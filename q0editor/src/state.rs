@@ -538,6 +538,7 @@ pub struct Session {
     pub show_credits: bool,
     pub credits_opened_at: Instant,
     pub show_settings: bool,
+    pub easing_editor: Option<crate::easing::EasingEditorState>,
     pub viewport: Viewport,
     /// Clipboard for display objects, raw graphics, or a mixed selection.
     pub clipboard: Option<ClipboardPayload>,
@@ -605,6 +606,7 @@ impl Session {
             show_credits: false,
             credits_opened_at: Instant::now(),
             show_settings: false,
+            easing_editor: None,
             viewport: Viewport::identity(),
             clipboard: None,
             onion: OnionSettings::default(),

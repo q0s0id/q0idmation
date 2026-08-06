@@ -2259,7 +2259,10 @@ impl EditorApp {
             .iter()
             .flat_map(|layer| &layer.placements)
             .filter(|placement| {
-                matches!(placement.tween, Tween::Linear { to_frame } if to_frame >= requested)
+                placement
+                    .tween
+                    .to_frame()
+                    .is_some_and(|to_frame| to_frame >= requested)
             })
             .count();
 
@@ -2292,10 +2295,11 @@ impl EditorApp {
                 .placements
                 .retain(|placement| placement.frame < q0rg.frame_count);
             for placement in &mut layer.placements {
-                if matches!(
-                    placement.tween,
-                    Tween::Linear { to_frame } if to_frame >= q0rg.frame_count
-                ) {
+                if placement
+                    .tween
+                    .to_frame()
+                    .is_some_and(|to_frame| to_frame >= q0rg.frame_count)
+                {
                     placement.tween = Tween::None;
                 }
             }
@@ -3839,11 +3843,10 @@ impl EditorApp {
                 .expect("selected editable layer still exists");
             (first_frame..=last_frame).any(|frame| !layer.is_blank_keyframe(frame))
                 || layer.placements.iter().any(|placement| {
-                    matches!(
-                        placement.tween,
-                        Tween::Linear { to_frame }
-                            if (first_frame..=last_frame).contains(&to_frame)
-                    )
+                    placement
+                        .tween
+                        .to_frame()
+                        .is_some_and(|to_frame| (first_frame..=last_frame).contains(&to_frame))
                 })
         });
         if !needs_change {
@@ -3873,11 +3876,11 @@ impl EditorApp {
             removed_items += before - layer.placements.len();
 
             for placement in &mut layer.placements {
-                if matches!(
-                    placement.tween,
-                    Tween::Linear { to_frame }
-                        if (first_frame..=last_frame).contains(&to_frame)
-                ) {
+                if placement
+                    .tween
+                    .to_frame()
+                    .is_some_and(|to_frame| (first_frame..=last_frame).contains(&to_frame))
+                {
                     placement.tween = Tween::None;
                 }
             }
@@ -4503,12 +4506,12 @@ impl EditorApp {
             if let Some(layer) = q0rg.layers.iter_mut().find(|l| l.layer_id == layer_id) {
                 for (idx, _) in &insertions {
                     if let Some(source) = layer.placements.get_mut(*idx) {
-                        if matches!(
-                            source.tween,
-                            Tween::Linear { to_frame }
-                                if source.frame < frame && frame <= to_frame
-                        ) {
-                            source.tween = Tween::Linear { to_frame: frame };
+                        if source
+                            .tween
+                            .to_frame()
+                            .is_some_and(|to_frame| source.frame < frame && frame <= to_frame)
+                        {
+                            source.tween = source.tween.with_to_frame(frame);
                         }
                     }
                 }
@@ -4661,7 +4664,7 @@ impl EditorApp {
         };
 
         // Already linear Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†РІР‚С›РЎС›Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р Р†РІР‚С›РЎС›Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†РІР‚С›РЎС›Р В Р’В Р вЂ™Р’В Р В Р’В Р Р†Р вЂљР’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†Р вЂљРЎвЂќР В Р’В Р В Р вЂ№Р В Р Р‹Р Р†Р вЂљРЎвЂќ just clear it.
-        if matches!(cur_tween, Tween::Linear { .. }) {
+        if cur_tween.to_frame().is_some() {
             self.history.snapshot(&self.state.project);
             if let Some(p) = self
                 .state
@@ -5614,6 +5617,7 @@ impl App for EditorApp {
 
             panels::q0enc::render(self, ctx);
             crate::q0lang::render(self, ctx);
+            crate::easing::render_editor(self, ctx);
         }
 
         if self.session.show_credits {

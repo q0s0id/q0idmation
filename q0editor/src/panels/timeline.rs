@@ -1411,8 +1411,6 @@ fn draw_layer_spans(
     frame_count: u16,
     is_current_layer: bool,
 ) {
-    use q0s_format::v2::Tween;
-
     let keyframes = visible_keyframes(layer, frame_count);
 
     let cell_top = row_y + CELL_PAD_Y;
@@ -1435,9 +1433,10 @@ fn draw_layer_spans(
         if span_end < keyframe || layer.is_blank_keyframe(keyframe) {
             continue;
         }
-        let has_tween = layer.placements.iter().any(|placement| {
-            placement.frame == keyframe && matches!(placement.tween, Tween::Linear { .. })
-        });
+        let has_tween = layer
+            .placements
+            .iter()
+            .any(|placement| placement.frame == keyframe && placement.tween.to_frame().is_some());
         let x0 = base_x + f32::from(keyframe) * FRAME_W;
         let x1 = base_x + (f32::from(span_end) + 1.0) * FRAME_W;
         painter.rect_filled(
@@ -1469,7 +1468,7 @@ fn draw_layer_spans(
 
     let mut arrows = std::collections::BTreeSet::new();
     for placement in &layer.placements {
-        if let Tween::Linear { to_frame } = placement.tween {
+        if let Some(to_frame) = placement.tween.to_frame() {
             if placement.frame < frame_count && to_frame < frame_count {
                 arrows.insert((placement.frame, to_frame));
             }

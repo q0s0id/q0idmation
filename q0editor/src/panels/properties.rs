@@ -781,7 +781,7 @@ fn placement_properties(
 ) {
     let before = app.state.project.clone();
     let current_frame = app.session.current_frame;
-    let Some((source_frame, mut transform)) = app
+    let Some((source_frame, mut transform, tween)) = app
         .state
         .project
         .q0rgs
@@ -792,7 +792,7 @@ fn placement_properties(
             let source = layer.placements.get(placement_idx)?;
             let active =
                 crate::render::active_transform_for_placement(layer, placement_idx, current_frame)?;
-            Some((source.frame, active))
+            Some((source.frame, active, source.tween))
         })
     else {
         ui.label("Selection is no longer available");
@@ -859,6 +859,8 @@ fn placement_properties(
                 transform.rotation = rotation_degrees.to_radians();
             }
         });
+
+    crate::easing::render_tween_properties(app, ui, q0rg_id, layer_id, placement_idx, tween);
 
     ui.separator();
     if ui

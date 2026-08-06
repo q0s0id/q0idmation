@@ -23,7 +23,8 @@ pub const Q0S_VERSION_KEYFRAMES: u16 = 3;
 pub const Q0S_VERSION_ASSET_NAMES: u16 = 4;
 pub const Q0S_VERSION_LAYER_FOLDERS: u16 = 5;
 pub const Q0S_VERSION_Q0V_ASSETS: u16 = 6;
-pub const Q0S_VERSION_CURRENT: u16 = Q0S_VERSION_Q0V_ASSETS;
+pub const Q0S_VERSION_EASING: u16 = 7;
+pub const Q0S_VERSION_CURRENT: u16 = Q0S_VERSION_EASING;
 
 /// Serialise a `ProjectV2` as the current vector `.q0s` bytes. Internally we
 /// reuse the current `.q1s` writer and patch the magic+version header in-place
@@ -58,6 +59,7 @@ pub fn parse_q0s_v2(bytes: &[u8]) -> Result<ProjectV2, Error> {
         Q0S_VERSION_LAYER_FOLDERS => {
             v2::parse_body_after_header(bytes, v2::Q1S_VERSION_LAYER_FOLDERS)
         }
+        Q0S_VERSION_Q0V_ASSETS => v2::parse_body_after_header(bytes, v2::Q1S_VERSION_Q0V_ASSETS),
         Q0S_VERSION_CURRENT => v2::parse_body_after_header(bytes, v2::Q1S_VERSION_CURRENT),
         _ => Err(Error::UnsupportedVersion(version)),
     }
@@ -78,6 +80,7 @@ pub fn is_q0s_v2(bytes: &[u8]) -> bool {
             | Q0S_VERSION_KEYFRAMES
             | Q0S_VERSION_ASSET_NAMES
             | Q0S_VERSION_LAYER_FOLDERS
+            | Q0S_VERSION_Q0V_ASSETS
             | Q0S_VERSION_CURRENT
     )
 }
@@ -86,8 +89,8 @@ pub fn is_q0s_v2(bytes: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::v2::{
-        Anchor, Asset, Layer, Path as VPath, Placement, ProjectMeta, Q0rg, Rgba, Target,
-        Transform2D, Tween, Vec2, VectorAsset,
+        Anchor, Asset, Easing, EasingFamily, EasingMode, Layer, Path as VPath, Placement,
+        ProjectMeta, Q0rg, Rgba, Target, Transform2D, Tween, Vec2, VectorAsset,
     };
 
     fn test_q0v_bytes() -> Vec<u8> {
@@ -185,6 +188,54 @@ mod tests {
     }
 
     #[test]
+    fn current_player_parser_still_reads_q0s_v6_q0v_assets() {
+        let mut project = small_project();
+        project.assets.clear();
+        project.assets.push(Asset::Q0v(v2::Q0vAsset {
+            asset_id: 7,
+            bytes: test_q0v_bytes(),
+        }));
+        project
+            .asset_names
+            .insert(7, "legacy q0s video".to_string());
+        project.q0rgs[0].layers[0].placements[0].target = Target::Asset(7);
+
+        let mut bytes =
+            v2::write_version(&project, v2::Q1S_VERSION_Q0V_ASSETS).expect("write q1s v7 body");
+        bytes[0..4].copy_from_slice(&Q0S_V2_MAGIC);
+        bytes[4..6].copy_from_slice(&Q0S_VERSION_Q0V_ASSETS.to_le_bytes());
+
+        assert!(is_q0s_v2(&bytes));
+        assert_eq!(parse_q0s_v2(&bytes).expect("parse q0s v6"), project);
+    }
+
+    #[test]
+    fn current_q0s_roundtrip_preserves_easing_for_player() {
+        let mut project = small_project();
+        project.q0rgs[0].frame_count = 4;
+        project.q0rgs[0].layers[0].explicit_keyframes.clear();
+        project.q0rgs[0].layers[0].placements[0].tween = Tween::Eased {
+            to_frame: 3,
+            easing: Easing::Preset {
+                family: EasingFamily::Bounce,
+                mode: EasingMode::InOut,
+            },
+        };
+        let mut target = project.q0rgs[0].layers[0].placements[0].clone();
+        target.frame = 3;
+        target.transform.tx = 90.0;
+        target.tween = Tween::None;
+        project.q0rgs[0].layers[0].placements.push(target);
+
+        let bytes = write_q0s_v2(&project).expect("write eased q0s");
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            Q0S_VERSION_CURRENT
+        );
+        assert_eq!(parse_q0s_v2(&bytes).expect("parse eased q0s"), project);
+    }
+
+    #[test]
     fn current_player_parser_still_reads_vector_q0s_v2() {
         let mut project = small_project();
         project.q0rgs[0].layers[0].explicit_keyframes.clear();
@@ -277,7 +328,7 @@ mod tests {
         let bytes = write_q0s_v2(&project).expect("write q0v q0s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_Q0V_ASSETS
+            Q0S_VERSION_CURRENT
         );
         assert_eq!(parse_q0s_v2(&bytes).expect("parse q0v q0s"), project);
     }

@@ -233,9 +233,8 @@ fn resolve_layer_at_frame(layer: &q0s_format::v2::Layer, frame: u16) -> Vec<Reso
         .enumerate()
         .map(|(source_order, index)| {
             let placement = &layer.placements[*index];
-            let interp = match placement.tween {
-                Tween::None => placement.transform,
-                Tween::Linear { to_frame } if to_frame > keyframe && frame >= keyframe => {
+            let interp = match placement.tween.to_frame() {
+                Some(to_frame) if to_frame > keyframe && frame >= keyframe => {
                     let occurrence = source_indices[..source_order]
                         .iter()
                         .filter(|candidate| {
@@ -252,10 +251,11 @@ fn resolve_layer_at_frame(layer: &q0s_format::v2::Layer, frame: u16) -> Vec<Reso
                         .map(|candidate| candidate.transform)
                         .unwrap_or(placement.transform);
                     let denominator = f32::from(to_frame - keyframe);
-                    let t = (f32::from(frame - keyframe) / denominator).clamp(0.0, 1.0);
+                    let raw_t = (f32::from(frame - keyframe) / denominator).clamp(0.0, 1.0);
+                    let t = placement.tween.easing().sample(raw_t);
                     lerp_transform(placement.transform, target_transform, t)
                 }
-                Tween::Linear { .. } => placement.transform,
+                Some(_) | None => placement.transform,
             };
             Resolved {
                 placement,
@@ -1328,6 +1328,36 @@ mod tests {
         assert_eq!(active.len(), 2);
         assert!((active[0].1.tx - 5.0).abs() < 1.0e-5);
         assert!((active[1].1.tx - 150.0).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn eased_tween_changes_the_resolved_transform() {
+        use q0s_format::v2::{Easing, EasingFamily, EasingMode};
+
+        let layer = Layer {
+            layer_id: 1,
+            name: "layer".into(),
+            explicit_keyframes: Vec::new(),
+            placements: vec![
+                test_placement(
+                    0,
+                    1,
+                    0.0,
+                    Tween::Eased {
+                        to_frame: 10,
+                        easing: Easing::Preset {
+                            family: EasingFamily::Quad,
+                            mode: EasingMode::In,
+                        },
+                    },
+                ),
+                test_placement(10, 1, 100.0, Tween::None),
+            ],
+        };
+
+        let active = active_placements_at(&layer, 5);
+        assert_eq!(active.len(), 1);
+        assert!((active[0].1.tx - 25.0).abs() < 1.0e-4);
     }
 
     #[test]

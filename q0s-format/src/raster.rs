@@ -21,7 +21,7 @@
 use crate::geom::{brush_outline, flatten_path};
 use crate::transform::Affine;
 use crate::v2::{
-    Asset, BitmapAsset, ProjectV2, Rgba, Target, Transform2D, Tween, Vec2, VectorAsset,
+    Asset, BitmapAsset, ProjectV2, Rgba, Target, Transform2D, Vec2, VectorAsset,
     MAX_Q0RG_NESTING_DEPTH,
 };
 
@@ -229,9 +229,8 @@ pub fn active_placements_at(layer: &crate::v2::Layer, frame: u16) -> Vec<(usize,
         .enumerate()
         .map(|(source_order, index)| {
             let placement = &layer.placements[*index];
-            let interp = match placement.tween {
-                Tween::None => placement.transform,
-                Tween::Linear { to_frame } if to_frame > keyframe && frame >= keyframe => {
+            let interp = match placement.tween.to_frame() {
+                Some(to_frame) if to_frame > keyframe && frame >= keyframe => {
                     let occurrence = source_indices[..source_order]
                         .iter()
                         .filter(|candidate| {
@@ -248,10 +247,11 @@ pub fn active_placements_at(layer: &crate::v2::Layer, frame: u16) -> Vec<(usize,
                         .map(|candidate| candidate.transform)
                         .unwrap_or(placement.transform);
                     let denominator = f32::from(to_frame - keyframe);
-                    let t = (f32::from(frame - keyframe) / denominator).clamp(0.0, 1.0);
+                    let raw_t = (f32::from(frame - keyframe) / denominator).clamp(0.0, 1.0);
+                    let t = placement.tween.easing().sample(raw_t);
                     lerp_transform(placement.transform, target_transform, t)
                 }
-                Tween::Linear { .. } => placement.transform,
+                Some(_) | None => placement.transform,
             };
             (*index, interp)
         })
@@ -534,7 +534,7 @@ fn blend_pixel(buffer: &mut [u8], idx: usize, c: Rgba) {
 #[cfg(test)]
 mod resolver_tests {
     use super::*;
-    use crate::v2::{Layer, Placement};
+    use crate::v2::{Layer, Placement, Tween};
 
     fn placement(frame: u16, asset: u16, tx: f32, tween: Tween) -> Placement {
         Placement {

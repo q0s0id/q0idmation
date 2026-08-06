@@ -1,7 +1,7 @@
 use q0s_format::v2::{
-    parse, validate, write, Anchor, Asset, BitmapAsset, Layer, Path, Placement, ProjectMeta,
-    ProjectV2, Q0rg, Rgba, Stroke, Target, Transform2D, Tween, Vec2, VectorAsset,
-    MAX_Q0RG_NESTING_DEPTH,
+    parse, validate, write, Anchor, Asset, BitmapAsset, Easing, EasingFamily, EasingMode, Layer,
+    Path, Placement, ProjectMeta, ProjectV2, Q0rg, Rgba, Stroke, Target, Transform2D, Tween, Vec2,
+    VectorAsset, MAX_Q0RG_NESTING_DEPTH,
 };
 use q0s_format::Error;
 
@@ -541,4 +541,51 @@ fn v2_rejects_trailing_bytes() {
             remaining: 4,
         }
     );
+}
+
+#[test]
+fn eased_tween_round_trips_in_current_q1s() {
+    let mut project = sample_v2_project();
+    project.q0rgs[0].layers[0].placements[1].tween = Tween::Eased {
+        to_frame: 5,
+        easing: Easing::Preset {
+            family: EasingFamily::Bounce,
+            mode: EasingMode::InOut,
+        },
+    };
+    let bytes = write(&project).expect("write eased project");
+    let decoded = parse(&bytes).expect("parse eased project");
+    assert_eq!(decoded, project);
+}
+
+#[test]
+fn custom_cubic_easing_round_trips_and_is_not_linear() {
+    let easing = Easing::CubicBezier {
+        x1: 0.42,
+        y1: 0.0,
+        x2: 1.0,
+        y2: 1.0,
+    };
+    assert!(easing.is_valid());
+    assert!(easing.sample(0.5) < 0.5);
+
+    let mut project = sample_v2_project();
+    project.q0rgs[0].layers[0].placements[1].tween = Tween::Eased {
+        to_frame: 5,
+        easing,
+    };
+    let decoded =
+        parse(&write(&project).expect("write custom easing")).expect("parse custom easing");
+    assert_eq!(decoded, project);
+}
+
+#[test]
+fn bounce_in_out_has_symmetric_endpoints() {
+    let easing = Easing::Preset {
+        family: EasingFamily::Bounce,
+        mode: EasingMode::InOut,
+    };
+    assert_eq!(easing.sample(0.0), 0.0);
+    assert_eq!(easing.sample(1.0), 1.0);
+    assert!((easing.sample(0.25) + easing.sample(0.75) - 1.0).abs() < 1e-5);
 }

@@ -98,15 +98,11 @@ pub fn capture_frames(
                 .cloned()
                 .map(|mut placement| {
                     placement.frame -= first_frame;
-                    placement.tween = match placement.tween {
-                        Tween::Linear { to_frame }
-                            if (first_frame..=last_frame).contains(&to_frame) =>
-                        {
-                            Tween::Linear {
-                                to_frame: to_frame - first_frame,
-                            }
+                    placement.tween = match placement.tween.to_frame() {
+                        Some(to_frame) if (first_frame..=last_frame).contains(&to_frame) => {
+                            placement.tween.with_to_frame(to_frame - first_frame)
                         }
-                        _ => Tween::None,
+                        Some(_) | None => Tween::None,
                     };
                     placement
                 }),
@@ -133,10 +129,11 @@ fn clear_frame_range(layer: &mut Layer, first_frame: u16, last_frame: u16, blank
         .placements
         .retain(|placement| !(first_frame..=last_frame).contains(&placement.frame));
     for placement in &mut layer.placements {
-        if matches!(
-            placement.tween,
-            Tween::Linear { to_frame } if (first_frame..=last_frame).contains(&to_frame)
-        ) {
+        if placement
+            .tween
+            .to_frame()
+            .is_some_and(|to_frame| (first_frame..=last_frame).contains(&to_frame))
+        {
             placement.tween = Tween::None;
         }
     }
@@ -194,13 +191,15 @@ pub fn materialize_selected_keyframes(
             let mut placements = Vec::new();
             for (placement_idx, transform) in crate::render::active_placements_at(layer, frame) {
                 let source = layer.placements.get(placement_idx)?;
-                if let Tween::Linear { to_frame } = source.tween {
-                    if source.frame < frame && frame <= to_frame {
-                        tween_retargets
-                            .entry((layer_id, placement_idx))
-                            .and_modify(|target| *target = (*target).min(frame))
-                            .or_insert(frame);
-                    }
+                if source
+                    .tween
+                    .to_frame()
+                    .is_some_and(|to_frame| source.frame < frame && frame <= to_frame)
+                {
+                    tween_retargets
+                        .entry((layer_id, placement_idx))
+                        .and_modify(|target| *target = (*target).min(frame))
+                        .or_insert(frame);
                 }
                 let mut placement = source.clone();
                 placement.frame = frame;
@@ -220,9 +219,7 @@ pub fn materialize_selected_keyframes(
             .iter_mut()
             .find(|layer| layer.layer_id == layer_id)?;
         let placement = layer.placements.get_mut(placement_idx)?;
-        placement.tween = Tween::Linear {
-            to_frame: target_frame,
-        };
+        placement.tween = placement.tween.with_to_frame(target_frame);
     }
     let created = insertions.len();
     for (layer_id, frame, placements) in insertions {
@@ -262,7 +259,7 @@ pub fn remove_selected_keyframes(
             }
             layer.remove_keyframe(frame);
             for placement in &mut layer.placements {
-                if matches!(placement.tween, Tween::Linear { to_frame } if to_frame == frame) {
+                if placement.tween.to_frame() == Some(frame) {
                     placement.tween = Tween::None;
                 }
             }
@@ -318,14 +315,12 @@ pub fn remove_selected_frame_columns(
             if placement.frame > last_frame {
                 placement.frame -= width;
             }
-            placement.tween = match placement.tween {
-                Tween::Linear { to_frame } if (first_frame..=last_frame).contains(&to_frame) => {
-                    Tween::None
+            placement.tween = match placement.tween.to_frame() {
+                Some(to_frame) if (first_frame..=last_frame).contains(&to_frame) => Tween::None,
+                Some(to_frame) if to_frame > last_frame => {
+                    placement.tween.with_to_frame(to_frame - width)
                 }
-                Tween::Linear { to_frame } if to_frame > last_frame => Tween::Linear {
-                    to_frame: to_frame - width,
-                },
-                tween => tween,
+                Some(_) | None => placement.tween,
             };
             shifted.push(placement);
         }
@@ -472,12 +467,11 @@ pub fn paste_frames(
             .placements
             .extend(row.placements.iter().cloned().map(|mut placement| {
                 placement.frame = target_frame.saturating_add(placement.frame);
-                placement.tween = match placement.tween {
-                    Tween::Linear { to_frame } => Tween::Linear {
-                        to_frame: target_frame.saturating_add(to_frame),
-                    },
-                    Tween::None => Tween::None,
-                };
+                if let Some(to_frame) = placement.tween.to_frame() {
+                    placement.tween = placement
+                        .tween
+                        .with_to_frame(target_frame.saturating_add(to_frame));
+                }
                 placement
             }));
         if !layer.has_keyframe(target_frame) {
@@ -694,10 +688,7 @@ pub fn paste_layers(
                 .placements
                 .iter()
                 .flat_map(|placement| {
-                    let tween_end = match placement.tween {
-                        Tween::Linear { to_frame } => Some(to_frame),
-                        Tween::None => None,
-                    };
+                    let tween_end = placement.tween.to_frame();
                     std::iter::once(placement.frame).chain(tween_end)
                 })
                 .chain(layer.explicit_keyframes.iter().copied())
@@ -934,6 +925,60 @@ mod tests {
         assert!(!layer.has_keyframe(3));
         assert!(!layer.has_keyframe(4));
         assert_eq!(layer.placements[0].tween, Tween::None);
+    }
+
+    #[test]
+    fn copy_and_paste_preserve_custom_tween_easing() {
+        use q0s_format::v2::Easing;
+
+        let mut project = crate::state::default_project();
+        project.q0rgs[0].frame_count = 8;
+        let layer_id = project.q0rgs[0].layers[0].layer_id;
+        project.q0rgs[0].layers[0].explicit_keyframes.clear();
+        project.q0rgs[0].layers[0].placements = vec![
+            placement(
+                0,
+                0.0,
+                Tween::Eased {
+                    to_frame: 3,
+                    easing: Easing::CubicBezier {
+                        x1: 0.2,
+                        y1: -0.4,
+                        x2: 0.8,
+                        y2: 1.4,
+                    },
+                },
+            ),
+            placement(3, 30.0, Tween::None),
+        ];
+        let selection = TimelineSelection {
+            anchor_layer_id: layer_id,
+            anchor_frame: 0,
+            focus_layer_id: layer_id,
+            focus_frame: 3,
+        };
+        let clipboard = capture_frames(&project, 1, selection).expect("capture tween");
+        let pasted = paste_frames(&mut project, 1, layer_id, 4, &clipboard).expect("paste tween");
+        assert_eq!(pasted.anchor_frame, 4);
+        assert_eq!(pasted.focus_frame, 7);
+        let pasted_tween = project.q0rgs[0].layers[0]
+            .placements
+            .iter()
+            .find(|placement| placement.frame == 4)
+            .expect("pasted source")
+            .tween;
+        assert_eq!(
+            pasted_tween,
+            Tween::Eased {
+                to_frame: 7,
+                easing: Easing::CubicBezier {
+                    x1: 0.2,
+                    y1: -0.4,
+                    x2: 0.8,
+                    y2: 1.4,
+                },
+            }
+        );
     }
 
     #[test]

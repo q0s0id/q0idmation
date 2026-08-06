@@ -3,6 +3,7 @@ pub mod app;
 pub mod assoc;
 mod bitmap_import;
 pub mod brush;
+pub mod easing;
 pub mod export;
 pub mod file_io;
 pub mod l10n;

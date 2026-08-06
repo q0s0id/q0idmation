@@ -3469,7 +3469,7 @@ pub(crate) fn preserve_blank_keyframe_after_content_delete(
     let mut changed = !layer.explicit_keyframes.contains(&frame);
     layer.ensure_explicit_keyframe(frame);
     for placement in &mut layer.placements {
-        if matches!(placement.tween, Tween::Linear { to_frame } if to_frame == frame) {
+        if placement.tween.to_frame() == Some(frame) {
             placement.tween = Tween::None;
             changed = true;
         }

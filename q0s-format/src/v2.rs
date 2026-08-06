@@ -4,7 +4,7 @@
 //!
 //!   Header:
 //!     [4]   magic "Q1S\0"
-//!     [2]   version = 2 (legacy) | 3 (skew) | 4 (blank keyframes) | 5 (asset names) | 6 (layer folders) | 7 (q0v assets)
+//!     [2]   version = 2 (legacy) | 3 (skew) | 4 (blank keyframes) | 5 (asset names) | 6 (layer folders) | 7 (q0v assets) | 8 (easing)
 //!     [2]   flags (reserved = 0)
 //!     [2]   asset_count
 //!     [2]   q0rg_count
@@ -22,16 +22,17 @@
 //!       placements[]: [2] frame, [1] target_kind, [2] target_id,
 //!         v2: transform [20]: tx ty sx sy rot (5 × f32)
 //!         v3+: transform [28]: tx ty sx sy rot skew_x skew_y (7 × f32)
-//!         tween: [1] kind (0=none, 1=linear), [2 if linear] to_frame
+//!         tween: [1] kind (0=none, 1=linear, 2=eased), [2 if motion] to_frame,
+//!           v8 eased: [1] easing kind + payload
 //!       v4+: [2] explicit_keyframe_count, explicit_keyframes[]: [2] frame
 //!   v6 layer metadata: [2] entry_count, then entries:
 //!     [2] q0rg_id, [2] layer_id, [1] kind, [1] parent flag, [2 if present] parent id, [1] collapsed
 //!
-//! Reading: v2 through v7 are accepted; v2 placements get skew_x/y = 0,
+//! Reading: v2 through v8 are accepted; v2 placements get skew_x/y = 0,
 //! v2/v3 layers get no explicit blank-keyframe markers, v2-v4 assets
 //! keep deterministic default labels, and v2-v5 projects have ordinary
 //! top-level layers without folders.
-//! Writing: always v7 (see `Q1S_VERSION_CURRENT`).
+//! Writing: always v8 (see `Q1S_VERSION_CURRENT`).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -45,7 +46,8 @@ pub const Q1S_VERSION_KEYFRAMES: u16 = 4;
 pub const Q1S_VERSION_ASSET_NAMES: u16 = 5;
 pub const Q1S_VERSION_LAYER_FOLDERS: u16 = 6;
 pub const Q1S_VERSION_Q0V_ASSETS: u16 = 7;
-pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_Q0V_ASSETS;
+pub const Q1S_VERSION_EASING: u16 = 8;
+pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_EASING;
 /// Kept as an alias so external code that imported the v2-era constant keeps
 /// compiling. It now means "the current write-out version".
 pub const Q1S_V2_VERSION: u16 = Q1S_VERSION_CURRENT;
@@ -64,6 +66,10 @@ const TARGET_KIND_ASSET: u8 = 1;
 const TARGET_KIND_Q0RG: u8 = 2;
 const TWEEN_KIND_NONE: u8 = 0;
 const TWEEN_KIND_LINEAR: u8 = 1;
+const TWEEN_KIND_EASED: u8 = 2;
+const EASING_KIND_LINEAR: u8 = 0;
+const EASING_KIND_PRESET: u8 = 1;
+const EASING_KIND_CUBIC_BEZIER: u8 = 2;
 const LAYER_KIND_NORMAL: u8 = 0;
 const LAYER_KIND_FOLDER: u8 = 1;
 
@@ -204,10 +210,242 @@ pub enum Target {
     Q0rg(u16),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum EasingFamily {
+    Quad = 0,
+    Cubic = 1,
+    Quart = 2,
+    Quint = 3,
+    Sine = 4,
+    Expo = 5,
+    Circ = 6,
+    Back = 7,
+    Elastic = 8,
+    Bounce = 9,
+}
+
+impl EasingFamily {
+    pub const ALL: [Self; 10] = [
+        Self::Quad,
+        Self::Cubic,
+        Self::Quart,
+        Self::Quint,
+        Self::Sine,
+        Self::Expo,
+        Self::Circ,
+        Self::Back,
+        Self::Elastic,
+        Self::Bounce,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Quad => "Quad",
+            Self::Cubic => "Cubic",
+            Self::Quart => "Quart",
+            Self::Quint => "Quint",
+            Self::Sine => "Sine",
+            Self::Expo => "Expo",
+            Self::Circ => "Circ",
+            Self::Back => "Back",
+            Self::Elastic => "Elastic",
+            Self::Bounce => "Bounce",
+        }
+    }
+
+    fn from_u8(value: u8) -> Option<Self> {
+        Self::ALL.get(usize::from(value)).copied()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum EasingMode {
+    In = 0,
+    Out = 1,
+    InOut = 2,
+}
+
+impl EasingMode {
+    pub const ALL: [Self; 3] = [Self::In, Self::Out, Self::InOut];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::In => "Ease In",
+            Self::Out => "Ease Out",
+            Self::InOut => "Ease In Out",
+        }
+    }
+
+    fn from_u8(value: u8) -> Option<Self> {
+        Self::ALL.get(usize::from(value)).copied()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum Easing {
+    #[default]
+    Linear,
+    Preset {
+        family: EasingFamily,
+        mode: EasingMode,
+    },
+    CubicBezier {
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+    },
+}
+
+impl Easing {
+    pub fn sample(self, t: f32) -> f32 {
+        let t = t.clamp(0.0, 1.0);
+        match self {
+            Self::Linear => t,
+            Self::Preset { family, mode } => match mode {
+                EasingMode::In => easing_in(family, t),
+                EasingMode::Out => 1.0 - easing_in(family, 1.0 - t),
+                EasingMode::InOut => {
+                    if t < 0.5 {
+                        0.5 * easing_in(family, t * 2.0)
+                    } else {
+                        1.0 - 0.5 * easing_in(family, (1.0 - t) * 2.0)
+                    }
+                }
+            },
+            Self::CubicBezier { x1, y1, x2, y2 } => sample_cubic_bezier(x1, y1, x2, y2, t),
+        }
+    }
+
+    pub fn is_valid(self) -> bool {
+        match self {
+            Self::Linear | Self::Preset { .. } => true,
+            Self::CubicBezier { x1, y1, x2, y2 } => {
+                x1.is_finite()
+                    && y1.is_finite()
+                    && x2.is_finite()
+                    && y2.is_finite()
+                    && (0.0..=1.0).contains(&x1)
+                    && (0.0..=1.0).contains(&x2)
+                    && (-8.0..=8.0).contains(&y1)
+                    && (-8.0..=8.0).contains(&y2)
+            }
+        }
+    }
+}
+
+fn easing_in(family: EasingFamily, t: f32) -> f32 {
+    use std::f32::consts::PI;
+    match family {
+        EasingFamily::Quad => t * t,
+        EasingFamily::Cubic => t * t * t,
+        EasingFamily::Quart => t.powi(4),
+        EasingFamily::Quint => t.powi(5),
+        EasingFamily::Sine => 1.0 - (t * PI * 0.5).cos(),
+        EasingFamily::Expo => {
+            if t <= 0.0 {
+                0.0
+            } else {
+                2.0_f32.powf(10.0 * t - 10.0)
+            }
+        }
+        EasingFamily::Circ => 1.0 - (1.0 - t * t).max(0.0).sqrt(),
+        EasingFamily::Back => {
+            const C1: f32 = 1.70158;
+            const C3: f32 = C1 + 1.0;
+            C3 * t * t * t - C1 * t * t
+        }
+        EasingFamily::Elastic => {
+            if t <= 0.0 || t >= 1.0 {
+                t
+            } else {
+                const C4: f32 = (2.0 * PI) / 3.0;
+                -2.0_f32.powf(10.0 * t - 10.0) * ((t * 10.0 - 10.75) * C4).sin()
+            }
+        }
+        EasingFamily::Bounce => 1.0 - bounce_out(1.0 - t),
+    }
+}
+
+fn bounce_out(t: f32) -> f32 {
+    const N1: f32 = 7.5625;
+    const D1: f32 = 2.75;
+    if t < 1.0 / D1 {
+        N1 * t * t
+    } else if t < 2.0 / D1 {
+        let t = t - 1.5 / D1;
+        N1 * t * t + 0.75
+    } else if t < 2.5 / D1 {
+        let t = t - 2.25 / D1;
+        N1 * t * t + 0.9375
+    } else {
+        let t = t - 2.625 / D1;
+        N1 * t * t + 0.984375
+    }
+}
+
+fn cubic_bezier_coordinate(a: f32, b: f32, t: f32) -> f32 {
+    let inv = 1.0 - t;
+    3.0 * inv * inv * t * a + 3.0 * inv * t * t * b + t * t * t
+}
+
+fn sample_cubic_bezier(x1: f32, y1: f32, x2: f32, y2: f32, x: f32) -> f32 {
+    let mut low = 0.0;
+    let mut high = 1.0;
+    for _ in 0..18 {
+        let mid = (low + high) * 0.5;
+        if cubic_bezier_coordinate(x1, x2, mid) < x {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    cubic_bezier_coordinate(y1, y2, (low + high) * 0.5)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Tween {
     None,
     Linear { to_frame: u16 },
+    Eased { to_frame: u16, easing: Easing },
+}
+
+impl Tween {
+    pub const fn to_frame(self) -> Option<u16> {
+        match self {
+            Self::None => None,
+            Self::Linear { to_frame } | Self::Eased { to_frame, .. } => Some(to_frame),
+        }
+    }
+
+    pub const fn easing(self) -> Easing {
+        match self {
+            Self::Eased { easing, .. } => easing,
+            Self::None | Self::Linear { .. } => Easing::Linear,
+        }
+    }
+
+    pub const fn with_to_frame(self, to_frame: u16) -> Self {
+        match self {
+            Self::Eased { easing, .. } => Self::Eased { to_frame, easing },
+            Self::None | Self::Linear { .. } => Self::Linear { to_frame },
+        }
+    }
+
+    pub const fn with_easing(self, easing: Easing) -> Self {
+        match self.to_frame() {
+            Some(to_frame) => {
+                if matches!(easing, Easing::Linear) {
+                    Self::Linear { to_frame }
+                } else {
+                    Self::Eased { to_frame, easing }
+                }
+            }
+            None => Self::None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -469,7 +707,7 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
                         }
                     }
                 }
-                if let Tween::Linear { to_frame } = p.tween {
+                if let Some(to_frame) = p.tween.to_frame() {
                     if to_frame <= p.frame {
                         return Err(Error::Validation("tween to_frame must be > frame"));
                     }
@@ -477,6 +715,9 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
                         return Err(Error::Validation(
                             "tween to_frame is out of q0rg frame_count bounds",
                         ));
+                    }
+                    if !p.tween.easing().is_valid() {
+                        return Err(Error::Validation("invalid tween easing curve"));
                     }
                 }
             }
@@ -648,6 +889,7 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
         && version != Q1S_VERSION_KEYFRAMES
         && version != Q1S_VERSION_ASSET_NAMES
         && version != Q1S_VERSION_LAYER_FOLDERS
+        && version != Q1S_VERSION_Q0V_ASSETS
         && version != Q1S_VERSION_CURRENT
     {
         return Err(Error::UnsupportedVersion(version));
@@ -681,6 +923,18 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
     {
         return Err(Error::Validation(
             "legacy q1s versions cannot store q0v assets",
+        ));
+    }
+    if version < Q1S_VERSION_EASING
+        && project
+            .q0rgs
+            .iter()
+            .flat_map(|q0rg| &q0rg.layers)
+            .flat_map(|layer| &layer.placements)
+            .any(|placement| matches!(placement.tween, Tween::Eased { .. }))
+    {
+        return Err(Error::Validation(
+            "legacy q1s versions cannot store easing curves",
         ));
     }
 
@@ -838,6 +1092,24 @@ fn write_optional_vec2(out: &mut Vec<u8>, v: Option<Vec2>) {
     }
 }
 
+fn write_easing(out: &mut Vec<u8>, easing: Easing) {
+    match easing {
+        Easing::Linear => out.push(EASING_KIND_LINEAR),
+        Easing::Preset { family, mode } => {
+            out.push(EASING_KIND_PRESET);
+            out.push(family as u8);
+            out.push(mode as u8);
+        }
+        Easing::CubicBezier { x1, y1, x2, y2 } => {
+            out.push(EASING_KIND_CUBIC_BEZIER);
+            out.extend_from_slice(&x1.to_le_bytes());
+            out.extend_from_slice(&y1.to_le_bytes());
+            out.extend_from_slice(&x2.to_le_bytes());
+            out.extend_from_slice(&y2.to_le_bytes());
+        }
+    }
+}
+
 fn write_q0rg(out: &mut Vec<u8>, q0rg: &Q0rg, version: u16) -> Result<(), Error> {
     out.extend_from_slice(&q0rg.q0rg_id.to_le_bytes());
     write_string_u16(out, &q0rg.name)?;
@@ -889,6 +1161,11 @@ fn write_q0rg(out: &mut Vec<u8>, q0rg: &Q0rg, version: u16) -> Result<(), Error>
                     out.push(TWEEN_KIND_LINEAR);
                     out.extend_from_slice(&to_frame.to_le_bytes());
                 }
+                Tween::Eased { to_frame, easing } => {
+                    out.push(TWEEN_KIND_EASED);
+                    out.extend_from_slice(&to_frame.to_le_bytes());
+                    write_easing(out, easing);
+                }
             }
         }
 
@@ -922,6 +1199,7 @@ pub fn parse(bytes: &[u8]) -> Result<ProjectV2, Error> {
         && version != Q1S_VERSION_KEYFRAMES
         && version != Q1S_VERSION_ASSET_NAMES
         && version != Q1S_VERSION_LAYER_FOLDERS
+        && version != Q1S_VERSION_Q0V_ASSETS
         && version != Q1S_VERSION_CURRENT
     {
         return Err(Error::UnsupportedVersion(version));
@@ -1148,6 +1426,26 @@ fn read_optional_vec2(c: &mut Cursor) -> Result<Option<Vec2>, Error> {
     }
 }
 
+fn read_easing(c: &mut Cursor) -> Result<Easing, Error> {
+    match c.read_u8()? {
+        EASING_KIND_LINEAR => Ok(Easing::Linear),
+        EASING_KIND_PRESET => {
+            let family = EasingFamily::from_u8(c.read_u8()?)
+                .ok_or(Error::Validation("invalid easing family"))?;
+            let mode = EasingMode::from_u8(c.read_u8()?)
+                .ok_or(Error::Validation("invalid easing mode"))?;
+            Ok(Easing::Preset { family, mode })
+        }
+        EASING_KIND_CUBIC_BEZIER => Ok(Easing::CubicBezier {
+            x1: c.read_f32()?,
+            y1: c.read_f32()?,
+            x2: c.read_f32()?,
+            y2: c.read_f32()?,
+        }),
+        _ => Err(Error::Validation("invalid easing kind")),
+    }
+}
+
 fn parse_q0rg(c: &mut Cursor, version: u16) -> Result<Q0rg, Error> {
     let q0rg_id = c.read_u16()?;
     let name = c.read_string_u16()?;
@@ -1194,6 +1492,10 @@ fn parse_q0rg(c: &mut Cursor, version: u16) -> Result<Q0rg, Error> {
                 TWEEN_KIND_NONE => Tween::None,
                 TWEEN_KIND_LINEAR => Tween::Linear {
                     to_frame: c.read_u16()?,
+                },
+                TWEEN_KIND_EASED if version >= Q1S_VERSION_EASING => Tween::Eased {
+                    to_frame: c.read_u16()?,
+                    easing: read_easing(c)?,
                 },
                 _ => return Err(Error::Validation("invalid tween kind")),
             };
@@ -1368,6 +1670,50 @@ mod compatibility_tests {
     }
 
     #[test]
+    fn current_parser_still_reads_q1s_v7_q0v_assets() {
+        let mut project = legacy_project();
+        project.assets.clear();
+        project.assets.push(Asset::Q0v(Q0vAsset {
+            asset_id: 7,
+            bytes: test_q0v_bytes(),
+        }));
+        project
+            .asset_names
+            .insert(7, "legacy embedded video".to_string());
+        project.q0rgs[0].layers[0].placements[0].target = Target::Asset(7);
+
+        let bytes = write_version(&project, Q1S_VERSION_Q0V_ASSETS).expect("write q1s v7 body");
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            Q1S_VERSION_Q0V_ASSETS
+        );
+        assert_eq!(parse(&bytes).expect("parse q1s v7"), project);
+    }
+
+    #[test]
+    fn q1s_v7_writer_rejects_easing_instead_of_dropping_it() {
+        let mut project = legacy_project();
+        project.q0rgs[0].frame_count = 3;
+        project.q0rgs[0].layers[0].placements[0].tween = Tween::Eased {
+            to_frame: 2,
+            easing: Easing::Preset {
+                family: EasingFamily::Cubic,
+                mode: EasingMode::InOut,
+            },
+        };
+        let mut target = project.q0rgs[0].layers[0].placements[0].clone();
+        target.frame = 2;
+        target.tween = Tween::None;
+        project.q0rgs[0].layers[0].placements.push(target);
+
+        assert_eq!(
+            write_version(&project, Q1S_VERSION_Q0V_ASSETS)
+                .expect_err("q1s v7 cannot store easing"),
+            Error::Validation("legacy q1s versions cannot store easing curves")
+        );
+    }
+
+    #[test]
     fn current_q1s_roundtrip_preserves_embedded_q0v_asset() {
         let mut project = legacy_project();
         project.assets.clear();
@@ -1383,7 +1729,7 @@ mod compatibility_tests {
         let bytes = write(&project).expect("write q0v project");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q1S_VERSION_Q0V_ASSETS
+            Q1S_VERSION_CURRENT
         );
         assert_eq!(parse(&bytes).expect("parse q0v project"), project);
     }

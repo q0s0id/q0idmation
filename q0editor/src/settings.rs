@@ -13,6 +13,7 @@ use q0theme::{BuiltinTheme, BUILTIN_THEMES, Q0S_SIGNATURE_ID};
 use serde::{Deserialize, Serialize};
 
 use crate::brush::{BrushNib, BrushSettings};
+use crate::easing::EasingPreset;
 use crate::l10n::Language;
 use q0s_format::geom::CapShape;
 use q0s_format::v2::Rgba;
@@ -787,6 +788,9 @@ pub struct Settings {
     pub brush_cap: BrushCap,
     #[serde(default)]
     pub brush: BrushPreferences,
+    /// User-created easing curves shared by every project.
+    #[serde(default)]
+    pub easing_presets: Vec<EasingPreset>,
     /// Font name used inside the q0lang script editor. Resolved via
     /// `q0lang::fonts::resolve` at install time; if the system can't find
     /// it, falls back to bundled monospace and warns once in status.
@@ -834,6 +838,7 @@ impl Default for Settings {
             theme: Theme::default(),
             brush_cap: BrushCap::Round,
             brush: BrushPreferences::default(),
+            easing_presets: Vec::new(),
             q0lang_font_name: default_q0lang_font_name(),
             q0lang_font_size: default_q0lang_font_size(),
             q0lang_show_line_numbers: default_q0lang_show_line_numbers(),
@@ -877,6 +882,7 @@ impl Settings {
         }
         settings.q0lang_font_size.0 = settings.q0lang_font_size.0.clamp(8.0, 72.0);
         settings.q0lang_tab_width = settings.q0lang_tab_width.clamp(1, 8);
+        crate::easing::sanitize_library(&mut settings.easing_presets);
         settings.prune_recent();
         settings
     }
@@ -1064,6 +1070,23 @@ mod tests {
         assert!(bounded.size.is_finite());
         assert!((0.1..=512.0).contains(&bounded.size));
         assert_eq!(bounded.smoothing, 100);
+    }
+
+    #[test]
+    fn easing_preset_library_survives_settings_roundtrip() {
+        let mut settings = Settings::default();
+        settings.easing_presets.push(EasingPreset::from_curve(
+            "impact bounce",
+            crate::easing::CubicCurve {
+                x1: 0.15,
+                y1: -0.75,
+                x2: 0.82,
+                y2: 1.5,
+            },
+        ));
+        let bytes = serde_json::to_vec(&settings).expect("serialize settings");
+        let decoded: Settings = serde_json::from_slice(&bytes).expect("deserialize settings");
+        assert_eq!(decoded.easing_presets, settings.easing_presets);
     }
 
     #[test]
