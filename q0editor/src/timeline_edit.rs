@@ -168,6 +168,186 @@ pub fn clear_frames(
     Some(removed)
 }
 
+/// Convert every selected non-key cell into a real keyframe using the exact
+/// visible state from the original timeline. When a new key splits an incoming
+/// tween, retarget that tween to the first inserted key so metadata and the
+/// rendered span agree.
+pub fn materialize_selected_keyframes(
+    project: &mut ProjectV2,
+    q0rg_id: u16,
+    selection: TimelineSelection,
+) -> Option<usize> {
+    let (layer_ids, first_frame, last_frame) = selected_frame_bounds(project, q0rg_id, selection)?;
+    let q0rg = project.q0rgs.iter().find(|q0rg| q0rg.q0rg_id == q0rg_id)?;
+    let mut insertions = Vec::<(u16, u16, Vec<q0s_format::v2::Placement>)>::new();
+    let mut tween_retargets = HashMap::<(u16, usize), u16>::new();
+
+    for layer_id in layer_ids {
+        let layer = q0rg
+            .layers
+            .iter()
+            .find(|layer| layer.layer_id == layer_id)?;
+        for frame in first_frame..=last_frame {
+            if layer.has_keyframe(frame) {
+                continue;
+            }
+            let mut placements = Vec::new();
+            for (placement_idx, transform) in crate::render::active_placements_at(layer, frame) {
+                let source = layer.placements.get(placement_idx)?;
+                if let Tween::Linear { to_frame } = source.tween {
+                    if source.frame < frame && frame <= to_frame {
+                        tween_retargets
+                            .entry((layer_id, placement_idx))
+                            .and_modify(|target| *target = (*target).min(frame))
+                            .or_insert(frame);
+                    }
+                }
+                let mut placement = source.clone();
+                placement.frame = frame;
+                placement.transform = transform;
+                placement.tween = Tween::None;
+                placements.push(placement);
+            }
+            insertions.push((layer_id, frame, placements));
+        }
+    }
+
+    let q0rg_index = q0rg_index(project, q0rg_id)?;
+    let q0rg = &mut project.q0rgs[q0rg_index];
+    for ((layer_id, placement_idx), target_frame) in tween_retargets {
+        let layer = q0rg
+            .layers
+            .iter_mut()
+            .find(|layer| layer.layer_id == layer_id)?;
+        let placement = layer.placements.get_mut(placement_idx)?;
+        placement.tween = Tween::Linear {
+            to_frame: target_frame,
+        };
+    }
+    let created = insertions.len();
+    for (layer_id, frame, placements) in insertions {
+        let layer = q0rg
+            .layers
+            .iter_mut()
+            .find(|layer| layer.layer_id == layer_id)?;
+        if placements.is_empty() {
+            layer.ensure_explicit_keyframe(frame);
+        } else {
+            layer.placements.extend(placements);
+        }
+    }
+    Some(created)
+}
+
+/// Demote selected keyframes back to ordinary held frames. Frame zero is the
+/// structural root of a drawable layer and therefore remains a keyframe.
+pub fn remove_selected_keyframes(
+    project: &mut ProjectV2,
+    q0rg_id: u16,
+    selection: TimelineSelection,
+) -> Option<usize> {
+    let (layer_ids, first_frame, last_frame) = selected_frame_bounds(project, q0rg_id, selection)?;
+    let q0rg_index = q0rg_index(project, q0rg_id)?;
+    let q0rg = &mut project.q0rgs[q0rg_index];
+    let mut removed = 0usize;
+
+    for layer_id in layer_ids {
+        let layer = q0rg
+            .layers
+            .iter_mut()
+            .find(|layer| layer.layer_id == layer_id)?;
+        for frame in first_frame.max(1)..=last_frame {
+            if !layer.has_keyframe(frame) {
+                continue;
+            }
+            layer.remove_keyframe(frame);
+            for placement in &mut layer.placements {
+                if matches!(placement.tween, Tween::Linear { to_frame } if to_frame == frame) {
+                    placement.tween = Tween::None;
+                }
+            }
+            removed += 1;
+        }
+    }
+    Some(removed)
+}
+
+/// Remove selected columns of time from the whole q0rg. Later keyframes,
+/// explicit blank keys and tween targets shift left together. A q0rg always
+/// keeps one frame; removing the complete timeline resets drawable layers to
+/// one blank root keyframe.
+pub fn remove_selected_frame_columns(
+    project: &mut ProjectV2,
+    q0rg_id: u16,
+    selection: TimelineSelection,
+) -> Option<u16> {
+    let (_, first_frame, last_frame) = selected_frame_bounds(project, q0rg_id, selection)?;
+    let q0rg_index = q0rg_index(project, q0rg_id)?;
+    let drawable_layer_ids = project.q0rgs[q0rg_index]
+        .layers
+        .iter()
+        .filter(|layer| !project.layer_is_folder(q0rg_id, layer.layer_id))
+        .map(|layer| layer.layer_id)
+        .collect::<HashSet<_>>();
+    let old_count = project.q0rgs[q0rg_index].frame_count;
+    if old_count <= 1 {
+        return Some(0);
+    }
+
+    let q0rg = &mut project.q0rgs[q0rg_index];
+    if first_frame == 0 && last_frame == old_count - 1 {
+        q0rg.frame_count = 1;
+        for layer in &mut q0rg.layers {
+            layer.explicit_keyframes.clear();
+            layer.placements.clear();
+            if drawable_layer_ids.contains(&layer.layer_id) {
+                layer.ensure_explicit_keyframe(0);
+            }
+        }
+        return Some(old_count - 1);
+    }
+
+    let width = last_frame - first_frame + 1;
+    q0rg.frame_count = old_count - width;
+    for layer in &mut q0rg.layers {
+        let mut shifted = Vec::with_capacity(layer.placements.len());
+        for mut placement in layer.placements.drain(..) {
+            if (first_frame..=last_frame).contains(&placement.frame) {
+                continue;
+            }
+            if placement.frame > last_frame {
+                placement.frame -= width;
+            }
+            placement.tween = match placement.tween {
+                Tween::Linear { to_frame } if (first_frame..=last_frame).contains(&to_frame) => {
+                    Tween::None
+                }
+                Tween::Linear { to_frame } if to_frame > last_frame => Tween::Linear {
+                    to_frame: to_frame - width,
+                },
+                tween => tween,
+            };
+            shifted.push(placement);
+        }
+        layer.placements = shifted;
+
+        layer
+            .explicit_keyframes
+            .retain(|frame| !(first_frame..=last_frame).contains(frame));
+        for frame in &mut layer.explicit_keyframes {
+            if *frame > last_frame {
+                *frame -= width;
+            }
+        }
+        layer.explicit_keyframes.sort_unstable();
+        layer.explicit_keyframes.dedup();
+        if drawable_layer_ids.contains(&layer.layer_id) && !layer.has_keyframe(0) {
+            layer.ensure_explicit_keyframe(0);
+        }
+    }
+    Some(width)
+}
+
 /// Remove source cells for a drag-move without turning every vacated cell into
 /// a blank keyframe. Frame zero is the only exception: a layer cannot inherit
 /// anything from before the timeline, so moving its first key leaves one real
@@ -311,6 +491,18 @@ pub fn paste_frames(
         focus_layer_id: *target_layer_ids.last()?,
         focus_frame: last_frame,
     })
+}
+
+pub fn duplicate_frames(
+    project: &mut ProjectV2,
+    q0rg_id: u16,
+    selection: TimelineSelection,
+) -> Option<TimelineSelection> {
+    let (layer_ids, _, last_frame) = selected_frame_bounds(project, q0rg_id, selection)?;
+    let target_layer_id = *layer_ids.first()?;
+    let target_frame = last_frame.checked_add(1)?;
+    let clipboard = capture_frames(project, q0rg_id, selection)?;
+    paste_frames(project, q0rg_id, target_layer_id, target_frame, &clipboard)
 }
 
 pub fn move_frames(
@@ -652,6 +844,261 @@ mod tests {
         assert!(layer.is_blank_keyframe(0));
         assert_eq!(layer.keyframe_frames(), vec![0, 3]);
         assert!(layer.placements.iter().any(|item| item.frame == 3));
+    }
+
+    #[test]
+    fn duplicate_frames_places_the_complete_range_immediately_after_itself() {
+        let mut project = crate::state::default_project();
+        let q0rg = &mut project.q0rgs[0];
+        q0rg.frame_count = 6;
+        q0rg.layers[0].explicit_keyframes = vec![2];
+        q0rg.layers[0].placements = vec![placement(1, 10.0, Tween::None)];
+        let selection = TimelineSelection {
+            anchor_layer_id: 1,
+            anchor_frame: 1,
+            focus_layer_id: 1,
+            focus_frame: 2,
+        };
+
+        let duplicated = duplicate_frames(&mut project, 1, selection).expect("duplicate frames");
+
+        assert_eq!(duplicated.anchor_frame, 3);
+        assert_eq!(duplicated.focus_frame, 4);
+        let layer = &project.q0rgs[0].layers[0];
+        assert!(layer
+            .placements
+            .iter()
+            .any(|item| item.frame == 3 && item.transform.tx == 10.0));
+        assert!(layer.is_blank_keyframe(4));
+    }
+
+    #[test]
+    fn materializing_a_frame_range_creates_every_key_and_clips_incoming_tween() {
+        let mut project = crate::state::default_project();
+        let q0rg = &mut project.q0rgs[0];
+        q0rg.frame_count = 8;
+        q0rg.layers[0].explicit_keyframes.clear();
+        q0rg.layers[0].placements = vec![
+            placement(0, 0.0, Tween::Linear { to_frame: 6 }),
+            placement(6, 60.0, Tween::None),
+        ];
+        let selection = TimelineSelection {
+            anchor_layer_id: 1,
+            anchor_frame: 2,
+            focus_layer_id: 1,
+            focus_frame: 3,
+        };
+
+        let created = materialize_selected_keyframes(&mut project, 1, selection)
+            .expect("materialize selected range");
+
+        let layer = &project.q0rgs[0].layers[0];
+        assert_eq!(created, 2);
+        assert_eq!(layer.keyframe_frames(), vec![0, 2, 3, 6]);
+        assert!(layer
+            .placements
+            .iter()
+            .any(|item| item.frame == 2 && (item.transform.tx - 20.0).abs() < 0.001));
+        assert!(layer
+            .placements
+            .iter()
+            .any(|item| item.frame == 3 && (item.transform.tx - 30.0).abs() < 0.001));
+        assert_eq!(layer.placements[0].tween, Tween::Linear { to_frame: 2 });
+    }
+
+    #[test]
+    fn removing_selected_keyframes_demotes_range_but_preserves_root_key() {
+        let mut project = crate::state::default_project();
+        let q0rg = &mut project.q0rgs[0];
+        q0rg.frame_count = 8;
+        q0rg.layers[0].explicit_keyframes = vec![4];
+        q0rg.layers[0].placements = vec![
+            placement(0, 0.0, Tween::Linear { to_frame: 3 }),
+            placement(3, 30.0, Tween::None),
+            placement(5, 50.0, Tween::None),
+        ];
+        let selection = TimelineSelection {
+            anchor_layer_id: 1,
+            anchor_frame: 0,
+            focus_layer_id: 1,
+            focus_frame: 4,
+        };
+
+        let removed = remove_selected_keyframes(&mut project, 1, selection)
+            .expect("remove selected keyframes");
+
+        let layer = &project.q0rgs[0].layers[0];
+        assert_eq!(removed, 2);
+        assert_eq!(layer.keyframe_frames(), vec![0, 5]);
+        assert!(layer.has_keyframe(0));
+        assert!(!layer.has_keyframe(3));
+        assert!(!layer.has_keyframe(4));
+        assert_eq!(layer.placements[0].tween, Tween::None);
+    }
+
+    #[test]
+    fn removing_selected_frame_columns_shifts_keys_blanks_and_tween_targets() {
+        let mut project = crate::state::default_project();
+        let q0rg = &mut project.q0rgs[0];
+        q0rg.frame_count = 10;
+        q0rg.layers[0].explicit_keyframes = vec![2, 4, 7];
+        q0rg.layers[0].placements = vec![
+            placement(0, 0.0, Tween::Linear { to_frame: 5 }),
+            placement(4, 40.0, Tween::None),
+            placement(5, 50.0, Tween::None),
+            placement(8, 80.0, Tween::None),
+        ];
+        let selection = TimelineSelection {
+            anchor_layer_id: 1,
+            anchor_frame: 3,
+            focus_layer_id: 1,
+            focus_frame: 4,
+        };
+
+        let removed = remove_selected_frame_columns(&mut project, 1, selection)
+            .expect("remove selected frame columns");
+
+        let q0rg = &project.q0rgs[0];
+        let layer = &q0rg.layers[0];
+        assert_eq!(removed, 2);
+        assert_eq!(q0rg.frame_count, 8);
+        assert_eq!(layer.explicit_keyframes, vec![2, 5]);
+        assert_eq!(layer.placements[0].tween, Tween::Linear { to_frame: 3 });
+        assert!(!layer
+            .placements
+            .iter()
+            .any(|item| item.transform.tx == 40.0));
+        assert!(layer
+            .placements
+            .iter()
+            .any(|item| item.frame == 3 && item.transform.tx == 50.0));
+        assert!(layer
+            .placements
+            .iter()
+            .any(|item| item.frame == 6 && item.transform.tx == 80.0));
+    }
+
+    #[test]
+    fn removing_leading_frame_columns_shifts_every_drawable_layer_and_restores_root_keys() {
+        let mut project = crate::state::default_project();
+        let q0rg = &mut project.q0rgs[0];
+        q0rg.frame_count = 6;
+        q0rg.layers[0].explicit_keyframes.clear();
+        q0rg.layers[0].placements = vec![placement(3, 30.0, Tween::None)];
+        q0rg.layers.push(Layer {
+            layer_id: 2,
+            name: "second".to_string(),
+            explicit_keyframes: vec![4],
+            placements: Vec::new(),
+        });
+        let selection = TimelineSelection {
+            anchor_layer_id: 1,
+            anchor_frame: 0,
+            focus_layer_id: 1,
+            focus_frame: 1,
+        };
+
+        assert_eq!(
+            remove_selected_frame_columns(&mut project, 1, selection),
+            Some(2)
+        );
+
+        let q0rg = &project.q0rgs[0];
+        assert_eq!(q0rg.frame_count, 4);
+        let first = q0rg
+            .layers
+            .iter()
+            .find(|layer| layer.layer_id == 1)
+            .unwrap();
+        let second = q0rg
+            .layers
+            .iter()
+            .find(|layer| layer.layer_id == 2)
+            .unwrap();
+        assert!(first
+            .placements
+            .iter()
+            .any(|item| item.frame == 1 && item.transform.tx == 30.0));
+        assert!(first.has_keyframe(0));
+        assert_eq!(second.explicit_keyframes, vec![0, 2]);
+        assert!(second.is_blank_keyframe(0));
+    }
+
+    #[test]
+    fn removing_the_complete_timeline_keeps_one_blank_root_on_every_drawable_layer() {
+        let mut project = crate::state::default_project();
+        let q0rg = &mut project.q0rgs[0];
+        q0rg.frame_count = 4;
+        q0rg.layers[0].placements = vec![placement(0, 0.0, Tween::None)];
+        q0rg.layers.push(Layer {
+            layer_id: 2,
+            name: "second".to_string(),
+            explicit_keyframes: vec![2],
+            placements: vec![placement(3, 30.0, Tween::None)],
+        });
+        let selection = TimelineSelection {
+            anchor_layer_id: 1,
+            anchor_frame: 0,
+            focus_layer_id: 2,
+            focus_frame: 3,
+        };
+
+        assert_eq!(
+            remove_selected_frame_columns(&mut project, 1, selection),
+            Some(3)
+        );
+
+        let q0rg = &project.q0rgs[0];
+        assert_eq!(q0rg.frame_count, 1);
+        for layer in &q0rg.layers {
+            assert!(layer.placements.is_empty());
+            assert_eq!(layer.explicit_keyframes, vec![0]);
+            assert!(layer.is_blank_keyframe(0));
+        }
+    }
+
+    #[test]
+    fn materializing_a_multi_layer_range_updates_every_selected_drawable_row() {
+        let mut project = crate::state::default_project();
+        let q0rg = &mut project.q0rgs[0];
+        q0rg.frame_count = 5;
+        q0rg.layers[0].placements = vec![placement(0, 10.0, Tween::None)];
+        q0rg.layers.push(Layer {
+            layer_id: 2,
+            name: "second".to_string(),
+            explicit_keyframes: vec![0],
+            placements: Vec::new(),
+        });
+        let selection = TimelineSelection {
+            anchor_layer_id: 1,
+            anchor_frame: 2,
+            focus_layer_id: 2,
+            focus_frame: 3,
+        };
+
+        assert_eq!(
+            materialize_selected_keyframes(&mut project, 1, selection),
+            Some(4)
+        );
+
+        let q0rg = &project.q0rgs[0];
+        for layer in &q0rg.layers {
+            assert!(layer.has_keyframe(2));
+            assert!(layer.has_keyframe(3));
+        }
+        let first = q0rg
+            .layers
+            .iter()
+            .find(|layer| layer.layer_id == 1)
+            .unwrap();
+        assert_eq!(crate::render::active_placements_at(first, 2).len(), 1);
+        let second = q0rg
+            .layers
+            .iter()
+            .find(|layer| layer.layer_id == 2)
+            .unwrap();
+        assert!(second.is_blank_keyframe(2));
+        assert!(second.is_blank_keyframe(3));
     }
 
     #[test]

@@ -483,7 +483,9 @@ pub fn handle_global_shortcuts(app: &mut EditorApp, ctx: &egui::Context) {
         } else if i.consume_key(Modifiers::NONE, Key::F5) {
             app.queue(Action::InsertFrame);
         }
-        if i.consume_key(Modifiers::NONE, Key::F6) {
+        if i.consume_key(Modifiers::SHIFT, Key::F6) {
+            app.queue(Action::ClearKeyframe);
+        } else if i.consume_key(Modifiers::NONE, Key::F6) {
             app.queue(Action::InsertKeyframe);
         }
         if i.consume_key(Modifiers::NONE, Key::F7) {

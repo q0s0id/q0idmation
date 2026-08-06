@@ -770,14 +770,22 @@ impl EditorApp {
                 self.insert_frame_smart();
             }
             Action::InsertKeyframe => {
-                if self.current_layer_is_folder() {
+                if self.session.pending_timeline_frame.is_none()
+                    && self.timeline_selection_is_multi()
+                {
+                    self.materialize_timeline_selection();
+                } else if self.current_layer_is_folder() {
                     self.session.status = "folders cannot contain keyframes".to_string();
                 } else {
                     self.insert_keyframe_smart();
                 }
             }
             Action::InsertBlankKeyframe => {
-                if self.current_layer_is_folder() {
+                if self.session.pending_timeline_frame.is_none()
+                    && self.timeline_selection_is_multi()
+                {
+                    self.blank_timeline_selection();
+                } else if self.current_layer_is_folder() {
                     self.session.status = "folders cannot contain keyframes".to_string();
                 } else {
                     self.insert_blank_keyframe_smart();
@@ -1434,30 +1442,86 @@ impl EditorApp {
                 }
             }
             Action::DuplicateSelection => {
-                if self.current_layer_is_folder() {
-                    self.session.status = "folders cannot contain artwork".to_string();
+                if self.session.pending_timeline_frame.is_some()
+                    && self.session.timeline_selection.is_some()
+                {
+                    self.session.status =
+                        "future frame is not created; press F5, F6, or F7 first".to_string();
                     return;
                 }
-                let payload = crate::selection_edit::capture_clipboard(
-                    &self.state.project,
-                    &self.session.selection,
-                );
-                if payload.is_empty() {
-                    self.session.status = "nothing to duplicate".to_string();
-                } else {
-                    self.history.snapshot(&self.state.project);
-                    let result = crate::selection_edit::paste_payload(
+                if let Some(selection) = self.session.timeline_selection {
+                    let before = self.state.project.clone();
+                    if let Some(duplicated) = crate::timeline_edit::duplicate_frames(
+                        &mut self.state.project,
+                        self.session.current_q0rg_id,
+                        selection,
+                    ) {
+                        self.history.snapshot(&before);
+                        self.session.timeline_selection = Some(duplicated);
+                        self.session.timeline_layer_selection = None;
+                        self.session.selection = Selection::None;
+                        self.session.current_layer_id = duplicated.anchor_layer_id;
+                        self.session.current_frame = duplicated.anchor_frame;
+                        self.state.dirty = true;
+                        self.textures.invalidate();
+                        self.session.status = "duplicated frames".to_string();
+                    } else {
+                        self.session.status = "could not duplicate frames".to_string();
+                    }
+                } else if let Some(selection) = self.session.timeline_layer_selection {
+                    let Some(layers) = crate::timeline_edit::capture_layers(
+                        &self.state.project,
+                        self.session.current_q0rg_id,
+                        selection,
+                    ) else {
+                        self.session.status = "nothing to duplicate".to_string();
+                        return;
+                    };
+                    let before = self.state.project.clone();
+                    if let Some(duplicated) = crate::timeline_edit::paste_layers(
                         &mut self.state.project,
                         self.session.current_q0rg_id,
                         self.session.current_layer_id,
-                        self.session.current_frame,
-                        &payload,
-                        q0s_format::v2::Vec2::new(10.0, 10.0),
+                        &layers,
+                    ) {
+                        self.history.snapshot(&before);
+                        self.session.timeline_layer_selection = Some(duplicated);
+                        self.session.timeline_selection = None;
+                        self.session.selection = Selection::None;
+                        self.session.current_layer_id = duplicated.anchor_layer_id;
+                        self.state.dirty = true;
+                        self.textures.invalidate();
+                        self.session.status = "duplicated layers".to_string();
+                    } else {
+                        self.session.status = "could not duplicate layers".to_string();
+                    }
+                } else {
+                    if self.current_layer_is_folder() {
+                        self.session.status = "folders cannot contain artwork".to_string();
+                        return;
+                    }
+                    let payload = crate::selection_edit::capture_clipboard(
+                        &self.state.project,
+                        &self.session.selection,
                     );
-                    self.session.selection = crate::selection_edit::selection_from_paste(result);
-                    self.state.dirty = true;
-                    self.textures.invalidate();
-                    self.session.status = "duplicated".to_string();
+                    if payload.is_empty() {
+                        self.session.status = "nothing to duplicate".to_string();
+                    } else {
+                        self.history.snapshot(&self.state.project);
+                        let result = crate::selection_edit::paste_payload(
+                            &mut self.state.project,
+                            self.session.current_q0rg_id,
+                            self.session.current_layer_id,
+                            self.session.current_frame,
+                            &payload,
+                            q0s_format::v2::Vec2::new(10.0, 10.0),
+                        );
+                        self.session.selection =
+                            crate::selection_edit::selection_from_paste(result);
+                        self.state.dirty = true;
+                        self.textures.invalidate();
+                        self.session.status = "duplicated".to_string();
+                    }
                 }
             }
             Action::BringToFront => {
@@ -4070,6 +4134,59 @@ impl EditorApp {
         }
     }
 
+    fn timeline_selection_is_multi(&self) -> bool {
+        self.session.timeline_selection.is_some_and(|selection| {
+            selection.anchor_layer_id != selection.focus_layer_id
+                || selection.anchor_frame != selection.focus_frame
+        })
+    }
+
+    fn materialize_timeline_selection(&mut self) {
+        let Some(selection) = self.session.timeline_selection else {
+            return;
+        };
+        let before = self.state.project.clone();
+        match crate::timeline_edit::materialize_selected_keyframes(
+            &mut self.state.project,
+            self.session.current_q0rg_id,
+            selection,
+        ) {
+            Some(created) if created > 0 => {
+                self.history.snapshot(&before);
+                self.state.dirty = true;
+                self.session.selection = Selection::None;
+                self.textures.invalidate();
+                self.session.status = format!("inserted {created} selected keyframe(s)");
+            }
+            Some(_) => {
+                self.session.status = "selected timeline cells are already keyframes".to_string();
+            }
+            None => {
+                self.session.status = "could not insert selected keyframes".to_string();
+            }
+        }
+    }
+
+    fn blank_timeline_selection(&mut self) {
+        match self.delete_timeline_selection() {
+            Some((cell_count, _, false)) => {
+                self.session.status =
+                    format!("{cell_count} selected timeline frame(s) already blank");
+            }
+            Some((cell_count, removed_items, true)) if removed_items > 0 => {
+                self.session.status = format!(
+                    "inserted {cell_count} blank keyframe(s), removed {removed_items} item(s)"
+                );
+            }
+            Some((cell_count, _, true)) => {
+                self.session.status = format!("inserted {cell_count} blank keyframe(s)");
+            }
+            None => {
+                self.session.status = "could not insert selected blank keyframes".to_string();
+            }
+        }
+    }
+
     /// F5 / Insert Frame. A click in the virtual tail chooses an exact future
     /// destination; F5 then grows the q0rg through every intervening frame.
     /// Without a virtual destination, preserve the classic one-step behaviour.
@@ -4384,6 +4501,17 @@ impl EditorApp {
                 q0rg.frame_count = frame.saturating_add(1);
             }
             if let Some(layer) = q0rg.layers.iter_mut().find(|l| l.layer_id == layer_id) {
+                for (idx, _) in &insertions {
+                    if let Some(source) = layer.placements.get_mut(*idx) {
+                        if matches!(
+                            source.tween,
+                            Tween::Linear { to_frame }
+                                if source.frame < frame && frame <= to_frame
+                        ) {
+                            source.tween = Tween::Linear { to_frame: frame };
+                        }
+                    }
+                }
                 for (idx, placement) in insertions.iter().rev() {
                     let insert_at = idx.saturating_add(1).min(layer.placements.len());
                     layer.placements.insert(insert_at, placement.clone());
@@ -4397,89 +4525,88 @@ impl EditorApp {
         new_count
     }
 
-    /// Clear every object from the current layer/frame while keeping a real
-    /// blank keyframe there. This also works on a held frame by inserting the
-    /// blank key that stops the previous contents.
+    /// Demote selected keyframes back to ordinary held frames. This is distinct
+    /// from Delete, which clears contents and intentionally leaves blank keys.
     fn clear_keyframe(&mut self) {
         if self.session.pending_timeline_frame.is_some() {
             self.session.status =
                 "future frame is not created; press F5, F6, or F7 first".to_string();
             return;
         }
-        self.session.timeline_selection = Some(crate::state::TimelineSelection::single(
-            self.session.current_layer_id,
-            self.session.current_frame,
-        ));
-        match self.delete_timeline_selection() {
-            Some((_, _, false)) => {
-                self.session.status = format!(
-                    "frame {} is already a blank keyframe",
-                    self.session.current_frame + 1
-                );
+        let selection = self.session.timeline_selection.unwrap_or_else(|| {
+            TimelineSelection::single(self.session.current_layer_id, self.session.current_frame)
+        });
+        let before = self.state.project.clone();
+        match crate::timeline_edit::remove_selected_keyframes(
+            &mut self.state.project,
+            self.session.current_q0rg_id,
+            selection,
+        ) {
+            Some(removed) if removed > 0 => {
+                self.history.snapshot(&before);
+                self.state.dirty = true;
+                self.session.selection = Selection::None;
+                self.textures.invalidate();
+                self.session.status = format!("cleared {removed} keyframe(s)");
             }
-            Some((_, removed, true)) if removed > 0 => {
-                self.session.status = format!(
-                    "cleared frame {} ({removed} item(s))",
-                    self.session.current_frame + 1
-                );
-            }
-            Some((_, _, true)) => {
-                self.session.status = format!("cleared frame {}", self.session.current_frame + 1);
+            Some(_) => {
+                self.session.status =
+                    "no removable keyframes selected; frame 1 must remain a keyframe".to_string();
             }
             None => {
-                self.session.status = "clear keyframe: current layer not found".to_string();
+                self.session.status = "clear keyframe: selection not found".to_string();
             }
         }
     }
 
-    /// Decrease frame_count by 1 if possible. All placements / tweens beyond
-    /// the new boundary are clipped: placements past it are removed; tweens
-    /// that pointed past it become Tween::None.
+    /// Remove the selected columns of time from the whole q0rg. Everything to
+    /// the right shifts left, including blank keys and tween destinations.
     fn remove_frame(&mut self) {
         if self.session.pending_timeline_frame.is_some() {
             self.session.status =
                 "future frame is not created; press F5, F6, or F7 first".to_string();
             return;
         }
-        let q0rg_id = self.session.current_q0rg_id;
-        let new_total = match self
-            .state
-            .project
-            .q0rgs
-            .iter()
-            .find(|q| q.q0rg_id == q0rg_id)
-            .map(|q| q.frame_count)
-        {
-            Some(n) if n > 1 => n - 1,
-            _ => {
-                self.session.status = "can't remove frame from a 1-frame q0rg".to_string();
-                return;
+        let selection = self.session.timeline_selection.unwrap_or_else(|| {
+            TimelineSelection::single(self.session.current_layer_id, self.session.current_frame)
+        });
+        let first_frame = selection.anchor_frame.min(selection.focus_frame);
+        let anchor_layer = selection.anchor_layer_id;
+        let before = self.state.project.clone();
+        match crate::timeline_edit::remove_selected_frame_columns(
+            &mut self.state.project,
+            self.session.current_q0rg_id,
+            selection,
+        ) {
+            Some(removed) if removed > 0 => {
+                self.history.snapshot(&before);
+                let new_count = self
+                    .state
+                    .project
+                    .q0rgs
+                    .iter()
+                    .find(|q0rg| q0rg.q0rg_id == self.session.current_q0rg_id)
+                    .map(|q0rg| q0rg.frame_count)
+                    .unwrap_or(1)
+                    .max(1);
+                self.session.current_layer_id = anchor_layer;
+                self.session.current_frame = first_frame.min(new_count - 1);
+                self.session.pending_timeline_frame = None;
+                self.session.timeline_selection = Some(TimelineSelection::single(
+                    anchor_layer,
+                    self.session.current_frame,
+                ));
+                self.session.selection = Selection::None;
+                self.state.dirty = true;
+                self.textures.invalidate();
+                self.session.status = format!("removed {removed} frame(s), {new_count} total");
             }
-        };
-
-        self.history.snapshot(&self.state.project);
-        if let Some(q) = self
-            .state
-            .project
-            .q0rgs
-            .iter_mut()
-            .find(|q| q.q0rg_id == q0rg_id)
-        {
-            q.frame_count = new_total;
-            for layer in &mut q.layers {
-                layer.explicit_keyframes.retain(|frame| *frame < new_total);
-                layer.placements.retain(|p| p.frame < new_total);
-                for p in &mut layer.placements {
-                    if let Tween::Linear { to_frame } = p.tween {
-                        if to_frame >= new_total {
-                            p.tween = Tween::None;
-                        }
-                    }
-                }
+            Some(_) => {
+                self.session.status = "can't remove the only timeline frame".to_string();
             }
-            self.state.dirty = true;
-            self.session.current_frame = self.session.current_frame.min(new_total - 1);
-            self.session.status = format!("frame removed, {new_total} total");
+            None => {
+                self.session.status = "remove frames: selection not found".to_string();
+            }
         }
     }
 
@@ -6519,16 +6646,17 @@ mod tests {
     }
 
     #[test]
-    fn clear_keyframe_turns_a_held_frame_into_a_blank_key() {
+    fn clear_keyframe_on_a_held_frame_is_a_noop() {
         let mut app = app_with_one_timeline_object(12);
         app.session.current_frame = 5;
 
         app.handle(&Context::default(), Action::ClearKeyframe);
 
         let layer = &app.state.project.q0rgs[0].layers[0];
-        assert!(layer.is_blank_keyframe(5));
-        assert_eq!(crate::render::active_placements_at(layer, 4).len(), 1);
-        assert!(crate::render::active_placements_at(layer, 5).is_empty());
+        assert!(!layer.has_keyframe(5));
+        assert_eq!(crate::render::active_placements_at(layer, 5).len(), 1);
+        assert!(!app.state.dirty);
+        assert!(!app.history.can_undo());
     }
 
     #[test]
@@ -6617,6 +6745,185 @@ mod tests {
         let layer = &app.state.project.q0rgs[0].layers[0];
         assert!(layer.is_blank_keyframe(5));
         assert!(matches!(layer.placements[0].tween, Tween::None));
+    }
+
+    #[test]
+    fn duplicate_timeline_range_places_a_selected_copy_after_the_source() {
+        let mut app = app_with_one_timeline_object(6);
+        let layer_id = app.session.current_layer_id;
+        app.state.project.q0rgs[0].layers[0]
+            .explicit_keyframes
+            .push(2);
+        app.session.timeline_selection = Some(TimelineSelection {
+            anchor_layer_id: layer_id,
+            anchor_frame: 1,
+            focus_layer_id: layer_id,
+            focus_frame: 2,
+        });
+
+        app.handle(&Context::default(), Action::DuplicateSelection);
+
+        let selection = app
+            .session
+            .timeline_selection
+            .expect("duplicated selection");
+        assert_eq!((selection.anchor_frame, selection.focus_frame), (3, 4));
+        let layer = &app.state.project.q0rgs[0].layers[0];
+        assert!(layer.has_keyframe(3));
+        assert!(layer.is_blank_keyframe(4));
+        assert!(app.history.can_undo());
+    }
+
+    #[test]
+    fn f6_inside_a_tween_retargets_the_incoming_tween_to_the_new_key() {
+        let mut app = app_with_one_timeline_object(8);
+        app.state.project.q0rgs[0].layers[0].placements[0].tween = Tween::Linear { to_frame: 6 };
+        app.state.project.q0rgs[0].layers[0]
+            .placements
+            .push(Placement {
+                frame: 6,
+                target: Target::Asset(77),
+                transform: Transform2D {
+                    tx: 60.0,
+                    ..Transform2D::IDENTITY
+                },
+                tween: Tween::None,
+            });
+        app.session.current_frame = 3;
+
+        app.handle(&Context::default(), Action::InsertKeyframe);
+
+        let layer = &app.state.project.q0rgs[0].layers[0];
+        assert_eq!(layer.placements[0].tween, Tween::Linear { to_frame: 3 });
+        assert!(layer.has_keyframe(3));
+    }
+
+    #[test]
+    fn f6_materializes_every_cell_in_a_multi_frame_selection() {
+        let mut app = app_with_one_timeline_object(8);
+        let layer_id = app.session.current_layer_id;
+        app.session.current_frame = 3;
+        app.session.timeline_selection = Some(TimelineSelection {
+            anchor_layer_id: layer_id,
+            anchor_frame: 2,
+            focus_layer_id: layer_id,
+            focus_frame: 3,
+        });
+
+        app.handle(&Context::default(), Action::InsertKeyframe);
+
+        let layer = &app.state.project.q0rgs[0].layers[0];
+        assert!(layer.has_keyframe(2));
+        assert!(layer.has_keyframe(3));
+    }
+
+    #[test]
+    fn f7_blanks_every_cell_in_a_multi_frame_selection() {
+        let mut app = app_with_one_timeline_object(8);
+        let layer_id = app.session.current_layer_id;
+        app.session.current_frame = 3;
+        app.session.timeline_selection = Some(TimelineSelection {
+            anchor_layer_id: layer_id,
+            anchor_frame: 2,
+            focus_layer_id: layer_id,
+            focus_frame: 3,
+        });
+
+        app.handle(&Context::default(), Action::InsertBlankKeyframe);
+
+        let layer = &app.state.project.q0rgs[0].layers[0];
+        assert!(layer.is_blank_keyframe(2));
+        assert!(layer.is_blank_keyframe(3));
+        assert!(crate::render::active_placements_at(layer, 2).is_empty());
+        assert!(crate::render::active_placements_at(layer, 3).is_empty());
+    }
+
+    #[test]
+    fn clear_keyframe_demotes_selected_keys_but_never_the_root_key() {
+        let mut app = app_with_one_timeline_object(8);
+        let layer_id = app.session.current_layer_id;
+        app.state.project.q0rgs[0].layers[0]
+            .explicit_keyframes
+            .push(4);
+        app.state.project.q0rgs[0].layers[0]
+            .placements
+            .push(Placement {
+                frame: 3,
+                target: Target::Asset(77),
+                transform: Transform2D {
+                    tx: 30.0,
+                    ..Transform2D::IDENTITY
+                },
+                tween: Tween::None,
+            });
+        app.session.current_frame = 4;
+        app.session.timeline_selection = Some(TimelineSelection {
+            anchor_layer_id: layer_id,
+            anchor_frame: 0,
+            focus_layer_id: layer_id,
+            focus_frame: 4,
+        });
+
+        app.handle(&Context::default(), Action::ClearKeyframe);
+
+        let layer = &app.state.project.q0rgs[0].layers[0];
+        assert!(layer.has_keyframe(0));
+        assert!(!layer.has_keyframe(3));
+        assert!(!layer.has_keyframe(4));
+        assert_eq!(crate::render::active_placements_at(layer, 4).len(), 1);
+    }
+
+    #[test]
+    fn remove_frame_cuts_the_selected_time_range_instead_of_only_the_tail() {
+        let mut app = app_with_one_timeline_object(10);
+        let layer_id = app.session.current_layer_id;
+        app.state.project.q0rgs[0].layers[0]
+            .placements
+            .push(Placement {
+                frame: 7,
+                target: Target::Asset(77),
+                transform: Transform2D {
+                    tx: 70.0,
+                    ..Transform2D::IDENTITY
+                },
+                tween: Tween::None,
+            });
+        app.session.current_frame = 4;
+        app.session.timeline_selection = Some(TimelineSelection {
+            anchor_layer_id: layer_id,
+            anchor_frame: 3,
+            focus_layer_id: layer_id,
+            focus_frame: 4,
+        });
+
+        app.handle(&Context::default(), Action::RemoveFrame);
+
+        let q0rg = &app.state.project.q0rgs[0];
+        assert_eq!(q0rg.frame_count, 8);
+        assert!(q0rg.layers[0]
+            .placements
+            .iter()
+            .any(|placement| placement.frame == 5 && placement.transform.tx == 70.0));
+        assert_eq!(app.session.current_frame, 3);
+    }
+
+    #[test]
+    fn removing_a_frame_range_is_undoable_as_one_operation() {
+        let mut app = app_with_one_timeline_object(8);
+        let before = app.state.project.clone();
+        let layer_id = app.session.current_layer_id;
+        app.session.timeline_selection = Some(TimelineSelection {
+            anchor_layer_id: layer_id,
+            anchor_frame: 2,
+            focus_layer_id: layer_id,
+            focus_frame: 4,
+        });
+
+        app.handle(&Context::default(), Action::RemoveFrame);
+        assert_ne!(app.state.project, before);
+        app.handle(&Context::default(), Action::Undo);
+
+        assert_eq!(app.state.project, before);
     }
 
     #[test]

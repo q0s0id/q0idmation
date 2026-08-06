@@ -1044,11 +1044,11 @@ fn timeline_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
         app.queue(Action::InsertBlankKeyframe);
         ui.close_menu();
     }
-    if ui.button("Clear Keyframe").clicked() {
+    if ui.button("Clear Keyframe(s)  (Shift+F6)").clicked() {
         app.queue(Action::ClearKeyframe);
         ui.close_menu();
     }
-    if ui.button("Remove Frame  (Shift+F5)").clicked() {
+    if ui.button("Remove Selected Frame(s)  (Shift+F5)").clicked() {
         app.queue(Action::RemoveFrame);
         ui.close_menu();
     }
@@ -1192,10 +1192,11 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
             {
                 app.queue(Action::InsertFrame);
             }
-            let keyframes_enabled = !app
-                .state
-                .project
-                .layer_is_folder(app.session.current_q0rg_id, app.session.current_layer_id);
+            let keyframes_enabled = app.session.timeline_selection.is_some()
+                || !app
+                    .state
+                    .project
+                    .layer_is_folder(app.session.current_q0rg_id, app.session.current_layer_id);
             if ui
                 .add_enabled(keyframes_enabled, egui::Button::new("+ Keyframe"))
                 .on_hover_text("Insert keyframe (F6)")
@@ -1212,7 +1213,7 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
             }
             if ui
                 .button("- Frame")
-                .on_hover_text("Remove frame from end (Shift+F5)")
+                .on_hover_text("Remove selected frame(s) and close the time gap (Shift+F5)")
                 .clicked()
             {
                 app.queue(Action::RemoveFrame);
