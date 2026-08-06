@@ -1,6 +1,6 @@
-# Q0S
+# q0idmation
 
-Q0S is an experimental 2D animation toolkit written in Rust. The first beta
+q0idmation is a free and open-source 2D animation toolkit written in Rust. The first beta
 ships two Windows applications:
 
 - `q0editor` creates and edits `.q1s` projects and exports `.q0s` movies.
@@ -77,3 +77,8 @@ Before sharing the beta, follow the compact [10-minute beta test](BETA_TEST.md).
   the Build ID and installer SHA256.
 
 Language documentation lives in [docs/q0lang/README.md](docs/q0lang/README.md).
+
+## License
+
+q0idmation is free software licensed under the GNU General Public License v3.0
+or later (`GPL-3.0-or-later`). See [LICENSE](LICENSE).

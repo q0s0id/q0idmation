@@ -11,7 +11,7 @@ SetCompressor /SOLID lzma
 
 !include "version.nsh"
 !define APP_NAME      "q0player"
-!define APP_PUBLISHER "q0s"
+!define APP_PUBLISHER "q0idmation"
 !define APP_EXE       "q0player.exe"
 !define Q0S_PROG_ID       "q0player.Movie"
 !define Q0S_PROG_FRIENDLY "q0s Movie"
@@ -21,24 +21,24 @@ SetCompressor /SOLID lzma
 !define Q0V_EXT           ".q0v"
 !define PREVIOUS_PROG_ID_VALUE "PreviousDefaultProgId"
 !define UNINST_KEY    "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}"
-!define APP_REG_KEY   "Software\q0s\${APP_NAME}"
+!define APP_REG_KEY   "Software\q0idmation\${APP_NAME}"
 
 Name "${APP_NAME} ${APP_VERSION}"
 !ifndef OUTPUT_FILE
   !define OUTPUT_FILE "dist\q0player-${APP_VERSION}-windows-x64-setup.exe"
 !endif
 OutFile "${OUTPUT_FILE}"
-InstallDir "$LOCALAPPDATA\Programs\q0s\${APP_NAME}"
+InstallDir "$LOCALAPPDATA\Programs\q0idmation\${APP_NAME}"
 InstallDirRegKey HKCU "${APP_REG_KEY}" "InstallDir"
 RequestExecutionLevel user
 ShowInstDetails show
 ShowUninstDetails show
-BrandingText "q0s :: black & red"
+BrandingText "q0idmation :: black & red"
 
 VIProductVersion "${APP_VERSION_NUMERIC}"
 VIAddVersionKey "ProductName"     "${APP_NAME}"
 VIAddVersionKey "ProductVersion"  "${APP_VERSION}"
-VIAddVersionKey "FileDescription" "q0s movie player installer"
+VIAddVersionKey "FileDescription" "q0player installer for q0idmation"
 VIAddVersionKey "FileVersion"     "${APP_VERSION}"
 VIAddVersionKey "CompanyName"     "${APP_PUBLISHER}"
 VIAddVersionKey "LegalCopyright"  "(C) 2026 q0s"
@@ -256,7 +256,7 @@ q0player_uninstall_q0v_done:
   Delete "$INSTDIR\LICENSE.txt"
   Delete "$INSTDIR\Uninstall.exe"
   RMDir  "$INSTDIR"
-  RMDir  "$LOCALAPPDATA\Programs\q0s"
+  RMDir  "$LOCALAPPDATA\Programs\q0idmation"
 
   Delete "$SMPROGRAMS\q0s\${APP_NAME}.lnk"
   RMDir  "$SMPROGRAMS\q0s"
@@ -264,7 +264,7 @@ q0player_uninstall_q0v_done:
 
   DeleteRegKey HKCU "${UNINST_KEY}"
   DeleteRegKey HKCU "${APP_REG_KEY}"
-  DeleteRegKey /ifempty HKCU "Software\q0s"
+  DeleteRegKey /ifempty HKCU "Software\q0idmation"
 
   System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, i 0, i 0)'
 SectionEnd

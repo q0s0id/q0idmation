@@ -16,36 +16,66 @@ $AttemptDir = $null
 $AttemptFiles = @()
 $Failure = $null
 
-function Have-Cmd($cmd) {
-    return [bool](Get-Command $cmd -ErrorAction SilentlyContinue)
-}
-
-function Ensure-Tool {
+function Find-Tool {
     param(
         [string]$Name,
-        [string]$Cmd,
         [string]$InstallHint,
-        [string[]]$ExtraSearchPaths = @()
+        [string[]]$FallbackPaths = @()
     )
 
-    if (Have-Cmd $Cmd) {
-        Write-Host "[ok] $Name found" -ForegroundColor DarkGreen
-        return
+    $command = Get-Command $Name -ErrorAction SilentlyContinue
+    if ($command) {
+        return $command.Source
     }
 
-    # Fallback: a tool may be installed but not listed in PATH (NSIS often is).
-    foreach ($candidate in $ExtraSearchPaths) {
-        if (Test-Path -LiteralPath $candidate) {
-            $toolDir = Split-Path -Parent $candidate
-            $env:Path = "$toolDir;$env:Path"
-            if (Have-Cmd $Cmd) {
-                Write-Host "[ok] $Name found at $candidate" -ForegroundColor DarkGreen
-                return
-            }
+    foreach ($candidate in $FallbackPaths) {
+        if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            return $candidate
+        }
+    }
+
+    $searchPatterns = @(
+        "$env:USERPROFILE\.rustup\toolchains\*\bin\$Name.exe",
+        "$env:USERPROFILE\.codex\*\toolchains\*\bin\$Name.exe",
+        "$env:USERPROFILE\.codex\*\bin\$Name.exe"
+    )
+    foreach ($pattern in $searchPatterns) {
+        $match = Get-ChildItem -Path $pattern -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+        if ($match) {
+            return $match.FullName
         }
     }
 
     throw "$Name is not installed. $InstallHint"
+}
+
+function Invoke-CheckedText {
+    param(
+        [string]$Program,
+        [string[]]$Arguments,
+        [string]$Label
+    )
+
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $output = & $Program @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+
+    if ($exitCode -ne 0) {
+        $details = (($output | Out-String).Trim())
+        if ($details) {
+            throw "$Label failed with exit code ${exitCode}: $details"
+        }
+        throw "$Label failed with exit code $exitCode"
+    }
+
+    return (($output | Out-String).Trim())
 }
 
 function Step($message) {
@@ -79,24 +109,51 @@ try {
     # -------- 0. Tools and release identity --------
 
     Step "Checking tools"
-    Ensure-Tool -Name "Python" -Cmd "python" `
-        -InstallHint "Install Python 3.10+ from https://www.python.org/downloads/."
-    Ensure-Tool -Name "Cargo" -Cmd "cargo" `
-        -InstallHint "Install Rust via https://rustup.rs/." `
-        -ExtraSearchPaths @("$env:USERPROFILE\.cargo\bin\cargo.exe")
-    Ensure-Tool -Name "Rust compiler" -Cmd "rustc" `
-        -InstallHint "Install Rust via https://rustup.rs/." `
-        -ExtraSearchPaths @("$env:USERPROFILE\.cargo\bin\rustc.exe")
-    Ensure-Tool -Name "NSIS" -Cmd "makensis" `
+    $Python = Find-Tool -Name "python" `
+        -InstallHint "Install Python 3.10+ from https://www.python.org/downloads/." `
+        -FallbackPaths @("C:\Python310\python.exe", "$env:LOCALAPPDATA\Programs\Python\Python310\python.exe")
+    $Cargo = Find-Tool -Name "cargo" `
+        -InstallHint "Install the stable Rust toolchain from https://rustup.rs/." `
+        -FallbackPaths @("$env:USERPROFILE\.cargo\bin\cargo.exe")
+    $Rustc = Find-Tool -Name "rustc" `
+        -InstallHint "Install the stable Rust toolchain from https://rustup.rs/." `
+        -FallbackPaths @("$env:USERPROFILE\.cargo\bin\rustc.exe")
+    $CargoFmt = Find-Tool -Name "cargo-fmt" `
+        -InstallHint "Install the rustfmt component with rustup component add rustfmt." `
+        -FallbackPaths @("$env:USERPROFILE\.cargo\bin\cargo-fmt.exe")
+    $CargoClippy = Find-Tool -Name "cargo-clippy" `
+        -InstallHint "Install the clippy component with rustup component add clippy." `
+        -FallbackPaths @("$env:USERPROFILE\.cargo\bin\cargo-clippy.exe")
+    $MakeNsis = Find-Tool -Name "makensis" `
         -InstallHint "Install NSIS 3.x from https://nsis.sourceforge.io/Download." `
-        -ExtraSearchPaths @(
+        -FallbackPaths @(
             "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
             "$env:ProgramFiles\NSIS\makensis.exe"
         )
+    $Git = Find-Tool -Name "git" `
+        -InstallHint "Install Git for Windows from https://git-scm.com/download/win."
+
+    $toolDirs = @(
+        (Split-Path -Parent $Cargo),
+        (Split-Path -Parent $Rustc),
+        (Split-Path -Parent $CargoFmt),
+        (Split-Path -Parent $CargoClippy),
+        (Split-Path -Parent $MakeNsis),
+        (Split-Path -Parent $Git)
+    ) | Select-Object -Unique
+    $env:Path = (($toolDirs + @($env:Path)) -join [IO.Path]::PathSeparator)
+
+    Write-Host "[ok] Python: $Python" -ForegroundColor DarkGreen
+    Write-Host "[ok] Cargo: $Cargo" -ForegroundColor DarkGreen
+    Write-Host "[ok] Rust compiler: $Rustc" -ForegroundColor DarkGreen
+    Write-Host "[ok] rustfmt: $CargoFmt" -ForegroundColor DarkGreen
+    Write-Host "[ok] Clippy: $CargoClippy" -ForegroundColor DarkGreen
+    Write-Host "[ok] NSIS: $MakeNsis" -ForegroundColor DarkGreen
+    Write-Host "[ok] Git: $Git" -ForegroundColor DarkGreen
 
     Push-Location $WorkspaceDir
     try {
-        $metadataJson = & cargo metadata --no-deps --format-version 1
+        $metadataJson = & $Cargo metadata --no-deps --format-version 1
         if ($LASTEXITCODE -ne 0) {
             throw "cargo metadata exited with $LASTEXITCODE"
         }
@@ -135,11 +192,11 @@ try {
     $NumericVersion = "{0}.{1}.{2}.0" -f $numericParts[0], $numericParts[1], $numericParts[2]
     $ArtifactVersion = $BetaVersion -replace '[^0-9A-Za-z.-]', '_'
 
-    $RustVersion = ((& rustc --version) | Out-String).Trim()
+    $RustVersion = ((& $Rustc --version) | Out-String).Trim()
     if ($LASTEXITCODE -ne 0) { throw "rustc --version failed" }
-    $CargoVersion = ((& cargo --version) | Out-String).Trim()
+    $CargoVersion = ((& $Cargo --version) | Out-String).Trim()
     if ($LASTEXITCODE -ne 0) { throw "cargo --version failed" }
-    $RustVerbose = @(& rustc -vV)
+    $RustVerbose = @(& $Rustc -vV)
     if ($LASTEXITCODE -ne 0) { throw "rustc -vV failed" }
     $RustHostLine = @($RustVerbose | Where-Object { $_ -like "host: *" }) | Select-Object -First 1
     if (-not $RustHostLine) { throw "rustc -vV did not report a host triple" }
@@ -147,8 +204,49 @@ try {
     if ($RustHostTriple -ne "x86_64-pc-windows-msvc") {
         throw "this packaging script produces Windows x64 artifacts; Rust host is $RustHostTriple"
     }
-    $NsisVersion = ((& makensis /VERSION) | Out-String).Trim()
+    $NsisVersion = ((& $MakeNsis /VERSION) | Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or -not $NsisVersion) { throw "makensis /VERSION failed" }
+
+    Step "Checking Git release identity"
+    Push-Location $WorkspaceDir
+    try {
+        $GitRoot = Invoke-CheckedText -Program $Git -Arguments @("rev-parse", "--show-toplevel") -Label "git root lookup"
+        if ((Resolve-Path -LiteralPath $GitRoot).Path -ne (Resolve-Path -LiteralPath $WorkspaceDir).Path) {
+            throw "workspace is not the Git repository root: $GitRoot"
+        }
+
+        $GitStatus = Invoke-CheckedText -Program $Git -Arguments @("status", "--porcelain=v1", "--untracked-files=normal") -Label "git status"
+        if ($GitStatus) {
+            throw "publication builds require a clean Git working tree. Commit or remove these changes:`n$GitStatus"
+        }
+
+        $GitCommit = Invoke-CheckedText -Program $Git -Arguments @("rev-parse", "HEAD") -Label "git commit lookup"
+        $GitShortCommit = Invoke-CheckedText -Program $Git -Arguments @("rev-parse", "--short=12", "HEAD") -Label "short git commit lookup"
+        $GitBranch = Invoke-CheckedText -Program $Git -Arguments @("branch", "--show-current") -Label "git branch lookup"
+        if (-not $GitBranch) {
+            throw "publication builds require a named branch; detached HEAD is not allowed"
+        }
+
+        $GitUpstream = Invoke-CheckedText -Program $Git -Arguments @("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}") -Label "git upstream lookup"
+        $GitUpstreamCommit = Invoke-CheckedText -Program $Git -Arguments @("rev-parse", "@{u}") -Label "git upstream commit lookup"
+        if ($GitUpstreamCommit -ne $GitCommit) {
+            throw "local HEAD $GitCommit is not the pushed upstream commit $GitUpstreamCommit"
+        }
+
+        $GitRemote = Invoke-CheckedText -Program $Git -Arguments @("remote", "get-url", "origin") -Label "origin URL lookup"
+        $RemoteHeadLine = Invoke-CheckedText -Program $Git -Arguments @("ls-remote", "--exit-code", "origin", "refs/heads/$GitBranch") -Label "remote branch lookup"
+        $GitRemoteCommit = ([regex]::Split($RemoteHeadLine.Trim(), "\s+") | Select-Object -First 1)
+        if ($GitRemoteCommit -ne $GitCommit) {
+            throw "origin/$GitBranch is $GitRemoteCommit, but local HEAD is $GitCommit"
+        }
+
+        $GitTagsText = Invoke-CheckedText -Program $Git -Arguments @("tag", "--points-at", "HEAD") -Label "git tag lookup"
+        $GitTags = @($GitTagsText -split "`r?`n" | Where-Object { $_ }) -join ", "
+        if (-not $GitTags) { $GitTags = "(none)" }
+    } finally {
+        Pop-Location
+    }
+
 
     $BuildUtc = [DateTime]::UtcNow
     $BuildUtcText = $BuildUtc.ToString(
@@ -159,10 +257,11 @@ try {
         "yyyyMMdd'T'HHmmss'Z'",
         [Globalization.CultureInfo]::InvariantCulture
     )
-    $BuildId = "q0s-$ArtifactVersion-windows-x64-$BuildStamp"
+    $BuildId = "q0idmation-$ArtifactVersion-windows-x64-$GitShortCommit-$BuildStamp"
 
     Write-Host "[ok] beta version $BetaVersion" -ForegroundColor DarkGreen
     Write-Host "[ok] Rust host $RustHostTriple" -ForegroundColor DarkGreen
+    Write-Host "[ok] Git commit $GitCommit ($GitBranch -> $GitUpstream)" -ForegroundColor DarkGreen
 
     New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
 
@@ -212,17 +311,22 @@ try {
     try {
         $releaseTargetDir = Join-Path $WorkspaceDir "target"
 
-        & cargo fmt --all -- --check
+        & $CargoFmt fmt --all -- --check
         if ($LASTEXITCODE -ne 0) {
             throw "cargo fmt check exited with $LASTEXITCODE"
         }
 
-        & cargo test --workspace --locked --target-dir $releaseTargetDir
+        & $Cargo check --workspace --locked --target-dir $releaseTargetDir
+        if ($LASTEXITCODE -ne 0) {
+            throw "cargo check exited with $LASTEXITCODE"
+        }
+
+        & $Cargo test --workspace --locked --target-dir $releaseTargetDir
         if ($LASTEXITCODE -ne 0) {
             throw "cargo test exited with $LASTEXITCODE"
         }
 
-        & cargo clippy --workspace --all-targets --locked --target-dir $releaseTargetDir -- -D warnings
+        & $CargoClippy clippy --workspace --all-targets --locked --target-dir $releaseTargetDir -- -D warnings
         if ($LASTEXITCODE -ne 0) {
             throw "cargo clippy exited with $LASTEXITCODE"
         }
@@ -233,9 +337,14 @@ try {
     # -------- 2. Assets --------
 
     Step "Generating installer assets (icons + BMP)"
-    & python "$InstallerDir\build_assets.py"
+    & $Python "$InstallerDir\build_assets.py"
     if ($LASTEXITCODE -ne 0) {
         throw "build_assets.py exited with $LASTEXITCODE"
+    }
+
+    $GeneratedStatus = Invoke-CheckedText -Program $Git -Arguments @("status", "--porcelain=v1", "--untracked-files=normal") -Label "post-asset git status"
+    if ($GeneratedStatus) {
+        throw "installer asset generation changed the committed source tree. Commit the generated assets before publishing:`n$GeneratedStatus"
     }
 
     # -------- 3. Cargo release build --------
@@ -266,7 +375,7 @@ try {
     try {
         # Pin the directory so inherited CARGO_TARGET_DIR cannot redirect the
         # build while NSIS still reads workspace\target\release.
-        & cargo build --release --locked -p q0editor -p q0player --target-dir $releaseTargetDir
+        & $Cargo build --release --locked -p q0editor -p q0player --target-dir $releaseTargetDir
         if ($LASTEXITCODE -ne 0) {
             throw "cargo build exited with $LASTEXITCODE"
         }
@@ -290,7 +399,7 @@ try {
         foreach ($spec in $InstallerSpecs) {
             $relativeOutput = "dist\$AttemptName\$($spec.FileName)"
             Write-Host "  makensis $($spec.Script) -> $($spec.FileName)"
-            & makensis /V2 `
+            & $MakeNsis /V2 `
                 "/DAPP_VERSION=$BetaVersion" `
                 "/DAPP_VERSION_NUMERIC=$NumericVersion" `
                 "/DOUTPUT_FILE=$relativeOutput" `
@@ -323,10 +432,16 @@ try {
     Set-Content -LiteralPath $StagedShaPath -Value ($shaLines -join "`r`n") -Encoding Ascii
 
     $buildInfoLines = @(
-        "Q0S beta build",
+        "q0idmation beta build",
         "Build ID: $BuildId",
         "Version: $BetaVersion",
         "Build UTC: $BuildUtcText",
+        "Git commit: $GitCommit",
+        "Git branch: $GitBranch",
+        "Git upstream: $GitUpstream",
+        "Git tags: $GitTags",
+        "Git remote: $GitRemote",
+        "Git working tree: clean",
         "Platform: Windows x64",
         "Rust host: $RustHostTriple",
         "Rust: $RustVersion",

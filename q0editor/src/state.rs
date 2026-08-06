@@ -478,7 +478,7 @@ pub struct Session {
     /// Independent classic eraser size while brush/eraser sync is disabled.
     pub eraser_size: f32,
     /// Cap shape applied to brush strokes when committing them, and to
-    /// strokeР В Р вЂ Р Р†Р вЂљР’В Р Р†Р вЂљРІвЂћСћfill conversions in the right-click menu. Per-session, so
+    /// stroke-to-fill conversions in the right-click menu. Per-session, so
     /// the user picks once and forgets.
     pub brush_cap: CapShape,
     pub show_credits: bool,

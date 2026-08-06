@@ -2961,14 +2961,14 @@ checksum = "3eb8486b569e12e2c32ad3e204dbaba5e4b5b216e9367044f25f1dba42341773"
 
 [[package]]
 name = "q0credits"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "egui",
 ]
 
 [[package]]
 name = "q0editor"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "dirs",
  "eframe",
@@ -2992,11 +2992,11 @@ dependencies = [
 
 [[package]]
 name = "q0icon"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 
 [[package]]
 name = "q0player"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "dirs",
  "eframe",
@@ -3019,21 +3019,21 @@ dependencies = [
 
 [[package]]
 name = "q0s-format"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "q0video",
 ]
 
 [[package]]
 name = "q0shell"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "q0s-format",
 ]
 
 [[package]]
 name = "q0term"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "eframe",
  "egui",
@@ -3042,11 +3042,11 @@ dependencies = [
 
 [[package]]
 name = "q0theme"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 
 [[package]]
 name = "q0video"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "image",
  "windows 0.58.0",

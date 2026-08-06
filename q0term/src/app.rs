@@ -61,7 +61,7 @@ impl TermApp {
             focus_input: true,
             pending_cursor: None,
         };
-        app.push_dim("Q0S q0lang shell. Type 'help'. Press Tab to complete.");
+        app.push_dim("q0idmation q0lang shell. Type 'help'. Press Tab to complete.");
         app
     }
 

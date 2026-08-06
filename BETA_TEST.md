@@ -1,4 +1,4 @@
-# Q0S first beta: 10-minute test
+# q0idmation first beta: 10-minute test
 
 Keep the original `.q1s` project while testing. A `.q0s` file is a playback
 export, not a replacement for the source project.
@@ -50,6 +50,6 @@ Exact error text:
 Does it reproduce after restarting the app: yes/no
 ```
 
-Q0S does not send telemetry and does not upload projects, diagnostics or bug
+q0idmation does not send telemetry and does not upload projects, diagnostics or bug
 reports automatically. Only attach a `.q1s` or `.q0s` file if you explicitly
 consent and have permission to share everything it contains.

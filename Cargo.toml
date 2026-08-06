@@ -2,3 +2,10 @@
 members = ["q0credits", "q0icon", "q0theme", "q0s-format", "q0video", "q0player", "q0editor", "q0shell", "q0term"]
 resolver = "2"
 
+[workspace.package]
+version = "0.1.0-beta.1"
+edition = "2021"
+authors = ["q0s"]
+license = "GPL-3.0-or-later"
+repository = "https://github.com/overisneverover-lab/q0idmation"
+homepage = "https://q0id.com"

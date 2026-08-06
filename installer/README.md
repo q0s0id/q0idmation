@@ -1,6 +1,6 @@
-# Windows installers
+# q0idmation Windows installers
 
-Q0S has two independent per-user NSIS installers for Windows x64:
+q0idmation has two independent per-user NSIS installers for Windows x64:
 
 | File pattern | Contents | Association |
 |---|---|---|
@@ -21,8 +21,8 @@ removed. Artifacts for other explicit versions are not removed.
 
 Each application has its own install directory:
 
-- `%LOCALAPPDATA%\Programs\q0s\q0editor\`
-- `%LOCALAPPDATA%\Programs\q0s\q0player\`
+- `%LOCALAPPDATA%\Programs\q0idmation\q0editor\`
+- `%LOCALAPPDATA%\Programs\q0idmation\q0player\`
 
 Installing or removing one application does not alter the other application's
 files.
@@ -33,6 +33,7 @@ files.
 - Rust and Cargo with the `rustfmt` and `clippy` components;
 - Python 3.10 or newer for the generated icons and BMP files;
 - NSIS 3.x. The script also checks the standard NSIS install directories.
+- Git with a clean working tree whose current branch is pushed to `origin`.
 
 ## Publication build
 
@@ -44,13 +45,16 @@ powershell -ExecutionPolicy Bypass -File .\installer\build.ps1
 
 Alternatively, start `installer\build.bat`. The script:
 
-1. checks Python, Cargo, rustc and NSIS;
+1. locates Python, Git, NSIS and the complete Rust toolchain, including custom
+   `.rustup` and `.codex` toolchain paths;
 2. reads the shared q0editor/q0player version from Cargo metadata;
-3. requires formatting, workspace tests and strict Clippy to pass;
-4. generates installer assets with `installer\build_assets.py`;
-5. builds locked release binaries for q0editor and q0player;
-6. builds both versioned installers in an isolated staging directory;
-7. verifies sizes and SHA256 hashes, creates the manifests, then publishes the
+3. requires a clean, pushed Git commit and records it in `BUILD-INFO.txt`;
+4. requires formatting, workspace check, tests and strict Clippy to pass;
+5. generates installer assets with `installer\build_assets.py` and verifies
+   that generation does not modify the committed source tree;
+6. builds locked release binaries for q0editor and q0player;
+7. builds both versioned installers in an isolated staging directory;
+8. verifies sizes and SHA256 hashes, creates the manifests, then publishes the
    complete set to `installer\dist`.
 
 On failure, only files from the current staging attempt are cleaned. Previous

@@ -1,8 +1,12 @@
 [package]
 name = "q0editor"
-version = "0.1.0"
-edition = "2021"
-
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Vector animation editor for q0idmation."
 [dependencies]
 q0credits = { path = "../q0credits" }
 eframe = "0.27"

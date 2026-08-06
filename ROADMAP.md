@@ -1,4 +1,4 @@
-# Q0S roadmap
+# q0idmation roadmap
 
 ## First beta
 

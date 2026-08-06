@@ -1,8 +1,12 @@
 [package]
 name = "q0shell"
-version = "0.1.0"
-edition = "2021"
-
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Command-line host for q0lang."
 [lib]
 path = "src/lib.rs"
 

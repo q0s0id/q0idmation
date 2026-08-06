@@ -8,7 +8,7 @@ path = "out/" + "slot-" + slot + ".txt"
 
 q0shell.print! "q0shell online"
 q0shell.mkdir! "out"
-q0shell.write! path, "Q0S"
+q0shell.write! path, "q0idmation"
 q0shell.append! path, "\nterminal host\n"
 q0shell.read! path
 q0shell.move! path, "out/done.txt"
