@@ -106,7 +106,9 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     ui.close_menu();
                 }
                 ui.separator();
-                let can_clip = crate::selection_edit::selection_can_clip(&app.session.selection);
+                let can_clip = app.session.timeline_selection.is_some()
+                    || app.session.timeline_layer_selection.is_some()
+                    || crate::selection_edit::selection_can_clip(&app.session.selection);
                 let can_delete = app.session.timeline_selection.is_some()
                     || selection_can_be_deleted(&app.session.selection);
                 let has_clip = app.session.clipboard.is_some();

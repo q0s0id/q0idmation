@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use geo::{
-    Area, BooleanOps, BoundingRect, Buffer, Contains, Coord, Line, LineString, MultiPolygon, Point,
-    Polygon, SimplifyVwPreserve,
+    Area, BooleanOps, BoundingRect, Buffer, Contains, ConvexHull, Coord, Line, LineString,
+    MultiPoint, MultiPolygon, Point, Polygon, SimplifyVwPreserve,
 };
 use q0s_format::v2::{
     Anchor, Asset, Path as VPath, Placement, ProjectV2, Rgba, Target, Transform2D, Tween, Vec2,
@@ -16,6 +16,33 @@ use crate::render::flatten_path;
 pub enum BrushNib {
     #[default]
     Circle,
+    Square,
+    Horizontal,
+    Vertical,
+    Slash,
+    Backslash,
+}
+
+impl BrushNib {
+    pub const ALL: [Self; 6] = [
+        Self::Circle,
+        Self::Square,
+        Self::Horizontal,
+        Self::Vertical,
+        Self::Slash,
+        Self::Backslash,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Circle => "Circle",
+            Self::Square => "Square",
+            Self::Horizontal => "Horizontal",
+            Self::Vertical => "Vertical",
+            Self::Slash => "Slash /",
+            Self::Backslash => "Backslash \\",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -100,9 +127,9 @@ pub fn brush_add_sample(stroke: &mut BrushStroke, settings: BrushSettings, sampl
 }
 
 /// Materialize the vector coverage from all raw samples in one operation.
-/// The live UI does not call this while the pointer is moving; it renders the
-/// same raw polyline with a round stroke tessellator instead. That keeps input
-/// latency independent of how long the current gesture already is.
+/// Circular live preview stays on the cheap round-stroke tessellator. Polygon
+/// nibs derive the same fixed-angle silhouette without mutating this cached
+/// commit coverage, so one gesture still has one authoritative sweep.
 pub fn brush_flush_pending(stroke: &mut BrushStroke) {
     if !stroke.dirty_preview {
         return;
@@ -119,6 +146,21 @@ pub fn brush_preview_geometry(stroke: &BrushStroke) -> &[VPath] {
 
 pub fn brush_preview_size(stroke: &BrushStroke) -> f32 {
     stroke.size
+}
+
+pub fn brush_preview_nib(stroke: &BrushStroke) -> BrushNib {
+    stroke.nib
+}
+
+/// Materialize the current gesture silhouette for non-circular live previews.
+/// Circle stays on the cheaper renderer path; fixed polygon nibs use this exact
+/// sweep so preview and commit cannot disagree about corners or orientation.
+pub fn brush_preview_paths_for_render(stroke: &BrushStroke) -> Vec<VPath> {
+    if !stroke.dirty_preview {
+        return stroke.preview_paths.clone();
+    }
+    let trajectory = build_sweep_trajectory(&stroke.samples, stroke.smoothing, stroke.size);
+    coverage_to_linear_paths(&sweep_trajectory_nib(stroke.nib, stroke.size, &trajectory))
 }
 
 /// The live preview and committed coverage share this exact centre trajectory.
@@ -138,14 +180,14 @@ pub fn brush_finish(mut stroke: BrushStroke, settings: BrushSettings) -> MultiPo
     brush_flush_pending(&mut stroke);
     if is_single_dab {
         // Smoothing is a boundary cleanup for a gesture. A one-sample gesture
-        // is already the exact static nib and must remain a literal circle.
+        // is already the exact static nib and must keep its literal footprint.
         stroke.coverage
     } else {
         let mut finished = smooth_contours(&stroke.coverage, settings.smoothing, settings.size);
         // Boundary simplification may safely remove wobble from the sides, but
-        // it must never polygonize the literal static nib at either endpoint.
+        // it must never deform the literal static nib at either endpoint.
         // Restore those two exact imprints after cleanup; this does not alter
-        // the centre sweep and keeps long strokes round-capped at smoothing 100.
+        // the centre sweep and keeps the selected nib shape at smoothing 100.
         if let Some(first) = stroke.samples.first().map(|sample| sample.position) {
             finished = finished.union(&sweep_nib(settings.nib, settings.size, first, first));
         }
@@ -238,62 +280,133 @@ fn sweep_trajectory_nib(nib: BrushNib, size: f32, trajectory: &[Vec2]) -> MultiP
         return sweep_nib(nib, size, first, first);
     }
 
-    match nib {
-        BrushNib::Circle => {
-            let radius = f64::from(size.max(0.1)) * 0.5;
-            let mut coords: Vec<Coord<f64>> = trajectory
-                .iter()
-                .map(|point| Coord {
-                    x: f64::from(point.x),
-                    y: f64::from(point.y),
-                })
-                .collect();
-            coords.dedup();
-            if coords.len() == 1 {
-                return sweep_nib(nib, size, first, first);
-            }
-            if (coords[0].x, coords[0].y) > (coords[coords.len() - 1].x, coords[coords.len() - 1].y)
-            {
-                coords.reverse();
-            }
-            LineString::new(coords).buffer(radius)
+    if nib == BrushNib::Circle {
+        let radius = f64::from(size.max(0.1)) * 0.5;
+        let mut coords: Vec<Coord<f64>> = trajectory
+            .iter()
+            .map(|point| Coord {
+                x: f64::from(point.x),
+                y: f64::from(point.y),
+            })
+            .collect();
+        coords.dedup();
+        if coords.len() == 1 {
+            return sweep_nib(nib, size, first, first);
         }
+        if (coords[0].x, coords[0].y) > (coords[coords.len() - 1].x, coords[coords.len() - 1].y) {
+            coords.reverse();
+        }
+        return LineString::new(coords).buffer(radius);
     }
+
+    let mut coverage = sweep_nib(nib, size, first, first);
+    for segment in trajectory.windows(2) {
+        coverage = coverage.union(&sweep_nib(nib, size, segment[0], segment[1]));
+    }
+    coverage
 }
 
 pub fn sweep_nib(nib: BrushNib, size: f32, start: Vec2, end: Vec2) -> MultiPolygon<f64> {
-    match nib {
-        BrushNib::Circle => {
-            let radius = (size.max(0.1) * 0.5) as f64;
-            if vec2_distance(start, end) <= 1.0e-6 {
-                return circular_nib_imprint(start, radius);
-            }
-            // Canonical endpoint order keeps a circular nib bit-for-bit
-            // independent of gesture direction, not merely visually equal.
-            let (start, end) = if (start.x, start.y) <= (end.x, end.y) {
-                (start, end)
-            } else {
-                (end, start)
-            };
-            Line::new(
-                Coord {
-                    x: start.x as f64,
-                    y: start.y as f64,
-                },
-                Coord {
-                    x: end.x as f64,
-                    y: end.y as f64,
-                },
-            )
-            .buffer(radius)
+    if nib == BrushNib::Circle {
+        let radius = f64::from(size.max(0.1)) * 0.5;
+        if vec2_distance(start, end) <= 1.0e-6 {
+            return circular_nib_imprint(start, radius);
         }
+        // Canonical endpoint order keeps a circular nib bit-for-bit
+        // independent of gesture direction, not merely visually equal.
+        let (start, end) = if (start.x, start.y) <= (end.x, end.y) {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        return Line::new(
+            Coord {
+                x: f64::from(start.x),
+                y: f64::from(start.y),
+            },
+            Coord {
+                x: f64::from(end.x),
+                y: f64::from(end.y),
+            },
+        )
+        .buffer(radius);
     }
+
+    let mut points = Vec::with_capacity(8);
+    for center in [start, end] {
+        points.extend(
+            nib_outline(nib, size, center)
+                .into_iter()
+                .map(|point| Point::new(f64::from(point.x), f64::from(point.y))),
+        );
+    }
+    if vec2_distance(start, end) <= 1.0e-6 {
+        return polygon_from_nib_outline(nib_outline(nib, size, start));
+    }
+    MultiPolygon(vec![MultiPoint(points).convex_hull()])
+}
+
+/// Exact static footprint for cursor rendering, clicks and segment sweeps.
+/// The shape never rotates with pointer direction; slash nibs keep their
+/// chosen angle for the entire gesture, matching a classic fixed pen.
+pub fn nib_outline(nib: BrushNib, size: f32, center: Vec2) -> Vec<Vec2> {
+    let size = size.max(0.1);
+    if nib == BrushNib::Circle {
+        const SEGMENTS: usize = 64;
+        let radius = size * 0.5;
+        return (0..SEGMENTS)
+            .map(|index| {
+                let angle = std::f32::consts::TAU * index as f32 / SEGMENTS as f32;
+                Vec2::new(
+                    center.x + radius * angle.cos(),
+                    center.y + radius * angle.sin(),
+                )
+            })
+            .collect();
+    }
+
+    let (width, height, angle) = match nib {
+        BrushNib::Circle => unreachable!(),
+        BrushNib::Square => (size, size, 0.0),
+        BrushNib::Horizontal => (size, size * 0.34, 0.0),
+        BrushNib::Vertical => (size * 0.34, size, 0.0),
+        BrushNib::Slash => (size, size * 0.34, -std::f32::consts::FRAC_PI_4),
+        BrushNib::Backslash => (size, size * 0.34, std::f32::consts::FRAC_PI_4),
+    };
+    let half_w = width * 0.5;
+    let half_h = height * 0.5;
+    let (sin, cos) = angle.sin_cos();
+    [
+        Vec2::new(-half_w, -half_h),
+        Vec2::new(half_w, -half_h),
+        Vec2::new(half_w, half_h),
+        Vec2::new(-half_w, half_h),
+    ]
+    .into_iter()
+    .map(|point| {
+        Vec2::new(
+            center.x + point.x * cos - point.y * sin,
+            center.y + point.x * sin + point.y * cos,
+        )
+    })
+    .collect()
+}
+
+fn polygon_from_nib_outline(points: Vec<Vec2>) -> MultiPolygon<f64> {
+    let mut coords: Vec<Coord<f64>> = points
+        .into_iter()
+        .map(|point| Coord {
+            x: f64::from(point.x),
+            y: f64::from(point.y),
+        })
+        .collect();
+    if let Some(first) = coords.first().copied() {
+        coords.push(first);
+    }
+    MultiPolygon(vec![Polygon::new(LineString::new(coords), Vec::new())])
 }
 
 fn circular_nib_imprint(center: Vec2, radius: f64) -> MultiPolygon<f64> {
-    // A click is a literal static circular nib, not a zero-length line buffer.
-    // 64 canonical vertices keep smoothing=0 round even at high zoom, while
-    // remaining cheap enough for boolean operations and serialization.
     const SEGMENTS: usize = 64;
     let mut coords = Vec::with_capacity(SEGMENTS + 1);
     for index in 0..SEGMENTS {
@@ -306,7 +419,6 @@ fn circular_nib_imprint(center: Vec2, radius: f64) -> MultiPolygon<f64> {
     coords.push(coords[0]);
     MultiPolygon(vec![Polygon::new(LineString::new(coords), Vec::new())])
 }
-
 pub fn smooth_contours(
     coverage: &MultiPolygon<f64>,
     smoothing: u8,
@@ -1809,6 +1921,117 @@ mod tests {
         );
     }
 
+    #[test]
+    fn every_classic_nib_creates_a_real_static_imprint() {
+        let center = Vec2::new(25.0, 30.0);
+        for nib in BrushNib::ALL {
+            let mut nib_settings = settings(20.0, 0);
+            nib_settings.nib = nib;
+            let stroke = stroke(&[center], nib_settings);
+            let bbox = stroke.coverage.bounding_rect().expect("nib dab bbox");
+            assert!(
+                stroke.coverage.contains(&Point::new(25.0, 30.0)),
+                "{nib:?} dab lost its center"
+            );
+            assert!(
+                stroke.coverage.unsigned_area() > 1.0,
+                "{nib:?} dab is empty"
+            );
+            assert!(bbox.width().is_finite() && bbox.height().is_finite());
+        }
+    }
+
+    #[test]
+    fn flat_nibs_keep_their_declared_orientation() {
+        let center = Vec2::new(0.0, 0.0);
+        let horizontal = sweep_nib(BrushNib::Horizontal, 30.0, center, center)
+            .bounding_rect()
+            .expect("horizontal bbox");
+        let vertical = sweep_nib(BrushNib::Vertical, 30.0, center, center)
+            .bounding_rect()
+            .expect("vertical bbox");
+        assert!(horizontal.width() > horizontal.height() * 2.5);
+        assert!(vertical.height() > vertical.width() * 2.5);
+
+        let slash_covariance: f32 = nib_outline(BrushNib::Slash, 30.0, center)
+            .iter()
+            .map(|point| point.x * point.y)
+            .sum();
+        let backslash_covariance: f32 = nib_outline(BrushNib::Backslash, 30.0, center)
+            .iter()
+            .map(|point| point.x * point.y)
+            .sum();
+        assert!(slash_covariance < 0.0, "slash angle flipped");
+        assert!(backslash_covariance > 0.0, "backslash angle flipped");
+    }
+
+    #[test]
+    fn every_static_nib_sweeps_sparse_samples_without_gaps_or_direction_drift() {
+        let start = Vec2::new(5.0, 8.0);
+        let end = Vec2::new(105.0, 48.0);
+        for nib in BrushNib::ALL {
+            let forward = sweep_nib(nib, 18.0, start, end);
+            let reverse = sweep_nib(nib, 18.0, end, start);
+            assert!(
+                forward.contains(&Point::new(55.0, 28.0)),
+                "{nib:?} left a sparse-sample gap"
+            );
+            let mismatch = forward
+                .difference(&reverse)
+                .union(&reverse.difference(&forward))
+                .unsigned_area();
+            assert!(mismatch < 1.0e-5, "{nib:?} direction mismatch: {mismatch}");
+        }
+    }
+
+    #[test]
+    fn polygon_nib_preview_and_commit_share_the_same_sweep() {
+        let mut nib_settings = settings(24.0, 0);
+        nib_settings.nib = BrushNib::Slash;
+        let mut gesture = brush_begin(nib_settings, BrushSample::mouse(Vec2::new(10.0, 10.0)));
+        brush_add_sample(
+            &mut gesture,
+            nib_settings,
+            BrushSample::mouse(Vec2::new(90.0, 45.0)),
+        );
+        let preview_paths = brush_preview_paths_for_render(&gesture);
+        let preview = vector_fill_geometry(&VectorAsset {
+            asset_id: 0,
+            paths: preview_paths,
+            fill: Some(nib_settings.color),
+            stroke: None,
+        });
+        brush_flush_pending(&mut gesture);
+        let mismatch = preview
+            .difference(&gesture.coverage)
+            .union(&gesture.coverage.difference(&preview))
+            .unsigned_area();
+        assert!(mismatch < 0.05, "preview/commit mismatch: {mismatch}");
+    }
+    #[test]
+    fn dense_polygon_nib_preview_does_not_reintroduce_pathological_latency() {
+        let mut nib_settings = settings(18.0, 35);
+        nib_settings.nib = BrushNib::Square;
+        let points: Vec<Vec2> = (0..=240)
+            .map(|index| {
+                let x = index as f32 * 1.5;
+                Vec2::new(x, (index as f32 * 0.11).sin() * 24.0)
+            })
+            .collect();
+        let mut gesture = brush_begin(nib_settings, BrushSample::mouse(points[0]));
+        for point in &points[1..] {
+            brush_add_sample(&mut gesture, nib_settings, BrushSample::mouse(*point));
+        }
+
+        let started = std::time::Instant::now();
+        let preview = brush_preview_paths_for_render(&gesture);
+        assert!(!preview.is_empty());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "dense square-nib preview took {:?}",
+            started.elapsed()
+        );
+    }
     #[test]
     fn self_crossing_stroke_is_one_filled_component() {
         let settings = settings(12.0, 0);

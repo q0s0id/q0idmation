@@ -707,6 +707,11 @@ impl Eq for PersistBrushSize {}
 pub enum PersistBrushNib {
     #[default]
     Circle,
+    Square,
+    Horizontal,
+    Vertical,
+    Slash,
+    Backslash,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -734,6 +739,11 @@ impl BrushPreferences {
             smoothing: settings.smoothing,
             nib: match settings.nib {
                 BrushNib::Circle => PersistBrushNib::Circle,
+                BrushNib::Square => PersistBrushNib::Square,
+                BrushNib::Horizontal => PersistBrushNib::Horizontal,
+                BrushNib::Vertical => PersistBrushNib::Vertical,
+                BrushNib::Slash => PersistBrushNib::Slash,
+                BrushNib::Backslash => PersistBrushNib::Backslash,
             },
             scale_with_stage: settings.scale_with_stage,
             sync_with_eraser: settings.sync_with_eraser,
@@ -752,6 +762,11 @@ impl BrushPreferences {
             smoothing: self.smoothing.min(100),
             nib: match self.nib {
                 PersistBrushNib::Circle => BrushNib::Circle,
+                PersistBrushNib::Square => BrushNib::Square,
+                PersistBrushNib::Horizontal => BrushNib::Horizontal,
+                PersistBrushNib::Vertical => BrushNib::Vertical,
+                PersistBrushNib::Slash => BrushNib::Slash,
+                PersistBrushNib::Backslash => BrushNib::Backslash,
             },
             scale_with_stage: self.scale_with_stage,
             sync_with_eraser: self.sync_with_eraser,
@@ -985,7 +1000,7 @@ mod tests {
             },
             size: 27.5,
             smoothing: 83,
-            nib: BrushNib::Circle,
+            nib: BrushNib::Backslash,
             scale_with_stage: false,
             sync_with_eraser: false,
         };
@@ -994,6 +1009,15 @@ mod tests {
         let decoded: BrushPreferences =
             serde_json::from_str(&encoded).expect("deserialize brush settings");
         assert_eq!(decoded.to_runtime(), runtime);
+
+        for nib in BrushNib::ALL {
+            let runtime = BrushSettings { nib, ..runtime };
+            let encoded = serde_json::to_string(&BrushPreferences::from_runtime(runtime))
+                .expect("serialize every nib");
+            let decoded: BrushPreferences =
+                serde_json::from_str(&encoded).expect("deserialize every nib");
+            assert_eq!(decoded.to_runtime().nib, nib);
+        }
 
         let unsafe_values: BrushPreferences = serde_json::from_str(
             r#"{

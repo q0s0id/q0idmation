@@ -14,6 +14,7 @@ pub mod selection_edit;
 pub mod settings;
 pub mod state;
 pub mod theme;
+pub mod timeline_edit;
 pub mod tools;
 
 pub use app::EditorApp;

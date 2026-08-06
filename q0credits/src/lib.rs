@@ -14,6 +14,8 @@ pub struct Palette {
 
 pub const GLORIOUS_MESSAGE: &str = "thanks to our glorious contributers! you guys keep Q0E alive.";
 
+pub const FIRST_PATRON: &str = "karma";
+
 pub const CONTRIBUTORS: [&str; 6] = [
     "karma",
     "Loonmoon",
@@ -117,6 +119,7 @@ pub fn show(ui: &mut Ui, palette: &Palette, elapsed_seconds: f32) {
             NAME_STYLES[index],
             progress,
             response,
+            *name == FIRST_PATRON,
         );
     }
 
@@ -253,6 +256,7 @@ fn paint_name(
     style: NameStyle,
     progress: f32,
     response: Response,
+    featured: bool,
 ) {
     let hover = ui.ctx().animate_bool_with_time(
         Id::new(("q0player_credit_name_hover", name)),
@@ -263,9 +267,57 @@ fn paint_name(
     let dim = palette.text_dim;
     let accent = palette.accent;
     let alpha_scale = progress.clamp(0.0, 1.0);
-    let center = rect.center() + vec2(0.0, -hover * 3.0);
-    let name_color = alpha(mix(text, accent, hover * 0.12), (255.0 * alpha_scale) as u8);
-    let font = FontId::proportional(NAME_FONT_SIZE + hover * 2.0);
+    if featured {
+        let card = rect.shrink2(vec2(4.0, 3.0));
+        painter.rect_filled(
+            card,
+            Rounding::same(8.0),
+            alpha(
+                mix(palette.panel, accent, 0.16),
+                (118.0 * alpha_scale) as u8,
+            ),
+        );
+        painter.rect_stroke(
+            card,
+            Rounding::same(8.0),
+            Stroke::new(
+                1.2_f32 + hover * 0.7,
+                alpha(
+                    mix(dim, accent, 0.52),
+                    ((122.0 + hover * 70.0) * alpha_scale) as u8,
+                ),
+            ),
+        );
+        let crown_y = rect.top() + 17.0;
+        let crown = [
+            pos2(rect.center().x - 13.0, crown_y + 5.0),
+            pos2(rect.center().x - 6.5, crown_y - 2.0),
+            pos2(rect.center().x, crown_y + 4.0),
+            pos2(rect.center().x + 6.5, crown_y - 2.0),
+            pos2(rect.center().x + 13.0, crown_y + 5.0),
+        ];
+        for points in crown.windows(2) {
+            painter.line_segment(
+                [points[0], points[1]],
+                Stroke::new(1.2_f32, alpha(accent, (190.0 * alpha_scale) as u8)),
+            );
+        }
+    }
+    let center = rect.center() + vec2(0.0, if featured { -7.0 } else { 0.0 } - hover * 3.0);
+    let name_color = alpha(
+        mix(
+            text,
+            accent,
+            if featured {
+                0.34 + hover * 0.16
+            } else {
+                hover * 0.12
+            },
+        ),
+        (255.0 * alpha_scale) as u8,
+    );
+    let font =
+        FontId::proportional(NAME_FONT_SIZE + if featured { 5.0 } else { 0.0 } + hover * 2.0);
     let galley = painter.layout_no_wrap(name.to_owned(), font, name_color);
     let text_pos = pos2(
         center.x - galley.size().x * 0.5,
@@ -278,6 +330,17 @@ fn paint_name(
             galley.clone(),
             alpha(Color32::BLACK, (28.0 * hover * alpha_scale) as u8),
         );
+    }
+    if featured {
+        let glow = alpha(accent, ((24.0 + hover * 26.0) * alpha_scale) as u8);
+        for offset in [
+            vec2(-1.5, 0.0),
+            vec2(1.5, 0.0),
+            vec2(0.0, -1.5),
+            vec2(0.0, 1.5),
+        ] {
+            painter.galley(text_pos + offset, galley.clone(), glow);
+        }
     }
     painter.galley(text_pos, galley.clone(), name_color);
 
@@ -306,6 +369,22 @@ fn paint_name(
         alpha(mix(dim, accent, 0.10), (150.0 * alpha_scale) as u8),
     );
 
+    if featured {
+        let badge_color = alpha(mix(dim, accent, 0.45), (210.0 * alpha_scale) as u8);
+        let badge_galley = painter.layout_no_wrap(
+            "first patron".to_owned(),
+            FontId::proportional(11.0 + hover * 0.5),
+            badge_color,
+        );
+        painter.galley(
+            pos2(
+                rect.center().x - badge_galley.size().x * 0.5,
+                rect.bottom() - badge_galley.size().y - 8.0,
+            ),
+            badge_galley,
+            badge_color,
+        );
+    }
     paint_name_constellation(
         painter,
         rect,
@@ -422,6 +501,14 @@ mod tests {
             CONTRIBUTORS.len()
         );
         assert_eq!(NAME_STYLES.len(), CONTRIBUTORS.len());
+        assert_eq!(FIRST_PATRON, "karma");
+        assert_eq!(
+            CONTRIBUTORS
+                .iter()
+                .filter(|name| **name == FIRST_PATRON)
+                .count(),
+            1
+        );
     }
 
     #[test]

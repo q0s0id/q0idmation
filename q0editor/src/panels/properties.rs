@@ -283,7 +283,7 @@ fn brush_properties(app: &mut EditorApp, ui: &mut Ui) {
     tool_hint(
         app,
         ui,
-        "Static circular fill nib. Smoothing is applied to the final boundary after the gesture.",
+        "Static fill nib. The chosen pen shape keeps one fixed angle; smoothing is applied after the gesture.",
     );
     let brush_before = app.session.brush;
     egui::Grid::new("classic_brush_settings")
@@ -301,7 +301,13 @@ fn brush_properties(app: &mut EditorApp, ui: &mut Ui) {
             ui.end_row();
 
             ui.label("Nib");
-            ui.label("Circle");
+            egui::ComboBox::from_id_source("classic_brush_nib")
+                .selected_text(app.session.brush.nib.label())
+                .show_ui(ui, |ui| {
+                    for nib in crate::brush::BrushNib::ALL {
+                        ui.selectable_value(&mut app.session.brush.nib, nib, nib.label());
+                    }
+                });
             ui.end_row();
 
             ui.label("Size");

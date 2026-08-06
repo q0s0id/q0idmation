@@ -15,7 +15,7 @@ use crate::panels;
 use crate::render::TextureCache;
 use crate::state::{
     default_project, History, LibraryItem, PathRef, PlacementRef, ProjectState, Selection, Session,
-    Tool, ToolState,
+    TimelineClipboard, TimelineSelection, Tool, ToolState,
 };
 
 pub struct EditorApp {
@@ -142,6 +142,7 @@ pub enum Action {
     RenameLayer(u16, u16, String),
     MoveLayer(u16, u16, i8),
     DropLayer(u16, u16, LayerDropTarget),
+    MoveTimelineFrames(TimelineSelection, u16, u16),
     IndentLayer(u16, u16),
     OutdentLayer(u16, u16),
     ToggleLayerFolder(u16, u16),
@@ -976,6 +977,25 @@ impl EditorApp {
             Action::DropLayer(q0rg_id, layer_id, target) => {
                 self.drop_layer(q0rg_id, layer_id, target);
             }
+            Action::MoveTimelineFrames(selection, target_layer_id, target_frame) => {
+                self.history.snapshot(&self.state.project);
+                if let Some(moved) = crate::timeline_edit::move_frames(
+                    &mut self.state.project,
+                    self.session.current_q0rg_id,
+                    selection,
+                    target_layer_id,
+                    target_frame,
+                ) {
+                    self.session.timeline_selection = Some(moved);
+                    self.session.timeline_layer_selection = None;
+                    self.session.current_layer_id = moved.anchor_layer_id;
+                    self.session.current_frame = moved.anchor_frame;
+                    self.state.dirty = true;
+                    self.session.status = "moved frames".to_string();
+                } else {
+                    self.session.status = "could not move frames".to_string();
+                }
+            }
             Action::IndentLayer(q0rg_id, layer_id) => {
                 self.indent_layer(q0rg_id, layer_id);
             }
@@ -1222,40 +1242,156 @@ impl EditorApp {
                 self.session.status = "zoom 100% (fit)".to_string();
             }
             Action::CopySelection => {
-                let payload = crate::selection_edit::capture_clipboard(
-                    &self.state.project,
-                    &self.session.selection,
-                );
-                if payload.is_empty() {
+                let payload = if let Some(selection) = self.session.timeline_selection {
+                    crate::timeline_edit::capture_frames(
+                        &self.state.project,
+                        self.session.current_q0rg_id,
+                        selection,
+                    )
+                    .map(|frames| crate::state::ClipboardPayload {
+                        timeline: Some(TimelineClipboard::Frames(frames)),
+                        ..Default::default()
+                    })
+                } else if let Some(selection) = self.session.timeline_layer_selection {
+                    crate::timeline_edit::capture_layers(
+                        &self.state.project,
+                        self.session.current_q0rg_id,
+                        selection,
+                    )
+                    .map(|layers| crate::state::ClipboardPayload {
+                        timeline: Some(TimelineClipboard::Layers(layers)),
+                        ..Default::default()
+                    })
+                } else {
+                    Some(crate::selection_edit::capture_clipboard(
+                        &self.state.project,
+                        &self.session.selection,
+                    ))
+                };
+                if payload.as_ref().is_none_or(|payload| payload.is_empty()) {
                     self.session.status = "nothing to copy".to_string();
                 } else {
-                    self.session.clipboard = Some(payload);
+                    self.session.clipboard = payload;
                     self.session.status = "copied".to_string();
                 }
             }
             Action::CutSelection => {
-                let payload = crate::selection_edit::capture_clipboard(
-                    &self.state.project,
-                    &self.session.selection,
-                );
-                if payload.is_empty() {
-                    self.session.status = "nothing to cut".to_string();
+                if let Some(selection) = self.session.timeline_selection {
+                    let Some(frames) = crate::timeline_edit::capture_frames(
+                        &self.state.project,
+                        self.session.current_q0rg_id,
+                        selection,
+                    ) else {
+                        self.session.status = "nothing to cut".to_string();
+                        return;
+                    };
+                    self.history.snapshot(&self.state.project);
+                    crate::timeline_edit::clear_frames(
+                        &mut self.state.project,
+                        self.session.current_q0rg_id,
+                        selection,
+                    );
+                    self.session.clipboard = Some(crate::state::ClipboardPayload {
+                        timeline: Some(TimelineClipboard::Frames(frames)),
+                        ..Default::default()
+                    });
+                    self.state.dirty = true;
+                    self.session.status = "cut frames".to_string();
+                } else if let Some(selection) = self.session.timeline_layer_selection {
+                    let Some(layers) = crate::timeline_edit::capture_layers(
+                        &self.state.project,
+                        self.session.current_q0rg_id,
+                        selection,
+                    ) else {
+                        self.session.status = "nothing to cut".to_string();
+                        return;
+                    };
+                    self.history.snapshot(&self.state.project);
+                    crate::timeline_edit::remove_layers(
+                        &mut self.state.project,
+                        self.session.current_q0rg_id,
+                        selection,
+                    );
+                    self.session.clipboard = Some(crate::state::ClipboardPayload {
+                        timeline: Some(TimelineClipboard::Layers(layers)),
+                        ..Default::default()
+                    });
+                    self.session.timeline_layer_selection = None;
+                    self.session.reconcile_with(&self.state.project);
+                    self.state.dirty = true;
+                    self.session.status = "cut layers".to_string();
                 } else {
-                    self.session.clipboard = Some(payload);
-                    if self.delete_selection() {
-                        self.session.status = "cut".to_string();
+                    let payload = crate::selection_edit::capture_clipboard(
+                        &self.state.project,
+                        &self.session.selection,
+                    );
+                    if payload.is_empty() {
+                        self.session.status = "nothing to cut".to_string();
+                    } else {
+                        self.session.clipboard = Some(payload);
+                        if self.delete_selection() {
+                            self.session.status = "cut".to_string();
+                        }
                     }
                 }
             }
             Action::Paste => {
-                if self.current_layer_is_folder() {
-                    self.session.status = "folders cannot contain artwork".to_string();
+                let Some(payload) = self.session.clipboard.clone() else {
+                    self.session.status = "clipboard empty".to_string();
                     return;
-                }
-                if let Some(payload) = self.session.clipboard.clone() {
-                    if payload.is_empty() {
-                        self.session.status = "clipboard empty".to_string();
-                    } else {
+                };
+                match payload.timeline.clone() {
+                    Some(TimelineClipboard::Frames(frames)) => {
+                        if self.current_layer_is_folder() {
+                            self.session.status = "paste frames onto a drawable layer".to_string();
+                            return;
+                        }
+                        self.history.snapshot(&self.state.project);
+                        if let Some(selection) = crate::timeline_edit::paste_frames(
+                            &mut self.state.project,
+                            self.session.current_q0rg_id,
+                            self.session.current_layer_id,
+                            self.session.current_frame,
+                            &frames,
+                        ) {
+                            self.session.timeline_selection = Some(selection);
+                            self.session.timeline_layer_selection = None;
+                            self.session.selection = Selection::None;
+                            self.session.current_layer_id = selection.anchor_layer_id;
+                            self.session.current_frame = selection.anchor_frame;
+                            self.state.dirty = true;
+                            self.session.status = "pasted frames".to_string();
+                        } else {
+                            self.session.status = "could not paste frames".to_string();
+                        }
+                    }
+                    Some(TimelineClipboard::Layers(layers)) => {
+                        self.history.snapshot(&self.state.project);
+                        if let Some(selection) = crate::timeline_edit::paste_layers(
+                            &mut self.state.project,
+                            self.session.current_q0rg_id,
+                            self.session.current_layer_id,
+                            &layers,
+                        ) {
+                            self.session.timeline_layer_selection = Some(selection);
+                            self.session.timeline_selection = None;
+                            self.session.selection = Selection::None;
+                            self.session.current_layer_id = selection.anchor_layer_id;
+                            self.state.dirty = true;
+                            self.session.status = "pasted layers".to_string();
+                        } else {
+                            self.session.status = "could not paste layers".to_string();
+                        }
+                    }
+                    None => {
+                        if self.current_layer_is_folder() {
+                            self.session.status = "folders cannot contain artwork".to_string();
+                            return;
+                        }
+                        if payload.is_empty() {
+                            self.session.status = "clipboard empty".to_string();
+                            return;
+                        }
                         self.history.snapshot(&self.state.project);
                         let result = crate::selection_edit::paste_payload(
                             &mut self.state.project,
@@ -1271,8 +1407,6 @@ impl EditorApp {
                         self.textures.invalidate();
                         self.session.status = "pasted".to_string();
                     }
-                } else {
-                    self.session.status = "clipboard empty".to_string();
                 }
             }
             Action::DuplicateSelection => {
@@ -5624,6 +5758,7 @@ mod tests {
                 }),
                 stroke: None,
             }],
+            timeline: None,
         });
         app.handle(&Context::default(), Action::Paste);
         let layer = &app.state.project.q0rgs[0].layers[0];

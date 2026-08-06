@@ -11,8 +11,8 @@ use q0s_format::v2::{
 
 use crate::app::EditorApp;
 use crate::render::{
-    flatten_path, flatten_path_for_stroke, paint_round_stroke_preview, placement_bbox,
-    placement_local_bbox, StageView,
+    flatten_path, flatten_path_for_stroke, paint_complex_fill, paint_round_stroke_preview,
+    placement_bbox, placement_local_bbox, StageView,
 };
 use crate::state::{Handle, PathRef, PlacementRef, Selection, Tool, ToolState, TransformEdge};
 
@@ -1024,10 +1024,6 @@ fn eraser_settings(app: &EditorApp, view_scale: f32) -> crate::brush::BrushSetti
     settings
 }
 
-fn eraser_radius_stage(app: &EditorApp, view_scale: f32) -> f32 {
-    eraser_settings(app, view_scale).size.max(0.1) * 0.5
-}
-
 /// Classic area eraser. It records the same raw pointer samples as the brush,
 /// builds one unioned nib coverage, and subtracts that coverage from raw fills
 /// once per gesture. Open strokes and display objects keep their legacy
@@ -1306,7 +1302,7 @@ fn nearest_segment_distance(pts: &[Vec2], p: Vec2) -> f32 {
     min_d
 }
 
-/// Draw the exact circular nib footprint before and during a brush gesture.
+/// Draw the exact static nib footprint before and during a brush gesture.
 /// The ring sits just outside the painted area, so it never hides the edge.
 fn draw_brush_cursor(app: &EditorApp, painter: &Painter, view: &StageView) {
     if app.session.current_tool != Tool::Brush {
@@ -1318,29 +1314,57 @@ fn draw_brush_cursor(app: &EditorApp, painter: &Painter, view: &StageView) {
     if !painter.clip_rect().contains(center) {
         return;
     }
-    let radius = brush_cursor_radius_px(app.session.brush, view.scale) + 1.25;
-    painter.circle_stroke(
-        center,
-        radius,
-        Stroke::new(2.5_f32, Color32::from_black_alpha(210)),
-    );
-    painter.circle_stroke(center, radius, Stroke::new(1.0_f32, Color32::WHITE));
+    let size_px = brush_cursor_radius_px(app.session.brush, view.scale) * 2.0 + 2.5;
+    draw_nib_cursor_outline(painter, center, app.session.brush.nib, size_px);
 }
 
-/// Draw a hollow circle at the cursor while the Eraser tool is active so the
-/// user sees what's about to be removed (matching Flash's eraser cursor).
+/// Draw the active eraser footprint. When brush/eraser sync is enabled this
+/// deliberately mirrors the selected nib instead of lying with a round cursor.
 fn draw_eraser_cursor(app: &EditorApp, painter: &Painter, view: &StageView) {
     if app.session.current_tool != Tool::Eraser {
         return;
     }
-    let Some(c) = painter.ctx().pointer_hover_pos() else {
+    let Some(center) = painter.ctx().pointer_hover_pos() else {
         return;
     };
-    let radius = eraser_radius_stage(app, view.scale) * view.scale;
-    painter.circle_stroke(c, radius, Stroke::new(1.5_f32, Color32::BLACK));
-    painter.circle_stroke(c, radius - 1.0, Stroke::new(1.0_f32, Color32::WHITE));
+    if !painter.clip_rect().contains(center) {
+        return;
+    }
+    let settings = eraser_settings(app, view.scale);
+    draw_nib_cursor_outline(
+        painter,
+        center,
+        settings.nib,
+        settings.size * view.scale + 2.0,
+    );
 }
 
+fn draw_nib_cursor_outline(
+    painter: &Painter,
+    center: Pos2,
+    nib: crate::brush::BrushNib,
+    size_px: f32,
+) {
+    let points: Vec<Pos2> = crate::brush::nib_outline(nib, size_px, Vec2::new(center.x, center.y))
+        .into_iter()
+        .map(|point| pos2(point.x, point.y))
+        .collect();
+    if points.len() < 3 {
+        return;
+    }
+    painter.add(Shape::Path(PathShape {
+        points: points.clone(),
+        closed: true,
+        fill: Color32::TRANSPARENT,
+        stroke: Stroke::new(2.5_f32, Color32::from_black_alpha(210)),
+    }));
+    painter.add(Shape::Path(PathShape {
+        points,
+        closed: true,
+        fill: Color32::TRANSPARENT,
+        stroke: Stroke::new(1.0_f32, Color32::WHITE),
+    }));
+}
 fn active_custom_transform_cursor(
     app: &EditorApp,
     response: &Response,
@@ -4586,6 +4610,48 @@ fn hit_test_selectable_placement(
     None
 }
 
+fn paint_classic_nib_preview(
+    painter: &Painter,
+    stroke: &crate::brush::BrushStroke,
+    view: &StageView,
+    fill: Color32,
+    outline: Option<Color32>,
+) {
+    if crate::brush::brush_preview_nib(stroke) == crate::brush::BrushNib::Circle {
+        let points: Vec<Pos2> = crate::brush::brush_preview_trajectory(stroke)
+            .into_iter()
+            .map(|point| stage_to_screen(point, view))
+            .collect();
+        let width = crate::brush::brush_preview_size(stroke) * view.scale;
+        if let Some(outline) = outline {
+            paint_round_stroke_preview(painter, &points, width + 2.0, outline);
+        }
+        paint_round_stroke_preview(painter, &points, width, fill);
+        return;
+    }
+
+    let contours: Vec<Vec<Pos2>> = crate::brush::brush_preview_paths_for_render(stroke)
+        .iter()
+        .map(|path| {
+            flatten_path(path)
+                .into_iter()
+                .map(|point| stage_to_screen(point, view))
+                .collect()
+        })
+        .filter(|points: &Vec<Pos2>| points.len() >= 3)
+        .collect();
+    paint_complex_fill(painter, &contours, fill);
+    if let Some(outline) = outline {
+        for points in contours {
+            painter.add(Shape::Path(PathShape {
+                points,
+                closed: true,
+                fill: Color32::TRANSPARENT,
+                stroke: Stroke::new(1.5_f32, outline),
+            }));
+        }
+    }
+}
 fn draw_in_progress_overlay(app: &EditorApp, painter: &Painter, view: &StageView) {
     let red = Color32::from_rgb(0xCC, 0x33, 0x33);
     let cursor = painter.ctx().pointer_hover_pos();
@@ -4646,27 +4712,12 @@ fn draw_in_progress_overlay(app: &EditorApp, painter: &Painter, view: &StageView
                 app.session.brush.color.b,
                 app.session.brush.color.a,
             );
-            let points: Vec<Pos2> = crate::brush::brush_preview_trajectory(stroke)
-                .into_iter()
-                .map(|point| stage_to_screen(point, view))
-                .collect();
-            paint_round_stroke_preview(
-                painter,
-                &points,
-                crate::brush::brush_preview_size(stroke) * view.scale,
-                color,
-            );
+            paint_classic_nib_preview(painter, stroke, view, color, None);
         }
         ToolState::EraserDrawing { stroke } => {
             let fill = Color32::from_rgba_unmultiplied(0xCC, 0x22, 0x22, 40);
             let outline = Color32::from_rgba_unmultiplied(0xCC, 0x22, 0x22, 220);
-            let points: Vec<Pos2> = crate::brush::brush_preview_trajectory(stroke)
-                .into_iter()
-                .map(|point| stage_to_screen(point, view))
-                .collect();
-            let width = crate::brush::brush_preview_size(stroke) * view.scale;
-            paint_round_stroke_preview(painter, &points, width + 2.0, outline);
-            paint_round_stroke_preview(painter, &points, width, fill);
+            paint_classic_nib_preview(painter, stroke, view, fill, Some(outline));
         }
         ToolState::PrimitiveDrawing { start, end } => {
             if let Some(kind) = primitive_kind_for_tool(app.session.current_tool) {

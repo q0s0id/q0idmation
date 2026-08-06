@@ -3,8 +3,8 @@ use std::time::Instant;
 
 pub use q0s_format::geom::CapShape;
 use q0s_format::v2::{
-    Anchor, Layer, Path as VPath, Placement, ProjectMeta, ProjectV2, Q0rg, Rgba, Transform2D, Vec2,
-    VectorAsset,
+    Anchor, Layer, LayerMetadata, Path as VPath, Placement, ProjectMeta, ProjectV2, Q0rg, Rgba,
+    Transform2D, Vec2, VectorAsset,
 };
 
 use crate::brush::{BrushSettings, BrushStroke};
@@ -34,6 +34,27 @@ pub struct LayerRename {
 pub struct TimelineLayerDrag {
     pub q0rg_id: u16,
     pub layer_id: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimelineFrameDrag {
+    pub q0rg_id: u16,
+    pub selection: TimelineSelection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimelineLayerSelection {
+    pub anchor_layer_id: u16,
+    pub focus_layer_id: u16,
+}
+
+impl TimelineLayerSelection {
+    pub const fn single(layer_id: u16) -> Self {
+        Self {
+            anchor_layer_id: layer_id,
+            focus_layer_id: layer_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,6 +206,30 @@ impl TimelineSelection {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct TimelineFrameClipboardRow {
+    pub explicit_keyframes: Vec<u16>,
+    pub placements: Vec<Placement>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TimelineFrameClipboard {
+    pub width: u16,
+    pub rows: Vec<TimelineFrameClipboardRow>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TimelineLayerClipboard {
+    pub layers: Vec<Layer>,
+    pub metadata: Vec<(u16, LayerMetadata)>,
+}
+
+#[derive(Debug, Clone)]
+pub enum TimelineClipboard {
+    Frames(TimelineFrameClipboard),
+    Layers(TimelineLayerClipboard),
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ClipboardPayload {
     /// Display-object placements. Targets remain project-local, matching the
@@ -193,11 +238,14 @@ pub struct ClipboardPayload {
     /// Standalone raw vector snapshots. Paste assigns fresh asset ids and
     /// keeps them as identity raw-graphics placements.
     pub raw_vectors: Vec<VectorAsset>,
+    /// Timeline cells or complete layer/folder blocks. This stays project-local
+    /// for the same reason as placement targets: ids refer to the open project.
+    pub timeline: Option<TimelineClipboard>,
 }
 
 impl ClipboardPayload {
     pub fn is_empty(&self) -> bool {
-        self.placements.is_empty() && self.raw_vectors.is_empty()
+        self.placements.is_empty() && self.raw_vectors.is_empty() && self.timeline.is_none()
     }
 }
 pub struct ProjectState {
@@ -458,6 +506,8 @@ pub struct Session {
     pub current_frame: u16,
     /// Rectangular frame-cell selection in the timeline, separate from stage selection.
     pub timeline_selection: Option<TimelineSelection>,
+    /// Selected layer rows for layer clipboard operations.
+    pub timeline_layer_selection: Option<TimelineLayerSelection>,
     pub current_tool: Tool,
     pub tool_state: ToolState,
     pub selection: Selection,
@@ -468,6 +518,7 @@ pub struct Session {
     pub library_rename: Option<LibraryRename>,
     pub layer_rename: Option<LayerRename>,
     pub timeline_layer_drag: Option<TimelineLayerDrag>,
+    pub timeline_frame_drag: Option<TimelineFrameDrag>,
     pub playing: bool,
     pub last_tick: Instant,
     pub status: String,
@@ -522,6 +573,7 @@ impl Session {
             current_layer_id: layer_id,
             current_frame: 0,
             timeline_selection: None,
+            timeline_layer_selection: None,
             current_tool: Tool::Select,
             tool_state: ToolState::Idle,
             selection: Selection::None,
@@ -531,6 +583,7 @@ impl Session {
             library_rename: None,
             layer_rename: None,
             timeline_layer_drag: None,
+            timeline_frame_drag: None,
             playing: false,
             last_tick: Instant::now(),
             status: "ready".to_string(),
@@ -592,6 +645,8 @@ impl Session {
             self.current_frame = self.current_frame.min(q.frame_count.saturating_sub(1));
             if previous_q0rg_id != self.current_q0rg_id {
                 self.timeline_selection = None;
+                self.timeline_layer_selection = None;
+                self.timeline_frame_drag = None;
             } else if let Some(selection) = self.timeline_selection {
                 let layers_exist = q
                     .layers
@@ -608,6 +663,41 @@ impl Session {
             }
         } else {
             self.timeline_selection = None;
+        }
+        if self.timeline_layer_selection.is_some_and(|selection| {
+            !project
+                .q0rgs
+                .iter()
+                .find(|q0rg| q0rg.q0rg_id == self.current_q0rg_id)
+                .is_some_and(|q0rg| {
+                    q0rg.layers
+                        .iter()
+                        .any(|layer| layer.layer_id == selection.anchor_layer_id)
+                        && q0rg
+                            .layers
+                            .iter()
+                            .any(|layer| layer.layer_id == selection.focus_layer_id)
+                })
+        }) {
+            self.timeline_layer_selection = None;
+        }
+        if self.timeline_frame_drag.is_some_and(|drag| {
+            drag.q0rg_id != self.current_q0rg_id
+                || !project
+                    .q0rgs
+                    .iter()
+                    .find(|q0rg| q0rg.q0rg_id == drag.q0rg_id)
+                    .is_some_and(|q0rg| {
+                        q0rg.layers
+                            .iter()
+                            .any(|layer| layer.layer_id == drag.selection.anchor_layer_id)
+                            && q0rg
+                                .layers
+                                .iter()
+                                .any(|layer| layer.layer_id == drag.selection.focus_layer_id)
+                    })
+        }) {
+            self.timeline_frame_drag = None;
         }
         if self.timeline_layer_drag.is_some_and(|drag| {
             drag.q0rg_id != self.current_q0rg_id

@@ -38,6 +38,7 @@ pub fn capture_clipboard(project: &ProjectV2, selection: &Selection) -> Clipboar
     ClipboardPayload {
         placements,
         raw_vectors,
+        timeline: None,
     }
 }
 
