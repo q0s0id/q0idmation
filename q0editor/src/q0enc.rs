@@ -749,8 +749,8 @@ fn export_q0s(
         .map_err(|error| format!("serialize: {error}"))?;
     let parsed = q0s_format::parse_q0s_v2(&bytes)
         .map_err(|error| format!("parse-back before write: {error}"))?;
-    if parsed != *job.snapshot() {
-        return Err("parse-back before write changed the project".to_string());
+    if !q0s_format::v2::wire_equivalent(&parsed, job.snapshot()) {
+        return Err("parse-back before write changed the canonical project".to_string());
     }
     if cancel.load(Ordering::Acquire) {
         return Ok(WorkerOutcome::Cancelled);
@@ -760,8 +760,8 @@ fn export_q0s(
     let reread = std::fs::read(&job.output_path).map_err(|error| format!("reread: {error}"))?;
     let reparsed = q0s_format::parse_q0s_v2(&reread)
         .map_err(|error| format!("parse-back after write: {error}"))?;
-    if reparsed != *job.snapshot() {
-        return Err("written q0s does not match the export snapshot".to_string());
+    if !q0s_format::v2::wire_equivalent(&reparsed, job.snapshot()) {
+        return Err("written q0s does not match the canonical export snapshot".to_string());
     }
     progress(1, 1, "runtime build verified");
     Ok(WorkerOutcome::Completed)
@@ -1580,6 +1580,60 @@ mod tests {
             .expect("parse q0s");
         assert_eq!(parsed.meta.name, "snapshot before edits");
         assert!(matches!(state.queue[0].state, JobState::Completed));
+        std::fs::remove_file(output).expect("cleanup q0s");
+    }
+
+    #[test]
+    fn q0s_job_accepts_equivalent_noncanonical_editor_order() {
+        let mut project = visual_project(8);
+        project.assets.push(Asset::Bitmap(BitmapAsset {
+            asset_id: 2,
+            width: 1,
+            height: 1,
+            rgba: vec![0, 255, 0, 255],
+        }));
+        project.assets.swap(0, 1);
+        let layer = &mut project.q0rgs[0].layers[0];
+        layer.placements.push(Placement {
+            frame: 6,
+            target: Target::Asset(1),
+            transform: Transform2D {
+                tx: 6.0,
+                ..Transform2D::IDENTITY
+            },
+            tween: Tween::None,
+        });
+        layer.placements.swap(0, 1);
+        layer.explicit_keyframes = vec![5, 2];
+
+        let output = unique_output("noncanonical-order").with_extension("q0s");
+        let mut state = Q0EncState::default();
+        state.open_for_project(&project, None);
+        state.output_text = output.display().to_string();
+        state.enqueue(&project).expect("enqueue q0s");
+        state.start_queue();
+        let statuses = wait_for_queue(&mut state);
+
+        assert!(
+            matches!(state.queue[0].state, JobState::Completed),
+            "queue state: {:?}; statuses: {statuses:?}",
+            state.queue[0].state
+        );
+        let parsed = q0s_format::parse_q0s_v2(&std::fs::read(&output).expect("read q0s"))
+            .expect("parse q0s");
+        assert_eq!(
+            parsed.assets.iter().map(Asset::id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            parsed.q0rgs[0].layers[0]
+                .placements
+                .iter()
+                .map(|placement| placement.frame)
+                .collect::<Vec<_>>(),
+            vec![0, 6]
+        );
+        assert_eq!(parsed.q0rgs[0].layers[0].explicit_keyframes, vec![2, 5]);
         std::fs::remove_file(output).expect("cleanup q0s");
     }
 

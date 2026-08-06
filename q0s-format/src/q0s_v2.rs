@@ -188,6 +188,32 @@ mod tests {
     }
 
     #[test]
+    fn current_q0s_roundtrip_accepts_noncanonical_editor_order() {
+        let mut project = small_project();
+        project.assets.push(Asset::Vector(v2::VectorAsset {
+            asset_id: 2,
+            paths: Vec::new(),
+            fill: None,
+            stroke: None,
+        }));
+        project.assets.swap(0, 1);
+        project.q0rgs[0].frame_count = 5;
+        let layer = &mut project.q0rgs[0].layers[0];
+        layer.placements.push(v2::Placement {
+            frame: 4,
+            target: Target::Asset(1),
+            transform: v2::Transform2D::IDENTITY,
+            tween: Tween::None,
+        });
+        layer.placements.swap(0, 1);
+        layer.explicit_keyframes = vec![3, 2];
+
+        let bytes = write_q0s_v2(&project).expect("write noncanonical q0s");
+        let parsed = parse_q0s_v2(&bytes).expect("parse noncanonical q0s");
+        assert_eq!(parsed, v2::canonicalized_for_wire(&project));
+    }
+
+    #[test]
     fn current_player_parser_still_reads_q0s_v6_q0v_assets() {
         let mut project = small_project();
         project.assets.clear();

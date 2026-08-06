@@ -4,7 +4,9 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use q0s_format::v2::{parse as parse_v2, write as write_v2, ProjectV2, Q1S_V2_MAGIC};
+use q0s_format::v2::{
+    parse as parse_v2, wire_equivalent, write as write_v2, ProjectV2, Q1S_V2_MAGIC,
+};
 use q0s_format::{migrate_v1_to_v2, parse_q1s, Q1S_MAGIC};
 
 pub const Q1S_EXTENSION: &str = "q1s";
@@ -87,7 +89,12 @@ pub fn save_project(path: &Path, project: &ProjectV2) -> Result<(), FileError> {
     // Do not put bytes on disk unless the writer's result can be parsed back
     // as a complete project. The staged file is also read back byte-for-byte
     // by `write_bytes_atomic` before it may replace the current project.
-    parse_v2(&bytes)?;
+    let parsed = parse_v2(&bytes)?;
+    if !wire_equivalent(&parsed, project) {
+        return Err(FileError::Format(q0s_format::Error::Validation(
+            "q1s parse-back changed the canonical project",
+        )));
+    }
     write_bytes_atomic(path, &bytes)?;
     Ok(())
 }
@@ -350,6 +357,58 @@ mod tests {
             1,
             "the destination should be the only file left"
         );
+    }
+
+    #[test]
+    fn save_project_accepts_noncanonical_order_but_verifies_all_content() {
+        let dir = TestDir::new("canonical-save");
+        let path = dir.0.join("project.q1s");
+        let mut project = default_project();
+        project
+            .assets
+            .push(q0s_format::v2::Asset::Vector(q0s_format::v2::VectorAsset {
+                asset_id: 2,
+                paths: Vec::new(),
+                fill: None,
+                stroke: None,
+            }));
+        project
+            .assets
+            .push(q0s_format::v2::Asset::Vector(q0s_format::v2::VectorAsset {
+                asset_id: 1,
+                paths: Vec::new(),
+                fill: None,
+                stroke: None,
+            }));
+        project.q0rgs[0].frame_count = 5;
+        project.q0rgs[0].layers[0].placements = vec![
+            q0s_format::v2::Placement {
+                frame: 4,
+                target: q0s_format::v2::Target::Asset(1),
+                transform: q0s_format::v2::Transform2D::IDENTITY,
+                tween: q0s_format::v2::Tween::None,
+            },
+            q0s_format::v2::Placement {
+                frame: 0,
+                target: q0s_format::v2::Target::Asset(2),
+                transform: q0s_format::v2::Transform2D::IDENTITY,
+                tween: q0s_format::v2::Tween::None,
+            },
+        ];
+        project.q0rgs[0].layers[0].explicit_keyframes = vec![3, 2];
+
+        save_project(&path, &project).expect("save noncanonical project");
+        let loaded = load_project(&path).expect("load canonical save");
+        assert!(wire_equivalent(&loaded, &project));
+        assert_eq!(
+            loaded
+                .assets
+                .iter()
+                .map(q0s_format::v2::Asset::id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(loaded.q0rgs[0].layers[0].explicit_keyframes, vec![2, 3]);
     }
 
     #[test]

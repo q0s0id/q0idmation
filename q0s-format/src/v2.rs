@@ -1,4 +1,4 @@
-//! .q1s format v2/v3 — vector shapes + recursive q0rg (MovieClip) symbols.
+//! .q1s format v2/v3 Р Р†Р вЂљРІР‚Сњ vector shapes + recursive q0rg (MovieClip) symbols.
 //!
 //! Binary layout (little-endian):
 //!
@@ -20,8 +20,8 @@
 //!     [2]   q0rg_id, [2+N] name, [2] frame_count, [2+N] script, [2] layer_count
 //!     layers[layer_count]: [2] layer_id, [2+N] name, [2] placement_count,
 //!       placements[]: [2] frame, [1] target_kind, [2] target_id,
-//!         v2: transform [20]: tx ty sx sy rot (5 × f32)
-//!         v3+: transform [28]: tx ty sx sy rot skew_x skew_y (7 × f32)
+//!         v2: transform [20]: tx ty sx sy rot (5 Р вЂњРІР‚вЂќ f32)
+//!         v3+: transform [28]: tx ty sx sy rot skew_x skew_y (7 Р вЂњРІР‚вЂќ f32)
 //!         tween: [1] kind (0=none, 1=linear, 2=eased), [2 if motion] to_frame,
 //!           v8 eased: [1] easing kind + payload
 //!       v4+: [2] explicit_keyframe_count, explicit_keyframes[]: [2] frame
@@ -103,7 +103,7 @@ pub struct Stroke {
     pub width: f32,
     /// Cap shape applied to open paths' endpoints. On-disk the field is
     /// optional (legacy strokes default to `Round`) so old files still
-    /// load — see the `flag == 1` vs `flag == 2` branches in the
+    /// load Р Р†Р вЂљРІР‚Сњ see the `flag == 1` vs `flag == 2` branches in the
     /// parser/writer.
     pub cap: crate::geom::CapShape,
 }
@@ -554,6 +554,89 @@ pub struct ProjectV2 {
     /// ordinary top-level layers, preserving legacy project behaviour.
     pub layer_metadata: HashMap<LayerKey, LayerMetadata>,
     pub q0rgs: Vec<Q0rg>,
+}
+
+/// Return the exact deterministic ordering used by the current q1s/q0s writer.
+///
+/// Asset ids, q0rg ids, placement frame groups, and explicit keyframe markers
+/// have no cross-group ordering semantics in the file format. Layer order and
+/// the relative order of placements on the same frame remain untouched because
+/// they affect rendering.
+#[cfg(test)]
+pub(crate) fn canonicalized_for_wire(project: &ProjectV2) -> ProjectV2 {
+    let mut canonical = project.clone();
+    canonical.assets.sort_by_key(Asset::id);
+    canonical.q0rgs.sort_by_key(|q0rg| q0rg.q0rg_id);
+    for q0rg in &mut canonical.q0rgs {
+        for layer in &mut q0rg.layers {
+            layer.placements.sort_by_key(|placement| placement.frame);
+            layer.explicit_keyframes.sort_unstable();
+        }
+    }
+    canonical
+}
+
+/// Compare two projects exactly as the current q1s/q0s wire format represents
+/// them, without cloning embedded bitmap or q0v payloads.
+pub fn wire_equivalent(left: &ProjectV2, right: &ProjectV2) -> bool {
+    if left.meta != right.meta
+        || left.asset_names != right.asset_names
+        || left.layer_metadata != right.layer_metadata
+        || left.assets.len() != right.assets.len()
+        || left.q0rgs.len() != right.q0rgs.len()
+    {
+        return false;
+    }
+
+    let mut left_assets = left.assets.iter().collect::<Vec<_>>();
+    let mut right_assets = right.assets.iter().collect::<Vec<_>>();
+    left_assets.sort_by_key(|asset| asset.id());
+    right_assets.sort_by_key(|asset| asset.id());
+    if left_assets != right_assets {
+        return false;
+    }
+
+    let mut left_q0rgs = left.q0rgs.iter().collect::<Vec<_>>();
+    let mut right_q0rgs = right.q0rgs.iter().collect::<Vec<_>>();
+    left_q0rgs.sort_by_key(|q0rg| q0rg.q0rg_id);
+    right_q0rgs.sort_by_key(|q0rg| q0rg.q0rg_id);
+    for (left_q0rg, right_q0rg) in left_q0rgs.into_iter().zip(right_q0rgs) {
+        if left_q0rg.q0rg_id != right_q0rg.q0rg_id
+            || left_q0rg.name != right_q0rg.name
+            || left_q0rg.frame_count != right_q0rg.frame_count
+            || left_q0rg.script != right_q0rg.script
+            || left_q0rg.layers.len() != right_q0rg.layers.len()
+        {
+            return false;
+        }
+
+        for (left_layer, right_layer) in left_q0rg.layers.iter().zip(&right_q0rg.layers) {
+            if left_layer.layer_id != right_layer.layer_id
+                || left_layer.name != right_layer.name
+                || left_layer.placements.len() != right_layer.placements.len()
+                || left_layer.explicit_keyframes.len() != right_layer.explicit_keyframes.len()
+            {
+                return false;
+            }
+
+            let mut left_keyframes = left_layer.explicit_keyframes.clone();
+            let mut right_keyframes = right_layer.explicit_keyframes.clone();
+            left_keyframes.sort_unstable();
+            right_keyframes.sort_unstable();
+            if left_keyframes != right_keyframes {
+                return false;
+            }
+
+            let mut left_placements = left_layer.placements.iter().collect::<Vec<_>>();
+            let mut right_placements = right_layer.placements.iter().collect::<Vec<_>>();
+            left_placements.sort_by_key(|placement| placement.frame);
+            right_placements.sort_by_key(|placement| placement.frame);
+            if left_placements != right_placements {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 impl ProjectV2 {
@@ -1340,7 +1423,7 @@ fn parse_asset(c: &mut Cursor, version: u16) -> Result<(Asset, Option<String>), 
             };
             let stroke = match c.read_u8()? {
                 0 => None,
-                // Legacy (pre-cap) stroke — implicit round cap.
+                // Legacy (pre-cap) stroke Р Р†Р вЂљРІР‚Сњ implicit round cap.
                 1 => {
                     let bytes = c.read_exact(4)?;
                     let color = Rgba {
@@ -1606,6 +1689,83 @@ mod compatibility_tests {
     }
 
     #[test]
+    fn wire_canonicalization_matches_current_q1s_roundtrip() {
+        let mut project = legacy_project();
+        project.assets.push(Asset::Vector(VectorAsset {
+            asset_id: 2,
+            paths: Vec::new(),
+            fill: None,
+            stroke: None,
+        }));
+        project.assets.swap(0, 1);
+        project.q0rgs[0].frame_count = 4;
+        let layer = &mut project.q0rgs[0].layers[0];
+        layer.placements.push(Placement {
+            frame: 3,
+            target: Target::Asset(1),
+            transform: Transform2D::IDENTITY,
+            tween: Tween::None,
+        });
+        layer.placements.swap(0, 1);
+        layer.explicit_keyframes = vec![2, 1];
+
+        let bytes = write(&project).expect("write current q1s");
+        let parsed = parse(&bytes).expect("parse current q1s");
+        assert_eq!(parsed, canonicalized_for_wire(&project));
+    }
+
+    #[test]
+    fn wire_canonicalization_preserves_same_frame_display_order() {
+        let mut project = legacy_project();
+        project.assets.push(Asset::Vector(VectorAsset {
+            asset_id: 2,
+            paths: Vec::new(),
+            fill: None,
+            stroke: None,
+        }));
+        let layer = &mut project.q0rgs[0].layers[0];
+        layer.placements = vec![
+            Placement {
+                frame: 2,
+                target: Target::Asset(1),
+                transform: Transform2D::IDENTITY,
+                tween: Tween::None,
+            },
+            Placement {
+                frame: 0,
+                target: Target::Asset(2),
+                transform: Transform2D::IDENTITY,
+                tween: Tween::None,
+            },
+            Placement {
+                frame: 0,
+                target: Target::Asset(1),
+                transform: Transform2D::IDENTITY,
+                tween: Tween::None,
+            },
+        ];
+        project.q0rgs[0].frame_count = 3;
+
+        let canonical = canonicalized_for_wire(&project);
+        assert!(wire_equivalent(&project, &canonical));
+        let targets = canonical.q0rgs[0].layers[0]
+            .placements
+            .iter()
+            .map(|placement| placement.target)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            targets,
+            vec![Target::Asset(2), Target::Asset(1), Target::Asset(1)]
+        );
+
+        let mut reordered_same_frame = canonical.clone();
+        reordered_same_frame.q0rgs[0].layers[0]
+            .placements
+            .swap(0, 1);
+        assert!(!wire_equivalent(&canonical, &reordered_same_frame));
+    }
+
+    #[test]
     fn current_parser_still_reads_q1s_v4_blank_keyframes() {
         let mut project = legacy_project();
         project.q0rgs[0].layers[0].explicit_keyframes.push(1);
@@ -1721,9 +1881,10 @@ mod compatibility_tests {
             asset_id: 7,
             bytes: test_q0v_bytes(),
         }));
-        project
-            .asset_names
-            .insert(7, "reference / видео".to_string());
+        project.asset_names.insert(
+            7,
+            "reference / Р В Р вЂ Р В РЎвЂР В РўвЂР В Р’ВµР В РЎвЂў".to_string(),
+        );
         project.q0rgs[0].layers[0].placements[0].target = Target::Asset(7);
 
         let bytes = write(&project).expect("write q0v project");
