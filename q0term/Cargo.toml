@@ -1,0 +1,13 @@
+[package]
+name = "q0term"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "q0term"
+path = "src/main.rs"
+
+[dependencies]
+q0shell = { path = "../q0shell" }
+eframe = "0.27"
+egui = "0.27"

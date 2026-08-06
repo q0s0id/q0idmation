@@ -1,0 +1,20 @@
+# q0lang basic example
+
+import q0.core
+import q0.timeline
+import q0.mouse
+import q0.math
+
+start = 2
+title = "Intro"
+beat = sin(pi / 2) * 4
+
+listen mouse.click onClick
+
+pb func onClick target
+pr func cacheFrame frame
+
+do! {
+  current = start + beat
+  gostop! current
+}

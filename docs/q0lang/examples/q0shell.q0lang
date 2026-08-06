@@ -1,0 +1,15 @@
+# q0shell basic filesystem example
+
+import q0shell
+import q0.math
+
+slot = round(sin(pi / 2) * 7)
+path = "out/" + "slot-" + slot + ".txt"
+
+q0shell.print! "q0shell online"
+q0shell.mkdir! "out"
+q0shell.write! path, "Q0S"
+q0shell.append! path, "\nterminal host\n"
+q0shell.read! path
+q0shell.move! path, "out/done.txt"
+q0shell.list! "out"

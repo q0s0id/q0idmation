@@ -1,0 +1,4 @@
+[workspace]
+members = ["q0credits", "q0icon", "q0theme", "q0s-format", "q0video", "q0player", "q0editor", "q0shell", "q0term"]
+resolver = "2"
+

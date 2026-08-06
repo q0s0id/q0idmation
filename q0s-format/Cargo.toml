@@ -1,0 +1,8 @@
+[package]
+name = "q0s-format"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+q0video = { path = "../q0video" }
+

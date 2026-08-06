@@ -1,0 +1,30 @@
+[package]
+name = "q0editor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+q0credits = { path = "../q0credits" }
+eframe = "0.27"
+egui = "0.27"
+q0s-format = { path = "../q0s-format" }
+q0video = { path = "../q0video" }
+q0theme = { path = "../q0theme" }
+rfd = "0.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+geo = "0.33"
+lyon_path = "1"
+lyon_tessellation = "1"
+image = { version = "0.24.9", default-features = false, features = ["png", "jpeg", "webp"] }
+gif = "0.13"
+
+[build-dependencies]
+q0icon = { path = "../q0icon" }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"

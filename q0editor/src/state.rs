@@ -1,0 +1,1074 @@
+use std::path::PathBuf;
+use std::time::Instant;
+
+pub use q0s_format::geom::CapShape;
+use q0s_format::v2::{
+    Anchor, Layer, Path as VPath, Placement, ProjectMeta, ProjectV2, Q0rg, Rgba, Transform2D, Vec2,
+    VectorAsset,
+};
+
+use crate::brush::{BrushSettings, BrushStroke};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibraryItem {
+    Q0rg(u16),
+    Asset(u16),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryRename {
+    pub item: LibraryItem,
+    pub draft: String,
+    pub focus_requested: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerRename {
+    pub q0rg_id: u16,
+    pub layer_id: u16,
+    pub draft: String,
+    pub focus_requested: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimelineLayerDrag {
+    pub q0rg_id: u16,
+    pub layer_id: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tool {
+    Select,
+    Hand,
+    Subselect,
+    Pen,
+    Pencil,
+    Brush,
+    Eraser,
+    Line,
+    Rectangle,
+    Oval,
+    Bucket,
+    Eyedropper,
+}
+
+impl Tool {
+    pub const ALL: [Tool; 12] = [
+        Tool::Select,
+        Tool::Hand,
+        Tool::Subselect,
+        Tool::Pen,
+        Tool::Pencil,
+        Tool::Brush,
+        Tool::Eraser,
+        Tool::Line,
+        Tool::Rectangle,
+        Tool::Oval,
+        Tool::Bucket,
+        Tool::Eyedropper,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Tool::Select => "Select",
+            Tool::Hand => "Hand",
+            Tool::Subselect => "Subselect",
+            Tool::Pen => "Pen",
+            Tool::Pencil => "Pencil",
+            Tool::Brush => "Brush",
+            Tool::Eraser => "Eraser",
+            Tool::Line => "Line",
+            Tool::Rectangle => "Rectangle",
+            Tool::Oval => "Oval",
+            Tool::Bucket => "Recolor Fill",
+            Tool::Eyedropper => "Eyedropper",
+        }
+    }
+
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Tool::Select => "V",
+            Tool::Hand => "H",
+            Tool::Subselect => "A",
+            Tool::Pen => "P",
+            Tool::Pencil => "Y",
+            Tool::Brush => "B",
+            Tool::Eraser => "E",
+            Tool::Line => "N",
+            Tool::Rectangle => "R",
+            Tool::Oval => "O",
+            Tool::Bucket => "K",
+            Tool::Eyedropper => "I",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlacementRef {
+    pub q0rg_id: u16,
+    pub layer_id: u16,
+    pub placement_idx: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PathRef {
+    pub q0rg_id: u16,
+    pub layer_id: u16,
+    pub placement_idx: usize,
+    pub path_idx: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Selection {
+    None,
+    Asset(u16),
+    Q0rg(u16),
+    Placement {
+        q0rg_id: u16,
+        layer_id: u16,
+        placement_idx: usize,
+    },
+    /// One editable raw-graphics contour inside a vector placement. Flash
+    /// treats fills/lines as selectable pieces even though they share one
+    /// drawing surface; this preserves that distinction without turning each
+    /// brush gesture into a separate display object.
+    Path {
+        q0rg_id: u16,
+        layer_id: u16,
+        placement_idx: usize,
+        path_idx: usize,
+    },
+    /// Marquee selection of several raw-graphics contours. They can share one
+    /// Placement/asset; selection still remains path-granular.
+    Paths(Vec<PathRef>),
+    /// V-tool marquee selection of only part of one raw contour. The selected
+    /// boundary anchors move together and reshape the fill, matching Animate's
+    /// partial raw-shape selection rather than Subselect's whole-path editing.
+    PathPoints {
+        path: PathRef,
+        anchor_indices: Vec<usize>,
+        bounds_min: Vec2,
+        bounds_max: Vec2,
+    },
+    /// Non-destructive V marquee over one or more raw drawing surfaces.
+    /// Geometry is not split until the user actually drags the selection.
+    RawArea {
+        /// Identity raw drawing surfaces intersected by the marquee.
+        placements: Vec<PlacementRef>,
+        /// Display objects intersected by the same marquee.
+        objects: Vec<PlacementRef>,
+        bounds_min: Vec2,
+        bounds_max: Vec2,
+    },
+    /// Marquee result: 2+ placements selected at once. Single-element marquee
+    /// hits collapse back to `Selection::Placement` so existing single-select
+    /// code paths keep working unchanged.
+    Multi(Vec<PlacementRef>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimelineSelection {
+    pub anchor_layer_id: u16,
+    pub anchor_frame: u16,
+    pub focus_layer_id: u16,
+    pub focus_frame: u16,
+}
+
+impl TimelineSelection {
+    pub const fn single(layer_id: u16, frame: u16) -> Self {
+        Self {
+            anchor_layer_id: layer_id,
+            anchor_frame: frame,
+            focus_layer_id: layer_id,
+            focus_frame: frame,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ClipboardPayload {
+    /// Display-object placements. Targets remain project-local, matching the
+    /// old clipboard contract, while transforms and ordering are preserved.
+    pub placements: Vec<Placement>,
+    /// Standalone raw vector snapshots. Paste assigns fresh asset ids and
+    /// keeps them as identity raw-graphics placements.
+    pub raw_vectors: Vec<VectorAsset>,
+}
+
+impl ClipboardPayload {
+    pub fn is_empty(&self) -> bool {
+        self.placements.is_empty() && self.raw_vectors.is_empty()
+    }
+}
+pub struct ProjectState {
+    pub project: ProjectV2,
+    pub file_path: Option<PathBuf>,
+    pub dirty: bool,
+}
+
+impl ProjectState {
+    pub fn new_default() -> Self {
+        Self {
+            project: default_project(),
+            file_path: None,
+            dirty: false,
+        }
+    }
+
+    pub fn replace(&mut self, project: ProjectV2, path: Option<PathBuf>) {
+        self.project = project;
+        self.file_path = path;
+        self.dirty = false;
+    }
+
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    pub fn title(&self) -> String {
+        let path = self
+            .file_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("{} (untitled)", self.project.meta.name));
+        let dirty = if self.dirty { "*" } else { "" };
+        format!("{}{} - q0editor", dirty, truncate_label(&path, 72))
+    }
+}
+
+fn truncate_label(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(3);
+    let mut shortened: String = text.chars().take(keep).collect();
+    shortened.push_str("...");
+    shortened
+}
+
+/// Identifies one of the 8 transform handles around a selection bounding box.
+/// Corner handles resize both axes; edge handles resize one axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Handle {
+    TopLeft,
+    TopRight,
+    BottomRight,
+    BottomLeft,
+    MidTop,
+    MidRight,
+    MidBottom,
+    MidLeft,
+}
+
+impl Handle {
+    pub fn is_corner(self) -> bool {
+        matches!(
+            self,
+            Handle::TopLeft | Handle::TopRight | Handle::BottomRight | Handle::BottomLeft
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransformEdge {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
+#[derive(Debug, Clone)]
+pub enum ToolState {
+    Idle,
+    PenDrawing {
+        anchors: Vec<Anchor>,
+    },
+    FreehandDrawing {
+        points: Vec<Vec2>,
+    },
+    BrushDrawing {
+        stroke: BrushStroke,
+    },
+    EraserDrawing {
+        stroke: BrushStroke,
+    },
+    PrimitiveDrawing {
+        start: Vec2,
+        end: Vec2,
+    },
+    DraggingPlacement {
+        q0rg_id: u16,
+        layer_id: u16,
+        placement_idx: usize,
+        cursor_offset: Vec2,
+    },
+    /// Move one raw vector contour without moving the containing Placement.
+    DraggingPath {
+        q0rg_id: u16,
+        layer_id: u16,
+        placement_idx: usize,
+        path_idx: usize,
+        start_cursor: Vec2,
+        start_path: VPath,
+    },
+    DraggingPaths {
+        refs: Vec<PathRef>,
+        start_cursor: Vec2,
+        start_paths: Vec<VPath>,
+    },
+    /// Axis-scale one connected raw-graphics selection without turning the
+    /// containing raw placement into a selectable display object.
+    DraggingRawHandle {
+        refs: Vec<PathRef>,
+        start_paths: Vec<VPath>,
+        handle: Handle,
+        start_bounds: (f32, f32, f32, f32),
+    },
+    DraggingRawRotate {
+        refs: Vec<PathRef>,
+        start_paths: Vec<VPath>,
+        center: Vec2,
+        start_angle: f32,
+    },
+    DraggingRawSkew {
+        refs: Vec<PathRef>,
+        start_paths: Vec<VPath>,
+        edge: TransformEdge,
+        start_bounds: (f32, f32, f32, f32),
+        start_cursor: Vec2,
+    },
+    DraggingPathPoints {
+        path: PathRef,
+        anchor_indices: Vec<usize>,
+        start_cursor: Vec2,
+        start_path: VPath,
+        start_bounds_min: Vec2,
+        start_bounds_max: Vec2,
+    },
+    /// Active while the user drags a transform handle around the selection.
+    /// `start_*` snapshots are captured on drag-start so each frame's update
+    /// can be computed from the original geometry, not the previous tick.
+    DraggingHandle {
+        q0rg_id: u16,
+        layer_id: u16,
+        placement_idx: usize,
+        handle: Handle,
+        start_transform: Transform2D,
+        /// Local-space AABB of the placement's content (asset / q0rg).
+        start_local_bbox: (f32, f32, f32, f32),
+        /// World-space AABB at drag start (kept for compatibility/status).
+        start_world_bbox: (f32, f32, f32, f32),
+    },
+    DraggingPlacementRotate {
+        q0rg_id: u16,
+        layer_id: u16,
+        placement_idx: usize,
+        start_transform: Transform2D,
+        center_local: Vec2,
+        center_world: Vec2,
+        start_angle: f32,
+    },
+    DraggingPlacementSkew {
+        q0rg_id: u16,
+        layer_id: u16,
+        placement_idx: usize,
+        edge: TransformEdge,
+        start_transform: Transform2D,
+        start_local_bbox: (f32, f32, f32, f32),
+        start_cursor_local: Vec2,
+    },
+    /// Rubber-band rectangle from `start` to the current cursor position.
+    /// Active while the user drags Select tool over empty stage. On drag-stop
+    /// the rect's contents are committed as a `Selection::Placement` (single
+    /// hit) or `Selection::Multi` (2+ hits).
+    Marquee {
+        start: Vec2,
+    },
+}
+
+impl ToolState {
+    pub fn is_drawing(&self) -> bool {
+        matches!(
+            self,
+            ToolState::PenDrawing { .. }
+                | ToolState::FreehandDrawing { .. }
+                | ToolState::BrushDrawing { .. }
+                | ToolState::EraserDrawing { .. }
+                | ToolState::PrimitiveDrawing { .. }
+        )
+    }
+}
+
+/// Onion-skin display settings. When `enabled`, the stage renders the
+/// `before` previous frames and `after` subsequent frames of the current
+/// q0rg semi-transparently behind/over the live frame, like Flash's
+/// "Onion Skin" toggle. Counts capped at 6 each side Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ past that the
+/// display is just visual noise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnionSettings {
+    pub enabled: bool,
+    pub before: u8,
+    pub after: u8,
+}
+
+impl Default for OnionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            before: 2,
+            after: 2,
+        }
+    }
+}
+
+/// Stage viewport: zoom is a multiplier on top of the auto-fit scale (1.0 = fit
+/// to canvas), pan is a screen-space offset in pixels relative to the canvas
+/// centre.  `panning` flips on while the user holds middle mouse to drag.
+#[derive(Debug, Clone, Copy)]
+pub struct Viewport {
+    pub zoom: f32,
+    pub pan: Vec2,
+    pub panning: bool,
+    /// Active hand interaction: permanent Hand tool or temporary Space override.
+    pub hand_active: bool,
+}
+
+impl Viewport {
+    pub fn identity() -> Self {
+        Self {
+            zoom: 1.0,
+            pan: Vec2::new(0.0, 0.0),
+            panning: false,
+            hand_active: false,
+        }
+    }
+}
+
+impl Default for Viewport {
+    fn default() -> Self {
+        Self::identity()
+    }
+}
+
+pub struct Session {
+    pub current_q0rg_id: u16,
+    pub current_layer_id: u16,
+    pub current_frame: u16,
+    /// Rectangular frame-cell selection in the timeline, separate from stage selection.
+    pub timeline_selection: Option<TimelineSelection>,
+    pub current_tool: Tool,
+    pub tool_state: ToolState,
+    pub selection: Selection,
+    pub breadcrumb: Vec<u16>,
+    /// Transient Library-panel filter and sort state.
+    pub library_search: String,
+    pub library_sort_ascending: bool,
+    pub library_rename: Option<LibraryRename>,
+    pub layer_rename: Option<LayerRename>,
+    pub timeline_layer_drag: Option<TimelineLayerDrag>,
+    pub playing: bool,
+    pub last_tick: Instant,
+    pub status: String,
+    pub stroke_color: Rgba,
+    pub stroke_width: f32,
+    pub fill_color: Option<Rgba>,
+    pub brush: BrushSettings,
+    /// Independent classic eraser size while brush/eraser sync is disabled.
+    pub eraser_size: f32,
+    /// Cap shape applied to brush strokes when committing them, and to
+    /// strokeР В Р вЂ Р Р†Р вЂљР’В Р Р†Р вЂљРІвЂћСћfill conversions in the right-click menu. Per-session, so
+    /// the user picks once and forgets.
+    pub brush_cap: CapShape,
+    pub show_credits: bool,
+    pub credits_opened_at: Instant,
+    pub show_settings: bool,
+    pub viewport: Viewport,
+    /// Clipboard for display objects, raw graphics, or a mixed selection.
+    pub clipboard: Option<ClipboardPayload>,
+    pub onion: OnionSettings,
+    /// True while the q0lang script editor window is open. Driven by
+    /// `Action::OpenQ0langEditor` / the close button on the window itself.
+    pub show_q0lang_editor: bool,
+    /// Which q0rg's `script` field the editor is bound to. `None` falls
+    /// back to `current_q0rg_id` when the window opens, so F9 always does
+    /// the right thing without first selecting a q0rg.
+    pub q0lang_target: Option<u16>,
+    /// "Armed" = the next script-text mutation should snapshot history.
+    /// Flips on whenever the script TextEdit gains focus (start of a new
+    /// edit session) and back off after the first snapshot, so a long
+    /// burst of typing collapses to a single undo entry.
+    pub q0lang_edit_armed: bool,
+}
+
+impl Session {
+    pub fn for_project(project: &ProjectV2) -> Self {
+        let entry = project.meta.entry_q0rg_id;
+        let layer_id = project
+            .q0rgs
+            .iter()
+            .find(|q| q.q0rg_id == entry)
+            .and_then(|q| {
+                q.layers
+                    .iter()
+                    .find(|layer| !project.layer_is_folder(entry, layer.layer_id))
+                    .or_else(|| q.layers.first())
+            })
+            .map(|layer| layer.layer_id)
+            .unwrap_or(1);
+        Self {
+            current_q0rg_id: entry,
+            current_layer_id: layer_id,
+            current_frame: 0,
+            timeline_selection: None,
+            current_tool: Tool::Select,
+            tool_state: ToolState::Idle,
+            selection: Selection::None,
+            breadcrumb: Vec::new(),
+            library_search: String::new(),
+            library_sort_ascending: true,
+            library_rename: None,
+            layer_rename: None,
+            timeline_layer_drag: None,
+            playing: false,
+            last_tick: Instant::now(),
+            status: "ready".to_string(),
+            stroke_color: Rgba {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255,
+            },
+            stroke_width: 1.0,
+            fill_color: None,
+            brush: BrushSettings::default(),
+            eraser_size: 18.0,
+            brush_cap: CapShape::Round,
+            show_credits: false,
+            credits_opened_at: Instant::now(),
+            show_settings: false,
+            viewport: Viewport::identity(),
+            clipboard: None,
+            onion: OnionSettings::default(),
+            show_q0lang_editor: false,
+            q0lang_target: None,
+            q0lang_edit_armed: true,
+        }
+    }
+
+    /// Make sure cached selectors still point at valid model state. Called after
+    /// undo/redo Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the project might have lost q0rgs, layers, placements etc.
+    pub fn reconcile_with(&mut self, project: &ProjectV2) {
+        let previous_q0rg_id = self.current_q0rg_id;
+        self.breadcrumb
+            .retain(|id| project.q0rgs.iter().any(|q0rg| q0rg.q0rg_id == *id));
+        if !project
+            .q0rgs
+            .iter()
+            .any(|q| q.q0rg_id == self.current_q0rg_id)
+        {
+            self.current_q0rg_id = project.meta.entry_q0rg_id;
+            self.breadcrumb.clear();
+        }
+        if let Some(q) = project
+            .q0rgs
+            .iter()
+            .find(|q| q.q0rg_id == self.current_q0rg_id)
+        {
+            if !q
+                .layers
+                .iter()
+                .any(|layer| layer.layer_id == self.current_layer_id)
+            {
+                self.current_layer_id = q
+                    .layers
+                    .iter()
+                    .find(|layer| !project.layer_is_folder(q.q0rg_id, layer.layer_id))
+                    .or_else(|| q.layers.first())
+                    .map(|layer| layer.layer_id)
+                    .unwrap_or(1);
+            }
+            self.current_frame = self.current_frame.min(q.frame_count.saturating_sub(1));
+            if previous_q0rg_id != self.current_q0rg_id {
+                self.timeline_selection = None;
+            } else if let Some(selection) = self.timeline_selection {
+                let layers_exist = q
+                    .layers
+                    .iter()
+                    .any(|layer| layer.layer_id == selection.anchor_layer_id)
+                    && q.layers
+                        .iter()
+                        .any(|layer| layer.layer_id == selection.focus_layer_id);
+                let frames_exist =
+                    selection.anchor_frame < q.frame_count && selection.focus_frame < q.frame_count;
+                if !layers_exist || !frames_exist {
+                    self.timeline_selection = None;
+                }
+            }
+        } else {
+            self.timeline_selection = None;
+        }
+        if self.timeline_layer_drag.is_some_and(|drag| {
+            drag.q0rg_id != self.current_q0rg_id
+                || !project
+                    .q0rgs
+                    .iter()
+                    .find(|q0rg| q0rg.q0rg_id == drag.q0rg_id)
+                    .is_some_and(|q0rg| {
+                        q0rg.layers
+                            .iter()
+                            .any(|layer| layer.layer_id == drag.layer_id)
+                    })
+        }) {
+            self.timeline_layer_drag = None;
+        }
+        match self.selection {
+            Selection::Asset(id) => {
+                if !project.assets.iter().any(|a| a.id() == id) {
+                    self.selection = Selection::None;
+                }
+            }
+            Selection::Q0rg(id) => {
+                if !project.q0rgs.iter().any(|q| q.q0rg_id == id) {
+                    self.selection = Selection::None;
+                }
+            }
+            Selection::Placement {
+                q0rg_id,
+                layer_id,
+                placement_idx,
+            } => {
+                let exists = project
+                    .q0rgs
+                    .iter()
+                    .find(|q| q.q0rg_id == q0rg_id)
+                    .and_then(|q| q.layers.iter().find(|l| l.layer_id == layer_id))
+                    .and_then(|l| l.placements.get(placement_idx))
+                    .is_some();
+                if !exists {
+                    self.selection = Selection::None;
+                }
+            }
+            Selection::Path {
+                q0rg_id,
+                layer_id,
+                placement_idx,
+                path_idx,
+            } => {
+                let exists = project
+                    .q0rgs
+                    .iter()
+                    .find(|q| q.q0rg_id == q0rg_id)
+                    .and_then(|q| q.layers.iter().find(|l| l.layer_id == layer_id))
+                    .and_then(|l| l.placements.get(placement_idx))
+                    .and_then(|placement| match placement.target {
+                        q0s_format::v2::Target::Asset(asset_id) => {
+                            project.assets.iter().find(|asset| asset.id() == asset_id)
+                        }
+                        q0s_format::v2::Target::Q0rg(_) => None,
+                    })
+                    .and_then(|asset| match asset {
+                        q0s_format::v2::Asset::Vector(vector) => vector.paths.get(path_idx),
+                        q0s_format::v2::Asset::Bitmap(_) | q0s_format::v2::Asset::Q0v(_) => None,
+                    })
+                    .is_some();
+                if !exists {
+                    self.selection = Selection::None;
+                }
+            }
+            Selection::Paths(ref refs) => {
+                let kept: Vec<PathRef> = refs
+                    .iter()
+                    .copied()
+                    .filter(|r| path_ref_exists(project, *r))
+                    .collect();
+                self.selection = collapse_path_refs(kept);
+            }
+            Selection::PathPoints {
+                path,
+                ref mut anchor_indices,
+                ..
+            } => {
+                if !path_ref_exists(project, path) {
+                    self.selection = Selection::None;
+                } else if let Some(anchor_count) = path_anchor_count(project, path) {
+                    anchor_indices.retain(|index| *index < anchor_count);
+                    if anchor_indices.is_empty() {
+                        self.selection = Selection::None;
+                    }
+                }
+            }
+            Selection::RawArea {
+                ref mut placements,
+                ref mut objects,
+                ..
+            } => {
+                let exists = |r: &PlacementRef| {
+                    project
+                        .q0rgs
+                        .iter()
+                        .find(|q| q.q0rg_id == r.q0rg_id)
+                        .and_then(|q| q.layers.iter().find(|layer| layer.layer_id == r.layer_id))
+                        .and_then(|layer| layer.placements.get(r.placement_idx))
+                        .is_some()
+                };
+                placements.retain(&exists);
+                objects.retain(exists);
+                if placements.is_empty() && objects.is_empty() {
+                    self.selection = Selection::None;
+                }
+            }
+            Selection::Multi(ref refs) => {
+                let kept: Vec<PlacementRef> = refs
+                    .iter()
+                    .copied()
+                    .filter(|r| {
+                        project
+                            .q0rgs
+                            .iter()
+                            .find(|q| q.q0rg_id == r.q0rg_id)
+                            .and_then(|q| q.layers.iter().find(|l| l.layer_id == r.layer_id))
+                            .and_then(|l| l.placements.get(r.placement_idx))
+                            .is_some()
+                    })
+                    .collect();
+                self.selection = match kept.len() {
+                    0 => Selection::None,
+                    1 => Selection::Placement {
+                        q0rg_id: kept[0].q0rg_id,
+                        layer_id: kept[0].layer_id,
+                        placement_idx: kept[0].placement_idx,
+                    },
+                    _ => Selection::Multi(kept),
+                };
+            }
+            Selection::None => {}
+        }
+        self.tool_state = ToolState::Idle;
+        self.playing = false;
+        // If the script editor is bound to a now-gone q0rg, clear the
+        // pin and let the next open snap to `current_q0rg_id`.
+        if let Some(id) = self.q0lang_target {
+            if !project.q0rgs.iter().any(|q| q.q0rg_id == id) {
+                self.q0lang_target = None;
+            }
+        }
+        self.clear_inactive_frame_selection(project);
+    }
+
+    pub fn clear_inactive_frame_selection(&mut self, project: &ProjectV2) {
+        let frame = self.current_frame;
+        let current_q0rg_id = self.current_q0rg_id;
+        let placement_on_current_frame = |r: PlacementRef| {
+            r.q0rg_id == current_q0rg_id
+                && project
+                    .q0rgs
+                    .iter()
+                    .find(|q| q.q0rg_id == r.q0rg_id)
+                    .and_then(|q| q.layers.iter().find(|l| l.layer_id == r.layer_id))
+                    .map(|layer| {
+                        crate::render::placement_is_active_at(layer, r.placement_idx, frame)
+                    })
+                    .unwrap_or(false)
+        };
+
+        let next = match self.selection.clone() {
+            Selection::Placement {
+                q0rg_id,
+                layer_id,
+                placement_idx,
+            } => {
+                let r = PlacementRef {
+                    q0rg_id,
+                    layer_id,
+                    placement_idx,
+                };
+                if placement_on_current_frame(r) {
+                    Selection::Placement {
+                        q0rg_id,
+                        layer_id,
+                        placement_idx,
+                    }
+                } else {
+                    Selection::None
+                }
+            }
+            Selection::Path {
+                q0rg_id,
+                layer_id,
+                placement_idx,
+                path_idx,
+            } => {
+                let r = PlacementRef {
+                    q0rg_id,
+                    layer_id,
+                    placement_idx,
+                };
+                if placement_on_current_frame(r) {
+                    Selection::Path {
+                        q0rg_id,
+                        layer_id,
+                        placement_idx,
+                        path_idx,
+                    }
+                } else {
+                    Selection::None
+                }
+            }
+            Selection::Paths(refs) => {
+                let kept: Vec<PathRef> = refs
+                    .into_iter()
+                    .filter(|r| {
+                        placement_on_current_frame(PlacementRef {
+                            q0rg_id: r.q0rg_id,
+                            layer_id: r.layer_id,
+                            placement_idx: r.placement_idx,
+                        }) && path_ref_exists(project, *r)
+                    })
+                    .collect();
+                collapse_path_refs(kept)
+            }
+            Selection::PathPoints {
+                path,
+                anchor_indices,
+                bounds_min,
+                bounds_max,
+            } => {
+                let placement = PlacementRef {
+                    q0rg_id: path.q0rg_id,
+                    layer_id: path.layer_id,
+                    placement_idx: path.placement_idx,
+                };
+                if placement_on_current_frame(placement) && path_ref_exists(project, path) {
+                    Selection::PathPoints {
+                        path,
+                        anchor_indices,
+                        bounds_min,
+                        bounds_max,
+                    }
+                } else {
+                    Selection::None
+                }
+            }
+            Selection::RawArea {
+                placements,
+                objects,
+                bounds_min,
+                bounds_max,
+            } => {
+                let kept_raw: Vec<PlacementRef> = placements
+                    .into_iter()
+                    .filter(|placement| placement_on_current_frame(*placement))
+                    .collect();
+                let kept_objects: Vec<PlacementRef> = objects
+                    .into_iter()
+                    .filter(|placement| placement_on_current_frame(*placement))
+                    .collect();
+                if kept_raw.is_empty() && kept_objects.is_empty() {
+                    Selection::None
+                } else if kept_raw.is_empty() {
+                    match kept_objects.len() {
+                        1 => Selection::Placement {
+                            q0rg_id: kept_objects[0].q0rg_id,
+                            layer_id: kept_objects[0].layer_id,
+                            placement_idx: kept_objects[0].placement_idx,
+                        },
+                        _ => Selection::Multi(kept_objects),
+                    }
+                } else {
+                    Selection::RawArea {
+                        placements: kept_raw,
+                        objects: kept_objects,
+                        bounds_min,
+                        bounds_max,
+                    }
+                }
+            }
+            Selection::Multi(refs) => {
+                let kept: Vec<PlacementRef> = refs
+                    .into_iter()
+                    .filter(|r| placement_on_current_frame(*r))
+                    .collect();
+                match kept.len() {
+                    0 => Selection::None,
+                    1 => Selection::Placement {
+                        q0rg_id: kept[0].q0rg_id,
+                        layer_id: kept[0].layer_id,
+                        placement_idx: kept[0].placement_idx,
+                    },
+                    _ => Selection::Multi(kept),
+                }
+            }
+            other => other,
+        };
+
+        if next != self.selection {
+            self.selection = next;
+            self.tool_state = ToolState::Idle;
+        }
+    }
+}
+
+fn path_ref_exists(project: &ProjectV2, r: PathRef) -> bool {
+    project
+        .q0rgs
+        .iter()
+        .find(|q| q.q0rg_id == r.q0rg_id)
+        .and_then(|q| q.layers.iter().find(|layer| layer.layer_id == r.layer_id))
+        .and_then(|layer| layer.placements.get(r.placement_idx))
+        .and_then(|placement| match placement.target {
+            q0s_format::v2::Target::Asset(asset_id) => {
+                project.assets.iter().find(|asset| asset.id() == asset_id)
+            }
+            q0s_format::v2::Target::Q0rg(_) => None,
+        })
+        .and_then(|asset| match asset {
+            q0s_format::v2::Asset::Vector(vector) => vector.paths.get(r.path_idx),
+            q0s_format::v2::Asset::Bitmap(_) | q0s_format::v2::Asset::Q0v(_) => None,
+        })
+        .is_some()
+}
+
+fn path_anchor_count(project: &ProjectV2, r: PathRef) -> Option<usize> {
+    project
+        .q0rgs
+        .iter()
+        .find(|q| q.q0rg_id == r.q0rg_id)
+        .and_then(|q| q.layers.iter().find(|layer| layer.layer_id == r.layer_id))
+        .and_then(|layer| layer.placements.get(r.placement_idx))
+        .and_then(|placement| match placement.target {
+            q0s_format::v2::Target::Asset(asset_id) => {
+                project.assets.iter().find(|asset| asset.id() == asset_id)
+            }
+            q0s_format::v2::Target::Q0rg(_) => None,
+        })
+        .and_then(|asset| match asset {
+            q0s_format::v2::Asset::Vector(vector) => vector.paths.get(r.path_idx),
+            q0s_format::v2::Asset::Bitmap(_) | q0s_format::v2::Asset::Q0v(_) => None,
+        })
+        .map(|path| path.anchors.len())
+}
+
+fn collapse_path_refs(refs: Vec<PathRef>) -> Selection {
+    match refs.len() {
+        0 => Selection::None,
+        1 => Selection::Path {
+            q0rg_id: refs[0].q0rg_id,
+            layer_id: refs[0].layer_id,
+            placement_idx: refs[0].placement_idx,
+            path_idx: refs[0].path_idx,
+        },
+        _ => Selection::Paths(refs),
+    }
+}
+
+/// Snapshot-based undo/redo stack. Each snapshot is a deep clone of the project,
+/// which is acceptable for the current scale (vector shapes are tiny). Capped to
+/// avoid unbounded memory growth on long sessions.
+const HISTORY_CAP: usize = 64;
+
+pub struct History {
+    undo: Vec<ProjectV2>,
+    redo: Vec<ProjectV2>,
+}
+
+impl History {
+    pub fn new() -> Self {
+        Self {
+            undo: Vec::new(),
+            redo: Vec::new(),
+        }
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    /// Record the project's CURRENT state as the "before" of the upcoming change.
+    /// Clears any redo branch (standard undo semantics). Skips pushing if the
+    /// current state already matches the top of the stack Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ this lets callers
+    /// safely snapshot on every `.changed()` from a DragValue without bloating
+    /// the stack with duplicates of the same intermediate value.
+    pub fn snapshot(&mut self, current: &ProjectV2) {
+        if self.undo.last() == Some(current) {
+            return;
+        }
+        self.undo.push(current.clone());
+        if self.undo.len() > HISTORY_CAP {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    /// Pop the latest "before"; push `current` onto the redo stack.
+    pub fn pop_undo(&mut self, current: &ProjectV2) -> Option<ProjectV2> {
+        let prior = self.undo.pop()?;
+        self.redo.push(current.clone());
+        Some(prior)
+    }
+
+    /// Pop the latest "after" off redo; push `current` back onto undo.
+    pub fn pop_redo(&mut self, current: &ProjectV2) -> Option<ProjectV2> {
+        let next = self.redo.pop()?;
+        self.undo.push(current.clone());
+        Some(next)
+    }
+}
+
+impl Default for History {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub const DEFAULT_STAGE_WIDTH: u16 = 640;
+pub const DEFAULT_STAGE_HEIGHT: u16 = 480;
+
+pub fn default_project() -> ProjectV2 {
+    ProjectV2 {
+        meta: ProjectMeta {
+            name: "untitled".to_string(),
+            fps: 24,
+            stage_width: DEFAULT_STAGE_WIDTH,
+            stage_height: DEFAULT_STAGE_HEIGHT,
+            entry_q0rg_id: 1,
+        },
+        assets: Vec::new(),
+        asset_names: std::collections::HashMap::new(),
+        layer_metadata: std::collections::HashMap::new(),
+        q0rgs: vec![Q0rg {
+            q0rg_id: 1,
+            name: "Stage".to_string(),
+            frame_count: 24,
+            script: String::new(),
+            layers: vec![Layer {
+                layer_id: 1,
+                name: "Layer 1".to_string(),
+                explicit_keyframes: Vec::new(),
+                placements: Vec::new(),
+            }],
+        }],
+    }
+}
+
+#[cfg(test)]
+mod default_project_tests {
+    use super::{default_project, DEFAULT_STAGE_HEIGHT, DEFAULT_STAGE_WIDTH};
+
+    #[test]
+    fn new_project_uses_the_classic_640_by_480_stage() {
+        let project = default_project();
+        assert_eq!(project.meta.stage_width, DEFAULT_STAGE_WIDTH);
+        assert_eq!(project.meta.stage_height, DEFAULT_STAGE_HEIGHT);
+        assert_eq!(
+            u32::from(project.meta.stage_width) * 3,
+            u32::from(project.meta.stage_height) * 4,
+            "the default stage must keep a true 4:3 aspect ratio"
+        );
+    }
+}
