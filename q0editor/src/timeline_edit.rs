@@ -168,6 +168,34 @@ pub fn clear_frames(
     Some(removed)
 }
 
+/// Remove source cells for a drag-move without turning every vacated cell into
+/// a blank keyframe. Frame zero is the only exception: a layer cannot inherit
+/// anything from before the timeline, so moving its first key leaves one real
+/// blank root key behind.
+fn remove_frames_for_move(
+    project: &mut ProjectV2,
+    q0rg_id: u16,
+    selection: TimelineSelection,
+) -> Option<usize> {
+    let (layer_ids, first_frame, last_frame) = selected_frame_bounds(project, q0rg_id, selection)?;
+    let q0rg_index = q0rg_index(project, q0rg_id)?;
+    let q0rg = &mut project.q0rgs[q0rg_index];
+    let mut removed = 0;
+    for layer_id in layer_ids {
+        let layer = q0rg
+            .layers
+            .iter_mut()
+            .find(|layer| layer.layer_id == layer_id)?;
+        let before = layer.placements.len();
+        clear_frame_range(layer, first_frame, last_frame, false);
+        if first_frame == 0 {
+            layer.ensure_explicit_keyframe(0);
+        }
+        removed += before - layer.placements.len();
+    }
+    Some(removed)
+}
+
 fn target_frame_layer_ids(
     project: &ProjectV2,
     q0rg_id: u16,
@@ -293,7 +321,7 @@ pub fn move_frames(
     target_frame: u16,
 ) -> Option<TimelineSelection> {
     let clipboard = capture_frames(project, q0rg_id, selection)?;
-    clear_frames(project, q0rg_id, selection)?;
+    remove_frames_for_move(project, q0rg_id, selection)?;
     paste_frames(project, q0rg_id, target_layer_id, target_frame, &clipboard)
 }
 
@@ -582,7 +610,7 @@ mod tests {
         };
         move_frames(&mut project, 1, selection, 1, 2).expect("move frames");
         let layer = &project.q0rgs[0].layers[0];
-        assert!(layer.is_blank_keyframe(1));
+        assert!(!layer.has_keyframe(1));
         assert!(layer
             .placements
             .iter()
@@ -591,6 +619,39 @@ mod tests {
             .placements
             .iter()
             .any(|item| item.frame == 3 && item.transform.tx == 20.0));
+    }
+
+    #[test]
+    fn repeated_frame_moves_do_not_leave_blank_keyframe_trails() {
+        let mut project = crate::state::default_project();
+        project.q0rgs[0].frame_count = 8;
+        project.q0rgs[0].layers[0].placements = vec![placement(1, 10.0, Tween::None)];
+
+        let first = TimelineSelection::single(1, 1);
+        let moved = move_frames(&mut project, 1, first, 1, 2).expect("first move");
+        move_frames(&mut project, 1, moved, 1, 3).expect("second move");
+
+        let layer = &project.q0rgs[0].layers[0];
+        assert_eq!(layer.keyframe_frames(), vec![0, 3]);
+        assert!(!layer.has_keyframe(1));
+        assert!(!layer.has_keyframe(2));
+        assert!(layer.placements.iter().any(|item| item.frame == 3));
+    }
+
+    #[test]
+    fn moving_first_frame_leaves_one_blank_root_keyframe() {
+        let mut project = crate::state::default_project();
+        project.q0rgs[0].frame_count = 8;
+        project.q0rgs[0].layers[0].placements = vec![placement(0, 10.0, Tween::None)];
+        project.q0rgs[0].layers[0].explicit_keyframes.clear();
+
+        move_frames(&mut project, 1, TimelineSelection::single(1, 0), 1, 3)
+            .expect("move first frame");
+
+        let layer = &project.q0rgs[0].layers[0];
+        assert!(layer.is_blank_keyframe(0));
+        assert_eq!(layer.keyframe_frames(), vec![0, 3]);
+        assert!(layer.placements.iter().any(|item| item.frame == 3));
     }
 
     #[test]
