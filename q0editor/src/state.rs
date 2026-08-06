@@ -504,6 +504,9 @@ pub struct Session {
     pub current_q0rg_id: u16,
     pub current_layer_id: u16,
     pub current_frame: u16,
+    /// Timeline-only cursor beyond the current q0rg tail. Stage tools keep using
+    /// current_frame until F5/F6/F7 materialises this virtual destination.
+    pub pending_timeline_frame: Option<u16>,
     /// Rectangular frame-cell selection in the timeline, separate from stage selection.
     pub timeline_selection: Option<TimelineSelection>,
     /// Selected layer rows for layer clipboard operations.
@@ -572,6 +575,7 @@ impl Session {
             current_q0rg_id: entry,
             current_layer_id: layer_id,
             current_frame: 0,
+            pending_timeline_frame: None,
             timeline_selection: None,
             timeline_layer_selection: None,
             current_tool: Tool::Select,
@@ -610,6 +614,19 @@ impl Session {
         }
     }
 
+    pub fn timeline_frame(&self) -> u16 {
+        self.pending_timeline_frame.unwrap_or(self.current_frame)
+    }
+
+    pub fn set_timeline_frame(&mut self, frame: u16, frame_count: u16) {
+        if frame < frame_count {
+            self.current_frame = frame;
+            self.pending_timeline_frame = None;
+        } else {
+            self.pending_timeline_frame = Some(frame);
+        }
+    }
+
     /// Make sure cached selectors still point at valid model state. Called after
     /// undo/redo Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the project might have lost q0rgs, layers, placements etc.
     pub fn reconcile_with(&mut self, project: &ProjectV2) {
@@ -644,6 +661,7 @@ impl Session {
             }
             self.current_frame = self.current_frame.min(q.frame_count.saturating_sub(1));
             if previous_q0rg_id != self.current_q0rg_id {
+                self.pending_timeline_frame = None;
                 self.timeline_selection = None;
                 self.timeline_layer_selection = None;
                 self.timeline_frame_drag = None;
@@ -655,14 +673,19 @@ impl Session {
                     && q.layers
                         .iter()
                         .any(|layer| layer.layer_id == selection.focus_layer_id);
-                let frames_exist =
-                    selection.anchor_frame < q.frame_count && selection.focus_frame < q.frame_count;
+                let selectable_last = self
+                    .pending_timeline_frame
+                    .unwrap_or_else(|| q.frame_count.saturating_sub(1))
+                    .max(q.frame_count.saturating_sub(1));
+                let frames_exist = selection.anchor_frame <= selectable_last
+                    && selection.focus_frame <= selectable_last;
                 if !layers_exist || !frames_exist {
                     self.timeline_selection = None;
                 }
             }
         } else {
             self.timeline_selection = None;
+            self.pending_timeline_frame = None;
         }
         if self.timeline_layer_selection.is_some_and(|selection| {
             !project
@@ -1139,7 +1162,7 @@ pub fn default_project() -> ProjectV2 {
             layers: vec![Layer {
                 layer_id: 1,
                 name: "Layer 1".to_string(),
-                explicit_keyframes: Vec::new(),
+                explicit_keyframes: vec![0],
                 placements: Vec::new(),
             }],
         }],
@@ -1149,6 +1172,17 @@ pub fn default_project() -> ProjectV2 {
 #[cfg(test)]
 mod default_project_tests {
     use super::{default_project, DEFAULT_STAGE_HEIGHT, DEFAULT_STAGE_WIDTH};
+
+    #[test]
+    fn new_project_starts_with_a_real_blank_keyframe() {
+        let project = default_project();
+        let q0rg = &project.q0rgs[0];
+        let layer = &q0rg.layers[0];
+        assert_eq!(q0rg.frame_count, 24);
+        assert_eq!(layer.keyframe_frames(), vec![0]);
+        assert!(layer.is_blank_keyframe(0));
+        assert!(crate::render::active_placements_at(layer, 23).is_empty());
+    }
 
     #[test]
     fn new_project_uses_the_classic_640_by_480_stage() {

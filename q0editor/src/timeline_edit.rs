@@ -222,7 +222,7 @@ fn ensure_target_frame_layers(
             Layer {
                 layer_id: next_id,
                 name: format!("Layer {next_id}"),
-                explicit_keyframes: Vec::new(),
+                explicit_keyframes: vec![0],
                 placements: Vec::new(),
             },
         );
@@ -418,7 +418,7 @@ pub fn remove_layers(
         project.q0rgs[q0rg_index].layers.push(Layer {
             layer_id: next_id,
             name: format!("Layer {next_id}"),
-            explicit_keyframes: Vec::new(),
+            explicit_keyframes: vec![0],
             placements: Vec::new(),
         });
     }

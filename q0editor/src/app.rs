@@ -748,6 +748,7 @@ impl EditorApp {
                 self.session.status = format!("tool: {}", tool.label());
             }
             Action::TogglePlay => {
+                self.session.pending_timeline_frame = None;
                 self.session.playing = !self.session.playing;
                 self.session.last_tick = Instant::now();
                 self.session.status = if self.session.playing {
@@ -766,16 +767,7 @@ impl EditorApp {
             }
             Action::LastFrame => self.go_to_frame(u16::MAX),
             Action::InsertFrame => {
-                // F5: step the playhead one frame forward, extending
-                // frame_count if we're at the tail. No new placement Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р’В Р Р†Р вЂљР’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р РЋРІвЂћСћР В Р’В Р В Р вЂ№Р В Р вЂ Р Р†Р вЂљРЎвЂєР РЋРЎвЂєР В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†РІР‚С›РЎС›Р В Р’В Р вЂ™Р’В Р В Р’В Р В РІР‚в„–Р В Р’В Р В Р вЂ№Р В Р Р‹Р Р†РІР‚С›РЎС›
-                // existing spans hold one frame longer.
-                let extended = self.advance_playhead_extending();
-                let next_frame = self.session.current_frame;
-                self.session.status = if extended {
-                    format!("frame inserted, now at {}", next_frame + 1)
-                } else {
-                    format!("frame {}", next_frame + 1)
-                };
+                self.insert_frame_smart();
             }
             Action::InsertKeyframe => {
                 if self.current_layer_is_folder() {
@@ -846,7 +838,7 @@ impl EditorApp {
                     Layer {
                         layer_id: next_id,
                         name: format!("Layer {next_id}"),
-                        explicit_keyframes: Vec::new(),
+                        explicit_keyframes: vec![0],
                         placements: Vec::new(),
                     },
                 );
@@ -990,6 +982,7 @@ impl EditorApp {
                     self.session.timeline_layer_selection = None;
                     self.session.current_layer_id = moved.anchor_layer_id;
                     self.session.current_frame = moved.anchor_frame;
+                    self.session.pending_timeline_frame = None;
                     self.state.dirty = true;
                     self.session.status = "moved frames".to_string();
                 } else {
@@ -1046,7 +1039,7 @@ impl EditorApp {
                     layers: vec![Layer {
                         layer_id: 1,
                         name: "Layer 1".to_string(),
-                        explicit_keyframes: Vec::new(),
+                        explicit_keyframes: vec![0],
                         placements: Vec::new(),
                     }],
                 });
@@ -1143,6 +1136,13 @@ impl EditorApp {
                 self.request_frame_count_change(q0rg_id, frame_count);
             }
             Action::DeleteSelection => {
+                if self.session.pending_timeline_frame.is_some()
+                    && self.session.timeline_selection.is_some()
+                {
+                    self.session.status =
+                        "future frame is not created; press F5, F6, or F7 first".to_string();
+                    return;
+                }
                 if let Selection::Q0rg(q0rg_id) = self.session.selection {
                     self.request_library_item_delete(LibraryItem::Q0rg(q0rg_id));
                     return;
@@ -1211,6 +1211,7 @@ impl EditorApp {
                     self.session.current_q0rg_id = parent;
                     self.refresh_layer_for_current_q0rg();
                     self.session.current_frame = 0;
+                    self.session.pending_timeline_frame = None;
                     self.session.timeline_selection = None;
                     self.session.tool_state = crate::state::ToolState::Idle;
                     self.session.selection = Selection::None;
@@ -1242,6 +1243,13 @@ impl EditorApp {
                 self.session.status = "zoom 100% (fit)".to_string();
             }
             Action::CopySelection => {
+                if self.session.pending_timeline_frame.is_some()
+                    && self.session.timeline_selection.is_some()
+                {
+                    self.session.status =
+                        "future frame is not created; press F5, F6, or F7 first".to_string();
+                    return;
+                }
                 let payload = if let Some(selection) = self.session.timeline_selection {
                     crate::timeline_edit::capture_frames(
                         &self.state.project,
@@ -1276,6 +1284,13 @@ impl EditorApp {
                 }
             }
             Action::CutSelection => {
+                if self.session.pending_timeline_frame.is_some()
+                    && self.session.timeline_selection.is_some()
+                {
+                    self.session.status =
+                        "future frame is not created; press F5, F6, or F7 first".to_string();
+                    return;
+                }
                 if let Some(selection) = self.session.timeline_selection {
                     let Some(frames) = crate::timeline_edit::capture_frames(
                         &self.state.project,
@@ -1346,12 +1361,13 @@ impl EditorApp {
                             self.session.status = "paste frames onto a drawable layer".to_string();
                             return;
                         }
+                        let target_frame = self.session.timeline_frame();
                         self.history.snapshot(&self.state.project);
                         if let Some(selection) = crate::timeline_edit::paste_frames(
                             &mut self.state.project,
                             self.session.current_q0rg_id,
                             self.session.current_layer_id,
-                            self.session.current_frame,
+                            target_frame,
                             &frames,
                         ) {
                             self.session.timeline_selection = Some(selection);
@@ -1359,6 +1375,7 @@ impl EditorApp {
                             self.session.selection = Selection::None;
                             self.session.current_layer_id = selection.anchor_layer_id;
                             self.session.current_frame = selection.anchor_frame;
+                            self.session.pending_timeline_frame = None;
                             self.state.dirty = true;
                             self.session.status = "pasted frames".to_string();
                         } else {
@@ -1377,6 +1394,7 @@ impl EditorApp {
                             self.session.timeline_selection = None;
                             self.session.selection = Selection::None;
                             self.session.current_layer_id = selection.anchor_layer_id;
+                            self.session.pending_timeline_frame = None;
                             self.state.dirty = true;
                             self.session.status = "pasted layers".to_string();
                         } else {
@@ -1384,6 +1402,12 @@ impl EditorApp {
                         }
                     }
                     None => {
+                        if self.session.pending_timeline_frame.is_some() {
+                            self.session.status =
+                                "create the future frame with F5, F6, or F7 before pasting artwork"
+                                    .to_string();
+                            return;
+                        }
                         if self.current_layer_is_folder() {
                             self.session.status = "folders cannot contain artwork".to_string();
                             return;
@@ -1668,7 +1692,7 @@ impl EditorApp {
             self.state.project.q0rgs[q0rg_index].layers.push(Layer {
                 layer_id: next_id,
                 name: format!("Layer {next_id}"),
-                explicit_keyframes: Vec::new(),
+                explicit_keyframes: vec![0],
                 placements: Vec::new(),
             });
         }
@@ -4009,6 +4033,46 @@ impl EditorApp {
         }
     }
 
+    /// F5 / Insert Frame. A click in the virtual tail chooses an exact future
+    /// destination; F5 then grows the q0rg through every intervening frame.
+    /// Without a virtual destination, preserve the classic one-step behaviour.
+    fn insert_frame_smart(&mut self) {
+        if let Some(target) = self.session.pending_timeline_frame.take() {
+            let q0rg_id = self.session.current_q0rg_id;
+            let old_count = self
+                .state
+                .project
+                .q0rgs
+                .iter()
+                .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+                .map(|q0rg| q0rg.frame_count)
+                .unwrap_or(0);
+            if target >= old_count {
+                self.history.snapshot(&self.state.project);
+                if let Some(q0rg) = self
+                    .state
+                    .project
+                    .q0rgs
+                    .iter_mut()
+                    .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+                {
+                    q0rg.frame_count = target.saturating_add(1);
+                }
+                self.state.dirty = true;
+            }
+            self.session.current_frame = target;
+            self.session.status = format!("extended timeline through frame {}", target + 1);
+            return;
+        }
+
+        let extended = self.advance_playhead_extending();
+        let next_frame = self.session.current_frame;
+        self.session.status = if extended {
+            format!("frame inserted, now at {}", next_frame + 1)
+        } else {
+            format!("frame {}", next_frame + 1)
+        };
+    }
     /// Step `current_frame` forward one slot, extending the q0rg's
     /// `frame_count` when we'd land off the end. Returns whether the
     /// frame_count was bumped Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р’В Р Р†Р вЂљР’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р РЋРІвЂћСћР В Р’В Р В Р вЂ№Р В Р вЂ Р Р†Р вЂљРЎвЂєР РЋРЎвЂєР В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†РІР‚С›РЎС›Р В Р’В Р вЂ™Р’В Р В Р’В Р В РІР‚в„–Р В Р’В Р В Р вЂ№Р В Р Р‹Р Р†РІР‚С›РЎС› caller usually folds that into the
@@ -4056,6 +4120,7 @@ impl EditorApp {
     }
 
     fn go_to_frame(&mut self, requested: u16) {
+        self.session.pending_timeline_frame = None;
         let last_frame = self
             .state
             .project
@@ -4074,6 +4139,21 @@ impl EditorApp {
     /// stay there. On an existing keyframe, create the next keyframe to the
     /// right and move the playhead onto it.
     fn insert_keyframe_smart(&mut self) {
+        if let Some(target) = self.session.pending_timeline_frame.take() {
+            let inserted = self.insert_keyframe_at(target);
+            let target_exists = self
+                .state
+                .project
+                .q0rgs
+                .iter()
+                .find(|q0rg| q0rg.q0rg_id == self.session.current_q0rg_id)
+                .map(|q0rg| target < q0rg.frame_count)
+                .unwrap_or(false);
+            if inserted > 0 || target_exists {
+                self.session.current_frame = target;
+            }
+            return;
+        }
         let current = self.session.current_frame;
         let has_exact_key = self
             .state
@@ -4110,6 +4190,21 @@ impl EditorApp {
     /// F7 / Insert Blank Keyframe. On an existing keyframe, create the next
     /// blank key to the right; on a held frame, blank the current playhead.
     fn insert_blank_keyframe_smart(&mut self) {
+        if let Some(target) = self.session.pending_timeline_frame.take() {
+            let inserted = self.insert_blank_keyframe_at(target);
+            let target_exists = self
+                .state
+                .project
+                .q0rgs
+                .iter()
+                .find(|q0rg| q0rg.q0rg_id == self.session.current_q0rg_id)
+                .map(|q0rg| target < q0rg.frame_count)
+                .unwrap_or(false);
+            if inserted || target_exists {
+                self.session.current_frame = target;
+            }
+            return;
+        }
         let current = self.session.current_frame;
         let has_exact_key = self
             .state
@@ -4269,6 +4364,11 @@ impl EditorApp {
     /// blank keyframe there. This also works on a held frame by inserting the
     /// blank key that stops the previous contents.
     fn clear_keyframe(&mut self) {
+        if self.session.pending_timeline_frame.is_some() {
+            self.session.status =
+                "future frame is not created; press F5, F6, or F7 first".to_string();
+            return;
+        }
         self.session.timeline_selection = Some(crate::state::TimelineSelection::single(
             self.session.current_layer_id,
             self.session.current_frame,
@@ -4299,6 +4399,11 @@ impl EditorApp {
     /// the new boundary are clipped: placements past it are removed; tweens
     /// that pointed past it become Tween::None.
     fn remove_frame(&mut self) {
+        if self.session.pending_timeline_frame.is_some() {
+            self.session.status =
+                "future frame is not created; press F5, F6, or F7 first".to_string();
+            return;
+        }
         let q0rg_id = self.session.current_q0rg_id;
         let new_total = match self
             .state
@@ -4352,6 +4457,11 @@ impl EditorApp {
     ///   we set Linear to that frame and reselect the *new* keyframe so
     ///   dragging the object immediately animates.
     fn toggle_motion_tween(&mut self) {
+        if self.session.pending_timeline_frame.is_some() {
+            self.session.status =
+                "future frame is not created; press F5, F6, or F7 first".to_string();
+            return;
+        }
         let Selection::Placement {
             q0rg_id,
             layer_id,
@@ -6031,6 +6141,79 @@ mod tests {
         assert!(!app.history.can_undo());
     }
 
+    #[test]
+    fn f5_on_virtual_frame_extends_through_the_clicked_destination() {
+        let mut app = EditorApp::default();
+        app.state.dirty = false;
+        app.session.pending_timeline_frame = Some(39);
+
+        app.handle(&Context::default(), Action::InsertFrame);
+
+        let q0rg = &app.state.project.q0rgs[0];
+        let layer = &q0rg.layers[0];
+        assert_eq!(q0rg.frame_count, 40);
+        assert_eq!(app.session.current_frame, 39);
+        assert_eq!(app.session.pending_timeline_frame, None);
+        assert_eq!(layer.keyframe_frames(), vec![0]);
+        assert!(layer.is_blank_keyframe(0));
+        assert!(app.state.dirty);
+        assert!(app.history.can_undo());
+    }
+
+    #[test]
+    fn f6_on_virtual_frame_extends_and_bakes_the_held_contents() {
+        let mut app = app_with_one_timeline_object(4);
+        app.session.pending_timeline_frame = Some(9);
+
+        app.handle(&Context::default(), Action::InsertKeyframe);
+
+        let q0rg = &app.state.project.q0rgs[0];
+        let layer = &q0rg.layers[0];
+        assert_eq!(q0rg.frame_count, 10);
+        assert_eq!(app.session.current_frame, 9);
+        assert_eq!(app.session.pending_timeline_frame, None);
+        assert!(layer
+            .placements
+            .iter()
+            .any(|placement| placement.frame == 9));
+        assert_eq!(crate::render::active_placements_at(layer, 9).len(), 1);
+    }
+    #[test]
+    fn frame_clipboard_pastes_at_a_virtual_timeline_destination() {
+        let mut app = app_with_one_timeline_object(4);
+        let layer_id = app.session.current_layer_id;
+        app.session.timeline_selection = Some(crate::state::TimelineSelection::single(layer_id, 0));
+        app.handle(&Context::default(), Action::CopySelection);
+        app.session.pending_timeline_frame = Some(9);
+        app.session.timeline_selection = Some(crate::state::TimelineSelection::single(layer_id, 9));
+
+        app.handle(&Context::default(), Action::Paste);
+
+        let q0rg = &app.state.project.q0rgs[0];
+        let layer = &q0rg.layers[0];
+        assert_eq!(q0rg.frame_count, 10);
+        assert_eq!(app.session.current_frame, 9);
+        assert_eq!(app.session.pending_timeline_frame, None);
+        assert!(layer
+            .placements
+            .iter()
+            .any(|placement| placement.frame == 9));
+    }
+
+    #[test]
+    fn deleting_a_virtual_frame_never_mutates_the_last_real_frame() {
+        let mut app = app_with_one_timeline_object(4);
+        let before = app.state.project.clone();
+        let layer_id = app.session.current_layer_id;
+        app.session.pending_timeline_frame = Some(9);
+        app.session.timeline_selection = Some(crate::state::TimelineSelection::single(layer_id, 9));
+
+        app.handle(&Context::default(), Action::DeleteSelection);
+
+        assert_eq!(app.state.project, before);
+        assert!(app.session.status.contains("future frame is not created"));
+    }
+
     fn app_with_one_timeline_object(frame_count: u16) -> EditorApp {
         let mut app = EditorApp::default();
         app.state.project.q0rgs[0].frame_count = frame_count;
@@ -6738,6 +6921,11 @@ mod tests {
             .unwrap();
         assert!(folder.explicit_keyframes.is_empty());
         assert!(folder.placements.is_empty());
+        assert!(app.state.project.q0rgs[0]
+            .layers
+            .iter()
+            .filter(|layer| layer.layer_id != folder_id)
+            .all(|layer| layer.is_blank_keyframe(0)));
         assert!(crate::tools::materialize_layer_keyframe_for_edit(
             &mut app.state.project,
             1,
@@ -6748,7 +6936,7 @@ mod tests {
 
         q0s_format::v2::validate(&app.state.project).expect("folder project");
         app.request_layer_delete(1, folder_id);
-        assert_eq!(app.pending_layer_delete, Some((1, folder_id, 3, 0)));
+        assert_eq!(app.pending_layer_delete, Some((1, folder_id, 3, 2)));
         app.apply_layer_delete(1, folder_id);
         assert_eq!(app.state.project.q0rgs[0].layers.len(), 1);
         assert!(!app
@@ -6964,6 +7152,11 @@ mod tests {
             .unwrap();
         assert!(folder.explicit_keyframes.is_empty());
         assert!(folder.placements.is_empty());
+        assert!(app.state.project.q0rgs[0]
+            .layers
+            .iter()
+            .filter(|layer| layer.layer_id != folder_id)
+            .all(|layer| layer.is_blank_keyframe(0)));
         q0s_format::v2::validate(&app.state.project).expect("timeline delete with folder");
     }
 

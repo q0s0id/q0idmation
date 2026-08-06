@@ -184,15 +184,18 @@ pub fn brush_finish(mut stroke: BrushStroke, settings: BrushSettings) -> MultiPo
         stroke.coverage
     } else {
         let mut finished = smooth_contours(&stroke.coverage, settings.smoothing, settings.size);
-        // Boundary simplification may safely remove wobble from the sides, but
-        // it must never deform the literal static nib at either endpoint.
-        // Restore those two exact imprints after cleanup; this does not alter
-        // the centre sweep and keeps the selected nib shape at smoothing 100.
-        if let Some(first) = stroke.samples.first().map(|sample| sample.position) {
-            finished = finished.union(&sweep_nib(settings.nib, settings.size, first, first));
-        }
-        if let Some(last) = stroke.samples.last().map(|sample| sample.position) {
-            finished = finished.union(&sweep_nib(settings.nib, settings.size, last, last));
+        // A circular nib has no semantic corners, so restoring its two exact
+        // endpoint discs protects the classic round cap from simplification.
+        // Polygon nibs are different: unioning their literal endpoint imprint
+        // back in after smoothing resurrects the very sharp corners smoothing
+        // just removed. Their caps therefore stay part of the smoothed boundary.
+        if settings.nib == BrushNib::Circle {
+            if let Some(first) = stroke.samples.first().map(|sample| sample.position) {
+                finished = finished.union(&sweep_nib(settings.nib, settings.size, first, first));
+            }
+            if let Some(last) = stroke.samples.last().map(|sample| sample.position) {
+                finished = finished.union(&sweep_nib(settings.nib, settings.size, last, last));
+            }
         }
         finished
     }
@@ -2007,6 +2010,38 @@ mod tests {
             .union(&gesture.coverage.difference(&preview))
             .unsigned_area();
         assert!(mismatch < 0.05, "preview/commit mismatch: {mismatch}");
+    }
+    #[test]
+    fn smoothing_polygon_nibs_does_not_restore_sharp_endpoint_imprints() {
+        let points = [
+            Vec2::new(20.0, 40.0),
+            Vec2::new(70.0, 72.0),
+            Vec2::new(130.0, 28.0),
+            Vec2::new(190.0, 58.0),
+        ];
+        for nib in [
+            BrushNib::Square,
+            BrushNib::Horizontal,
+            BrushNib::Vertical,
+            BrushNib::Slash,
+            BrushNib::Backslash,
+        ] {
+            let mut high = settings(30.0, 100);
+            high.nib = nib;
+            let raw = stroke(&points, high);
+            let expected = smooth_contours(&raw.coverage, high.smoothing, high.size);
+            let finished = brush_finish(raw, high);
+            let mismatch = expected
+                .difference(&finished)
+                .union(&finished.difference(&expected))
+                .unsigned_area();
+            assert!(
+                mismatch < 1.0e-6,
+                "{nib:?} restored a sharp endpoint imprint: mismatch {mismatch}"
+            );
+            let paths = coverage_to_paths(&finished);
+            assert_paths_are_finite_and_simple(&paths);
+        }
     }
     #[test]
     fn dense_polygon_nib_preview_does_not_reintroduce_pathological_latency() {

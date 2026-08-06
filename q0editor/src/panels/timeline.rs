@@ -17,7 +17,7 @@ const LAYER_LABEL_W: f32 = 110.0;
 const CELL_PAD_Y: f32 = 1.0;
 /// How many "virtual" frame slots to render past `frame_count` so the user
 /// sees there's room to extend the q0rg. They render as darker chequered
-/// cells — clicks on them are ignored (use F5 / + Frame to actually extend).
+/// cells and can hold a virtual playhead until F5/F6/F7 materialises them.
 const VIRTUAL_FRAMES_BUFFER: u16 = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -438,7 +438,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                             let rel_x = pos.x - (rect.min.x + LAYER_LABEL_W);
                             if rel_x >= 0.0 {
                                 let f = (rel_x / FRAME_W).floor() as i32;
-                                if f >= 0 && f < frame_count as i32 {
+                                if f >= 0 && f < visible_frames as i32 {
                                     click_frame = Some(f as u16);
                                 }
                             } else if response.double_clicked() {
@@ -536,12 +536,12 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 &layer_ids,
                 rect.min.x + LAYER_LABEL_W,
                 rect.min.y + ROW_H,
-                frame_count,
+                visible_frames,
             );
 
             // Playhead
             let playhead_x =
-                rect.min.x + LAYER_LABEL_W + (app.session.current_frame as f32 + 0.5) * FRAME_W;
+                rect.min.x + LAYER_LABEL_W + (app.session.timeline_frame() as f32 + 0.5) * FRAME_W;
             painter.line_segment(
                 [
                     pos2(playhead_x, rect.min.y),
@@ -559,7 +559,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     let rel_x = pos.x - (rect.min.x + LAYER_LABEL_W);
                     if rel_x >= 0.0 {
                         let f = (rel_x / FRAME_W).floor() as i32;
-                        if f >= 0 && f < frame_count as i32 {
+                        if f >= 0 && f < visible_frames as i32 {
                             click_frame = Some(f as u16);
                         }
                     }
@@ -586,7 +586,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 app.session.selection = Selection::None;
             }
             if let Some(f) = click_frame {
-                app.session.current_frame = f;
+                app.session.set_timeline_frame(f, frame_count);
             }
             if let (Some(layer_id), Some(frame)) = (click_layer, click_frame) {
                 app.session.selection = Selection::None;
@@ -609,7 +609,13 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             let frame_drop_cell =
                 ui.input(|input| input.pointer.latest_pos())
                     .and_then(|position| {
-                        timeline_cell_at(rect, position, frame_count, &layer_ids, &folder_layer_ids)
+                        timeline_cell_at(
+                            rect,
+                            position,
+                            visible_frames,
+                            &layer_ids,
+                            &folder_layer_ids,
+                        )
                     });
 
             if app.session.timeline_layer_drag.is_none() && library_payload.is_none() {
@@ -628,7 +634,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                             app.session.timeline_selection =
                                 Some(TimelineSelection::single(layer_id, frame));
                             app.session.current_layer_id = layer_id;
-                            app.session.current_frame = frame;
+                            app.session.set_timeline_frame(frame, frame_count);
                         }
                     } else if response.dragged() && app.session.timeline_frame_drag.is_none() {
                         app.session.selection = Selection::None;
@@ -641,7 +647,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         selection.focus_frame = frame;
                         app.session.timeline_selection = Some(selection);
                         app.session.current_layer_id = layer_id;
-                        app.session.current_frame = frame;
+                        app.session.set_timeline_frame(frame, frame_count);
                     }
                 }
             }
@@ -722,8 +728,8 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     let rel_x = pos.x - (rect.min.x + LAYER_LABEL_W);
                     if rel_x >= 0.0 {
                         let f = (rel_x / FRAME_W).floor() as i32;
-                        if f >= 0 && f < frame_count as i32 {
-                            app.session.current_frame = f as u16;
+                        if f >= 0 && f < visible_frames as i32 {
+                            app.session.set_timeline_frame(f as u16, frame_count);
                         }
                     }
                     // Identify which layer row was clicked.
@@ -744,7 +750,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                                 app.session.timeline_layer_selection = None;
                                 app.session.timeline_selection = Some(TimelineSelection::single(
                                     layer.layer_id,
-                                    app.session.current_frame,
+                                    app.session.timeline_frame(),
                                 ));
                             }
                         }
@@ -1019,7 +1025,7 @@ fn timeline_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
         return;
     }
 
-    let frame = app.session.current_frame + 1;
+    let frame = app.session.timeline_frame() + 1;
     ui.separator();
     ui.label(
         egui::RichText::new(format!("Frame {frame}"))
@@ -1075,20 +1081,24 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
             app.queue(Action::LastFrame);
         }
         ui.separator();
-        let max = app
+        let frame_count = app
             .state
             .project
             .q0rgs
             .iter()
             .find(|q| q.q0rg_id == app.session.current_q0rg_id)
-            .map(|q| q.frame_count.saturating_sub(1))
-            .unwrap_or(0);
-        let mut displayed_frame = u32::from(app.session.current_frame) + 1;
+            .map(|q| q.frame_count)
+            .unwrap_or(1);
+        let max = frame_count
+            .saturating_add(VIRTUAL_FRAMES_BUFFER)
+            .saturating_sub(1);
+        let mut displayed_frame = u32::from(app.session.timeline_frame()) + 1;
         if ui
             .add(egui::Slider::new(&mut displayed_frame, 1..=u32::from(max) + 1).text("frame"))
             .changed()
         {
-            app.session.current_frame = (displayed_frame - 1) as u16;
+            app.session
+                .set_timeline_frame((displayed_frame - 1) as u16, frame_count);
         }
         ui.separator();
 
@@ -1805,7 +1815,7 @@ mod tests {
     }
 
     #[test]
-    fn timeline_cell_hit_testing_ignores_header_and_virtual_frames() {
+    fn timeline_cell_hit_testing_accepts_virtual_frames_but_ignores_header() {
         let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 100.0));
         let layers = [10, 20];
         assert_eq!(
@@ -1832,7 +1842,17 @@ mod tests {
             timeline_cell_at(
                 rect,
                 pos2(LAYER_LABEL_W + FRAME_W * 6.0, ROW_H * 1.5),
-                5,
+                35,
+                &layers,
+                &[],
+            ),
+            Some((10, 6))
+        );
+        assert_eq!(
+            timeline_cell_at(
+                rect,
+                pos2(LAYER_LABEL_W + FRAME_W * 36.0, ROW_H * 1.5),
+                35,
                 &layers,
                 &[],
             ),

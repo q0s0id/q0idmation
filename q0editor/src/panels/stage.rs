@@ -32,6 +32,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     release_canvas_keyboard_focus(ui.ctx(), canvas_interacted);
     if canvas_interacted {
         app.session.timeline_selection = None;
+        app.session.pending_timeline_frame = None;
     }
 
     // Canvas backdrop — area outside the stage paper. Pulled from the
