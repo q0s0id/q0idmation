@@ -105,7 +105,7 @@ pub struct Theme {
     /// Header strip at the top of the timeline (frame numbers row).
     #[serde(default = "default_timeline_header")]
     pub timeline_header: ColorRgb,
-    /// The red-ish playhead line.
+    /// Timeline playhead line. Built-in themes derive it from their accent.
     #[serde(default = "default_playhead")]
     pub playhead: ColorRgb,
     /// Black dot drawn on a keyframe cell.
@@ -206,7 +206,7 @@ fn default_timeline_header() -> ColorRgb {
     ColorRgb::new(0x2A, 0x2A, 0x2A)
 }
 fn default_playhead() -> ColorRgb {
-    ColorRgb::new(0xCC, 0x33, 0x33)
+    q0theme::default_theme().accent.into()
 }
 fn default_keyframe() -> ColorRgb {
     ColorRgb::new(0x10, 0x10, 0x10)
@@ -331,7 +331,7 @@ impl Theme {
     ///
     /// Heuristic: pick canvas/header/grid as scaled tones of `window`,
     /// span/empty cells as blends between `panel` and `text`/`accent`,
-    /// keyframe = `text` (always legible), playhead = fixed warm red.
+    /// keyframe = `text` (always legible), playhead = theme accent.
     /// User-saved overrides via the Settings color-pickers persist on
     /// top — derivation only runs when a preset is picked.
     pub fn with_timeline_from_base(mut self) -> Self {
@@ -400,9 +400,9 @@ impl Theme {
         self.empty_beyond = scale(window, 0.75);
         self.empty_beyond_5 = blend(self.empty_beyond, panel, 0.4);
 
-        // Playhead stays a warm red — that's the universal "now" cue
-        // and we want it to read on every theme.
-        self.playhead = ColorRgb::new(0xCC, 0x33, 0x33);
+        // Timeline focus follows the theme's own identity instead of
+        // leaking the dark/q0s-signature red into every preset.
+        self.playhead = accent;
 
         // ----- q0lang syntax palette -----
         // Pick syntax colours by mixing the theme's own accent with
@@ -475,7 +475,7 @@ impl Theme {
             theme.timeline_header = ColorRgb::new(0x12, 0x04, 0x07);
             theme.timeline_grid = ColorRgb::new(0x2A, 0x0B, 0x10);
             theme.timeline_grid_5 = ColorRgb::new(0x50, 0x0D, 0x18);
-            theme.playhead = ColorRgb::new(0xFF, 0x33, 0x55);
+            theme.playhead = theme.accent;
             theme.keyframe = ColorRgb::new(0xFF, 0xF0, 0xF3);
             theme.extension = ColorRgb::new(0x4A, 0x1A, 0x22);
             theme.extension_active = ColorRgb::new(0x82, 0x16, 0x2A);
@@ -845,6 +845,13 @@ impl Default for Settings {
     }
 }
 
+fn migrate_legacy_timeline_focus_color(theme: &mut Theme) {
+    const LEGACY_FIXED_PLAYHEAD: ColorRgb = ColorRgb::new(0xCC, 0x33, 0x33);
+    if theme.playhead == LEGACY_FIXED_PLAYHEAD {
+        theme.playhead = theme.accent;
+    }
+}
+
 impl Settings {
     pub fn load() -> Self {
         let mut settings = match Self::path()
@@ -858,6 +865,7 @@ impl Settings {
         if settings.theme.accent == ColorRgb::new(0x0F, 0x84, 0xCE) {
             settings.theme.accent = ColorRgb::new(0xC8, 0x10, 0x2E);
         }
+        migrate_legacy_timeline_focus_color(&mut settings.theme);
         if settings.q0lang_font_name == "Impact" {
             settings.q0lang_font_name = default_q0lang_font_name();
         }
@@ -970,6 +978,7 @@ mod tests {
         for preset in Theme::PRESETS {
             let theme = Theme::from_builtin(preset);
             assert_eq!(theme.accent, preset.accent.into(), "{} accent", preset.name);
+            assert_eq!(theme.playhead, theme.accent, "{} playhead", preset.name);
             assert_eq!(theme.panel, preset.panel.into(), "{} panel", preset.name);
             assert_eq!(theme.window, preset.window.into(), "{} window", preset.name);
             assert_eq!(theme.deep_bg, preset.deep_bg.into(), "{} deep", preset.name);
@@ -987,6 +996,23 @@ mod tests {
                 preset.name
             );
         }
+    }
+
+    #[test]
+    fn legacy_fixed_red_playhead_migrates_to_the_current_theme_accent() {
+        let mut theme = Theme {
+            accent: ColorRgb::new(0x26, 0x8B, 0xD2),
+            playhead: ColorRgb::new(0xCC, 0x33, 0x33),
+            ..Theme::default()
+        };
+
+        migrate_legacy_timeline_focus_color(&mut theme);
+        assert_eq!(theme.playhead, theme.accent);
+
+        let custom = ColorRgb::new(0x12, 0x34, 0x56);
+        theme.playhead = custom;
+        migrate_legacy_timeline_focus_color(&mut theme);
+        assert_eq!(theme.playhead, custom);
     }
 
     #[test]

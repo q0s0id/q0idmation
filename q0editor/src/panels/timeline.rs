@@ -272,7 +272,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             }
             // End-of-q0rg marker: dashed amber bar at the right edge of the
             // last real frame so the user can see exactly where `frame_count`
-            // ends without confusing it with the red playhead.
+            // ends without confusing it with the solid theme-coloured playhead.
             let edge_x = rect.min.x + LAYER_LABEL_W + (frame_count as f32) * FRAME_W;
             let edge_color = Color32::from_rgb(0xC8, 0x95, 0x30);
             let mut y = rect.min.y;
@@ -1593,7 +1593,7 @@ fn draw_timeline_selection(
     else {
         return;
     };
-    let accent = theme.playhead.to_color32();
+    let accent = timeline_selection_color(theme);
     let fill = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 54);
     let stroke = Stroke::new(1.0_f32, accent);
 
@@ -1608,6 +1608,10 @@ fn draw_timeline_selection(
         painter.rect_filled(selected, 0.0, fill);
         painter.rect_stroke(selected, 0.0, stroke);
     }
+}
+
+fn timeline_selection_color(theme: &Theme) -> Color32 {
+    theme.accent.to_color32()
 }
 
 /// Linear blend `a + t*(b-a)` per channel. Used to derive the second-row
@@ -1643,6 +1647,17 @@ mod tests {
             transform: Transform2D::IDENTITY,
             tween: Tween::None,
         }
+    }
+
+    #[test]
+    fn timeline_selection_uses_theme_accent_not_legacy_playhead_red() {
+        let theme = Theme {
+            accent: crate::settings::ColorRgb::new(0x26, 0x8B, 0xD2),
+            playhead: crate::settings::ColorRgb::new(0xCC, 0x33, 0x33),
+            ..Theme::default()
+        };
+
+        assert_eq!(timeline_selection_color(&theme), theme.accent.to_color32());
     }
 
     #[test]
