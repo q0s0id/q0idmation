@@ -11,6 +11,11 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     ScrollArea::vertical()
         .auto_shrink([false, true])
         .show(ui, |ui| {
+            let timeline_tweens = crate::easing::selected_tween_targets(app);
+            if !timeline_tweens.is_empty() {
+                crate::easing::render_selected_tween_properties(app, ui, &timeline_tweens);
+                return;
+            }
             match app.session.selection.clone() {
                 Selection::None => stage_properties(app, ui),
                 Selection::Asset(id) => asset_properties(app, ui, id),

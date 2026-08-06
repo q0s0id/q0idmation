@@ -84,7 +84,10 @@ fn layer_move_icon_button(
     response.on_hover_text(hover_text)
 }
 
-fn visible_layer_indices(project: &q0s_format::v2::ProjectV2, q0rg_idx: usize) -> Vec<usize> {
+pub(crate) fn visible_layer_indices(
+    project: &q0s_format::v2::ProjectV2,
+    q0rg_idx: usize,
+) -> Vec<usize> {
     let Some(q0rg) = project.q0rgs.get(q0rg_idx) else {
         return Vec::new();
     };
@@ -105,6 +108,20 @@ fn visible_layer_indices(project: &q0s_format::v2::ProjectV2, q0rg_idx: usize) -
         }
     }
     visible
+}
+
+pub(crate) fn visible_layer_ids(project: &q0s_format::v2::ProjectV2, q0rg_id: u16) -> Vec<u16> {
+    let Some(q0rg_idx) = project
+        .q0rgs
+        .iter()
+        .position(|q0rg| q0rg.q0rg_id == q0rg_id)
+    else {
+        return Vec::new();
+    };
+    visible_layer_indices(project, q0rg_idx)
+        .into_iter()
+        .map(|index| project.q0rgs[q0rg_idx].layers[index].layer_id)
+        .collect()
 }
 
 fn layer_selection_contains(
@@ -1053,11 +1070,8 @@ fn timeline_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
         ui.close_menu();
     }
     ui.separator();
-    if ui
-        .button("Create / Remove Motion Tween  (Ctrl+Alt+T)")
-        .clicked()
-    {
-        app.queue(Action::ToggleMotionTween);
+    if ui.button("Create Motion Tween  (Ctrl+Alt+T)").clicked() {
+        app.queue(Action::CreateMotionTween);
         ui.close_menu();
     }
 }
@@ -1218,16 +1232,16 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
             {
                 app.queue(Action::RemoveFrame);
             }
-            let can_tween = matches!(
-                app.session.selection,
-                crate::state::Selection::Placement { .. }
-            );
+            let can_tween = app.session.timeline_selection.is_some()
+                && app.session.pending_timeline_frame.is_none();
             if ui
                 .add_enabled(can_tween, egui::Button::new("Tween"))
-                .on_hover_text("Toggle motion tween from selected keyframe (Ctrl+Alt+T)")
+                .on_hover_text(
+                    "Create a motion tween from a non-keyframe cell between two keyframes (Ctrl+Alt+T)",
+                )
                 .clicked()
             {
-                app.queue(Action::ToggleMotionTween);
+                app.queue(Action::CreateMotionTween);
             }
         });
     });

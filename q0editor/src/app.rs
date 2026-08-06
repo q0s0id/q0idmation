@@ -174,7 +174,7 @@ pub enum Action {
     SendToBack,
     RemoveFrame,
     ClearKeyframe,
-    ToggleMotionTween,
+    CreateMotionTween,
     /// Open the q0lang script editor for the given q0rg, or for the
     /// currently-selected one when `None`.
     OpenQ0langEditor(Option<u16>),
@@ -1532,7 +1532,7 @@ impl EditorApp {
             }
             Action::RemoveFrame => self.remove_frame(),
             Action::ClearKeyframe => self.clear_keyframe(),
-            Action::ToggleMotionTween => self.toggle_motion_tween(),
+            Action::CreateMotionTween => self.toggle_motion_tween(),
             Action::OpenQ0langEditor(target) => {
                 let resolved = target.unwrap_or(self.session.current_q0rg_id);
                 if self
@@ -4613,173 +4613,47 @@ impl EditorApp {
         }
     }
 
-    /// Tween toggling on the selected placement.
-    /// * Linear Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†РІР‚С›РЎС›Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р Р†РІР‚С›РЎС›Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†РІР‚С›РЎС›Р В Р’В Р вЂ™Р’В Р В Р’В Р Р†Р вЂљР’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†Р вЂљРЎвЂќР В Р’В Р В Р вЂ№Р В Р Р‹Р Р†Р вЂљРЎвЂќ None (removes the tween in one click).
-    /// * None + a later same-target keyframe exists Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†РІР‚С›РЎС›Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р Р†РІР‚С›РЎС›Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†РІР‚С›РЎС›Р В Р’В Р вЂ™Р’В Р В Р’В Р Р†Р вЂљР’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†Р вЂљРЎвЂќР В Р’В Р В Р вЂ№Р В Р Р‹Р Р†Р вЂљРЎвЂќ Linear pointing at it.
-    /// * None + no later keyframe Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†РІР‚С›РЎС›Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р Р†РІР‚С›РЎС›Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†РІР‚С›РЎС›Р В Р’В Р вЂ™Р’В Р В Р’В Р Р†Р вЂљР’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†Р вЂљРЎвЂќР В Р’В Р В Р вЂ№Р В Р Р‹Р Р†Р вЂљРЎвЂќ **auto-create one** so a fresh tween
-    ///   "just works" without the user manually scrubbing forward and
-    ///   pressing F6. The new keyframe lands at `playhead` if the
-    ///   playhead is past the selected frame, otherwise 10 frames after
-    ///   the selected one (extending `frame_count` if necessary). Then
-    ///   we set Linear to that frame and reselect the *new* keyframe so
-    ///   dragging the object immediately animates.
+    /// Create motion tweens from non-keyframe timeline cells. A valid cell must
+    /// sit strictly between two non-empty keyframes on the same drawable layer.
+    /// No destination keyframe is ever invented implicitly.
     fn toggle_motion_tween(&mut self) {
         if self.session.pending_timeline_frame.is_some() {
-            self.session.status =
-                "future frame is not created; press F5, F6, or F7 first".to_string();
+            self.session.tween_warning = Some(
+                "This future frame does not exist yet. Create it with F5, F6, or F7 first."
+                    .to_string(),
+            );
             return;
         }
-        let Selection::Placement {
+
+        let selection = self.session.timeline_selection.unwrap_or_else(|| {
+            TimelineSelection::single(self.session.current_layer_id, self.session.current_frame)
+        });
+        let q0rg_id = self.session.current_q0rg_id;
+        let visible_layer_ids =
+            crate::panels::timeline::visible_layer_ids(&self.state.project, q0rg_id);
+        let before = self.state.project.clone();
+
+        match crate::easing::create_tweens_for_selection(
+            &mut self.state.project,
             q0rg_id,
-            layer_id,
-            placement_idx,
-        } = self.session.selection.clone()
-        else {
-            self.session.status = "tween: select a placement first".to_string();
-            return;
-        };
-
-        // Read-only snapshot of what we need.
-        let (cur_tween, cur_frame, cur_target, cur_transform, next_frame) = {
-            let Some(layer) = self
-                .state
-                .project
-                .q0rgs
-                .iter()
-                .find(|q| q.q0rg_id == q0rg_id)
-                .and_then(|q| q.layers.iter().find(|l| l.layer_id == layer_id))
-            else {
-                return;
-            };
-            let Some(p) = layer.placements.get(placement_idx) else {
-                return;
-            };
-            let next = layer
-                .placements
-                .iter()
-                .filter(|n| n.target == p.target && n.frame > p.frame)
-                .map(|n| n.frame)
-                .min();
-            (p.tween, p.frame, p.target, p.transform, next)
-        };
-
-        // Already linear Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†РІР‚С›РЎС›Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р Р†РІР‚С›РЎС›Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†РІР‚С›РЎС›Р В Р’В Р вЂ™Р’В Р В Р’В Р Р†Р вЂљР’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†Р вЂљРЎвЂќР В Р’В Р В Р вЂ№Р В Р Р‹Р Р†Р вЂљРЎвЂќ just clear it.
-        if cur_tween.to_frame().is_some() {
-            self.history.snapshot(&self.state.project);
-            if let Some(p) = self
-                .state
-                .project
-                .q0rgs
-                .iter_mut()
-                .find(|q| q.q0rg_id == q0rg_id)
-                .and_then(|q| q.layers.iter_mut().find(|l| l.layer_id == layer_id))
-                .and_then(|l| l.placements.get_mut(placement_idx))
-            {
-                p.tween = Tween::None;
-                self.state.dirty = true;
-                self.session.status = "tween removed".to_string();
-            }
-            return;
-        }
-
-        // From here we're going from None Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†РІР‚С›РЎС›Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р Р†РІР‚С›РЎС›Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†РІР‚С›РЎС›Р В Р’В Р вЂ™Р’В Р В Р’В Р Р†Р вЂљР’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†Р вЂљРЎвЂќР В Р’В Р В Р вЂ№Р В Р Р‹Р Р†Р вЂљРЎвЂќ Linear. Decide where the
-        // second keyframe sits (existing or auto-create).
-        self.history.snapshot(&self.state.project);
-        let target_frame: u16 = match next_frame {
-            Some(f) => f,
-            None => {
-                let playhead = self.session.current_frame;
-                let candidate = if playhead > cur_frame {
-                    playhead
+            selection,
+            &visible_layer_ids,
+        ) {
+            Ok(targets) => {
+                self.history.snapshot(&before);
+                self.state.mark_dirty();
+                self.session.selection = Selection::None;
+                self.session.status = if targets.len() == 1 {
+                    "created motion tween".to_string()
                 } else {
-                    cur_frame.saturating_add(10)
+                    format!("created {} motion tween tracks", targets.len())
                 };
-                // Extend frame_count if `candidate` lies beyond the q0rg.
-                if let Some(q) = self
-                    .state
-                    .project
-                    .q0rgs
-                    .iter_mut()
-                    .find(|q| q.q0rg_id == q0rg_id)
-                {
-                    if candidate >= q.frame_count {
-                        q.frame_count = candidate.saturating_add(1);
-                    }
-                }
-                // Insert a fresh same-target keyframe at `candidate`.
-                if let Some(layer) = self
-                    .state
-                    .project
-                    .q0rgs
-                    .iter_mut()
-                    .find(|q| q.q0rg_id == q0rg_id)
-                    .and_then(|q| q.layers.iter_mut().find(|l| l.layer_id == layer_id))
-                {
-                    layer.placements.push(Placement {
-                        frame: candidate,
-                        target: cur_target,
-                        transform: cur_transform,
-                        tween: Tween::None,
-                    });
-                }
-                candidate
             }
-        };
-
-        // Set Linear on the source placement.
-        if let Some(p) = self
-            .state
-            .project
-            .q0rgs
-            .iter_mut()
-            .find(|q| q.q0rg_id == q0rg_id)
-            .and_then(|q| q.layers.iter_mut().find(|l| l.layer_id == layer_id))
-            .and_then(|l| l.placements.get_mut(placement_idx))
-        {
-            p.tween = Tween::Linear {
-                to_frame: target_frame,
-            };
-        }
-
-        // Move playhead to the new keyframe and reselect it so the user
-        // can immediately drag/resize the destination pose.
-        if next_frame.is_none() {
-            self.session.current_frame = target_frame;
-            // Find the index of the newly-created keyframe (last placement
-            // matching frame == target_frame and target == cur_target).
-            if let Some(layer) = self
-                .state
-                .project
-                .q0rgs
-                .iter()
-                .find(|q| q.q0rg_id == q0rg_id)
-                .and_then(|q| q.layers.iter().find(|l| l.layer_id == layer_id))
-            {
-                if let Some((idx, _)) = layer
-                    .placements
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .find(|(_, p)| p.frame == target_frame && p.target == cur_target)
-                {
-                    self.session.selection = Selection::Placement {
-                        q0rg_id,
-                        layer_id,
-                        placement_idx: idx,
-                    };
-                }
+            Err(error) => {
+                self.session.tween_warning = Some(error.message().to_string());
+                self.session.status = error.message().to_string();
             }
         }
-
-        self.state.dirty = true;
-        self.session.status = if next_frame.is_some() {
-            format!("tween to frame {}", target_frame + 1)
-        } else {
-            format!(
-                "tween to new keyframe at frame {} (drag to set the end pose)",
-                target_frame + 1
-            )
-        };
     }
 
     fn render_credits_dialog(&mut self, ctx: &Context) {
@@ -5618,6 +5492,7 @@ impl App for EditorApp {
             panels::q0enc::render(self, ctx);
             crate::q0lang::render(self, ctx);
             crate::easing::render_editor(self, ctx);
+            crate::easing::render_warning(self, ctx);
         }
 
         if self.session.show_credits {
@@ -6567,6 +6442,64 @@ mod tests {
         app.session.current_layer_id = app.state.project.q0rgs[0].layers[0].layer_id;
         app.state.dirty = false;
         app
+    }
+
+    #[test]
+    fn tween_command_uses_interior_timeline_cell_not_stage_selection() {
+        let mut app = app_with_one_timeline_object(8);
+        let layer_id = app.session.current_layer_id;
+        app.state.project.q0rgs[0].layers[0]
+            .placements
+            .push(Placement {
+                frame: 6,
+                target: Target::Asset(77),
+                transform: Transform2D {
+                    tx: 60.0,
+                    ..Transform2D::IDENTITY
+                },
+                tween: Tween::None,
+            });
+        app.session.current_frame = 3;
+        app.session.timeline_selection = Some(TimelineSelection::single(layer_id, 3));
+        app.session.selection = Selection::None;
+
+        app.handle(&Context::default(), Action::CreateMotionTween);
+
+        assert_eq!(
+            app.state.project.q0rgs[0].layers[0].placements[0].tween,
+            Tween::Linear { to_frame: 6 }
+        );
+        assert!(app.state.dirty);
+        assert!(app.history.can_undo());
+        assert!(app.session.tween_warning.is_none());
+    }
+
+    #[test]
+    fn tween_command_on_keyframe_shows_warning_without_mutating_project() {
+        let mut app = app_with_one_timeline_object(8);
+        let layer_id = app.session.current_layer_id;
+        app.state.project.q0rgs[0].layers[0]
+            .placements
+            .push(Placement {
+                frame: 6,
+                target: Target::Asset(77),
+                transform: Transform2D::IDENTITY,
+                tween: Tween::None,
+            });
+        app.session.current_frame = 0;
+        app.session.timeline_selection = Some(TimelineSelection::single(layer_id, 0));
+        let before = app.state.project.clone();
+
+        app.handle(&Context::default(), Action::CreateMotionTween);
+
+        assert_eq!(app.state.project, before);
+        assert!(!app.state.dirty);
+        assert!(!app.history.can_undo());
+        assert!(app
+            .session
+            .tween_warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("cannot be created on a keyframe")));
     }
 
     #[test]

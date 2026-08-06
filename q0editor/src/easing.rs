@@ -1,8 +1,9 @@
 use egui::{pos2, vec2, Color32, Sense, Stroke, Ui};
-use q0s_format::v2::{Easing, EasingFamily, EasingMode, Tween};
+use q0s_format::v2::{Easing, EasingFamily, EasingMode, ProjectV2, Tween};
 use serde::{Deserialize, Serialize};
 
-use crate::app::{Action, EditorApp};
+use crate::app::EditorApp;
+use crate::state::TimelineSelection;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CubicCurve {
@@ -124,27 +125,306 @@ fn finite_or(value: f32, fallback: f32) -> f32 {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct EasingEditorState {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TweenRef {
     pub q0rg_id: u16,
     pub layer_id: u16,
     pub placement_idx: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TweenCreateError {
+    NoTimelineCell,
+    KeyframeSelected,
+    MissingSourceKeyframe,
+    MissingDestinationKeyframe,
+    EmptySourceKeyframe,
+    EmptyDestinationKeyframe,
+    AlreadyTweened,
+    NoMatchingObjects,
+}
+
+impl TweenCreateError {
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::NoTimelineCell => {
+                "Select a non-keyframe timeline cell between two keyframes first."
+            }
+            Self::KeyframeSelected => {
+                "A motion tween cannot be created on a keyframe. Select a frame between two keyframes."
+            }
+            Self::MissingSourceKeyframe => {
+                "There is no source keyframe behind this cell. Create a non-empty keyframe first."
+            }
+            Self::MissingDestinationKeyframe => {
+                "There is no destination keyframe ahead. Create a non-empty keyframe after this cell first."
+            }
+            Self::EmptySourceKeyframe => {
+                "The source keyframe is empty. A motion tween needs artwork on both keyframes."
+            }
+            Self::EmptyDestinationKeyframe => {
+                "The keyframe ahead is empty. Put the destination artwork there before creating a tween."
+            }
+            Self::AlreadyTweened => {
+                "This frame is already part of a motion tween. Use Properties to edit or remove it."
+            }
+            Self::NoMatchingObjects => {
+                "The two keyframes do not contain matching objects that can be tweened."
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TweenCreationPlan {
+    layer_id: u16,
+    source_frame: u16,
+    destination_frame: u16,
+    placement_indices: Vec<usize>,
+}
+
+fn selected_layer_ids(selection: TimelineSelection, visible_layer_ids: &[u16]) -> Vec<u16> {
+    let Some(anchor) = visible_layer_ids
+        .iter()
+        .position(|layer_id| *layer_id == selection.anchor_layer_id)
+    else {
+        return Vec::new();
+    };
+    let Some(focus) = visible_layer_ids
+        .iter()
+        .position(|layer_id| *layer_id == selection.focus_layer_id)
+    else {
+        return Vec::new();
+    };
+    visible_layer_ids[anchor.min(focus)..=anchor.max(focus)].to_vec()
+}
+
+pub fn create_tweens_for_selection(
+    project: &mut ProjectV2,
+    q0rg_id: u16,
+    selection: TimelineSelection,
+    visible_layer_ids: &[u16],
+) -> Result<Vec<TweenRef>, TweenCreateError> {
+    let layer_ids = selected_layer_ids(selection, visible_layer_ids);
+    if layer_ids.is_empty() {
+        return Err(TweenCreateError::NoTimelineCell);
+    }
+    let first_frame = selection.anchor_frame.min(selection.focus_frame);
+    let last_frame = selection.anchor_frame.max(selection.focus_frame);
+    let Some(q0rg) = project.q0rgs.iter().find(|q0rg| q0rg.q0rg_id == q0rg_id) else {
+        return Err(TweenCreateError::NoTimelineCell);
+    };
+
+    let mut plans = Vec::<TweenCreationPlan>::new();
+    for layer_id in layer_ids {
+        if project.layer_is_folder(q0rg_id, layer_id) {
+            continue;
+        }
+        let Some(layer) = q0rg.layers.iter().find(|layer| layer.layer_id == layer_id) else {
+            continue;
+        };
+        let keyframes = layer.keyframe_frames();
+        for frame in first_frame..=last_frame {
+            if layer.has_keyframe(frame) {
+                return Err(TweenCreateError::KeyframeSelected);
+            }
+            if layer.placements.iter().any(|placement| {
+                placement
+                    .tween
+                    .to_frame()
+                    .is_some_and(|to_frame| placement.frame < frame && frame < to_frame)
+            }) {
+                return Err(TweenCreateError::AlreadyTweened);
+            }
+
+            let source_frame = keyframes
+                .iter()
+                .copied()
+                .filter(|keyframe| *keyframe < frame)
+                .max()
+                .ok_or(TweenCreateError::MissingSourceKeyframe)?;
+            let destination_frame = keyframes
+                .iter()
+                .copied()
+                .filter(|keyframe| *keyframe > frame)
+                .min()
+                .ok_or(TweenCreateError::MissingDestinationKeyframe)?;
+
+            if plans.iter().any(|plan| {
+                plan.layer_id == layer_id
+                    && plan.source_frame == source_frame
+                    && plan.destination_frame == destination_frame
+            }) {
+                continue;
+            }
+
+            let source_indices = layer
+                .placements
+                .iter()
+                .enumerate()
+                .filter(|(_, placement)| placement.frame == source_frame)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            if source_indices.is_empty() {
+                return Err(TweenCreateError::EmptySourceKeyframe);
+            }
+            if !layer
+                .placements
+                .iter()
+                .any(|placement| placement.frame == destination_frame)
+            {
+                return Err(TweenCreateError::EmptyDestinationKeyframe);
+            }
+
+            let mut placement_indices = Vec::new();
+            for (source_order, placement_idx) in source_indices.iter().copied().enumerate() {
+                let source = &layer.placements[placement_idx];
+                if source.tween.to_frame().is_some() {
+                    return Err(TweenCreateError::AlreadyTweened);
+                }
+                let occurrence = source_indices[..source_order]
+                    .iter()
+                    .filter(|candidate| layer.placements[**candidate].target == source.target)
+                    .count();
+                let destination_exists = layer
+                    .placements
+                    .iter()
+                    .filter(|placement| {
+                        placement.frame == destination_frame && placement.target == source.target
+                    })
+                    .nth(occurrence)
+                    .is_some();
+                if destination_exists {
+                    placement_indices.push(placement_idx);
+                }
+            }
+            if placement_indices.is_empty() {
+                return Err(TweenCreateError::NoMatchingObjects);
+            }
+            plans.push(TweenCreationPlan {
+                layer_id,
+                source_frame,
+                destination_frame,
+                placement_indices,
+            });
+        }
+    }
+
+    if plans.is_empty() {
+        return Err(TweenCreateError::NoTimelineCell);
+    }
+
+    let q0rg = project
+        .q0rgs
+        .iter_mut()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+        .expect("q0rg was resolved before tween mutation");
+    let mut targets = Vec::new();
+    for plan in plans {
+        let layer = q0rg
+            .layers
+            .iter_mut()
+            .find(|layer| layer.layer_id == plan.layer_id)
+            .expect("selected tween layer still exists");
+        for placement_idx in plan.placement_indices {
+            layer.placements[placement_idx].tween = Tween::Linear {
+                to_frame: plan.destination_frame,
+            };
+            targets.push(TweenRef {
+                q0rg_id,
+                layer_id: plan.layer_id,
+                placement_idx,
+            });
+        }
+    }
+    targets.sort_unstable();
+    targets.dedup();
+    Ok(targets)
+}
+
+pub fn tween_targets_for_selection(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    selection: TimelineSelection,
+    visible_layer_ids: &[u16],
+) -> Vec<TweenRef> {
+    let selected_layers = selected_layer_ids(selection, visible_layer_ids);
+    let first_frame = selection.anchor_frame.min(selection.focus_frame);
+    let last_frame = selection.anchor_frame.max(selection.focus_frame);
+    let Some(q0rg) = project.q0rgs.iter().find(|q0rg| q0rg.q0rg_id == q0rg_id) else {
+        return Vec::new();
+    };
+    let mut targets = Vec::new();
+    for layer_id in selected_layers {
+        let Some(layer) = q0rg.layers.iter().find(|layer| layer.layer_id == layer_id) else {
+            continue;
+        };
+        for (placement_idx, placement) in layer.placements.iter().enumerate() {
+            let Some(to_frame) = placement.tween.to_frame() else {
+                continue;
+            };
+            if placement.frame <= last_frame && to_frame >= first_frame {
+                targets.push(TweenRef {
+                    q0rg_id,
+                    layer_id,
+                    placement_idx,
+                });
+            }
+        }
+    }
+    targets.sort_unstable();
+    targets.dedup();
+    targets
+}
+
+pub fn selected_tween_targets(app: &EditorApp) -> Vec<TweenRef> {
+    let Some(selection) = app.session.timeline_selection else {
+        return Vec::new();
+    };
+    let q0rg_id = app.session.current_q0rg_id;
+    let visible_layer_ids = crate::panels::timeline::visible_layer_ids(&app.state.project, q0rg_id);
+    tween_targets_for_selection(&app.state.project, q0rg_id, selection, &visible_layer_ids)
+}
+
+#[derive(Debug, Clone)]
+pub struct EasingEditorState {
+    pub targets: Vec<TweenRef>,
     pub curve: CubicCurve,
     pub preset_name: String,
     active_handle: Option<usize>,
 }
 
 impl EasingEditorState {
-    pub fn new(q0rg_id: u16, layer_id: u16, placement_idx: usize, easing: Easing) -> Self {
+    pub fn new(mut targets: Vec<TweenRef>, easing: Easing) -> Self {
+        targets.sort_unstable();
+        targets.dedup();
         Self {
-            q0rg_id,
-            layer_id,
-            placement_idx,
+            targets,
             curve: CubicCurve::from_easing(easing),
             preset_name: "My easing".to_string(),
             active_handle: None,
         }
     }
+}
+
+fn tween_for_target(app: &EditorApp, target: TweenRef) -> Option<(u16, Tween)> {
+    app.state
+        .project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == target.q0rg_id)
+        .and_then(|q0rg| {
+            q0rg.layers
+                .iter()
+                .find(|layer| layer.layer_id == target.layer_id)
+        })
+        .and_then(|layer| layer.placements.get(target.placement_idx))
+        .and_then(|placement| {
+            placement
+                .tween
+                .to_frame()
+                .map(|_| (placement.frame, placement.tween))
+        })
 }
 
 pub fn render_tween_properties(
@@ -157,29 +437,102 @@ pub fn render_tween_properties(
 ) {
     ui.separator();
     ui.label(egui::RichText::new("Motion tween").strong());
-
-    let Some(to_frame) = tween.to_frame() else {
+    if tween.to_frame().is_none() {
         ui.label(
-            egui::RichText::new("No tween starts at this keyframe")
+            egui::RichText::new(
+                "Select a non-keyframe timeline cell between two keyframes to create a tween.",
+            )
+            .small()
+            .color(app.settings.theme.text_dim.to_color32()),
+        );
+        return;
+    }
+    render_tween_controls(
+        app,
+        ui,
+        &[TweenRef {
+            q0rg_id,
+            layer_id,
+            placement_idx,
+        }],
+        false,
+    );
+}
+
+pub fn render_selected_tween_properties(app: &mut EditorApp, ui: &mut Ui, targets: &[TweenRef]) {
+    render_tween_controls(app, ui, targets, true);
+}
+
+fn render_tween_controls(
+    app: &mut EditorApp,
+    ui: &mut Ui,
+    targets: &[TweenRef],
+    timeline_selection: bool,
+) {
+    let records = targets
+        .iter()
+        .copied()
+        .filter_map(|target| {
+            tween_for_target(app, target).map(|(start, tween)| (target, start, tween))
+        })
+        .collect::<Vec<_>>();
+    if records.is_empty() {
+        return;
+    }
+
+    let mut spans = std::collections::BTreeSet::new();
+    for (target, start, tween) in &records {
+        if let Some(end) = tween.to_frame() {
+            spans.insert((target.layer_id, *start, end));
+        }
+    }
+    if timeline_selection {
+        ui.label(
+            egui::RichText::new(if spans.len() == 1 {
+                "1 motion tween".to_string()
+            } else {
+                format!("{} motion tweens", spans.len())
+            })
+            .strong(),
+        );
+        ui.label(
+            egui::RichText::new(format!("{} animated object track(s)", records.len()))
                 .small()
                 .color(app.settings.theme.text_dim.to_color32()),
         );
-        if ui.button("Create motion tween").clicked() {
-            app.queue(Action::ToggleMotionTween);
+    }
+
+    let first_easing = records[0].2.easing();
+    let common_easing = records
+        .iter()
+        .all(|(_, _, tween)| tween.easing() == first_easing)
+        .then_some(first_easing);
+    match common_easing {
+        Some(easing) => {
+            ui.label(
+                egui::RichText::new(easing_label(easing))
+                    .small()
+                    .color(app.settings.theme.text_dim.to_color32()),
+            );
+            paint_easing_preview(ui, easing, vec2(ui.available_width().max(120.0), 82.0));
         }
-        return;
-    };
+        None => {
+            ui.label(
+                egui::RichText::new(
+                    "Mixed easing — a new preset will be applied to all selected tweens",
+                )
+                .small()
+                .color(app.settings.theme.text_dim.to_color32()),
+            );
+        }
+    }
 
-    let easing = tween.easing();
-    ui.label(format!("To frame {}", to_frame + 1));
-    ui.label(
-        egui::RichText::new(easing_label(easing))
-            .small()
-            .color(app.settings.theme.text_dim.to_color32()),
-    );
-    paint_easing_preview(ui, easing, vec2(ui.available_width().max(120.0), 82.0));
-
+    let target_refs = records
+        .iter()
+        .map(|(target, _, _)| *target)
+        .collect::<Vec<_>>();
     let mut requested = None;
+    let mut remove = false;
     ui.horizontal_wrapped(|ui| {
         ui.menu_button("Built-in presets", |ui| {
             if ui.button("Linear").clicked() {
@@ -212,16 +565,27 @@ pub fn render_tween_properties(
 
         if ui.button("Edit curve...").clicked() {
             app.session.easing_editor = Some(EasingEditorState::new(
-                q0rg_id,
-                layer_id,
-                placement_idx,
-                easing,
+                target_refs.clone(),
+                common_easing.unwrap_or(first_easing),
             ));
+        }
+        if ui
+            .button(if spans.len() == 1 {
+                "Remove tween"
+            } else {
+                "Remove tweens"
+            })
+            .clicked()
+        {
+            remove = true;
         }
     });
 
     if let Some(easing) = requested {
-        apply_tween_easing(app, q0rg_id, layer_id, placement_idx, easing);
+        apply_tween_easing(app, &target_refs, easing);
+    }
+    if remove {
+        remove_tweens(app, &target_refs);
     }
 }
 
@@ -234,7 +598,12 @@ pub fn render_editor(app: &mut EditorApp, ctx: &egui::Context) {
     let mut apply_curve = false;
     let mut save_settings = false;
 
-    egui::Window::new("Easing Curve Editor")
+    let title = if state.targets.len() == 1 {
+        "Easing Curve Editor".to_string()
+    } else {
+        format!("Easing Curve Editor — {} tweens", state.targets.len())
+    };
+    egui::Window::new(title)
         .open(&mut open)
         .default_width(430.0)
         .resizable(true)
@@ -278,7 +647,12 @@ pub fn render_editor(app: &mut EditorApp, ctx: &egui::Context) {
                 });
 
             ui.horizontal(|ui| {
-                if ui.button("Apply to tween").clicked() {
+                let apply_label = if state.targets.len() == 1 {
+                    "Apply to tween".to_string()
+                } else {
+                    format!("Apply to {} tweens", state.targets.len())
+                };
+                if ui.button(apply_label).clicked() {
                     apply_curve = true;
                 }
                 if ui.button("Reset").clicked() {
@@ -336,13 +710,7 @@ pub fn render_editor(app: &mut EditorApp, ctx: &egui::Context) {
         });
 
     if apply_curve {
-        apply_tween_easing(
-            app,
-            state.q0rg_id,
-            state.layer_id,
-            state.placement_idx,
-            state.curve.easing(),
-        );
+        apply_tween_easing(app, &state.targets, state.curve.easing());
     }
     if save_settings {
         sanitize_library(&mut app.settings.easing_presets);
@@ -363,51 +731,119 @@ pub fn sanitize_library(presets: &mut Vec<EasingPreset>) {
     presets.truncate(128);
 }
 
-fn apply_tween_easing(
-    app: &mut EditorApp,
-    q0rg_id: u16,
-    layer_id: u16,
-    placement_idx: usize,
-    easing: Easing,
-) {
-    let current = app
-        .state
-        .project
-        .q0rgs
+fn apply_tween_easing(app: &mut EditorApp, targets: &[TweenRef], easing: Easing) {
+    let mut changed = targets
         .iter()
-        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
-        .and_then(|q0rg| q0rg.layers.iter().find(|layer| layer.layer_id == layer_id))
-        .and_then(|layer| layer.placements.get(placement_idx))
-        .map(|placement| placement.tween);
-    let Some(current) = current else {
-        app.session.status = "tween no longer exists".to_string();
+        .copied()
+        .filter(|target| {
+            tween_for_target(app, *target)
+                .is_some_and(|(_, tween)| tween.with_easing(easing) != tween)
+        })
+        .collect::<Vec<_>>();
+    changed.sort_unstable();
+    changed.dedup();
+    if changed.is_empty() {
+        return;
+    }
+
+    app.history.snapshot(&app.state.project);
+    let mut updated_count = 0usize;
+    for target in changed {
+        let Some(placement) = app
+            .state
+            .project
+            .q0rgs
+            .iter_mut()
+            .find(|q0rg| q0rg.q0rg_id == target.q0rg_id)
+            .and_then(|q0rg| {
+                q0rg.layers
+                    .iter_mut()
+                    .find(|layer| layer.layer_id == target.layer_id)
+            })
+            .and_then(|layer| layer.placements.get_mut(target.placement_idx))
+        else {
+            continue;
+        };
+        if placement.tween.to_frame().is_some() {
+            placement.tween = placement.tween.with_easing(easing);
+            updated_count += 1;
+        }
+    }
+    if updated_count > 0 {
+        app.state.mark_dirty();
+        app.session.status = if updated_count == 1 {
+            format!("tween easing: {}", easing_label(easing))
+        } else {
+            format!("updated easing on {updated_count} tween tracks")
+        };
+    }
+}
+
+fn remove_tweens(app: &mut EditorApp, targets: &[TweenRef]) {
+    let mut removable = targets
+        .iter()
+        .copied()
+        .filter(|target| tween_for_target(app, *target).is_some())
+        .collect::<Vec<_>>();
+    removable.sort_unstable();
+    removable.dedup();
+    if removable.is_empty() {
+        return;
+    }
+
+    app.history.snapshot(&app.state.project);
+    let mut removed = 0usize;
+    for target in removable {
+        let Some(placement) = app
+            .state
+            .project
+            .q0rgs
+            .iter_mut()
+            .find(|q0rg| q0rg.q0rg_id == target.q0rg_id)
+            .and_then(|q0rg| {
+                q0rg.layers
+                    .iter_mut()
+                    .find(|layer| layer.layer_id == target.layer_id)
+            })
+            .and_then(|layer| layer.placements.get_mut(target.placement_idx))
+        else {
+            continue;
+        };
+        if placement.tween.to_frame().is_some() {
+            placement.tween = Tween::None;
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        app.state.mark_dirty();
+        app.session.status = if removed == 1 {
+            "removed motion tween".to_string()
+        } else {
+            format!("removed {removed} motion tween tracks")
+        };
+    }
+}
+
+pub fn render_warning(app: &mut EditorApp, ctx: &egui::Context) {
+    let Some(message) = app.session.tween_warning.clone() else {
         return;
     };
-    if current.to_frame().is_none() {
-        app.session.status = "this keyframe has no motion tween".to_string();
-        return;
-    }
-    let updated = current.with_easing(easing);
-    if updated == current {
-        return;
-    }
-    app.history.snapshot(&app.state.project);
-    if let Some(placement) = app
-        .state
-        .project
-        .q0rgs
-        .iter_mut()
-        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
-        .and_then(|q0rg| {
-            q0rg.layers
-                .iter_mut()
-                .find(|layer| layer.layer_id == layer_id)
-        })
-        .and_then(|layer| layer.placements.get_mut(placement_idx))
-    {
-        placement.tween = updated;
-        app.state.mark_dirty();
-        app.session.status = format!("tween easing: {}", easing_label(easing));
+    let mut open = true;
+    let mut dismiss = false;
+    egui::Window::new("Motion tween not created")
+        .open(&mut open)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label(message);
+            ui.add_space(8.0);
+            if ui.button("OK").clicked() {
+                dismiss = true;
+            }
+        });
+    if dismiss || !open {
+        app.session.tween_warning = None;
     }
 }
 
@@ -541,6 +977,192 @@ fn curve_editor(ui: &mut Ui, state: &mut EasingEditorState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn timeline_project() -> ProjectV2 {
+        let mut project = crate::state::default_project();
+        project.q0rgs[0].frame_count = 8;
+        project.q0rgs[0].layers[0].explicit_keyframes.clear();
+        project.q0rgs[0].layers[0].placements = vec![
+            q0s_format::v2::Placement {
+                frame: 0,
+                target: q0s_format::v2::Target::Asset(77),
+                transform: q0s_format::v2::Transform2D::IDENTITY,
+                tween: Tween::None,
+            },
+            q0s_format::v2::Placement {
+                frame: 6,
+                target: q0s_format::v2::Target::Asset(77),
+                transform: q0s_format::v2::Transform2D {
+                    tx: 60.0,
+                    ..q0s_format::v2::Transform2D::IDENTITY
+                },
+                tween: Tween::None,
+            },
+        ];
+        project
+    }
+
+    #[test]
+    fn non_keyframe_between_two_content_keys_creates_tween() {
+        let mut project = timeline_project();
+        let targets =
+            create_tweens_for_selection(&mut project, 1, TimelineSelection::single(1, 3), &[1])
+                .expect("interior frame must create tween");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            project.q0rgs[0].layers[0].placements[0].tween,
+            Tween::Linear { to_frame: 6 }
+        );
+        assert_eq!(project.q0rgs[0].layers[0].placements.len(), 2);
+    }
+
+    #[test]
+    fn keyframe_selection_is_rejected_without_mutation() {
+        let mut project = timeline_project();
+        let before = project.clone();
+        assert_eq!(
+            create_tweens_for_selection(&mut project, 1, TimelineSelection::single(1, 0), &[1],),
+            Err(TweenCreateError::KeyframeSelected)
+        );
+        assert_eq!(project, before);
+    }
+
+    #[test]
+    fn empty_destination_keyframe_is_rejected_without_auto_keying() {
+        let mut project = timeline_project();
+        project.q0rgs[0].layers[0].placements.pop();
+        project.q0rgs[0].layers[0].explicit_keyframes = vec![6];
+        let before = project.clone();
+
+        assert_eq!(
+            create_tweens_for_selection(&mut project, 1, TimelineSelection::single(1, 3), &[1],),
+            Err(TweenCreateError::EmptyDestinationKeyframe)
+        );
+        assert_eq!(project, before);
+    }
+
+    #[test]
+    fn missing_destination_keyframe_is_rejected_without_extending_timeline() {
+        let mut project = timeline_project();
+        project.q0rgs[0].layers[0].placements.pop();
+        let before = project.clone();
+
+        assert_eq!(
+            create_tweens_for_selection(&mut project, 1, TimelineSelection::single(1, 3), &[1],),
+            Err(TweenCreateError::MissingDestinationKeyframe)
+        );
+        assert_eq!(project, before);
+    }
+
+    #[test]
+    fn selecting_any_cell_of_tween_finds_its_settings_target() {
+        let mut project = timeline_project();
+        project.q0rgs[0].layers[0].placements[0].tween = Tween::Linear { to_frame: 6 };
+
+        for frame in [0, 3, 6] {
+            let targets =
+                tween_targets_for_selection(&project, 1, TimelineSelection::single(1, frame), &[1]);
+            assert_eq!(targets.len(), 1, "frame {frame} must resolve tween");
+            assert_eq!(targets[0].placement_idx, 0);
+        }
+    }
+
+    #[test]
+    fn rectangular_selection_collects_multiple_tweens() {
+        let mut project = timeline_project();
+        project.q0rgs[0].layers[0].placements[0].tween = Tween::Linear { to_frame: 6 };
+        project.q0rgs[0].layers.push(q0s_format::v2::Layer {
+            layer_id: 2,
+            name: "second".to_string(),
+            explicit_keyframes: Vec::new(),
+            placements: vec![
+                q0s_format::v2::Placement {
+                    frame: 0,
+                    target: q0s_format::v2::Target::Asset(88),
+                    transform: q0s_format::v2::Transform2D::IDENTITY,
+                    tween: Tween::Linear { to_frame: 6 },
+                },
+                q0s_format::v2::Placement {
+                    frame: 6,
+                    target: q0s_format::v2::Target::Asset(88),
+                    transform: q0s_format::v2::Transform2D::IDENTITY,
+                    tween: Tween::None,
+                },
+            ],
+        });
+        let selection = TimelineSelection {
+            anchor_layer_id: 1,
+            anchor_frame: 2,
+            focus_layer_id: 2,
+            focus_frame: 4,
+        };
+        let targets = tween_targets_for_selection(&project, 1, selection, &[1, 2]);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].layer_id, 1);
+        assert_eq!(targets[1].layer_id, 2);
+    }
+
+    #[test]
+    fn applying_easing_updates_multiple_tweens_as_one_undo_step() {
+        let mut app = EditorApp::default();
+        app.state.project = timeline_project();
+        app.state.project.q0rgs[0].layers[0].placements[0].tween = Tween::Linear { to_frame: 6 };
+        app.state.project.q0rgs[0]
+            .layers
+            .push(q0s_format::v2::Layer {
+                layer_id: 2,
+                name: "second".to_string(),
+                explicit_keyframes: Vec::new(),
+                placements: vec![
+                    q0s_format::v2::Placement {
+                        frame: 0,
+                        target: q0s_format::v2::Target::Asset(88),
+                        transform: q0s_format::v2::Transform2D::IDENTITY,
+                        tween: Tween::Linear { to_frame: 6 },
+                    },
+                    q0s_format::v2::Placement {
+                        frame: 6,
+                        target: q0s_format::v2::Target::Asset(88),
+                        transform: q0s_format::v2::Transform2D::IDENTITY,
+                        tween: Tween::None,
+                    },
+                ],
+            });
+        let targets = vec![
+            TweenRef {
+                q0rg_id: 1,
+                layer_id: 1,
+                placement_idx: 0,
+            },
+            TweenRef {
+                q0rg_id: 1,
+                layer_id: 2,
+                placement_idx: 0,
+            },
+        ];
+        let easing = Easing::Preset {
+            family: EasingFamily::Bounce,
+            mode: EasingMode::InOut,
+        };
+
+        apply_tween_easing(&mut app, &targets, easing);
+
+        assert_eq!(
+            app.state.project.q0rgs[0].layers[0].placements[0]
+                .tween
+                .easing(),
+            easing
+        );
+        assert_eq!(
+            app.state.project.q0rgs[0].layers[1].placements[0]
+                .tween
+                .easing(),
+            easing
+        );
+        assert!(app.history.can_undo());
+        assert!(app.state.dirty);
+    }
 
     #[test]
     fn library_sanitizer_deduplicates_and_bounds_curves() {

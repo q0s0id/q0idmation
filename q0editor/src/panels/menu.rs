@@ -499,7 +499,7 @@ pub fn handle_global_shortcuts(app: &mut EditorApp, ctx: &egui::Context) {
             app.queue(Action::OpenQ0langEditor(None));
         }
         if i.consume_key(Modifiers::COMMAND | Modifiers::ALT, Key::T) {
-            app.queue(Action::ToggleMotionTween);
+            app.queue(Action::CreateMotionTween);
         }
         // Tool letter shortcuts only when no widget is capturing keyboard.
         if !typing {
