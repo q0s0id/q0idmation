@@ -3632,6 +3632,10 @@ impl EditorApp {
         ) else {
             return false;
         };
+        let affected_layers: std::collections::BTreeSet<(u16, u16)> = refs
+            .iter()
+            .map(|reference| (reference.q0rg_id, reference.layer_id))
+            .collect();
 
         let mut by_asset: std::collections::BTreeMap<u16, Vec<usize>> =
             std::collections::BTreeMap::new();
@@ -3702,6 +3706,14 @@ impl EditorApp {
                 .project
                 .assets
                 .retain(|asset| !empty_assets.contains(&asset.id()));
+        }
+        for (q0rg_id, layer_id) in affected_layers {
+            crate::tools::preserve_blank_keyframe_after_content_delete(
+                &mut self.state.project,
+                q0rg_id,
+                layer_id,
+                self.session.current_frame,
+            );
         }
         self.state.dirty = true;
         self.session.selection = Selection::None;
@@ -3849,6 +3861,12 @@ impl EditorApp {
                 {
                     if mapped_idx < layer.placements.len() {
                         layer.placements.remove(mapped_idx);
+                        crate::tools::preserve_blank_keyframe_after_content_delete(
+                            &mut self.state.project,
+                            q0rg_id,
+                            layer_id,
+                            self.session.current_frame,
+                        );
                         self.state.dirty = true;
                         self.session.selection = Selection::None;
                         return true;
@@ -3999,31 +4017,50 @@ impl EditorApp {
                     return false;
                 }
                 self.history.snapshot(&self.state.project);
-                // Sort refs by (q0rg_id, layer_id, placement_idx desc) so we can
-                // remove from the back of each layer without shifting earlier
-                // indices.
-                let mut sorted = refs.clone();
+                let Some(mut sorted) = crate::tools::materialize_placement_refs_for_edit(
+                    &mut self.state.project,
+                    &refs,
+                    self.session.current_frame,
+                ) else {
+                    return false;
+                };
+                let affected_layers: std::collections::BTreeSet<(u16, u16)> = sorted
+                    .iter()
+                    .map(|reference| (reference.q0rg_id, reference.layer_id))
+                    .collect();
+                // Remove from the back of each freshly materialized layer so
+                // placement indices remain stable throughout the operation.
                 sorted.sort_by(|a, b| {
                     a.q0rg_id
                         .cmp(&b.q0rg_id)
                         .then(a.layer_id.cmp(&b.layer_id))
                         .then(b.placement_idx.cmp(&a.placement_idx))
                 });
-                for r in sorted {
-                    if let Some(q) = self
+                for reference in sorted {
+                    if let Some(layer) = self
                         .state
                         .project
                         .q0rgs
                         .iter_mut()
-                        .find(|q| q.q0rg_id == r.q0rg_id)
+                        .find(|q0rg| q0rg.q0rg_id == reference.q0rg_id)
+                        .and_then(|q0rg| {
+                            q0rg.layers
+                                .iter_mut()
+                                .find(|layer| layer.layer_id == reference.layer_id)
+                        })
                     {
-                        if let Some(layer) = q.layers.iter_mut().find(|l| l.layer_id == r.layer_id)
-                        {
-                            if r.placement_idx < layer.placements.len() {
-                                layer.placements.remove(r.placement_idx);
-                            }
+                        if reference.placement_idx < layer.placements.len() {
+                            layer.placements.remove(reference.placement_idx);
                         }
                     }
+                }
+                for (q0rg_id, layer_id) in affected_layers {
+                    crate::tools::preserve_blank_keyframe_after_content_delete(
+                        &mut self.state.project,
+                        q0rg_id,
+                        layer_id,
+                        self.session.current_frame,
+                    );
                 }
                 self.state.dirty = true;
                 self.session.selection = Selection::None;
@@ -5833,6 +5870,178 @@ mod tests {
         assert!(app.delete_selection());
         assert!(!app.state.project.asset_names.contains_key(&77));
         q0s_format::v2::validate(&app.state.project).expect("project remains valid");
+    }
+
+    #[test]
+    fn deleting_last_stage_object_turns_content_key_into_blank_key() {
+        let mut app = app_with_one_timeline_object(12);
+        app.state.project.q0rgs[0].layers[0]
+            .explicit_keyframes
+            .clear();
+        app.session.current_frame = 0;
+        app.session.selection = Selection::Placement {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: 0,
+        };
+
+        assert!(app.delete_selection());
+
+        let layer = &app.state.project.q0rgs[0].layers[0];
+        assert!(layer.placements.is_empty());
+        assert!(layer.is_blank_keyframe(0));
+        assert_eq!(layer.keyframe_frames(), vec![0]);
+    }
+
+    #[test]
+    fn deleting_last_tween_target_from_stage_keeps_blank_key_and_clears_incoming_tween() {
+        let mut app = app_with_one_timeline_object(12);
+        app.state.project.q0rgs[0].layers[0]
+            .explicit_keyframes
+            .clear();
+        app.state.project.q0rgs[0].layers[0].placements[0].tween = Tween::Linear { to_frame: 5 };
+        app.state.project.q0rgs[0].layers[0]
+            .placements
+            .push(Placement {
+                frame: 5,
+                target: Target::Asset(77),
+                transform: Transform2D {
+                    tx: 50.0,
+                    ..Transform2D::IDENTITY
+                },
+                tween: Tween::None,
+            });
+        app.session.current_frame = 5;
+        app.session.selection = Selection::Placement {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: 1,
+        };
+
+        assert!(app.delete_selection());
+
+        let layer = &app.state.project.q0rgs[0].layers[0];
+        assert!(layer.is_blank_keyframe(5));
+        assert!(matches!(layer.placements[0].tween, Tween::None));
+        assert!(crate::render::active_placements_at(layer, 5).is_empty());
+    }
+
+    #[test]
+    fn deleting_all_stage_objects_on_held_frame_creates_blank_key_without_mutating_source() {
+        let mut app = app_with_one_timeline_object(12);
+        app.state.project.q0rgs[0].layers[0]
+            .explicit_keyframes
+            .clear();
+        app.state.project.q0rgs[0].layers[0]
+            .placements
+            .push(Placement {
+                frame: 0,
+                target: Target::Asset(78),
+                transform: Transform2D::IDENTITY,
+                tween: Tween::None,
+            });
+        app.session.current_frame = 5;
+        app.session.selection = Selection::Multi(vec![
+            crate::state::PlacementRef {
+                q0rg_id: 1,
+                layer_id: 1,
+                placement_idx: 0,
+            },
+            crate::state::PlacementRef {
+                q0rg_id: 1,
+                layer_id: 1,
+                placement_idx: 1,
+            },
+        ]);
+
+        assert!(app.delete_selection());
+
+        let layer = &app.state.project.q0rgs[0].layers[0];
+        assert_eq!(crate::render::active_placements_at(layer, 0).len(), 2);
+        assert!(layer.is_blank_keyframe(5));
+        assert!(crate::render::active_placements_at(layer, 5).is_empty());
+        assert_eq!(layer.placements.iter().filter(|p| p.frame == 0).count(), 2);
+        assert_eq!(layer.placements.iter().filter(|p| p.frame == 5).count(), 0);
+    }
+
+    #[test]
+    fn deleting_last_raw_fill_turns_content_key_into_blank_key() {
+        let mut app = held_raw_app();
+        app.session.current_frame = 0;
+        app.state.project.assets.truncate(1);
+        app.state.project.q0rgs[0].layers[0].placements.truncate(1);
+        app.state.project.q0rgs[0].layers[0]
+            .explicit_keyframes
+            .clear();
+        app.session.selection = crate::tools::selection_at_point_pub(
+            &app.state.project,
+            1,
+            0,
+            q0s_format::v2::Vec2::new(10.0, 10.0),
+        )
+        .expect("raw selection");
+
+        assert!(app.delete_selection());
+
+        let layer = &app.state.project.q0rgs[0].layers[0];
+        assert!(layer.placements.is_empty());
+        assert!(layer.is_blank_keyframe(0));
+        assert_eq!(layer.keyframe_frames(), vec![0]);
+        q0s_format::v2::validate(&app.state.project).expect("blank raw frame remains valid");
+    }
+
+    #[test]
+    fn deleting_last_held_raw_fill_creates_blank_key_without_mutating_source() {
+        let mut app = held_raw_app();
+        app.state.project.assets.truncate(1);
+        app.state.project.q0rgs[0].layers[0].placements.truncate(1);
+        app.state.project.q0rgs[0].layers[0]
+            .explicit_keyframes
+            .clear();
+        app.session.selection = crate::tools::selection_at_point_pub(
+            &app.state.project,
+            1,
+            5,
+            q0s_format::v2::Vec2::new(10.0, 10.0),
+        )
+        .expect("held raw selection");
+
+        assert!(app.delete_selection());
+
+        let layer = &app.state.project.q0rgs[0].layers[0];
+        assert_eq!(crate::render::active_placements_at(layer, 0).len(), 1);
+        assert!(layer.is_blank_keyframe(5));
+        assert!(crate::render::active_placements_at(layer, 5).is_empty());
+        assert_eq!(layer.placements.iter().filter(|p| p.frame == 0).count(), 1);
+        q0s_format::v2::validate(&app.state.project).expect("held raw delete remains valid");
+    }
+
+    #[test]
+    fn deleting_held_raw_area_creates_blank_key_without_mutating_source() {
+        let mut app = held_raw_app();
+        app.state.project.assets.truncate(1);
+        app.state.project.q0rgs[0].layers[0].placements.truncate(1);
+        app.state.project.q0rgs[0].layers[0]
+            .explicit_keyframes
+            .clear();
+        app.session.selection = Selection::RawArea {
+            placements: vec![crate::state::PlacementRef {
+                q0rg_id: 1,
+                layer_id: 1,
+                placement_idx: 0,
+            }],
+            objects: Vec::new(),
+            bounds_min: Vec2::new(-1.0, -1.0),
+            bounds_max: Vec2::new(21.0, 21.0),
+        };
+
+        assert!(app.delete_selection());
+
+        let layer = &app.state.project.q0rgs[0].layers[0];
+        assert_eq!(crate::render::active_placements_at(layer, 0).len(), 1);
+        assert!(layer.is_blank_keyframe(5));
+        assert!(crate::render::active_placements_at(layer, 5).is_empty());
+        q0s_format::v2::validate(&app.state.project).expect("held raw area delete remains valid");
     }
 
     #[test]

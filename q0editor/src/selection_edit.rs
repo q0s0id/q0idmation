@@ -272,6 +272,11 @@ pub fn remove_raw_area_and_objects(
     frame: u16,
 ) -> bool {
     let clip = crate::tools::rect_polygon((bounds_min.x, bounds_min.y, bounds_max.x, bounds_max.y));
+    let affected_layers: BTreeSet<(u16, u16)> = raw_placements
+        .iter()
+        .chain(objects.iter())
+        .map(|reference| (reference.q0rg_id, reference.layer_id))
+        .collect();
 
     let mut mappings: BTreeMap<(u16, u16), BTreeMap<usize, usize>> = BTreeMap::new();
     for reference in raw_placements.iter().chain(objects.iter()) {
@@ -379,6 +384,13 @@ pub fn remove_raw_area_and_objects(
             if reference.placement_idx < layer.placements.len() {
                 layer.placements.remove(reference.placement_idx);
             }
+        }
+    }
+    if changed {
+        for (q0rg_id, layer_id) in affected_layers {
+            crate::tools::preserve_blank_keyframe_after_content_delete(
+                project, q0rg_id, layer_id, frame,
+            );
         }
     }
 

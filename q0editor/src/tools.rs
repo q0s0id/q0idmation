@@ -3398,6 +3398,85 @@ pub(crate) fn materialize_layer_keyframe_for_edit(
     Some(mapping)
 }
 
+/// Materialize every referenced display object on `frame` and remap the
+/// selection to the freshly baked placement indices. This is the multi-object
+/// counterpart of `materialize_placement_keyframe_for_edit`; without it,
+/// deleting a marquee selection on a held frame mutates the source keyframe.
+pub(crate) fn materialize_placement_refs_for_edit(
+    project: &mut ProjectV2,
+    refs: &[PlacementRef],
+    frame: u16,
+) -> Option<Vec<PlacementRef>> {
+    let mut mappings = std::collections::BTreeMap::new();
+    for reference in refs {
+        let key = (reference.q0rg_id, reference.layer_id);
+        if mappings.contains_key(&key) {
+            continue;
+        }
+        let mapping = materialize_layer_keyframe_for_edit(
+            project,
+            reference.q0rg_id,
+            reference.layer_id,
+            frame,
+        )?;
+        mappings.insert(key, mapping);
+    }
+
+    refs.iter()
+        .map(|reference| {
+            let mapping = mappings.get(&(reference.q0rg_id, reference.layer_id))?;
+            Some(PlacementRef {
+                q0rg_id: reference.q0rg_id,
+                layer_id: reference.layer_id,
+                placement_idx: *mapping.get(&reference.placement_idx)?,
+            })
+        })
+        .collect()
+}
+
+/// A content keyframe is represented implicitly by placements. If a stage edit
+/// removes the final placement, preserve the frame explicitly so it becomes a
+/// real blank keyframe instead of disappearing and revealing the previous hold.
+pub(crate) fn preserve_blank_keyframe_after_content_delete(
+    project: &mut ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    frame: u16,
+) -> bool {
+    if project.layer_is_folder(q0rg_id, layer_id) {
+        return false;
+    }
+    let Some(layer) = project
+        .q0rgs
+        .iter_mut()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+        .and_then(|q0rg| {
+            q0rg.layers
+                .iter_mut()
+                .find(|layer| layer.layer_id == layer_id)
+        })
+    else {
+        return false;
+    };
+    if layer
+        .placements
+        .iter()
+        .any(|placement| placement.frame == frame)
+    {
+        return false;
+    }
+
+    let mut changed = !layer.explicit_keyframes.contains(&frame);
+    layer.ensure_explicit_keyframe(frame);
+    for placement in &mut layer.placements {
+        if matches!(placement.tween, Tween::Linear { to_frame } if to_frame == frame) {
+            placement.tween = Tween::None;
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Bake a held display object by materializing its complete layer keyframe and
 /// return the selected placement's remapped index.
 pub(crate) fn materialize_placement_keyframe_for_edit(
