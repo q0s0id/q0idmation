@@ -14,7 +14,10 @@ use crate::render::{
     flatten_path, flatten_path_for_stroke, paint_complex_fill, paint_round_stroke_preview,
     placement_bbox, placement_local_bbox, StageView,
 };
-use crate::state::{Handle, PathRef, PlacementRef, Selection, Tool, ToolState, TransformEdge};
+use crate::state::{
+    GroupTransformOperation, Handle, PathRef, PlacementRef, Selection, Tool, ToolState,
+    TransformEdge, TransformPivot,
+};
 
 const HIT_RADIUS: f32 = 6.0;
 // Sample spacing for raw brush points. We commit fewer than this many anchors
@@ -136,12 +139,24 @@ fn pick_cursor(app: &EditorApp, response: &Response, view: &StageView) -> Option
     {
         return Some(resize_cursor_for_handle(handle));
     }
+    if let ToolState::DraggingGroup {
+        operation: GroupTransformOperation::Scale { handle, .. },
+        ..
+    } = app.session.tool_state
+    {
+        return Some(resize_cursor_for_handle(handle));
+    }
     if matches!(
         app.session.tool_state,
         ToolState::DraggingRawRotate { .. }
             | ToolState::DraggingPlacementRotate { .. }
             | ToolState::DraggingRawSkew { .. }
             | ToolState::DraggingPlacementSkew { .. }
+            | ToolState::DraggingGroup {
+                operation: GroupTransformOperation::Rotate { .. }
+                    | GroupTransformOperation::Skew { .. },
+                ..
+            }
     ) {
         return Some(CursorIcon::None);
     }
@@ -151,6 +166,10 @@ fn pick_cursor(app: &EditorApp, response: &Response, view: &StageView) -> Option
             | ToolState::DraggingPath { .. }
             | ToolState::DraggingPaths { .. }
             | ToolState::DraggingPathPoints { .. }
+            | ToolState::DraggingGroup {
+                operation: GroupTransformOperation::Move { .. },
+                ..
+            }
     ) {
         return Some(CursorIcon::Grabbing);
     }
@@ -194,15 +213,11 @@ fn selected_transform_hit(
     view: &StageView,
     cursor_screen: Pos2,
 ) -> Option<TransformHit> {
-    if let Selection::RawArea {
-        objects,
-        bounds_min,
-        bounds_max,
-        ..
-    } = &app.session.selection
-    {
-        if objects.is_empty() {
-            let bounds = (bounds_min.x, bounds_min.y, bounds_max.x, bounds_max.y);
+    if matches!(
+        app.session.selection,
+        Selection::RawArea { .. } | Selection::Mixed { .. } | Selection::Multi(_)
+    ) {
+        if let Some(bounds) = selection_transform_bounds(app) {
             if let Some(hit) = hit_test_raw_transform(bounds, view, cursor_screen) {
                 return Some(hit);
             }
@@ -246,6 +261,9 @@ fn select_cursor(
     use egui::CursorIcon;
     let cursor_screen = response.hover_pos()?;
 
+    if selected_pivot_hit(app, view, cursor_screen) {
+        return Some(CursorIcon::Move);
+    }
     // Transform handles take priority over body hit so the user can grab
     // a handle that overlaps a body pixel without surprise.
     if let Some(hit) = selected_transform_hit(app, view, cursor_screen) {
@@ -298,6 +316,150 @@ fn selection_color(app: &EditorApp) -> Color32 {
 fn selection_fill_color(app: &EditorApp, alpha: u8) -> Color32 {
     let color = selection_color(app);
     Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+}
+
+fn union_bounds(
+    left: Option<(f32, f32, f32, f32)>,
+    right: Option<(f32, f32, f32, f32)>,
+) -> Option<(f32, f32, f32, f32)> {
+    match (left, right) {
+        (Some(a), Some(b)) => Some((a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))),
+        (Some(bounds), None) | (None, Some(bounds)) => Some(bounds),
+        (None, None) => None,
+    }
+}
+
+fn placement_ref_world_bounds(
+    project: &ProjectV2,
+    reference: PlacementRef,
+    frame: u16,
+) -> Option<(f32, f32, f32, f32)> {
+    let layer = project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == reference.q0rg_id)?
+        .layers
+        .iter()
+        .find(|layer| layer.layer_id == reference.layer_id)?;
+    let placement = layer.placements.get(reference.placement_idx)?;
+    let transform =
+        crate::render::active_transform_for_placement(layer, reference.placement_idx, frame)?;
+    let mut visual = placement.clone();
+    visual.transform = transform;
+    placement_bbox(project, &visual)
+}
+
+fn placement_refs_world_bounds(
+    project: &ProjectV2,
+    references: &[PlacementRef],
+    frame: u16,
+) -> Option<(f32, f32, f32, f32)> {
+    references.iter().copied().fold(None, |bounds, reference| {
+        union_bounds(
+            bounds,
+            placement_ref_world_bounds(project, reference, frame),
+        )
+    })
+}
+
+fn selection_transform_bounds(app: &EditorApp) -> Option<(f32, f32, f32, f32)> {
+    match &app.session.selection {
+        Selection::Placement {
+            q0rg_id,
+            layer_id,
+            placement_idx,
+        } => placement_ref_world_bounds(
+            &app.state.project,
+            PlacementRef {
+                q0rg_id: *q0rg_id,
+                layer_id: *layer_id,
+                placement_idx: *placement_idx,
+            },
+            app.session.current_frame,
+        ),
+        Selection::Path {
+            q0rg_id,
+            layer_id,
+            placement_idx,
+            path_idx,
+        } => raw_path_refs_bounds(
+            &app.state.project,
+            &[PathRef {
+                q0rg_id: *q0rg_id,
+                layer_id: *layer_id,
+                placement_idx: *placement_idx,
+                path_idx: *path_idx,
+            }],
+        ),
+        Selection::Paths(paths) => raw_path_refs_bounds(&app.state.project, paths),
+        Selection::RawArea {
+            objects,
+            bounds_min,
+            bounds_max,
+            ..
+        } => union_bounds(
+            Some((bounds_min.x, bounds_min.y, bounds_max.x, bounds_max.y)),
+            placement_refs_world_bounds(&app.state.project, objects, app.session.current_frame),
+        ),
+        Selection::Mixed { paths, objects } => union_bounds(
+            raw_path_refs_bounds(&app.state.project, paths),
+            placement_refs_world_bounds(&app.state.project, objects, app.session.current_frame),
+        ),
+        Selection::Multi(objects) => {
+            placement_refs_world_bounds(&app.state.project, objects, app.session.current_frame)
+        }
+        Selection::None
+        | Selection::Asset(_)
+        | Selection::Q0rg(_)
+        | Selection::PathPoints { .. } => None,
+    }
+}
+
+fn selection_default_pivot(app: &EditorApp) -> Option<Vec2> {
+    if let Selection::Placement {
+        q0rg_id,
+        layer_id,
+        placement_idx,
+    } = app.session.selection
+    {
+        let (_, local_bbox, transform) = drag_start_data(
+            &app.state.project,
+            q0rg_id,
+            layer_id,
+            placement_idx,
+            app.session.current_frame,
+        )?;
+        let local_center = Vec2::new(
+            (local_bbox.0 + local_bbox.2) * 0.5,
+            (local_bbox.1 + local_bbox.3) * 0.5,
+        );
+        return Some(Affine::from_transform(transform).apply(local_center));
+    }
+    selection_transform_bounds(app)
+        .map(|bounds| Vec2::new((bounds.0 + bounds.2) * 0.5, (bounds.1 + bounds.3) * 0.5))
+}
+
+fn selection_transform_pivot(app: &EditorApp) -> Option<Vec2> {
+    app.session
+        .transform_pivot
+        .as_ref()
+        .filter(|pivot| pivot.selection == app.session.selection)
+        .map(|pivot| pivot.point)
+        .or_else(|| selection_default_pivot(app))
+}
+
+fn set_selection_transform_pivot(app: &mut EditorApp, point: Vec2) {
+    app.session.transform_pivot = Some(TransformPivot {
+        selection: app.session.selection.clone(),
+        point,
+    });
+}
+
+fn selected_pivot_hit(app: &EditorApp, view: &StageView, cursor_screen: Pos2) -> bool {
+    selection_transform_pivot(app).is_some_and(|pivot| {
+        screen_distance_sq(stage_to_screen(pivot, view), cursor_screen)
+            <= PIVOT_HIT_RADIUS_PX * PIVOT_HIT_RADIUS_PX
+    })
 }
 
 // ---------------- Pen tool ----------------
@@ -761,11 +923,115 @@ fn marquee_selection(
 /// Materialise a non-destructive V selection only when a drag starts. The
 /// boolean result is stored as accurate linear boundaries: no Bezier refit,
 /// no rubber-band handles, and no geometry mutation merely from selecting.
-fn cut_raw_areas_for_drag(
+fn prepare_writable_raw_references(
+    project: &mut ProjectV2,
+    paths: &[PathRef],
+    placements: &[PlacementRef],
+    frame: u16,
+) {
+    let mut groups: std::collections::BTreeMap<(u16, u16), std::collections::BTreeSet<u16>> =
+        std::collections::BTreeMap::new();
+    for reference in placements
+        .iter()
+        .copied()
+        .chain(paths.iter().map(|path| PlacementRef {
+            q0rg_id: path.q0rg_id,
+            layer_id: path.layer_id,
+            placement_idx: path.placement_idx,
+        }))
+    {
+        let Some(asset_id) = project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == reference.q0rg_id)
+            .and_then(|q0rg| {
+                q0rg.layers
+                    .iter()
+                    .find(|layer| layer.layer_id == reference.layer_id)
+            })
+            .and_then(|layer| layer.placements.get(reference.placement_idx))
+            .and_then(|placement| match placement.target {
+                Target::Asset(asset_id) => Some(asset_id),
+                Target::Q0rg(_) => None,
+            })
+        else {
+            continue;
+        };
+        groups
+            .entry((reference.q0rg_id, reference.layer_id))
+            .or_default()
+            .insert(asset_id);
+    }
+    for ((q0rg_id, layer_id), asset_ids) in groups {
+        crate::brush::prepare_writable_raw_assets(project, q0rg_id, layer_id, frame, &asset_ids);
+    }
+}
+
+fn remap_group_references_for_edit(
+    project: &mut ProjectV2,
+    paths: &[PathRef],
+    raw_placements: &[PlacementRef],
+    objects: &[PlacementRef],
+    frame: u16,
+) -> Option<(Vec<PathRef>, Vec<PlacementRef>, Vec<PlacementRef>)> {
+    let mut all = Vec::new();
+    for reference in paths
+        .iter()
+        .map(|path| PlacementRef {
+            q0rg_id: path.q0rg_id,
+            layer_id: path.layer_id,
+            placement_idx: path.placement_idx,
+        })
+        .chain(raw_placements.iter().copied())
+        .chain(objects.iter().copied())
+    {
+        if !all.contains(&reference) {
+            all.push(reference);
+        }
+    }
+    let mapped = materialize_placement_refs_for_edit(project, &all, frame)?;
+    let remap = |reference: PlacementRef| -> Option<PlacementRef> {
+        let index = all.iter().position(|candidate| *candidate == reference)?;
+        mapped.get(index).copied()
+    };
+    let mapped_paths: Vec<PathRef> = paths
+        .iter()
+        .map(|path| {
+            let placement = remap(PlacementRef {
+                q0rg_id: path.q0rg_id,
+                layer_id: path.layer_id,
+                placement_idx: path.placement_idx,
+            })?;
+            Some(PathRef {
+                q0rg_id: placement.q0rg_id,
+                layer_id: placement.layer_id,
+                placement_idx: placement.placement_idx,
+                path_idx: path.path_idx,
+            })
+        })
+        .collect::<Option<_>>()?;
+    let mapped_raw: Vec<PlacementRef> = raw_placements
+        .iter()
+        .copied()
+        .map(remap)
+        .collect::<Option<_>>()?;
+    let mapped_objects: Vec<PlacementRef> =
+        objects.iter().copied().map(remap).collect::<Option<_>>()?;
+    prepare_writable_raw_references(project, &mapped_paths, &mapped_raw, frame);
+    Some((mapped_paths, mapped_raw, mapped_objects))
+}
+
+fn cut_raw_areas_for_drag_prepared(
     app: &mut EditorApp,
     placements: &[PlacementRef],
     rect: (f32, f32, f32, f32),
 ) -> Vec<PathRef> {
+    prepare_writable_raw_references(
+        &mut app.state.project,
+        &[],
+        placements,
+        app.session.current_frame,
+    );
     let clip = rect_polygon(rect);
     let mut jobs = Vec::new();
     let mut seen_assets = std::collections::BTreeSet::new();
@@ -804,7 +1070,6 @@ fn cut_raw_areas_for_drag(
         return Vec::new();
     }
 
-    app.history.snapshot(&app.state.project);
     let mut refs = Vec::new();
     for (r, asset_id, selected, remainder) in jobs {
         let Some(Asset::Vector(vector)) = app
@@ -842,10 +1107,293 @@ fn cut_raw_areas_for_drag(
     refs
 }
 
+fn cut_raw_areas_for_drag(
+    app: &mut EditorApp,
+    placements: &[PlacementRef],
+    rect: (f32, f32, f32, f32),
+) -> Vec<PathRef> {
+    app.history.snapshot(&app.state.project);
+    let Some((_, placements, _)) = remap_group_references_for_edit(
+        &mut app.state.project,
+        &[],
+        placements,
+        &[],
+        app.session.current_frame,
+    ) else {
+        return Vec::new();
+    };
+    cut_raw_areas_for_drag_prepared(app, &placements, rect)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GroupTransformIntent {
+    Move,
+    Hit(TransformHit),
+}
+
+struct GroupTransformData<'a> {
+    refs: &'a [PathRef],
+    start_paths: &'a [VPath],
+    objects: &'a [PlacementRef],
+    start_transforms: &'a [Transform2D],
+    operation: GroupTransformOperation,
+    start_pivot: Vec2,
+}
+
+fn placement_ref_transform(project: &ProjectV2, reference: PlacementRef) -> Option<Transform2D> {
+    project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == reference.q0rg_id)?
+        .layers
+        .iter()
+        .find(|layer| layer.layer_id == reference.layer_id)?
+        .placements
+        .get(reference.placement_idx)
+        .map(|placement| placement.transform)
+}
+
+fn selection_from_group_parts(paths: Vec<PathRef>, objects: Vec<PlacementRef>) -> Selection {
+    if !paths.is_empty() && !objects.is_empty() {
+        return Selection::Mixed { paths, objects };
+    }
+    if !paths.is_empty() {
+        return match paths.len() {
+            1 => Selection::Path {
+                q0rg_id: paths[0].q0rg_id,
+                layer_id: paths[0].layer_id,
+                placement_idx: paths[0].placement_idx,
+                path_idx: paths[0].path_idx,
+            },
+            _ => Selection::Paths(paths),
+        };
+    }
+    match objects.len() {
+        0 => Selection::None,
+        1 => Selection::Placement {
+            q0rg_id: objects[0].q0rg_id,
+            layer_id: objects[0].layer_id,
+            placement_idx: objects[0].placement_idx,
+        },
+        _ => Selection::Multi(objects),
+    }
+}
+
+fn begin_group_transform(
+    app: &mut EditorApp,
+    selection: Selection,
+    intent: GroupTransformIntent,
+    start_cursor: Vec2,
+) -> bool {
+    let Some(bounds) = selection_transform_bounds(app) else {
+        return false;
+    };
+    if !raw_selection_supports_axis_resize(bounds) {
+        return false;
+    }
+    let pivot = selection_transform_pivot(app)
+        .unwrap_or_else(|| Vec2::new((bounds.0 + bounds.2) * 0.5, (bounds.1 + bounds.3) * 0.5));
+    let (paths, raw_placements, objects, raw_rect) = match selection {
+        Selection::RawArea {
+            placements,
+            objects,
+            bounds_min,
+            bounds_max,
+        } => (
+            Vec::new(),
+            placements,
+            objects,
+            Some((bounds_min.x, bounds_min.y, bounds_max.x, bounds_max.y)),
+        ),
+        Selection::Mixed { paths, objects } => (paths, Vec::new(), objects, None),
+        Selection::Multi(objects) => (Vec::new(), Vec::new(), objects, None),
+        _ => return false,
+    };
+    app.history.snapshot(&app.state.project);
+    let Some((mut paths, raw_placements, objects)) = remap_group_references_for_edit(
+        &mut app.state.project,
+        &paths,
+        &raw_placements,
+        &objects,
+        app.session.current_frame,
+    ) else {
+        return false;
+    };
+    if let Some(rect) = raw_rect {
+        paths.extend(cut_raw_areas_for_drag_prepared(app, &raw_placements, rect));
+    }
+    if paths.is_empty() && objects.is_empty() {
+        return false;
+    }
+    let start_paths: Vec<VPath> = paths
+        .iter()
+        .filter_map(|reference| {
+            raw_path_clone(
+                &app.state.project,
+                reference.q0rg_id,
+                reference.layer_id,
+                reference.placement_idx,
+                reference.path_idx,
+            )
+        })
+        .collect();
+    let start_transforms: Vec<Transform2D> = objects
+        .iter()
+        .copied()
+        .filter_map(|reference| placement_ref_transform(&app.state.project, reference))
+        .collect();
+    if start_paths.len() != paths.len() || start_transforms.len() != objects.len() {
+        return false;
+    }
+    app.session.selection = selection_from_group_parts(paths.clone(), objects.clone());
+    set_selection_transform_pivot(app, pivot);
+    let operation = match intent {
+        GroupTransformIntent::Move => GroupTransformOperation::Move { start_cursor },
+        GroupTransformIntent::Hit(TransformHit::Scale(handle)) => GroupTransformOperation::Scale {
+            handle,
+            start_bounds: bounds,
+        },
+        GroupTransformIntent::Hit(TransformHit::Rotate(_)) => GroupTransformOperation::Rotate {
+            center: pivot,
+            start_angle: (start_cursor.y - pivot.y).atan2(start_cursor.x - pivot.x),
+        },
+        GroupTransformIntent::Hit(TransformHit::Skew(edge)) => GroupTransformOperation::Skew {
+            edge,
+            start_bounds: bounds,
+            start_cursor,
+        },
+    };
+    app.session.tool_state = ToolState::DraggingGroup {
+        refs: paths,
+        start_paths,
+        objects,
+        start_transforms,
+        operation,
+        start_pivot: pivot,
+    };
+    app.session.status = match operation {
+        GroupTransformOperation::Move { .. } => "Moving mixed selection",
+        GroupTransformOperation::Scale { .. } => "Resizing mixed selection",
+        GroupTransformOperation::Rotate { .. } => "Rotating mixed selection",
+        GroupTransformOperation::Skew { .. } => "Skewing mixed selection",
+    }
+    .to_string();
+    true
+}
+
+fn group_transform_affine(operation: GroupTransformOperation, cursor: Vec2) -> Option<Affine> {
+    match operation {
+        GroupTransformOperation::Move { start_cursor } => Some(Affine {
+            tx: cursor.x - start_cursor.x,
+            ty: cursor.y - start_cursor.y,
+            ..Affine::IDENTITY
+        }),
+        GroupTransformOperation::Scale {
+            handle,
+            start_bounds,
+        } => {
+            let (anchor, scale_x, scale_y) = raw_handle_scale(start_bounds, handle, cursor)?;
+            Some(Affine {
+                a11: scale_x,
+                a12: 0.0,
+                a21: 0.0,
+                a22: scale_y,
+                tx: anchor.x * (1.0 - scale_x),
+                ty: anchor.y * (1.0 - scale_y),
+            })
+        }
+        GroupTransformOperation::Rotate {
+            center,
+            start_angle,
+        } => {
+            let angle = (cursor.y - center.y).atan2(cursor.x - center.x) - start_angle;
+            let (sin, cos) = angle.sin_cos();
+            Some(Affine {
+                a11: cos,
+                a12: -sin,
+                a21: sin,
+                a22: cos,
+                tx: center.x - cos * center.x + sin * center.y,
+                ty: center.y - sin * center.x - cos * center.y,
+            })
+        }
+        GroupTransformOperation::Skew {
+            edge,
+            start_bounds,
+            start_cursor,
+        } => {
+            let delta = Vec2::new(cursor.x - start_cursor.x, cursor.y - start_cursor.y);
+            let (min_x, min_y, max_x, max_y) = start_bounds;
+            let mut affine = Affine::IDENTITY;
+            match edge {
+                TransformEdge::Top => {
+                    let shear = (delta.x / (min_y - max_y)).clamp(-8.0, 8.0);
+                    affine.a12 = shear;
+                    affine.tx = -max_y * shear;
+                }
+                TransformEdge::Bottom => {
+                    let shear = (delta.x / (max_y - min_y)).clamp(-8.0, 8.0);
+                    affine.a12 = shear;
+                    affine.tx = -min_y * shear;
+                }
+                TransformEdge::Left => {
+                    let shear = (delta.y / (min_x - max_x)).clamp(-8.0, 8.0);
+                    affine.a21 = shear;
+                    affine.ty = -max_x * shear;
+                }
+                TransformEdge::Right => {
+                    let shear = (delta.y / (max_x - min_x)).clamp(-8.0, 8.0);
+                    affine.a21 = shear;
+                    affine.ty = -min_x * shear;
+                }
+            }
+            Some(affine)
+        }
+    }
+}
+
+fn apply_group_transform(app: &mut EditorApp, data: GroupTransformData<'_>, cursor: Vec2) -> bool {
+    let Some(transform) = group_transform_affine(data.operation, cursor) else {
+        return false;
+    };
+    let mut changed = false;
+    for (reference, source) in data.refs.iter().copied().zip(data.start_paths.iter()) {
+        changed |= replace_raw_path_mapped(&mut app.state.project, reference, source, |point| {
+            transform.apply(point)
+        });
+    }
+    for (reference, source) in data
+        .objects
+        .iter()
+        .copied()
+        .zip(data.start_transforms.iter().copied())
+    {
+        let composed = Affine::compose(transform, Affine::from_transform(source));
+        let Some(next) = crate::app::affine_to_transform(composed) else {
+            continue;
+        };
+        if let Some(placement) = placement_mut(
+            app,
+            reference.q0rg_id,
+            reference.layer_id,
+            reference.placement_idx,
+        ) {
+            placement.transform = next;
+            changed = true;
+        }
+    }
+    if changed {
+        app.state.dirty = true;
+        set_selection_transform_pivot(app, transform.apply(data.start_pivot));
+    }
+    changed
+}
+
 fn begin_transforming_raw_area(
     app: &mut EditorApp,
     placements: &[PlacementRef],
     bounds: (f32, f32, f32, f32),
+    pivot: Vec2,
     hit: TransformHit,
     start_cursor: Vec2,
 ) -> bool {
@@ -874,16 +1422,8 @@ fn begin_transforming_raw_area(
     if start_paths.len() != refs.len() {
         return false;
     }
-    app.session.selection = if refs.len() == 1 {
-        Selection::Path {
-            q0rg_id: refs[0].q0rg_id,
-            layer_id: refs[0].layer_id,
-            placement_idx: refs[0].placement_idx,
-            path_idx: refs[0].path_idx,
-        }
-    } else {
-        Selection::Paths(refs.clone())
-    };
+    app.session.selection = selection_from_group_parts(refs.clone(), Vec::new());
+    set_selection_transform_pivot(app, pivot);
     match hit {
         TransformHit::Scale(handle) => {
             app.session.tool_state = ToolState::DraggingRawHandle {
@@ -891,16 +1431,16 @@ fn begin_transforming_raw_area(
                 start_paths,
                 handle,
                 start_bounds: bounds,
+                start_pivot: pivot,
             };
             app.session.status = "Resizing selected fill area".to_string();
         }
         TransformHit::Rotate(_) => {
-            let center = Vec2::new((bounds.0 + bounds.2) * 0.5, (bounds.1 + bounds.3) * 0.5);
             app.session.tool_state = ToolState::DraggingRawRotate {
                 refs,
                 start_paths,
-                center,
-                start_angle: (start_cursor.y - center.y).atan2(start_cursor.x - center.x),
+                center: pivot,
+                start_angle: (start_cursor.y - pivot.y).atan2(start_cursor.x - pivot.x),
             };
             app.session.status = "Rotating selected fill area".to_string();
         }
@@ -911,6 +1451,7 @@ fn begin_transforming_raw_area(
                 edge,
                 start_bounds: bounds,
                 start_cursor,
+                start_pivot: pivot,
             };
             app.session.status = "Skewing selected fill area".to_string();
         }
@@ -1587,6 +2128,34 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
             let p = cursor_screen
                 .map(|screen| screen_to_stage(screen, view))
                 .unwrap_or(current_cursor);
+            if let Some(screen_pos) = cursor_screen {
+                if selected_pivot_hit(app, view, screen_pos) {
+                    let selection = app.session.selection.clone();
+                    set_selection_transform_pivot(app, p);
+                    app.session.tool_state = ToolState::DraggingTransformPivot { selection };
+                    app.session.status = "Moving transform anchor".to_string();
+                    return;
+                }
+            }
+            let group_selection = match &app.session.selection {
+                Selection::RawArea { objects, .. } if !objects.is_empty() => {
+                    Some(app.session.selection.clone())
+                }
+                Selection::Mixed { .. } | Selection::Multi(_) => {
+                    Some(app.session.selection.clone())
+                }
+                _ => None,
+            };
+            if let (Some(selection), Some(screen_pos)) = (group_selection, cursor_screen) {
+                if let Some(bounds) = selection_transform_bounds(app) {
+                    if let Some(hit) = hit_test_raw_transform(bounds, view, screen_pos) {
+                        if begin_group_transform(app, selection, GroupTransformIntent::Hit(hit), p)
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
             if let (Some(refs), Some(screen_pos)) = (
                 selection_raw_path_refs(&app.session.selection),
                 cursor_screen,
@@ -1598,7 +2167,13 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                                 begin_scaling_raw_paths(app, refs, handle, bounds)
                             }
                             TransformHit::Rotate(_) => {
-                                begin_rotating_raw_paths(app, refs, bounds, p)
+                                let center = selection_transform_pivot(app).unwrap_or_else(|| {
+                                    Vec2::new(
+                                        (bounds.0 + bounds.2) * 0.5,
+                                        (bounds.1 + bounds.3) * 0.5,
+                                    )
+                                });
+                                begin_rotating_raw_paths(app, refs, bounds, center, p)
                             }
                             TransformHit::Skew(edge) => {
                                 begin_skewing_raw_paths(app, refs, edge, bounds, p)
@@ -1623,24 +2198,50 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 if objects.is_empty() {
                     let bounds = (bounds_min.x, bounds_min.y, bounds_max.x, bounds_max.y);
                     if let Some(hit) = hit_test_raw_transform(bounds, view, screen_pos) {
-                        if begin_transforming_raw_area(app, &placements, bounds, hit, p) {
+                        let pivot = selection_transform_pivot(app).unwrap_or_else(|| {
+                            Vec2::new((bounds.0 + bounds.2) * 0.5, (bounds.1 + bounds.3) * 0.5)
+                        });
+                        if begin_transforming_raw_area(app, &placements, bounds, pivot, hit, p) {
                             return;
                         }
                     }
                 }
             }
+            let group_selection = match &app.session.selection {
+                Selection::RawArea { objects, .. } if !objects.is_empty() => {
+                    Some(app.session.selection.clone())
+                }
+                Selection::Mixed { .. } | Selection::Multi(_) => {
+                    Some(app.session.selection.clone())
+                }
+                _ => None,
+            };
+            if let Some(selection) = group_selection {
+                if let Some(bounds) = selection_transform_bounds(app) {
+                    if p.x >= bounds.0
+                        && p.x <= bounds.2
+                        && p.y >= bounds.1
+                        && p.y <= bounds.3
+                        && begin_group_transform(app, selection, GroupTransformIntent::Move, p)
+                    {
+                        return;
+                    }
+                }
+            }
             if let Selection::RawArea {
                 placements,
+                objects,
                 bounds_min,
                 bounds_max,
-                ..
             } = app.session.selection.clone()
             {
-                if p.x >= bounds_min.x
+                if objects.is_empty()
+                    && p.x >= bounds_min.x
                     && p.x <= bounds_max.x
                     && p.y >= bounds_min.y
                     && p.y <= bounds_max.y
                 {
+                    let start_pivot = selection_transform_pivot(app);
                     let refs = cut_raw_areas_for_drag(
                         app,
                         &placements,
@@ -1659,20 +2260,16 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                         })
                         .collect();
                     if !refs.is_empty() && start_paths.len() == refs.len() {
-                        app.session.selection = if refs.len() == 1 {
-                            Selection::Path {
-                                q0rg_id: refs[0].q0rg_id,
-                                layer_id: refs[0].layer_id,
-                                placement_idx: refs[0].placement_idx,
-                                path_idx: refs[0].path_idx,
-                            }
-                        } else {
-                            Selection::Paths(refs.clone())
-                        };
+                        app.session.selection =
+                            selection_from_group_parts(refs.clone(), Vec::new());
+                        if let Some(pivot) = start_pivot {
+                            set_selection_transform_pivot(app, pivot);
+                        }
                         app.session.tool_state = ToolState::DraggingPaths {
                             refs,
                             start_cursor: p,
                             start_paths,
+                            start_pivot,
                         };
                         app.session.status = "Moving selected fill".to_string();
                         return;
@@ -1760,6 +2357,12 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                     if let Some(hit) =
                         hit_test_placement_transform(local_bbox, start_t, view, screen_pos)
                     {
+                        let transform_pivot = selection_transform_pivot(app);
+                        let pivot_local = transform_pivot.and_then(|point| {
+                            Affine::from_transform(start_t)
+                                .inverse()
+                                .map(|inverse| inverse.apply(point))
+                        });
                         app.history.snapshot(&app.state.project);
                         let Some(placement_idx) = materialize_placement_keyframe_for_edit(
                             &mut app.state.project,
@@ -1775,6 +2378,9 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                             layer_id,
                             placement_idx,
                         };
+                        if let Some(point) = transform_pivot {
+                            set_selection_transform_pivot(app, point);
+                        }
                         match hit {
                             TransformHit::Scale(handle) => {
                                 app.session.tool_state = ToolState::DraggingHandle {
@@ -1785,16 +2391,22 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                                     start_transform: start_t,
                                     start_local_bbox: local_bbox,
                                     start_world_bbox: world_bbox,
+                                    pivot_local,
                                 };
                                 app.session.status = "Resizing selection".to_string();
                             }
                             TransformHit::Rotate(_) => {
-                                let center_local = Vec2::new(
+                                let default_center_local = Vec2::new(
                                     (local_bbox.0 + local_bbox.2) * 0.5,
                                     (local_bbox.1 + local_bbox.3) * 0.5,
                                 );
-                                let center_world =
-                                    Affine::from_transform(start_t).apply(center_local);
+                                let affine = Affine::from_transform(start_t);
+                                let center_world = transform_pivot
+                                    .unwrap_or_else(|| affine.apply(default_center_local));
+                                let center_local = affine
+                                    .inverse()
+                                    .map(|inverse| inverse.apply(center_world))
+                                    .unwrap_or(default_center_local);
                                 app.session.tool_state = ToolState::DraggingPlacementRotate {
                                     q0rg_id,
                                     layer_id,
@@ -1819,6 +2431,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                                     start_transform: start_t,
                                     start_local_bbox: local_bbox,
                                     start_cursor_local: inverse.apply(p),
+                                    pivot_local,
                                 };
                                 app.session.status = "Skewing selection".to_string();
                             }
@@ -1858,6 +2471,25 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 p,
             ) {
                 let q0rg_id = app.session.current_q0rg_id;
+                let previous_selection = app.session.selection.clone();
+                let custom_pivot = app
+                    .session
+                    .transform_pivot
+                    .as_ref()
+                    .filter(|pivot| pivot.selection == previous_selection)
+                    .filter(|_| {
+                        matches!(
+                            previous_selection,
+                            Selection::Placement {
+                                q0rg_id: selected_q0rg,
+                                layer_id: selected_layer,
+                                placement_idx: selected_index,
+                            } if selected_q0rg == q0rg_id
+                                && selected_layer == layer_id
+                                && selected_index == idx
+                        )
+                    })
+                    .map(|pivot| pivot.point);
                 app.session.selection = Selection::Placement {
                     q0rg_id,
                     layer_id,
@@ -1885,12 +2517,18 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                         layer_id,
                         placement_idx,
                     };
+                    if let Some(pivot) = custom_pivot {
+                        set_selection_transform_pivot(app, pivot);
+                    }
                     let cursor_offset = Vec2::new(t.tx - p.x, t.ty - p.y);
+                    let pivot_cursor_offset =
+                        custom_pivot.map(|pivot| Vec2::new(pivot.x - p.x, pivot.y - p.y));
                     app.session.tool_state = ToolState::DraggingPlacement {
                         q0rg_id,
                         layer_id,
                         placement_idx,
                         cursor_offset,
+                        pivot_cursor_offset,
                     };
                     app.session.status = "Object keyframed and selected".to_string();
                 }
@@ -1912,12 +2550,23 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 layer_id,
                 placement_idx,
                 cursor_offset,
+                pivot_cursor_offset,
             } => {
                 if let Some(p) = cursor {
+                    let mut moved = false;
                     if let Some(pl) = placement_mut(app, q0rg_id, layer_id, placement_idx) {
                         pl.transform.tx = p.x + cursor_offset.x;
                         pl.transform.ty = p.y + cursor_offset.y;
+                        moved = true;
+                    }
+                    if moved {
                         app.state.dirty = true;
+                        if let Some(offset) = pivot_cursor_offset {
+                            set_selection_transform_pivot(
+                                app,
+                                Vec2::new(p.x + offset.x, p.y + offset.y),
+                            );
+                        }
                     }
                 }
             }
@@ -1948,6 +2597,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 refs,
                 start_cursor,
                 start_paths,
+                start_pivot,
             } => {
                 if let Some(p) = cursor {
                     let delta = Vec2::new(p.x - start_cursor.x, p.y - start_cursor.y);
@@ -1965,6 +2615,12 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                     }
                     if changed {
                         app.state.dirty = true;
+                        if let Some(pivot) = start_pivot {
+                            set_selection_transform_pivot(
+                                app,
+                                Vec2::new(pivot.x + delta.x, pivot.y + delta.y),
+                            );
+                        }
                     }
                 }
             }
@@ -1973,6 +2629,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 start_paths,
                 handle,
                 start_bounds,
+                start_pivot,
             } => {
                 if let Some(p) = cursor {
                     let mut changed = false;
@@ -1988,6 +2645,15 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                     }
                     if changed {
                         app.state.dirty = true;
+                        if let Some(transform) = group_transform_affine(
+                            GroupTransformOperation::Scale {
+                                handle,
+                                start_bounds,
+                            },
+                            p,
+                        ) {
+                            set_selection_transform_pivot(app, transform.apply(start_pivot));
+                        }
                     }
                 }
             }
@@ -2020,6 +2686,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 edge,
                 start_bounds,
                 start_cursor,
+                start_pivot,
             } => {
                 if let Some(p) = cursor {
                     let delta = Vec2::new(p.x - start_cursor.x, p.y - start_cursor.y);
@@ -2036,6 +2703,16 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                     }
                     if changed {
                         app.state.dirty = true;
+                        if let Some(transform) = group_transform_affine(
+                            GroupTransformOperation::Skew {
+                                edge,
+                                start_bounds,
+                                start_cursor,
+                            },
+                            p,
+                        ) {
+                            set_selection_transform_pivot(app, transform.apply(start_pivot));
+                        }
                     }
                 }
             }
@@ -2080,8 +2757,11 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 start_transform,
                 start_local_bbox,
                 start_world_bbox,
+                pivot_local,
             } => {
                 if let Some(p) = cursor {
+                    let mut next_pivot = None;
+                    let mut changed = false;
                     if let Some(pl) = placement_mut(app, q0rg_id, layer_id, placement_idx) {
                         if apply_handle_drag(
                             &mut pl.transform,
@@ -2091,7 +2771,15 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                             handle,
                             p,
                         ) {
-                            app.state.dirty = true;
+                            changed = true;
+                            next_pivot = pivot_local
+                                .map(|local| Affine::from_transform(pl.transform).apply(local));
+                        }
+                    }
+                    if changed {
+                        app.state.dirty = true;
+                        if let Some(pivot) = next_pivot {
+                            set_selection_transform_pivot(app, pivot);
                         }
                     }
                 }
@@ -2126,6 +2814,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 start_transform,
                 start_local_bbox,
                 start_cursor_local,
+                pivot_local,
             } => {
                 if let Some(p) = cursor {
                     if let Some(next) = skew_placement_from_cursor(
@@ -2135,11 +2824,51 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                         start_cursor_local,
                         p,
                     ) {
+                        let mut changed = false;
                         if let Some(pl) = placement_mut(app, q0rg_id, layer_id, placement_idx) {
                             pl.transform = next;
+                            changed = true;
+                        }
+                        if changed {
                             app.state.dirty = true;
+                            if let Some(local) = pivot_local {
+                                set_selection_transform_pivot(
+                                    app,
+                                    Affine::from_transform(next).apply(local),
+                                );
+                            }
                         }
                     }
+                }
+            }
+            ToolState::DraggingGroup {
+                refs,
+                start_paths,
+                objects,
+                start_transforms,
+                operation,
+                start_pivot,
+            } => {
+                if let Some(p) = cursor {
+                    apply_group_transform(
+                        app,
+                        GroupTransformData {
+                            refs: &refs,
+                            start_paths: &start_paths,
+                            objects: &objects,
+                            start_transforms: &start_transforms,
+                            operation,
+                            start_pivot,
+                        },
+                        p,
+                    );
+                }
+            }
+            ToolState::DraggingTransformPivot { selection }
+                if selection == app.session.selection =>
+            {
+                if let Some(p) = cursor {
+                    set_selection_transform_pivot(app, p);
                 }
             }
             _ => {}
@@ -2194,6 +2923,8 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 | ToolState::DraggingHandle { .. }
                 | ToolState::DraggingPlacementRotate { .. }
                 | ToolState::DraggingPlacementSkew { .. }
+                | ToolState::DraggingGroup { .. }
+                | ToolState::DraggingTransformPivot { .. }
         );
         let mut merged = false;
         for (q0rg_id, layer_id) in raw_layers {
@@ -2235,7 +2966,8 @@ fn raw_edit_layers(state: &ToolState) -> std::collections::BTreeSet<(u16, u16)> 
         ToolState::DraggingPaths { refs, .. }
         | ToolState::DraggingRawHandle { refs, .. }
         | ToolState::DraggingRawRotate { refs, .. }
-        | ToolState::DraggingRawSkew { refs, .. } => {
+        | ToolState::DraggingRawSkew { refs, .. }
+        | ToolState::DraggingGroup { refs, .. } => {
             layers.extend(
                 refs.iter()
                     .map(|reference| (reference.q0rg_id, reference.layer_id)),
@@ -2799,6 +3531,7 @@ fn begin_dragging_raw_paths(
     if refs.is_empty() {
         return false;
     }
+    let start_pivot = selection_transform_pivot(app);
     app.history.snapshot(&app.state.project);
     let Some(refs) =
         prepare_raw_path_refs_for_edit(&mut app.state.project, &refs, app.session.current_frame)
@@ -2820,20 +3553,15 @@ fn begin_dragging_raw_paths(
     if start_paths.len() != refs.len() {
         return false;
     }
-    app.session.selection = if refs.len() == 1 {
-        Selection::Path {
-            q0rg_id: refs[0].q0rg_id,
-            layer_id: refs[0].layer_id,
-            placement_idx: refs[0].placement_idx,
-            path_idx: refs[0].path_idx,
-        }
-    } else {
-        Selection::Paths(refs.clone())
-    };
+    app.session.selection = selection_from_group_parts(refs.clone(), Vec::new());
+    if let Some(pivot) = start_pivot {
+        set_selection_transform_pivot(app, pivot);
+    }
     app.session.tool_state = ToolState::DraggingPaths {
         refs,
         start_cursor,
         start_paths,
+        start_pivot,
     };
     app.session.status = status.to_string();
     true
@@ -2848,6 +3576,12 @@ fn begin_scaling_raw_paths(
     if refs.is_empty() || !raw_selection_supports_axis_resize(start_bounds) {
         return false;
     }
+    let start_pivot = selection_transform_pivot(app).unwrap_or_else(|| {
+        Vec2::new(
+            (start_bounds.0 + start_bounds.2) * 0.5,
+            (start_bounds.1 + start_bounds.3) * 0.5,
+        )
+    });
     app.history.snapshot(&app.state.project);
     let Some(refs) =
         prepare_raw_path_refs_for_edit(&mut app.state.project, &refs, app.session.current_frame)
@@ -2869,11 +3603,14 @@ fn begin_scaling_raw_paths(
     if start_paths.len() != refs.len() {
         return false;
     }
+    app.session.selection = selection_from_group_parts(refs.clone(), Vec::new());
+    set_selection_transform_pivot(app, start_pivot);
     app.session.tool_state = ToolState::DraggingRawHandle {
         refs,
         start_paths,
         handle,
         start_bounds,
+        start_pivot,
     };
     app.session.status = "Resizing raw graphics".to_string();
     true
@@ -2883,12 +3620,12 @@ fn begin_rotating_raw_paths(
     app: &mut EditorApp,
     refs: Vec<PathRef>,
     bounds: (f32, f32, f32, f32),
+    center: Vec2,
     start_cursor: Vec2,
 ) -> bool {
     if refs.is_empty() || !raw_selection_supports_axis_resize(bounds) {
         return false;
     }
-    let center = Vec2::new((bounds.0 + bounds.2) * 0.5, (bounds.1 + bounds.3) * 0.5);
     app.history.snapshot(&app.state.project);
     let Some(refs) =
         prepare_raw_path_refs_for_edit(&mut app.state.project, &refs, app.session.current_frame)
@@ -2910,6 +3647,8 @@ fn begin_rotating_raw_paths(
     if start_paths.len() != refs.len() {
         return false;
     }
+    app.session.selection = selection_from_group_parts(refs.clone(), Vec::new());
+    set_selection_transform_pivot(app, center);
     app.session.tool_state = ToolState::DraggingRawRotate {
         refs,
         start_paths,
@@ -2930,6 +3669,8 @@ fn begin_skewing_raw_paths(
     if refs.is_empty() || !raw_selection_supports_axis_resize(bounds) {
         return false;
     }
+    let start_pivot = selection_transform_pivot(app)
+        .unwrap_or_else(|| Vec2::new((bounds.0 + bounds.2) * 0.5, (bounds.1 + bounds.3) * 0.5));
     app.history.snapshot(&app.state.project);
     let Some(refs) =
         prepare_raw_path_refs_for_edit(&mut app.state.project, &refs, app.session.current_frame)
@@ -2951,12 +3692,15 @@ fn begin_skewing_raw_paths(
     if start_paths.len() != refs.len() {
         return false;
     }
+    app.session.selection = selection_from_group_parts(refs.clone(), Vec::new());
+    set_selection_transform_pivot(app, start_pivot);
     app.session.tool_state = ToolState::DraggingRawSkew {
         refs,
         start_paths,
         edge,
         start_bounds: bounds,
         start_cursor,
+        start_pivot,
     };
     app.session.status = "Skewing raw graphics".to_string();
     true
@@ -3514,8 +4258,8 @@ fn placement_mut(
 /// with a mouse at low zoom.
 const HANDLE_HIT_RADIUS_PX: f32 = 14.0;
 const RAW_HANDLE_HIT_RADIUS_PX: f32 = 10.0;
-const ROTATE_HOTSPOT_OFFSET_PX: f32 = 18.0;
-const ROTATE_HIT_RADIUS_PX: f32 = 11.0;
+const ROTATE_HIT_RADIUS_PX: f32 = 34.0;
+const PIVOT_HIT_RADIUS_PX: f32 = 10.0;
 const SKEW_EDGE_HIT_RADIUS_PX: f32 = 7.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3674,12 +4418,14 @@ fn hit_test_transform_frame(
     {
         let corner = corner_screen[index];
         let outward = corner - center_screen;
-        let hotspot = if outward.length_sq() > 1.0e-6 {
-            corner + outward.normalized() * ROTATE_HOTSPOT_OFFSET_PX
-        } else {
-            corner
-        };
-        if screen_distance_sq(hotspot, screen_pos) <= ROTATE_HIT_RADIUS_PX * ROTATE_HIT_RADIUS_PX {
+        let from_corner = screen_pos - corner;
+        let distance_sq = from_corner.length_sq();
+        let inner_radius = handle_radius + 1.0;
+        if outward.length_sq() > 1.0e-6
+            && from_corner.dot(outward) > 0.0
+            && distance_sq >= inner_radius * inner_radius
+            && distance_sq <= ROTATE_HIT_RADIUS_PX * ROTATE_HIT_RADIUS_PX
+        {
             return Some(TransformHit::Rotate(handle));
         }
     }
@@ -4857,12 +5603,20 @@ fn draw_in_progress_overlay(app: &EditorApp, painter: &Painter, view: &StageView
         | ToolState::DraggingHandle { .. }
         | ToolState::DraggingPlacementRotate { .. }
         | ToolState::DraggingPlacementSkew { .. }
+        | ToolState::DraggingGroup { .. }
+        | ToolState::DraggingTransformPivot { .. }
         | ToolState::Idle => {}
     }
 }
 
 /// Draw selection bounds using the current theme accent.
 pub fn draw_selection_overlay(app: &EditorApp, painter: &Painter, view: &StageView) {
+    draw_selection_content_overlay(app, painter, view);
+    draw_group_transform_frame(app, painter, view);
+    draw_transform_pivot_overlay(app, painter, view);
+}
+
+fn draw_selection_content_overlay(app: &EditorApp, painter: &Painter, view: &StageView) {
     let accent = selection_color(app);
     if let Selection::Multi(refs) = &app.session.selection {
         for r in refs {
@@ -4915,7 +5669,15 @@ pub fn draw_selection_overlay(app: &EditorApp, painter: &Painter, view: &StageVi
         bounds_max,
     } = app.session.selection
     {
-        draw_raw_area_selection(app, painter, view, placements, bounds_min, bounds_max);
+        draw_raw_area_selection(
+            app,
+            painter,
+            view,
+            placements,
+            bounds_min,
+            bounds_max,
+            objects.is_empty(),
+        );
         for reference in objects {
             let Some(layer) = app
                 .state
@@ -4961,6 +5723,15 @@ pub fn draw_selection_overlay(app: &EditorApp, painter: &Painter, view: &StageVi
         }
         return;
     }
+    if let Selection::Mixed {
+        ref paths,
+        ref objects,
+    } = app.session.selection
+    {
+        draw_raw_paths_overlay(app, painter, view, paths, false);
+        draw_object_reference_outlines(app, painter, view, objects);
+        return;
+    }
     if let Selection::PathPoints {
         path,
         ref anchor_indices,
@@ -4980,7 +5751,7 @@ pub fn draw_selection_overlay(app: &EditorApp, painter: &Painter, view: &StageVi
         return;
     }
     if let Selection::Paths(ref refs) = app.session.selection {
-        draw_raw_paths_overlay(app, painter, view, refs);
+        draw_raw_paths_overlay(app, painter, view, refs, true);
         return;
     }
     if let Selection::Path {
@@ -5118,6 +5889,104 @@ pub fn draw_selection_overlay(app: &EditorApp, painter: &Painter, view: &StageVi
     }
 }
 
+fn draw_object_reference_outlines(
+    app: &EditorApp,
+    painter: &Painter,
+    view: &StageView,
+    objects: &[PlacementRef],
+) {
+    let accent = selection_color(app);
+    for reference in objects {
+        let Some(layer) = app
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == reference.q0rg_id)
+            .and_then(|q0rg| {
+                q0rg.layers
+                    .iter()
+                    .find(|layer| layer.layer_id == reference.layer_id)
+            })
+        else {
+            continue;
+        };
+        let Some(placement) = layer.placements.get(reference.placement_idx) else {
+            continue;
+        };
+        let Some(transform) = crate::render::active_transform_for_placement(
+            layer,
+            reference.placement_idx,
+            app.session.current_frame,
+        ) else {
+            continue;
+        };
+        let mut visual = placement.clone();
+        visual.transform = transform;
+        let Some((min_x, min_y, max_x, max_y)) = placement_bbox(&app.state.project, &visual) else {
+            continue;
+        };
+        let rect = egui::Rect::from_min_max(
+            stage_to_screen(Vec2::new(min_x, min_y), view),
+            stage_to_screen(Vec2::new(max_x, max_y), view),
+        )
+        .expand(2.0);
+        painter.rect_stroke(
+            rect,
+            0.0,
+            Stroke::new(2.0_f32, Color32::from_black_alpha(180)),
+        );
+        painter.rect_stroke(rect, 0.0, Stroke::new(1.0_f32, accent));
+    }
+}
+
+fn draw_group_transform_frame(app: &EditorApp, painter: &Painter, view: &StageView) {
+    let needs_group_frame = match &app.session.selection {
+        Selection::RawArea { objects, .. } => !objects.is_empty(),
+        Selection::Mixed { .. } | Selection::Multi(_) => true,
+        _ => false,
+    };
+    if !needs_group_frame {
+        return;
+    }
+    let Some(bounds) = selection_transform_bounds(app) else {
+        return;
+    };
+    let rect = egui::Rect::from_min_max(
+        stage_to_screen(Vec2::new(bounds.0, bounds.1), view),
+        stage_to_screen(Vec2::new(bounds.2, bounds.3), view),
+    );
+    draw_flash_selection_box(painter, rect, selection_color(app));
+}
+
+fn draw_transform_pivot_overlay(app: &EditorApp, painter: &Painter, view: &StageView) {
+    if app.session.current_tool != Tool::Select || selection_transform_bounds(app).is_none() {
+        return;
+    }
+    let Some(pivot) = selection_transform_pivot(app) else {
+        return;
+    };
+    let point = stage_to_screen(pivot, view);
+    let accent = selection_color(app);
+    painter.circle_filled(point, 5.0, Color32::WHITE);
+    painter.circle_stroke(point, 6.0, Stroke::new(2.0_f32, Color32::BLACK));
+    painter.circle_stroke(point, 5.0, Stroke::new(1.5_f32, accent));
+    painter.line_segment(
+        [
+            Pos2::new(point.x - 8.0, point.y),
+            Pos2::new(point.x + 8.0, point.y),
+        ],
+        Stroke::new(1.0_f32, accent),
+    );
+    painter.line_segment(
+        [
+            Pos2::new(point.x, point.y - 8.0),
+            Pos2::new(point.x, point.y + 8.0),
+        ],
+        Stroke::new(1.0_f32, accent),
+    );
+}
+
 fn selection_stipple_step(rect: egui::Rect) -> f32 {
     const BASE_STEP_PX: f32 = 5.0;
     const MAX_CANDIDATES: f32 = 2_500.0;
@@ -5132,6 +6001,7 @@ fn draw_raw_area_selection(
     placements: &[PlacementRef],
     bounds_min: Vec2,
     bounds_max: Vec2,
+    draw_box: bool,
 ) {
     let selection_rect = egui::Rect::from_two_pos(
         stage_to_screen(bounds_min, view),
@@ -5195,10 +6065,18 @@ fn draw_raw_area_selection(
         }
         y += step;
     }
-    draw_flash_selection_box(painter, selection_rect, selection_color(app));
+    if draw_box {
+        draw_flash_selection_box(painter, selection_rect, selection_color(app));
+    }
 }
 
-fn draw_raw_paths_overlay(app: &EditorApp, painter: &Painter, view: &StageView, refs: &[PathRef]) {
+fn draw_raw_paths_overlay(
+    app: &EditorApp,
+    painter: &Painter,
+    view: &StageView,
+    refs: &[PathRef],
+    draw_boxes: bool,
+) {
     let mut grouped: std::collections::BTreeMap<(u16, u16, usize), Vec<usize>> =
         std::collections::BTreeMap::new();
     for r in refs {
@@ -5298,11 +6176,13 @@ fn draw_raw_paths_overlay(app: &EditorApp, painter: &Painter, view: &StageView, 
             Pos2::new(f32::NEG_INFINITY, f32::NEG_INFINITY),
             |acc, point| Pos2::new(acc.x.max(point.x), acc.y.max(point.y)),
         );
-        draw_flash_selection_box(
-            painter,
-            egui::Rect::from_min_max(min, max),
-            selection_color(app),
-        );
+        if draw_boxes {
+            draw_flash_selection_box(
+                painter,
+                egui::Rect::from_min_max(min, max),
+                selection_color(app),
+            );
+        }
     }
 }
 
@@ -6448,6 +7328,7 @@ mod tests {
             &mut app,
             &[placement],
             (10.0, 10.0, 30.0, 30.0),
+            Vec2::new(20.0, 20.0),
             TransformHit::Scale(Handle::BottomRight),
             Vec2::new(30.0, 30.0),
         ));
@@ -7255,7 +8136,7 @@ mod tests {
 
         let center = stage_to_screen(frame.center, &view);
         let outward = (corner - center).normalized();
-        let rotate = corner + outward * ROTATE_HOTSPOT_OFFSET_PX;
+        let rotate = corner + outward * (ROTATE_HIT_RADIUS_PX * 0.7);
         assert_eq!(
             hit_test_placement_transform((0.0, 0.0, 100.0, 60.0), transform, &view, rotate,),
             Some(TransformHit::Rotate(Handle::TopLeft))
@@ -8043,5 +8924,224 @@ mod tests {
         assert_eq!(objects.len(), 1);
         assert_eq!(placements[0].placement_idx, 0);
         assert_eq!(objects[0].placement_idx, 1);
+    }
+
+    #[test]
+    fn rotation_zone_is_broad_outside_corner_but_handle_keeps_priority() {
+        let view = StageView {
+            origin: pos2(0.0, 0.0),
+            scale: 1.0,
+            stage_rect: egui::Rect::from_min_max(pos2(-200.0, -200.0), pos2(300.0, 300.0)),
+        };
+        let frame = axis_aligned_transform_frame((0.0, 0.0, 100.0, 100.0));
+        assert_eq!(
+            hit_test_transform_frame(
+                frame,
+                &view,
+                pos2(0.0, 0.0),
+                RAW_HANDLE_HIT_RADIUS_PX,
+                false,
+            ),
+            Some(TransformHit::Scale(Handle::TopLeft)),
+            "the resize handle must still win directly on the corner"
+        );
+        assert_eq!(
+            hit_test_transform_frame(
+                frame,
+                &view,
+                pos2(-24.0, -24.0),
+                RAW_HANDLE_HIT_RADIUS_PX,
+                false,
+            ),
+            Some(TransformHit::Rotate(Handle::TopLeft)),
+            "rotation should be grabbable through a broad outward corner sector"
+        );
+    }
+
+    #[test]
+    fn custom_transform_anchor_stays_fixed_during_rotation() {
+        let center = Vec2::new(180.0, 70.0);
+        let operation = GroupTransformOperation::Rotate {
+            center,
+            start_angle: 0.0,
+        };
+        let affine = group_transform_affine(operation, Vec2::new(center.x, center.y + 40.0))
+            .expect("rotation affine");
+        let mapped = affine.apply(center);
+        assert!((mapped.x - center.x).abs() < 1.0e-4);
+        assert!((mapped.y - center.y).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn mixed_raw_and_object_bounds_include_both_sides() {
+        let square = |asset_id: u16| {
+            Asset::Vector(VectorAsset {
+                asset_id,
+                paths: vec![VPath {
+                    anchors: vec![
+                        anchor(Vec2::new(0.0, 0.0)),
+                        anchor(Vec2::new(20.0, 0.0)),
+                        anchor(Vec2::new(20.0, 20.0)),
+                        anchor(Vec2::new(0.0, 20.0)),
+                    ],
+                    closed: true,
+                }],
+                fill: Some(Rgba {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 255,
+                }),
+                stroke: None,
+            })
+        };
+        let mut app = EditorApp::default();
+        app.state.project.assets = vec![square(1), square(2)];
+        let mut object_transform = Transform2D::IDENTITY;
+        object_transform.tx = 100.0;
+        app.state.project.q0rgs[0].layers[0].placements = vec![
+            Placement {
+                frame: 0,
+                target: Target::Asset(1),
+                transform: Transform2D::IDENTITY,
+                tween: Tween::None,
+            },
+            Placement {
+                frame: 0,
+                target: Target::Asset(2),
+                transform: object_transform,
+                tween: Tween::None,
+            },
+        ];
+        app.session.selection = Selection::RawArea {
+            placements: vec![PlacementRef {
+                q0rg_id: 1,
+                layer_id: 1,
+                placement_idx: 0,
+            }],
+            objects: vec![PlacementRef {
+                q0rg_id: 1,
+                layer_id: 1,
+                placement_idx: 1,
+            }],
+            bounds_min: Vec2::new(0.0, 0.0),
+            bounds_max: Vec2::new(20.0, 20.0),
+        };
+        assert_eq!(
+            selection_transform_bounds(&app),
+            Some((0.0, 0.0, 120.0, 20.0))
+        );
+    }
+
+    #[test]
+    fn mixed_group_move_transforms_raw_path_and_object_together() {
+        let square = |asset_id: u16| {
+            Asset::Vector(VectorAsset {
+                asset_id,
+                paths: vec![VPath {
+                    anchors: vec![
+                        anchor(Vec2::new(0.0, 0.0)),
+                        anchor(Vec2::new(20.0, 0.0)),
+                        anchor(Vec2::new(20.0, 20.0)),
+                        anchor(Vec2::new(0.0, 20.0)),
+                    ],
+                    closed: true,
+                }],
+                fill: Some(Rgba {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 255,
+                }),
+                stroke: None,
+            })
+        };
+        let mut app = EditorApp::default();
+        app.state.project.assets = vec![square(1), square(2)];
+        let mut object_transform = Transform2D::IDENTITY;
+        object_transform.tx = 100.0;
+        app.state.project.q0rgs[0].layers[0].placements = vec![
+            Placement {
+                frame: 0,
+                target: Target::Asset(1),
+                transform: Transform2D::IDENTITY,
+                tween: Tween::None,
+            },
+            Placement {
+                frame: 0,
+                target: Target::Asset(2),
+                transform: object_transform,
+                tween: Tween::None,
+            },
+        ];
+        app.session.selection = Selection::RawArea {
+            placements: vec![PlacementRef {
+                q0rg_id: 1,
+                layer_id: 1,
+                placement_idx: 0,
+            }],
+            objects: vec![PlacementRef {
+                q0rg_id: 1,
+                layer_id: 1,
+                placement_idx: 1,
+            }],
+            bounds_min: Vec2::new(0.0, 0.0),
+            bounds_max: Vec2::new(20.0, 20.0),
+        };
+        let selection = app.session.selection.clone();
+        assert!(begin_group_transform(
+            &mut app,
+            selection,
+            GroupTransformIntent::Move,
+            Vec2::new(0.0, 0.0),
+        ));
+        let ToolState::DraggingGroup {
+            refs,
+            start_paths,
+            objects,
+            start_transforms,
+            operation,
+            start_pivot,
+        } = app.session.tool_state.clone()
+        else {
+            panic!("mixed selection must enter one group transform")
+        };
+        assert!(matches!(app.session.selection, Selection::Mixed { .. }));
+        assert_eq!(refs.len(), 1);
+        assert_eq!(objects.len(), 1);
+        assert!(apply_group_transform(
+            &mut app,
+            GroupTransformData {
+                refs: &refs,
+                start_paths: &start_paths,
+                objects: &objects,
+                start_transforms: &start_transforms,
+                operation,
+                start_pivot,
+            },
+            Vec2::new(10.0, 5.0),
+        ));
+        let moved_pivot = selection_transform_pivot(&app).expect("moved pivot");
+        assert!((moved_pivot.x - (start_pivot.x + 10.0)).abs() < 1.0e-4);
+        assert!((moved_pivot.y - (start_pivot.y + 5.0)).abs() < 1.0e-4);
+        let moved_path = raw_path_clone(
+            &app.state.project,
+            refs[0].q0rg_id,
+            refs[0].layer_id,
+            refs[0].placement_idx,
+            refs[0].path_idx,
+        )
+        .expect("moved raw path");
+        assert!(
+            (moved_path.anchors[0].point.x - (start_paths[0].anchors[0].point.x + 10.0)).abs()
+                < 1.0e-4
+        );
+        assert!(
+            (moved_path.anchors[0].point.y - (start_paths[0].anchors[0].point.y + 5.0)).abs()
+                < 1.0e-4
+        );
+        let moved_object = placement_ref_transform(&app.state.project, objects[0]).expect("object");
+        assert!((moved_object.tx - (start_transforms[0].tx + 10.0)).abs() < 1.0e-4);
+        assert!((moved_object.ty - (start_transforms[0].ty + 5.0)).abs() < 1.0e-4);
     }
 }

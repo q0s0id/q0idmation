@@ -20,6 +20,7 @@ pub fn selection_can_clip(selection: &Selection) -> bool {
         Selection::Placement { .. } | Selection::Path { .. } => true,
         Selection::Paths(items) => !items.is_empty(),
         Selection::Multi(items) => !items.is_empty(),
+        Selection::Mixed { paths, objects } => !paths.is_empty() || !objects.is_empty(),
         Selection::RawArea {
             placements,
             objects,
@@ -54,6 +55,7 @@ fn selected_object_placements(project: &ProjectV2, selection: &Selection) -> Vec
             placement_idx: *placement_idx,
         }],
         Selection::Multi(items) => items.clone(),
+        Selection::Mixed { objects, .. } => objects.clone(),
         Selection::RawArea { objects, .. } => objects.clone(),
         _ => Vec::new(),
     };
@@ -76,6 +78,7 @@ fn selected_raw_vectors(project: &ProjectV2, selection: &Selection) -> Vec<Vecto
             path_idx: *path_idx,
         }]),
         Selection::Paths(refs) if !refs.is_empty() => Some(refs.clone()),
+        Selection::Mixed { paths, .. } if !paths.is_empty() => Some(paths.clone()),
         _ => None,
     };
 
@@ -261,6 +264,118 @@ pub fn paste_payload(
     }
 
     result
+}
+
+pub fn remove_materialized_paths_and_objects(
+    project: &mut ProjectV2,
+    paths: &[PathRef],
+    objects: &[PlacementRef],
+    frame: u16,
+) -> bool {
+    if paths.is_empty() && objects.is_empty() {
+        return false;
+    }
+    let mut by_asset: BTreeMap<u16, Vec<usize>> = BTreeMap::new();
+    let mut affected_layers: BTreeSet<(u16, u16)> = objects
+        .iter()
+        .map(|reference| (reference.q0rg_id, reference.layer_id))
+        .collect();
+    for reference in paths {
+        affected_layers.insert((reference.q0rg_id, reference.layer_id));
+        let Some(asset_id) = placement_asset_id(
+            project,
+            PlacementRef {
+                q0rg_id: reference.q0rg_id,
+                layer_id: reference.layer_id,
+                placement_idx: reference.placement_idx,
+            },
+        ) else {
+            continue;
+        };
+        by_asset
+            .entry(asset_id)
+            .or_default()
+            .push(reference.path_idx);
+    }
+
+    let mut emptied_assets = BTreeSet::new();
+    let mut changed = !objects.is_empty();
+    for (asset_id, indices) in &mut by_asset {
+        indices.sort_unstable();
+        indices.dedup();
+        indices.reverse();
+        let Some(Asset::Vector(vector)) = project
+            .assets
+            .iter_mut()
+            .find(|asset| asset.id() == *asset_id)
+        else {
+            continue;
+        };
+        for index in indices.iter().copied() {
+            if index < vector.paths.len() {
+                vector.paths.remove(index);
+                changed = true;
+            }
+        }
+        if vector.paths.is_empty() {
+            emptied_assets.insert(*asset_id);
+        }
+    }
+    if !changed {
+        return false;
+    }
+
+    let mut remove_refs = objects.to_vec();
+    if !emptied_assets.is_empty() {
+        for q0rg in &project.q0rgs {
+            for layer in &q0rg.layers {
+                for (placement_idx, placement) in layer.placements.iter().enumerate() {
+                    if matches!(placement.target, Target::Asset(id) if emptied_assets.contains(&id))
+                    {
+                        remove_refs.push(PlacementRef {
+                            q0rg_id: q0rg.q0rg_id,
+                            layer_id: layer.layer_id,
+                            placement_idx,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    remove_refs.sort_by(|left, right| {
+        left.q0rg_id
+            .cmp(&right.q0rg_id)
+            .then(left.layer_id.cmp(&right.layer_id))
+            .then(right.placement_idx.cmp(&left.placement_idx))
+    });
+    remove_refs.dedup();
+    for reference in remove_refs {
+        if let Some(layer) = project
+            .q0rgs
+            .iter_mut()
+            .find(|q0rg| q0rg.q0rg_id == reference.q0rg_id)
+            .and_then(|q0rg| {
+                q0rg.layers
+                    .iter_mut()
+                    .find(|layer| layer.layer_id == reference.layer_id)
+            })
+        {
+            if reference.placement_idx < layer.placements.len() {
+                layer.placements.remove(reference.placement_idx);
+            }
+        }
+    }
+    if !emptied_assets.is_empty() {
+        project
+            .assets
+            .retain(|asset| !emptied_assets.contains(&asset.id()));
+    }
+    for (q0rg_id, layer_id) in affected_layers {
+        crate::tools::preserve_blank_keyframe_after_content_delete(
+            project, q0rg_id, layer_id, frame,
+        );
+    }
+    true
 }
 
 pub fn remove_raw_area_and_objects(

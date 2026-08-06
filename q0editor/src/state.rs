@@ -181,6 +181,13 @@ pub enum Selection {
         bounds_min: Vec2,
         bounds_max: Vec2,
     },
+    /// Materialized mixed free-transform selection. Raw marquee fragments are
+    /// cut into path-granular geometry only when the user starts moving or
+    /// transforming them; display objects remain ordinary placements.
+    Mixed {
+        paths: Vec<PathRef>,
+        objects: Vec<PlacementRef>,
+    },
     /// Marquee result: 2+ placements selected at once. Single-element marquee
     /// hits collapse back to `Selection::Placement` so existing single-select
     /// code paths keep working unchanged.
@@ -327,6 +334,32 @@ pub enum TransformEdge {
     Left,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransformPivot {
+    pub selection: Selection,
+    pub point: Vec2,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum GroupTransformOperation {
+    Move {
+        start_cursor: Vec2,
+    },
+    Scale {
+        handle: Handle,
+        start_bounds: (f32, f32, f32, f32),
+    },
+    Rotate {
+        center: Vec2,
+        start_angle: f32,
+    },
+    Skew {
+        edge: TransformEdge,
+        start_bounds: (f32, f32, f32, f32),
+        start_cursor: Vec2,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub enum ToolState {
     Idle,
@@ -351,6 +384,7 @@ pub enum ToolState {
         layer_id: u16,
         placement_idx: usize,
         cursor_offset: Vec2,
+        pivot_cursor_offset: Option<Vec2>,
     },
     /// Move one raw vector contour without moving the containing Placement.
     DraggingPath {
@@ -365,6 +399,7 @@ pub enum ToolState {
         refs: Vec<PathRef>,
         start_cursor: Vec2,
         start_paths: Vec<VPath>,
+        start_pivot: Option<Vec2>,
     },
     /// Axis-scale one connected raw-graphics selection without turning the
     /// containing raw placement into a selectable display object.
@@ -373,6 +408,7 @@ pub enum ToolState {
         start_paths: Vec<VPath>,
         handle: Handle,
         start_bounds: (f32, f32, f32, f32),
+        start_pivot: Vec2,
     },
     DraggingRawRotate {
         refs: Vec<PathRef>,
@@ -386,6 +422,7 @@ pub enum ToolState {
         edge: TransformEdge,
         start_bounds: (f32, f32, f32, f32),
         start_cursor: Vec2,
+        start_pivot: Vec2,
     },
     DraggingPathPoints {
         path: PathRef,
@@ -408,6 +445,7 @@ pub enum ToolState {
         start_local_bbox: (f32, f32, f32, f32),
         /// World-space AABB at drag start (kept for compatibility/status).
         start_world_bbox: (f32, f32, f32, f32),
+        pivot_local: Option<Vec2>,
     },
     DraggingPlacementRotate {
         q0rg_id: u16,
@@ -426,6 +464,18 @@ pub enum ToolState {
         start_transform: Transform2D,
         start_local_bbox: (f32, f32, f32, f32),
         start_cursor_local: Vec2,
+        pivot_local: Option<Vec2>,
+    },
+    DraggingGroup {
+        refs: Vec<PathRef>,
+        start_paths: Vec<VPath>,
+        objects: Vec<PlacementRef>,
+        start_transforms: Vec<Transform2D>,
+        operation: GroupTransformOperation,
+        start_pivot: Vec2,
+    },
+    DraggingTransformPivot {
+        selection: Selection,
     },
     /// Rubber-band rectangle from `start` to the current cursor position.
     /// Active while the user drags Select tool over empty stage. On drag-stop
@@ -514,6 +564,7 @@ pub struct Session {
     pub current_tool: Tool,
     pub tool_state: ToolState,
     pub selection: Selection,
+    pub transform_pivot: Option<TransformPivot>,
     pub breadcrumb: Vec<u16>,
     /// Transient Library-panel filter and sort state.
     pub library_search: String,
@@ -583,6 +634,7 @@ impl Session {
             current_tool: Tool::Select,
             tool_state: ToolState::Idle,
             selection: Selection::None,
+            transform_pivot: None,
             breadcrumb: Vec::new(),
             library_search: String::new(),
             library_sort_ascending: true,
@@ -836,19 +888,27 @@ impl Session {
                     self.selection = Selection::None;
                 }
             }
+            Selection::Mixed {
+                ref paths,
+                ref objects,
+            } => {
+                let kept_paths: Vec<PathRef> = paths
+                    .iter()
+                    .copied()
+                    .filter(|reference| path_ref_exists(project, *reference))
+                    .collect();
+                let kept_objects: Vec<PlacementRef> = objects
+                    .iter()
+                    .copied()
+                    .filter(|reference| placement_ref_exists(project, *reference))
+                    .collect();
+                self.selection = collapse_mixed_selection(kept_paths, kept_objects);
+            }
             Selection::Multi(ref refs) => {
                 let kept: Vec<PlacementRef> = refs
                     .iter()
                     .copied()
-                    .filter(|r| {
-                        project
-                            .q0rgs
-                            .iter()
-                            .find(|q| q.q0rg_id == r.q0rg_id)
-                            .and_then(|q| q.layers.iter().find(|l| l.layer_id == r.layer_id))
-                            .and_then(|l| l.placements.get(r.placement_idx))
-                            .is_some()
-                    })
+                    .filter(|reference| placement_ref_exists(project, *reference))
                     .collect();
                 self.selection = match kept.len() {
                     0 => Selection::None,
@@ -1067,6 +1127,20 @@ fn path_anchor_count(project: &ProjectV2, r: PathRef) -> Option<usize> {
         .map(|path| path.anchors.len())
 }
 
+fn placement_ref_exists(project: &ProjectV2, reference: PlacementRef) -> bool {
+    project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == reference.q0rg_id)
+        .and_then(|q0rg| {
+            q0rg.layers
+                .iter()
+                .find(|layer| layer.layer_id == reference.layer_id)
+        })
+        .and_then(|layer| layer.placements.get(reference.placement_idx))
+        .is_some()
+}
+
 fn collapse_path_refs(refs: Vec<PathRef>) -> Selection {
     match refs.len() {
         0 => Selection::None,
@@ -1077,6 +1151,24 @@ fn collapse_path_refs(refs: Vec<PathRef>) -> Selection {
             path_idx: refs[0].path_idx,
         },
         _ => Selection::Paths(refs),
+    }
+}
+
+fn collapse_mixed_selection(paths: Vec<PathRef>, objects: Vec<PlacementRef>) -> Selection {
+    if !paths.is_empty() && !objects.is_empty() {
+        return Selection::Mixed { paths, objects };
+    }
+    if !paths.is_empty() {
+        return collapse_path_refs(paths);
+    }
+    match objects.len() {
+        0 => Selection::None,
+        1 => Selection::Placement {
+            q0rg_id: objects[0].q0rg_id,
+            layer_id: objects[0].layer_id,
+            placement_idx: objects[0].placement_idx,
+        },
+        _ => Selection::Multi(objects),
     }
 }
 

@@ -345,6 +345,9 @@ pub(crate) fn selection_can_be_deleted(selection: &crate::state::Selection) -> b
         | crate::state::Selection::Path { .. }
         | crate::state::Selection::PathPoints { .. } => true,
         crate::state::Selection::Paths(items) => !items.is_empty(),
+        crate::state::Selection::Mixed { paths, objects } => {
+            !paths.is_empty() || !objects.is_empty()
+        }
         crate::state::Selection::Multi(items) => !items.is_empty(),
         crate::state::Selection::RawArea {
             placements,

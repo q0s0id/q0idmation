@@ -72,6 +72,21 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                             .small(),
                     );
                 }
+                Selection::Mixed { paths, objects } => {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} contours + {} objects",
+                            paths.len(),
+                            objects.len()
+                        ))
+                        .strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new("Free transform edits them as one group")
+                            .color(app.settings.theme.text_dim.to_color32())
+                            .small(),
+                    );
+                }
                 Selection::Multi(refs) => {
                     ui.label(egui::RichText::new(format!("{} objects", refs.len())).strong());
                     ui.separator();

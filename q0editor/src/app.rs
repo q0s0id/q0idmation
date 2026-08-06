@@ -4040,6 +4040,21 @@ impl EditorApp {
                 self.session.selection = Selection::None;
                 true
             }
+            Selection::Mixed { paths, objects } => {
+                self.history.snapshot(&self.state.project);
+                let changed = crate::selection_edit::remove_materialized_paths_and_objects(
+                    &mut self.state.project,
+                    &paths,
+                    &objects,
+                    self.session.current_frame,
+                );
+                if changed {
+                    self.state.dirty = true;
+                    self.session.selection = Selection::None;
+                    self.textures.invalidate();
+                }
+                changed
+            }
             Selection::RawArea {
                 placements,
                 objects,
@@ -5535,7 +5550,7 @@ struct BreakApartPiece {
     raw_path_count: usize,
 }
 
-fn affine_to_transform(affine: Affine) -> Option<Transform2D> {
+pub(crate) fn affine_to_transform(affine: Affine) -> Option<Transform2D> {
     let sx = affine.a11.hypot(affine.a21);
     let determinant = affine.a11 * affine.a22 - affine.a12 * affine.a21;
     if !sx.is_finite() || sx <= 1.0e-7 || !determinant.is_finite() || determinant <= 1.0e-9 {
