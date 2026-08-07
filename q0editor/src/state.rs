@@ -407,6 +407,7 @@ pub enum ToolState {
     DraggingRawHandle {
         refs: Vec<PathRef>,
         start_paths: Vec<VPath>,
+        start_appearances: Vec<(u16, VectorAppearance)>,
         handle: Handle,
         start_bounds: (f32, f32, f32, f32),
         start_pivot: Vec2,
@@ -414,12 +415,14 @@ pub enum ToolState {
     DraggingRawRotate {
         refs: Vec<PathRef>,
         start_paths: Vec<VPath>,
+        start_appearances: Vec<(u16, VectorAppearance)>,
         center: Vec2,
         start_angle: f32,
     },
     DraggingRawSkew {
         refs: Vec<PathRef>,
         start_paths: Vec<VPath>,
+        start_appearances: Vec<(u16, VectorAppearance)>,
         edge: TransformEdge,
         start_bounds: (f32, f32, f32, f32),
         start_cursor: Vec2,
@@ -470,6 +473,7 @@ pub enum ToolState {
     DraggingGroup {
         refs: Vec<PathRef>,
         start_paths: Vec<VPath>,
+        start_appearances: Vec<(u16, VectorAppearance)>,
         objects: Vec<PlacementRef>,
         start_transforms: Vec<Transform2D>,
         operation: GroupTransformOperation,

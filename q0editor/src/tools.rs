@@ -1427,6 +1427,7 @@ enum GroupTransformIntent {
 struct GroupTransformData<'a> {
     refs: &'a [PathRef],
     start_paths: &'a [VPath],
+    start_appearances: &'a [(u16, q0s_format::v2::VectorAppearance)],
     objects: &'a [PlacementRef],
     start_transforms: &'a [Transform2D],
     operation: GroupTransformOperation,
@@ -1538,6 +1539,8 @@ fn begin_group_transform(
     if start_paths.len() != paths.len() || start_transforms.len() != objects.len() {
         return false;
     }
+    let start_appearances =
+        capture_whole_asset_appearances_for_raw_refs(&app.state.project, &paths);
     app.session.selection = selection_from_group_parts(paths.clone(), objects.clone());
     set_selection_transform_pivot(app, pivot);
     let operation = match intent {
@@ -1559,6 +1562,7 @@ fn begin_group_transform(
     app.session.tool_state = ToolState::DraggingGroup {
         refs: paths,
         start_paths,
+        start_appearances,
         objects,
         start_transforms,
         operation,
@@ -1649,12 +1653,13 @@ fn apply_group_transform(app: &mut EditorApp, data: GroupTransformData<'_>, curs
     let Some(transform) = group_transform_affine(data.operation, cursor) else {
         return false;
     };
-    let mut changed = false;
-    for (reference, source) in data.refs.iter().copied().zip(data.start_paths.iter()) {
-        changed |= replace_raw_path_mapped(&mut app.state.project, reference, source, |point| {
-            transform.apply(point)
-        });
-    }
+    let mut changed = apply_raw_affine_snapshot(
+        &mut app.state.project,
+        data.refs,
+        data.start_paths,
+        data.start_appearances,
+        transform,
+    );
     for (reference, source) in data
         .objects
         .iter()
@@ -1717,11 +1722,13 @@ fn begin_transforming_raw_area(
     }
     app.session.selection = selection_from_group_parts(refs.clone(), Vec::new());
     set_selection_transform_pivot(app, pivot);
+    let start_appearances = capture_whole_asset_appearances_for_raw_refs(&app.state.project, &refs);
     match hit {
         TransformHit::Scale(handle) => {
             app.session.tool_state = ToolState::DraggingRawHandle {
                 refs,
                 start_paths,
+                start_appearances,
                 handle,
                 start_bounds: bounds,
                 start_pivot: pivot,
@@ -1732,6 +1739,7 @@ fn begin_transforming_raw_area(
             app.session.tool_state = ToolState::DraggingRawRotate {
                 refs,
                 start_paths,
+                start_appearances,
                 center: pivot,
                 start_angle: (start_cursor.y - pivot.y).atan2(start_cursor.x - pivot.x),
             };
@@ -1741,6 +1749,7 @@ fn begin_transforming_raw_area(
             app.session.tool_state = ToolState::DraggingRawSkew {
                 refs,
                 start_paths,
+                start_appearances,
                 edge,
                 start_bounds: bounds,
                 start_cursor,
@@ -2947,31 +2956,27 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
             ToolState::DraggingRawHandle {
                 refs,
                 start_paths,
+                start_appearances,
                 handle,
                 start_bounds,
                 start_pivot,
             } => {
                 if let Some(p) = cursor {
-                    let mut changed = false;
-                    for (r, source) in refs.iter().copied().zip(start_paths.iter()) {
-                        changed |= replace_raw_path_scaled(
-                            &mut app.state.project,
-                            r,
-                            source,
-                            start_bounds,
+                    if let Some(transform) = group_transform_affine(
+                        GroupTransformOperation::Scale {
                             handle,
-                            p,
-                        );
-                    }
-                    if changed {
-                        app.state.dirty = true;
-                        if let Some(transform) = group_transform_affine(
-                            GroupTransformOperation::Scale {
-                                handle,
-                                start_bounds,
-                            },
-                            p,
+                            start_bounds,
+                        },
+                        p,
+                    ) {
+                        if apply_raw_affine_snapshot(
+                            &mut app.state.project,
+                            &refs,
+                            &start_paths,
+                            &start_appearances,
+                            transform,
                         ) {
+                            app.state.dirty = true;
                             set_selection_transform_pivot(app, transform.apply(start_pivot));
                         }
                     }
@@ -2980,57 +2985,56 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
             ToolState::DraggingRawRotate {
                 refs,
                 start_paths,
+                start_appearances,
                 center,
                 start_angle,
             } => {
                 if let Some(p) = cursor {
-                    let angle = (p.y - center.y).atan2(p.x - center.x) - start_angle;
-                    let mut changed = false;
-                    for (r, source) in refs.iter().copied().zip(start_paths.iter()) {
-                        changed |= replace_raw_path_rotated(
-                            &mut app.state.project,
-                            r,
-                            source,
+                    if let Some(transform) = group_transform_affine(
+                        GroupTransformOperation::Rotate {
                             center,
-                            angle,
-                        );
-                    }
-                    if changed {
-                        app.state.dirty = true;
+                            start_angle,
+                        },
+                        p,
+                    ) {
+                        if apply_raw_affine_snapshot(
+                            &mut app.state.project,
+                            &refs,
+                            &start_paths,
+                            &start_appearances,
+                            transform,
+                        ) {
+                            app.state.dirty = true;
+                        }
                     }
                 }
             }
             ToolState::DraggingRawSkew {
                 refs,
                 start_paths,
+                start_appearances,
                 edge,
                 start_bounds,
                 start_cursor,
                 start_pivot,
             } => {
                 if let Some(p) = cursor {
-                    let delta = Vec2::new(p.x - start_cursor.x, p.y - start_cursor.y);
-                    let mut changed = false;
-                    for (r, source) in refs.iter().copied().zip(start_paths.iter()) {
-                        changed |= replace_raw_path_skewed(
-                            &mut app.state.project,
-                            r,
-                            source,
-                            start_bounds,
+                    if let Some(transform) = group_transform_affine(
+                        GroupTransformOperation::Skew {
                             edge,
-                            delta,
-                        );
-                    }
-                    if changed {
-                        app.state.dirty = true;
-                        if let Some(transform) = group_transform_affine(
-                            GroupTransformOperation::Skew {
-                                edge,
-                                start_bounds,
-                                start_cursor,
-                            },
-                            p,
+                            start_bounds,
+                            start_cursor,
+                        },
+                        p,
+                    ) {
+                        if apply_raw_affine_snapshot(
+                            &mut app.state.project,
+                            &refs,
+                            &start_paths,
+                            &start_appearances,
+                            transform,
                         ) {
+                            app.state.dirty = true;
                             set_selection_transform_pivot(app, transform.apply(start_pivot));
                         }
                     }
@@ -3164,6 +3168,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
             ToolState::DraggingGroup {
                 refs,
                 start_paths,
+                start_appearances,
                 objects,
                 start_transforms,
                 operation,
@@ -3175,6 +3180,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                         GroupTransformData {
                             refs: &refs,
                             start_paths: &start_paths,
+                            start_appearances: &start_appearances,
                             objects: &objects,
                             start_transforms: &start_transforms,
                             operation,
@@ -3985,30 +3991,60 @@ fn capture_whole_asset_appearances_for_raw_refs(
     }
 }
 
-fn translate_captured_appearances(
+fn transform_captured_appearances(
     project: &mut ProjectV2,
     start_appearances: &[(u16, q0s_format::v2::VectorAppearance)],
-    delta: Vec2,
+    transform: Affine,
 ) -> bool {
     #[cfg(not(feature = "appearance-mask-eraser"))]
     {
-        let _ = (project, start_appearances, delta);
+        let _ = (project, start_appearances, transform);
         false
     }
     #[cfg(feature = "appearance-mask-eraser")]
     {
         let mut changed = false;
         for (asset_id, source) in start_appearances {
-            let translated = crate::appearance::transform_appearance(source, |point| {
-                Vec2::new(point.x + delta.x, point.y + delta.y)
-            });
-            if project.asset_appearances.get(asset_id) != Some(&translated) {
-                project.asset_appearances.insert(*asset_id, translated);
+            let transformed =
+                crate::appearance::transform_appearance(source, |point| transform.apply(point));
+            if project.asset_appearances.get(asset_id) != Some(&transformed) {
+                project.asset_appearances.insert(*asset_id, transformed);
                 changed = true;
             }
         }
         changed
     }
+}
+
+fn translate_captured_appearances(
+    project: &mut ProjectV2,
+    start_appearances: &[(u16, q0s_format::v2::VectorAppearance)],
+    delta: Vec2,
+) -> bool {
+    transform_captured_appearances(
+        project,
+        start_appearances,
+        Affine {
+            tx: delta.x,
+            ty: delta.y,
+            ..Affine::IDENTITY
+        },
+    )
+}
+
+fn apply_raw_affine_snapshot(
+    project: &mut ProjectV2,
+    refs: &[PathRef],
+    start_paths: &[VPath],
+    start_appearances: &[(u16, q0s_format::v2::VectorAppearance)],
+    transform: Affine,
+) -> bool {
+    let mut changed = false;
+    for (reference, source) in refs.iter().copied().zip(start_paths) {
+        changed |=
+            replace_raw_path_mapped(project, reference, source, |point| transform.apply(point));
+    }
+    changed | transform_captured_appearances(project, start_appearances, transform)
 }
 
 fn begin_dragging_raw_paths(
@@ -4096,9 +4132,11 @@ fn begin_scaling_raw_paths(
     }
     app.session.selection = selection_from_group_parts(refs.clone(), Vec::new());
     set_selection_transform_pivot(app, start_pivot);
+    let start_appearances = capture_whole_asset_appearances_for_raw_refs(&app.state.project, &refs);
     app.session.tool_state = ToolState::DraggingRawHandle {
         refs,
         start_paths,
+        start_appearances,
         handle,
         start_bounds,
         start_pivot,
@@ -4140,9 +4178,11 @@ fn begin_rotating_raw_paths(
     }
     app.session.selection = selection_from_group_parts(refs.clone(), Vec::new());
     set_selection_transform_pivot(app, center);
+    let start_appearances = capture_whole_asset_appearances_for_raw_refs(&app.state.project, &refs);
     app.session.tool_state = ToolState::DraggingRawRotate {
         refs,
         start_paths,
+        start_appearances,
         center,
         start_angle: (start_cursor.y - center.y).atan2(start_cursor.x - center.x),
     };
@@ -4185,9 +4225,11 @@ fn begin_skewing_raw_paths(
     }
     app.session.selection = selection_from_group_parts(refs.clone(), Vec::new());
     set_selection_transform_pivot(app, start_pivot);
+    let start_appearances = capture_whole_asset_appearances_for_raw_refs(&app.state.project, &refs);
     app.session.tool_state = ToolState::DraggingRawSkew {
         refs,
         start_paths,
+        start_appearances,
         edge,
         start_bounds: bounds,
         start_cursor,
@@ -4256,65 +4298,6 @@ fn raw_handle_scale(
     Some((anchor, scale_x, scale_y))
 }
 
-fn scale_point_around(point: Vec2, anchor: Vec2, scale_x: f32, scale_y: f32) -> Vec2 {
-    Vec2::new(
-        anchor.x + (point.x - anchor.x) * scale_x,
-        anchor.y + (point.y - anchor.y) * scale_y,
-    )
-}
-
-fn replace_raw_path_scaled(
-    project: &mut ProjectV2,
-    r: PathRef,
-    source: &VPath,
-    start_bounds: (f32, f32, f32, f32),
-    handle: Handle,
-    cursor: Vec2,
-) -> bool {
-    let Some((anchor, scale_x, scale_y)) = raw_handle_scale(start_bounds, handle, cursor) else {
-        return false;
-    };
-    let asset_id = project
-        .q0rgs
-        .iter()
-        .find(|q0rg| q0rg.q0rg_id == r.q0rg_id)
-        .and_then(|q0rg| {
-            q0rg.layers
-                .iter()
-                .find(|layer| layer.layer_id == r.layer_id)
-        })
-        .and_then(|layer| layer.placements.get(r.placement_idx))
-        .and_then(|placement| match placement.target {
-            Target::Asset(asset_id) => Some(asset_id),
-            Target::Q0rg(_) => None,
-        });
-    let Some(asset_id) = asset_id else {
-        return false;
-    };
-    let Some(Asset::Vector(vector)) = project
-        .assets
-        .iter_mut()
-        .find(|asset| asset.id() == asset_id)
-    else {
-        return false;
-    };
-    let Some(target) = vector.paths.get_mut(r.path_idx) else {
-        return false;
-    };
-
-    *target = source.clone();
-    for anchor_point in &mut target.anchors {
-        anchor_point.point = scale_point_around(anchor_point.point, anchor, scale_x, scale_y);
-        if let Some(handle_point) = &mut anchor_point.in_handle {
-            *handle_point = scale_point_around(*handle_point, anchor, scale_x, scale_y);
-        }
-        if let Some(handle_point) = &mut anchor_point.out_handle {
-            *handle_point = scale_point_around(*handle_point, anchor, scale_x, scale_y);
-        }
-    }
-    true
-}
-
 fn replace_raw_path_mapped<F>(project: &mut ProjectV2, r: PathRef, source: &VPath, map: F) -> bool
 where
     F: Fn(Vec2) -> Vec2,
@@ -4357,46 +4340,6 @@ where
         }
     }
     true
-}
-
-fn replace_raw_path_rotated(
-    project: &mut ProjectV2,
-    r: PathRef,
-    source: &VPath,
-    center: Vec2,
-    angle: f32,
-) -> bool {
-    let (sin, cos) = angle.sin_cos();
-    replace_raw_path_mapped(project, r, source, |point| {
-        let x = point.x - center.x;
-        let y = point.y - center.y;
-        Vec2::new(center.x + x * cos - y * sin, center.y + x * sin + y * cos)
-    })
-}
-
-fn replace_raw_path_skewed(
-    project: &mut ProjectV2,
-    r: PathRef,
-    source: &VPath,
-    bounds: (f32, f32, f32, f32),
-    edge: TransformEdge,
-    delta: Vec2,
-) -> bool {
-    let (min_x, min_y, max_x, max_y) = bounds;
-    let shear = match edge {
-        TransformEdge::Top => delta.x / (min_y - max_y),
-        TransformEdge::Bottom => delta.x / (max_y - min_y),
-        TransformEdge::Left => delta.y / (min_x - max_x),
-        TransformEdge::Right => delta.y / (max_x - min_x),
-    }
-    .clamp(-8.0, 8.0);
-
-    replace_raw_path_mapped(project, r, source, |point| match edge {
-        TransformEdge::Top => Vec2::new(point.x + (point.y - max_y) * shear, point.y),
-        TransformEdge::Bottom => Vec2::new(point.x + (point.y - min_y) * shear, point.y),
-        TransformEdge::Left => Vec2::new(point.x, point.y + (point.x - max_x) * shear),
-        TransformEdge::Right => Vec2::new(point.x, point.y + (point.x - min_x) * shear),
-    })
 }
 
 fn raw_path_clone(
@@ -8616,6 +8559,187 @@ mod tests {
     }
 
     #[cfg(feature = "appearance-mask-eraser")]
+    fn halo_only_fragment_for_transform() -> (EditorApp, Vec<PathRef>, (f32, f32, f32, f32)) {
+        let mut app = EditorApp::default();
+        app.state.project = appearance_selection_project(false);
+        let selection = select_raw_area_by_rect(&app.state.project, 1, 0, (-8.0, 6.0, -2.0, 14.0))
+            .expect("pure halo marquee");
+        let Selection::RawArea {
+            placements,
+            bounds_min,
+            bounds_max,
+            ..
+        } = selection
+        else {
+            panic!("halo marquee must be raw area");
+        };
+        let refs = cut_raw_areas_for_drag(
+            &mut app,
+            &placements,
+            (bounds_min.x, bounds_min.y, bounds_max.x, bounds_max.y),
+        );
+        assert!(!refs.is_empty());
+        let bounds = raw_path_refs_bounds(&app.state.project, &refs).expect("fragment bounds");
+        (app, refs, bounds)
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn scaling_halo_only_fragment_scales_appearance_with_hidden_carrier() {
+        let (mut app, refs, bounds) = halo_only_fragment_for_transform();
+        let before = raw_path_refs_bounds(&app.state.project, &refs).unwrap();
+        assert!(begin_scaling_raw_paths(
+            &mut app,
+            refs,
+            Handle::MidRight,
+            bounds,
+        ));
+        let ToolState::DraggingRawHandle {
+            refs,
+            start_paths,
+            start_appearances,
+            handle,
+            start_bounds,
+            ..
+        } = app.session.tool_state.clone()
+        else {
+            panic!("scale state");
+        };
+        let cursor = Vec2::new(
+            bounds.0 + (bounds.2 - bounds.0) * 2.0,
+            (bounds.1 + bounds.3) * 0.5,
+        );
+        let transform = group_transform_affine(
+            GroupTransformOperation::Scale {
+                handle,
+                start_bounds,
+            },
+            cursor,
+        )
+        .unwrap();
+        assert!(apply_raw_affine_snapshot(
+            &mut app.state.project,
+            &refs,
+            &start_paths,
+            &start_appearances,
+            transform,
+        ));
+        let after = raw_path_refs_bounds(&app.state.project, &refs).unwrap();
+        assert!(((after.2 - after.0) - (before.2 - before.0) * 2.0).abs() < 0.15);
+        assert!(((after.3 - after.1) - (before.3 - before.1)).abs() < 0.15);
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn rotating_halo_only_fragment_rotates_appearance_with_hidden_carrier() {
+        let (mut app, refs, bounds) = halo_only_fragment_for_transform();
+        let center = Vec2::new((bounds.0 + bounds.2) * 0.5, (bounds.1 + bounds.3) * 0.5);
+        let before = raw_path_refs_bounds(&app.state.project, &refs).unwrap();
+        assert!(begin_rotating_raw_paths(
+            &mut app,
+            refs,
+            bounds,
+            center,
+            Vec2::new(center.x + 10.0, center.y),
+        ));
+        let ToolState::DraggingRawRotate {
+            refs,
+            start_paths,
+            start_appearances,
+            center,
+            start_angle,
+        } = app.session.tool_state.clone()
+        else {
+            panic!("rotation state");
+        };
+        let cursor = Vec2::new(center.x, center.y + 10.0);
+        let transform = group_transform_affine(
+            GroupTransformOperation::Rotate {
+                center,
+                start_angle,
+            },
+            cursor,
+        )
+        .unwrap();
+        assert!(apply_raw_affine_snapshot(
+            &mut app.state.project,
+            &refs,
+            &start_paths,
+            &start_appearances,
+            transform,
+        ));
+        let after = raw_path_refs_bounds(&app.state.project, &refs).unwrap();
+        let before_w = before.2 - before.0;
+        let before_h = before.3 - before.1;
+        let after_w = after.2 - after.0;
+        let after_h = after.3 - after.1;
+        assert!(
+            (after_w - before_h).abs() < 0.15,
+            "rotated halo width stayed stale: before={before:?} after={after:?}"
+        );
+        assert!(
+            (after_h - before_w).abs() < 0.15,
+            "rotated halo height stayed stale: before={before:?} after={after:?}"
+        );
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn skewing_halo_only_fragment_keeps_visible_bounds_local_to_fragment() {
+        let (mut app, refs, bounds) = halo_only_fragment_for_transform();
+        let start_cursor = Vec2::new(bounds.2, (bounds.1 + bounds.3) * 0.5);
+        assert!(begin_skewing_raw_paths(
+            &mut app,
+            refs,
+            TransformEdge::Right,
+            bounds,
+            start_cursor,
+        ));
+        let ToolState::DraggingRawSkew {
+            refs,
+            start_paths,
+            start_appearances,
+            edge,
+            start_bounds,
+            start_cursor,
+            ..
+        } = app.session.tool_state.clone()
+        else {
+            panic!("skew state");
+        };
+        let cursor = Vec2::new(start_cursor.x, start_cursor.y + 4.0);
+        let transform = group_transform_affine(
+            GroupTransformOperation::Skew {
+                edge,
+                start_bounds,
+                start_cursor,
+            },
+            cursor,
+        )
+        .unwrap();
+        assert!(apply_raw_affine_snapshot(
+            &mut app.state.project,
+            &refs,
+            &start_paths,
+            &start_appearances,
+            transform,
+        ));
+        let after = raw_path_refs_bounds(&app.state.project, &refs).unwrap();
+        assert!(
+            after.2 - after.0 < 20.0,
+            "skew exploded halo bbox: {after:?}"
+        );
+        assert!(
+            after.3 - after.1 < 20.0,
+            "skew exploded halo bbox: {after:?}"
+        );
+        assert!(
+            after.0 > -20.0 && after.2 < 20.0,
+            "skewed fragment escaped its local neighbourhood: {after:?}"
+        );
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
     #[test]
     fn raw_selection_bounds_include_soft_halo_support() {
         let project = appearance_selection_project(false);
@@ -9019,12 +9143,20 @@ mod tests {
             placement_idx: 0,
             path_idx: 0,
         };
-        assert!(replace_raw_path_rotated(
+        let transform = group_transform_affine(
+            GroupTransformOperation::Rotate {
+                center,
+                start_angle: 0.0,
+            },
+            Vec2::new(center.x, center.y + 10.0),
+        )
+        .unwrap();
+        assert!(apply_raw_affine_snapshot(
             &mut project,
-            reference,
-            &source,
-            center,
-            std::f32::consts::FRAC_PI_2,
+            &[reference],
+            std::slice::from_ref(&source),
+            &[],
+            transform,
         ));
         let rotated = raw_path_clone(&project, 1, 1, 0, 0).unwrap();
         assert!((rotated.anchors[0].point.x - 10.0).abs() < 1.0e-4);
@@ -9616,13 +9748,20 @@ mod tests {
         let source = raw_path_clone(&project, 1, 1, 0, 0).expect("selected square");
         let bounds = raw_path_refs_bounds(&project, &[selected]).expect("selected bounds");
 
-        assert!(replace_raw_path_scaled(
-            &mut project,
-            selected,
-            &source,
-            bounds,
-            Handle::MidRight,
+        let transform = group_transform_affine(
+            GroupTransformOperation::Scale {
+                handle: Handle::MidRight,
+                start_bounds: bounds,
+            },
             Vec2::new(40.0, 10.0),
+        )
+        .unwrap();
+        assert!(apply_raw_affine_snapshot(
+            &mut project,
+            &[selected],
+            std::slice::from_ref(&source),
+            &[],
+            transform,
         ));
 
         let Asset::Vector(vector) = &project.assets[0] else {
@@ -10047,6 +10186,7 @@ mod tests {
         let ToolState::DraggingGroup {
             refs,
             start_paths,
+            start_appearances,
             objects,
             start_transforms,
             operation,
@@ -10063,6 +10203,7 @@ mod tests {
             GroupTransformData {
                 refs: &refs,
                 start_paths: &start_paths,
+                start_appearances: &start_appearances,
                 objects: &objects,
                 start_transforms: &start_transforms,
                 operation,
