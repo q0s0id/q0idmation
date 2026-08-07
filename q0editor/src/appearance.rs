@@ -23,7 +23,10 @@ pub enum BrushMaterial {
     Solid,
     /// Finite-support soft halo around the vector source. `radius` is in stage
     /// units and is also the support radius used by the appearance-aware eraser.
-    SoftHalo { radius: f32, opacity: f32 },
+    SoftHalo {
+        radius: f32,
+        opacity: f32,
+    },
 }
 
 impl BrushMaterial {
@@ -159,10 +162,7 @@ pub fn source_cut_for_visible_erase(
     }
 }
 
-fn visible_support(
-    geometry: &MultiPolygon<f64>,
-    material: BrushMaterial,
-) -> MultiPolygon<f64> {
+fn visible_support(geometry: &MultiPolygon<f64>, material: BrushMaterial) -> MultiPolygon<f64> {
     let radius = f64::from(material.support_radius());
     if radius <= GEOMETRY_EPSILON {
         geometry.clone()
@@ -339,7 +339,11 @@ fn remove_current_layer_asset_placements(
         .q0rgs
         .iter_mut()
         .find(|q0rg| q0rg.q0rg_id == q0rg_id)
-        .and_then(|q0rg| q0rg.layers.iter_mut().find(|layer| layer.layer_id == layer_id))
+        .and_then(|q0rg| {
+            q0rg.layers
+                .iter_mut()
+                .find(|layer| layer.layer_id == layer_id)
+        })
     {
         layer.placements.retain(|placement| {
             placement.frame != frame
@@ -617,8 +621,13 @@ mod tests {
         let source_cut = source_cut_for_visible_erase(&visible_erase, material);
         let remaining_source = source.difference(&source_cut);
         let rerendered_support = visible_support(&remaining_source, material);
-        let bleed = rerendered_support.intersection(&visible_erase).unsigned_area();
-        assert!(bleed <= 1.0e-6, "halo bled {bleed} area back into erased pixels");
+        let bleed = rerendered_support
+            .intersection(&visible_erase)
+            .unsigned_area();
+        assert!(
+            bleed <= 1.0e-6,
+            "halo bled {bleed} area back into erased pixels"
+        );
     }
 
     #[test]
