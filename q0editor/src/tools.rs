@@ -1,5 +1,7 @@
-use egui::epaint::PathShape;
-use egui::{pos2, Color32, Context, Key, Painter, PointerButton, Pos2, Response, Shape, Stroke};
+use egui::epaint::{PathShape, Vertex};
+use egui::{
+    pos2, Color32, Context, Key, Mesh, Painter, PointerButton, Pos2, Response, Shape, Stroke,
+};
 use geo::{
     Area, BooleanOps, BoundingRect, Contains, Coord, LineString, MultiPolygon, Point, Polygon,
 };
@@ -6501,7 +6503,7 @@ fn draw_transform_pivot_overlay(app: &EditorApp, painter: &Painter, view: &Stage
     );
 }
 
-const SELECTION_STIPPLE_SPACING_PX: f32 = 2.0;
+const SELECTION_STIPPLE_SPACING_PX: f32 = 3.0;
 const SELECTION_CONTOUR_SPACING_PX: f32 = 1.0;
 
 fn clip_segment_to_rect(a: Pos2, b: Pos2, rect: egui::Rect) -> Option<(Pos2, Pos2)> {
@@ -6568,16 +6570,48 @@ fn dense_selection_contour_points(contours: &[Vec<Pos2>], clip_rect: egui::Rect)
 }
 
 fn draw_dense_selection_contour(painter: &Painter, contours: &[Vec<Pos2>], accent: Color32) {
-    let clip_rect = painter.clip_rect();
-    for point in dense_selection_contour_points(contours, clip_rect) {
-        // Keep these as actual dots rather than an almost-solid stroke.
-        painter.circle_filled(point, 0.52, Color32::from_black_alpha(220));
-        painter.circle_filled(point, 0.32, accent);
-    }
+    let points = dense_selection_contour_points(contours, painter.clip_rect());
+    // One mesh per colour instead of one epaint shape per dot. At Animate-like
+    // density a viewport can contain tens of thousands of contour samples.
+    draw_stipple_batch(painter, &points, 0.45, Color32::from_black_alpha(220));
+    draw_stipple_batch(painter, &points, 0.24, accent);
 }
 
 fn fixed_selection_grid_start(min: f32) -> f32 {
     (min / SELECTION_STIPPLE_SPACING_PX).ceil() * SELECTION_STIPPLE_SPACING_PX
+}
+
+fn stipple_mesh(points: &[Pos2], half_size: f32, color: Color32) -> Mesh {
+    let mut mesh = Mesh::default();
+    mesh.vertices.reserve(points.len().saturating_mul(4));
+    mesh.indices.reserve(points.len().saturating_mul(6));
+    for point in points {
+        let base = mesh.vertices.len() as u32;
+        let min = Pos2::new(point.x - half_size, point.y - half_size);
+        let max = Pos2::new(point.x + half_size, point.y + half_size);
+        for pos in [
+            Pos2::new(min.x, min.y),
+            Pos2::new(max.x, min.y),
+            Pos2::new(max.x, max.y),
+            Pos2::new(min.x, max.y),
+        ] {
+            mesh.vertices.push(Vertex {
+                pos,
+                uv: Pos2::ZERO,
+                color,
+            });
+        }
+        mesh.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+    mesh
+}
+
+fn draw_stipple_batch(painter: &Painter, points: &[Pos2], half_size: f32, color: Color32) {
+    if points.is_empty() {
+        return;
+    }
+    painter.add(Shape::Mesh(stipple_mesh(points, half_size, color)));
 }
 
 fn selection_stipple_step() -> f32 {
@@ -6632,9 +6666,8 @@ fn draw_appearance_selection_stipple(
         return;
     }
     let clipped = painter.with_clip_rect(sample_rect);
-    for point in appearance_selection_stipple_points(view, sample_rect, tester, subset_support) {
-        clipped.circle_filled(point, 0.62, Color32::WHITE);
-    }
+    let points = appearance_selection_stipple_points(view, sample_rect, tester, subset_support);
+    draw_stipple_batch(&clipped, &points, 0.38, Color32::WHITE);
 }
 
 fn draw_raw_area_selection(
@@ -6700,6 +6733,7 @@ fn draw_raw_area_selection(
     // visible viewport is sampled so off-screen geometry does not create work.
     let surface = geo::unary_union(surfaces.iter());
     let step = selection_stipple_step();
+    let mut stipple_points = Vec::new();
     let mut y = fixed_selection_grid_start(visible_rect.top());
     while y <= visible_rect.bottom() {
         let mut x = fixed_selection_grid_start(visible_rect.left());
@@ -6709,12 +6743,13 @@ fn draw_raw_area_selection(
                 ((y - view.origin.y) / view.scale) as f64,
             );
             if surface.contains(&stage) {
-                clipped.circle_filled(Pos2::new(x, y), 0.8, Color32::WHITE);
+                stipple_points.push(Pos2::new(x, y));
             }
             x += step;
         }
         y += step;
     }
+    draw_stipple_batch(&clipped, &stipple_points, 0.42, Color32::WHITE);
     if draw_box {
         draw_flash_selection_box(painter, selection_rect, selection_color(app));
     }
@@ -6963,6 +6998,7 @@ fn draw_partial_raw_selection(
     // Keep the dotted raw-area cue at one fixed screen-space density. Work is
     // clipped to the viewport rather than thinning the pattern on large areas.
     let step = selection_stipple_step();
+    let mut stipple_points = Vec::new();
     let mut y = fixed_selection_grid_start(visible_rect.top());
     while y <= visible_rect.bottom() {
         let mut x = fixed_selection_grid_start(visible_rect.left());
@@ -6972,12 +7008,13 @@ fn draw_partial_raw_selection(
                 (y - view.origin.y) / view.scale,
             );
             if point_in_polygon(&local, stage) {
-                clipped.circle_filled(Pos2::new(x, y), 0.8, Color32::WHITE);
+                stipple_points.push(Pos2::new(x, y));
             }
             x += step;
         }
         y += step;
     }
+    draw_stipple_batch(&clipped, &stipple_points, 0.42, Color32::WHITE);
     draw_flash_selection_box(painter, selection_rect, selection_color(app));
 }
 
@@ -9567,10 +9604,26 @@ mod tests {
 
     #[test]
     fn selection_stipple_density_is_fixed_in_screen_space() {
-        assert_eq!(selection_stipple_step(), 2.0);
+        assert_eq!(selection_stipple_step(), 3.0);
         assert_eq!(fixed_selection_grid_start(0.0), 0.0);
-        assert_eq!(fixed_selection_grid_start(1.0), 2.0);
-        assert_eq!(fixed_selection_grid_start(37.1), 38.0);
+        assert_eq!(fixed_selection_grid_start(1.0), 3.0);
+        assert_eq!(fixed_selection_grid_start(37.1), 39.0);
+    }
+
+    #[test]
+    fn selection_stipple_is_batched_into_one_mesh_geometry() {
+        let points = [
+            Pos2::new(1.0, 2.0),
+            Pos2::new(4.0, 5.0),
+            Pos2::new(7.0, 8.0),
+        ];
+        let mesh = stipple_mesh(&points, 0.4, Color32::WHITE);
+        assert_eq!(mesh.vertices.len(), points.len() * 4);
+        assert_eq!(mesh.indices.len(), points.len() * 6);
+        assert_eq!(
+            mesh.indices,
+            vec![0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7, 8, 9, 10, 8, 10, 11]
+        );
     }
 
     #[test]
