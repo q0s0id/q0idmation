@@ -7,7 +7,7 @@ this branch keeps the trusted classic brush/eraser path intact and routes only q
 - switch back to `main`, or
 - build q0editor with `--no-default-features` on this branch.
 
-`q0s-format` is unchanged. `.q1s` serialization is unchanged. experimental brush appearance metadata is runtime-only and is intentionally not written to project files yet.
+`q0s-format` is unchanged. `.q1s` serialization is unchanged. experimental brush appearance metadata is runtime-only and is intentionally not written to project files yet. reopening a project therefore falls back to the ordinary solid vector appearance until a persistent format is designed and compatibility-tested.
 
 ## experiment semantics
 
