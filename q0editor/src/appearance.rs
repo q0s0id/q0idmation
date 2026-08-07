@@ -1,12 +1,12 @@
 use std::collections::BTreeSet;
 
-use geo::{BooleanOps, Buffer, MultiPolygon};
+use geo::{BooleanOps, BoundingRect, Buffer, MultiPolygon};
 use q0s_format::v2::{
     Asset, Path as VPath, ProjectV2, Rgba, Target, Transform2D, Tween, VectorAppearance,
     VectorAsset, VectorMaterial,
 };
 
-use crate::app::EditorApp;
+use crate::{app::EditorApp, brush::BrushSettings};
 
 pub const DEFAULT_HALO_RADIUS: f32 = 10.0;
 pub const DEFAULT_HALO_OPACITY: f32 = 0.55;
@@ -21,6 +21,12 @@ pub fn default_brush_appearance() -> VectorAppearance {
     }
 }
 
+/// Classic brush paint is plain vector fill. The material exists only when
+/// Glow is explicitly enabled in brush properties.
+pub(crate) fn brush_material(settings: BrushSettings) -> Option<VectorMaterial> {
+    settings.glow.then_some(default_brush_appearance().material)
+}
+
 /// Build the appearance for the single merged raw-fill asset produced by a
 /// classic brush commit. Existing mask cuts follow same-colour paint through
 /// merge drawing, while the freshly painted region clears those cuts so a new
@@ -29,14 +35,13 @@ pub(crate) fn merged_brush_appearance(
     project: &ProjectV2,
     same_color_asset_ids: &BTreeSet<u16>,
     freshly_painted: &MultiPolygon<f64>,
+    material: VectorMaterial,
 ) -> VectorAppearance {
-    let mut material = None;
     let mut mask = MultiPolygon(Vec::new());
     for asset_id in same_color_asset_ids {
         let Some(appearance) = project.asset_appearances.get(asset_id) else {
             continue;
         };
-        material.get_or_insert(appearance.material);
         let coverage = mask_paths_to_coverage(&appearance.erase_mask);
         if !coverage.0.is_empty() {
             mask = mask.union(&coverage);
@@ -46,7 +51,7 @@ pub(crate) fn merged_brush_appearance(
         mask = mask.difference(freshly_painted);
     }
     VectorAppearance {
-        material: material.unwrap_or_else(|| default_brush_appearance().material),
+        material,
         erase_mask: crate::brush::coverage_to_paths(&mask),
     }
 }
@@ -123,7 +128,7 @@ pub(crate) fn split_asset_appearance(
     }
 }
 
-fn mask_paths_to_coverage(paths: &[VPath]) -> MultiPolygon<f64> {
+pub(crate) fn mask_paths_to_coverage(paths: &[VPath]) -> MultiPolygon<f64> {
     if paths.is_empty() {
         return MultiPolygon(Vec::new());
     }
@@ -140,11 +145,91 @@ fn mask_paths_to_coverage(paths: &[VPath]) -> MultiPolygon<f64> {
     })
 }
 
-fn material_support(source: &MultiPolygon<f64>, material: VectorMaterial) -> MultiPolygon<f64> {
+pub(crate) fn material_support(
+    source: &MultiPolygon<f64>,
+    material: VectorMaterial,
+) -> MultiPolygon<f64> {
     match material {
         VectorMaterial::Solid => source.clone(),
         VectorMaterial::SoftHalo { radius, .. } => source.buffer(f64::from(radius.max(0.0))),
     }
+}
+
+/// Opaque/vector body that is still visible after the non-destructive erase
+/// mask. This is what the editor tessellates as real vector geometry.
+pub(crate) fn visible_source_surface_for_vector(
+    vector: &VectorAsset,
+    appearance: Option<&VectorAppearance>,
+) -> MultiPolygon<f64> {
+    let source = crate::brush::vector_fill_geometry(vector);
+    let Some(appearance) = appearance else {
+        return source;
+    };
+    let mask = mask_paths_to_coverage(&appearance.erase_mask);
+    if mask.0.is_empty() {
+        source
+    } else {
+        source.difference(&mask)
+    }
+}
+
+/// Full selectable visual support: vector body plus the finite halo support,
+/// with erased areas removed. This intentionally uses the material's finite
+/// support radius rather than the source path bbox so glow is real graphics to
+/// hit-testing, selection and transform bounds.
+pub(crate) fn visible_material_surface_for_vector(
+    vector: &VectorAsset,
+    appearance: Option<&VectorAppearance>,
+) -> MultiPolygon<f64> {
+    let source = crate::brush::vector_fill_geometry(vector);
+    let Some(appearance) = appearance else {
+        return source;
+    };
+    let support = material_support(&source, appearance.material);
+    let mask = mask_paths_to_coverage(&appearance.erase_mask);
+    if mask.0.is_empty() {
+        support
+    } else {
+        support.difference(&mask)
+    }
+}
+
+pub(crate) fn visible_material_surface_for_paths(
+    vector: &VectorAsset,
+    appearance: Option<&VectorAppearance>,
+    path_indices: &[usize],
+) -> MultiPolygon<f64> {
+    let subset = VectorAsset {
+        asset_id: vector.asset_id,
+        paths: path_indices
+            .iter()
+            .filter_map(|index| vector.paths.get(*index).cloned())
+            .collect(),
+        fill: vector.fill,
+        stroke: None,
+    };
+    visible_material_surface_for_vector(&subset, appearance)
+}
+
+pub(crate) fn asset_visible_material_bounds(
+    project: &ProjectV2,
+    asset_id: u16,
+) -> Option<(f32, f32, f32, f32)> {
+    let Asset::Vector(vector) = project.assets.iter().find(|asset| asset.id() == asset_id)? else {
+        return None;
+    };
+    if vector.fill.is_none() || vector.stroke.is_some() {
+        return None;
+    }
+    let surface =
+        visible_material_surface_for_vector(vector, project.asset_appearances.get(&asset_id));
+    let bounds = surface.bounding_rect()?;
+    Some((
+        bounds.min().x as f32,
+        bounds.min().y as f32,
+        bounds.max().x as f32,
+        bounds.max().y as f32,
+    ))
 }
 
 /// Erase the resolved appearance, not the source vector. The exact eraser

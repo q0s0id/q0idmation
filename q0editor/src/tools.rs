@@ -781,6 +781,110 @@ pub(crate) fn vector_fill_geometry(vector: &VectorAsset) -> MultiPolygon<f64> {
     surface
 }
 
+pub(crate) fn raw_selectable_fill_surface(
+    project: &ProjectV2,
+    asset_id: u16,
+    vector: &VectorAsset,
+) -> MultiPolygon<f64> {
+    #[cfg(feature = "appearance-mask-eraser")]
+    {
+        crate::appearance::visible_material_surface_for_vector(
+            vector,
+            project.asset_appearances.get(&asset_id),
+        )
+    }
+    #[cfg(not(feature = "appearance-mask-eraser"))]
+    {
+        let _ = (project, asset_id);
+        vector_fill_geometry(vector)
+    }
+}
+
+fn raw_selectable_paths_surface(
+    project: &ProjectV2,
+    asset_id: u16,
+    vector: &VectorAsset,
+    path_indices: &[usize],
+) -> MultiPolygon<f64> {
+    #[cfg(feature = "appearance-mask-eraser")]
+    {
+        crate::appearance::visible_material_surface_for_paths(
+            vector,
+            project.asset_appearances.get(&asset_id),
+            path_indices,
+        )
+    }
+    #[cfg(not(feature = "appearance-mask-eraser"))]
+    {
+        let _ = (project, asset_id);
+        vector_fill_geometry(&VectorAsset {
+            asset_id: vector.asset_id,
+            paths: path_indices
+                .iter()
+                .filter_map(|index| vector.paths.get(*index).cloned())
+                .collect(),
+            fill: vector.fill,
+            stroke: None,
+        })
+    }
+}
+
+fn selectable_component_at_cursor(
+    project: &ProjectV2,
+    asset_id: u16,
+    vector: &VectorAsset,
+    cursor: Vec2,
+) -> Option<Polygon<f64>> {
+    #[cfg(not(feature = "appearance-mask-eraser"))]
+    let _ = (project, asset_id);
+    let point = Point::new(cursor.x as f64, cursor.y as f64);
+    let source = vector_fill_geometry(vector);
+    #[cfg(feature = "appearance-mask-eraser")]
+    let appearance = project.asset_appearances.get(&asset_id);
+    #[cfg(feature = "appearance-mask-eraser")]
+    let mask = appearance
+        .map(|appearance| crate::appearance::mask_paths_to_coverage(&appearance.erase_mask))
+        .unwrap_or_else(|| MultiPolygon(Vec::new()));
+
+    for component in source.0 {
+        #[cfg(feature = "appearance-mask-eraser")]
+        let visible = if let Some(appearance) = appearance {
+            let support = crate::appearance::material_support(
+                &MultiPolygon(vec![component.clone()]),
+                appearance.material,
+            );
+            if mask.0.is_empty() {
+                support
+            } else {
+                support.difference(&mask)
+            }
+        } else {
+            MultiPolygon(vec![component.clone()])
+        };
+        #[cfg(not(feature = "appearance-mask-eraser"))]
+        let visible = MultiPolygon(vec![component.clone()]);
+
+        if visible.0.iter().any(|polygon| {
+            polygon.contains(&point) || polygon_boundary_near_cursor(polygon, cursor, 2.0)
+        }) {
+            return Some(component);
+        }
+    }
+    None
+}
+
+fn surface_to_screen_contours(surface: &MultiPolygon<f64>, view: &StageView) -> Vec<Vec<Pos2>> {
+    crate::brush::coverage_to_paths(surface)
+        .iter()
+        .map(|path| {
+            flatten_path(path)
+                .into_iter()
+                .map(|point| stage_to_screen(point, view))
+                .collect()
+        })
+        .collect()
+}
+
 pub(crate) fn geo_multi_polygon_to_linear_paths(geometry: &MultiPolygon<f64>) -> Vec<VPath> {
     fn ring_path(ring: &LineString<f64>) -> Option<VPath> {
         let mut points: Vec<Vec2> = ring
@@ -853,7 +957,8 @@ fn select_raw_area_by_rect(
             if vector.fill.is_none() {
                 continue;
             }
-            let selected = vector_fill_geometry(vector).intersection(&clip);
+            let selected =
+                raw_selectable_fill_surface(project, asset_id, vector).intersection(&clip);
             if selected.unsigned_area() > 0.05 {
                 if let Some(bounds) = selected.bounding_rect() {
                     actual_min.x = actual_min.x.min(bounds.min().x as f32);
@@ -3020,8 +3125,6 @@ fn hit_test_raw_selection(
     cursor: Vec2,
 ) -> Option<RawSelectionHit> {
     let q = project.q0rgs.iter().find(|q| q.q0rg_id == q0rg_id)?;
-    let cursor_point = Point::new(cursor.x as f64, cursor.y as f64);
-
     for layer in q.layers.iter().rev() {
         for placement_idx in active_raw_placement_indices(project, layer, frame)
             .into_iter()
@@ -3038,25 +3141,23 @@ fn hit_test_raw_selection(
             };
 
             if vector.fill.is_some() {
-                let surface = vector_fill_geometry(vector);
-                if let Some(component) = surface.0.iter().find(|polygon| {
-                    polygon.contains(&cursor_point)
-                        || polygon_boundary_near_cursor(polygon, cursor, 2.0)
-                }) {
+                if let Some(component) =
+                    selectable_component_at_cursor(project, asset_id, vector, cursor)
+                {
                     let refs: Vec<PathRef> = vector
                         .paths
                         .iter()
                         .enumerate()
                         .filter(|(_, path)| path.closed)
                         .filter_map(|(path_idx, path)| {
-                            // A contour belongs to this connected component only
-                            // when it contributes one of the component's visible
-                            // boundaries. Polygon containment alone makes an
-                            // island inside a hole select its enclosing ring.
+                            // Refs stay tied to the source vector component even
+                            // when the click lands in its halo. This preserves
+                            // independent raw regions while making the material
+                            // support participate in normal Select semantics.
                             path.anchors
                                 .iter()
                                 .any(|anchor| {
-                                    polygon_boundary_near_cursor(component, anchor.point, 0.5)
+                                    polygon_boundary_near_cursor(&component, anchor.point, 0.5)
                                 })
                                 .then_some(PathRef {
                                     q0rg_id,
@@ -3448,30 +3549,75 @@ pub(crate) fn materialize_raw_paths_as_placements(
 }
 
 fn raw_path_refs_bounds(project: &ProjectV2, refs: &[PathRef]) -> Option<(f32, f32, f32, f32)> {
+    let mut grouped: std::collections::BTreeMap<(u16, u16, usize), Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for reference in refs {
+        grouped
+            .entry((
+                reference.q0rg_id,
+                reference.layer_id,
+                reference.placement_idx,
+            ))
+            .or_default()
+            .push(reference.path_idx);
+    }
+
     let mut min_x = f32::INFINITY;
     let mut min_y = f32::INFINITY;
     let mut max_x = f32::NEG_INFINITY;
     let mut max_y = f32::NEG_INFINITY;
     let mut found = false;
-
-    for r in refs {
-        let Some(path) =
-            raw_path_clone(project, r.q0rg_id, r.layer_id, r.placement_idx, r.path_idx)
+    for ((q0rg_id, layer_id, placement_idx), mut path_indices) in grouped {
+        path_indices.sort_unstable();
+        path_indices.dedup();
+        let Some(placement) = project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+            .and_then(|q0rg| q0rg.layers.iter().find(|layer| layer.layer_id == layer_id))
+            .and_then(|layer| layer.placements.get(placement_idx))
         else {
             continue;
         };
-        for point in flatten_path(&path) {
-            if !point.x.is_finite() || !point.y.is_finite() {
-                continue;
-            }
-            min_x = min_x.min(point.x);
-            min_y = min_y.min(point.y);
-            max_x = max_x.max(point.x);
-            max_y = max_y.max(point.y);
+        let Target::Asset(asset_id) = placement.target else {
+            continue;
+        };
+        let Some(Asset::Vector(vector)) =
+            project.assets.iter().find(|asset| asset.id() == asset_id)
+        else {
+            continue;
+        };
+        let surface = raw_selectable_paths_surface(project, asset_id, vector, &path_indices);
+        if let Some(bounds) = surface.bounding_rect() {
+            min_x = min_x.min(bounds.min().x as f32);
+            min_y = min_y.min(bounds.min().y as f32);
+            max_x = max_x.max(bounds.max().x as f32);
+            max_y = max_y.max(bounds.max().y as f32);
             found = true;
+            continue;
+        }
+        #[cfg(feature = "appearance-mask-eraser")]
+        if project.asset_appearances.contains_key(&asset_id) {
+            // An appearance asset with no visible material surface is fully
+            // erased. Never resurrect its source paths as selection bounds.
+            continue;
+        }
+        for path_idx in path_indices {
+            let Some(path) = vector.paths.get(path_idx) else {
+                continue;
+            };
+            for point in flatten_path(path) {
+                if !point.x.is_finite() || !point.y.is_finite() {
+                    continue;
+                }
+                min_x = min_x.min(point.x);
+                min_y = min_y.min(point.y);
+                max_x = max_x.max(point.x);
+                max_y = max_y.max(point.y);
+                found = true;
+            }
         }
     }
-
     found.then_some((min_x, min_y, max_x, max_y))
 }
 
@@ -6063,19 +6209,10 @@ fn draw_raw_area_selection(
         else {
             continue;
         };
-        let contours: Vec<Vec<Pos2>> = vector
-            .paths
-            .iter()
-            .filter(|path| path.closed)
-            .map(|path| {
-                flatten_path(path)
-                    .into_iter()
-                    .map(|point| stage_to_screen(point, view))
-                    .collect()
-            })
-            .collect();
+        let surface = raw_selectable_fill_surface(&app.state.project, asset_id, vector);
+        let contours = surface_to_screen_contours(&surface, view);
         crate::render::paint_complex_fill(&clipped, &contours, selection_fill_color(app, 64));
-        surfaces.push(vector_fill_geometry(vector));
+        surfaces.push(surface);
     }
 
     // Animate-style stipple is evaluated against one unioned surface, so holes
@@ -6113,11 +6250,15 @@ fn draw_raw_paths_overlay(
 ) {
     let mut grouped: std::collections::BTreeMap<(u16, u16, usize), Vec<usize>> =
         std::collections::BTreeMap::new();
-    for r in refs {
+    for reference in refs {
         grouped
-            .entry((r.q0rg_id, r.layer_id, r.placement_idx))
+            .entry((
+                reference.q0rg_id,
+                reference.layer_id,
+                reference.placement_idx,
+            ))
             .or_default()
-            .push(r.path_idx);
+            .push(reference.path_idx);
     }
 
     for ((q0rg_id, layer_id, placement_idx), mut path_indices) in grouped {
@@ -6128,8 +6269,8 @@ fn draw_raw_paths_overlay(
             .project
             .q0rgs
             .iter()
-            .find(|q| q.q0rg_id == q0rg_id)
-            .and_then(|q| q.layers.iter().find(|layer| layer.layer_id == layer_id))
+            .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+            .and_then(|q0rg| q0rg.layers.iter().find(|layer| layer.layer_id == layer_id))
             .and_then(|layer| layer.placements.get(placement_idx))
         else {
             continue;
@@ -6147,50 +6288,58 @@ fn draw_raw_paths_overlay(
             continue;
         };
 
-        let mut fill_contours: Vec<Vec<Pos2>> = Vec::new();
-        let mut fill_points: Vec<Pos2> = Vec::new();
-        for path_idx in path_indices {
-            let Some(path) = vector.paths.get(path_idx) else {
+        // Open paths remain ordinary path overlays. Closed fill refs use the
+        // resolved visual material surface, so erased mask regions disappear
+        // from the stipple/outline while soft halo becomes selectable artwork.
+        for path_idx in &path_indices {
+            let Some(path) = vector.paths.get(*path_idx) else {
                 continue;
             };
             if path.closed && vector.fill.is_some() {
-                let points: Vec<Pos2> = flatten_path(path)
-                    .into_iter()
-                    .map(|point| stage_to_screen(point, view))
-                    .collect();
-                if points.len() >= 3 {
-                    fill_points.extend(points.iter().copied());
-                    fill_contours.push(points);
-                }
-            } else {
-                let raw_points: Vec<Pos2> = flatten_path(path)
-                    .into_iter()
-                    .map(|point| stage_to_screen(point, view))
-                    .collect();
-                let points =
-                    crate::render::sanitize_display_polyline(&raw_points, 2.0, path.closed);
-                if points.len() >= 2 {
-                    painter.add(Shape::Path(PathShape {
-                        points: points.clone(),
-                        closed: path.closed,
-                        fill: Color32::TRANSPARENT,
-                        stroke: Stroke::new(3.0_f32, Color32::from_black_alpha(210)),
-                    }));
-                    painter.add(Shape::Path(PathShape {
-                        points,
-                        closed: path.closed,
-                        fill: Color32::TRANSPARENT,
-                        stroke: Stroke::new(1.5_f32, selection_color(app)),
-                    }));
-                }
+                continue;
+            }
+            let raw_points: Vec<Pos2> = flatten_path(path)
+                .into_iter()
+                .map(|point| stage_to_screen(point, view))
+                .collect();
+            let points = crate::render::sanitize_display_polyline(&raw_points, 2.0, path.closed);
+            if points.len() >= 2 {
+                painter.add(Shape::Path(PathShape {
+                    points: points.clone(),
+                    closed: path.closed,
+                    fill: Color32::TRANSPARENT,
+                    stroke: Stroke::new(3.0_f32, Color32::from_black_alpha(210)),
+                }));
+                painter.add(Shape::Path(PathShape {
+                    points,
+                    closed: path.closed,
+                    fill: Color32::TRANSPARENT,
+                    stroke: Stroke::new(1.5_f32, selection_color(app)),
+                }));
             }
         }
 
-        if fill_contours.is_empty() {
+        let closed_indices: Vec<usize> = path_indices
+            .iter()
+            .copied()
+            .filter(|index| {
+                vector
+                    .paths
+                    .get(*index)
+                    .is_some_and(|path| path.closed && vector.fill.is_some())
+            })
+            .collect();
+        if closed_indices.is_empty() {
             continue;
         }
-        crate::render::paint_complex_fill(painter, &fill_contours, selection_fill_color(app, 64));
-        for contour in &fill_contours {
+        let surface =
+            raw_selectable_paths_surface(&app.state.project, asset_id, vector, &closed_indices);
+        let contours = surface_to_screen_contours(&surface, view);
+        if contours.is_empty() {
+            continue;
+        }
+        crate::render::paint_complex_fill(painter, &contours, selection_fill_color(app, 64));
+        for contour in &contours {
             let outline = crate::render::sanitize_display_polyline(contour, 2.0, true);
             if outline.len() >= 3 {
                 painter.add(Shape::Path(PathShape {
@@ -6201,67 +6350,30 @@ fn draw_raw_paths_overlay(
                 }));
             }
         }
-        let min = fill_points
-            .iter()
-            .fold(Pos2::new(f32::INFINITY, f32::INFINITY), |acc, point| {
-                Pos2::new(acc.x.min(point.x), acc.y.min(point.y))
-            });
-        let max = fill_points.iter().fold(
-            Pos2::new(f32::NEG_INFINITY, f32::NEG_INFINITY),
-            |acc, point| Pos2::new(acc.x.max(point.x), acc.y.max(point.y)),
-        );
         if draw_boxes {
-            draw_flash_selection_box(
-                painter,
-                egui::Rect::from_min_max(min, max),
-                selection_color(app),
-            );
+            let points: Vec<Pos2> = contours.iter().flatten().copied().collect();
+            if !points.is_empty() {
+                let min = points
+                    .iter()
+                    .fold(Pos2::new(f32::INFINITY, f32::INFINITY), |acc, point| {
+                        Pos2::new(acc.x.min(point.x), acc.y.min(point.y))
+                    });
+                let max = points.iter().fold(
+                    Pos2::new(f32::NEG_INFINITY, f32::NEG_INFINITY),
+                    |acc, point| Pos2::new(acc.x.max(point.x), acc.y.max(point.y)),
+                );
+                draw_flash_selection_box(
+                    painter,
+                    egui::Rect::from_min_max(min, max),
+                    selection_color(app),
+                );
+            }
         }
     }
 }
 
 fn draw_whole_raw_fill_overlay(app: &EditorApp, painter: &Painter, view: &StageView, r: PathRef) {
-    let Some(path) = raw_path_clone(
-        &app.state.project,
-        r.q0rg_id,
-        r.layer_id,
-        r.placement_idx,
-        r.path_idx,
-    ) else {
-        return;
-    };
-    let points: Vec<Pos2> = flatten_path(&path)
-        .into_iter()
-        .map(|point| stage_to_screen(point, view))
-        .collect();
-    if points.len() < 3 {
-        return;
-    }
-    crate::render::paint_concave_fill(painter, &points, selection_fill_color(app, 64));
-    let outline = crate::render::sanitize_display_polyline(&points, 2.0, path.closed);
-    if outline.len() >= 2 {
-        painter.add(Shape::Path(PathShape {
-            points: outline,
-            closed: path.closed,
-            fill: Color32::TRANSPARENT,
-            stroke: Stroke::new(1.5_f32, selection_color(app)),
-        }));
-    }
-    let min = points
-        .iter()
-        .fold(Pos2::new(f32::INFINITY, f32::INFINITY), |a, p| {
-            Pos2::new(a.x.min(p.x), a.y.min(p.y))
-        });
-    let max = points
-        .iter()
-        .fold(Pos2::new(f32::NEG_INFINITY, f32::NEG_INFINITY), |a, p| {
-            Pos2::new(a.x.max(p.x), a.y.max(p.y))
-        });
-    draw_flash_selection_box(
-        painter,
-        egui::Rect::from_min_max(min, max),
-        selection_color(app),
-    );
+    draw_raw_paths_overlay(app, painter, view, &[r], true);
 }
 
 fn draw_partial_raw_selection(
@@ -7773,6 +7885,152 @@ mod tests {
             selection_at_point_pub(&project, 1, 0, Vec2::new(10.0, 10.0)),
             Some(Selection::Paths(ref refs)) if refs.len() == 1 && refs[0].path_idx == 0
         ));
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    fn appearance_selection_project(mask: bool) -> ProjectV2 {
+        let square = |min_x: f32, min_y: f32, max_x: f32, max_y: f32| VPath {
+            anchors: vec![
+                anchor(Vec2::new(min_x, min_y)),
+                anchor(Vec2::new(max_x, min_y)),
+                anchor(Vec2::new(max_x, max_y)),
+                anchor(Vec2::new(min_x, max_y)),
+            ],
+            closed: true,
+        };
+        let mut appearances = std::collections::HashMap::new();
+        appearances.insert(
+            1,
+            q0s_format::v2::VectorAppearance {
+                material: q0s_format::v2::VectorMaterial::SoftHalo {
+                    radius: 10.0,
+                    opacity: 0.6,
+                },
+                erase_mask: if mask {
+                    vec![square(7.0, 7.0, 13.0, 13.0)]
+                } else {
+                    Vec::new()
+                },
+            },
+        );
+        ProjectV2 {
+            meta: ProjectMeta {
+                name: "appearance-selection".into(),
+                fps: 24,
+                stage_width: 100,
+                stage_height: 100,
+                entry_q0rg_id: 1,
+            },
+            assets: vec![Asset::Vector(VectorAsset {
+                asset_id: 1,
+                paths: vec![square(0.0, 0.0, 20.0, 20.0)],
+                fill: Some(Rgba {
+                    r: 180,
+                    g: 20,
+                    b: 40,
+                    a: 255,
+                }),
+                stroke: None,
+            })],
+            asset_names: std::collections::HashMap::new(),
+            asset_appearances: appearances,
+            layer_metadata: std::collections::HashMap::new(),
+            q0rgs: vec![Q0rg {
+                q0rg_id: 1,
+                name: "Scene".into(),
+                frame_count: 1,
+                script: String::new(),
+                layers: vec![Layer {
+                    layer_id: 1,
+                    name: "Layer".into(),
+                    explicit_keyframes: Vec::new(),
+                    placements: vec![Placement {
+                        frame: 0,
+                        target: Target::Asset(1),
+                        transform: Transform2D::IDENTITY,
+                        tween: Tween::None,
+                    }],
+                }],
+            }],
+        }
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn normal_select_hits_halo_but_not_an_erased_mask_hole() {
+        let project = appearance_selection_project(true);
+        assert!(matches!(
+            hit_test_raw_selection(&project, 1, 0, Vec2::new(-5.0, 10.0)),
+            Some(RawSelectionHit::Fill(ref refs)) if refs.len() == 1 && refs[0].path_idx == 0
+        ));
+        assert_eq!(
+            hit_test_raw_selection(&project, 1, 0, Vec2::new(10.0, 10.0)),
+            None,
+            "pixels removed by the appearance mask must not remain selectable"
+        );
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn raw_selection_bounds_include_soft_halo_support() {
+        let project = appearance_selection_project(false);
+        let bounds = raw_path_refs_bounds(
+            &project,
+            &[PathRef {
+                q0rg_id: 1,
+                layer_id: 1,
+                placement_idx: 0,
+                path_idx: 0,
+            }],
+        )
+        .expect("glowing raw bounds");
+        assert!(
+            bounds.0 <= -9.9,
+            "left halo missing from bounds: {bounds:?}"
+        );
+        assert!(bounds.1 <= -9.9, "top halo missing from bounds: {bounds:?}");
+        assert!(
+            bounds.2 >= 29.9,
+            "right halo missing from bounds: {bounds:?}"
+        );
+        assert!(
+            bounds.3 >= 29.9,
+            "bottom halo missing from bounds: {bounds:?}"
+        );
+
+        let placement = &project.q0rgs[0].layers[0].placements[0];
+        let placement_bounds = placement_bbox(&project, placement).expect("placement bounds");
+        assert!(placement_bounds.0 <= -9.9 && placement_bounds.2 >= 29.9);
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn fully_erased_appearance_has_no_selection_bounds_or_placement_bbox() {
+        let mut project = appearance_selection_project(false);
+        project.asset_appearances.get_mut(&1).unwrap().erase_mask = vec![VPath {
+            anchors: vec![
+                anchor(Vec2::new(-20.0, -20.0)),
+                anchor(Vec2::new(40.0, -20.0)),
+                anchor(Vec2::new(40.0, 40.0)),
+                anchor(Vec2::new(-20.0, 40.0)),
+            ],
+            closed: true,
+        }];
+        let reference = PathRef {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: 0,
+            path_idx: 0,
+        };
+        assert_eq!(raw_path_refs_bounds(&project, &[reference]), None);
+        assert_eq!(
+            placement_bbox(&project, &project.q0rgs[0].layers[0].placements[0]),
+            None
+        );
+        assert_eq!(
+            hit_test_raw_selection(&project, 1, 0, Vec2::new(10.0, 10.0)),
+            None
+        );
     }
 
     #[test]

@@ -342,6 +342,13 @@ fn brush_properties(app: &mut EditorApp, ui: &mut Ui) {
             ui.add(egui::Slider::new(&mut app.session.brush.smoothing, 0..=100));
             ui.end_row();
 
+            #[cfg(feature = "appearance-mask-eraser")]
+            {
+                ui.label("Glow");
+                ui.checkbox(&mut app.session.brush.glow, "");
+                ui.end_row();
+            }
+
             ui.label("Scale with stage");
             ui.checkbox(&mut app.session.brush.scale_with_stage, "");
             ui.end_row();

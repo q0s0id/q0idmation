@@ -27,6 +27,7 @@ pub struct StageView {
     pub stage_rect: Rect,
 }
 
+#[cfg(feature = "appearance-mask-eraser")]
 #[derive(Clone)]
 struct CachedAppearanceTexture {
     texture: TextureHandle,
@@ -41,6 +42,7 @@ pub struct TextureCache {
     by_asset_id: HashMap<u16, TextureHandle>,
     by_q0v_frame: HashMap<(u16, u32), TextureHandle>,
     q0v_media: HashMap<u16, q0video::q0v::Q0vFile>,
+    #[cfg(feature = "appearance-mask-eraser")]
     appearance_by_asset: HashMap<(u16, u16), CachedAppearanceTexture>,
 }
 
@@ -49,6 +51,7 @@ impl TextureCache {
         self.by_asset_id.clear();
         self.by_q0v_frame.clear();
         self.q0v_media.clear();
+        #[cfg(feature = "appearance-mask-eraser")]
         self.appearance_by_asset.clear();
     }
 }
@@ -405,13 +408,23 @@ fn render_asset(
             painter.add(Shape::Mesh(mesh));
         }
         Asset::Vector(v) => {
+            #[cfg(feature = "appearance-mask-eraser")]
             if let Some(appearance) = appearance {
-                if paint_vector_appearance(
+                paint_vector_appearance_halo(
                     painter, v, appearance, transform, view, textures, ctx, tint,
-                ) {
-                    return;
+                );
+                if let Some(fill) = v.fill {
+                    let fill_color = modulate(rgba_to_color32(fill), tint);
+                    let contours = masked_vector_body_contours(v, appearance, transform, view);
+                    paint_complex_fill(painter, &contours, fill_color);
                 }
+                // Appearance metadata is validated only for fill-only vectors.
+                // The body above stays real tessellated vector geometry; only
+                // the soft halo is a filtered texture.
+                return;
             }
+            #[cfg(not(feature = "appearance-mask-eraser"))]
+            let _ = appearance;
             // Multiply the on-disk stroke width by the composed area
             // scale so a 2Р вЂњРІР‚вЂќ scaled q0rg actually renders 2Р вЂњРІР‚вЂќ-thick
             // outlines. Otherwise stroked vectors look comically thin
@@ -869,7 +882,7 @@ pub fn placement_local_bbox(
     match placement.target {
         Target::Asset(id) => {
             let asset = project.assets.iter().find(|a| a.id() == id)?;
-            let pts = asset_local_outline(asset);
+            let pts = asset_local_visual_outline(project, id, asset);
             aabb_of(&pts)
         }
         Target::Q0rg(child_id) => q0rg_local_bbox(project, child_id, Q0RG_RECURSION_LIMIT),
@@ -1053,7 +1066,7 @@ fn placement_bbox_at_depth(
     let pts_local: Vec<Vec2> = match placement.target {
         Target::Asset(id) => {
             let asset = project.assets.iter().find(|a| a.id() == id)?;
-            asset_local_outline(asset)
+            asset_local_visual_outline(project, id, asset)
         }
         Target::Q0rg(child_id) => {
             let (lmin_x, lmin_y, lmax_x, lmax_y) = q0rg_local_bbox(project, child_id, depth - 1)?;
@@ -1121,6 +1134,25 @@ fn q0rg_local_bbox(project: &ProjectV2, q0rg_id: u16, depth: u8) -> Option<(f32,
     } else {
         None
     }
+}
+
+fn asset_local_visual_outline(project: &ProjectV2, asset_id: u16, asset: &Asset) -> Vec<Vec2> {
+    #[cfg(feature = "appearance-mask-eraser")]
+    if project.asset_appearances.contains_key(&asset_id) {
+        return crate::appearance::asset_visible_material_bounds(project, asset_id)
+            .map(|(min_x, min_y, max_x, max_y)| {
+                vec![
+                    Vec2::new(min_x, min_y),
+                    Vec2::new(max_x, min_y),
+                    Vec2::new(max_x, max_y),
+                    Vec2::new(min_x, max_y),
+                ]
+            })
+            .unwrap_or_default();
+    }
+    #[cfg(not(feature = "appearance-mask-eraser"))]
+    let _ = (project, asset_id);
+    asset_local_outline(asset)
 }
 
 fn asset_local_outline(asset: &Asset) -> Vec<Vec2> {
@@ -1246,8 +1278,9 @@ fn lerp_transform(a: Transform2D, b: Transform2D, t: f32) -> Transform2D {
     }
 }
 
+#[cfg(feature = "appearance-mask-eraser")]
 #[allow(clippy::too_many_arguments)]
-fn paint_vector_appearance(
+fn paint_vector_appearance_halo(
     painter: &Painter,
     vector: &q0s_format::v2::VectorAsset,
     appearance: &VectorAppearance,
@@ -1256,21 +1289,21 @@ fn paint_vector_appearance(
     textures: &mut TextureCache,
     ctx: &Context,
     tint: Color32,
-) -> bool {
+) {
     if vector.fill.is_none() || vector.stroke.is_some() {
-        return false;
+        return;
     }
-    let target_ppu = (view.scale * transform.uniform_scale() * 2.0).clamp(1.0, 4.0);
-    let bucket = (target_ppu * 4.0).round().clamp(4.0, 16.0) as u16;
+    let target_ppu = (view.scale * transform.uniform_scale() * 2.0).clamp(1.0, 8.0);
+    let bucket = (target_ppu * 4.0).round().clamp(4.0, 32.0) as u16;
     let ppu = f32::from(bucket) / 4.0;
     let key = (vector.asset_id, bucket);
     let cached = match textures.appearance_by_asset.entry(key) {
         std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
         std::collections::hash_map::Entry::Vacant(entry) => {
             let Some(tile) =
-                q0s_format::raster::rasterize_vector_appearance_local(vector, appearance, ppu)
+                q0s_format::raster::rasterize_vector_halo_local(vector, appearance, ppu)
             else {
-                return false;
+                return;
             };
             let image = ColorImage::from_rgba_unmultiplied(
                 [tile.width as usize, tile.height as usize],
@@ -1320,7 +1353,40 @@ fn paint_vector_appearance(
     }
     mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
     painter.add(Shape::Mesh(mesh));
-    true
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn masked_vector_body_contours(
+    vector: &q0s_format::v2::VectorAsset,
+    appearance: &VectorAppearance,
+    transform: Affine,
+    view: &StageView,
+) -> Vec<Vec<Pos2>> {
+    if appearance.erase_mask.is_empty() {
+        // Preserve the exact normal vector-render path until there is an actual
+        // mask to clip. Merely enabling Glow must never polygonize the artwork.
+        return vector
+            .paths
+            .iter()
+            .filter(|path| path.closed)
+            .map(|path| {
+                flatten_path(path)
+                    .iter()
+                    .map(|point| stage_to_screen(transform.apply(*point), view))
+                    .collect()
+            })
+            .collect();
+    }
+    let visible = crate::appearance::visible_source_surface_for_vector(vector, Some(appearance));
+    crate::brush::coverage_to_paths(&visible)
+        .iter()
+        .map(|path| {
+            flatten_path(path)
+                .iter()
+                .map(|point| stage_to_screen(transform.apply(*point), view))
+                .collect()
+        })
+        .collect()
 }
 
 fn rgba_to_color32(c: Rgba) -> Color32 {

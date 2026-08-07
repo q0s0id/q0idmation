@@ -18,12 +18,14 @@ this branch keeps the classic brush and eraser engine as the only tool path. the
 
 ## appearance and eraser semantics
 
-- soft halo is rendered from a gaussian alpha blur rather than a fixed stack of buffered polygons.
+- classic brush paint is plain vector fill by default. `Glow` is an explicit brush property and is off in old/missing settings too.
+- only the soft halo is rasterized from a gaussian alpha blur; the brush body remains the normal tessellated vector fill in q0editor.
 - source fill alpha and halo alpha are resolved first. the erase mask is multiplied into that final material alpha afterwards.
 - the mask eraser never subtracts from the source vector paths.
 - the mask receives the exact classic eraser-nib coverage clipped to finite visible material support; halo radius is never added to the eraser footprint.
 - regenerating the halo cannot paint back into an erased mask region.
 - appearance metadata belongs to the vector asset inside the project, so undo/redo, save/reopen, nested q0rg rendering, transforms, export and q0player all see the same state.
+- normal Select resolves the visible material surface: erased mask regions are not selectable, while finite glow support participates in hit-testing and bounds. Subselect still exposes only real vector anchors.
 - ordinary assets without appearance metadata continue through the legacy vector renderer and classic geometry eraser.
 
 this remains feature-gated while the visual/material model is being proven, but it is no longer runtime-only state.

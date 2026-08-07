@@ -6,7 +6,7 @@ use geo::{
 };
 use q0s_format::v2::{
     Anchor, Asset, Path as VPath, Placement, ProjectV2, Rgba, Target, Transform2D, Tween, Vec2,
-    VectorAsset,
+    VectorAsset, VectorMaterial,
 };
 
 use crate::app::EditorApp;
@@ -51,6 +51,9 @@ pub struct BrushSettings {
     pub size: f32,
     pub smoothing: u8,
     pub nib: BrushNib,
+    /// Optional soft outer glow material. Classic brush paint is plain vector
+    /// fill by default; glow must be explicitly enabled by the user.
+    pub glow: bool,
     pub scale_with_stage: bool,
     pub sync_with_eraser: bool,
 }
@@ -67,6 +70,7 @@ impl Default for BrushSettings {
             size: 10.0,
             smoothing: 50,
             nib: BrushNib::Circle,
+            glow: false,
             scale_with_stage: true,
             sync_with_eraser: true,
         }
@@ -1052,6 +1056,34 @@ struct RawFillCandidate {
     geometry: MultiPolygon<f64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RawFillStyle {
+    color: Rgba,
+    material: Option<VectorMaterial>,
+}
+
+fn raw_fill_style(project: &ProjectV2, candidate: &RawFillCandidate) -> RawFillStyle {
+    RawFillStyle {
+        color: candidate.color,
+        material: project
+            .asset_appearances
+            .get(&candidate.asset_id)
+            .map(|appearance| appearance.material),
+    }
+}
+
+fn requested_brush_material(settings: BrushSettings) -> Option<VectorMaterial> {
+    #[cfg(feature = "appearance-mask-eraser")]
+    {
+        crate::appearance::brush_material(settings)
+    }
+    #[cfg(not(feature = "appearance-mask-eraser"))]
+    {
+        let _ = settings;
+        None
+    }
+}
+
 pub fn commit_brush_region(
     app: &mut EditorApp,
     region: MultiPolygon<f64>,
@@ -1067,14 +1099,21 @@ pub fn commit_brush_region(
     let candidates = collect_raw_fill_candidates(&app.state.project, q0rg_id, layer_id, frame);
     #[cfg(feature = "appearance-mask-eraser")]
     let freshly_painted = region.clone();
+    let requested_material = requested_brush_material(settings);
+    let requested_style = RawFillStyle {
+        color: settings.color,
+        material: requested_material,
+    };
 
-    // A raw drawing is one planar paint surface, not a stack of overlapping
-    // same-style containers. Existing paint of this colour joins the new
-    // region; every other colour is cut by the resulting painted surface.
+    // A raw drawing is one planar paint surface per visual style. Plain vector
+    // paint and glowing paint of the same colour must stay distinct; otherwise
+    // toggling Glow would silently restyle older artwork.
     let mut painted = region;
-    let mut same_color_assets = BTreeSet::new();
+    let mut same_style_assets = BTreeSet::new();
     for candidate in &candidates {
-        if candidate.color == settings.color && same_color_assets.insert(candidate.asset_id) {
+        if raw_fill_style(&app.state.project, candidate) == requested_style
+            && same_style_assets.insert(candidate.asset_id)
+        {
             painted = painted.union(&candidate.geometry);
         }
     }
@@ -1083,16 +1122,21 @@ pub fn commit_brush_region(
         return;
     }
     #[cfg(feature = "appearance-mask-eraser")]
-    let merged_appearance = crate::appearance::merged_brush_appearance(
-        &app.state.project,
-        &same_color_assets,
-        &freshly_painted,
-    );
+    let merged_appearance = requested_material.map(|material| {
+        crate::appearance::merged_brush_appearance(
+            &app.state.project,
+            &same_style_assets,
+            &freshly_painted,
+            material,
+        )
+    });
 
     let mut different_updates = Vec::new();
     let mut seen_different = BTreeSet::new();
     for candidate in &candidates {
-        if candidate.color != settings.color && seen_different.insert(candidate.asset_id) {
+        if raw_fill_style(&app.state.project, candidate) != requested_style
+            && seen_different.insert(candidate.asset_id)
+        {
             different_updates.push((candidate.asset_id, candidate.geometry.difference(&painted)));
         }
     }
@@ -1116,7 +1160,7 @@ pub fn commit_brush_region(
         frame,
         &seen_different,
     );
-    let mut remove_asset_ids = same_color_assets.clone();
+    let mut remove_asset_ids = same_style_assets.clone();
     for (original_asset_id, geometry) in &different_updates {
         let asset_id = *writable_different
             .get(original_asset_id)
@@ -1157,10 +1201,12 @@ pub fn commit_brush_region(
     let _ = painted_asset_id;
     #[cfg(feature = "appearance-mask-eraser")]
     {
-        app.state
-            .project
-            .asset_appearances
-            .insert(painted_asset_id, merged_appearance);
+        if let Some(appearance) = merged_appearance {
+            app.state
+                .project
+                .asset_appearances
+                .insert(painted_asset_id, appearance);
+        }
         app.textures.invalidate();
     }
 
@@ -1181,22 +1227,24 @@ pub(crate) fn merge_touching_raw_fills_after_edit(
     frame: u16,
 ) -> bool {
     let candidates = collect_raw_fill_candidates(project, q0rg_id, layer_id, frame);
-    let mut groups: Vec<(Rgba, Vec<RawFillCandidate>)> = Vec::new();
+    let mut groups: Vec<(RawFillStyle, Vec<RawFillCandidate>)> = Vec::new();
     for candidate in candidates {
+        let style = raw_fill_style(project, &candidate);
         if let Some((_, items)) = groups
             .iter_mut()
-            .find(|(color, _)| *color == candidate.color)
+            .find(|(candidate_style, _)| *candidate_style == style)
         {
             if !items.iter().any(|item| item.asset_id == candidate.asset_id) {
                 items.push(candidate);
             }
         } else {
-            groups.push((candidate.color, vec![candidate]));
+            groups.push((style, vec![candidate]));
         }
     }
 
     let mut updates = Vec::new();
-    for (color, items) in groups {
+    for (style, items) in groups {
+        let color = style.color;
         let source_surfaces: Vec<MultiPolygon<f64>> = items
             .iter()
             .flat_map(|item| item.source_surfaces.iter().cloned())
@@ -1220,16 +1268,31 @@ pub(crate) fn merge_touching_raw_fills_after_edit(
         {
             continue;
         }
-        updates.push((color, asset_ids, paths));
+        updates.push((style, asset_ids, paths));
     }
     if updates.is_empty() {
         return false;
     }
 
-    for (color, asset_ids, paths) in updates {
+    for (style, asset_ids, paths) in updates {
+        #[cfg(feature = "appearance-mask-eraser")]
+        let merged_appearance = style.material.map(|material| {
+            crate::appearance::merged_brush_appearance(
+                project,
+                &asset_ids,
+                &MultiPolygon(Vec::new()),
+                material,
+            )
+        });
         remove_current_layer_asset_placements(project, q0rg_id, layer_id, frame, &asset_ids);
         remove_unreferenced_assets(project, &asset_ids);
-        append_raw_fill(project, q0rg_id, layer_id, frame, color, paths);
+        let new_asset_id = append_raw_fill(project, q0rg_id, layer_id, frame, style.color, paths);
+        #[cfg(not(feature = "appearance-mask-eraser"))]
+        let _ = new_asset_id;
+        #[cfg(feature = "appearance-mask-eraser")]
+        if let Some(appearance) = merged_appearance {
+            project.asset_appearances.insert(new_asset_id, appearance);
+        }
     }
     true
 }
@@ -2511,6 +2574,53 @@ mod tests {
             coverage_to_paths(&brush_finish(first, settings)),
             coverage_to_paths(&brush_finish(second, settings))
         );
+    }
+
+    #[test]
+    fn classic_brush_is_plain_vector_by_default_and_glow_is_opt_in() {
+        let mut plain_app = EditorApp::default();
+        let plain = settings(16.0, 0);
+        assert!(!plain.glow);
+        let plain_stroke = stroke(&[Vec2::new(10.0, 10.0), Vec2::new(40.0, 10.0)], plain);
+        commit_brush_region(&mut plain_app, brush_finish(plain_stroke, plain), plain);
+        assert!(plain_app.state.project.asset_appearances.is_empty());
+
+        let mut glow_app = EditorApp::default();
+        let glow = BrushSettings {
+            glow: true,
+            ..settings(16.0, 0)
+        };
+        let glow_stroke = stroke(&[Vec2::new(10.0, 10.0), Vec2::new(40.0, 10.0)], glow);
+        commit_brush_region(&mut glow_app, brush_finish(glow_stroke, glow), glow);
+        assert_eq!(glow_app.state.project.asset_appearances.len(), 1);
+        let appearance = glow_app
+            .state
+            .project
+            .asset_appearances
+            .values()
+            .next()
+            .unwrap();
+        assert!(matches!(
+            appearance.material,
+            VectorMaterial::SoftHalo { .. }
+        ));
+    }
+
+    #[test]
+    fn plain_and_glowing_paint_of_same_colour_remain_distinct_styles() {
+        let mut app = EditorApp::default();
+        let plain = settings(12.0, 0);
+        let glow = BrushSettings {
+            glow: true,
+            ..plain
+        };
+        let left = stroke(&[Vec2::new(10.0, 20.0), Vec2::new(30.0, 20.0)], plain);
+        commit_brush_region(&mut app, brush_finish(left, plain), plain);
+        let right = stroke(&[Vec2::new(50.0, 20.0), Vec2::new(70.0, 20.0)], glow);
+        commit_brush_region(&mut app, brush_finish(right, glow), glow);
+
+        assert_eq!(app.state.project.assets.len(), 2);
+        assert_eq!(app.state.project.asset_appearances.len(), 1);
     }
 
     #[test]

@@ -722,6 +722,7 @@ pub struct BrushPreferences {
     pub size: PersistBrushSize,
     pub smoothing: u8,
     pub nib: PersistBrushNib,
+    pub glow: bool,
     pub scale_with_stage: bool,
     pub sync_with_eraser: bool,
 }
@@ -746,6 +747,7 @@ impl BrushPreferences {
                 BrushNib::Slash => PersistBrushNib::Slash,
                 BrushNib::Backslash => PersistBrushNib::Backslash,
             },
+            glow: settings.glow,
             scale_with_stage: settings.scale_with_stage,
             sync_with_eraser: settings.sync_with_eraser,
         }
@@ -769,6 +771,7 @@ impl BrushPreferences {
                 PersistBrushNib::Slash => BrushNib::Slash,
                 PersistBrushNib::Backslash => BrushNib::Backslash,
             },
+            glow: self.glow,
             scale_with_stage: self.scale_with_stage,
             sync_with_eraser: self.sync_with_eraser,
         }
@@ -1033,6 +1036,7 @@ mod tests {
             size: 27.5,
             smoothing: 83,
             nib: BrushNib::Backslash,
+            glow: true,
             scale_with_stage: false,
             sync_with_eraser: false,
         };
@@ -1041,6 +1045,13 @@ mod tests {
         let decoded: BrushPreferences =
             serde_json::from_str(&encoded).expect("deserialize brush settings");
         assert_eq!(decoded.to_runtime(), runtime);
+        assert!(decoded.to_runtime().glow);
+
+        let legacy_without_glow: BrushPreferences = serde_json::from_str(
+            r#"{"color":{"r":1,"g":2,"b":3,"a":255},"size":10.0,"smoothing":50,"nib":"Circle","scale_with_stage":true,"sync_with_eraser":true}"#,
+        )
+        .expect("old brush settings without glow");
+        assert!(!legacy_without_glow.to_runtime().glow);
 
         for nib in BrushNib::ALL {
             let runtime = BrushSettings { nib, ..runtime };

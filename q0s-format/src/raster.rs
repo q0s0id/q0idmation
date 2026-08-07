@@ -357,6 +357,26 @@ pub fn rasterize_vector_appearance_local(
     appearance: &VectorAppearance,
     pixels_per_unit: f32,
 ) -> Option<RasterizedVectorAppearance> {
+    rasterize_vector_appearance_local_impl(vector, appearance, pixels_per_unit, true)
+}
+
+/// Rasterize only the soft material outside the vector body. q0editor draws
+/// this layer underneath a real tessellated vector fill, so zooming never
+/// turns the actual artwork into a bitmap.
+pub fn rasterize_vector_halo_local(
+    vector: &VectorAsset,
+    appearance: &VectorAppearance,
+    pixels_per_unit: f32,
+) -> Option<RasterizedVectorAppearance> {
+    rasterize_vector_appearance_local_impl(vector, appearance, pixels_per_unit, false)
+}
+
+fn rasterize_vector_appearance_local_impl(
+    vector: &VectorAsset,
+    appearance: &VectorAppearance,
+    pixels_per_unit: f32,
+    include_base: bool,
+) -> Option<RasterizedVectorAppearance> {
     let fill = vector.fill?;
     let pixels_per_unit = pixels_per_unit.clamp(0.5, 8.0);
     let mut min_x = f32::INFINITY;
@@ -425,10 +445,16 @@ pub fn rasterize_vector_appearance_local(
     let source_alpha: Vec<u8> = source_rgba.chunks_exact(4).map(|pixel| pixel[3]).collect();
 
     let material_alpha = match appearance.material {
-        VectorMaterial::Solid => source_alpha
-            .iter()
-            .map(|alpha| ((u16::from(*alpha) * u16::from(fill.a) + 127) / 255) as u8)
-            .collect::<Vec<_>>(),
+        VectorMaterial::Solid => {
+            if include_base {
+                source_alpha
+                    .iter()
+                    .map(|alpha| ((u16::from(*alpha) * u16::from(fill.a) + 127) / 255) as u8)
+                    .collect::<Vec<_>>()
+            } else {
+                vec![0; source_alpha.len()]
+            }
+        }
         VectorMaterial::SoftHalo { radius, opacity } => {
             let blurred =
                 gaussian_blur_alpha(&source_alpha, width, height, radius * pixels_per_unit);
@@ -438,7 +464,13 @@ pub fn rasterize_vector_appearance_local(
                 .map(|(source, blur)| {
                     let base = (f32::from(*source) * f32::from(fill.a) / 255.0).round();
                     let halo = f32::from(blur) * f32::from(fill.a) / 255.0 * opacity;
-                    base.max(halo).clamp(0.0, 255.0).round() as u8
+                    if include_base {
+                        base.max(halo).clamp(0.0, 255.0).round() as u8
+                    } else if *source == 0 {
+                        halo.clamp(0.0, 255.0).round() as u8
+                    } else {
+                        0
+                    }
                 })
                 .collect::<Vec<_>>()
         }
@@ -1028,6 +1060,38 @@ mod resolver_tests {
         for pixel in tile.rgba.chunks_exact(4).filter(|pixel| pixel[3] > 0) {
             assert_eq!(&pixel[..3], &[fill.r, fill.g, fill.b]);
         }
+    }
+
+    #[test]
+    fn halo_only_raster_never_contains_the_vector_body() {
+        let vector = VectorAsset {
+            asset_id: 1,
+            paths: vec![rectangle_path(0.0, 0.0, 20.0, 20.0)],
+            fill: Some(Rgba {
+                r: 240,
+                g: 80,
+                b: 30,
+                a: 255,
+            }),
+            stroke: None,
+        };
+        let appearance = VectorAppearance {
+            material: VectorMaterial::SoftHalo {
+                radius: 10.0,
+                opacity: 0.7,
+            },
+            erase_mask: Vec::new(),
+        };
+        let tile = rasterize_vector_halo_local(&vector, &appearance, 4.0).expect("halo tile");
+        assert_eq!(
+            appearance_pixel(&tile, Vec2::new(10.0, 10.0))[3],
+            0,
+            "the editor halo texture must never bitmap the vector body"
+        );
+        assert!(
+            appearance_pixel(&tile, Vec2::new(-2.0, 10.0))[3] > 0,
+            "soft material must remain visible outside the source fill"
+        );
     }
 
     #[test]
