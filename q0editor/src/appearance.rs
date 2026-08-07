@@ -18,6 +18,8 @@ pub fn default_brush_appearance() -> VectorAppearance {
             opacity: DEFAULT_HALO_OPACITY,
         },
         erase_mask: Vec::new(),
+        material_source: Vec::new(),
+        clip_mask: Vec::new(),
     }
 }
 
@@ -53,6 +55,8 @@ pub(crate) fn merged_brush_appearance(
     VectorAppearance {
         material,
         erase_mask: crate::brush::coverage_to_paths(&mask),
+        material_source: Vec::new(),
+        clip_mask: Vec::new(),
     }
 }
 
@@ -66,69 +70,82 @@ pub(crate) fn split_asset_appearance(
     project: &mut ProjectV2,
     source_asset_id: u16,
     selected_asset_id: u16,
+    original_paths: &[VPath],
+    partition_region: &MultiPolygon<f64>,
+    source_empty: bool,
 ) {
     let Some(original) = project.asset_appearances.get(&source_asset_id).cloned() else {
         return;
     };
-    let old_mask = mask_paths_to_coverage(&original.erase_mask);
-    let source_support = project
-        .assets
-        .iter()
-        .find(|asset| asset.id() == source_asset_id)
-        .and_then(|asset| match asset {
-            Asset::Vector(vector) if vector.fill.is_some() && vector.stroke.is_none() => {
-                Some(material_support(
-                    &crate::brush::vector_fill_geometry(vector),
-                    original.material,
-                ))
-            }
-            _ => None,
-        });
-    let selected_support = project
-        .assets
-        .iter()
-        .find(|asset| asset.id() == selected_asset_id)
-        .and_then(|asset| match asset {
-            Asset::Vector(vector) if vector.fill.is_some() && vector.stroke.is_none() => {
-                Some(material_support(
-                    &crate::brush::vector_fill_geometry(vector),
-                    original.material,
-                ))
-            }
-            _ => None,
-        });
-
-    if let Some(selected_support) = selected_support {
-        let selected_mask = if old_mask.0.is_empty() {
-            MultiPolygon(Vec::new())
-        } else {
-            old_mask.intersection(&selected_support)
-        };
-        project.asset_appearances.insert(
-            selected_asset_id,
-            VectorAppearance {
-                material: original.material,
-                erase_mask: crate::brush::coverage_to_paths(&selected_mask),
-            },
-        );
+    if source_empty {
+        project
+            .asset_appearances
+            .insert(selected_asset_id, original);
+        return;
     }
-    if let Some(source_support) = source_support {
-        let source_mask = if old_mask.0.is_empty() {
-            MultiPolygon(Vec::new())
-        } else {
-            old_mask.intersection(&source_support)
-        };
-        project.asset_appearances.insert(
-            source_asset_id,
-            VectorAppearance {
-                material: original.material,
-                erase_mask: crate::brush::coverage_to_paths(&source_mask),
-            },
-        );
+
+    let material_source = if original.material_source.is_empty() {
+        original_paths.to_vec()
+    } else {
+        original.material_source.clone()
+    };
+    let material_geometry = paths_to_coverage(&material_source);
+    if material_geometry.0.is_empty() {
+        return;
+    }
+    let full_support = material_support(&material_geometry, original.material);
+    let old_clip = if original.clip_mask.is_empty() {
+        full_support
+    } else {
+        mask_paths_to_coverage(&original.clip_mask)
+    };
+    let selected_clip = old_clip.intersection(partition_region);
+    let source_clip = old_clip.difference(partition_region);
+
+    let make = |clip: MultiPolygon<f64>| VectorAppearance {
+        material: original.material,
+        erase_mask: original.erase_mask.clone(),
+        material_source: material_source.clone(),
+        clip_mask: crate::brush::coverage_to_paths(&clip),
+    };
+    project
+        .asset_appearances
+        .insert(selected_asset_id, make(selected_clip));
+    project
+        .asset_appearances
+        .insert(source_asset_id, make(source_clip));
+}
+
+pub(crate) fn transform_appearance(
+    appearance: &VectorAppearance,
+    map: impl Fn(q0s_format::v2::Vec2) -> q0s_format::v2::Vec2 + Copy,
+) -> VectorAppearance {
+    fn map_paths(
+        paths: &[VPath],
+        map: impl Fn(q0s_format::v2::Vec2) -> q0s_format::v2::Vec2 + Copy,
+    ) -> Vec<VPath> {
+        paths
+            .iter()
+            .cloned()
+            .map(|mut path| {
+                for anchor in &mut path.anchors {
+                    anchor.point = map(anchor.point);
+                    anchor.in_handle = anchor.in_handle.map(map);
+                    anchor.out_handle = anchor.out_handle.map(map);
+                }
+                path
+            })
+            .collect()
+    }
+    VectorAppearance {
+        material: appearance.material,
+        erase_mask: map_paths(&appearance.erase_mask, map),
+        material_source: map_paths(&appearance.material_source, map),
+        clip_mask: map_paths(&appearance.clip_mask, map),
     }
 }
 
-pub(crate) fn mask_paths_to_coverage(paths: &[VPath]) -> MultiPolygon<f64> {
+pub(crate) fn paths_to_coverage(paths: &[VPath]) -> MultiPolygon<f64> {
     if paths.is_empty() {
         return MultiPolygon(Vec::new());
     }
@@ -145,6 +162,10 @@ pub(crate) fn mask_paths_to_coverage(paths: &[VPath]) -> MultiPolygon<f64> {
     })
 }
 
+pub(crate) fn mask_paths_to_coverage(paths: &[VPath]) -> MultiPolygon<f64> {
+    paths_to_coverage(paths)
+}
+
 pub(crate) fn material_support(
     source: &MultiPolygon<f64>,
     material: VectorMaterial,
@@ -157,6 +178,28 @@ pub(crate) fn material_support(
 
 /// Opaque/vector body that is still visible after the non-destructive erase
 /// mask. This is what the editor tessellates as real vector geometry.
+pub(crate) fn material_source_surface(
+    vector: &VectorAsset,
+    appearance: &VectorAppearance,
+) -> MultiPolygon<f64> {
+    if appearance.material_source.is_empty() {
+        crate::brush::vector_fill_geometry(vector)
+    } else {
+        paths_to_coverage(&appearance.material_source)
+    }
+}
+
+fn clip_surface(surface: MultiPolygon<f64>, appearance: &VectorAppearance) -> MultiPolygon<f64> {
+    if appearance.clip_mask.is_empty() {
+        surface
+    } else {
+        surface.intersection(&mask_paths_to_coverage(&appearance.clip_mask))
+    }
+}
+
+/// Opaque/vector body that is still visible after the post-material fragment
+/// clip and the non-destructive erase mask. The body itself remains real vector
+/// geometry; the frozen material source is used only by the filter layer.
 pub(crate) fn visible_source_surface_for_vector(
     vector: &VectorAsset,
     appearance: Option<&VectorAppearance>,
@@ -165,32 +208,33 @@ pub(crate) fn visible_source_surface_for_vector(
     let Some(appearance) = appearance else {
         return source;
     };
+    let clipped = clip_surface(source, appearance);
     let mask = mask_paths_to_coverage(&appearance.erase_mask);
     if mask.0.is_empty() {
-        source
+        clipped
     } else {
-        source.difference(&mask)
+        clipped.difference(&mask)
     }
 }
 
-/// Full selectable visual support: vector body plus the finite halo support,
-/// with erased areas removed. This intentionally uses the material's finite
-/// support radius rather than the source path bbox so glow is real graphics to
-/// hit-testing, selection and transform bounds.
+/// Full selectable visual support. Split fragments keep a frozen material
+/// source and a post-material clip, so moving a cut piece carries the exact
+/// resolved slice instead of generating a fresh glow along the cut edge.
 pub(crate) fn visible_material_surface_for_vector(
     vector: &VectorAsset,
     appearance: Option<&VectorAppearance>,
 ) -> MultiPolygon<f64> {
-    let source = crate::brush::vector_fill_geometry(vector);
     let Some(appearance) = appearance else {
-        return source;
+        return crate::brush::vector_fill_geometry(vector);
     };
-    let support = material_support(&source, appearance.material);
+    let material_source = material_source_surface(vector, appearance);
+    let support = material_support(&material_source, appearance.material);
+    let clipped = clip_surface(support, appearance);
     let mask = mask_paths_to_coverage(&appearance.erase_mask);
     if mask.0.is_empty() {
-        support
+        clipped
     } else {
-        support.difference(&mask)
+        clipped.difference(&mask)
     }
 }
 
@@ -208,7 +252,12 @@ pub(crate) fn visible_material_surface_for_paths(
         fill: vector.fill,
         stroke: None,
     };
-    visible_material_surface_for_vector(&subset, appearance)
+    let subset_source = crate::brush::vector_fill_geometry(&subset);
+    let Some(appearance) = appearance else {
+        return subset_source;
+    };
+    let subset_support = material_support(&subset_source, appearance.material);
+    visible_material_surface_for_vector(vector, Some(appearance)).intersection(&subset_support)
 }
 
 pub(crate) fn asset_visible_material_bounds(
@@ -279,17 +328,7 @@ pub fn erase_visible_region(app: &mut EditorApp, region: MultiPolygon<f64>) -> b
         if vector.fill.is_none() || vector.stroke.is_some() {
             continue;
         }
-        let source = crate::brush::vector_fill_geometry(vector);
-        if source.0.is_empty() {
-            continue;
-        }
-        let support = material_support(&source, appearance.material);
-        let old_mask = mask_paths_to_coverage(&appearance.erase_mask);
-        let visible_support = if old_mask.0.is_empty() {
-            support
-        } else {
-            support.difference(&old_mask)
-        };
+        let visible_support = visible_material_surface_for_vector(vector, Some(appearance));
         if !visible_support.intersection(&region).0.is_empty() {
             hit_asset_ids.insert(asset_id);
         }
@@ -335,8 +374,7 @@ pub fn erase_visible_region(app: &mut EditorApp, region: MultiPolygon<f64>) -> b
         else {
             continue;
         };
-        let source = crate::brush::vector_fill_geometry(vector);
-        let support = material_support(&source, appearance.material);
+        let support = visible_material_surface_for_vector(vector, Some(&appearance));
         let visible_cut = support.intersection(&region);
         if visible_cut.0.is_empty() {
             continue;
@@ -425,6 +463,8 @@ mod tests {
                     opacity: 0.5,
                 },
                 erase_mask: Vec::new(),
+                material_source: Vec::new(),
+                clip_mask: Vec::new(),
             },
         );
         app.state.project.q0rgs[0].layers[0]
@@ -436,6 +476,76 @@ mod tests {
                 tween: Tween::None,
             });
         app
+    }
+
+    #[test]
+    fn splitting_glowing_fill_partitions_original_material_instead_of_reblurring_fragments() {
+        let mut app = app_with_appearance();
+        let original_paths = match &app.state.project.assets[0] {
+            Asset::Vector(vector) => vector.paths.clone(),
+            _ => unreachable!(),
+        };
+        let original_vector = match &app.state.project.assets[0] {
+            Asset::Vector(vector) => vector.clone(),
+            _ => unreachable!(),
+        };
+        let original_appearance = app.state.project.asset_appearances[&1].clone();
+        let original_visible =
+            visible_material_surface_for_vector(&original_vector, Some(&original_appearance));
+
+        let left_path = square_path(0.0, 0.0, 5.0, 10.0);
+        let right_path = square_path(5.0, 0.0, 10.0, 10.0);
+        if let Asset::Vector(vector) = &mut app.state.project.assets[0] {
+            vector.paths = vec![left_path];
+        }
+        app.state.project.assets.push(Asset::Vector(VectorAsset {
+            asset_id: 2,
+            paths: vec![right_path],
+            fill: original_vector.fill,
+            stroke: None,
+        }));
+        let partition = rect_region(5.0, -20.0, 30.0, 30.0);
+        split_asset_appearance(
+            &mut app.state.project,
+            1,
+            2,
+            &original_paths,
+            &partition,
+            false,
+        );
+
+        let left_appearance = &app.state.project.asset_appearances[&1];
+        let right_appearance = &app.state.project.asset_appearances[&2];
+        assert_eq!(left_appearance.material_source, original_paths);
+        assert_eq!(right_appearance.material_source, original_paths);
+        let left_vector = match &app.state.project.assets[0] {
+            Asset::Vector(vector) => vector,
+            _ => unreachable!(),
+        };
+        let right_vector = match &app.state.project.assets[1] {
+            Asset::Vector(vector) => vector,
+            _ => unreachable!(),
+        };
+        let left_visible = visible_material_surface_for_vector(left_vector, Some(left_appearance));
+        let right_visible =
+            visible_material_surface_for_vector(right_vector, Some(right_appearance));
+        let reconstructed = left_visible.union(&right_visible);
+        assert!(
+            original_visible
+                .difference(&reconstructed)
+                .union(&reconstructed.difference(&original_visible))
+                .unsigned_area()
+                < 0.05,
+            "post-material fragments must reconstruct the pre-split appearance field"
+        );
+        assert!(left_visible.intersection(&right_visible).unsigned_area() < 0.05);
+        let right_bounds = right_visible
+            .bounding_rect()
+            .expect("right fragment bounds");
+        assert!(
+            right_bounds.min().x >= 4.95,
+            "right fragment must not generate a new halo across the cut edge: {right_bounds:?}"
+        );
     }
 
     #[test]

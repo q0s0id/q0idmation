@@ -4,7 +4,7 @@
 //!
 //!   Header:
 //!     [4]   magic "Q1S\0"
-//!     [2]   version = 2 (legacy) | 3 (skew) | 4 (blank keyframes) | 5 (asset names) | 6 (layer folders) | 7 (q0v assets) | 8 (easing) | 9 (vector appearance masks)
+//!     [2]   version = 2 (legacy) | 3 (skew) | 4 (blank keyframes) | 5 (asset names) | 6 (layer folders) | 7 (q0v assets) | 8 (easing) | 9 (vector appearance masks) | 10 (post-material appearance fragments)
 //!     [2]   flags (reserved = 0)
 //!     [2]   asset_count
 //!     [2]   q0rg_count
@@ -29,12 +29,14 @@
 //!     [2] q0rg_id, [2] layer_id, [1] kind, [1] parent flag, [2 if present] parent id, [1] collapsed
 //!   v9 vector appearance metadata: [2] entry_count, then entries:
 //!     [2] asset_id, [1] material kind, material payload, [2] erase path count, erase paths[]
+//!   v10 post-material fragments append per appearance:
+//!     [2] material source path count, source paths[], [2] clip path count, clip paths[]
 //!
-//! Reading: v2 through v9 are accepted; v2 placements get skew_x/y = 0,
+//! Reading: v2 through v10 are accepted; v2 placements get skew_x/y = 0,
 //! v2/v3 layers get no explicit blank-keyframe markers, v2-v4 assets
 //! keep deterministic default labels, and v2-v5 projects have ordinary
 //! top-level layers without folders.
-//! Writing: always v9 (see `Q1S_VERSION_CURRENT`).
+//! Writing: always v10 (see `Q1S_VERSION_CURRENT`).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -50,7 +52,8 @@ pub const Q1S_VERSION_LAYER_FOLDERS: u16 = 6;
 pub const Q1S_VERSION_Q0V_ASSETS: u16 = 7;
 pub const Q1S_VERSION_EASING: u16 = 8;
 pub const Q1S_VERSION_APPEARANCE_MASKS: u16 = 9;
-pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_APPEARANCE_MASKS;
+pub const Q1S_VERSION_APPEARANCE_FRAGMENTS: u16 = 10;
+pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_APPEARANCE_FRAGMENTS;
 /// Kept as an alias so external code that imported the v2-era constant keeps
 /// compiling. It now means "the current write-out version".
 pub const Q1S_V2_VERSION: u16 = Q1S_VERSION_CURRENT;
@@ -162,11 +165,16 @@ pub enum VectorMaterial {
 
 /// Sparse per-vector appearance state. `erase_mask` is expressed in the
 /// vector asset's local coordinates and is applied after material evaluation.
-/// Moving/scaling/nesting the asset therefore moves the mask with the artwork.
+/// `material_source` freezes the pre-split source used by filters, while
+/// `clip_mask` partitions that resolved appearance after the filter. Empty
+/// source/clip vectors preserve the legacy behaviour: current vector geometry
+/// is the material source and the whole finite material support is visible.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VectorAppearance {
     pub material: VectorMaterial,
     pub erase_mask: Vec<Path>,
+    pub material_source: Vec<Path>,
+    pub clip_mask: Vec<Path>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -783,23 +791,27 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
                 }
             }
         }
-        for path in &appearance.erase_mask {
-            if !path.closed || path.anchors.len() < 3 {
-                return Err(Error::Validation(
-                    "appearance erase mask paths must be closed with >= 3 anchors",
-                ));
-            }
-            for anchor in &path.anchors {
-                if !anchor.point.is_finite()
-                    || anchor
-                        .in_handle
-                        .into_iter()
-                        .chain(anchor.out_handle)
-                        .any(|handle| !handle.is_finite())
-                {
+        for paths in [
+            &appearance.erase_mask,
+            &appearance.material_source,
+            &appearance.clip_mask,
+        ] {
+            for path in paths {
+                if !path.closed || path.anchors.len() < 3 {
                     return Err(Error::Validation(
-                        "appearance erase mask anchors must be finite",
+                        "appearance paths must be closed with >= 3 anchors",
                     ));
+                }
+                for anchor in &path.anchors {
+                    if !anchor.point.is_finite()
+                        || anchor
+                            .in_handle
+                            .into_iter()
+                            .chain(anchor.out_handle)
+                            .any(|handle| !handle.is_finite())
+                    {
+                        return Err(Error::Validation("appearance anchors must be finite"));
+                    }
                 }
             }
         }
@@ -1049,6 +1061,7 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
         && version != Q1S_VERSION_LAYER_FOLDERS
         && version != Q1S_VERSION_Q0V_ASSETS
         && version != Q1S_VERSION_EASING
+        && version != Q1S_VERSION_APPEARANCE_MASKS
         && version != Q1S_VERSION_CURRENT
     {
         return Err(Error::UnsupportedVersion(version));
@@ -1087,6 +1100,15 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
     if version < Q1S_VERSION_APPEARANCE_MASKS && !project.asset_appearances.is_empty() {
         return Err(Error::Validation(
             "legacy q1s versions cannot store vector appearance masks",
+        ));
+    }
+    if version < Q1S_VERSION_APPEARANCE_FRAGMENTS
+        && project.asset_appearances.values().any(|appearance| {
+            !appearance.material_source.is_empty() || !appearance.clip_mask.is_empty()
+        })
+    {
+        return Err(Error::Validation(
+            "q1s v9 cannot store post-material appearance fragments",
         ));
     }
 
@@ -1183,6 +1205,22 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
             out.extend_from_slice(&path_count.to_le_bytes());
             for path in &appearance.erase_mask {
                 write_mask_path(&mut out, path)?;
+            }
+            if version >= Q1S_VERSION_APPEARANCE_FRAGMENTS {
+                let source_count =
+                    u16::try_from(appearance.material_source.len()).map_err(|_| {
+                        Error::Overflow("appearance material source path count exceeds u16")
+                    })?;
+                out.extend_from_slice(&source_count.to_le_bytes());
+                for path in &appearance.material_source {
+                    write_mask_path(&mut out, path)?;
+                }
+                let clip_count = u16::try_from(appearance.clip_mask.len())
+                    .map_err(|_| Error::Overflow("appearance clip path count exceeds u16"))?;
+                out.extend_from_slice(&clip_count.to_le_bytes());
+                for path in &appearance.clip_mask {
+                    write_mask_path(&mut out, path)?;
+                }
             }
         }
     }
@@ -1405,6 +1443,7 @@ pub fn parse(bytes: &[u8]) -> Result<ProjectV2, Error> {
         && version != Q1S_VERSION_LAYER_FOLDERS
         && version != Q1S_VERSION_Q0V_ASSETS
         && version != Q1S_VERSION_EASING
+        && version != Q1S_VERSION_APPEARANCE_MASKS
         && version != Q1S_VERSION_CURRENT
     {
         return Err(Error::UnsupportedVersion(version));
@@ -1506,12 +1545,29 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
             for _ in 0..path_count {
                 erase_mask.push(read_mask_path(&mut c)?);
             }
+            let (material_source, clip_mask) = if version >= Q1S_VERSION_APPEARANCE_FRAGMENTS {
+                let source_count = c.read_u16()?;
+                let mut source = Vec::with_capacity(usize::from(source_count));
+                for _ in 0..source_count {
+                    source.push(read_mask_path(&mut c)?);
+                }
+                let clip_count = c.read_u16()?;
+                let mut clip = Vec::with_capacity(usize::from(clip_count));
+                for _ in 0..clip_count {
+                    clip.push(read_mask_path(&mut c)?);
+                }
+                (source, clip)
+            } else {
+                (Vec::new(), Vec::new())
+            };
             if asset_appearances
                 .insert(
                     asset_id,
                     VectorAppearance {
                         material,
                         erase_mask,
+                        material_source,
+                        clip_mask,
                     },
                 )
                 .is_some()
@@ -2140,6 +2196,8 @@ mod compatibility_tests {
                         },
                     ],
                 }],
+                material_source: Vec::new(),
+                clip_mask: Vec::new(),
             },
         );
         project
@@ -2151,11 +2209,117 @@ mod compatibility_tests {
         let bytes = write(&project).expect("write appearance q1s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q1S_VERSION_APPEARANCE_MASKS
+            Q1S_VERSION_CURRENT
         );
         let parsed = parse(&bytes).expect("parse appearance q1s");
         assert_eq!(parsed, project);
         assert_eq!(parsed.asset_appearances[&1], project.asset_appearances[&1]);
+    }
+
+    #[test]
+    fn q1s_v9_appearance_without_fragments_remains_readable() {
+        let project = appearance_project();
+        let bytes = write_version(&project, Q1S_VERSION_APPEARANCE_MASKS)
+            .expect("write q1s v9 appearance fixture");
+        let parsed = parse(&bytes).expect("parse q1s v9 appearance fixture");
+        assert_eq!(parsed, project);
+        assert!(parsed.asset_appearances[&1].material_source.is_empty());
+        assert!(parsed.asset_appearances[&1].clip_mask.is_empty());
+    }
+
+    #[test]
+    fn current_q1s_roundtrip_preserves_post_material_fragments() {
+        let mut project = appearance_project();
+        let source = match &project.assets[0] {
+            Asset::Vector(vector) => vector.paths.clone(),
+            _ => unreachable!(),
+        };
+        let appearance = project.asset_appearances.get_mut(&1).unwrap();
+        appearance.material_source = source;
+        appearance.clip_mask = vec![Path {
+            closed: true,
+            anchors: vec![
+                Anchor {
+                    point: Vec2::new(10.0, -10.0),
+                    in_handle: None,
+                    out_handle: None,
+                },
+                Anchor {
+                    point: Vec2::new(30.0, -10.0),
+                    in_handle: None,
+                    out_handle: None,
+                },
+                Anchor {
+                    point: Vec2::new(30.0, 30.0),
+                    in_handle: None,
+                    out_handle: None,
+                },
+                Anchor {
+                    point: Vec2::new(10.0, 30.0),
+                    in_handle: None,
+                    out_handle: None,
+                },
+            ],
+        }];
+        let bytes = write(&project).expect("write q1s v10 fragments");
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            Q1S_VERSION_APPEARANCE_FRAGMENTS
+        );
+        assert_eq!(parse(&bytes).expect("parse q1s v10 fragments"), project);
+    }
+
+    #[test]
+    fn q1s_v9_writer_rejects_post_material_fragments_instead_of_dropping_them() {
+        let mut project = appearance_project();
+        project
+            .asset_appearances
+            .get_mut(&1)
+            .unwrap()
+            .material_source = match &project.assets[0] {
+            Asset::Vector(vector) => vector.paths.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            write_version(&project, Q1S_VERSION_APPEARANCE_MASKS)
+                .expect_err("q1s v9 cannot store appearance fragments"),
+            Error::Validation("q1s v9 cannot store post-material appearance fragments")
+        );
+    }
+
+    #[test]
+    fn validation_rejects_invalid_post_material_fragment_paths() {
+        let mut project = appearance_project();
+        let source = match &project.assets[0] {
+            Asset::Vector(vector) => vector.paths.clone(),
+            _ => unreachable!(),
+        };
+        project
+            .asset_appearances
+            .get_mut(&1)
+            .unwrap()
+            .material_source = source.clone();
+        project
+            .asset_appearances
+            .get_mut(&1)
+            .unwrap()
+            .material_source[0]
+            .anchors[0]
+            .point
+            .x = f32::NAN;
+        assert_eq!(
+            validate(&project).expect_err("non-finite material source must fail"),
+            Error::Validation("appearance anchors must be finite")
+        );
+
+        let mut project = appearance_project();
+        let mut clip = source[0].clone();
+        clip.closed = false;
+        project.asset_appearances.get_mut(&1).unwrap().clip_mask = vec![clip];
+        assert_eq!(
+            validate(&project).expect_err("open post-material clip must fail"),
+            Error::Validation("appearance paths must be closed with >= 3 anchors")
+        );
     }
 
     #[test]

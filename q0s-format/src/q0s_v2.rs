@@ -25,7 +25,8 @@ pub const Q0S_VERSION_LAYER_FOLDERS: u16 = 5;
 pub const Q0S_VERSION_Q0V_ASSETS: u16 = 6;
 pub const Q0S_VERSION_EASING: u16 = 7;
 pub const Q0S_VERSION_APPEARANCE_MASKS: u16 = 8;
-pub const Q0S_VERSION_CURRENT: u16 = Q0S_VERSION_APPEARANCE_MASKS;
+pub const Q0S_VERSION_APPEARANCE_FRAGMENTS: u16 = 9;
+pub const Q0S_VERSION_CURRENT: u16 = Q0S_VERSION_APPEARANCE_FRAGMENTS;
 
 /// Serialise a `ProjectV2` as the current vector `.q0s` bytes. Internally we
 /// reuse the current `.q1s` writer and patch the magic+version header in-place
@@ -62,6 +63,9 @@ pub fn parse_q0s_v2(bytes: &[u8]) -> Result<ProjectV2, Error> {
         }
         Q0S_VERSION_Q0V_ASSETS => v2::parse_body_after_header(bytes, v2::Q1S_VERSION_Q0V_ASSETS),
         Q0S_VERSION_EASING => v2::parse_body_after_header(bytes, v2::Q1S_VERSION_EASING),
+        Q0S_VERSION_APPEARANCE_MASKS => {
+            v2::parse_body_after_header(bytes, v2::Q1S_VERSION_APPEARANCE_MASKS)
+        }
         Q0S_VERSION_CURRENT => v2::parse_body_after_header(bytes, v2::Q1S_VERSION_CURRENT),
         _ => Err(Error::UnsupportedVersion(version)),
     }
@@ -84,6 +88,7 @@ pub fn is_q0s_v2(bytes: &[u8]) -> bool {
             | Q0S_VERSION_LAYER_FOLDERS
             | Q0S_VERSION_Q0V_ASSETS
             | Q0S_VERSION_EASING
+            | Q0S_VERSION_APPEARANCE_MASKS
             | Q0S_VERSION_CURRENT
     )
 }
@@ -301,15 +306,70 @@ mod tests {
                     opacity: 0.5,
                 },
                 erase_mask: vec![mask],
+                material_source: Vec::new(),
+                clip_mask: Vec::new(),
             },
         );
 
         let bytes = write_q0s_v2(&project).expect("write appearance q0s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_APPEARANCE_MASKS
+            Q0S_VERSION_CURRENT
         );
         assert_eq!(parse_q0s_v2(&bytes).expect("parse appearance q0s"), project);
+    }
+
+    #[test]
+    fn current_player_parser_still_reads_q0s_v8_appearance_body() {
+        let mut project = small_project();
+        project.asset_appearances.insert(
+            1,
+            v2::VectorAppearance {
+                material: v2::VectorMaterial::SoftHalo {
+                    radius: 5.0,
+                    opacity: 0.4,
+                },
+                erase_mask: Vec::new(),
+                material_source: Vec::new(),
+                clip_mask: Vec::new(),
+            },
+        );
+        let mut bytes = v2::write_version(&project, v2::Q1S_VERSION_APPEARANCE_MASKS)
+            .expect("write q1s v9 body");
+        bytes[0..4].copy_from_slice(&Q0S_V2_MAGIC);
+        bytes[4..6].copy_from_slice(&Q0S_VERSION_APPEARANCE_MASKS.to_le_bytes());
+        assert!(is_q0s_v2(&bytes));
+        assert_eq!(
+            parse_q0s_v2(&bytes).expect("parse q0s v8 appearance"),
+            project
+        );
+    }
+
+    #[test]
+    fn current_q0s_roundtrip_preserves_post_material_fragments() {
+        let mut project = small_project();
+        let source = match &project.assets[0] {
+            Asset::Vector(vector) => vector.paths.clone(),
+            _ => unreachable!(),
+        };
+        project.asset_appearances.insert(
+            1,
+            v2::VectorAppearance {
+                material: v2::VectorMaterial::SoftHalo {
+                    radius: 6.0,
+                    opacity: 0.5,
+                },
+                erase_mask: Vec::new(),
+                material_source: source.clone(),
+                clip_mask: source,
+            },
+        );
+        let bytes = write_q0s_v2(&project).expect("write q0s fragments");
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            Q0S_VERSION_APPEARANCE_FRAGMENTS
+        );
+        assert_eq!(parse_q0s_v2(&bytes).expect("parse q0s fragments"), project);
     }
 
     #[test]

@@ -10,8 +10,8 @@ this branch keeps the classic brush and eraser engine as the only tool path. the
 ## data and compatibility
 
 - classic vector paint still commits as fill-only raw geometry.
-- q1s v9 stores sparse vector appearance metadata: material plus asset-local erase-mask paths.
-- q0s v8 carries the same appearance data into q0player.
+- q1s v9 introduced sparse vector appearance metadata; q1s v10 adds frozen material-source and post-material clip paths for split/moved fragments.
+- q0s v8 carries the original appearance masks; q0s v9 carries post-material fragments into q0player.
 - older q1s/q0s versions remain readable and load with no synthetic appearance state.
 - writing an older format version with appearance data fails instead of silently dropping it.
 - v1 migration creates no appearance metadata.
@@ -29,3 +29,6 @@ this branch keeps the classic brush and eraser engine as the only tool path. the
 - ordinary assets without appearance metadata continue through the legacy vector renderer and classic geometry eraser.
 
 this remains feature-gated while the visual/material model is being proven, but it is no longer runtime-only state.
+
+- partial raw-fill split does not re-evaluate filters from each new contour. both fragments retain the pre-split material source and complementary post-filter clips; translating a fragment translates its material/erase/clip state together.
+- halo textures use transparent overscan and remain continuous underneath the real vector fill, avoiding raster/vector AA cracks. cache fingerprints are content-aware and translation-invariant so moving a fragment reuses the same texture while real shape edits invalidate it.

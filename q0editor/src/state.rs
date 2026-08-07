@@ -4,7 +4,7 @@ use std::time::Instant;
 pub use q0s_format::geom::CapShape;
 use q0s_format::v2::{
     Anchor, Layer, LayerMetadata, Path as VPath, Placement, ProjectMeta, ProjectV2, Q0rg, Rgba,
-    Transform2D, Vec2, VectorAsset,
+    Transform2D, Vec2, VectorAppearance, VectorAsset,
 };
 
 use crate::brush::{BrushSettings, BrushStroke};
@@ -399,6 +399,7 @@ pub enum ToolState {
         refs: Vec<PathRef>,
         start_cursor: Vec2,
         start_paths: Vec<VPath>,
+        start_appearances: Vec<(u16, VectorAppearance)>,
         start_pivot: Option<Vec2>,
     },
     /// Axis-scale one connected raw-graphics selection without turning the

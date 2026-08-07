@@ -1174,9 +1174,115 @@ fn cut_raw_areas_for_drag_prepared(
     if jobs.is_empty() {
         return Vec::new();
     }
+    // Inserting a selected fragment immediately after its source placement must
+    // not invalidate placement indices of jobs we have not processed yet.
+    jobs.sort_by(|left, right| {
+        right
+            .0
+            .q0rg_id
+            .cmp(&left.0.q0rg_id)
+            .then(right.0.layer_id.cmp(&left.0.layer_id))
+            .then(right.0.placement_idx.cmp(&left.0.placement_idx))
+    });
 
     let mut refs = Vec::new();
+    let mut appearance_changed = false;
     for (r, asset_id, selected, remainder) in jobs {
+        #[cfg(feature = "appearance-mask-eraser")]
+        let appearance_enabled = app.state.project.asset_appearances.contains_key(&asset_id);
+        #[cfg(not(feature = "appearance-mask-eraser"))]
+        let appearance_enabled = false;
+
+        if appearance_enabled && !remainder.0.is_empty() {
+            let Some(Asset::Vector(original)) = app
+                .state
+                .project
+                .assets
+                .iter()
+                .find(|asset| asset.id() == asset_id)
+                .cloned()
+            else {
+                continue;
+            };
+            let selected_paths = geo_multi_polygon_to_linear_paths(&selected);
+            let remainder_paths = geo_multi_polygon_to_linear_paths(&remainder);
+            if selected_paths.is_empty() || remainder_paths.is_empty() {
+                continue;
+            }
+            if let Some(Asset::Vector(vector)) = app
+                .state
+                .project
+                .assets
+                .iter_mut()
+                .find(|asset| asset.id() == asset_id)
+            {
+                let mut paths: Vec<VPath> = vector
+                    .paths
+                    .iter()
+                    .filter(|path| !path.closed)
+                    .cloned()
+                    .collect();
+                paths.extend(remainder_paths);
+                vector.paths = paths;
+            }
+            let selected_asset_id = next_asset_id(&app.state.project);
+            app.state.project.assets.push(Asset::Vector(VectorAsset {
+                asset_id: selected_asset_id,
+                paths: selected_paths,
+                fill: original.fill,
+                stroke: original.stroke,
+            }));
+            #[cfg(feature = "appearance-mask-eraser")]
+            crate::appearance::split_asset_appearance(
+                &mut app.state.project,
+                asset_id,
+                selected_asset_id,
+                &original.paths,
+                &MultiPolygon(vec![clip.clone()]),
+                false,
+            );
+
+            let Some(layer) = app
+                .state
+                .project
+                .q0rgs
+                .iter_mut()
+                .find(|q| q.q0rg_id == r.q0rg_id)
+                .and_then(|q| q.layers.iter_mut().find(|l| l.layer_id == r.layer_id))
+            else {
+                continue;
+            };
+            let insertion = (r.placement_idx + 1).min(layer.placements.len());
+            layer.placements.insert(
+                insertion,
+                Placement {
+                    frame: app.session.current_frame,
+                    target: Target::Asset(selected_asset_id),
+                    transform: Transform2D::IDENTITY,
+                    tween: Tween::None,
+                },
+            );
+            let selected_len = app
+                .state
+                .project
+                .assets
+                .iter()
+                .find(|asset| asset.id() == selected_asset_id)
+                .and_then(|asset| match asset {
+                    Asset::Vector(vector) => Some(vector.paths.len()),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            refs.extend((0..selected_len).map(|path_idx| PathRef {
+                q0rg_id: r.q0rg_id,
+                layer_id: r.layer_id,
+                placement_idx: insertion,
+                path_idx,
+            }));
+            appearance_changed = true;
+            continue;
+        }
+
         let Some(Asset::Vector(vector)) = app
             .state
             .project
@@ -1208,6 +1314,9 @@ fn cut_raw_areas_for_drag_prepared(
     }
     if !refs.is_empty() {
         app.state.dirty = true;
+    }
+    if appearance_changed {
+        app.textures.invalidate();
     }
     refs
 }
@@ -2388,10 +2497,13 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                         if let Some(pivot) = start_pivot {
                             set_selection_transform_pivot(app, pivot);
                         }
+                        let start_appearances =
+                            capture_whole_asset_appearances_for_raw_refs(&app.state.project, &refs);
                         app.session.tool_state = ToolState::DraggingPaths {
                             refs,
                             start_cursor: p,
                             start_paths,
+                            start_appearances,
                             start_pivot,
                         };
                         app.session.status = "Moving selected fill".to_string();
@@ -2720,6 +2832,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 refs,
                 start_cursor,
                 start_paths,
+                start_appearances,
                 start_pivot,
             } => {
                 if let Some(p) = cursor {
@@ -2736,6 +2849,11 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                             delta,
                         );
                     }
+                    changed |= translate_captured_appearances(
+                        &mut app.state.project,
+                        &start_appearances,
+                        delta,
+                    );
                     if changed {
                         app.state.dirty = true;
                         if let Some(pivot) = start_pivot {
@@ -3433,7 +3551,7 @@ pub(crate) fn materialize_raw_paths_as_placements(
 
         path_indices.sort_unstable();
         path_indices.dedup();
-        let (selected_paths, fill, stroke, source_empty) = {
+        let (selected_paths, fill, stroke, source_empty, original_paths) = {
             let Asset::Vector(vector) = app
                 .state
                 .project
@@ -3443,6 +3561,7 @@ pub(crate) fn materialize_raw_paths_as_placements(
             else {
                 return None;
             };
+            let original_paths = vector.paths.clone();
             if path_indices
                 .iter()
                 .any(|path_idx| *path_idx >= vector.paths.len())
@@ -3461,6 +3580,7 @@ pub(crate) fn materialize_raw_paths_as_placements(
                 vector.fill,
                 vector.stroke,
                 vector.paths.is_empty(),
+                original_paths,
             )
         };
         if selected_paths.is_empty() {
@@ -3474,12 +3594,39 @@ pub(crate) fn materialize_raw_paths_as_placements(
             fill,
             stroke,
         }));
+        #[cfg(not(feature = "appearance-mask-eraser"))]
+        let _ = &original_paths;
         #[cfg(feature = "appearance-mask-eraser")]
-        crate::appearance::split_asset_appearance(
-            &mut app.state.project,
-            writable_asset_id,
-            selected_asset_id,
-        );
+        {
+            let selected_geometry = app
+                .state
+                .project
+                .assets
+                .iter()
+                .find(|asset| asset.id() == selected_asset_id)
+                .and_then(|asset| match asset {
+                    Asset::Vector(vector) => Some(vector_fill_geometry(vector)),
+                    _ => None,
+                })
+                .unwrap_or_else(|| MultiPolygon(Vec::new()));
+            let partition = app
+                .state
+                .project
+                .asset_appearances
+                .get(&writable_asset_id)
+                .map(|appearance| {
+                    crate::appearance::material_support(&selected_geometry, appearance.material)
+                })
+                .unwrap_or(selected_geometry);
+            crate::appearance::split_asset_appearance(
+                &mut app.state.project,
+                writable_asset_id,
+                selected_asset_id,
+                &original_paths,
+                &partition,
+                source_empty,
+            );
+        }
         let layer = app
             .state
             .project
@@ -3702,6 +3849,89 @@ pub(crate) fn prepare_raw_path_refs_for_edit(
     Some(mapped)
 }
 
+fn capture_whole_asset_appearances_for_raw_refs(
+    project: &ProjectV2,
+    refs: &[PathRef],
+) -> Vec<(u16, q0s_format::v2::VectorAppearance)> {
+    #[cfg(not(feature = "appearance-mask-eraser"))]
+    {
+        let _ = (project, refs);
+        return Vec::new();
+    }
+    #[cfg(feature = "appearance-mask-eraser")]
+    {
+        let mut grouped: std::collections::BTreeMap<u16, std::collections::BTreeSet<usize>> =
+            std::collections::BTreeMap::new();
+        for reference in refs {
+            let Some(asset_id) = project
+                .q0rgs
+                .iter()
+                .find(|q0rg| q0rg.q0rg_id == reference.q0rg_id)
+                .and_then(|q0rg| {
+                    q0rg.layers
+                        .iter()
+                        .find(|layer| layer.layer_id == reference.layer_id)
+                })
+                .and_then(|layer| layer.placements.get(reference.placement_idx))
+                .and_then(|placement| match placement.target {
+                    Target::Asset(asset_id) => Some(asset_id),
+                    Target::Q0rg(_) => None,
+                })
+            else {
+                continue;
+            };
+            grouped
+                .entry(asset_id)
+                .or_default()
+                .insert(reference.path_idx);
+        }
+        grouped
+            .into_iter()
+            .filter_map(|(asset_id, selected)| {
+                let appearance = project.asset_appearances.get(&asset_id)?.clone();
+                let Asset::Vector(vector) =
+                    project.assets.iter().find(|asset| asset.id() == asset_id)?
+                else {
+                    return None;
+                };
+                let editable: std::collections::BTreeSet<usize> = vector
+                    .paths
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, path)| path.closed.then_some(index))
+                    .collect();
+                (selected == editable).then_some((asset_id, appearance))
+            })
+            .collect()
+    }
+}
+
+fn translate_captured_appearances(
+    project: &mut ProjectV2,
+    start_appearances: &[(u16, q0s_format::v2::VectorAppearance)],
+    delta: Vec2,
+) -> bool {
+    #[cfg(not(feature = "appearance-mask-eraser"))]
+    {
+        let _ = (project, start_appearances, delta);
+        false
+    }
+    #[cfg(feature = "appearance-mask-eraser")]
+    {
+        let mut changed = false;
+        for (asset_id, source) in start_appearances {
+            let translated = crate::appearance::transform_appearance(source, |point| {
+                Vec2::new(point.x + delta.x, point.y + delta.y)
+            });
+            if project.asset_appearances.get(asset_id) != Some(&translated) {
+                project.asset_appearances.insert(*asset_id, translated);
+                changed = true;
+            }
+        }
+        changed
+    }
+}
+
 fn begin_dragging_raw_paths(
     app: &mut EditorApp,
     refs: Vec<PathRef>,
@@ -3737,10 +3967,12 @@ fn begin_dragging_raw_paths(
     if let Some(pivot) = start_pivot {
         set_selection_transform_pivot(app, pivot);
     }
+    let start_appearances = capture_whole_asset_appearances_for_raw_refs(&app.state.project, &refs);
     app.session.tool_state = ToolState::DraggingPaths {
         refs,
         start_cursor,
         start_paths,
+        start_appearances,
         start_pivot,
     };
     app.session.status = status.to_string();
@@ -7440,6 +7672,170 @@ mod tests {
         assert_eq!(bounds_max, Vec2::new(60.0, 50.0));
     }
 
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn dragging_partial_glowing_raw_area_carries_post_material_fragment_without_new_glow() {
+        let mut app = EditorApp::default();
+        let original_path = VPath {
+            anchors: vec![
+                anchor(Vec2::new(0.0, 0.0)),
+                anchor(Vec2::new(100.0, 0.0)),
+                anchor(Vec2::new(100.0, 100.0)),
+                anchor(Vec2::new(0.0, 100.0)),
+            ],
+            closed: true,
+        };
+        app.state.project.assets = vec![Asset::Vector(VectorAsset {
+            asset_id: 1,
+            paths: vec![original_path.clone()],
+            fill: Some(Rgba {
+                r: 20,
+                g: 30,
+                b: 40,
+                a: 255,
+            }),
+            stroke: None,
+        })];
+        app.state.project.asset_appearances.insert(
+            1,
+            q0s_format::v2::VectorAppearance {
+                material: q0s_format::v2::VectorMaterial::SoftHalo {
+                    radius: 10.0,
+                    opacity: 0.5,
+                },
+                erase_mask: Vec::new(),
+                material_source: Vec::new(),
+                clip_mask: Vec::new(),
+            },
+        );
+        app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            frame: 0,
+            target: Target::Asset(1),
+            transform: Transform2D::IDENTITY,
+            tween: Tween::None,
+        }];
+        let source_ref = PlacementRef {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: 0,
+        };
+        let refs = cut_raw_areas_for_drag(&mut app, &[source_ref], (50.0, -10.0, 110.0, 110.0));
+        assert!(!refs.is_empty());
+        assert_eq!(app.state.project.q0rgs[0].layers[0].placements.len(), 2);
+        assert_eq!(app.state.project.asset_appearances.len(), 2);
+        assert!(
+            !crate::brush::merge_touching_raw_fills_after_edit(&mut app.state.project, 1, 1, 0,),
+            "post-material fragments must not be geometry-merged back into a newly evaluated glow"
+        );
+        assert_eq!(app.state.project.q0rgs[0].layers[0].placements.len(), 2);
+
+        let selected_placement = refs[0].placement_idx;
+        let selected_asset_id =
+            match app.state.project.q0rgs[0].layers[0].placements[selected_placement].target {
+                Target::Asset(id) => id,
+                Target::Q0rg(_) => unreachable!(),
+            };
+        assert_ne!(selected_asset_id, 1);
+        assert_eq!(
+            app.state.project.asset_appearances[&1].material_source,
+            vec![original_path.clone()]
+        );
+        assert_eq!(
+            app.state.project.asset_appearances[&selected_asset_id].material_source,
+            vec![original_path]
+        );
+        let selected_vector = match app
+            .state
+            .project
+            .assets
+            .iter()
+            .find(|asset| asset.id() == selected_asset_id)
+            .unwrap()
+        {
+            Asset::Vector(vector) => vector,
+            _ => unreachable!(),
+        };
+        let before_visible = crate::appearance::visible_material_surface_for_vector(
+            selected_vector,
+            app.state.project.asset_appearances.get(&selected_asset_id),
+        );
+        let before_bounds = before_visible.bounding_rect().unwrap();
+        assert!(before_bounds.min().x >= 49.9);
+
+        let start_paths: Vec<VPath> = refs
+            .iter()
+            .map(|reference| {
+                raw_path_clone(
+                    &app.state.project,
+                    reference.q0rg_id,
+                    reference.layer_id,
+                    reference.placement_idx,
+                    reference.path_idx,
+                )
+                .unwrap()
+            })
+            .collect();
+        let start_appearances =
+            capture_whole_asset_appearances_for_raw_refs(&app.state.project, &refs);
+        assert_eq!(start_appearances.len(), 1);
+        let delta = Vec2::new(30.0, 15.0);
+        for (reference, source) in refs.iter().zip(&start_paths) {
+            assert!(replace_raw_path_translated(
+                &mut app.state.project,
+                reference.q0rg_id,
+                reference.layer_id,
+                reference.placement_idx,
+                reference.path_idx,
+                source,
+                delta,
+            ));
+        }
+        assert!(translate_captured_appearances(
+            &mut app.state.project,
+            &start_appearances,
+            delta,
+        ));
+
+        let selected_vector = match app
+            .state
+            .project
+            .assets
+            .iter()
+            .find(|asset| asset.id() == selected_asset_id)
+            .unwrap()
+        {
+            Asset::Vector(vector) => vector,
+            _ => unreachable!(),
+        };
+        let after_visible = crate::appearance::visible_material_surface_for_vector(
+            selected_vector,
+            app.state.project.asset_appearances.get(&selected_asset_id),
+        );
+        let after_bounds = after_visible.bounding_rect().unwrap();
+        assert!((after_bounds.min().x - (before_bounds.min().x + f64::from(delta.x))).abs() < 0.05);
+        assert!((after_bounds.min().y - (before_bounds.min().y + f64::from(delta.y))).abs() < 0.05);
+        assert!(
+            after_bounds.min().x >= 79.9,
+            "moving the fragment must not grow a new halo leftward across its cut edge"
+        );
+        let remainder_vector = match app
+            .state
+            .project
+            .assets
+            .iter()
+            .find(|asset| asset.id() == 1)
+            .unwrap()
+        {
+            Asset::Vector(vector) => vector,
+            _ => unreachable!(),
+        };
+        let remainder_visible = crate::appearance::visible_material_surface_for_vector(
+            remainder_vector,
+            app.state.project.asset_appearances.get(&1),
+        );
+        assert!(remainder_visible.bounding_rect().unwrap().max().x <= 50.1);
+    }
+
     #[test]
     fn dotted_raw_area_can_start_scaling_without_prior_move() {
         let mut app = EditorApp::default();
@@ -7911,6 +8307,8 @@ mod tests {
                 } else {
                     Vec::new()
                 },
+                material_source: Vec::new(),
+                clip_mask: Vec::new(),
             },
         );
         ProjectV2 {

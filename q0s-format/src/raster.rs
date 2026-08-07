@@ -383,7 +383,12 @@ fn rasterize_vector_appearance_local_impl(
     let mut min_y = f32::INFINITY;
     let mut max_x = f32::NEG_INFINITY;
     let mut max_y = f32::NEG_INFINITY;
-    for path in vector.paths.iter().filter(|path| path.closed) {
+    let material_paths: &[crate::v2::Path] = if appearance.material_source.is_empty() {
+        &vector.paths
+    } else {
+        &appearance.material_source
+    };
+    for path in material_paths.iter().filter(|path| path.closed) {
         for point in flatten_path(path, FLATTEN_SAMPLES) {
             min_x = min_x.min(point.x);
             min_y = min_y.min(point.y);
@@ -398,8 +403,11 @@ fn rasterize_vector_appearance_local_impl(
         VectorMaterial::Solid => 0.0,
         VectorMaterial::SoftHalo { radius, .. } => radius.max(0.0),
     };
-    let antialias_margin = 2.0 / pixels_per_unit;
-    let margin = material_margin + antialias_margin;
+    // Keep a transparent texel guard outside the finite filter support. Linear
+    // sampling must never touch the texture edge while the halo still has alpha,
+    // otherwise the vector/halo seam exposes square holes at high zoom.
+    let filter_guard = 4.0 / pixels_per_unit;
+    let margin = material_margin + filter_guard;
     let local_min = Vec2::new(min_x - margin, min_y - margin);
     let local_max = Vec2::new(max_x + margin, max_y + margin);
     let width = (((local_max.x - local_min.x) * pixels_per_unit).ceil() as u32).max(1);
@@ -417,69 +425,8 @@ fn rasterize_vector_appearance_local_impl(
         tx: -local_min.x * pixels_per_unit,
         ty: -local_min.y * pixels_per_unit,
     };
-    let source_contours: Vec<Vec<Vec2>> = vector
-        .paths
-        .iter()
-        .filter(|path| path.closed)
-        .map(|path| {
-            flatten_path(path, FLATTEN_SAMPLES)
-                .into_iter()
-                .map(|point| local_to_pixel.apply(point))
-                .collect()
-        })
-        .collect();
-    let pixel_count = (width as usize).saturating_mul(height as usize);
-    let mut source_rgba = vec![0u8; pixel_count.saturating_mul(4)];
-    scanline_fill_multi(
-        &source_contours,
-        Rgba {
-            r: 255,
-            g: 255,
-            b: 255,
-            a: 255,
-        },
-        &mut source_rgba,
-        width,
-        height,
-    );
-    let source_alpha: Vec<u8> = source_rgba.chunks_exact(4).map(|pixel| pixel[3]).collect();
-
-    let material_alpha = match appearance.material {
-        VectorMaterial::Solid => {
-            if include_base {
-                source_alpha
-                    .iter()
-                    .map(|alpha| ((u16::from(*alpha) * u16::from(fill.a) + 127) / 255) as u8)
-                    .collect::<Vec<_>>()
-            } else {
-                vec![0; source_alpha.len()]
-            }
-        }
-        VectorMaterial::SoftHalo { radius, opacity } => {
-            let blurred =
-                gaussian_blur_alpha(&source_alpha, width, height, radius * pixels_per_unit);
-            source_alpha
-                .iter()
-                .zip(blurred)
-                .map(|(source, blur)| {
-                    let base = (f32::from(*source) * f32::from(fill.a) / 255.0).round();
-                    let halo = f32::from(blur) * f32::from(fill.a) / 255.0 * opacity;
-                    if include_base {
-                        base.max(halo).clamp(0.0, 255.0).round() as u8
-                    } else if *source == 0 {
-                        halo.clamp(0.0, 255.0).round() as u8
-                    } else {
-                        0
-                    }
-                })
-                .collect::<Vec<_>>()
-        }
-    };
-
-    let mut mask_rgba = vec![0u8; pixel_count.saturating_mul(4)];
-    if !appearance.erase_mask.is_empty() {
-        let mask_contours: Vec<Vec<Vec2>> = appearance
-            .erase_mask
+    let to_contours = |paths: &[crate::v2::Path]| -> Vec<Vec<Vec2>> {
+        paths
             .iter()
             .filter(|path| path.closed)
             .map(|path| {
@@ -488,25 +435,82 @@ fn rasterize_vector_appearance_local_impl(
                     .map(|point| local_to_pixel.apply(point))
                     .collect()
             })
-            .collect();
+            .collect()
+    };
+    let pixel_count = (width as usize).saturating_mul(height as usize);
+    let raster_alpha = |contours: &[Vec<Vec2>]| -> Vec<u8> {
+        let mut rgba = vec![0u8; pixel_count.saturating_mul(4)];
         scanline_fill_multi(
-            &mask_contours,
+            contours,
             Rgba {
                 r: 255,
                 g: 255,
                 b: 255,
                 a: 255,
             },
-            &mut mask_rgba,
+            &mut rgba,
             width,
             height,
         );
-    }
+        rgba.chunks_exact(4).map(|pixel| pixel[3]).collect()
+    };
+    let body_alpha = raster_alpha(&to_contours(&vector.paths));
+    let material_source_alpha = raster_alpha(&to_contours(material_paths));
+
+    let material_alpha = match appearance.material {
+        VectorMaterial::Solid => {
+            if include_base {
+                body_alpha
+                    .iter()
+                    .map(|alpha| ((u16::from(*alpha) * u16::from(fill.a) + 127) / 255) as u8)
+                    .collect::<Vec<_>>()
+            } else {
+                vec![0; body_alpha.len()]
+            }
+        }
+        VectorMaterial::SoftHalo { radius, opacity } => {
+            let blurred = gaussian_blur_alpha(
+                &material_source_alpha,
+                width,
+                height,
+                radius * pixels_per_unit,
+            );
+            body_alpha
+                .iter()
+                .zip(blurred)
+                .map(|(body, blur)| {
+                    let base = f32::from(*body) * f32::from(fill.a) / 255.0;
+                    let halo = f32::from(blur) * f32::from(fill.a) / 255.0 * opacity;
+                    if include_base {
+                        base.max(halo).clamp(0.0, 255.0).round() as u8
+                    } else {
+                        // Keep the halo continuous underneath the real vector.
+                        // Cutting a bitmap-shaped hole here can never line up
+                        // exactly with egui/lyon vector AA and exposes square
+                        // background gaps along diagonal/curved edges.
+                        halo.clamp(0.0, 255.0).round() as u8
+                    }
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let erase_alpha = if appearance.erase_mask.is_empty() {
+        vec![0u8; pixel_count]
+    } else {
+        raster_alpha(&to_contours(&appearance.erase_mask))
+    };
+    let clip_alpha = if appearance.clip_mask.is_empty() {
+        vec![255u8; pixel_count]
+    } else {
+        raster_alpha(&to_contours(&appearance.clip_mask))
+    };
 
     let mut rgba = vec![0u8; pixel_count.saturating_mul(4)];
     for (index, out) in rgba.chunks_exact_mut(4).enumerate() {
-        let mask = mask_rgba[index * 4 + 3];
-        let alpha = ((u16::from(material_alpha[index]) * u16::from(255 - mask) + 127) / 255) as u8;
+        let visible =
+            (u32::from(255 - erase_alpha[index]) * u32::from(clip_alpha[index]) + 127) / 255;
+        let alpha = ((u32::from(material_alpha[index]) * visible + 127) / 255) as u8;
         out.copy_from_slice(&[fill.r, fill.g, fill.b, alpha]);
     }
     Some(RasterizedVectorAppearance {
@@ -522,45 +526,108 @@ fn gaussian_blur_alpha(source: &[u8], width: u32, height: u32, support_radius: f
     if source.is_empty() || support_radius <= 0.5 {
         return source.to_vec();
     }
-    let radius = support_radius.ceil().clamp(1.0, 128.0) as i32;
     let sigma = (support_radius / 3.5).max(0.45);
-    let mut kernel = Vec::with_capacity((radius * 2 + 1) as usize);
-    let mut sum = 0.0f32;
-    for offset in -radius..=radius {
-        let x = offset as f32;
-        let weight = (-0.5 * x * x / (sigma * sigma)).exp();
-        kernel.push(weight);
-        sum += weight;
+    let radii = gaussian_box_radii(sigma, 3);
+    let mut current: Vec<f32> = source.iter().map(|value| f32::from(*value)).collect();
+    let mut scratch = vec![0.0f32; current.len()];
+    for radius in radii {
+        box_blur_horizontal_zero(&current, &mut scratch, width, height, radius);
+        box_blur_vertical_zero(&scratch, &mut current, width, height, radius);
     }
-    for weight in &mut kernel {
-        *weight /= sum.max(f32::EPSILON);
+    current
+        .into_iter()
+        .map(|value| value.clamp(0.0, 255.0).round() as u8)
+        .collect()
+}
+
+/// Three box filters approximate a Gaussian very closely while keeping blur
+/// cost O(pixel_count), independent of the visual radius. The old convolution
+/// was O(pixel_count * radius), which is why crossing a zoom bucket could stall
+/// q0editor for half a second on a large glowing raw fill.
+fn gaussian_box_radii(sigma: f32, passes: usize) -> Vec<usize> {
+    let passes_f = passes as f32;
+    let ideal = ((12.0 * sigma * sigma / passes_f) + 1.0).sqrt();
+    let mut lower = ideal.floor() as i32;
+    if lower % 2 == 0 {
+        lower -= 1;
     }
-    let w = width as i32;
-    let h = height as i32;
-    let mut horizontal = vec![0.0f32; source.len()];
+    lower = lower.max(1);
+    let upper = lower + 2;
+    let numerator = 12.0 * sigma * sigma
+        - passes_f * (lower * lower) as f32
+        - 4.0 * passes_f * lower as f32
+        - 3.0 * passes_f;
+    let denominator = (-4 * lower - 4) as f32;
+    let lower_count = (numerator / denominator).round().clamp(0.0, passes_f) as usize;
+    (0..passes)
+        .map(|index| {
+            let width = if index < lower_count { lower } else { upper };
+            ((width - 1) / 2).max(0) as usize
+        })
+        .collect()
+}
+
+fn box_blur_horizontal_zero(
+    source: &[f32],
+    output: &mut [f32],
+    width: u32,
+    height: u32,
+    radius: usize,
+) {
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return;
+    }
+    if radius == 0 {
+        output.copy_from_slice(source);
+        return;
+    }
+    let denominator = (radius * 2 + 1) as f32;
+    let mut prefix = vec![0.0f32; w + 1];
     for y in 0..h {
+        prefix.fill(0.0);
+        let row = y * w;
         for x in 0..w {
-            let mut value = 0.0;
-            for offset in -radius..=radius {
-                let sx = (x + offset).clamp(0, w - 1);
-                value +=
-                    f32::from(source[(y * w + sx) as usize]) * kernel[(offset + radius) as usize];
-            }
-            horizontal[(y * w + x) as usize] = value;
+            prefix[x + 1] = prefix[x] + source[row + x];
+        }
+        for x in 0..w {
+            let left = x.saturating_sub(radius);
+            let right = (x + radius + 1).min(w);
+            output[row + x] = (prefix[right] - prefix[left]) / denominator;
         }
     }
-    let mut output = vec![0u8; source.len()];
-    for y in 0..h {
-        for x in 0..w {
-            let mut value = 0.0;
-            for offset in -radius..=radius {
-                let sy = (y + offset).clamp(0, h - 1);
-                value += horizontal[(sy * w + x) as usize] * kernel[(offset + radius) as usize];
-            }
-            output[(y * w + x) as usize] = value.clamp(0.0, 255.0).round() as u8;
+}
+
+fn box_blur_vertical_zero(
+    source: &[f32],
+    output: &mut [f32],
+    width: u32,
+    height: u32,
+    radius: usize,
+) {
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return;
+    }
+    if radius == 0 {
+        output.copy_from_slice(source);
+        return;
+    }
+    let denominator = (radius * 2 + 1) as f32;
+    let mut prefix = vec![0.0f32; h + 1];
+    for x in 0..w {
+        prefix.fill(0.0);
+        for y in 0..h {
+            prefix[y + 1] = prefix[y] + source[y * w + x];
+        }
+        for y in 0..h {
+            let top = y.saturating_sub(radius);
+            let bottom = (y + radius + 1).min(h);
+            output[y * w + x] = (prefix[bottom] - prefix[top]) / denominator;
         }
     }
-    output
 }
 
 fn rasterize_vector(
@@ -1039,6 +1106,8 @@ mod resolver_tests {
                 opacity: 0.7,
             },
             erase_mask: Vec::new(),
+            material_source: Vec::new(),
+            clip_mask: Vec::new(),
         };
         let tile =
             rasterize_vector_appearance_local(&vector, &appearance, 4.0).expect("appearance tile");
@@ -1063,7 +1132,7 @@ mod resolver_tests {
     }
 
     #[test]
-    fn halo_only_raster_never_contains_the_vector_body() {
+    fn halo_only_raster_is_continuous_under_the_vector_body() {
         let vector = VectorAsset {
             asset_id: 1,
             paths: vec![rectangle_path(0.0, 0.0, 20.0, 20.0)],
@@ -1081,16 +1150,115 @@ mod resolver_tests {
                 opacity: 0.7,
             },
             erase_mask: Vec::new(),
+            material_source: Vec::new(),
+            clip_mask: Vec::new(),
         };
         let tile = rasterize_vector_halo_local(&vector, &appearance, 4.0).expect("halo tile");
-        assert_eq!(
-            appearance_pixel(&tile, Vec2::new(10.0, 10.0))[3],
-            0,
-            "the editor halo texture must never bitmap the vector body"
+        assert!(
+            appearance_pixel(&tile, Vec2::new(10.0, 10.0))[3] > 0,
+            "halo underlay must stay continuous beneath the vector body so AA cannot expose square gaps"
         );
         assert!(
             appearance_pixel(&tile, Vec2::new(-2.0, 10.0))[3] > 0,
             "soft material must remain visible outside the source fill"
+        );
+        let border_is_clear = (0..tile.width).all(|x| {
+            let top = ((x) * 4 + 3) as usize;
+            let bottom = (((tile.height - 1) * tile.width + x) * 4 + 3) as usize;
+            tile.rgba[top] == 0 && tile.rgba[bottom] == 0
+        }) && (0..tile.height).all(|y| {
+            let left = ((y * tile.width) * 4 + 3) as usize;
+            let right = ((y * tile.width + tile.width - 1) * 4 + 3) as usize;
+            tile.rgba[left] == 0 && tile.rgba[right] == 0
+        });
+        assert!(
+            border_is_clear,
+            "halo texture needs transparent overscan around its finite support"
+        );
+    }
+
+    #[test]
+    fn post_material_fragment_split_partitions_one_resolved_glow_field() {
+        let fill = Rgba {
+            r: 210,
+            g: 40,
+            b: 30,
+            a: 255,
+        };
+        let original_path = rectangle_path(0.0, 0.0, 20.0, 20.0);
+        let original = VectorAsset {
+            asset_id: 1,
+            paths: vec![original_path.clone()],
+            fill: Some(fill),
+            stroke: None,
+        };
+        let left = VectorAsset {
+            asset_id: 2,
+            paths: vec![rectangle_path(0.0, 0.0, 10.0, 20.0)],
+            fill: Some(fill),
+            stroke: None,
+        };
+        let right = VectorAsset {
+            asset_id: 3,
+            paths: vec![rectangle_path(10.0, 0.0, 20.0, 20.0)],
+            fill: Some(fill),
+            stroke: None,
+        };
+        let material = VectorMaterial::SoftHalo {
+            radius: 8.0,
+            opacity: 0.65,
+        };
+        let whole = VectorAppearance {
+            material,
+            erase_mask: Vec::new(),
+            material_source: Vec::new(),
+            clip_mask: Vec::new(),
+        };
+        let left_appearance = VectorAppearance {
+            material,
+            erase_mask: Vec::new(),
+            material_source: vec![original_path.clone()],
+            clip_mask: vec![rectangle_path(-20.0, -20.0, 10.0, 40.0)],
+        };
+        let right_appearance = VectorAppearance {
+            material,
+            erase_mask: Vec::new(),
+            material_source: vec![original_path],
+            clip_mask: vec![rectangle_path(10.0, -20.0, 40.0, 40.0)],
+        };
+
+        let whole_tile = rasterize_vector_appearance_local(&original, &whole, 4.0).unwrap();
+        let left_tile = rasterize_vector_appearance_local(&left, &left_appearance, 4.0).unwrap();
+        let right_tile = rasterize_vector_appearance_local(&right, &right_appearance, 4.0).unwrap();
+        assert_eq!(whole_tile.local_min, left_tile.local_min);
+        assert_eq!(whole_tile.local_min, right_tile.local_min);
+        assert_eq!(
+            (whole_tile.width, whole_tile.height),
+            (left_tile.width, left_tile.height)
+        );
+        assert_eq!(
+            (whole_tile.width, whole_tile.height),
+            (right_tile.width, right_tile.height)
+        );
+
+        for index in 0..(whole_tile.width as usize * whole_tile.height as usize) {
+            let whole_alpha = whole_tile.rgba[index * 4 + 3];
+            let split_alpha = left_tile.rgba[index * 4 + 3].max(right_tile.rgba[index * 4 + 3]);
+            assert!(
+                whole_alpha.abs_diff(split_alpha) <= 1,
+                "post-material split changed resolved alpha at pixel {index}: whole={whole_alpha}, split={split_alpha}"
+            );
+        }
+
+        let right_halo = rasterize_vector_halo_local(&right, &right_appearance, 4.0).unwrap();
+        assert_eq!(
+            appearance_pixel(&right_halo, Vec2::new(9.0, 10.0))[3],
+            0,
+            "split edge must be a post-filter clip, not a fresh glow source"
+        );
+        assert!(
+            appearance_pixel(&right_halo, Vec2::new(22.0, 10.0))[3] > 0,
+            "the original external edge must retain its halo"
         );
     }
 
@@ -1113,6 +1281,8 @@ mod resolver_tests {
                 opacity: 0.8,
             },
             erase_mask: vec![rectangle_path(22.0, 7.0, 26.0, 13.0)],
+            material_source: Vec::new(),
+            clip_mask: Vec::new(),
         };
         let tile =
             rasterize_vector_appearance_local(&vector, &appearance, 4.0).expect("appearance tile");
@@ -1145,6 +1315,8 @@ mod resolver_tests {
                     opacity: 0.8,
                 },
                 erase_mask: vec![rectangle_path(3.0, 3.0, 7.0, 7.0)],
+                material_source: Vec::new(),
+                clip_mask: Vec::new(),
             },
         );
         let project = ProjectV2 {

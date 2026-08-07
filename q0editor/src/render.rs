@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+#[cfg(feature = "appearance-mask-eraser")]
+use std::hash::{Hash, Hasher};
 
 use egui::epaint::{PathShape, Vertex};
 use egui::{
@@ -31,7 +33,7 @@ pub struct StageView {
 #[derive(Clone)]
 struct CachedAppearanceTexture {
     texture: TextureHandle,
-    local_min: Vec2,
+    local_min_offset: Vec2,
     width: u32,
     height: u32,
     pixels_per_unit: f32,
@@ -43,7 +45,7 @@ pub struct TextureCache {
     by_q0v_frame: HashMap<(u16, u32), TextureHandle>,
     q0v_media: HashMap<u16, q0video::q0v::Q0vFile>,
     #[cfg(feature = "appearance-mask-eraser")]
-    appearance_by_asset: HashMap<(u16, u16), CachedAppearanceTexture>,
+    appearance_by_asset: HashMap<(u16, u16, u64), CachedAppearanceTexture>,
 }
 
 impl TextureCache {
@@ -1279,6 +1281,89 @@ fn lerp_transform(a: Transform2D, b: Transform2D, t: f32) -> Transform2D {
 }
 
 #[cfg(feature = "appearance-mask-eraser")]
+fn appearance_cache_signature(
+    vector: &q0s_format::v2::VectorAsset,
+    appearance: &VectorAppearance,
+) -> (u64, Vec2) {
+    let material_paths: &[q0s_format::v2::Path] = if appearance.material_source.is_empty() {
+        &vector.paths
+    } else {
+        &appearance.material_source
+    };
+    let mut origin = Vec2::new(f32::INFINITY, f32::INFINITY);
+    for path in vector
+        .paths
+        .iter()
+        .chain(material_paths)
+        .chain(&appearance.erase_mask)
+        .chain(&appearance.clip_mask)
+    {
+        for anchor in &path.anchors {
+            for point in std::iter::once(anchor.point)
+                .chain(anchor.in_handle)
+                .chain(anchor.out_handle)
+            {
+                if point.x.is_finite() && point.y.is_finite() {
+                    origin.x = origin.x.min(point.x);
+                    origin.y = origin.y.min(point.y);
+                }
+            }
+        }
+    }
+    if !origin.x.is_finite() || !origin.y.is_finite() {
+        origin = Vec2::new(0.0, 0.0);
+    }
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    if let Some(fill) = vector.fill {
+        [fill.r, fill.g, fill.b, fill.a].hash(&mut hasher);
+    }
+    match appearance.material {
+        q0s_format::v2::VectorMaterial::Solid => 0u8.hash(&mut hasher),
+        q0s_format::v2::VectorMaterial::SoftHalo { radius, opacity } => {
+            1u8.hash(&mut hasher);
+            radius.to_bits().hash(&mut hasher);
+            opacity.to_bits().hash(&mut hasher);
+        }
+    }
+    let mut hash_paths = |tag: u8, paths: &[q0s_format::v2::Path]| {
+        tag.hash(&mut hasher);
+        paths.len().hash(&mut hasher);
+        for path in paths {
+            path.closed.hash(&mut hasher);
+            path.anchors.len().hash(&mut hasher);
+            for anchor in &path.anchors {
+                let hash_point =
+                    |point: Vec2, hasher: &mut std::collections::hash_map::DefaultHasher| {
+                        (point.x - origin.x).to_bits().hash(hasher);
+                        (point.y - origin.y).to_bits().hash(hasher);
+                    };
+                hash_point(anchor.point, &mut hasher);
+                match anchor.in_handle {
+                    Some(point) => {
+                        1u8.hash(&mut hasher);
+                        hash_point(point, &mut hasher);
+                    }
+                    None => 0u8.hash(&mut hasher),
+                }
+                match anchor.out_handle {
+                    Some(point) => {
+                        1u8.hash(&mut hasher);
+                        hash_point(point, &mut hasher);
+                    }
+                    None => 0u8.hash(&mut hasher),
+                }
+            }
+        }
+    };
+    hash_paths(0, &vector.paths);
+    hash_paths(1, material_paths);
+    hash_paths(2, &appearance.erase_mask);
+    hash_paths(3, &appearance.clip_mask);
+    (hasher.finish(), origin)
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
 #[allow(clippy::too_many_arguments)]
 fn paint_vector_appearance_halo(
     painter: &Painter,
@@ -1296,7 +1381,15 @@ fn paint_vector_appearance_halo(
     let target_ppu = (view.scale * transform.uniform_scale() * 2.0).clamp(1.0, 8.0);
     let bucket = (target_ppu * 4.0).round().clamp(4.0, 32.0) as u16;
     let ppu = f32::from(bucket) / 4.0;
-    let key = (vector.asset_id, bucket);
+    let (fingerprint, origin) = appearance_cache_signature(vector, appearance);
+    let key = (vector.asset_id, bucket, fingerprint);
+    if !textures.appearance_by_asset.contains_key(&key) {
+        textures
+            .appearance_by_asset
+            .retain(|(asset_id, cached_bucket, _), _| {
+                *asset_id != vector.asset_id || *cached_bucket != bucket
+            });
+    }
     let cached = match textures.appearance_by_asset.entry(key) {
         std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
         std::collections::hash_map::Entry::Vacant(entry) => {
@@ -1310,28 +1403,38 @@ fn paint_vector_appearance_halo(
                 &tile.rgba,
             );
             let texture = ctx.load_texture(
-                format!("q0s_appearance_{}_{}", vector.asset_id, bucket),
+                format!(
+                    "q0s_appearance_{}_{}_{}",
+                    vector.asset_id, bucket, fingerprint
+                ),
                 image,
                 TextureOptions::LINEAR,
             );
             entry.insert(CachedAppearanceTexture {
                 texture,
-                local_min: tile.local_min,
+                local_min_offset: Vec2::new(
+                    tile.local_min.x - origin.x,
+                    tile.local_min.y - origin.y,
+                ),
                 width: tile.width,
                 height: tile.height,
                 pixels_per_unit: tile.pixels_per_unit,
             })
         }
     };
+    let local_min = Vec2::new(
+        origin.x + cached.local_min_offset.x,
+        origin.y + cached.local_min_offset.y,
+    );
     let local_max = Vec2::new(
-        cached.local_min.x + cached.width as f32 / cached.pixels_per_unit,
-        cached.local_min.y + cached.height as f32 / cached.pixels_per_unit,
+        local_min.x + cached.width as f32 / cached.pixels_per_unit,
+        local_min.y + cached.height as f32 / cached.pixels_per_unit,
     );
     let local_corners = [
-        cached.local_min,
-        Vec2::new(local_max.x, cached.local_min.y),
+        local_min,
+        Vec2::new(local_max.x, local_min.y),
         local_max,
-        Vec2::new(cached.local_min.x, local_max.y),
+        Vec2::new(local_min.x, local_max.y),
     ];
     let screen_corners: Vec<Pos2> = local_corners
         .iter()
@@ -1408,6 +1511,75 @@ mod tests {
             },
             tween,
         }
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn appearance_cache_signature_reuses_texture_for_translation_but_not_shape_change() {
+        let path = VPath {
+            anchors: [
+                Vec2::new(0.0, 0.0),
+                Vec2::new(20.0, 0.0),
+                Vec2::new(20.0, 20.0),
+                Vec2::new(0.0, 20.0),
+            ]
+            .into_iter()
+            .map(|point| Anchor {
+                point,
+                in_handle: None,
+                out_handle: None,
+            })
+            .collect(),
+            closed: true,
+        };
+        let vector = q0s_format::v2::VectorAsset {
+            asset_id: 7,
+            paths: vec![path.clone()],
+            fill: Some(Rgba {
+                r: 20,
+                g: 30,
+                b: 40,
+                a: 255,
+            }),
+            stroke: None,
+        };
+        let appearance = VectorAppearance {
+            material: q0s_format::v2::VectorMaterial::SoftHalo {
+                radius: 10.0,
+                opacity: 0.5,
+            },
+            erase_mask: Vec::new(),
+            material_source: vec![path.clone()],
+            clip_mask: vec![path],
+        };
+        let (before_hash, before_origin) = appearance_cache_signature(&vector, &appearance);
+
+        let delta = Vec2::new(73.0, -19.0);
+        let mut moved_vector = vector.clone();
+        for path in &mut moved_vector.paths {
+            for anchor in &mut path.anchors {
+                anchor.point.x += delta.x;
+                anchor.point.y += delta.y;
+            }
+        }
+        let moved_appearance = crate::appearance::transform_appearance(&appearance, |point| {
+            Vec2::new(point.x + delta.x, point.y + delta.y)
+        });
+        let (moved_hash, moved_origin) =
+            appearance_cache_signature(&moved_vector, &moved_appearance);
+        assert_eq!(
+            before_hash, moved_hash,
+            "pure movement must reuse the halo texture"
+        );
+        assert!((moved_origin.x - before_origin.x - delta.x).abs() < 1.0e-4);
+        assert!((moved_origin.y - before_origin.y - delta.y).abs() < 1.0e-4);
+
+        moved_vector.paths[0].anchors[1].point.x += 4.0;
+        let (changed_hash, _) = appearance_cache_signature(&moved_vector, &moved_appearance);
+        assert_ne!(
+            moved_hash, changed_hash,
+            "topology/shape edits must invalidate stale halo pixels"
+        );
     }
 
     #[test]

@@ -234,6 +234,8 @@ fn convert_to_q0rg_keeps_vector_appearance_attached_to_the_asset() {
             ],
             closed: true,
         }],
+        material_source: Vec::new(),
+        clip_mask: Vec::new(),
     };
     app.state
         .project

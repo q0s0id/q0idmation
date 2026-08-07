@@ -1060,15 +1060,17 @@ struct RawFillCandidate {
 struct RawFillStyle {
     color: Rgba,
     material: Option<VectorMaterial>,
+    fragmented: bool,
 }
 
 fn raw_fill_style(project: &ProjectV2, candidate: &RawFillCandidate) -> RawFillStyle {
+    let appearance = project.asset_appearances.get(&candidate.asset_id);
     RawFillStyle {
         color: candidate.color,
-        material: project
-            .asset_appearances
-            .get(&candidate.asset_id)
-            .map(|appearance| appearance.material),
+        material: appearance.map(|appearance| appearance.material),
+        fragmented: appearance.is_some_and(|appearance| {
+            !appearance.material_source.is_empty() || !appearance.clip_mask.is_empty()
+        }),
     }
 }
 
@@ -1103,6 +1105,7 @@ pub fn commit_brush_region(
     let requested_style = RawFillStyle {
         color: settings.color,
         material: requested_material,
+        fragmented: false,
     };
 
     // A raw drawing is one planar paint surface per visual style. Plain vector
@@ -1244,6 +1247,12 @@ pub(crate) fn merge_touching_raw_fills_after_edit(
 
     let mut updates = Vec::new();
     for (style, items) in groups {
+        // A post-material fragment is a slice of one already-resolved filter
+        // field. Geometry-merging those slices would make the filter evaluate
+        // again from the merged contours and resurrect the split-edge glow.
+        if style.fragmented {
+            continue;
+        }
         let color = style.color;
         let source_surfaces: Vec<MultiPolygon<f64>> = items
             .iter()
