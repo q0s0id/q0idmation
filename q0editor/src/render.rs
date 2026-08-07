@@ -1378,8 +1378,8 @@ fn paint_vector_appearance_halo(
     if vector.fill.is_none() || vector.stroke.is_some() {
         return;
     }
-    let target_ppu = (view.scale * transform.uniform_scale() * 2.0).clamp(1.0, 8.0);
-    let bucket = (target_ppu * 4.0).round().clamp(4.0, 32.0) as u16;
+    let target_ppu = (view.scale * transform.uniform_scale() * 2.0).clamp(1.0, 4.0);
+    let bucket = (target_ppu * 4.0).round().clamp(4.0, 16.0) as u16;
     let ppu = f32::from(bucket) / 4.0;
     let (fingerprint, origin) = appearance_cache_signature(vector, appearance);
     let key = (vector.asset_id, bucket, fingerprint);
@@ -1465,9 +1465,9 @@ fn masked_vector_body_contours(
     transform: Affine,
     view: &StageView,
 ) -> Vec<Vec<Pos2>> {
-    if appearance.erase_mask.is_empty() {
+    if appearance.erase_mask.is_empty() && appearance.clip_mask.is_empty() {
         // Preserve the exact normal vector-render path until there is an actual
-        // mask to clip. Merely enabling Glow must never polygonize the artwork.
+        // post-material/erase clip. Merely enabling Glow must never polygonize the artwork.
         return vector
             .paths
             .iter()
@@ -1580,6 +1580,82 @@ mod tests {
             moved_hash, changed_hash,
             "topology/shape edits must invalidate stale halo pixels"
         );
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn vector_body_obeys_post_material_clip_even_without_erase_mask() {
+        let vector = q0s_format::v2::VectorAsset {
+            asset_id: 1,
+            paths: vec![VPath {
+                anchors: [
+                    Vec2::new(0.0, 0.0),
+                    Vec2::new(20.0, 0.0),
+                    Vec2::new(20.0, 20.0),
+                    Vec2::new(0.0, 20.0),
+                ]
+                .into_iter()
+                .map(|point| Anchor {
+                    point,
+                    in_handle: None,
+                    out_handle: None,
+                })
+                .collect(),
+                closed: true,
+            }],
+            fill: Some(Rgba {
+                r: 10,
+                g: 20,
+                b: 30,
+                a: 255,
+            }),
+            stroke: None,
+        };
+        let appearance = VectorAppearance {
+            material: q0s_format::v2::VectorMaterial::SoftHalo {
+                radius: 8.0,
+                opacity: 0.5,
+            },
+            erase_mask: Vec::new(),
+            material_source: vector.paths.clone(),
+            clip_mask: vec![VPath {
+                anchors: [
+                    Vec2::new(10.0, -20.0),
+                    Vec2::new(40.0, -20.0),
+                    Vec2::new(40.0, 40.0),
+                    Vec2::new(10.0, 40.0),
+                ]
+                .into_iter()
+                .map(|point| Anchor {
+                    point,
+                    in_handle: None,
+                    out_handle: None,
+                })
+                .collect(),
+                closed: true,
+            }],
+        };
+        let view = StageView {
+            origin: Pos2::ZERO,
+            scale: 1.0,
+            stage_rect: egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(100.0, 100.0)),
+        };
+        let contours = masked_vector_body_contours(&vector, &appearance, Affine::IDENTITY, &view);
+        let min_x = contours
+            .iter()
+            .flatten()
+            .map(|point| point.x)
+            .fold(f32::INFINITY, f32::min);
+        let max_x = contours
+            .iter()
+            .flatten()
+            .map(|point| point.x)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            min_x >= 9.9,
+            "body must be clipped at the post-material boundary: {min_x}"
+        );
+        assert!(max_x <= 20.1);
     }
 
     #[test]

@@ -31,4 +31,6 @@ this branch keeps the classic brush and eraser engine as the only tool path. the
 this remains feature-gated while the visual/material model is being proven, but it is no longer runtime-only state.
 
 - partial raw-fill split does not re-evaluate filters from each new contour. both fragments retain the pre-split material source and complementary post-filter clips; translating a fragment translates its material/erase/clip state together.
+- a fragment's post-material clip is authoritative for rendering, hit-testing and selection bounds. hidden portions of the frozen source cannot start a drag, while a marquee containing only visible halo can still create and move a real fragment.
+- fragment rasterization is bounded around the post-material clip plus one finite filter radius instead of allocating a texture for the complete frozen source. editor halo quality is capped at 4 pixels per stage unit at extreme zoom so interactive cache rebuilds remain bounded.
 - halo textures use transparent overscan and remain continuous underneath the real vector fill, avoiding raster/vector AA cracks. cache fingerprints are content-aware and translation-invariant so moving a fragment reuses the same texture while real shape edits invalidate it.

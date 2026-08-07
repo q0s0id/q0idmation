@@ -379,26 +379,28 @@ fn rasterize_vector_appearance_local_impl(
 ) -> Option<RasterizedVectorAppearance> {
     let fill = vector.fill?;
     let pixels_per_unit = pixels_per_unit.clamp(0.5, 8.0);
-    let mut min_x = f32::INFINITY;
-    let mut min_y = f32::INFINITY;
-    let mut max_x = f32::NEG_INFINITY;
-    let mut max_y = f32::NEG_INFINITY;
     let material_paths: &[crate::v2::Path] = if appearance.material_source.is_empty() {
         &vector.paths
     } else {
         &appearance.material_source
     };
-    for path in material_paths.iter().filter(|path| path.closed) {
-        for point in flatten_path(path, FLATTEN_SAMPLES) {
-            min_x = min_x.min(point.x);
-            min_y = min_y.min(point.y);
-            max_x = max_x.max(point.x);
-            max_y = max_y.max(point.y);
+    let path_bounds = |paths: &[crate::v2::Path]| -> Option<(f32, f32, f32, f32)> {
+        let mut min_x = f32::INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        for path in paths.iter().filter(|path| path.closed) {
+            for point in flatten_path(path, FLATTEN_SAMPLES) {
+                min_x = min_x.min(point.x);
+                min_y = min_y.min(point.y);
+                max_x = max_x.max(point.x);
+                max_y = max_y.max(point.y);
+            }
         }
-    }
-    if !min_x.is_finite() || !min_y.is_finite() || !max_x.is_finite() || !max_y.is_finite() {
-        return None;
-    }
+        (min_x.is_finite() && min_y.is_finite() && max_x.is_finite() && max_y.is_finite())
+            .then_some((min_x, min_y, max_x, max_y))
+    };
+    let source_bounds = path_bounds(material_paths)?;
     let material_margin = match appearance.material {
         VectorMaterial::Solid => 0.0,
         VectorMaterial::SoftHalo { radius, .. } => radius.max(0.0),
@@ -407,9 +409,19 @@ fn rasterize_vector_appearance_local_impl(
     // sampling must never touch the texture edge while the halo still has alpha,
     // otherwise the vector/halo seam exposes square holes at high zoom.
     let filter_guard = 4.0 / pixels_per_unit;
-    let margin = material_margin + filter_guard;
-    let local_min = Vec2::new(min_x - margin, min_y - margin);
-    let local_max = Vec2::new(max_x + margin, max_y + margin);
+    let (work_bounds, work_margin) = if appearance.clip_mask.is_empty() {
+        (source_bounds, material_margin + filter_guard)
+    } else {
+        // A post-material fragment only needs source samples within one finite
+        // filter radius of its clip. Rasterising the complete frozen source for
+        // every tiny split fragment was the dominant selection/drag stall.
+        (
+            path_bounds(&appearance.clip_mask)?,
+            material_margin + filter_guard,
+        )
+    };
+    let local_min = Vec2::new(work_bounds.0 - work_margin, work_bounds.1 - work_margin);
+    let local_max = Vec2::new(work_bounds.2 + work_margin, work_bounds.3 + work_margin);
     let width = (((local_max.x - local_min.x) * pixels_per_unit).ceil() as u32).max(1);
     let height = (((local_max.y - local_min.y) * pixels_per_unit).ceil() as u32).max(1);
     const MAX_SIDE: u32 = 8192;
@@ -454,18 +466,17 @@ fn rasterize_vector_appearance_local_impl(
         );
         rgba.chunks_exact(4).map(|pixel| pixel[3]).collect()
     };
-    let body_alpha = raster_alpha(&to_contours(&vector.paths));
     let material_source_alpha = raster_alpha(&to_contours(material_paths));
 
     let material_alpha = match appearance.material {
         VectorMaterial::Solid => {
             if include_base {
-                body_alpha
-                    .iter()
-                    .map(|alpha| ((u16::from(*alpha) * u16::from(fill.a) + 127) / 255) as u8)
+                raster_alpha(&to_contours(&vector.paths))
+                    .into_iter()
+                    .map(|alpha| ((u16::from(alpha) * u16::from(fill.a) + 127) / 255) as u8)
                     .collect::<Vec<_>>()
             } else {
-                vec![0; body_alpha.len()]
+                vec![0; pixel_count]
             }
         }
         VectorMaterial::SoftHalo { radius, opacity } => {
@@ -475,23 +486,30 @@ fn rasterize_vector_appearance_local_impl(
                 height,
                 radius * pixels_per_unit,
             );
-            body_alpha
-                .iter()
-                .zip(blurred)
-                .map(|(body, blur)| {
-                    let base = f32::from(*body) * f32::from(fill.a) / 255.0;
-                    let halo = f32::from(blur) * f32::from(fill.a) / 255.0 * opacity;
-                    if include_base {
+            if include_base {
+                let body_alpha = raster_alpha(&to_contours(&vector.paths));
+                body_alpha
+                    .into_iter()
+                    .zip(blurred)
+                    .map(|(body, blur)| {
+                        let base = f32::from(body) * f32::from(fill.a) / 255.0;
+                        let halo = f32::from(blur) * f32::from(fill.a) / 255.0 * opacity;
                         base.max(halo).clamp(0.0, 255.0).round() as u8
-                    } else {
-                        // Keep the halo continuous underneath the real vector.
-                        // Cutting a bitmap-shaped hole here can never line up
-                        // exactly with egui/lyon vector AA and exposes square
-                        // background gaps along diagonal/curved edges.
-                        halo.clamp(0.0, 255.0).round() as u8
-                    }
-                })
-                .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                // Keep the halo continuous underneath the real vector. Cutting
+                // a bitmap-shaped hole here can never line up exactly with
+                // egui/lyon vector AA and exposes square background gaps.
+                blurred
+                    .into_iter()
+                    .map(|blur| {
+                        (f32::from(blur) * f32::from(fill.a) / 255.0 * opacity)
+                            .clamp(0.0, 255.0)
+                            .round() as u8
+                    })
+                    .collect::<Vec<_>>()
+            }
         }
     };
 
@@ -1230,24 +1248,29 @@ mod resolver_tests {
         let whole_tile = rasterize_vector_appearance_local(&original, &whole, 4.0).unwrap();
         let left_tile = rasterize_vector_appearance_local(&left, &left_appearance, 4.0).unwrap();
         let right_tile = rasterize_vector_appearance_local(&right, &right_appearance, 4.0).unwrap();
-        assert_eq!(whole_tile.local_min, left_tile.local_min);
-        assert_eq!(whole_tile.local_min, right_tile.local_min);
-        assert_eq!(
-            (whole_tile.width, whole_tile.height),
-            (left_tile.width, left_tile.height)
-        );
-        assert_eq!(
-            (whole_tile.width, whole_tile.height),
-            (right_tile.width, right_tile.height)
-        );
-
-        for index in 0..(whole_tile.width as usize * whole_tile.height as usize) {
-            let whole_alpha = whole_tile.rgba[index * 4 + 3];
-            let split_alpha = left_tile.rgba[index * 4 + 3].max(right_tile.rgba[index * 4 + 3]);
-            assert!(
-                whole_alpha.abs_diff(split_alpha) <= 1,
-                "post-material split changed resolved alpha at pixel {index}: whole={whole_alpha}, split={split_alpha}"
-            );
+        let sample_or_clear = |tile: &RasterizedVectorAppearance, local: Vec2| -> u8 {
+            let px = (local.x - tile.local_min.x) * tile.pixels_per_unit;
+            let py = (local.y - tile.local_min.y) * tile.pixels_per_unit;
+            if px < 0.0 || py < 0.0 || px >= tile.width as f32 || py >= tile.height as f32 {
+                0
+            } else {
+                appearance_pixel(tile, local)[3]
+            }
+        };
+        for y in 0..whole_tile.height {
+            for x in 0..whole_tile.width {
+                let local = Vec2::new(
+                    whole_tile.local_min.x + (x as f32 + 0.5) / whole_tile.pixels_per_unit,
+                    whole_tile.local_min.y + (y as f32 + 0.5) / whole_tile.pixels_per_unit,
+                );
+                let whole_alpha = appearance_pixel(&whole_tile, local)[3];
+                let split_alpha =
+                    sample_or_clear(&left_tile, local).max(sample_or_clear(&right_tile, local));
+                assert!(
+                    whole_alpha.abs_diff(split_alpha) <= 1,
+                    "post-material split changed resolved alpha at ({x},{y}): whole={whole_alpha}, split={split_alpha}"
+                );
+            }
         }
 
         let right_halo = rasterize_vector_halo_local(&right, &right_appearance, 4.0).unwrap();
@@ -1259,6 +1282,57 @@ mod resolver_tests {
         assert!(
             appearance_pixel(&right_halo, Vec2::new(22.0, 10.0))[3] > 0,
             "the original external edge must retain its halo"
+        );
+    }
+
+    #[test]
+    fn post_material_clip_limits_raster_work_to_the_fragment_neighbourhood() {
+        let fill = Rgba {
+            r: 200,
+            g: 30,
+            b: 20,
+            a: 255,
+        };
+        let source_path = rectangle_path(0.0, 0.0, 300.0, 300.0);
+        let vector = VectorAsset {
+            asset_id: 1,
+            paths: vec![source_path.clone()],
+            fill: Some(fill),
+            stroke: None,
+        };
+        let whole = VectorAppearance {
+            material: VectorMaterial::SoftHalo {
+                radius: 12.0,
+                opacity: 0.6,
+            },
+            erase_mask: Vec::new(),
+            material_source: Vec::new(),
+            clip_mask: Vec::new(),
+        };
+        let fragment = VectorAppearance {
+            material: whole.material,
+            erase_mask: Vec::new(),
+            material_source: vec![source_path],
+            clip_mask: vec![rectangle_path(-10.0, 120.0, 20.0, 180.0)],
+        };
+        let whole_tile = rasterize_vector_halo_local(&vector, &whole, 4.0).unwrap();
+        let fragment_tile = rasterize_vector_halo_local(&vector, &fragment, 4.0).unwrap();
+        assert!(
+            fragment_tile.width < whole_tile.width / 4,
+            "tiny post-material clip must not allocate the full source width: fragment={} whole={}",
+            fragment_tile.width,
+            whole_tile.width,
+        );
+        assert!(
+            fragment_tile.height < whole_tile.height / 2,
+            "fragment raster height should be bounded around its clip: fragment={} whole={}",
+            fragment_tile.height,
+            whole_tile.height,
+        );
+        assert!(appearance_pixel(&fragment_tile, Vec2::new(-5.0, 150.0))[3] > 0);
+        assert_eq!(
+            appearance_pixel(&fragment_tile, Vec2::new(100.0, 150.0))[3],
+            0
         );
     }
 

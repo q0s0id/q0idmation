@@ -839,38 +839,48 @@ fn selectable_component_at_cursor(
     let _ = (project, asset_id);
     let point = Point::new(cursor.x as f64, cursor.y as f64);
     let source = vector_fill_geometry(vector);
-    #[cfg(feature = "appearance-mask-eraser")]
-    let appearance = project.asset_appearances.get(&asset_id);
-    #[cfg(feature = "appearance-mask-eraser")]
-    let mask = appearance
-        .map(|appearance| crate::appearance::mask_paths_to_coverage(&appearance.erase_mask))
-        .unwrap_or_else(|| MultiPolygon(Vec::new()));
 
-    for component in source.0 {
-        #[cfg(feature = "appearance-mask-eraser")]
-        let visible = if let Some(appearance) = appearance {
-            let support = crate::appearance::material_support(
-                &MultiPolygon(vec![component.clone()]),
-                appearance.material,
-            );
-            if mask.0.is_empty() {
-                support
-            } else {
-                support.difference(&mask)
-            }
-        } else {
-            MultiPolygon(vec![component.clone()])
-        };
-        #[cfg(not(feature = "appearance-mask-eraser"))]
-        let visible = MultiPolygon(vec![component.clone()]);
-
-        if visible.0.iter().any(|polygon| {
+    #[cfg(feature = "appearance-mask-eraser")]
+    {
+        // The resolved visual surface is the authoritative hitbox. In
+        // particular a frozen material source may extend far outside a split
+        // fragment's clip; those hidden pixels must never start a drag.
+        let actual_visible = raw_selectable_fill_surface(project, asset_id, vector);
+        let hits_actual = actual_visible.0.iter().any(|polygon| {
             polygon.contains(&point) || polygon_boundary_near_cursor(polygon, cursor, 2.0)
-        }) {
-            return Some(component);
+        });
+        if !hits_actual {
+            return None;
         }
+        let appearance = project.asset_appearances.get(&asset_id);
+        for component in source.0 {
+            let support = appearance.map_or_else(
+                || MultiPolygon(vec![component.clone()]),
+                |appearance| {
+                    crate::appearance::material_support(
+                        &MultiPolygon(vec![component.clone()]),
+                        appearance.material,
+                    )
+                },
+            );
+            if support.0.iter().any(|polygon| {
+                polygon.contains(&point) || polygon_boundary_near_cursor(polygon, cursor, 2.0)
+            }) {
+                return Some(component);
+            }
+        }
+        None
     }
-    None
+
+    #[cfg(not(feature = "appearance-mask-eraser"))]
+    {
+        for component in source.0 {
+            if component.contains(&point) || polygon_boundary_near_cursor(&component, cursor, 2.0) {
+                return Some(component);
+            }
+        }
+        None
+    }
 }
 
 fn surface_to_screen_contours(surface: &MultiPolygon<f64>, view: &StageView) -> Vec<Vec<Pos2>> {
@@ -1137,7 +1147,8 @@ fn cut_raw_areas_for_drag_prepared(
         placements,
         app.session.current_frame,
     );
-    let clip = rect_polygon(rect);
+    let clip_polygon = rect_polygon(rect);
+    let clip = MultiPolygon(vec![clip_polygon.clone()]);
     let mut jobs = Vec::new();
     let mut seen_assets = std::collections::BTreeSet::new();
     for r in placements {
@@ -1163,13 +1174,40 @@ fn cut_raw_areas_for_drag_prepared(
         else {
             continue;
         };
-        let surface = vector_fill_geometry(vector);
-        let selected = surface.intersection(&clip);
+        let source = vector_fill_geometry(vector);
+        #[cfg(feature = "appearance-mask-eraser")]
+        let appearance_enabled = app.state.project.asset_appearances.contains_key(&asset_id);
+        #[cfg(not(feature = "appearance-mask-eraser"))]
+        let appearance_enabled = false;
+
+        if appearance_enabled {
+            // Raw-area selection is based on what is actually visible. A marquee
+            // may contain only a piece of halo and no source fill at all; that is
+            // still a real post-material fragment and must be draggable without
+            // falling through to a whole-source click drag.
+            let visible = raw_selectable_fill_surface(&app.state.project, asset_id, vector);
+            let selected_visible = visible.intersection(&clip);
+            if selected_visible.unsigned_area() <= 0.05 {
+                continue;
+            }
+            let visible_remainder = visible.difference(&clip);
+            jobs.push((
+                *r,
+                asset_id,
+                source.intersection(&clip),
+                source.difference(&clip),
+                true,
+                visible_remainder.unsigned_area() <= 0.05,
+            ));
+            continue;
+        }
+
+        let selected = source.intersection(&clip);
         if selected.unsigned_area() <= 0.05 {
             continue;
         }
-        let remainder = surface.difference(&clip);
-        jobs.push((*r, asset_id, selected, remainder));
+        let remainder = source.difference(&clip);
+        jobs.push((*r, asset_id, selected, remainder, false, false));
     }
     if jobs.is_empty() {
         return Vec::new();
@@ -1187,13 +1225,8 @@ fn cut_raw_areas_for_drag_prepared(
 
     let mut refs = Vec::new();
     let mut appearance_changed = false;
-    for (r, asset_id, selected, remainder) in jobs {
-        #[cfg(feature = "appearance-mask-eraser")]
-        let appearance_enabled = app.state.project.asset_appearances.contains_key(&asset_id);
-        #[cfg(not(feature = "appearance-mask-eraser"))]
-        let appearance_enabled = false;
-
-        if appearance_enabled && !remainder.0.is_empty() {
+    for (r, asset_id, selected, remainder, appearance_enabled, whole_visual) in jobs {
+        if appearance_enabled {
             let Some(Asset::Vector(original)) = app
                 .state
                 .project
@@ -1204,27 +1237,73 @@ fn cut_raw_areas_for_drag_prepared(
             else {
                 continue;
             };
-            let selected_paths = geo_multi_polygon_to_linear_paths(&selected);
-            let remainder_paths = geo_multi_polygon_to_linear_paths(&remainder);
-            if selected_paths.is_empty() || remainder_paths.is_empty() {
+
+            if whole_visual {
+                // The marquee already contains the complete resolved fragment;
+                // no split is needed. Return its real source refs so the ordinary
+                // whole-asset move path can carry vector + appearance together.
+                refs.extend(
+                    original
+                        .paths
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(path_idx, path)| {
+                            path.closed.then_some(PathRef {
+                                q0rg_id: r.q0rg_id,
+                                layer_id: r.layer_id,
+                                placement_idx: r.placement_idx,
+                                path_idx,
+                            })
+                        }),
+                );
                 continue;
             }
-            if let Some(Asset::Vector(vector)) = app
-                .state
-                .project
-                .assets
-                .iter_mut()
-                .find(|asset| asset.id() == asset_id)
-            {
-                let mut paths: Vec<VPath> = vector
-                    .paths
-                    .iter()
-                    .filter(|path| !path.closed)
-                    .cloned()
-                    .collect();
-                paths.extend(remainder_paths);
-                vector.paths = paths;
+
+            let selected_has_body = selected.unsigned_area() > 0.05;
+            let remainder_has_body = remainder.unsigned_area() > 0.05;
+            let carrier_paths: Vec<VPath> = original
+                .paths
+                .iter()
+                .filter(|path| path.closed)
+                .cloned()
+                .collect();
+            if carrier_paths.is_empty() {
+                continue;
             }
+
+            // When the marquee cuts real fill we keep the compact physical body
+            // split. If it catches halo only (or all body but not all halo), the
+            // frozen source is duplicated only as an internal carrier; the
+            // post-material clip is authoritative for rendering/hit-testing.
+            let selected_paths = if selected_has_body {
+                let paths = geo_multi_polygon_to_linear_paths(&selected);
+                if paths.is_empty() {
+                    carrier_paths.clone()
+                } else {
+                    paths
+                }
+            } else {
+                carrier_paths.clone()
+            };
+            if selected_has_body && remainder_has_body {
+                if let Some(Asset::Vector(vector)) = app
+                    .state
+                    .project
+                    .assets
+                    .iter_mut()
+                    .find(|asset| asset.id() == asset_id)
+                {
+                    let mut paths: Vec<VPath> = vector
+                        .paths
+                        .iter()
+                        .filter(|path| !path.closed)
+                        .cloned()
+                        .collect();
+                    paths.extend(geo_multi_polygon_to_linear_paths(&remainder));
+                    vector.paths = paths;
+                }
+            }
+
             let selected_asset_id = next_asset_id(&app.state.project);
             app.state.project.assets.push(Asset::Vector(VectorAsset {
                 asset_id: selected_asset_id,
@@ -1238,7 +1317,7 @@ fn cut_raw_areas_for_drag_prepared(
                 asset_id,
                 selected_asset_id,
                 &original.paths,
-                &MultiPolygon(vec![clip.clone()]),
+                &clip,
                 false,
             );
 
@@ -8366,6 +8445,174 @@ mod tests {
             None,
             "pixels removed by the appearance mask must not remain selectable"
         );
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn post_material_clip_is_the_real_halo_hitbox() {
+        let mut project = appearance_selection_project(false);
+        let original = match &project.assets[0] {
+            Asset::Vector(vector) => vector.paths.clone(),
+            _ => unreachable!(),
+        };
+        let appearance = project.asset_appearances.get_mut(&1).unwrap();
+        appearance.material_source = original;
+        appearance.clip_mask = vec![VPath {
+            anchors: vec![
+                anchor(Vec2::new(24.0, 6.0)),
+                anchor(Vec2::new(30.0, 6.0)),
+                anchor(Vec2::new(30.0, 14.0)),
+                anchor(Vec2::new(24.0, 14.0)),
+            ],
+            closed: true,
+        }];
+
+        assert_eq!(
+            hit_test_raw_selection(&project, 1, 0, Vec2::new(-5.0, 10.0)),
+            None,
+            "fresh support around the hidden source must not be a draggable hitbox outside the post-material clip"
+        );
+        assert!(matches!(
+            hit_test_raw_selection(&project, 1, 0, Vec2::new(26.0, 10.0)),
+            Some(RawSelectionHit::Fill(ref refs)) if refs.len() == 1 && refs[0].path_idx == 0
+        ));
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn halo_only_marquee_can_be_split_and_moved_without_dragging_the_whole_source() {
+        let mut app = EditorApp::default();
+        app.state.project = appearance_selection_project(false);
+        let original_path = match &app.state.project.assets[0] {
+            Asset::Vector(vector) => vector.paths[0].clone(),
+            _ => unreachable!(),
+        };
+        let selection = select_raw_area_by_rect(&app.state.project, 1, 0, (-8.0, 6.0, -2.0, 14.0))
+            .expect("pure halo marquee must select visible appearance pixels");
+        let Selection::RawArea {
+            placements,
+            bounds_min,
+            bounds_max,
+            ..
+        } = selection
+        else {
+            panic!("halo marquee must remain a raw-area selection");
+        };
+        assert!(
+            bounds_max.x < 0.0,
+            "test rectangle must not touch source fill"
+        );
+
+        let refs = cut_raw_areas_for_drag(
+            &mut app,
+            &placements,
+            (bounds_min.x, bounds_min.y, bounds_max.x, bounds_max.y),
+        );
+        assert!(
+            !refs.is_empty(),
+            "drag materialisation must create a movable post-material fragment even when the marquee contains halo only"
+        );
+        assert_eq!(app.state.project.q0rgs[0].layers[0].placements.len(), 2);
+        let selected_placement = refs[0].placement_idx;
+        let selected_asset_id =
+            match app.state.project.q0rgs[0].layers[0].placements[selected_placement].target {
+                Target::Asset(id) => id,
+                Target::Q0rg(_) => unreachable!(),
+            };
+        let selected_vector = match app
+            .state
+            .project
+            .assets
+            .iter()
+            .find(|asset| asset.id() == selected_asset_id)
+            .unwrap()
+        {
+            Asset::Vector(vector) => vector,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            selected_vector.paths,
+            vec![original_path.clone()],
+            "halo-only fragments may carry hidden source geometry internally, but selection/rendering must be clipped to the chosen visual slice"
+        );
+        let selected_visible = crate::appearance::visible_material_surface_for_vector(
+            selected_vector,
+            app.state.project.asset_appearances.get(&selected_asset_id),
+        );
+        let selected_bounds = selected_visible.bounding_rect().unwrap();
+        assert!(selected_bounds.max().x < -1.9);
+        assert!(selected_bounds.min().x >= -8.1);
+        assert_eq!(
+            hit_test_raw_selection(&app.state.project, 1, 0, Vec2::new(10.0, 10.0))
+                .and_then(|hit| match hit {
+                    RawSelectionHit::Fill(refs) => refs.first().copied(),
+                    RawSelectionHit::Path(path) => Some(path),
+                })
+                .map(|reference| reference.placement_idx),
+            Some(0),
+            "the original body must still belong to the remainder fragment, not the halo-only fragment"
+        );
+        assert_eq!(
+            hit_test_raw_selection(&app.state.project, 1, 0, Vec2::new(-5.0, 10.0))
+                .and_then(|hit| match hit {
+                    RawSelectionHit::Fill(refs) => refs.first().copied(),
+                    RawSelectionHit::Path(path) => Some(path),
+                })
+                .map(|reference| reference.placement_idx),
+            Some(selected_placement),
+            "only the actually clipped halo slice may start the selected fragment drag"
+        );
+
+        let start_paths: Vec<VPath> = refs
+            .iter()
+            .map(|reference| {
+                raw_path_clone(
+                    &app.state.project,
+                    reference.q0rg_id,
+                    reference.layer_id,
+                    reference.placement_idx,
+                    reference.path_idx,
+                )
+                .unwrap()
+            })
+            .collect();
+        let start_appearances =
+            capture_whole_asset_appearances_for_raw_refs(&app.state.project, &refs);
+        let delta = Vec2::new(40.0, 0.0);
+        for (reference, source) in refs.iter().zip(&start_paths) {
+            assert!(replace_raw_path_translated(
+                &mut app.state.project,
+                reference.q0rg_id,
+                reference.layer_id,
+                reference.placement_idx,
+                reference.path_idx,
+                source,
+                delta,
+            ));
+        }
+        assert!(translate_captured_appearances(
+            &mut app.state.project,
+            &start_appearances,
+            delta,
+        ));
+        let selected_vector = match app
+            .state
+            .project
+            .assets
+            .iter()
+            .find(|asset| asset.id() == selected_asset_id)
+            .unwrap()
+        {
+            Asset::Vector(vector) => vector,
+            _ => unreachable!(),
+        };
+        let moved = crate::appearance::visible_material_surface_for_vector(
+            selected_vector,
+            app.state.project.asset_appearances.get(&selected_asset_id),
+        );
+        let moved_bounds = moved.bounding_rect().unwrap();
+        assert!((moved_bounds.min().x - (selected_bounds.min().x + 40.0)).abs() < 0.05);
+        assert!((moved_bounds.max().x - (selected_bounds.max().x + 40.0)).abs() < 0.05);
     }
 
     #[cfg(feature = "appearance-mask-eraser")]

@@ -227,9 +227,15 @@ pub(crate) fn visible_material_surface_for_vector(
     let Some(appearance) = appearance else {
         return crate::brush::vector_fill_geometry(vector);
     };
-    let material_source = material_source_surface(vector, appearance);
-    let support = material_support(&material_source, appearance.material);
-    let clipped = clip_surface(support, appearance);
+    // A post-material fragment clip is already a partition of the finite
+    // resolved material support. Re-buffering the frozen source on every
+    // selection/hover frame is both redundant and extremely expensive.
+    let clipped = if appearance.clip_mask.is_empty() {
+        let material_source = material_source_surface(vector, appearance);
+        material_support(&material_source, appearance.material)
+    } else {
+        mask_paths_to_coverage(&appearance.clip_mask)
+    };
     let mask = mask_paths_to_coverage(&appearance.erase_mask);
     if mask.0.is_empty() {
         clipped
@@ -256,6 +262,15 @@ pub(crate) fn visible_material_surface_for_paths(
     let Some(appearance) = appearance else {
         return subset_source;
     };
+    let all_closed_selected = vector
+        .paths
+        .iter()
+        .enumerate()
+        .filter(|(_, path)| path.closed)
+        .all(|(index, _)| path_indices.contains(&index));
+    if all_closed_selected {
+        return visible_material_surface_for_vector(vector, Some(appearance));
+    }
     let subset_support = material_support(&subset_source, appearance.material);
     visible_material_surface_for_vector(vector, Some(appearance)).intersection(&subset_support)
 }
