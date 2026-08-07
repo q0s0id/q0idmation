@@ -6508,6 +6508,62 @@ fn selection_stipple_step(rect: egui::Rect) -> f32 {
     BASE_STEP_PX.max((area / MAX_CANDIDATES).sqrt())
 }
 
+#[cfg(feature = "appearance-mask-eraser")]
+fn appearance_selection_stipple_step(rect: egui::Rect) -> f32 {
+    const BASE_STEP_PX: f32 = 6.0;
+    const MAX_CANDIDATES: f32 = 900.0;
+    let area = rect.width().max(0.0) * rect.height().max(0.0);
+    BASE_STEP_PX.max((area / MAX_CANDIDATES).sqrt())
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn appearance_selection_stipple_points(
+    view: &StageView,
+    rect: egui::Rect,
+    tester: &crate::appearance::VisibleMaterialHitTester,
+    subset_support: Option<(&MultiPolygon<f64>, q0s_format::v2::VectorMaterial)>,
+) -> Vec<Pos2> {
+    let step = appearance_selection_stipple_step(rect);
+    let mut points = Vec::new();
+    let mut y = rect.top() + step * 0.5;
+    while y < rect.bottom() {
+        let mut x = rect.left() + step * 0.5;
+        while x < rect.right() {
+            let world = Vec2::new(
+                (x - view.origin.x) / view.scale,
+                (y - view.origin.y) / view.scale,
+            );
+            let subset_hit = subset_support.is_none_or(|(surface, material)| {
+                crate::appearance::material_support_contains_point(
+                    surface,
+                    material,
+                    tester.canonical_point(world),
+                    0.0,
+                )
+            });
+            if subset_hit && tester.contains(world, 0.0) {
+                points.push(Pos2::new(x, y));
+            }
+            x += step;
+        }
+        y += step;
+    }
+    points
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn draw_appearance_selection_stipple(
+    painter: &Painter,
+    view: &StageView,
+    rect: egui::Rect,
+    tester: &crate::appearance::VisibleMaterialHitTester,
+    subset_support: Option<(&MultiPolygon<f64>, q0s_format::v2::VectorMaterial)>,
+) {
+    let clipped = painter.with_clip_rect(rect);
+    for point in appearance_selection_stipple_points(view, rect, tester, subset_support) {
+        clipped.circle_filled(point, 0.9, Color32::WHITE);
+    }
+}
 fn draw_raw_area_selection(
     app: &EditorApp,
     painter: &Painter,
@@ -6544,11 +6600,14 @@ fn draw_raw_area_selection(
             continue;
         };
         #[cfg(feature = "appearance-mask-eraser")]
-        if app.state.project.asset_appearances.contains_key(&asset_id) {
-            // The glow itself is already a cached raster layer. Rebuilding its
-            // polygonal buffer just to paint selection stipple caused the
-            // selection-frame freeze. The marquee/transform box is enough UI
-            // feedback; hit-testing still follows the exact visible material.
+        if let Some(appearance) = app.state.project.asset_appearances.get(&asset_id) {
+            if let Some(tester) =
+                crate::appearance::prepare_visible_material_hit_tester(vector, Some(appearance))
+            {
+                draw_appearance_selection_stipple(painter, view, selection_rect, &tester, None);
+            }
+            // Do not add the appearance to `surfaces`: doing so would rebuild
+            // the expensive buffered glow for the legacy stipple pass below.
             continue;
         }
         let surface = raw_selectable_fill_surface(&app.state.project, asset_id, vector);
@@ -6676,18 +6735,59 @@ fn draw_raw_paths_overlay(
         }
         #[cfg(feature = "appearance-mask-eraser")]
         if let Some(appearance) = app.state.project.asset_appearances.get(&asset_id) {
-            if draw_boxes {
-                if let Some((min_x, min_y, max_x, max_y)) =
-                    crate::appearance::fast_visible_material_bounds_for_paths(
-                        vector,
-                        Some(appearance),
-                        &closed_indices,
-                    )
+            let fast_bounds = crate::appearance::fast_visible_material_bounds_for_paths(
+                vector,
+                Some(appearance),
+                &closed_indices,
+            );
+            let fallback_bounds = || {
+                let mut bounds: Option<(f32, f32, f32, f32)> = None;
+                for index in &closed_indices {
+                    let Some(path) = vector.paths.get(*index) else {
+                        continue;
+                    };
+                    for anchor in &path.anchors {
+                        let point = anchor.point;
+                        bounds = Some(match bounds {
+                            Some((min_x, min_y, max_x, max_y)) => (
+                                min_x.min(point.x),
+                                min_y.min(point.y),
+                                max_x.max(point.x),
+                                max_y.max(point.y),
+                            ),
+                            None => (point.x, point.y, point.x, point.y),
+                        });
+                    }
+                }
+                bounds
+            };
+            if let Some((min_x, min_y, max_x, max_y)) = fast_bounds.or_else(fallback_bounds) {
+                let rect = egui::Rect::from_min_max(
+                    stage_to_screen(Vec2::new(min_x, min_y), view),
+                    stage_to_screen(Vec2::new(max_x, max_y), view),
+                );
+                if let Some(tester) =
+                    crate::appearance::prepare_visible_material_hit_tester(vector, Some(appearance))
                 {
-                    let rect = egui::Rect::from_min_max(
-                        stage_to_screen(Vec2::new(min_x, min_y), view),
-                        stage_to_screen(Vec2::new(max_x, max_y), view),
-                    );
+                    let subset = VectorAsset {
+                        asset_id: vector.asset_id,
+                        paths: closed_indices
+                            .iter()
+                            .filter_map(|index| vector.paths.get(*index).cloned())
+                            .collect(),
+                        fill: vector.fill,
+                        stroke: None,
+                    };
+                    let subset_surface = vector_fill_geometry(&subset);
+                    let canonical_subset = appearance.field_transform.inverse().map(|inverse| {
+                        crate::appearance::transform_surface(&subset_surface, inverse)
+                    });
+                    let subset_support = canonical_subset
+                        .as_ref()
+                        .map(|surface| (surface, appearance.material));
+                    draw_appearance_selection_stipple(painter, view, rect, &tester, subset_support);
+                }
+                if draw_boxes {
                     draw_flash_selection_box(painter, rect, selection_color(app));
                 }
             }
@@ -8500,6 +8600,42 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn glow_selection_overlay_stipple_remains_visible_and_respects_erased_hole() {
+        let project = appearance_selection_project(true);
+        let vector = match &project.assets[0] {
+            Asset::Vector(vector) => vector,
+            _ => unreachable!(),
+        };
+        let appearance = &project.asset_appearances[&1];
+        let tester =
+            crate::appearance::prepare_visible_material_hit_tester(vector, Some(appearance))
+                .expect("appearance hit tester");
+        let view = StageView {
+            origin: Pos2::new(0.0, 0.0),
+            scale: 1.0,
+            stage_rect: egui::Rect::from_min_max(Pos2::new(-20.0, -20.0), Pos2::new(50.0, 50.0)),
+        };
+        let rect = egui::Rect::from_min_max(Pos2::new(-10.0, -10.0), Pos2::new(30.0, 30.0));
+        let points = appearance_selection_stipple_points(&view, rect, &tester, None);
+        assert!(
+            !points.is_empty(),
+            "selected glow must still produce visible overlay stipple"
+        );
+        assert!(
+            points
+                .iter()
+                .any(|point| point.x < 0.0 && point.y >= 0.0 && point.y <= 20.0),
+            "overlay must visibly reach the selectable halo outside source geometry: {points:?}"
+        );
+        assert!(
+            points.iter().all(|point| {
+                !(point.x >= 7.0 && point.x <= 13.0 && point.y >= 7.0 && point.y <= 13.0)
+            }),
+            "erased appearance hole must remain empty in the selection overlay: {points:?}"
+        );
+    }
     #[cfg(feature = "appearance-mask-eraser")]
     #[test]
     fn post_material_clip_is_the_real_halo_hitbox() {

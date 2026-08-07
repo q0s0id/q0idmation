@@ -278,37 +278,72 @@ pub(crate) fn material_support_contains_point(
 /// point belongs to the buffer iff its distance to the filled source is at
 /// most the halo radius. Selection/hover calls this every frame, so avoiding
 /// `geo::Buffer` here is critical for dense classic-brush contours.
+pub(crate) struct VisibleMaterialHitTester {
+    inverse_field: Affine,
+    support: MultiPolygon<f64>,
+    material: VectorMaterial,
+    support_is_post_material_clip: bool,
+    erase: MultiPolygon<f64>,
+}
+
+impl VisibleMaterialHitTester {
+    pub(crate) fn canonical_point(&self, point: Vec2) -> Vec2 {
+        self.inverse_field.apply(point)
+    }
+
+    pub(crate) fn contains(&self, point: Vec2, edge_tolerance: f32) -> bool {
+        let canonical_point = self.canonical_point(point);
+        let inside_support = if self.support_is_post_material_clip {
+            surface_contains_or_near(&self.support, canonical_point, edge_tolerance)
+        } else {
+            material_support_contains_point(
+                &self.support,
+                self.material,
+                canonical_point,
+                edge_tolerance,
+            )
+        };
+        inside_support && !surface_contains_or_near(&self.erase, canonical_point, 0.001)
+    }
+}
+
+pub(crate) fn prepare_visible_material_hit_tester(
+    vector: &VectorAsset,
+    appearance: Option<&VectorAppearance>,
+) -> Option<VisibleMaterialHitTester> {
+    let Some(appearance) = appearance else {
+        return Some(VisibleMaterialHitTester {
+            inverse_field: Affine::IDENTITY,
+            support: crate::brush::vector_fill_geometry(vector),
+            material: VectorMaterial::Solid,
+            support_is_post_material_clip: false,
+            erase: MultiPolygon(Vec::new()),
+        });
+    };
+    let inverse_field = appearance.field_transform.inverse()?;
+    let support_is_post_material_clip = !appearance.clip_mask.is_empty();
+    let support = if support_is_post_material_clip {
+        mask_paths_to_coverage(&appearance.clip_mask)
+    } else {
+        material_source_surface(vector, appearance)
+    };
+    Some(VisibleMaterialHitTester {
+        inverse_field,
+        support,
+        material: appearance.material,
+        support_is_post_material_clip,
+        erase: mask_paths_to_coverage(&appearance.erase_mask),
+    })
+}
+
 pub(crate) fn visible_material_contains_point(
     vector: &VectorAsset,
     appearance: Option<&VectorAppearance>,
     point: Vec2,
     edge_tolerance: f32,
 ) -> bool {
-    let Some(appearance) = appearance else {
-        let source = crate::brush::vector_fill_geometry(vector);
-        return surface_contains_or_near(&source, point, edge_tolerance);
-    };
-    let Some(inverse_field) = appearance.field_transform.inverse() else {
-        return false;
-    };
-    let canonical_point = inverse_field.apply(point);
-    let inside_support = if appearance.clip_mask.is_empty() {
-        let source = material_source_surface(vector, appearance);
-        material_support_contains_point(
-            &source,
-            appearance.material,
-            canonical_point,
-            edge_tolerance,
-        )
-    } else {
-        let clip = mask_paths_to_coverage(&appearance.clip_mask);
-        surface_contains_or_near(&clip, canonical_point, edge_tolerance)
-    };
-    if !inside_support {
-        return false;
-    }
-    let erase = mask_paths_to_coverage(&appearance.erase_mask);
-    !surface_contains_or_near(&erase, canonical_point, 0.001)
+    prepare_visible_material_hit_tester(vector, appearance)
+        .is_some_and(|tester| tester.contains(point, edge_tolerance))
 }
 
 fn path_anchor_bounds(paths: &[VPath]) -> Option<(f32, f32, f32, f32)> {
