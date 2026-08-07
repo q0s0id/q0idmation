@@ -237,6 +237,14 @@ pub enum TimelineClipboard {
     Layers(TimelineLayerClipboard),
 }
 
+#[derive(Debug, Clone)]
+pub struct RawVectorClipboard {
+    pub vector: VectorAsset,
+    /// Appearance is part of raw artwork, not renderer-only state. When present
+    /// it carries a frozen material source/post-material clip with the snapshot.
+    pub appearance: Option<VectorAppearance>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ClipboardPayload {
     /// Display-object placements. Targets remain project-local, matching the
@@ -244,7 +252,7 @@ pub struct ClipboardPayload {
     pub placements: Vec<Placement>,
     /// Standalone raw vector snapshots. Paste assigns fresh asset ids and
     /// keeps them as identity raw-graphics placements.
-    pub raw_vectors: Vec<VectorAsset>,
+    pub raw_vectors: Vec<RawVectorClipboard>,
     /// Timeline cells or complete layer/folder blocks. This stays project-local
     /// for the same reason as placement targets: ids refer to the open project.
     pub timeline: Option<TimelineClipboard>,

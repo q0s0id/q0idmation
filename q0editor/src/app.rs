@@ -6087,16 +6087,19 @@ mod tests {
         let mut app = held_raw_app();
         app.session.clipboard = Some(crate::state::ClipboardPayload {
             placements: Vec::new(),
-            raw_vectors: vec![q0s_format::v2::VectorAsset {
-                asset_id: 0,
-                paths: vec![test_square(40.0, 60.0)],
-                fill: Some(q0s_format::v2::Rgba {
-                    r: 200,
-                    g: 30,
-                    b: 40,
-                    a: 128,
-                }),
-                stroke: None,
+            raw_vectors: vec![crate::state::RawVectorClipboard {
+                vector: q0s_format::v2::VectorAsset {
+                    asset_id: 0,
+                    paths: vec![test_square(40.0, 60.0)],
+                    fill: Some(q0s_format::v2::Rgba {
+                        r: 200,
+                        g: 30,
+                        b: 40,
+                        a: 128,
+                    }),
+                    stroke: None,
+                },
+                appearance: None,
             }],
             timeline: None,
         });

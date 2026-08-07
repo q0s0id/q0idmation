@@ -2585,6 +2585,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "appearance-mask-eraser")]
     #[test]
     fn classic_brush_is_plain_vector_by_default_and_glow_is_opt_in() {
         let mut plain_app = EditorApp::default();
@@ -2615,6 +2616,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "appearance-mask-eraser")]
     #[test]
     fn plain_and_glowing_paint_of_same_colour_remain_distinct_styles() {
         let mut app = EditorApp::default();
@@ -2630,6 +2632,24 @@ mod tests {
 
         assert_eq!(app.state.project.assets.len(), 2);
         assert_eq!(app.state.project.asset_appearances.len(), 1);
+    }
+
+    #[cfg(not(feature = "appearance-mask-eraser"))]
+    #[test]
+    fn disabling_appearance_engine_restores_plain_merge_drawing_even_if_glow_is_set() {
+        let mut app = EditorApp::default();
+        let plain = settings(12.0, 0);
+        let glow = BrushSettings {
+            glow: true,
+            ..plain
+        };
+        let left = stroke(&[Vec2::new(10.0, 20.0), Vec2::new(30.0, 20.0)], plain);
+        commit_brush_region(&mut app, brush_finish(left, plain), plain);
+        let right = stroke(&[Vec2::new(25.0, 20.0), Vec2::new(45.0, 20.0)], glow);
+        commit_brush_region(&mut app, brush_finish(right, glow), glow);
+
+        assert_eq!(app.state.project.assets.len(), 1);
+        assert!(app.state.project.asset_appearances.is_empty());
     }
 
     #[test]

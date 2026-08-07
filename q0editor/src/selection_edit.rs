@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use geo::{Area, BooleanOps};
+use geo::{Area, BooleanOps, MultiPolygon};
 use q0s_format::v2::{
     Asset, Path as VPath, Placement, ProjectV2, Target, Transform2D, Tween, Vec2, VectorAsset,
 };
 
-use crate::state::{ClipboardPayload, PathRef, PlacementRef, Selection};
+use crate::state::{ClipboardPayload, PathRef, PlacementRef, RawVectorClipboard, Selection};
 
 #[derive(Debug, Clone, Default)]
 pub struct PasteResult {
@@ -64,7 +64,7 @@ fn selected_object_placements(project: &ProjectV2, selection: &Selection) -> Vec
         .collect()
 }
 
-fn selected_raw_vectors(project: &ProjectV2, selection: &Selection) -> Vec<VectorAsset> {
+fn selected_raw_vectors(project: &ProjectV2, selection: &Selection) -> Vec<RawVectorClipboard> {
     let path_refs: Option<Vec<PathRef>> = match selection {
         Selection::Path {
             q0rg_id,
@@ -120,14 +120,34 @@ fn selected_raw_vectors(project: &ProjectV2, selection: &Selection) -> Vec<Vecto
                 .into_iter()
                 .filter_map(|index| vector.paths.get(index).cloned())
                 .collect();
-            if !paths.is_empty() {
-                vectors.push(VectorAsset {
-                    asset_id: 0,
-                    paths,
-                    fill: vector.fill,
-                    stroke: vector.stroke,
-                });
+            if paths.is_empty() {
+                continue;
             }
+            let snapshot = VectorAsset {
+                asset_id: 0,
+                paths,
+                fill: vector.fill,
+                stroke: vector.stroke,
+            };
+            #[cfg(feature = "appearance-mask-eraser")]
+            let appearance = project
+                .asset_appearances
+                .get(&asset_id)
+                .and_then(|appearance| {
+                    let selected_geometry = crate::tools::vector_fill_geometry(&snapshot);
+                    let partition = crate::appearance::material_support(
+                        &selected_geometry,
+                        appearance.material,
+                    );
+                    crate::appearance::partition_appearance(appearance, &vector.paths, &partition)
+                        .map(|(_, selected)| selected)
+                });
+            #[cfg(not(feature = "appearance-mask-eraser"))]
+            let appearance = None;
+            vectors.push(RawVectorClipboard {
+                vector: snapshot,
+                appearance,
+            });
         }
         return vectors;
     }
@@ -141,7 +161,12 @@ fn selected_raw_vectors(project: &ProjectV2, selection: &Selection) -> Vec<Vecto
     else {
         return Vec::new();
     };
-    let clip = crate::tools::rect_polygon((bounds_min.x, bounds_min.y, bounds_max.x, bounds_max.y));
+    let clip = MultiPolygon(vec![crate::tools::rect_polygon((
+        bounds_min.x,
+        bounds_min.y,
+        bounds_max.x,
+        bounds_max.y,
+    ))]);
     let mut vectors = Vec::new();
     for reference in placements {
         let Some(placement) = placement_clone(project, *reference) else {
@@ -155,15 +180,76 @@ fn selected_raw_vectors(project: &ProjectV2, selection: &Selection) -> Vec<Vecto
         else {
             continue;
         };
-        let selected = crate::tools::vector_fill_geometry(vector).intersection(&clip);
+        let source = crate::tools::vector_fill_geometry(vector);
+
+        #[cfg(feature = "appearance-mask-eraser")]
+        if let Some(appearance) = project.asset_appearances.get(&asset_id) {
+            let visible =
+                crate::appearance::visible_material_surface_for_vector(vector, Some(appearance));
+            let selected_visible = visible.intersection(&clip);
+            if selected_visible.unsigned_area() <= 0.05 {
+                continue;
+            }
+            let selected_body = source.intersection(&clip);
+            let body_remainder = source.difference(&clip);
+            let paths = if selected_body.unsigned_area() > 0.05 {
+                if body_remainder.unsigned_area() <= 0.05 {
+                    // Whole-body capture keeps the original curves verbatim.
+                    vector.paths.clone()
+                } else {
+                    crate::tools::geo_multi_polygon_to_linear_paths(&selected_body)
+                }
+            } else {
+                // Halo-only marquee: preserve hidden carrier geometry internally;
+                // the post-material clip remains authoritative for what is visible.
+                vector
+                    .paths
+                    .iter()
+                    .filter(|path| path.closed)
+                    .cloned()
+                    .collect()
+            };
+            if paths.is_empty() {
+                continue;
+            }
+            let selected_appearance = if visible.difference(&clip).unsigned_area() <= 0.05 {
+                let mut frozen = appearance.clone();
+                if frozen.material_source.is_empty() {
+                    frozen.material_source = vector.paths.clone();
+                }
+                frozen
+            } else {
+                let Some((_, selected)) =
+                    crate::appearance::partition_appearance(appearance, &vector.paths, &clip)
+                else {
+                    continue;
+                };
+                selected
+            };
+            vectors.push(RawVectorClipboard {
+                vector: VectorAsset {
+                    asset_id: 0,
+                    paths,
+                    fill: vector.fill,
+                    stroke: None,
+                },
+                appearance: Some(selected_appearance),
+            });
+            continue;
+        }
+
+        let selected = source.intersection(&clip);
         let paths = crate::tools::geo_multi_polygon_to_linear_paths(&selected);
         if !paths.is_empty() {
-            vectors.push(VectorAsset {
-                asset_id: 0,
-                paths,
-                fill: vector.fill,
-                // Partial fill selection must not invent a stroke on the cut edge.
-                stroke: None,
+            vectors.push(RawVectorClipboard {
+                vector: VectorAsset {
+                    asset_id: 0,
+                    paths,
+                    fill: vector.fill,
+                    // Partial fill selection must not invent a stroke on the cut edge.
+                    stroke: None,
+                },
+                appearance: None,
             });
         }
     }
@@ -187,12 +273,24 @@ pub fn paste_payload(
 
     for source in &payload.raw_vectors {
         let asset_id = next_asset_id(project);
-        let mut vector = source.clone();
+        let mut vector = source.vector.clone();
         vector.asset_id = asset_id;
         translate_vector(&mut vector, offset);
         let path_count = vector.paths.len();
         let bounds = vector_bounds(&vector);
         project.assets.push(Asset::Vector(vector));
+        #[cfg(feature = "appearance-mask-eraser")]
+        if let Some(appearance) = &source.appearance {
+            let translated = crate::appearance::transform_appearance(
+                appearance,
+                q0s_format::transform::Affine {
+                    tx: offset.x,
+                    ty: offset.y,
+                    ..q0s_format::transform::Affine::IDENTITY
+                },
+            );
+            project.asset_appearances.insert(asset_id, translated);
+        }
 
         let Some(layer) = project
             .q0rgs
@@ -386,7 +484,12 @@ pub fn remove_raw_area_and_objects(
     bounds_max: Vec2,
     frame: u16,
 ) -> bool {
-    let clip = crate::tools::rect_polygon((bounds_min.x, bounds_min.y, bounds_max.x, bounds_max.y));
+    let clip = MultiPolygon(vec![crate::tools::rect_polygon((
+        bounds_min.x,
+        bounds_min.y,
+        bounds_max.x,
+        bounds_max.y,
+    ))]);
     let affected_layers: BTreeSet<(u16, u16)> = raw_placements
         .iter()
         .chain(objects.iter())
@@ -455,18 +558,65 @@ pub fn remove_raw_area_and_objects(
         };
         let surface = crate::tools::vector_fill_geometry(&snapshot);
         let selected = surface.intersection(&clip);
-        if selected.unsigned_area() <= 0.05 {
+        #[cfg(feature = "appearance-mask-eraser")]
+        let appearance = project.asset_appearances.get(&asset_id).cloned();
+        #[cfg(feature = "appearance-mask-eraser")]
+        let visible = appearance.as_ref().map(|appearance| {
+            crate::appearance::visible_material_surface_for_vector(&snapshot, Some(appearance))
+        });
+        #[cfg(feature = "appearance-mask-eraser")]
+        let selected_visual_area = visible
+            .as_ref()
+            .map(|visible| visible.intersection(&clip).unsigned_area());
+        #[cfg(not(feature = "appearance-mask-eraser"))]
+        let selected_visual_area: Option<f64> = None;
+        if selected_visual_area.unwrap_or_else(|| selected.unsigned_area()) <= 0.05 {
             continue;
         }
         changed = true;
         let remainder = surface.difference(&clip);
+
+        #[cfg(feature = "appearance-mask-eraser")]
+        let visible_remainder_area = visible
+            .as_ref()
+            .map(|visible| visible.difference(&clip).unsigned_area());
+        #[cfg(not(feature = "appearance-mask-eraser"))]
+        let visible_remainder_area: Option<f64> = None;
+
+        #[cfg(feature = "appearance-mask-eraser")]
+        if let Some(appearance) = appearance {
+            if let Some((source_appearance, _)) =
+                crate::appearance::partition_appearance(&appearance, &snapshot.paths, &clip)
+            {
+                project
+                    .asset_appearances
+                    .insert(asset_id, source_appearance);
+            }
+            if visible_remainder_area.is_some_and(|area| area <= 0.05) {
+                remove_refs.push(*reference);
+                continue;
+            }
+        }
+
+        if selected.unsigned_area() <= 0.05 {
+            // Halo-only removal changed just the post-material clip. The carrier
+            // vector stays untouched and remains invisible outside that clip.
+            continue;
+        }
+
         let mut paths: Vec<VPath> = snapshot
             .paths
             .iter()
             .filter(|path| !path.closed)
             .cloned()
             .collect();
-        paths.extend(crate::tools::geo_multi_polygon_to_linear_paths(&remainder));
+        if remainder.unsigned_area() > 0.05 {
+            paths.extend(crate::tools::geo_multi_polygon_to_linear_paths(&remainder));
+        } else if visible_remainder_area.is_some_and(|area| area > 0.05) {
+            // The body was fully selected but some resolved material remains.
+            // Keep closed source paths only as an internal carrier for that halo.
+            paths.extend(snapshot.paths.iter().filter(|path| path.closed).cloned());
+        }
         if paths.is_empty() {
             remove_refs.push(*reference);
         } else if let Some(Asset::Vector(vector)) = project

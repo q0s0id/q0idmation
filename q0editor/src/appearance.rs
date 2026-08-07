@@ -72,6 +72,41 @@ pub(crate) fn clone_asset_appearance(project: &mut ProjectV2, source: u16, desti
     }
 }
 
+pub(crate) fn partition_appearance(
+    original: &VectorAppearance,
+    original_paths: &[VPath],
+    partition_region: &MultiPolygon<f64>,
+) -> Option<(VectorAppearance, VectorAppearance)> {
+    let material_source = if original.material_source.is_empty() {
+        original_paths.to_vec()
+    } else {
+        original.material_source.clone()
+    };
+    let material_geometry = paths_to_coverage(&material_source);
+    if material_geometry.0.is_empty() {
+        return None;
+    }
+    let full_support = material_support(&material_geometry, original.material);
+    let old_clip = if original.clip_mask.is_empty() {
+        full_support
+    } else {
+        mask_paths_to_coverage(&original.clip_mask)
+    };
+    let inverse_field = original.field_transform.inverse()?;
+    let canonical_partition = transform_surface(partition_region, inverse_field);
+    let selected_clip = old_clip.intersection(&canonical_partition);
+    let source_clip = old_clip.difference(&canonical_partition);
+
+    let make = |clip: MultiPolygon<f64>| VectorAppearance {
+        material: original.material,
+        erase_mask: original.erase_mask.clone(),
+        material_source: material_source.clone(),
+        clip_mask: crate::brush::coverage_to_paths(&clip),
+        field_transform: original.field_transform,
+    };
+    Some((make(source_clip), make(selected_clip)))
+}
+
 pub(crate) fn split_asset_appearance(
     project: &mut ProjectV2,
     source_asset_id: u16,
@@ -89,42 +124,15 @@ pub(crate) fn split_asset_appearance(
             .insert(selected_asset_id, original);
         return;
     }
-
-    let material_source = if original.material_source.is_empty() {
-        original_paths.to_vec()
-    } else {
-        original.material_source.clone()
-    };
-    let material_geometry = paths_to_coverage(&material_source);
-    if material_geometry.0.is_empty() {
+    let Some((source, selected)) =
+        partition_appearance(&original, original_paths, partition_region)
+    else {
         return;
-    }
-    let full_support = material_support(&material_geometry, original.material);
-    let old_clip = if original.clip_mask.is_empty() {
-        full_support
-    } else {
-        mask_paths_to_coverage(&original.clip_mask)
-    };
-    let Some(inverse_field) = original.field_transform.inverse() else {
-        return;
-    };
-    let canonical_partition = transform_surface(partition_region, inverse_field);
-    let selected_clip = old_clip.intersection(&canonical_partition);
-    let source_clip = old_clip.difference(&canonical_partition);
-
-    let make = |clip: MultiPolygon<f64>| VectorAppearance {
-        material: original.material,
-        erase_mask: original.erase_mask.clone(),
-        material_source: material_source.clone(),
-        clip_mask: crate::brush::coverage_to_paths(&clip),
-        field_transform: original.field_transform,
     };
     project
         .asset_appearances
-        .insert(selected_asset_id, make(selected_clip));
-    project
-        .asset_appearances
-        .insert(source_asset_id, make(source_clip));
+        .insert(selected_asset_id, selected);
+    project.asset_appearances.insert(source_asset_id, source);
 }
 
 pub(crate) fn transform_appearance(

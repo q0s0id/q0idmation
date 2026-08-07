@@ -4,7 +4,7 @@ use q0s_format::v2::{
 };
 
 use q0editor::app::{Action, EditorApp};
-use q0editor::state::Selection;
+use q0editor::state::{PlacementRef, Selection};
 
 fn seed_simple_shape(app: &mut EditorApp) -> u16 {
     let asset_id = app
@@ -275,6 +275,409 @@ fn convert_to_q0rg_keeps_vector_appearance_attached_to_the_asset() {
         Target::Asset(id) if id == asset_id
     ));
     q0s_format::v2::validate(&app.state.project).expect("appearance survives valid conversion");
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+#[test]
+fn convert_clicked_raw_glow_to_q0rg_preserves_material_state() {
+    let mut app = EditorApp::default();
+    let q0rg_id = app.session.current_q0rg_id;
+    let layer_id = app.session.current_layer_id;
+    let asset_id = 1;
+    let path = VPath {
+        anchors: [
+            Vec2::new(30.0, 30.0),
+            Vec2::new(70.0, 30.0),
+            Vec2::new(70.0, 70.0),
+            Vec2::new(30.0, 70.0),
+        ]
+        .into_iter()
+        .map(|point| Anchor {
+            point,
+            in_handle: None,
+            out_handle: None,
+        })
+        .collect(),
+        closed: true,
+    };
+    app.state.project.assets = vec![Asset::Vector(VectorAsset {
+        asset_id,
+        paths: vec![path],
+        fill: Some(q0s_format::v2::Rgba {
+            r: 210,
+            g: 30,
+            b: 20,
+            a: 255,
+        }),
+        stroke: None,
+    })];
+    app.state.project.asset_appearances.insert(
+        asset_id,
+        q0s_format::v2::VectorAppearance {
+            material: q0s_format::v2::VectorMaterial::SoftHalo {
+                radius: 10.0,
+                opacity: 0.65,
+            },
+            erase_mask: Vec::new(),
+            material_source: Vec::new(),
+            clip_mask: Vec::new(),
+            field_transform: q0s_format::transform::Affine::IDENTITY,
+        },
+    );
+    app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+        frame: 0,
+        target: Target::Asset(asset_id),
+        transform: Transform2D::IDENTITY,
+        tween: Tween::None,
+    }];
+    let before = q0s_format::raster::rasterize_q0rg_frame(
+        &app.state.project,
+        q0rg_id,
+        0,
+        128,
+        128,
+        2,
+        [0, 0, 0, 0],
+    );
+
+    app.session.selection = Selection::Path {
+        q0rg_id,
+        layer_id,
+        placement_idx: 0,
+        path_idx: 0,
+    };
+    invoke_convert(&mut app);
+
+    let after = q0s_format::raster::rasterize_q0rg_frame(
+        &app.state.project,
+        q0rg_id,
+        0,
+        128,
+        128,
+        2,
+        [0, 0, 0, 0],
+    );
+    assert_eq!(
+        after, before,
+        "clicked raw glow must survive q0rg conversion"
+    );
+    let outer = app
+        .state
+        .project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+        .unwrap();
+    let Target::Q0rg(inner_id) = outer.layers[0].placements[0].target else {
+        panic!("raw fill must become q0rg");
+    };
+    let inner = app
+        .state
+        .project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == inner_id)
+        .unwrap();
+    let Target::Asset(inner_asset_id) = inner.layers[0].placements[0].target else {
+        panic!("q0rg must contain raw vector asset");
+    };
+    assert!(app
+        .state
+        .project
+        .asset_appearances
+        .contains_key(&inner_asset_id));
+    q0s_format::v2::validate(&app.state.project).expect("clicked glow q0rg validates");
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+#[test]
+fn convert_raw_area_to_q0rg_preserves_resolved_glow_pixels() {
+    let mut app = EditorApp::default();
+    let q0rg_id = app.session.current_q0rg_id;
+    let layer_id = app.session.current_layer_id;
+    let asset_id = 1;
+    let path = VPath {
+        anchors: [
+            Vec2::new(30.0, 30.0),
+            Vec2::new(70.0, 30.0),
+            Vec2::new(70.0, 70.0),
+            Vec2::new(30.0, 70.0),
+        ]
+        .into_iter()
+        .map(|point| Anchor {
+            point,
+            in_handle: None,
+            out_handle: None,
+        })
+        .collect(),
+        closed: true,
+    };
+    app.state.project.assets = vec![Asset::Vector(VectorAsset {
+        asset_id,
+        paths: vec![path.clone()],
+        fill: Some(q0s_format::v2::Rgba {
+            r: 230,
+            g: 40,
+            b: 25,
+            a: 255,
+        }),
+        stroke: None,
+    })];
+    app.state.project.asset_appearances.insert(
+        asset_id,
+        q0s_format::v2::VectorAppearance {
+            material: q0s_format::v2::VectorMaterial::SoftHalo {
+                radius: 12.0,
+                opacity: 0.75,
+            },
+            erase_mask: Vec::new(),
+            material_source: Vec::new(),
+            clip_mask: Vec::new(),
+            field_transform: q0s_format::transform::Affine::IDENTITY,
+        },
+    );
+    app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+        frame: 0,
+        target: Target::Asset(asset_id),
+        transform: Transform2D::IDENTITY,
+        tween: Tween::None,
+    }];
+
+    let before = q0s_format::raster::rasterize_q0rg_frame(
+        &app.state.project,
+        q0rg_id,
+        0,
+        128,
+        128,
+        2,
+        [0, 0, 0, 0],
+    );
+    let halo_alpha_before = before[((50 * 128 + 28) * 4 + 3) as usize];
+    assert!(
+        halo_alpha_before > 0,
+        "fixture must contain visible glow outside the vector body"
+    );
+
+    app.session.selection = Selection::RawArea {
+        placements: vec![PlacementRef {
+            q0rg_id,
+            layer_id,
+            placement_idx: 0,
+        }],
+        objects: Vec::new(),
+        bounds_min: Vec2::new(0.0, 0.0),
+        bounds_max: Vec2::new(100.0, 100.0),
+    };
+    invoke_convert(&mut app);
+
+    q0s_format::v2::validate(&app.state.project).expect("glowing raw-area conversion validates");
+    let after = q0s_format::raster::rasterize_q0rg_frame(
+        &app.state.project,
+        q0rg_id,
+        0,
+        128,
+        128,
+        2,
+        [0, 0, 0, 0],
+    );
+    assert_eq!(
+        after, before,
+        "Convert to q0rg must preserve the complete resolved frame, including halo pixels"
+    );
+    assert_eq!(
+        after[((50 * 128 + 28) * 4 + 3) as usize],
+        halo_alpha_before,
+        "halo outside the source body must survive q0rg conversion"
+    );
+
+    let outer = app
+        .state
+        .project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+        .unwrap();
+    let Target::Q0rg(inner_id) = outer.layers[0].placements[0].target else {
+        panic!("converted raw area must become a q0rg placement");
+    };
+    let inner = app
+        .state
+        .project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == inner_id)
+        .unwrap();
+    let Target::Asset(inner_asset_id) = inner.layers[0].placements[0].target else {
+        panic!("converted q0rg must contain a vector asset");
+    };
+    let appearance = app
+        .state
+        .project
+        .asset_appearances
+        .get(&inner_asset_id)
+        .expect("converted q0rg vector must retain its appearance");
+    assert!(
+        !appearance.material_source.is_empty(),
+        "raw clipboard must freeze the material source instead of dropping glow state"
+    );
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+#[test]
+fn convert_halo_only_raw_area_to_q0rg_preserves_visible_glow_without_loss() {
+    let mut app = EditorApp::default();
+    let q0rg_id = app.session.current_q0rg_id;
+    let layer_id = app.session.current_layer_id;
+    let asset_id = 1;
+    let path = VPath {
+        anchors: [
+            Vec2::new(30.0, 30.0),
+            Vec2::new(70.0, 30.0),
+            Vec2::new(70.0, 70.0),
+            Vec2::new(30.0, 70.0),
+        ]
+        .into_iter()
+        .map(|point| Anchor {
+            point,
+            in_handle: None,
+            out_handle: None,
+        })
+        .collect(),
+        closed: true,
+    };
+    app.state.project.assets = vec![Asset::Vector(VectorAsset {
+        asset_id,
+        paths: vec![path],
+        fill: Some(q0s_format::v2::Rgba {
+            r: 220,
+            g: 35,
+            b: 20,
+            a: 255,
+        }),
+        stroke: None,
+    })];
+    app.state.project.asset_appearances.insert(
+        asset_id,
+        q0s_format::v2::VectorAppearance {
+            material: q0s_format::v2::VectorMaterial::SoftHalo {
+                radius: 12.0,
+                opacity: 0.75,
+            },
+            erase_mask: Vec::new(),
+            material_source: Vec::new(),
+            clip_mask: Vec::new(),
+            field_transform: q0s_format::transform::Affine::IDENTITY,
+        },
+    );
+    app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+        frame: 0,
+        target: Target::Asset(asset_id),
+        transform: Transform2D::IDENTITY,
+        tween: Tween::None,
+    }];
+    let before = q0s_format::raster::rasterize_q0rg_frame(
+        &app.state.project,
+        q0rg_id,
+        0,
+        128,
+        128,
+        2,
+        [0, 0, 0, 0],
+    );
+    assert!(before[((50 * 128 + 28) * 4 + 3) as usize] > 0);
+
+    app.session.selection = Selection::RawArea {
+        placements: vec![PlacementRef {
+            q0rg_id,
+            layer_id,
+            placement_idx: 0,
+        }],
+        objects: Vec::new(),
+        bounds_min: Vec2::new(24.0, 40.0),
+        bounds_max: Vec2::new(29.0, 60.0),
+    };
+    invoke_convert(&mut app);
+
+    q0s_format::v2::validate(&app.state.project).expect("halo-only q0rg validates");
+    let after = q0s_format::raster::rasterize_q0rg_frame(
+        &app.state.project,
+        q0rg_id,
+        0,
+        128,
+        128,
+        2,
+        [0, 0, 0, 0],
+    );
+    let mut differing = 0usize;
+    let mut max_alpha_diff = 0u8;
+    let mut sum_before = 0u64;
+    let mut sum_after = 0u64;
+    for (before_px, after_px) in before.chunks_exact(4).zip(after.chunks_exact(4)) {
+        if before_px != after_px {
+            differing += 1;
+        }
+        max_alpha_diff = max_alpha_diff.max(before_px[3].abs_diff(after_px[3]));
+        sum_before += u64::from(before_px[3]);
+        sum_after += u64::from(after_px[3]);
+    }
+    let alpha = |buf: &[u8], x: usize, y: usize| buf[(y * 128 + x) * 4 + 3];
+    let selected_before = alpha(&before, 28, 50);
+    let selected_after = alpha(&after, 28, 50);
+    assert!(
+        selected_after > 0,
+        "halo-only q0rg must not drop the selected glow slice"
+    );
+    assert!(
+        selected_before.abs_diff(selected_after) <= 32,
+        "selected halo changed too much: {selected_before}->{selected_after}"
+    );
+    assert!(
+        max_alpha_diff <= 32,
+        "post-material split seam is too large: {max_alpha_diff}; changed pixels={differing}"
+    );
+    assert!(
+        sum_after * 1000 >= sum_before * 995,
+        "q0rg conversion lost visible glow energy: alpha sum {sum_before}->{sum_after}"
+    );
+    assert!(
+        sum_after * 1000 <= sum_before * 1005,
+        "q0rg conversion amplified visible glow too much: alpha sum {sum_before}->{sum_after}"
+    );
+
+    let outer = app
+        .state
+        .project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+        .unwrap();
+    assert_eq!(outer.layers[0].placements.len(), 2, "remainder + q0rg");
+    let symbol_placement = outer.layers[0]
+        .placements
+        .iter()
+        .find(|placement| matches!(placement.target, Target::Q0rg(_)))
+        .expect("halo-only q0rg placement");
+    let Target::Q0rg(inner_id) = symbol_placement.target else {
+        unreachable!();
+    };
+    let inner = app
+        .state
+        .project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == inner_id)
+        .unwrap();
+    let Target::Asset(inner_asset_id) = inner.layers[0].placements[0].target else {
+        panic!("halo-only q0rg must retain an internal carrier asset");
+    };
+    let appearance = app
+        .state
+        .project
+        .asset_appearances
+        .get(&inner_asset_id)
+        .expect("halo-only q0rg appearance");
+    assert!(!appearance.material_source.is_empty());
+    assert!(!appearance.clip_mask.is_empty());
 }
 
 #[test]
@@ -851,6 +1254,89 @@ fn convert_dotted_mixed_selection_to_q0rg() {
         .iter()
         .any(|placement| matches!(placement.target, Target::Q0rg(_))));
     q0s_format::v2::validate(&app.state.project).expect("mixed symbol project validates");
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+#[test]
+fn copy_paste_raw_glow_carries_appearance_with_fresh_asset_id() {
+    let mut app = EditorApp::default();
+    let q0rg_id = app.session.current_q0rg_id;
+    let layer_id = app.session.current_layer_id;
+    let asset_id = 1;
+    app.state.project.assets = vec![Asset::Vector(VectorAsset {
+        asset_id,
+        paths: vec![VPath {
+            anchors: [
+                Vec2::new(20.0, 20.0),
+                Vec2::new(40.0, 20.0),
+                Vec2::new(40.0, 40.0),
+                Vec2::new(20.0, 40.0),
+            ]
+            .into_iter()
+            .map(|point| Anchor {
+                point,
+                in_handle: None,
+                out_handle: None,
+            })
+            .collect(),
+            closed: true,
+        }],
+        fill: Some(q0s_format::v2::Rgba {
+            r: 180,
+            g: 20,
+            b: 20,
+            a: 255,
+        }),
+        stroke: None,
+    })];
+    app.state.project.asset_appearances.insert(
+        asset_id,
+        q0s_format::v2::VectorAppearance {
+            material: q0s_format::v2::VectorMaterial::SoftHalo {
+                radius: 8.0,
+                opacity: 0.6,
+            },
+            erase_mask: Vec::new(),
+            material_source: Vec::new(),
+            clip_mask: Vec::new(),
+            field_transform: q0s_format::transform::Affine::IDENTITY,
+        },
+    );
+    app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+        frame: 0,
+        target: Target::Asset(asset_id),
+        transform: Transform2D::IDENTITY,
+        tween: Tween::None,
+    }];
+    app.session.selection = Selection::Path {
+        q0rg_id,
+        layer_id,
+        placement_idx: 0,
+        path_idx: 0,
+    };
+
+    drive_one(&mut app, Action::CopySelection);
+    let clipboard = app.session.clipboard.as_ref().expect("raw glow clipboard");
+    assert_eq!(clipboard.raw_vectors.len(), 1);
+    assert!(clipboard.raw_vectors[0].appearance.is_some());
+    drive_one(&mut app, Action::Paste);
+
+    let layer = &app.state.project.q0rgs[0].layers[0];
+    assert_eq!(layer.placements.len(), 2);
+    let Target::Asset(pasted_asset_id) = layer.placements[1].target else {
+        panic!("pasted raw glow must be a fresh vector asset");
+    };
+    assert_ne!(pasted_asset_id, asset_id);
+    let pasted = app
+        .state
+        .project
+        .asset_appearances
+        .get(&pasted_asset_id)
+        .expect("pasted raw glow appearance");
+    assert!(!pasted.material_source.is_empty());
+    assert!((pasted.field_transform.tx - 10.0).abs() < 1.0e-6);
+    assert!((pasted.field_transform.ty - 10.0).abs() < 1.0e-6);
+    q0s_format::v2::validate(&app.state.project).expect("pasted raw glow validates");
 }
 
 #[test]
