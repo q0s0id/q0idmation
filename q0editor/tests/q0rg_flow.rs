@@ -4,7 +4,9 @@ use q0s_format::v2::{
 };
 
 use q0editor::app::{Action, EditorApp};
-use q0editor::state::{PlacementRef, Selection};
+#[cfg(feature = "appearance-mask-eraser")]
+use q0editor::state::PlacementRef;
+use q0editor::state::Selection;
 
 fn seed_simple_shape(app: &mut EditorApp) -> u16 {
     let asset_id = app

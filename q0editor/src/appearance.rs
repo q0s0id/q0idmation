@@ -1,9 +1,9 @@
 use std::collections::BTreeSet;
 
-use geo::{BooleanOps, BoundingRect, Buffer, Coord, LineString, MultiPolygon, Polygon};
+use geo::{BooleanOps, Buffer, Contains, Coord, LineString, MultiPolygon, Point, Polygon};
 use q0s_format::transform::Affine;
 use q0s_format::v2::{
-    Asset, Path as VPath, ProjectV2, Rgba, Target, Transform2D, Tween, VectorAppearance,
+    Asset, Path as VPath, ProjectV2, Rgba, Target, Transform2D, Tween, Vec2, VectorAppearance,
     VectorAsset, VectorMaterial,
 };
 
@@ -211,6 +211,288 @@ pub(crate) fn material_support(
         VectorMaterial::SoftHalo { radius, .. } => source.buffer(f64::from(radius.max(0.0))),
     }
 }
+fn point_segment_distance_sq(point: Point<f64>, a: Coord<f64>, b: Coord<f64>) -> f64 {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let len_sq = dx * dx + dy * dy;
+    if len_sq <= f64::EPSILON {
+        let px = point.x() - a.x;
+        let py = point.y() - a.y;
+        return px * px + py * py;
+    }
+    let t = (((point.x() - a.x) * dx + (point.y() - a.y) * dy) / len_sq).clamp(0.0, 1.0);
+    let x = a.x + dx * t;
+    let y = a.y + dy * t;
+    let px = point.x() - x;
+    let py = point.y() - y;
+    px * px + py * py
+}
+
+fn ring_near_point(ring: &LineString<f64>, point: Point<f64>, distance: f64) -> bool {
+    if distance < 0.0 {
+        return false;
+    }
+    let limit_sq = distance * distance;
+    ring.0
+        .windows(2)
+        .any(|segment| point_segment_distance_sq(point, segment[0], segment[1]) <= limit_sq)
+}
+
+pub(crate) fn surface_contains_or_near(
+    surface: &MultiPolygon<f64>,
+    point: Vec2,
+    distance: f32,
+) -> bool {
+    let point = Point::new(f64::from(point.x), f64::from(point.y));
+    if surface.contains(&point) {
+        return true;
+    }
+    let distance = f64::from(distance.max(0.0));
+    if distance <= 0.0 {
+        return false;
+    }
+    surface.0.iter().any(|polygon| {
+        ring_near_point(polygon.exterior(), point, distance)
+            || polygon
+                .interiors()
+                .iter()
+                .any(|ring| ring_near_point(ring, point, distance))
+    })
+}
+
+pub(crate) fn material_support_contains_point(
+    source: &MultiPolygon<f64>,
+    material: VectorMaterial,
+    point: Vec2,
+    edge_tolerance: f32,
+) -> bool {
+    let radius = match material {
+        VectorMaterial::Solid => 0.0,
+        VectorMaterial::SoftHalo { radius, .. } => radius.max(0.0),
+    };
+    surface_contains_or_near(source, point, radius + edge_tolerance.max(0.0))
+}
+
+/// Hit-test the resolved material without constructing a polygonal buffer.
+/// This is mathematically the same finite support test for a soft halo: a
+/// point belongs to the buffer iff its distance to the filled source is at
+/// most the halo radius. Selection/hover calls this every frame, so avoiding
+/// `geo::Buffer` here is critical for dense classic-brush contours.
+pub(crate) fn visible_material_contains_point(
+    vector: &VectorAsset,
+    appearance: Option<&VectorAppearance>,
+    point: Vec2,
+    edge_tolerance: f32,
+) -> bool {
+    let Some(appearance) = appearance else {
+        let source = crate::brush::vector_fill_geometry(vector);
+        return surface_contains_or_near(&source, point, edge_tolerance);
+    };
+    let Some(inverse_field) = appearance.field_transform.inverse() else {
+        return false;
+    };
+    let canonical_point = inverse_field.apply(point);
+    let inside_support = if appearance.clip_mask.is_empty() {
+        let source = material_source_surface(vector, appearance);
+        material_support_contains_point(
+            &source,
+            appearance.material,
+            canonical_point,
+            edge_tolerance,
+        )
+    } else {
+        let clip = mask_paths_to_coverage(&appearance.clip_mask);
+        surface_contains_or_near(&clip, canonical_point, edge_tolerance)
+    };
+    if !inside_support {
+        return false;
+    }
+    let erase = mask_paths_to_coverage(&appearance.erase_mask);
+    !surface_contains_or_near(&erase, canonical_point, 0.001)
+}
+
+fn path_anchor_bounds(paths: &[VPath]) -> Option<(f32, f32, f32, f32)> {
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    let mut found = false;
+    for anchor in paths
+        .iter()
+        .filter(|path| path.closed)
+        .flat_map(|path| path.anchors.iter())
+    {
+        if !anchor.point.x.is_finite() || !anchor.point.y.is_finite() {
+            continue;
+        }
+        min_x = min_x.min(anchor.point.x);
+        min_y = min_y.min(anchor.point.y);
+        max_x = max_x.max(anchor.point.x);
+        max_y = max_y.max(anchor.point.y);
+        found = true;
+    }
+    found.then_some((min_x, min_y, max_x, max_y))
+}
+
+fn transform_bounds(
+    bounds: (f32, f32, f32, f32),
+    transform: Affine,
+) -> Option<(f32, f32, f32, f32)> {
+    let (min_x, min_y, max_x, max_y) = bounds;
+    let corners = [
+        Vec2::new(min_x, min_y),
+        Vec2::new(max_x, min_y),
+        Vec2::new(max_x, max_y),
+        Vec2::new(min_x, max_y),
+    ];
+    let mut out = (
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+    );
+    for corner in corners {
+        let point = transform.apply(corner);
+        if !point.x.is_finite() || !point.y.is_finite() {
+            return None;
+        }
+        out.0 = out.0.min(point.x);
+        out.1 = out.1.min(point.y);
+        out.2 = out.2.max(point.x);
+        out.3 = out.3.max(point.y);
+    }
+    Some(out)
+}
+
+fn intersect_bounds(
+    left: (f32, f32, f32, f32),
+    right: (f32, f32, f32, f32),
+) -> Option<(f32, f32, f32, f32)> {
+    let bounds = (
+        left.0.max(right.0),
+        left.1.max(right.1),
+        left.2.min(right.2),
+        left.3.min(right.3),
+    );
+    (bounds.0 <= bounds.2 && bounds.1 <= bounds.3).then_some(bounds)
+}
+
+/// Cheap conservative visual bounds for interactive selection UI. Unlike the
+/// exact material surface this never buffers a dense brush polygon. Partial erase-mask
+/// cutouts are ignored for the outer box unless they provably erase the complete
+/// finite envelope. Hit-testing remains exact while the transform UI stays cheap.
+pub(crate) fn fast_visible_material_bounds_for_paths(
+    vector: &VectorAsset,
+    appearance: Option<&VectorAppearance>,
+    path_indices: &[usize],
+) -> Option<(f32, f32, f32, f32)> {
+    let selected_paths: Vec<VPath> = path_indices
+        .iter()
+        .filter_map(|index| vector.paths.get(*index).cloned())
+        .filter(|path| path.closed)
+        .collect();
+    let selected_bounds = path_anchor_bounds(&selected_paths)?;
+    let Some(appearance) = appearance else {
+        return Some(selected_bounds);
+    };
+
+    let all_closed_selected = vector
+        .paths
+        .iter()
+        .enumerate()
+        .filter(|(_, path)| path.closed)
+        .all(|(index, _)| path_indices.contains(&index));
+
+    let canonical_whole_bounds = if appearance.clip_mask.is_empty() {
+        let source_paths = if appearance.material_source.is_empty() {
+            &vector.paths
+        } else {
+            &appearance.material_source
+        };
+        let mut bounds = path_anchor_bounds(source_paths)?;
+        if let VectorMaterial::SoftHalo { radius, .. } = appearance.material {
+            let radius = radius.max(0.0);
+            bounds.0 -= radius;
+            bounds.1 -= radius;
+            bounds.2 += radius;
+            bounds.3 += radius;
+        }
+        bounds
+    } else {
+        path_anchor_bounds(&appearance.clip_mask)?
+    };
+
+    if !appearance.erase_mask.is_empty() {
+        // Usually a partial eraser cannot possibly cover the complete visual
+        // envelope, so reject that case using anchor bounds alone. Only when
+        // the erase bbox encloses the whole finite support do we pay for one
+        // rectangle-vs-mask boolean operation. This preserves the important
+        // "fully erased => no selection" invariant without ever buffering the
+        // dense brush source in the per-frame UI path.
+        if let Some(erase_bounds) = path_anchor_bounds(&appearance.erase_mask) {
+            let can_cover_whole = erase_bounds.0 <= canonical_whole_bounds.0
+                && erase_bounds.1 <= canonical_whole_bounds.1
+                && erase_bounds.2 >= canonical_whole_bounds.2
+                && erase_bounds.3 >= canonical_whole_bounds.3;
+            if can_cover_whole {
+                let (min_x, min_y, max_x, max_y) = canonical_whole_bounds;
+                let envelope = MultiPolygon(vec![Polygon::new(
+                    LineString::new(vec![
+                        Coord {
+                            x: f64::from(min_x),
+                            y: f64::from(min_y),
+                        },
+                        Coord {
+                            x: f64::from(max_x),
+                            y: f64::from(min_y),
+                        },
+                        Coord {
+                            x: f64::from(max_x),
+                            y: f64::from(max_y),
+                        },
+                        Coord {
+                            x: f64::from(min_x),
+                            y: f64::from(max_y),
+                        },
+                        Coord {
+                            x: f64::from(min_x),
+                            y: f64::from(min_y),
+                        },
+                    ]),
+                    Vec::new(),
+                )]);
+                let erase = mask_paths_to_coverage(&appearance.erase_mask);
+                if envelope.difference(&erase).0.is_empty() {
+                    return None;
+                }
+            }
+        }
+    }
+
+    let whole_bounds = transform_bounds(canonical_whole_bounds, appearance.field_transform)?;
+
+    if all_closed_selected {
+        return Some(whole_bounds);
+    }
+
+    let radius = match appearance.material {
+        VectorMaterial::Solid => 0.0,
+        VectorMaterial::SoftHalo { radius, .. } => radius.max(0.0),
+    };
+    let row_x = (appearance.field_transform.a11 * appearance.field_transform.a11
+        + appearance.field_transform.a12 * appearance.field_transform.a12)
+        .sqrt();
+    let row_y = (appearance.field_transform.a21 * appearance.field_transform.a21
+        + appearance.field_transform.a22 * appearance.field_transform.a22)
+        .sqrt();
+    let partial = (
+        selected_bounds.0 - radius * row_x,
+        selected_bounds.1 - radius * row_y,
+        selected_bounds.2 + radius * row_x,
+        selected_bounds.3 + radius * row_y,
+    );
+    intersect_bounds(partial, whole_bounds).or(Some(partial))
+}
 
 /// Opaque/vector body that is still visible after the non-destructive erase
 /// mask. This is what the editor tessellates as real vector geometry.
@@ -319,6 +601,29 @@ pub(crate) fn visible_material_surface_for_paths(
     visible_material_surface_for_vector(vector, Some(appearance)).intersection(&subset_support)
 }
 
+pub(crate) fn asset_visible_material_bounds_fast(
+    project: &ProjectV2,
+    asset_id: u16,
+) -> Option<(f32, f32, f32, f32)> {
+    let Asset::Vector(vector) = project.assets.iter().find(|asset| asset.id() == asset_id)? else {
+        return None;
+    };
+    if vector.fill.is_none() || vector.stroke.is_some() {
+        return None;
+    }
+    let path_indices: Vec<usize> = vector
+        .paths
+        .iter()
+        .enumerate()
+        .filter_map(|(index, path)| path.closed.then_some(index))
+        .collect();
+    fast_visible_material_bounds_for_paths(
+        vector,
+        project.asset_appearances.get(&asset_id),
+        &path_indices,
+    )
+}
+#[cfg(test)]
 pub(crate) fn asset_visible_material_bounds(
     project: &ProjectV2,
     asset_id: u16,
@@ -331,7 +636,7 @@ pub(crate) fn asset_visible_material_bounds(
     }
     let surface =
         visible_material_surface_for_vector(vector, project.asset_appearances.get(&asset_id));
-    let bounds = surface.bounding_rect()?;
+    let bounds = geo::BoundingRect::bounding_rect(&surface)?;
     Some((
         bounds.min().x as f32,
         bounds.min().y as f32,
@@ -468,7 +773,7 @@ pub fn erase_visible_region(app: &mut EditorApp, region: MultiPolygon<f64>) -> b
 
 #[cfg(test)]
 mod tests {
-    use geo::{Area, BoundingRect, Coord, LineString, Polygon};
+    use geo::{Area, BoundingRect, Contains, Coord, LineString, Point, Polygon};
     use q0s_format::v2::{Anchor, Placement};
 
     use super::*;
@@ -663,5 +968,73 @@ mod tests {
         assert!((bounds.min().y - 4.0).abs() < 0.05);
         assert!((bounds.max().y - 6.0).abs() < 0.05);
         assert!((mask.unsigned_area() - eraser_area).abs() < 0.1);
+    }
+    #[test]
+    fn fast_material_point_hit_matches_exact_halo_surface_and_erase_hole() {
+        let mut app = app_with_appearance();
+        app.state
+            .project
+            .asset_appearances
+            .get_mut(&1)
+            .unwrap()
+            .erase_mask = vec![square_path(4.0, 4.0, 6.0, 6.0)];
+        let vector = match &app.state.project.assets[0] {
+            Asset::Vector(vector) => vector,
+            _ => unreachable!(),
+        };
+        let appearance = &app.state.project.asset_appearances[&1];
+        let exact = visible_material_surface_for_vector(vector, Some(appearance));
+
+        for point in [
+            Vec2::new(-5.0, 5.0),  // visible halo
+            Vec2::new(5.0, 5.0),   // erased hole
+            Vec2::new(-11.0, 5.0), // outside finite support
+            Vec2::new(5.0, 19.0),  // halo near the lower edge
+        ] {
+            let exact_hit = exact.contains(&Point::new(f64::from(point.x), f64::from(point.y)));
+            let fast_hit = visible_material_contains_point(vector, Some(appearance), point, 0.0);
+            assert_eq!(
+                fast_hit, exact_hit,
+                "distance-based hot-path hit must match exact buffered support at {point:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fast_visual_bounds_enclose_exact_glow_before_and_after_field_transform() {
+        let mut app = app_with_appearance();
+        let assert_fast_encloses_exact = |project: &ProjectV2| {
+            let exact = asset_visible_material_bounds(project, 1).expect("exact glow bounds");
+            let fast = asset_visible_material_bounds_fast(project, 1).expect("fast glow bounds");
+            assert!(
+                fast.0 <= exact.0 + 0.01
+                    && fast.1 <= exact.1 + 0.01
+                    && fast.2 >= exact.2 - 0.01
+                    && fast.3 >= exact.3 - 0.01,
+                "fast selection bounds must conservatively enclose visible glow: fast={fast:?}, exact={exact:?}"
+            );
+            assert!(
+                [fast.0, fast.1, fast.2, fast.3]
+                    .into_iter()
+                    .all(f32::is_finite),
+                "selection bounds must stay finite"
+            );
+        };
+
+        assert_fast_encloses_exact(&app.state.project);
+        app.state
+            .project
+            .asset_appearances
+            .get_mut(&1)
+            .unwrap()
+            .field_transform = Affine {
+            a11: 1.0,
+            a12: 0.6,
+            a21: 0.2,
+            a22: 1.0,
+            tx: 30.0,
+            ty: -5.0,
+        };
+        assert_fast_encloses_exact(&app.state.project);
     }
 }

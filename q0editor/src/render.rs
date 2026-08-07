@@ -1141,7 +1141,7 @@ fn q0rg_local_bbox(project: &ProjectV2, q0rg_id: u16, depth: u8) -> Option<(f32,
 fn asset_local_visual_outline(project: &ProjectV2, asset_id: u16, asset: &Asset) -> Vec<Vec2> {
     #[cfg(feature = "appearance-mask-eraser")]
     if project.asset_appearances.contains_key(&asset_id) {
-        return crate::appearance::asset_visible_material_bounds(project, asset_id)
+        return crate::appearance::asset_visible_material_bounds_fast(project, asset_id)
             .map(|(min_x, min_y, max_x, max_y)| {
                 vec![
                     Vec2::new(min_x, min_y),

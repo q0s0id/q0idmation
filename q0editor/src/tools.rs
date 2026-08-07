@@ -224,7 +224,7 @@ fn selected_transform_hit(
         }
     }
     if let Some(refs) = selection_raw_path_refs(&app.session.selection) {
-        if let Some(bounds) = raw_path_refs_bounds(&app.state.project, &refs) {
+        if let Some(bounds) = raw_path_refs_ui_bounds(&app.state.project, &refs) {
             if let Some(hit) = hit_test_raw_transform(bounds, view, cursor_screen) {
                 return Some(hit);
             }
@@ -382,7 +382,7 @@ fn selection_transform_bounds(app: &EditorApp) -> Option<(f32, f32, f32, f32)> {
             layer_id,
             placement_idx,
             path_idx,
-        } => raw_path_refs_bounds(
+        } => raw_path_refs_ui_bounds(
             &app.state.project,
             &[PathRef {
                 q0rg_id: *q0rg_id,
@@ -391,7 +391,7 @@ fn selection_transform_bounds(app: &EditorApp) -> Option<(f32, f32, f32, f32)> {
                 path_idx: *path_idx,
             }],
         ),
-        Selection::Paths(paths) => raw_path_refs_bounds(&app.state.project, paths),
+        Selection::Paths(paths) => raw_path_refs_ui_bounds(&app.state.project, paths),
         Selection::RawArea {
             objects,
             bounds_min,
@@ -402,7 +402,7 @@ fn selection_transform_bounds(app: &EditorApp) -> Option<(f32, f32, f32, f32)> {
             placement_refs_world_bounds(&app.state.project, objects, app.session.current_frame),
         ),
         Selection::Mixed { paths, objects } => union_bounds(
-            raw_path_refs_bounds(&app.state.project, paths),
+            raw_path_refs_ui_bounds(&app.state.project, paths),
             placement_refs_world_bounds(&app.state.project, objects, app.session.current_frame),
         ),
         Selection::Multi(objects) => {
@@ -837,35 +837,36 @@ fn selectable_component_at_cursor(
 ) -> Option<Polygon<f64>> {
     #[cfg(not(feature = "appearance-mask-eraser"))]
     let _ = (project, asset_id);
+    #[cfg(not(feature = "appearance-mask-eraser"))]
     let point = Point::new(cursor.x as f64, cursor.y as f64);
     let source = vector_fill_geometry(vector);
 
     #[cfg(feature = "appearance-mask-eraser")]
     {
-        // The resolved visual surface is the authoritative hitbox. In
-        // particular a frozen material source may extend far outside a split
-        // fragment's clip; those hidden pixels must never start a drag.
-        let actual_visible = raw_selectable_fill_surface(project, asset_id, vector);
-        let hits_actual = actual_visible.0.iter().any(|polygon| {
-            polygon.contains(&point) || polygon_boundary_near_cursor(polygon, cursor, 2.0)
-        });
-        if !hits_actual {
+        let appearance = project.asset_appearances.get(&asset_id);
+        if !crate::appearance::visible_material_contains_point(vector, appearance, cursor, 2.0) {
             return None;
         }
-        let appearance = project.asset_appearances.get(&asset_id);
+
         for component in source.0 {
-            let support = appearance.map_or_else(
-                || MultiPolygon(vec![component.clone()]),
-                |appearance| {
-                    crate::appearance::material_support(
-                        &MultiPolygon(vec![component.clone()]),
-                        appearance.material,
-                    )
-                },
-            );
-            if support.0.iter().any(|polygon| {
-                polygon.contains(&point) || polygon_boundary_near_cursor(polygon, cursor, 2.0)
-            }) {
+            let support = MultiPolygon(vec![component.clone()]);
+            let hits_component = if let Some(appearance) = appearance {
+                let Some(inverse_field) = appearance.field_transform.inverse() else {
+                    continue;
+                };
+                let canonical_cursor = inverse_field.apply(cursor);
+                let canonical_support =
+                    crate::appearance::transform_surface(&support, inverse_field);
+                crate::appearance::material_support_contains_point(
+                    &canonical_support,
+                    appearance.material,
+                    canonical_cursor,
+                    2.0,
+                )
+            } else {
+                crate::appearance::surface_contains_or_near(&support, cursor, 2.0)
+            };
+            if hits_component {
                 return Some(component);
             }
         }
@@ -2480,7 +2481,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 selection_raw_path_refs(&app.session.selection),
                 cursor_screen,
             ) {
-                if let Some(bounds) = raw_path_refs_bounds(&app.state.project, &refs) {
+                if let Some(bounds) = raw_path_refs_ui_bounds(&app.state.project, &refs) {
                     if let Some(hit) = hit_test_raw_transform(bounds, view, screen_pos) {
                         let started = match hit {
                             TransformHit::Scale(handle) => {
@@ -3780,6 +3781,7 @@ pub(crate) fn materialize_raw_paths_as_placements(
     Some(placements)
 }
 
+#[cfg(test)]
 fn raw_path_refs_bounds(project: &ProjectV2, refs: &[PathRef]) -> Option<(f32, f32, f32, f32)> {
     let mut grouped: std::collections::BTreeMap<(u16, u16, usize), Vec<usize>> =
         std::collections::BTreeMap::new();
@@ -3853,6 +3855,80 @@ fn raw_path_refs_bounds(project: &ProjectV2, refs: &[PathRef]) -> Option<(f32, f
     found.then_some((min_x, min_y, max_x, max_y))
 }
 
+fn raw_path_refs_ui_bounds(project: &ProjectV2, refs: &[PathRef]) -> Option<(f32, f32, f32, f32)> {
+    let mut grouped: std::collections::BTreeMap<(u16, u16, usize), Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for reference in refs {
+        grouped
+            .entry((
+                reference.q0rg_id,
+                reference.layer_id,
+                reference.placement_idx,
+            ))
+            .or_default()
+            .push(reference.path_idx);
+    }
+
+    let mut result: Option<(f32, f32, f32, f32)> = None;
+    for ((q0rg_id, layer_id, placement_idx), mut path_indices) in grouped {
+        path_indices.sort_unstable();
+        path_indices.dedup();
+        let Some(placement) = project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+            .and_then(|q0rg| q0rg.layers.iter().find(|layer| layer.layer_id == layer_id))
+            .and_then(|layer| layer.placements.get(placement_idx))
+        else {
+            continue;
+        };
+        let Target::Asset(asset_id) = placement.target else {
+            continue;
+        };
+        let Some(Asset::Vector(vector)) =
+            project.assets.iter().find(|asset| asset.id() == asset_id)
+        else {
+            continue;
+        };
+
+        #[cfg(feature = "appearance-mask-eraser")]
+        if let Some(appearance) = project.asset_appearances.get(&asset_id) {
+            if let Some(bounds) = crate::appearance::fast_visible_material_bounds_for_paths(
+                vector,
+                Some(appearance),
+                &path_indices,
+            ) {
+                result = union_bounds(result, Some(bounds));
+            }
+            // Appearance geometry may keep a hidden carrier after erase/split.
+            // Never fall back to that carrier for the interactive selection box.
+            continue;
+        }
+
+        let mut bounds: Option<(f32, f32, f32, f32)> = None;
+        for path_idx in path_indices {
+            let Some(path) = vector.paths.get(path_idx) else {
+                continue;
+            };
+            for point in flatten_path(path) {
+                if !point.x.is_finite() || !point.y.is_finite() {
+                    continue;
+                }
+                bounds = Some(match bounds {
+                    Some((min_x, min_y, max_x, max_y)) => (
+                        min_x.min(point.x),
+                        min_y.min(point.y),
+                        max_x.max(point.x),
+                        max_y.max(point.y),
+                    ),
+                    None => (point.x, point.y, point.x, point.y),
+                });
+            }
+        }
+        result = union_bounds(result, bounds);
+    }
+    result
+}
 fn raw_selection_supports_axis_resize(bounds: (f32, f32, f32, f32)) -> bool {
     let (min_x, min_y, max_x, max_y) = bounds;
     [min_x, min_y, max_x, max_y].into_iter().all(f32::is_finite)
@@ -6467,6 +6543,14 @@ fn draw_raw_area_selection(
         else {
             continue;
         };
+        #[cfg(feature = "appearance-mask-eraser")]
+        if app.state.project.asset_appearances.contains_key(&asset_id) {
+            // The glow itself is already a cached raster layer. Rebuilding its
+            // polygonal buffer just to paint selection stipple caused the
+            // selection-frame freeze. The marquee/transform box is enough UI
+            // feedback; hit-testing still follows the exact visible material.
+            continue;
+        }
         let surface = raw_selectable_fill_surface(&app.state.project, asset_id, vector);
         let contours = surface_to_screen_contours(&surface, view);
         crate::render::paint_complex_fill(&clipped, &contours, selection_fill_color(app, 64));
@@ -6590,6 +6674,26 @@ fn draw_raw_paths_overlay(
         if closed_indices.is_empty() {
             continue;
         }
+        #[cfg(feature = "appearance-mask-eraser")]
+        if let Some(appearance) = app.state.project.asset_appearances.get(&asset_id) {
+            if draw_boxes {
+                if let Some((min_x, min_y, max_x, max_y)) =
+                    crate::appearance::fast_visible_material_bounds_for_paths(
+                        vector,
+                        Some(appearance),
+                        &closed_indices,
+                    )
+                {
+                    let rect = egui::Rect::from_min_max(
+                        stage_to_screen(Vec2::new(min_x, min_y), view),
+                        stage_to_screen(Vec2::new(max_x, max_y), view),
+                    );
+                    draw_flash_selection_box(painter, rect, selection_color(app));
+                }
+            }
+            continue;
+        }
+
         let surface =
             raw_selectable_paths_surface(&app.state.project, asset_id, vector, &closed_indices);
         let contours = surface_to_screen_contours(&surface, view);
@@ -8585,7 +8689,7 @@ mod tests {
             (bounds_min.x, bounds_min.y, bounds_max.x, bounds_max.y),
         );
         assert!(!refs.is_empty());
-        let bounds = raw_path_refs_bounds(&app.state.project, &refs).expect("fragment bounds");
+        let bounds = raw_path_refs_ui_bounds(&app.state.project, &refs).expect("fragment bounds");
         (app, refs, bounds)
     }
 
@@ -8593,7 +8697,7 @@ mod tests {
     #[test]
     fn scaling_halo_only_fragment_scales_appearance_with_hidden_carrier() {
         let (mut app, refs, bounds) = halo_only_fragment_for_transform();
-        let before = raw_path_refs_bounds(&app.state.project, &refs).unwrap();
+        let before = raw_path_refs_ui_bounds(&app.state.project, &refs).unwrap();
         assert!(begin_scaling_raw_paths(
             &mut app,
             refs,
@@ -8630,7 +8734,7 @@ mod tests {
             &start_appearances,
             transform,
         ));
-        let after = raw_path_refs_bounds(&app.state.project, &refs).unwrap();
+        let after = raw_path_refs_ui_bounds(&app.state.project, &refs).unwrap();
         assert!(((after.2 - after.0) - (before.2 - before.0) * 2.0).abs() < 0.15);
         assert!(((after.3 - after.1) - (before.3 - before.1)).abs() < 0.15);
     }
@@ -8640,7 +8744,7 @@ mod tests {
     fn rotating_halo_only_fragment_rotates_appearance_with_hidden_carrier() {
         let (mut app, refs, bounds) = halo_only_fragment_for_transform();
         let center = Vec2::new((bounds.0 + bounds.2) * 0.5, (bounds.1 + bounds.3) * 0.5);
-        let before = raw_path_refs_bounds(&app.state.project, &refs).unwrap();
+        let before = raw_path_refs_ui_bounds(&app.state.project, &refs).unwrap();
         assert!(begin_rotating_raw_paths(
             &mut app,
             refs,
@@ -8674,7 +8778,7 @@ mod tests {
             &start_appearances,
             transform,
         ));
-        let after = raw_path_refs_bounds(&app.state.project, &refs).unwrap();
+        let after = raw_path_refs_ui_bounds(&app.state.project, &refs).unwrap();
         let before_w = before.2 - before.0;
         let before_h = before.3 - before.1;
         let after_w = after.2 - after.0;
@@ -8730,7 +8834,7 @@ mod tests {
             &start_appearances,
             transform,
         ));
-        let after = raw_path_refs_bounds(&app.state.project, &refs).unwrap();
+        let after = raw_path_refs_ui_bounds(&app.state.project, &refs).unwrap();
         assert!(
             after.2 - after.0 < 20.0,
             "skew exploded halo bbox: {after:?}"
