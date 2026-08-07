@@ -26,7 +26,8 @@ pub const Q0S_VERSION_Q0V_ASSETS: u16 = 6;
 pub const Q0S_VERSION_EASING: u16 = 7;
 pub const Q0S_VERSION_APPEARANCE_MASKS: u16 = 8;
 pub const Q0S_VERSION_APPEARANCE_FRAGMENTS: u16 = 9;
-pub const Q0S_VERSION_CURRENT: u16 = Q0S_VERSION_APPEARANCE_FRAGMENTS;
+pub const Q0S_VERSION_APPEARANCE_AFFINE: u16 = 10;
+pub const Q0S_VERSION_CURRENT: u16 = Q0S_VERSION_APPEARANCE_AFFINE;
 
 /// Serialise a `ProjectV2` as the current vector `.q0s` bytes. Internally we
 /// reuse the current `.q1s` writer and patch the magic+version header in-place
@@ -66,6 +67,9 @@ pub fn parse_q0s_v2(bytes: &[u8]) -> Result<ProjectV2, Error> {
         Q0S_VERSION_APPEARANCE_MASKS => {
             v2::parse_body_after_header(bytes, v2::Q1S_VERSION_APPEARANCE_MASKS)
         }
+        Q0S_VERSION_APPEARANCE_FRAGMENTS => {
+            v2::parse_body_after_header(bytes, v2::Q1S_VERSION_APPEARANCE_FRAGMENTS)
+        }
         Q0S_VERSION_CURRENT => v2::parse_body_after_header(bytes, v2::Q1S_VERSION_CURRENT),
         _ => Err(Error::UnsupportedVersion(version)),
     }
@@ -89,6 +93,7 @@ pub fn is_q0s_v2(bytes: &[u8]) -> bool {
             | Q0S_VERSION_Q0V_ASSETS
             | Q0S_VERSION_EASING
             | Q0S_VERSION_APPEARANCE_MASKS
+            | Q0S_VERSION_APPEARANCE_FRAGMENTS
             | Q0S_VERSION_CURRENT
     )
 }
@@ -308,6 +313,7 @@ mod tests {
                 erase_mask: vec![mask],
                 material_source: Vec::new(),
                 clip_mask: Vec::new(),
+                field_transform: crate::transform::Affine::IDENTITY,
             },
         );
 
@@ -332,6 +338,7 @@ mod tests {
                 erase_mask: Vec::new(),
                 material_source: Vec::new(),
                 clip_mask: Vec::new(),
+                field_transform: crate::transform::Affine::IDENTITY,
             },
         );
         let mut bytes = v2::write_version(&project, v2::Q1S_VERSION_APPEARANCE_MASKS)
@@ -362,14 +369,88 @@ mod tests {
                 erase_mask: Vec::new(),
                 material_source: source.clone(),
                 clip_mask: source,
+                field_transform: crate::transform::Affine::IDENTITY,
             },
         );
         let bytes = write_q0s_v2(&project).expect("write q0s fragments");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_APPEARANCE_FRAGMENTS
+            Q0S_VERSION_CURRENT
         );
         assert_eq!(parse_q0s_v2(&bytes).expect("parse q0s fragments"), project);
+    }
+
+    #[test]
+    fn current_player_parser_still_reads_q0s_v9_fragment_body_with_identity_field() {
+        let mut project = small_project();
+        let source = match &project.assets[0] {
+            Asset::Vector(vector) => vector.paths.clone(),
+            _ => unreachable!(),
+        };
+        project.asset_appearances.insert(
+            1,
+            v2::VectorAppearance {
+                material: v2::VectorMaterial::SoftHalo {
+                    radius: 6.0,
+                    opacity: 0.5,
+                },
+                erase_mask: Vec::new(),
+                material_source: source.clone(),
+                clip_mask: source,
+                field_transform: crate::transform::Affine::IDENTITY,
+            },
+        );
+        let mut bytes = v2::write_version(&project, v2::Q1S_VERSION_APPEARANCE_FRAGMENTS)
+            .expect("write q1s v10 fragment body");
+        bytes[0..4].copy_from_slice(&Q0S_V2_MAGIC);
+        bytes[4..6].copy_from_slice(&Q0S_VERSION_APPEARANCE_FRAGMENTS.to_le_bytes());
+        let parsed = parse_q0s_v2(&bytes).expect("parse q0s v9 fragments");
+        assert_eq!(parsed, project);
+        assert_eq!(
+            parsed.asset_appearances[&1].field_transform,
+            crate::transform::Affine::IDENTITY
+        );
+    }
+
+    #[test]
+    fn current_q0s_roundtrip_preserves_appearance_field_affine() {
+        let mut project = small_project();
+        let source = match &project.assets[0] {
+            Asset::Vector(vector) => vector.paths.clone(),
+            _ => unreachable!(),
+        };
+        let field_transform = crate::transform::Affine {
+            a11: 0.8,
+            a12: 0.45,
+            a21: -0.2,
+            a22: 1.1,
+            tx: 17.0,
+            ty: -9.0,
+        };
+        project.asset_appearances.insert(
+            1,
+            v2::VectorAppearance {
+                material: v2::VectorMaterial::SoftHalo {
+                    radius: 6.0,
+                    opacity: 0.5,
+                },
+                erase_mask: Vec::new(),
+                material_source: source.clone(),
+                clip_mask: source,
+                field_transform,
+            },
+        );
+        let bytes = write_q0s_v2(&project).expect("write affine q0s");
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            Q0S_VERSION_CURRENT
+        );
+        let parsed = parse_q0s_v2(&bytes).expect("parse affine q0s");
+        assert_eq!(
+            parsed.asset_appearances[&1].field_transform,
+            field_transform
+        );
+        assert_eq!(parsed, project);
     }
 
     #[test]

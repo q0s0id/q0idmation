@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
-use geo::{BooleanOps, BoundingRect, Buffer, MultiPolygon};
+use geo::{BooleanOps, BoundingRect, Buffer, Coord, LineString, MultiPolygon, Polygon};
+use q0s_format::transform::Affine;
 use q0s_format::v2::{
     Asset, Path as VPath, ProjectV2, Rgba, Target, Transform2D, Tween, VectorAppearance,
     VectorAsset, VectorMaterial,
@@ -20,6 +21,7 @@ pub fn default_brush_appearance() -> VectorAppearance {
         erase_mask: Vec::new(),
         material_source: Vec::new(),
         clip_mask: Vec::new(),
+        field_transform: Affine::IDENTITY,
     }
 }
 
@@ -44,7 +46,10 @@ pub(crate) fn merged_brush_appearance(
         let Some(appearance) = project.asset_appearances.get(asset_id) else {
             continue;
         };
-        let coverage = mask_paths_to_coverage(&appearance.erase_mask);
+        let coverage = transform_surface(
+            &mask_paths_to_coverage(&appearance.erase_mask),
+            appearance.field_transform,
+        );
         if !coverage.0.is_empty() {
             mask = mask.union(&coverage);
         }
@@ -57,6 +62,7 @@ pub(crate) fn merged_brush_appearance(
         erase_mask: crate::brush::coverage_to_paths(&mask),
         material_source: Vec::new(),
         clip_mask: Vec::new(),
+        field_transform: Affine::IDENTITY,
     }
 }
 
@@ -99,14 +105,19 @@ pub(crate) fn split_asset_appearance(
     } else {
         mask_paths_to_coverage(&original.clip_mask)
     };
-    let selected_clip = old_clip.intersection(partition_region);
-    let source_clip = old_clip.difference(partition_region);
+    let Some(inverse_field) = original.field_transform.inverse() else {
+        return;
+    };
+    let canonical_partition = transform_surface(partition_region, inverse_field);
+    let selected_clip = old_clip.intersection(&canonical_partition);
+    let source_clip = old_clip.difference(&canonical_partition);
 
     let make = |clip: MultiPolygon<f64>| VectorAppearance {
         material: original.material,
         erase_mask: original.erase_mask.clone(),
         material_source: material_source.clone(),
         clip_mask: crate::brush::coverage_to_paths(&clip),
+        field_transform: original.field_transform,
     };
     project
         .asset_appearances
@@ -118,31 +129,48 @@ pub(crate) fn split_asset_appearance(
 
 pub(crate) fn transform_appearance(
     appearance: &VectorAppearance,
-    map: impl Fn(q0s_format::v2::Vec2) -> q0s_format::v2::Vec2 + Copy,
+    transform: Affine,
 ) -> VectorAppearance {
-    fn map_paths(
-        paths: &[VPath],
-        map: impl Fn(q0s_format::v2::Vec2) -> q0s_format::v2::Vec2 + Copy,
-    ) -> Vec<VPath> {
-        paths
+    let mut transformed = appearance.clone();
+    transformed.field_transform = Affine::compose(transform, appearance.field_transform);
+    transformed
+}
+
+pub(crate) fn transform_surface(
+    surface: &MultiPolygon<f64>,
+    transform: Affine,
+) -> MultiPolygon<f64> {
+    fn ring(line: &LineString<f64>, transform: Affine) -> LineString<f64> {
+        LineString::new(
+            line.0
+                .iter()
+                .map(|coord| {
+                    let mapped =
+                        transform.apply(q0s_format::v2::Vec2::new(coord.x as f32, coord.y as f32));
+                    Coord {
+                        x: f64::from(mapped.x),
+                        y: f64::from(mapped.y),
+                    }
+                })
+                .collect(),
+        )
+    }
+    MultiPolygon(
+        surface
+            .0
             .iter()
-            .cloned()
-            .map(|mut path| {
-                for anchor in &mut path.anchors {
-                    anchor.point = map(anchor.point);
-                    anchor.in_handle = anchor.in_handle.map(map);
-                    anchor.out_handle = anchor.out_handle.map(map);
-                }
-                path
+            .map(|polygon| {
+                Polygon::new(
+                    ring(polygon.exterior(), transform),
+                    polygon
+                        .interiors()
+                        .iter()
+                        .map(|interior| ring(interior, transform))
+                        .collect(),
+                )
             })
-            .collect()
-    }
-    VectorAppearance {
-        material: appearance.material,
-        erase_mask: map_paths(&appearance.erase_mask, map),
-        material_source: map_paths(&appearance.material_source, map),
-        clip_mask: map_paths(&appearance.clip_mask, map),
-    }
+            .collect(),
+    )
 }
 
 pub(crate) fn paths_to_coverage(paths: &[VPath]) -> MultiPolygon<f64> {
@@ -193,7 +221,11 @@ fn clip_surface(surface: MultiPolygon<f64>, appearance: &VectorAppearance) -> Mu
     if appearance.clip_mask.is_empty() {
         surface
     } else {
-        surface.intersection(&mask_paths_to_coverage(&appearance.clip_mask))
+        let clip = transform_surface(
+            &mask_paths_to_coverage(&appearance.clip_mask),
+            appearance.field_transform,
+        );
+        surface.intersection(&clip)
     }
 }
 
@@ -209,7 +241,10 @@ pub(crate) fn visible_source_surface_for_vector(
         return source;
     };
     let clipped = clip_surface(source, appearance);
-    let mask = mask_paths_to_coverage(&appearance.erase_mask);
+    let mask = transform_surface(
+        &mask_paths_to_coverage(&appearance.erase_mask),
+        appearance.field_transform,
+    );
     if mask.0.is_empty() {
         clipped
     } else {
@@ -237,11 +272,12 @@ pub(crate) fn visible_material_surface_for_vector(
         mask_paths_to_coverage(&appearance.clip_mask)
     };
     let mask = mask_paths_to_coverage(&appearance.erase_mask);
-    if mask.0.is_empty() {
+    let canonical_visible = if mask.0.is_empty() {
         clipped
     } else {
         clipped.difference(&mask)
-    }
+    };
+    transform_surface(&canonical_visible, appearance.field_transform)
 }
 
 pub(crate) fn visible_material_surface_for_paths(
@@ -394,11 +430,15 @@ pub fn erase_visible_region(app: &mut EditorApp, region: MultiPolygon<f64>) -> b
         if visible_cut.0.is_empty() {
             continue;
         }
+        let Some(inverse_field) = appearance.field_transform.inverse() else {
+            continue;
+        };
+        let canonical_cut = transform_surface(&visible_cut, inverse_field);
         let old_mask = mask_paths_to_coverage(&appearance.erase_mask);
         let new_mask = if old_mask.0.is_empty() {
-            visible_cut
+            canonical_cut
         } else {
-            old_mask.union(&visible_cut)
+            old_mask.union(&canonical_cut)
         };
         let new_paths = crate::brush::coverage_to_paths(&new_mask);
         if new_paths != appearance.erase_mask {
@@ -480,6 +520,7 @@ mod tests {
                 erase_mask: Vec::new(),
                 material_source: Vec::new(),
                 clip_mask: Vec::new(),
+                field_transform: q0s_format::transform::Affine::IDENTITY,
             },
         );
         app.state.project.q0rgs[0].layers[0]

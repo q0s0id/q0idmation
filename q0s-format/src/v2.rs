@@ -4,7 +4,7 @@
 //!
 //!   Header:
 //!     [4]   magic "Q1S\0"
-//!     [2]   version = 2 (legacy) | 3 (skew) | 4 (blank keyframes) | 5 (asset names) | 6 (layer folders) | 7 (q0v assets) | 8 (easing) | 9 (vector appearance masks) | 10 (post-material appearance fragments)
+//!     [2]   version = 2 (legacy) | 3 (skew) | 4 (blank keyframes) | 5 (asset names) | 6 (layer folders) | 7 (q0v assets) | 8 (easing) | 9 (vector appearance masks) | 10 (post-material appearance fragments) | 11 (appearance field affine)
 //!     [2]   flags (reserved = 0)
 //!     [2]   asset_count
 //!     [2]   q0rg_count
@@ -32,12 +32,15 @@
 //!   v10 post-material fragments append per appearance:
 //!     [2] material source path count, source paths[], [2] clip path count, clip paths[]
 //!
-//! Reading: v2 through v10 are accepted; v2 placements get skew_x/y = 0,
+//! Reading: v2 through v11 are accepted; v2 placements get skew_x/y = 0,
 //! v2/v3 layers get no explicit blank-keyframe markers, v2-v4 assets
 //! keep deterministic default labels, and v2-v5 projects have ordinary
 //! top-level layers without folders.
-//! Writing: always v10 (see `Q1S_VERSION_CURRENT`).
+//!   v11 transformed appearance fields append per appearance:
+//!     [24] field affine a11 a12 a21 a22 tx ty (6 x f32)
+//! Writing: always v11 (see `Q1S_VERSION_CURRENT`).
 
+use crate::transform::Affine;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::error::Error;
@@ -53,7 +56,8 @@ pub const Q1S_VERSION_Q0V_ASSETS: u16 = 7;
 pub const Q1S_VERSION_EASING: u16 = 8;
 pub const Q1S_VERSION_APPEARANCE_MASKS: u16 = 9;
 pub const Q1S_VERSION_APPEARANCE_FRAGMENTS: u16 = 10;
-pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_APPEARANCE_FRAGMENTS;
+pub const Q1S_VERSION_APPEARANCE_AFFINE: u16 = 11;
+pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_APPEARANCE_AFFINE;
 /// Kept as an alias so external code that imported the v2-era constant keeps
 /// compiling. It now means "the current write-out version".
 pub const Q1S_V2_VERSION: u16 = Q1S_VERSION_CURRENT;
@@ -166,8 +170,10 @@ pub enum VectorMaterial {
 /// Sparse per-vector appearance state. `erase_mask` is expressed in the
 /// vector asset's local coordinates and is applied after material evaluation.
 /// `material_source` freezes the pre-split source used by filters, while
-/// `clip_mask` partitions that resolved appearance after the filter. Empty
-/// source/clip vectors preserve the legacy behaviour: current vector geometry
+/// `clip_mask` partitions that resolved appearance after the filter. `field_transform`
+/// transforms that already-resolved field as one affine surface; this is what makes
+/// rotate/skew/scale affect the glow itself instead of re-running an axis-aligned blur.
+/// Empty source/clip vectors preserve the legacy behaviour: current vector geometry
 /// is the material source and the whole finite material support is visible.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VectorAppearance {
@@ -175,6 +181,7 @@ pub struct VectorAppearance {
     pub erase_mask: Vec<Path>,
     pub material_source: Vec<Path>,
     pub clip_mask: Vec<Path>,
+    pub field_transform: Affine,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -778,6 +785,28 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
                 "vector appearance requires a fill-only vector asset",
             ));
         }
+        let field = appearance.field_transform;
+        if ![
+            field.a11, field.a12, field.a21, field.a22, field.tx, field.ty,
+        ]
+        .into_iter()
+        .all(f32::is_finite)
+        {
+            return Err(Error::Validation(
+                "appearance field transform must be finite",
+            ));
+        }
+        let determinant = field.a11 * field.a22 - field.a12 * field.a21;
+        if determinant.abs() < 1.0e-9 {
+            return Err(Error::Validation(
+                "appearance field transform must be invertible",
+            ));
+        }
+        if field != Affine::IDENTITY && appearance.material_source.is_empty() {
+            return Err(Error::Validation(
+                "transformed appearance field requires a frozen material source",
+            ));
+        }
         match appearance.material {
             VectorMaterial::Solid => {}
             VectorMaterial::SoftHalo { radius, opacity } => {
@@ -1062,6 +1091,7 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
         && version != Q1S_VERSION_Q0V_ASSETS
         && version != Q1S_VERSION_EASING
         && version != Q1S_VERSION_APPEARANCE_MASKS
+        && version != Q1S_VERSION_APPEARANCE_FRAGMENTS
         && version != Q1S_VERSION_CURRENT
     {
         return Err(Error::UnsupportedVersion(version));
@@ -1109,6 +1139,16 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
     {
         return Err(Error::Validation(
             "q1s v9 cannot store post-material appearance fragments",
+        ));
+    }
+    if version < Q1S_VERSION_APPEARANCE_AFFINE
+        && project
+            .asset_appearances
+            .values()
+            .any(|appearance| appearance.field_transform != Affine::IDENTITY)
+    {
+        return Err(Error::Validation(
+            "q1s v10 cannot store transformed appearance fields",
         ));
     }
 
@@ -1220,6 +1260,18 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
                 out.extend_from_slice(&clip_count.to_le_bytes());
                 for path in &appearance.clip_mask {
                     write_mask_path(&mut out, path)?;
+                }
+            }
+            if version >= Q1S_VERSION_APPEARANCE_AFFINE {
+                for value in [
+                    appearance.field_transform.a11,
+                    appearance.field_transform.a12,
+                    appearance.field_transform.a21,
+                    appearance.field_transform.a22,
+                    appearance.field_transform.tx,
+                    appearance.field_transform.ty,
+                ] {
+                    out.extend_from_slice(&value.to_le_bytes());
                 }
             }
         }
@@ -1444,6 +1496,7 @@ pub fn parse(bytes: &[u8]) -> Result<ProjectV2, Error> {
         && version != Q1S_VERSION_Q0V_ASSETS
         && version != Q1S_VERSION_EASING
         && version != Q1S_VERSION_APPEARANCE_MASKS
+        && version != Q1S_VERSION_APPEARANCE_FRAGMENTS
         && version != Q1S_VERSION_CURRENT
     {
         return Err(Error::UnsupportedVersion(version));
@@ -1560,6 +1613,18 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
             } else {
                 (Vec::new(), Vec::new())
             };
+            let field_transform = if version >= Q1S_VERSION_APPEARANCE_AFFINE {
+                Affine {
+                    a11: c.read_f32()?,
+                    a12: c.read_f32()?,
+                    a21: c.read_f32()?,
+                    a22: c.read_f32()?,
+                    tx: c.read_f32()?,
+                    ty: c.read_f32()?,
+                }
+            } else {
+                Affine::IDENTITY
+            };
             if asset_appearances
                 .insert(
                     asset_id,
@@ -1568,6 +1633,7 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
                         erase_mask,
                         material_source,
                         clip_mask,
+                        field_transform,
                     },
                 )
                 .is_some()
@@ -2198,6 +2264,7 @@ mod compatibility_tests {
                 }],
                 material_source: Vec::new(),
                 clip_mask: Vec::new(),
+                field_transform: crate::transform::Affine::IDENTITY,
             },
         );
         project
@@ -2264,9 +2331,86 @@ mod compatibility_tests {
         let bytes = write(&project).expect("write q1s v10 fragments");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q1S_VERSION_APPEARANCE_FRAGMENTS
+            Q1S_VERSION_CURRENT
         );
-        assert_eq!(parse(&bytes).expect("parse q1s v10 fragments"), project);
+        assert_eq!(parse(&bytes).expect("parse current q1s fragments"), project);
+    }
+
+    #[test]
+    fn q1s_v10_fragment_body_remains_readable_with_identity_field() {
+        let mut project = appearance_project();
+        let source = match &project.assets[0] {
+            Asset::Vector(vector) => vector.paths.clone(),
+            _ => unreachable!(),
+        };
+        let appearance = project.asset_appearances.get_mut(&1).unwrap();
+        appearance.material_source = source.clone();
+        appearance.clip_mask = source;
+        appearance.field_transform = Affine::IDENTITY;
+        let bytes = write_version(&project, Q1S_VERSION_APPEARANCE_FRAGMENTS)
+            .expect("write q1s v10 fragment fixture");
+        let parsed = parse(&bytes).expect("parse q1s v10 fragment fixture");
+        assert_eq!(parsed, project);
+        assert_eq!(
+            parsed.asset_appearances[&1].field_transform,
+            Affine::IDENTITY
+        );
+    }
+
+    #[test]
+    fn current_q1s_roundtrip_preserves_appearance_field_affine() {
+        let mut project = appearance_project();
+        let source = match &project.assets[0] {
+            Asset::Vector(vector) => vector.paths.clone(),
+            _ => unreachable!(),
+        };
+        let field_transform = Affine {
+            a11: 0.75,
+            a12: 0.5,
+            a21: -0.25,
+            a22: 1.2,
+            tx: 13.0,
+            ty: -7.0,
+        };
+        let appearance = project.asset_appearances.get_mut(&1).unwrap();
+        appearance.material_source = source.clone();
+        appearance.clip_mask = source;
+        appearance.field_transform = field_transform;
+        let bytes = write(&project).expect("write affine q1s");
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            Q1S_VERSION_CURRENT
+        );
+        let parsed = parse(&bytes).expect("parse affine q1s");
+        assert_eq!(
+            parsed.asset_appearances[&1].field_transform,
+            field_transform
+        );
+        assert_eq!(parsed, project);
+    }
+
+    #[test]
+    fn q1s_v10_writer_rejects_transformed_field_instead_of_dropping_it() {
+        let mut project = appearance_project();
+        let source = match &project.assets[0] {
+            Asset::Vector(vector) => vector.paths.clone(),
+            _ => unreachable!(),
+        };
+        let appearance = project.asset_appearances.get_mut(&1).unwrap();
+        appearance.material_source = source;
+        appearance.field_transform = Affine {
+            a11: 1.0,
+            a12: 0.4,
+            a21: 0.0,
+            a22: 1.0,
+            tx: 0.0,
+            ty: 0.0,
+        };
+        assert_eq!(
+            write_version(&project, Q1S_VERSION_APPEARANCE_FRAGMENTS)
+                .expect_err("q1s v10 cannot store field affine"),
+            Error::Validation("q1s v10 cannot store transformed appearance fields")
+        );
     }
 
     #[test]
@@ -2284,6 +2428,56 @@ mod compatibility_tests {
             write_version(&project, Q1S_VERSION_APPEARANCE_MASKS)
                 .expect_err("q1s v9 cannot store appearance fragments"),
             Error::Validation("q1s v9 cannot store post-material appearance fragments")
+        );
+    }
+
+    #[test]
+    fn validation_rejects_invalid_appearance_field_affine() {
+        let mut project = appearance_project();
+        let source = match &project.assets[0] {
+            Asset::Vector(vector) => vector.paths.clone(),
+            _ => unreachable!(),
+        };
+        let appearance = project.asset_appearances.get_mut(&1).unwrap();
+        appearance.material_source = source.clone();
+        appearance.field_transform.a12 = f32::NAN;
+        assert_eq!(
+            validate(&project).expect_err("non-finite field affine must fail"),
+            Error::Validation("appearance field transform must be finite")
+        );
+
+        let mut project = appearance_project();
+        let appearance = project.asset_appearances.get_mut(&1).unwrap();
+        appearance.material_source = source.clone();
+        appearance.field_transform = Affine {
+            a11: 1.0,
+            a12: 2.0,
+            a21: 0.5,
+            a22: 1.0,
+            tx: 0.0,
+            ty: 0.0,
+        };
+        assert_eq!(
+            validate(&project).expect_err("singular field affine must fail"),
+            Error::Validation("appearance field transform must be invertible")
+        );
+
+        let mut project = appearance_project();
+        project
+            .asset_appearances
+            .get_mut(&1)
+            .unwrap()
+            .field_transform = Affine {
+            a11: 1.0,
+            a12: 0.25,
+            a21: 0.0,
+            a22: 1.0,
+            tx: 0.0,
+            ty: 0.0,
+        };
+        assert_eq!(
+            validate(&project).expect_err("field affine without frozen source must fail"),
+            Error::Validation("transformed appearance field requires a frozen material source")
         );
     }
 

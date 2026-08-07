@@ -1291,10 +1291,8 @@ fn appearance_cache_signature(
         &appearance.material_source
     };
     let mut origin = Vec2::new(f32::INFINITY, f32::INFINITY);
-    for path in vector
-        .paths
+    for path in material_paths
         .iter()
-        .chain(material_paths)
         .chain(&appearance.erase_mask)
         .chain(&appearance.clip_mask)
     {
@@ -1356,7 +1354,6 @@ fn appearance_cache_signature(
             }
         }
     };
-    hash_paths(0, &vector.paths);
     hash_paths(1, material_paths);
     hash_paths(2, &appearance.erase_mask);
     hash_paths(3, &appearance.clip_mask);
@@ -1378,7 +1375,8 @@ fn paint_vector_appearance_halo(
     if vector.fill.is_none() || vector.stroke.is_some() {
         return;
     }
-    let target_ppu = (view.scale * transform.uniform_scale() * 2.0).clamp(1.0, 4.0);
+    let field_transform = Affine::compose(transform, appearance.field_transform);
+    let target_ppu = (view.scale * field_transform.uniform_scale() * 2.0).clamp(1.0, 4.0);
     let bucket = (target_ppu * 4.0).round().clamp(4.0, 16.0) as u16;
     let ppu = f32::from(bucket) / 4.0;
     let (fingerprint, origin) = appearance_cache_signature(vector, appearance);
@@ -1438,7 +1436,7 @@ fn paint_vector_appearance_halo(
     ];
     let screen_corners: Vec<Pos2> = local_corners
         .iter()
-        .map(|point| stage_to_screen(transform.apply(*point), view))
+        .map(|point| stage_to_screen(field_transform.apply(*point), view))
         .collect();
     let mut mesh = Mesh::with_texture(cached.texture.id());
     let uv = [
@@ -1515,7 +1513,7 @@ mod tests {
 
     #[cfg(feature = "appearance-mask-eraser")]
     #[test]
-    fn appearance_cache_signature_reuses_texture_for_translation_but_not_shape_change() {
+    fn appearance_cache_signature_tracks_frozen_field_content_not_carrier_affine() {
         let path = VPath {
             anchors: [
                 Vec2::new(0.0, 0.0),
@@ -1551,6 +1549,7 @@ mod tests {
             erase_mask: Vec::new(),
             material_source: vec![path.clone()],
             clip_mask: vec![path],
+            field_transform: q0s_format::transform::Affine::IDENTITY,
         };
         let (before_hash, before_origin) = appearance_cache_signature(&vector, &appearance);
 
@@ -1562,23 +1561,35 @@ mod tests {
                 anchor.point.y += delta.y;
             }
         }
-        let moved_appearance = crate::appearance::transform_appearance(&appearance, |point| {
-            Vec2::new(point.x + delta.x, point.y + delta.y)
-        });
+        let moved_appearance = crate::appearance::transform_appearance(
+            &appearance,
+            Affine {
+                tx: delta.x,
+                ty: delta.y,
+                ..Affine::IDENTITY
+            },
+        );
         let (moved_hash, moved_origin) =
             appearance_cache_signature(&moved_vector, &moved_appearance);
         assert_eq!(
             before_hash, moved_hash,
-            "pure movement must reuse the halo texture"
+            "affine movement must reuse the frozen halo texture"
         );
-        assert!((moved_origin.x - before_origin.x - delta.x).abs() < 1.0e-4);
-        assert!((moved_origin.y - before_origin.y - delta.y).abs() < 1.0e-4);
+        assert_eq!(before_origin, moved_origin);
 
         moved_vector.paths[0].anchors[1].point.x += 4.0;
         let (changed_hash, _) = appearance_cache_signature(&moved_vector, &moved_appearance);
-        assert_ne!(
+        assert_eq!(
             moved_hash, changed_hash,
-            "topology/shape edits must invalidate stale halo pixels"
+            "editing the carrier vector must not regenerate an already-frozen material field"
+        );
+
+        let mut changed_field = moved_appearance.clone();
+        changed_field.material_source[0].anchors[1].point.x += 4.0;
+        let (changed_field_hash, _) = appearance_cache_signature(&moved_vector, &changed_field);
+        assert_ne!(
+            moved_hash, changed_field_hash,
+            "changing frozen field content must invalidate the halo texture"
         );
     }
 
@@ -1634,6 +1645,7 @@ mod tests {
                 .collect(),
                 closed: true,
             }],
+            field_transform: Affine::IDENTITY,
         };
         let view = StageView {
             origin: Pos2::ZERO,

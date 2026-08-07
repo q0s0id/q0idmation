@@ -10,8 +10,8 @@ this branch keeps the classic brush and eraser engine as the only tool path. the
 ## data and compatibility
 
 - classic vector paint still commits as fill-only raw geometry.
-- q1s v9 introduced sparse vector appearance metadata; q1s v10 adds frozen material-source and post-material clip paths for split/moved fragments.
-- q0s v8 carries the original appearance masks; q0s v9 carries post-material fragments into q0player.
+- q1s v9 introduced sparse vector appearance metadata; q1s v10 adds frozen material-source and post-material clip paths; q1s v11 adds an exact 2x3 affine for the already-resolved appearance field.
+- q0s v8 carries the original appearance masks, q0s v9 carries post-material fragments, and q0s v10 carries the resolved-field affine into q0player.
 - older q1s/q0s versions remain readable and load with no synthetic appearance state.
 - writing an older format version with appearance data fails instead of silently dropping it.
 - v1 migration creates no appearance metadata.
@@ -32,6 +32,6 @@ this remains feature-gated while the visual/material model is being proven, but 
 
 - partial raw-fill split does not re-evaluate filters from each new contour. both fragments retain the pre-split material source and complementary post-filter clips; translating a fragment translates its material/erase/clip state together.
 - a fragment's post-material clip is authoritative for rendering, hit-testing and selection bounds. hidden portions of the frozen source cannot start a drag, while a marquee containing only visible halo can still create and move a real fragment.
-- raw move/scale/rotate/skew all apply one affine transform from the same drag-start snapshot to vector geometry, frozen material source, erase mask and post-material clip. transform handles therefore cannot rotate or shear a hidden carrier away from its visible glow fragment.
+- raw move/scale/rotate/skew use one drag-start affine for the carrier vector and compose that same matrix into the resolved appearance field. the frozen material source is not skewed and blurred again: its already-resolved halo texture is rotated/scaled/sheared as a field, with clip and erase masks staying in that canonical field space.
 - fragment rasterization is bounded around the post-material clip plus one finite filter radius instead of allocating a texture for the complete frozen source. editor halo quality is capped at 4 pixels per stage unit at extreme zoom so interactive cache rebuilds remain bounded.
-- halo textures use transparent overscan and remain continuous underneath the real vector fill, avoiding raster/vector AA cracks. cache fingerprints are content-aware and translation-invariant so moving a fragment reuses the same texture while real shape edits invalidate it.
+- halo textures use transparent overscan and remain continuous underneath the real vector fill, avoiding raster/vector AA cracks. once a material source is frozen, affine edits reuse that canonical halo texture; changing the frozen source/clip/erase content invalidates it.

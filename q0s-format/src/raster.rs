@@ -540,6 +540,105 @@ fn rasterize_vector_appearance_local_impl(
     })
 }
 
+fn rasterize_vector_body_local(
+    vector: &VectorAsset,
+    appearance: &VectorAppearance,
+    pixels_per_unit: f32,
+) -> Option<RasterizedVectorAppearance> {
+    let fill = vector.fill?;
+    let pixels_per_unit = pixels_per_unit.clamp(0.5, 8.0);
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for path in vector.paths.iter().filter(|path| path.closed) {
+        for point in flatten_path(path, FLATTEN_SAMPLES) {
+            min_x = min_x.min(point.x);
+            min_y = min_y.min(point.y);
+            max_x = max_x.max(point.x);
+            max_y = max_y.max(point.y);
+        }
+    }
+    if !min_x.is_finite() || !min_y.is_finite() || !max_x.is_finite() || !max_y.is_finite() {
+        return None;
+    }
+    let guard = 2.0 / pixels_per_unit;
+    let local_min = Vec2::new(min_x - guard, min_y - guard);
+    let local_max = Vec2::new(max_x + guard, max_y + guard);
+    let width = (((local_max.x - local_min.x) * pixels_per_unit).ceil() as u32).max(1);
+    let height = (((local_max.y - local_min.y) * pixels_per_unit).ceil() as u32).max(1);
+    const MAX_SIDE: u32 = 8192;
+    if width > MAX_SIDE || height > MAX_SIDE {
+        return None;
+    }
+    let local_to_pixel = Affine {
+        a11: pixels_per_unit,
+        a12: 0.0,
+        a21: 0.0,
+        a22: pixels_per_unit,
+        tx: -local_min.x * pixels_per_unit,
+        ty: -local_min.y * pixels_per_unit,
+    };
+    let contours = |paths: &[crate::v2::Path], transform: Affine| -> Vec<Vec<Vec2>> {
+        let composed = Affine::compose(local_to_pixel, transform);
+        paths
+            .iter()
+            .filter(|path| path.closed)
+            .map(|path| {
+                flatten_path(path, FLATTEN_SAMPLES)
+                    .into_iter()
+                    .map(|point| composed.apply(point))
+                    .collect()
+            })
+            .collect()
+    };
+    let pixel_count = (width as usize).saturating_mul(height as usize);
+    let raster_alpha = |polygons: &[Vec<Vec2>]| -> Vec<u8> {
+        let mut rgba = vec![0u8; pixel_count.saturating_mul(4)];
+        scanline_fill_multi(
+            polygons,
+            Rgba {
+                r: 255,
+                g: 255,
+                b: 255,
+                a: 255,
+            },
+            &mut rgba,
+            width,
+            height,
+        );
+        rgba.chunks_exact(4).map(|pixel| pixel[3]).collect()
+    };
+    let body_alpha = raster_alpha(&contours(&vector.paths, Affine::IDENTITY));
+    let clip_alpha = if appearance.clip_mask.is_empty() {
+        vec![255u8; pixel_count]
+    } else {
+        raster_alpha(&contours(&appearance.clip_mask, appearance.field_transform))
+    };
+    let erase_alpha = if appearance.erase_mask.is_empty() {
+        vec![0u8; pixel_count]
+    } else {
+        raster_alpha(&contours(
+            &appearance.erase_mask,
+            appearance.field_transform,
+        ))
+    };
+    let mut rgba = vec![0u8; pixel_count.saturating_mul(4)];
+    for (index, out) in rgba.chunks_exact_mut(4).enumerate() {
+        let visible =
+            (u32::from(clip_alpha[index]) * u32::from(255 - erase_alpha[index]) + 127) / 255;
+        let alpha = (u32::from(body_alpha[index]) * visible * u32::from(fill.a) + 32_512) / 65_025;
+        out.copy_from_slice(&[fill.r, fill.g, fill.b, alpha.min(255) as u8]);
+    }
+    Some(RasterizedVectorAppearance {
+        rgba,
+        width,
+        height,
+        local_min,
+        pixels_per_unit,
+    })
+}
+
 fn gaussian_blur_alpha(source: &[u8], width: u32, height: u32, support_radius: f32) -> Vec<u8> {
     if source.is_empty() || support_radius <= 0.5 {
         return source.to_vec();
@@ -657,11 +756,18 @@ fn rasterize_vector(
     h: u32,
 ) {
     if let Some(appearance) = appearance {
-        let pixels_per_unit = t.uniform_scale().clamp(1.0, 4.0);
-        if let Some(tile) = rasterize_vector_appearance_local(v, appearance, pixels_per_unit) {
-            composite_appearance_tile(&tile, t, buffer, w, h);
-            return;
+        if matches!(appearance.material, VectorMaterial::SoftHalo { .. }) {
+            let field_transform = Affine::compose(t, appearance.field_transform);
+            let pixels_per_unit = field_transform.uniform_scale().clamp(1.0, 4.0);
+            if let Some(tile) = rasterize_vector_halo_local(v, appearance, pixels_per_unit) {
+                composite_appearance_tile(&tile, field_transform, buffer, w, h);
+            }
         }
+        let body_ppu = t.uniform_scale().clamp(1.0, 4.0);
+        if let Some(body) = rasterize_vector_body_local(v, appearance, body_ppu) {
+            composite_appearance_tile(&body, t, buffer, w, h);
+        }
+        return;
     }
     if let Some(fill) = v.fill {
         let contours: Vec<Vec<Vec2>> = v
@@ -1126,6 +1232,7 @@ mod resolver_tests {
             erase_mask: Vec::new(),
             material_source: Vec::new(),
             clip_mask: Vec::new(),
+            field_transform: crate::transform::Affine::IDENTITY,
         };
         let tile =
             rasterize_vector_appearance_local(&vector, &appearance, 4.0).expect("appearance tile");
@@ -1170,6 +1277,7 @@ mod resolver_tests {
             erase_mask: Vec::new(),
             material_source: Vec::new(),
             clip_mask: Vec::new(),
+            field_transform: crate::transform::Affine::IDENTITY,
         };
         let tile = rasterize_vector_halo_local(&vector, &appearance, 4.0).expect("halo tile");
         assert!(
@@ -1192,6 +1300,98 @@ mod resolver_tests {
         assert!(
             border_is_clear,
             "halo texture needs transparent overscan around its finite support"
+        );
+    }
+
+    #[test]
+    fn appearance_field_affine_transforms_resolved_halo_instead_of_reblurring_skewed_source() {
+        fn map_path(path: &VPath, transform: Affine) -> VPath {
+            let mut mapped = path.clone();
+            for anchor in &mut mapped.anchors {
+                anchor.point = transform.apply(anchor.point);
+                anchor.in_handle = anchor.in_handle.map(|point| transform.apply(point));
+                anchor.out_handle = anchor.out_handle.map(|point| transform.apply(point));
+            }
+            mapped
+        }
+
+        let source_path = rectangle_path(0.0, 0.0, 8.0, 28.0);
+        let vector = VectorAsset {
+            asset_id: 1,
+            paths: vec![source_path.clone()],
+            fill: Some(Rgba {
+                r: 220,
+                g: 40,
+                b: 30,
+                a: 255,
+            }),
+            stroke: None,
+        };
+        let base = VectorAppearance {
+            material: VectorMaterial::SoftHalo {
+                radius: 7.0,
+                opacity: 0.7,
+            },
+            erase_mask: Vec::new(),
+            material_source: vec![source_path.clone()],
+            clip_mask: Vec::new(),
+            field_transform: Affine::IDENTITY,
+        };
+        let shear = Affine {
+            a11: 1.0,
+            a12: 0.75,
+            a21: 0.0,
+            a22: 1.0,
+            tx: 32.0,
+            ty: 18.0,
+        };
+        let mut transformed_field = base.clone();
+        transformed_field.field_transform = shear;
+
+        let base_tile = rasterize_vector_halo_local(&vector, &base, 4.0).unwrap();
+        let transformed_tile =
+            rasterize_vector_halo_local(&vector, &transformed_field, 4.0).unwrap();
+        assert_eq!(base_tile.width, transformed_tile.width);
+        assert_eq!(base_tile.height, transformed_tile.height);
+        assert_eq!(base_tile.local_min, transformed_tile.local_min);
+        assert_eq!(
+            base_tile.rgba, transformed_tile.rgba,
+            "field affine must not be baked by regenerating a differently shaped gaussian"
+        );
+
+        let wrong_reblur = VectorAppearance {
+            field_transform: Affine::IDENTITY,
+            material_source: vec![map_path(&source_path, shear)],
+            ..base.clone()
+        };
+        let wrong_tile = rasterize_vector_halo_local(&vector, &wrong_reblur, 4.0).unwrap();
+        assert!(
+            wrong_tile.width != base_tile.width
+                || wrong_tile.height != base_tile.height
+                || wrong_tile.rgba != base_tile.rgba,
+            "skewing the source then re-running gaussian must remain distinguishable from transforming the resolved field"
+        );
+
+        let mut rendered = vec![0u8; 128 * 96 * 4];
+        composite_appearance_tile(&base_tile, shear, &mut rendered, 128, 96);
+        let mut min_x = u32::MAX;
+        let mut max_x = 0u32;
+        let mut min_y = u32::MAX;
+        let mut max_y = 0u32;
+        for y in 0..96u32 {
+            for x in 0..128u32 {
+                if rendered[((y * 128 + x) * 4 + 3) as usize] > 0 {
+                    min_x = min_x.min(x);
+                    max_x = max_x.max(x);
+                    min_y = min_y.min(y);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        assert!(min_x < max_x && min_y < max_y, "affine halo must render");
+        assert!(
+            max_x - min_x > max_y - min_y,
+            "horizontal shear must visibly skew the already-resolved tall halo: x={min_x}..{max_x}, y={min_y}..{max_y}"
         );
     }
 
@@ -1231,18 +1431,21 @@ mod resolver_tests {
             erase_mask: Vec::new(),
             material_source: Vec::new(),
             clip_mask: Vec::new(),
+            field_transform: crate::transform::Affine::IDENTITY,
         };
         let left_appearance = VectorAppearance {
             material,
             erase_mask: Vec::new(),
             material_source: vec![original_path.clone()],
             clip_mask: vec![rectangle_path(-20.0, -20.0, 10.0, 40.0)],
+            field_transform: crate::transform::Affine::IDENTITY,
         };
         let right_appearance = VectorAppearance {
             material,
             erase_mask: Vec::new(),
             material_source: vec![original_path],
             clip_mask: vec![rectangle_path(10.0, -20.0, 40.0, 40.0)],
+            field_transform: crate::transform::Affine::IDENTITY,
         };
 
         let whole_tile = rasterize_vector_appearance_local(&original, &whole, 4.0).unwrap();
@@ -1308,12 +1511,14 @@ mod resolver_tests {
             erase_mask: Vec::new(),
             material_source: Vec::new(),
             clip_mask: Vec::new(),
+            field_transform: crate::transform::Affine::IDENTITY,
         };
         let fragment = VectorAppearance {
             material: whole.material,
             erase_mask: Vec::new(),
             material_source: vec![source_path],
             clip_mask: vec![rectangle_path(-10.0, 120.0, 20.0, 180.0)],
+            field_transform: crate::transform::Affine::IDENTITY,
         };
         let whole_tile = rasterize_vector_halo_local(&vector, &whole, 4.0).unwrap();
         let fragment_tile = rasterize_vector_halo_local(&vector, &fragment, 4.0).unwrap();
@@ -1357,6 +1562,7 @@ mod resolver_tests {
             erase_mask: vec![rectangle_path(22.0, 7.0, 26.0, 13.0)],
             material_source: Vec::new(),
             clip_mask: Vec::new(),
+            field_transform: crate::transform::Affine::IDENTITY,
         };
         let tile =
             rasterize_vector_appearance_local(&vector, &appearance, 4.0).expect("appearance tile");
@@ -1391,6 +1597,7 @@ mod resolver_tests {
                 erase_mask: vec![rectangle_path(3.0, 3.0, 7.0, 7.0)],
                 material_source: Vec::new(),
                 clip_mask: Vec::new(),
+                field_transform: crate::transform::Affine::IDENTITY,
             },
         );
         let project = ProjectV2 {

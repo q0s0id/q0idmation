@@ -3973,12 +3973,17 @@ fn capture_whole_asset_appearances_for_raw_refs(
         grouped
             .into_iter()
             .filter_map(|(asset_id, selected)| {
-                let appearance = project.asset_appearances.get(&asset_id)?.clone();
+                let mut appearance = project.asset_appearances.get(&asset_id)?.clone();
                 let Asset::Vector(vector) =
                     project.assets.iter().find(|asset| asset.id() == asset_id)?
                 else {
                     return None;
                 };
+                if appearance.material_source.is_empty() {
+                    // The first affine edit freezes the pre-transform material source.
+                    // From now on field_transform moves the already-resolved glow.
+                    appearance.material_source = vector.paths.clone();
+                }
                 let editable: std::collections::BTreeSet<usize> = vector
                     .paths
                     .iter()
@@ -4005,8 +4010,7 @@ fn transform_captured_appearances(
     {
         let mut changed = false;
         for (asset_id, source) in start_appearances {
-            let transformed =
-                crate::appearance::transform_appearance(source, |point| transform.apply(point));
+            let transformed = crate::appearance::transform_appearance(source, transform);
             if project.asset_appearances.get(asset_id) != Some(&transformed) {
                 project.asset_appearances.insert(*asset_id, transformed);
                 changed = true;
@@ -7728,6 +7732,7 @@ mod tests {
                 erase_mask: Vec::new(),
                 material_source: Vec::new(),
                 clip_mask: Vec::new(),
+                field_transform: q0s_format::transform::Affine::IDENTITY,
             },
         );
         app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
@@ -8331,6 +8336,7 @@ mod tests {
                 },
                 material_source: Vec::new(),
                 clip_mask: Vec::new(),
+                field_transform: q0s_format::transform::Affine::IDENTITY,
             },
         );
         ProjectV2 {
