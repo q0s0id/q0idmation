@@ -6501,82 +6501,87 @@ fn draw_transform_pivot_overlay(app: &EditorApp, painter: &Painter, view: &Stage
     );
 }
 
-fn dense_selection_contour_points(contours: &[Vec<Pos2>]) -> Vec<Pos2> {
-    const BASE_SPACING_PX: f32 = 1.8;
-    const MAX_POINTS: f32 = 12_000.0;
+const SELECTION_STIPPLE_SPACING_PX: f32 = 2.0;
+const SELECTION_CONTOUR_SPACING_PX: f32 = 1.0;
 
-    let perimeter: f32 = contours
-        .iter()
-        .map(|contour| {
-            if contour.len() < 2 {
-                return 0.0;
+fn clip_segment_to_rect(a: Pos2, b: Pos2, rect: egui::Rect) -> Option<(Pos2, Pos2)> {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let mut t0 = 0.0_f32;
+    let mut t1 = 1.0_f32;
+    for (p, q) in [
+        (-dx, a.x - rect.left()),
+        (dx, rect.right() - a.x),
+        (-dy, a.y - rect.top()),
+        (dy, rect.bottom() - a.y),
+    ] {
+        if p.abs() <= f32::EPSILON {
+            if q < 0.0 {
+                return None;
             }
-            contour
-                .iter()
-                .copied()
-                .zip(contour.iter().copied().cycle().skip(1))
-                .take(contour.len())
-                .map(|(a, b)| a.distance(b))
-                .sum::<f32>()
-        })
-        .sum();
-    if perimeter <= f32::EPSILON {
-        return Vec::new();
+            continue;
+        }
+        let r = q / p;
+        if p < 0.0 {
+            t0 = t0.max(r);
+        } else {
+            t1 = t1.min(r);
+        }
+        if t0 > t1 {
+            return None;
+        }
     }
-    let spacing = BASE_SPACING_PX.max(perimeter / MAX_POINTS);
-    let mut points = Vec::with_capacity((perimeter / spacing).ceil() as usize);
+    Some((a + (b - a) * t0, a + (b - a) * t1))
+}
 
+fn dense_selection_contour_points(contours: &[Vec<Pos2>], clip_rect: egui::Rect) -> Vec<Pos2> {
+    let mut points = Vec::new();
     for contour in contours {
         if contour.len() < 2 {
             continue;
         }
-        let mut carry = 0.0_f32;
         for (a, b) in contour
             .iter()
             .copied()
             .zip(contour.iter().copied().cycle().skip(1))
             .take(contour.len())
         {
-            let delta = b - a;
+            let Some((visible_a, visible_b)) = clip_segment_to_rect(a, b, clip_rect) else {
+                continue;
+            };
+            let delta = visible_b - visible_a;
             let length = delta.length();
             if length <= f32::EPSILON {
                 continue;
             }
             let direction = delta / length;
-            let mut distance = if carry <= f32::EPSILON {
-                0.0
-            } else {
-                spacing - carry
-            };
-            while distance < length {
-                points.push(a + direction * distance);
-                distance += spacing;
+            // Screen-space spacing is intentionally fixed. This mimics the
+            // dense Flash/Animate selection cue even through smooth zoom.
+            let mut distance = 0.0_f32;
+            while distance <= length {
+                points.push(visible_a + direction * distance);
+                distance += SELECTION_CONTOUR_SPACING_PX;
             }
-            carry = (carry + length) % spacing;
         }
     }
     points
 }
 
 fn draw_dense_selection_contour(painter: &Painter, contours: &[Vec<Pos2>], accent: Color32) {
-    for point in dense_selection_contour_points(contours) {
-        painter.circle_filled(point, 1.05, Color32::from_black_alpha(210));
-        painter.circle_filled(point, 0.62, accent);
+    let clip_rect = painter.clip_rect();
+    for point in dense_selection_contour_points(contours, clip_rect) {
+        // Keep these as actual dots rather than an almost-solid stroke.
+        painter.circle_filled(point, 0.52, Color32::from_black_alpha(220));
+        painter.circle_filled(point, 0.32, accent);
     }
 }
-fn selection_stipple_step(rect: egui::Rect) -> f32 {
-    const BASE_STEP_PX: f32 = 5.0;
-    const MAX_CANDIDATES: f32 = 2_500.0;
-    let area = rect.width().max(0.0) * rect.height().max(0.0);
-    BASE_STEP_PX.max((area / MAX_CANDIDATES).sqrt())
+
+fn fixed_selection_grid_start(min: f32) -> f32 {
+    (min / SELECTION_STIPPLE_SPACING_PX).ceil() * SELECTION_STIPPLE_SPACING_PX
 }
 
-#[cfg(feature = "appearance-mask-eraser")]
-fn appearance_selection_stipple_step(rect: egui::Rect) -> f32 {
-    const BASE_STEP_PX: f32 = 6.0;
-    const MAX_CANDIDATES: f32 = 900.0;
-    let area = rect.width().max(0.0) * rect.height().max(0.0);
-    BASE_STEP_PX.max((area / MAX_CANDIDATES).sqrt())
+fn selection_stipple_step() -> f32 {
+    SELECTION_STIPPLE_SPACING_PX
 }
 
 #[cfg(feature = "appearance-mask-eraser")]
@@ -6586,12 +6591,12 @@ fn appearance_selection_stipple_points(
     tester: &crate::appearance::VisibleMaterialHitTester,
     subset_support: Option<(&MultiPolygon<f64>, q0s_format::v2::VectorMaterial)>,
 ) -> Vec<Pos2> {
-    let step = appearance_selection_stipple_step(rect);
+    let step = selection_stipple_step();
     let mut points = Vec::new();
-    let mut y = rect.top() + step * 0.5;
-    while y < rect.bottom() {
-        let mut x = rect.left() + step * 0.5;
-        while x < rect.right() {
+    let mut y = fixed_selection_grid_start(rect.top());
+    while y <= rect.bottom() {
+        let mut x = fixed_selection_grid_start(rect.left());
+        while x <= rect.right() {
             let world = Vec2::new(
                 (x - view.origin.x) / view.scale,
                 (y - view.origin.y) / view.scale,
@@ -6622,11 +6627,16 @@ fn draw_appearance_selection_stipple(
     tester: &crate::appearance::VisibleMaterialHitTester,
     subset_support: Option<(&MultiPolygon<f64>, q0s_format::v2::VectorMaterial)>,
 ) {
-    let clipped = painter.with_clip_rect(rect);
-    for point in appearance_selection_stipple_points(view, rect, tester, subset_support) {
-        clipped.circle_filled(point, 0.9, Color32::WHITE);
+    let sample_rect = rect.intersect(painter.clip_rect());
+    if !sample_rect.is_positive() {
+        return;
+    }
+    let clipped = painter.with_clip_rect(sample_rect);
+    for point in appearance_selection_stipple_points(view, sample_rect, tester, subset_support) {
+        clipped.circle_filled(point, 0.62, Color32::WHITE);
     }
 }
+
 fn draw_raw_area_selection(
     app: &EditorApp,
     painter: &Painter,
@@ -6640,7 +6650,8 @@ fn draw_raw_area_selection(
         stage_to_screen(bounds_min, view),
         stage_to_screen(bounds_max, view),
     );
-    let clipped = painter.with_clip_rect(selection_rect);
+    let visible_rect = selection_rect.intersect(painter.clip_rect());
+    let clipped = painter.with_clip_rect(visible_rect);
     let mut surfaces = Vec::new();
     for r in placements {
         let Some(placement) = app
@@ -6685,15 +6696,14 @@ fn draw_raw_area_selection(
     }
 
     // Animate-style stipple is evaluated against one unioned surface, so holes
-    // remain empty. The grid adapts to screen area and therefore performs at
-    // most roughly 2.5k containment checks per frame instead of tens of
-    // thousands on a large selection.
+    // remain empty. Density is fixed in screen space at every zoom; only the
+    // visible viewport is sampled so off-screen geometry does not create work.
     let surface = geo::unary_union(surfaces.iter());
-    let step = selection_stipple_step(selection_rect);
-    let mut y = selection_rect.top() + step * 0.5;
-    while y < selection_rect.bottom() {
-        let mut x = selection_rect.left() + step * 0.5;
-        while x < selection_rect.right() {
+    let step = selection_stipple_step();
+    let mut y = fixed_selection_grid_start(visible_rect.top());
+    while y <= visible_rect.bottom() {
+        let mut x = fixed_selection_grid_start(visible_rect.left());
+        while x <= visible_rect.right() {
             let stage = Point::new(
                 ((x - view.origin.x) / view.scale) as f64,
                 ((y - view.origin.y) / view.scale) as f64,
@@ -6939,7 +6949,8 @@ fn draw_partial_raw_selection(
         stage_to_screen(bounds_min, view),
         stage_to_screen(bounds_max, view),
     );
-    let clipped = painter.with_clip_rect(selection_rect);
+    let visible_rect = selection_rect.intersect(painter.clip_rect());
+    let clipped = painter.with_clip_rect(visible_rect);
     crate::render::paint_concave_fill(&clipped, &screen, selection_fill_color(app, 64));
     if path.closed && screen.len() >= 3 {
         draw_dense_selection_contour(
@@ -6949,13 +6960,13 @@ fn draw_partial_raw_selection(
         );
     }
 
-    // Keep the dotted raw-area cue without evaluating an unbounded pixel grid
-    // every frame on large marquee selections.
-    let step = selection_stipple_step(selection_rect);
-    let mut y = selection_rect.top() + step * 0.5;
-    while y < selection_rect.bottom() {
-        let mut x = selection_rect.left() + step * 0.5;
-        while x < selection_rect.right() {
+    // Keep the dotted raw-area cue at one fixed screen-space density. Work is
+    // clipped to the viewport rather than thinning the pattern on large areas.
+    let step = selection_stipple_step();
+    let mut y = fixed_selection_grid_start(visible_rect.top());
+    while y <= visible_rect.bottom() {
+        let mut x = fixed_selection_grid_start(visible_rect.left());
+        while x <= visible_rect.right() {
             let stage = Vec2::new(
                 (x - view.origin.x) / view.scale,
                 (y - view.origin.y) / view.scale,
@@ -9555,43 +9566,41 @@ mod tests {
     }
 
     #[test]
-    fn selection_stipple_density_is_bounded_by_screen_area() {
-        let small = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(100.0, 100.0));
-        assert_eq!(selection_stipple_step(small), 5.0);
-
-        let large = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(2000.0, 1000.0));
-        let step = selection_stipple_step(large);
-        let candidates = (large.width() / step).ceil() * (large.height() / step).ceil();
-        assert!(step > 20.0);
-        assert!(candidates <= 2_600.0, "candidate grid must stay bounded");
+    fn selection_stipple_density_is_fixed_in_screen_space() {
+        assert_eq!(selection_stipple_step(), 2.0);
+        assert_eq!(fixed_selection_grid_start(0.0), 0.0);
+        assert_eq!(fixed_selection_grid_start(1.0), 2.0);
+        assert_eq!(fixed_selection_grid_start(37.1), 38.0);
     }
 
     #[test]
-    fn dense_selection_contour_is_screen_dense_but_length_bounded() {
+    fn dense_selection_contour_keeps_one_pixel_spacing_and_clips_offscreen_work() {
         let square = vec![
             Pos2::new(0.0, 0.0),
             Pos2::new(100.0, 0.0),
             Pos2::new(100.0, 100.0),
             Pos2::new(0.0, 100.0),
         ];
-        let points = dense_selection_contour_points(&[square]);
+        let clip = egui::Rect::from_min_max(Pos2::new(-1.0, -1.0), Pos2::new(101.0, 101.0));
+        let points = dense_selection_contour_points(&[square], clip);
         assert!(
-            points.len() >= 210,
-            "400px contour should read almost continuously, got {} points",
+            points.len() >= 396,
+            "400px contour should be effectively one-dot-per-pixel, got {} points",
             points.len()
         );
 
         let huge = vec![
-            Pos2::new(0.0, 0.0),
-            Pos2::new(100_000.0, 0.0),
+            Pos2::new(-100_000.0, 50.0),
+            Pos2::new(100_000.0, 50.0),
             Pos2::new(100_000.0, 100_000.0),
-            Pos2::new(0.0, 100_000.0),
+            Pos2::new(-100_000.0, 100_000.0),
         ];
-        let huge_points = dense_selection_contour_points(&[huge]);
+        let viewport = egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(200.0, 100.0));
+        let visible_points = dense_selection_contour_points(&[huge], viewport);
         assert!(
-            huge_points.len() <= 12_010,
-            "contour work must scale with the point budget, got {}",
-            huge_points.len()
+            visible_points.len() <= 205,
+            "off-screen contour length must not create work, got {} visible points",
+            visible_points.len()
         );
     }
     #[test]
