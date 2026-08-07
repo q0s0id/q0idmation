@@ -6994,6 +6994,13 @@ fn draw_raw_paths_overlay(
     refs: &[PathRef],
     draw_boxes: bool,
 ) {
+    // Path refs may span multiple internal carrier placements after appearance
+    // splitting. That is an implementation detail: one logical selection gets
+    // exactly one transform frame. Per-carrier boxes make a single glow look
+    // like two independent selections.
+    let selection_frame = draw_boxes
+        .then(|| raw_path_refs_ui_bounds(&app.state.project, refs))
+        .flatten();
     let mut grouped: std::collections::BTreeMap<(u16, u16, usize), Vec<usize>> =
         std::collections::BTreeMap::new();
     for reference in refs {
@@ -7136,9 +7143,6 @@ fn draw_raw_paths_overlay(
                         .map(|surface| (surface, appearance.material));
                     draw_appearance_selection_stipple(painter, view, rect, &tester, subset_support);
                 }
-                if draw_boxes {
-                    draw_flash_selection_box(painter, rect, selection_color(app));
-                }
             }
             continue;
         }
@@ -7162,25 +7166,14 @@ fn draw_raw_paths_overlay(
                 }));
             }
         }
-        if draw_boxes {
-            let points: Vec<Pos2> = contours.iter().flatten().copied().collect();
-            if !points.is_empty() {
-                let min = points
-                    .iter()
-                    .fold(Pos2::new(f32::INFINITY, f32::INFINITY), |acc, point| {
-                        Pos2::new(acc.x.min(point.x), acc.y.min(point.y))
-                    });
-                let max = points.iter().fold(
-                    Pos2::new(f32::NEG_INFINITY, f32::NEG_INFINITY),
-                    |acc, point| Pos2::new(acc.x.max(point.x), acc.y.max(point.y)),
-                );
-                draw_flash_selection_box(
-                    painter,
-                    egui::Rect::from_min_max(min, max),
-                    selection_color(app),
-                );
-            }
-        }
+    }
+
+    if let Some((min_x, min_y, max_x, max_y)) = selection_frame {
+        let rect = egui::Rect::from_min_max(
+            stage_to_screen(Vec2::new(min_x, min_y), view),
+            stage_to_screen(Vec2::new(max_x, max_y), view),
+        );
+        draw_flash_selection_box(painter, rect, selection_color(app));
     }
 }
 
@@ -9151,6 +9144,15 @@ mod tests {
             "drag materialisation must create a movable post-material fragment even when the marquee contains halo only"
         );
         assert_eq!(app.state.project.q0rgs[0].layers[0].placements.len(), 2);
+        let selected_placements: std::collections::BTreeSet<_> = refs
+            .iter()
+            .map(|reference| reference.placement_idx)
+            .collect();
+        assert_eq!(
+            selected_placements.len(),
+            1,
+            "one halo-only marquee must materialize one selected carrier; the remainder must not leak into selection"
+        );
         let selected_placement = refs[0].placement_idx;
         let selected_asset_id =
             match app.state.project.q0rgs[0].layers[0].placements[selected_placement].target {
