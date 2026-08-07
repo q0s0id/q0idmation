@@ -1,6 +1,8 @@
 pub mod app;
 #[cfg(windows)]
 pub mod assoc;
+#[cfg(feature = "appearance-mask-eraser")]
+pub mod appearance;
 mod bitmap_import;
 pub mod brush;
 pub mod easing;
@@ -16,6 +18,14 @@ pub mod settings;
 pub mod state;
 pub mod theme;
 pub mod timeline_edit;
+
+#[cfg(not(feature = "appearance-mask-eraser"))]
+pub mod tools;
+#[cfg(feature = "appearance-mask-eraser")]
+#[path = "tools.rs"]
+mod tools_legacy;
+#[cfg(feature = "appearance-mask-eraser")]
+#[path = "tools_experimental.rs"]
 pub mod tools;
 
 pub use app::EditorApp;
