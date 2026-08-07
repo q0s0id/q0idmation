@@ -6501,6 +6501,69 @@ fn draw_transform_pivot_overlay(app: &EditorApp, painter: &Painter, view: &Stage
     );
 }
 
+fn dense_selection_contour_points(contours: &[Vec<Pos2>]) -> Vec<Pos2> {
+    const BASE_SPACING_PX: f32 = 1.8;
+    const MAX_POINTS: f32 = 12_000.0;
+
+    let perimeter: f32 = contours
+        .iter()
+        .map(|contour| {
+            if contour.len() < 2 {
+                return 0.0;
+            }
+            contour
+                .iter()
+                .copied()
+                .zip(contour.iter().copied().cycle().skip(1))
+                .take(contour.len())
+                .map(|(a, b)| a.distance(b))
+                .sum::<f32>()
+        })
+        .sum();
+    if perimeter <= f32::EPSILON {
+        return Vec::new();
+    }
+    let spacing = BASE_SPACING_PX.max(perimeter / MAX_POINTS);
+    let mut points = Vec::with_capacity((perimeter / spacing).ceil() as usize);
+
+    for contour in contours {
+        if contour.len() < 2 {
+            continue;
+        }
+        let mut carry = 0.0_f32;
+        for (a, b) in contour
+            .iter()
+            .copied()
+            .zip(contour.iter().copied().cycle().skip(1))
+            .take(contour.len())
+        {
+            let delta = b - a;
+            let length = delta.length();
+            if length <= f32::EPSILON {
+                continue;
+            }
+            let direction = delta / length;
+            let mut distance = if carry <= f32::EPSILON {
+                0.0
+            } else {
+                spacing - carry
+            };
+            while distance < length {
+                points.push(a + direction * distance);
+                distance += spacing;
+            }
+            carry = (carry + length) % spacing;
+        }
+    }
+    points
+}
+
+fn draw_dense_selection_contour(painter: &Painter, contours: &[Vec<Pos2>], accent: Color32) {
+    for point in dense_selection_contour_points(contours) {
+        painter.circle_filled(point, 1.05, Color32::from_black_alpha(210));
+        painter.circle_filled(point, 0.62, accent);
+    }
+}
 fn selection_stipple_step(rect: egui::Rect) -> f32 {
     const BASE_STEP_PX: f32 = 5.0;
     const MAX_CANDIDATES: f32 = 2_500.0;
@@ -6606,6 +6669,10 @@ fn draw_raw_area_selection(
             {
                 draw_appearance_selection_stipple(painter, view, selection_rect, &tester, None);
             }
+            let body =
+                crate::appearance::visible_source_surface_for_vector(vector, Some(appearance));
+            let body_contours = surface_to_screen_contours(&body, view);
+            draw_dense_selection_contour(&clipped, &body_contours, selection_color(app));
             // Do not add the appearance to `surfaces`: doing so would rebuild
             // the expensive buffered glow for the legacy stipple pass below.
             continue;
@@ -6613,6 +6680,7 @@ fn draw_raw_area_selection(
         let surface = raw_selectable_fill_surface(&app.state.project, asset_id, vector);
         let contours = surface_to_screen_contours(&surface, view);
         crate::render::paint_complex_fill(&clipped, &contours, selection_fill_color(app, 64));
+        draw_dense_selection_contour(&clipped, &contours, selection_color(app));
         surfaces.push(surface);
     }
 
@@ -6766,18 +6834,22 @@ fn draw_raw_paths_overlay(
                     stage_to_screen(Vec2::new(min_x, min_y), view),
                     stage_to_screen(Vec2::new(max_x, max_y), view),
                 );
+                let subset = VectorAsset {
+                    asset_id: vector.asset_id,
+                    paths: closed_indices
+                        .iter()
+                        .filter_map(|index| vector.paths.get(*index).cloned())
+                        .collect(),
+                    fill: vector.fill,
+                    stroke: None,
+                };
+                let body =
+                    crate::appearance::visible_source_surface_for_vector(&subset, Some(appearance));
+                let body_contours = surface_to_screen_contours(&body, view);
+                draw_dense_selection_contour(painter, &body_contours, selection_color(app));
                 if let Some(tester) =
                     crate::appearance::prepare_visible_material_hit_tester(vector, Some(appearance))
                 {
-                    let subset = VectorAsset {
-                        asset_id: vector.asset_id,
-                        paths: closed_indices
-                            .iter()
-                            .filter_map(|index| vector.paths.get(*index).cloned())
-                            .collect(),
-                        fill: vector.fill,
-                        stroke: None,
-                    };
                     let subset_surface = vector_fill_geometry(&subset);
                     let canonical_subset = appearance.field_transform.inverse().map(|inverse| {
                         crate::appearance::transform_surface(&subset_surface, inverse)
@@ -6801,6 +6873,7 @@ fn draw_raw_paths_overlay(
             continue;
         }
         crate::render::paint_complex_fill(painter, &contours, selection_fill_color(app, 64));
+        draw_dense_selection_contour(painter, &contours, selection_color(app));
         for contour in &contours {
             let outline = crate::render::sanitize_display_polyline(contour, 2.0, true);
             if outline.len() >= 3 {
@@ -6868,6 +6941,13 @@ fn draw_partial_raw_selection(
     );
     let clipped = painter.with_clip_rect(selection_rect);
     crate::render::paint_concave_fill(&clipped, &screen, selection_fill_color(app, 64));
+    if path.closed && screen.len() >= 3 {
+        draw_dense_selection_contour(
+            &clipped,
+            std::slice::from_ref(&screen),
+            selection_color(app),
+        );
+    }
 
     // Keep the dotted raw-area cue without evaluating an unbounded pixel grid
     // every frame on large marquee selections.
@@ -9486,6 +9566,34 @@ mod tests {
         assert!(candidates <= 2_600.0, "candidate grid must stay bounded");
     }
 
+    #[test]
+    fn dense_selection_contour_is_screen_dense_but_length_bounded() {
+        let square = vec![
+            Pos2::new(0.0, 0.0),
+            Pos2::new(100.0, 0.0),
+            Pos2::new(100.0, 100.0),
+            Pos2::new(0.0, 100.0),
+        ];
+        let points = dense_selection_contour_points(&[square]);
+        assert!(
+            points.len() >= 210,
+            "400px contour should read almost continuously, got {} points",
+            points.len()
+        );
+
+        let huge = vec![
+            Pos2::new(0.0, 0.0),
+            Pos2::new(100_000.0, 0.0),
+            Pos2::new(100_000.0, 100_000.0),
+            Pos2::new(0.0, 100_000.0),
+        ];
+        let huge_points = dense_selection_contour_points(&[huge]);
+        assert!(
+            huge_points.len() <= 12_010,
+            "contour work must scale with the point budget, got {}",
+            huge_points.len()
+        );
+    }
     #[test]
     fn valid_scale_clamps_crossing_and_repairs_non_finite_values() {
         assert_eq!(valid_scale(2.5), 2.5);
