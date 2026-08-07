@@ -1,0 +1,37 @@
+name: appearance eraser ci base
+
+on:
+  pull_request:
+    branches:
+      - ci/appearance-experiment-v2
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Format working tree
+        run: cargo fmt --all
+
+      - name: Workspace check
+        run: cargo check --workspace --locked
+
+      - name: Workspace tests
+        run: cargo test --workspace --locked
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Release q0editor
+        run: cargo build --release --locked -p q0editor
+
+      - name: Legacy fallback check
+        run: cargo check --locked -p q0editor --no-default-features
