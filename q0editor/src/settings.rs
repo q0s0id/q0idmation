@@ -12,6 +12,7 @@ use egui::{Color32, Rounding, Stroke};
 use q0theme::{BuiltinTheme, BUILTIN_THEMES, Q0S_SIGNATURE_ID};
 use serde::{Deserialize, Serialize};
 
+use crate::advanced_brush::{AdvancedBrushSettings, BrushMode};
 use crate::brush::{BrushNib, BrushSettings};
 use crate::easing::EasingPreset;
 use crate::l10n::Language;
@@ -693,6 +694,31 @@ impl From<ColorRgba> for Rgba {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub enum PersistBrushMode {
+    #[default]
+    Classic,
+    Advanced,
+}
+
+impl From<BrushMode> for PersistBrushMode {
+    fn from(mode: BrushMode) -> Self {
+        match mode {
+            BrushMode::Classic => Self::Classic,
+            BrushMode::Advanced => Self::Advanced,
+        }
+    }
+}
+
+impl From<PersistBrushMode> for BrushMode {
+    fn from(mode: PersistBrushMode) -> Self {
+        match mode {
+            PersistBrushMode::Classic => Self::Classic,
+            PersistBrushMode::Advanced => Self::Advanced,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct PersistBrushSize(pub f32);
 
@@ -747,7 +773,7 @@ impl BrushPreferences {
                 BrushNib::Slash => PersistBrushNib::Slash,
                 BrushNib::Backslash => PersistBrushNib::Backslash,
             },
-            glow: settings.glow,
+            glow: false,
             scale_with_stage: settings.scale_with_stage,
             sync_with_eraser: settings.sync_with_eraser,
         }
@@ -771,7 +797,6 @@ impl BrushPreferences {
                 PersistBrushNib::Slash => BrushNib::Slash,
                 PersistBrushNib::Backslash => BrushNib::Backslash,
             },
-            glow: self.glow,
             scale_with_stage: self.scale_with_stage,
             sync_with_eraser: self.sync_with_eraser,
         }
@@ -780,6 +805,108 @@ impl BrushPreferences {
     pub fn update_from_runtime(&mut self, settings: BrushSettings) {
         *self = Self::from_runtime(settings);
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AdvancedBrushPreferences {
+    pub color: ColorRgba,
+    pub size: PersistBrushSize,
+    pub smoothing: u8,
+    pub stabilizer: u8,
+    pub roundness: PersistBrushSize,
+    pub angle_degrees: PersistBrushSize,
+    pub auto_angle: bool,
+    pub taper_start: PersistBrushSize,
+    pub taper_end: PersistBrushSize,
+    pub pressure_size: bool,
+    pub pressure_min_size: PersistBrushSize,
+    pub velocity_size: PersistBrushSize,
+    pub glow: bool,
+    pub glow_radius: PersistBrushSize,
+    pub glow_opacity: PersistBrushSize,
+    pub scale_with_stage: bool,
+}
+
+impl Default for AdvancedBrushPreferences {
+    fn default() -> Self {
+        Self::from_runtime(AdvancedBrushSettings::default())
+    }
+}
+
+impl AdvancedBrushPreferences {
+    pub fn from_runtime(settings: AdvancedBrushSettings) -> Self {
+        let settings = settings.sanitized();
+        Self {
+            color: settings.color.into(),
+            size: PersistBrushSize(settings.size),
+            smoothing: settings.smoothing,
+            stabilizer: settings.stabilizer,
+            roundness: PersistBrushSize(settings.roundness),
+            angle_degrees: PersistBrushSize(settings.angle_degrees),
+            auto_angle: settings.auto_angle,
+            taper_start: PersistBrushSize(settings.taper_start),
+            taper_end: PersistBrushSize(settings.taper_end),
+            pressure_size: settings.pressure_size,
+            pressure_min_size: PersistBrushSize(settings.pressure_min_size),
+            velocity_size: PersistBrushSize(settings.velocity_size),
+            glow: settings.glow,
+            glow_radius: PersistBrushSize(settings.glow_radius),
+            glow_opacity: PersistBrushSize(settings.glow_opacity),
+            scale_with_stage: settings.scale_with_stage,
+        }
+    }
+
+    pub fn to_runtime(self) -> AdvancedBrushSettings {
+        AdvancedBrushSettings {
+            color: self.color.into(),
+            size: self.size.0,
+            smoothing: self.smoothing,
+            stabilizer: self.stabilizer,
+            roundness: self.roundness.0,
+            angle_degrees: self.angle_degrees.0,
+            auto_angle: self.auto_angle,
+            taper_start: self.taper_start.0,
+            taper_end: self.taper_end.0,
+            pressure_size: self.pressure_size,
+            pressure_min_size: self.pressure_min_size.0,
+            velocity_size: self.velocity_size.0,
+            glow: self.glow,
+            glow_radius: self.glow_radius.0,
+            glow_opacity: self.glow_opacity.0,
+            scale_with_stage: self.scale_with_stage,
+        }
+        .sanitized()
+    }
+
+    pub fn update_from_runtime(&mut self, settings: AdvancedBrushSettings) {
+        *self = Self::from_runtime(settings);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AdvancedBrushPreset {
+    pub name: String,
+    pub settings: AdvancedBrushPreferences,
+}
+
+impl Default for AdvancedBrushPreset {
+    fn default() -> Self {
+        Self {
+            name: "Custom".to_string(),
+            settings: AdvancedBrushPreferences::default(),
+        }
+    }
+}
+
+fn sanitize_advanced_brush_presets(presets: &mut Vec<AdvancedBrushPreset>) {
+    let mut names = std::collections::HashSet::new();
+    presets.retain_mut(|preset| {
+        preset.name = preset.name.trim().chars().take(48).collect();
+        !preset.name.is_empty() && names.insert(preset.name.to_ascii_lowercase())
+    });
+    presets.truncate(64);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -791,6 +918,13 @@ pub struct Settings {
     pub brush_cap: BrushCap,
     #[serde(default)]
     pub brush: BrushPreferences,
+    #[serde(default)]
+    pub brush_mode: PersistBrushMode,
+    #[serde(default)]
+    pub advanced_brush: AdvancedBrushPreferences,
+    /// User-created Advanced-brush presets shared by every project.
+    #[serde(default)]
+    pub advanced_brush_presets: Vec<AdvancedBrushPreset>,
     /// User-created easing curves shared by every project.
     #[serde(default)]
     pub easing_presets: Vec<EasingPreset>,
@@ -841,6 +975,9 @@ impl Default for Settings {
             theme: Theme::default(),
             brush_cap: BrushCap::Round,
             brush: BrushPreferences::default(),
+            brush_mode: PersistBrushMode::Classic,
+            advanced_brush: AdvancedBrushPreferences::default(),
+            advanced_brush_presets: Vec::new(),
             easing_presets: Vec::new(),
             q0lang_font_name: default_q0lang_font_name(),
             q0lang_font_size: default_q0lang_font_size(),
@@ -858,6 +995,20 @@ fn migrate_legacy_timeline_focus_color(theme: &mut Theme) {
     if theme.playhead == LEGACY_FIXED_PLAYHEAD {
         theme.playhead = theme.accent;
     }
+}
+
+fn migrate_legacy_brush_glow(settings: &mut Settings) {
+    if !settings.brush.glow {
+        return;
+    }
+    let mut advanced = settings.advanced_brush.to_runtime();
+    advanced.color = settings.brush.color.into();
+    advanced.size = settings.brush.size.0;
+    advanced.smoothing = settings.brush.smoothing;
+    advanced.glow = true;
+    settings.advanced_brush.update_from_runtime(advanced);
+    settings.brush_mode = PersistBrushMode::Advanced;
+    settings.brush.glow = false;
 }
 
 impl Settings {
@@ -885,6 +1036,11 @@ impl Settings {
         }
         settings.q0lang_font_size.0 = settings.q0lang_font_size.0.clamp(8.0, 72.0);
         settings.q0lang_tab_width = settings.q0lang_tab_width.clamp(1, 8);
+        // The experimental Glow checkbox used to live on Classic. Migrate it
+        // once into Advanced instead of keeping a raster material inside the
+        // Flash-style classic engine.
+        migrate_legacy_brush_glow(&mut settings);
+        sanitize_advanced_brush_presets(&mut settings.advanced_brush_presets);
         crate::easing::sanitize_library(&mut settings.easing_presets);
         settings.prune_recent();
         settings
@@ -1036,7 +1192,6 @@ mod tests {
             size: 27.5,
             smoothing: 83,
             nib: BrushNib::Backslash,
-            glow: true,
             scale_with_stage: false,
             sync_with_eraser: false,
         };
@@ -1045,13 +1200,16 @@ mod tests {
         let decoded: BrushPreferences =
             serde_json::from_str(&encoded).expect("deserialize brush settings");
         assert_eq!(decoded.to_runtime(), runtime);
-        assert!(decoded.to_runtime().glow);
+        assert!(
+            !decoded.glow,
+            "new classic preferences never write legacy glow"
+        );
 
         let legacy_without_glow: BrushPreferences = serde_json::from_str(
             r#"{"color":{"r":1,"g":2,"b":3,"a":255},"size":10.0,"smoothing":50,"nib":"Circle","scale_with_stage":true,"sync_with_eraser":true}"#,
         )
         .expect("old brush settings without glow");
-        assert!(!legacy_without_glow.to_runtime().glow);
+        assert!(!legacy_without_glow.glow);
 
         for nib in BrushNib::ALL {
             let runtime = BrushSettings { nib, ..runtime };
@@ -1081,6 +1239,103 @@ mod tests {
         assert!(bounded.size.is_finite());
         assert!((0.1..=512.0).contains(&bounded.size));
         assert_eq!(bounded.smoothing, 100);
+    }
+
+    #[test]
+    fn legacy_classic_glow_migrates_into_advanced_mode_once() {
+        let mut settings = Settings::default();
+        settings.brush.glow = true;
+        settings.brush.color = ColorRgba {
+            r: 11,
+            g: 22,
+            b: 33,
+            a: 144,
+        };
+        settings.brush.size = PersistBrushSize(27.0);
+        settings.brush.smoothing = 73;
+
+        migrate_legacy_brush_glow(&mut settings);
+
+        assert_eq!(settings.brush_mode, PersistBrushMode::Advanced);
+        assert!(!settings.brush.glow);
+        let advanced = settings.advanced_brush.to_runtime();
+        assert!(advanced.glow);
+        assert_eq!(
+            advanced.color,
+            Rgba {
+                r: 11,
+                g: 22,
+                b: 33,
+                a: 144
+            }
+        );
+        assert_eq!(advanced.size, 27.0);
+        assert_eq!(advanced.smoothing, 73);
+
+        let once = settings.advanced_brush;
+        migrate_legacy_brush_glow(&mut settings);
+        assert_eq!(
+            settings.advanced_brush, once,
+            "migration must be idempotent"
+        );
+    }
+
+    #[test]
+    fn advanced_brush_preferences_round_trip_every_dynamic_field() {
+        let runtime = AdvancedBrushSettings {
+            color: Rgba {
+                r: 12,
+                g: 34,
+                b: 56,
+                a: 178,
+            },
+            size: 37.5,
+            smoothing: 71,
+            stabilizer: 63,
+            roundness: 0.31,
+            angle_degrees: -47.0,
+            auto_angle: true,
+            taper_start: 0.12,
+            taper_end: 0.28,
+            pressure_size: true,
+            pressure_min_size: 0.16,
+            velocity_size: 0.72,
+            glow: true,
+            glow_radius: 19.0,
+            glow_opacity: 0.44,
+            scale_with_stage: false,
+        };
+        let encoded = serde_json::to_string(&AdvancedBrushPreferences::from_runtime(runtime))
+            .expect("serialize advanced brush");
+        let decoded: AdvancedBrushPreferences =
+            serde_json::from_str(&encoded).expect("deserialize advanced brush");
+        assert_eq!(decoded.to_runtime(), runtime.sanitized());
+    }
+
+    #[test]
+    fn advanced_brush_custom_library_round_trips_in_global_settings() {
+        let runtime = AdvancedBrushSettings {
+            glow: true,
+            stabilizer: 88,
+            ..AdvancedBrushSettings::default()
+        };
+        let mut settings = Settings {
+            brush_mode: PersistBrushMode::Advanced,
+            advanced_brush: AdvancedBrushPreferences::from_runtime(runtime),
+            ..Settings::default()
+        };
+        settings.advanced_brush_presets.push(AdvancedBrushPreset {
+            name: "q0 glow ink".to_string(),
+            settings: AdvancedBrushPreferences::from_runtime(runtime),
+        });
+        let encoded = serde_json::to_vec(&settings).expect("serialize settings");
+        let decoded: Settings = serde_json::from_slice(&encoded).expect("deserialize settings");
+        assert_eq!(decoded.brush_mode, PersistBrushMode::Advanced);
+        assert_eq!(
+            decoded.advanced_brush_presets,
+            settings.advanced_brush_presets
+        );
+        assert_eq!(decoded.advanced_brush.to_runtime(), runtime.sanitized());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # appearance-mask-eraser experiment
 
-this branch keeps the classic brush and eraser engine as the only tool path. the appearance experiment no longer swaps in a reduced copy of `tools.rs`, so brush nibs, eraser nib sync and the in-progress eraser preview all use the same code as the classic editor.
+this branch keeps the classic brush and eraser engine intact while adding a separate Advanced brush path. the appearance experiment no longer swaps in a reduced copy of `tools.rs`, so classic nibs, eraser nib sync and eraser preview remain on the original tool path.
 
 ## rollback
 
@@ -18,7 +18,7 @@ this branch keeps the classic brush and eraser engine as the only tool path. the
 
 ## appearance and eraser semantics
 
-- classic brush paint is plain vector fill by default. `Glow` is an explicit brush property and is off in old/missing settings too.
+- classic brush paint is always plain vector fill and has no runtime material toggle. legacy Classic `Glow` settings migrate once into Advanced mode; Glow now belongs to Advanced materials.
 - only the soft halo is rasterized from a gaussian alpha blur; the brush body remains the normal tessellated vector fill in q0editor.
 - source fill alpha and halo alpha are resolved first. the erase mask is multiplied into that final material alpha afterwards.
 - the mask eraser never subtracts from the source vector paths.

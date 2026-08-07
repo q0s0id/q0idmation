@@ -51,9 +51,6 @@ pub struct BrushSettings {
     pub size: f32,
     pub smoothing: u8,
     pub nib: BrushNib,
-    /// Optional soft outer glow material. Classic brush paint is plain vector
-    /// fill by default; glow must be explicitly enabled by the user.
-    pub glow: bool,
     pub scale_with_stage: bool,
     pub sync_with_eraser: bool,
 }
@@ -70,7 +67,6 @@ impl Default for BrushSettings {
             size: 10.0,
             smoothing: 50,
             nib: BrushNib::Circle,
-            glow: false,
             scale_with_stage: true,
             sync_with_eraser: true,
         }
@@ -1074,23 +1070,25 @@ fn raw_fill_style(project: &ProjectV2, candidate: &RawFillCandidate) -> RawFillS
     }
 }
 
-fn requested_brush_material(settings: BrushSettings) -> Option<VectorMaterial> {
-    #[cfg(feature = "appearance-mask-eraser")]
-    {
-        crate::appearance::brush_material(settings)
-    }
-    #[cfg(not(feature = "appearance-mask-eraser"))]
-    {
-        let _ = settings;
-        None
-    }
-}
-
 pub fn commit_brush_region(
     app: &mut EditorApp,
     region: MultiPolygon<f64>,
     settings: BrushSettings,
 ) {
+    commit_brush_region_with_material(app, region, settings, None);
+}
+
+pub fn commit_brush_region_with_material(
+    app: &mut EditorApp,
+    region: MultiPolygon<f64>,
+    settings: BrushSettings,
+    requested_material: Option<VectorMaterial>,
+) {
+    #[cfg(not(feature = "appearance-mask-eraser"))]
+    let requested_material = {
+        let _ = requested_material;
+        None
+    };
     if region.0.is_empty() {
         return;
     }
@@ -1101,7 +1099,6 @@ pub fn commit_brush_region(
     let candidates = collect_raw_fill_candidates(&app.state.project, q0rg_id, layer_id, frame);
     #[cfg(feature = "appearance-mask-eraser")]
     let freshly_painted = region.clone();
-    let requested_material = requested_brush_material(settings);
     let requested_style = RawFillStyle {
         color: settings.color,
         material: requested_material,
@@ -2587,48 +2584,35 @@ mod tests {
 
     #[cfg(feature = "appearance-mask-eraser")]
     #[test]
-    fn classic_brush_is_plain_vector_by_default_and_glow_is_opt_in() {
-        let mut plain_app = EditorApp::default();
-        let plain = settings(16.0, 0);
-        assert!(!plain.glow);
-        let plain_stroke = stroke(&[Vec2::new(10.0, 10.0), Vec2::new(40.0, 10.0)], plain);
-        commit_brush_region(&mut plain_app, brush_finish(plain_stroke, plain), plain);
-        assert!(plain_app.state.project.asset_appearances.is_empty());
-
-        let mut glow_app = EditorApp::default();
-        let glow = BrushSettings {
-            glow: true,
-            ..settings(16.0, 0)
-        };
-        let glow_stroke = stroke(&[Vec2::new(10.0, 10.0), Vec2::new(40.0, 10.0)], glow);
-        commit_brush_region(&mut glow_app, brush_finish(glow_stroke, glow), glow);
-        assert_eq!(glow_app.state.project.asset_appearances.len(), 1);
-        let appearance = glow_app
-            .state
-            .project
-            .asset_appearances
-            .values()
-            .next()
-            .unwrap();
-        assert!(matches!(
-            appearance.material,
-            VectorMaterial::SoftHalo { .. }
-        ));
+    fn classic_brush_runtime_cannot_create_a_material() {
+        let mut app = EditorApp::default();
+        let classic = settings(16.0, 0);
+        let classic_stroke = stroke(&[Vec2::new(10.0, 10.0), Vec2::new(40.0, 10.0)], classic);
+        commit_brush_region(&mut app, brush_finish(classic_stroke, classic), classic);
+        assert!(
+            app.state.project.asset_appearances.is_empty(),
+            "classic runtime has no material setting and must stay pure vector"
+        );
     }
 
     #[cfg(feature = "appearance-mask-eraser")]
     #[test]
-    fn plain_and_glowing_paint_of_same_colour_remain_distinct_styles() {
+    fn explicit_advanced_material_stays_distinct_from_plain_paint() {
         let mut app = EditorApp::default();
         let plain = settings(12.0, 0);
-        let glow = BrushSettings {
-            glow: true,
-            ..plain
-        };
         let left = stroke(&[Vec2::new(10.0, 20.0), Vec2::new(30.0, 20.0)], plain);
         commit_brush_region(&mut app, brush_finish(left, plain), plain);
-        let right = stroke(&[Vec2::new(50.0, 20.0), Vec2::new(70.0, 20.0)], glow);
-        commit_brush_region(&mut app, brush_finish(right, glow), glow);
+
+        let right = stroke(&[Vec2::new(50.0, 20.0), Vec2::new(70.0, 20.0)], plain);
+        commit_brush_region_with_material(
+            &mut app,
+            brush_finish(right, plain),
+            plain,
+            Some(VectorMaterial::SoftHalo {
+                radius: 12.0,
+                opacity: 0.55,
+            }),
+        );
 
         assert_eq!(app.state.project.assets.len(), 2);
         assert_eq!(app.state.project.asset_appearances.len(), 1);
@@ -2636,17 +2620,21 @@ mod tests {
 
     #[cfg(not(feature = "appearance-mask-eraser"))]
     #[test]
-    fn disabling_appearance_engine_restores_plain_merge_drawing_even_if_glow_is_set() {
+    fn disabling_appearance_engine_ignores_advanced_material_and_keeps_plain_merge_drawing() {
         let mut app = EditorApp::default();
         let plain = settings(12.0, 0);
-        let glow = BrushSettings {
-            glow: true,
-            ..plain
-        };
         let left = stroke(&[Vec2::new(10.0, 20.0), Vec2::new(30.0, 20.0)], plain);
         commit_brush_region(&mut app, brush_finish(left, plain), plain);
-        let right = stroke(&[Vec2::new(25.0, 20.0), Vec2::new(45.0, 20.0)], glow);
-        commit_brush_region(&mut app, brush_finish(right, glow), glow);
+        let right = stroke(&[Vec2::new(25.0, 20.0), Vec2::new(45.0, 20.0)], plain);
+        commit_brush_region_with_material(
+            &mut app,
+            brush_finish(right, plain),
+            plain,
+            Some(VectorMaterial::SoftHalo {
+                radius: 12.0,
+                opacity: 0.55,
+            }),
+        );
 
         assert_eq!(app.state.project.assets.len(), 1);
         assert!(app.state.project.asset_appearances.is_empty());

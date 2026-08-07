@@ -7,7 +7,7 @@ use q0s_format::v2::{
     VectorAsset, VectorMaterial,
 };
 
-use crate::{app::EditorApp, brush::BrushSettings};
+use crate::app::EditorApp;
 
 pub const DEFAULT_HALO_RADIUS: f32 = 10.0;
 pub const DEFAULT_HALO_OPACITY: f32 = 0.55;
@@ -23,12 +23,6 @@ pub fn default_brush_appearance() -> VectorAppearance {
         clip_mask: Vec::new(),
         field_transform: Affine::IDENTITY,
     }
-}
-
-/// Classic brush paint is plain vector fill. The material exists only when
-/// Glow is explicitly enabled in brush properties.
-pub(crate) fn brush_material(settings: BrushSettings) -> Option<VectorMaterial> {
-    settings.glow.then_some(default_brush_appearance().material)
 }
 
 /// Build the appearance for the single merged raw-fill asset produced by a

@@ -213,6 +213,8 @@ impl Default for EditorApp {
         // Mirror persisted drawing defaults into the in-memory session.
         session.brush_cap = settings.brush_cap.into();
         session.brush = settings.brush.to_runtime();
+        session.brush_mode = settings.brush_mode.into();
+        session.advanced_brush = settings.advanced_brush.to_runtime();
         Self {
             state: ProjectState {
                 project,
@@ -303,6 +305,8 @@ impl EditorApp {
         let mut session = Session::for_project(&project);
         session.brush_cap = self.settings.brush_cap.into();
         session.brush = self.settings.brush.to_runtime();
+        session.brush_mode = self.settings.brush_mode.into();
+        session.advanced_brush = self.settings.advanced_brush.to_runtime();
         let mut q0enc = crate::q0enc::Q0EncState::default();
         q0enc.apply_persisted_preferences(
             self.settings.last_export_directory.clone(),

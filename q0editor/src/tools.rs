@@ -76,7 +76,7 @@ pub fn handle(
         Tool::Hand => {}
         Tool::Pen => pen(app, response, cursor_stage, painter, view, ctx),
         Tool::Pencil => pencil_freehand(app, response, cursor_stage),
-        Tool::Brush => classic_brush(app, response, view, ctx),
+        Tool::Brush => brush_tool(app, response, view, ctx),
         Tool::Eraser => eraser(app, response, view, ctx),
         Tool::Select => select(app, response, cursor_stage, view),
         Tool::Subselect => subselect(app, response, cursor_stage),
@@ -588,6 +588,190 @@ fn brush_settings_for_view(app: &EditorApp, view_scale: f32) -> crate::brush::Br
         settings.size /= view_scale.max(1.0e-4);
     }
     settings
+}
+
+fn advanced_brush_settings_for_view(
+    app: &EditorApp,
+    view_scale: f32,
+) -> crate::advanced_brush::AdvancedBrushSettings {
+    let mut settings = app.session.advanced_brush.sanitized();
+    if !settings.scale_with_stage {
+        settings.size /= view_scale.max(1.0e-4);
+        settings.glow_radius /= view_scale.max(1.0e-4);
+    }
+    settings
+}
+
+fn brush_tool(app: &mut EditorApp, response: &Response, view: &StageView, ctx: &Context) {
+    match app.session.brush_mode {
+        crate::advanced_brush::BrushMode::Classic => classic_brush(app, response, view, ctx),
+        crate::advanced_brush::BrushMode::Advanced => advanced_brush(app, response, view, ctx),
+    }
+}
+
+fn advanced_material(
+    settings: crate::advanced_brush::AdvancedBrushSettings,
+) -> Option<q0s_format::v2::VectorMaterial> {
+    #[cfg(feature = "appearance-mask-eraser")]
+    {
+        settings.material()
+    }
+    #[cfg(not(feature = "appearance-mask-eraser"))]
+    {
+        let _ = settings;
+        None
+    }
+}
+
+fn advanced_input_samples(
+    ctx: &Context,
+    response: &Response,
+    view: &StageView,
+) -> Vec<crate::advanced_brush::AdvancedBrushSample> {
+    let (now, dt, events) =
+        ctx.input(|input| (input.time, input.unstable_dt, input.events.clone()));
+    let mut touch = Vec::new();
+    for event in &events {
+        if let egui::Event::Touch {
+            phase, pos, force, ..
+        } = event
+        {
+            if matches!(phase, egui::TouchPhase::Start | egui::TouchPhase::Move)
+                && response.rect.contains(*pos)
+            {
+                touch.push((*pos, *force));
+            }
+        }
+    }
+    let mut raw = if touch.is_empty() {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                egui::Event::PointerMoved(pos) if response.rect.contains(*pos) => {
+                    Some((*pos, None))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    } else {
+        touch
+    };
+    if raw.is_empty() {
+        if let Some(pos) = response
+            .interact_pointer_pos()
+            .filter(|pos| response.rect.contains(*pos))
+        {
+            raw.push((pos, None));
+        }
+    }
+    let count = raw.len().max(1) as f64;
+    let span = f64::from(dt.max(1.0 / 1000.0));
+    raw.into_iter()
+        .enumerate()
+        .map(
+            |(index, (screen, pressure))| crate::advanced_brush::AdvancedBrushSample {
+                position: screen_to_stage(screen, view),
+                pressure,
+                time_seconds: now - span + span * (index as f64 + 1.0) / count,
+            },
+        )
+        .collect()
+}
+
+fn advanced_brush(app: &mut EditorApp, response: &Response, view: &StageView, ctx: &Context) {
+    let settings = advanced_brush_settings_for_view(app, view.scale);
+    if response.drag_started_by(PointerButton::Primary) {
+        if let Some(screen) = response.interact_pointer_pos() {
+            let time = ctx.input(|input| input.time);
+            let pressure = ctx.input(|input| {
+                input.events.iter().rev().find_map(|event| match event {
+                    egui::Event::Touch { pos, force, .. } if (*pos - screen).length_sq() <= 9.0 => {
+                        *force
+                    }
+                    _ => None,
+                })
+            });
+            app.session.tool_state = ToolState::AdvancedBrushDrawing {
+                stroke: crate::advanced_brush::advanced_begin(
+                    settings,
+                    crate::advanced_brush::AdvancedBrushSample {
+                        position: screen_to_stage(screen, view),
+                        pressure,
+                        time_seconds: time,
+                    },
+                ),
+            };
+            app.session.status = "Advanced Brush: drawing (GPU preview)".to_string();
+        }
+    }
+
+    if response.drag_started_by(PointerButton::Primary)
+        || response.dragged_by(PointerButton::Primary)
+        || response.drag_stopped_by(PointerButton::Primary)
+    {
+        let samples = advanced_input_samples(ctx, response, view);
+        if let ToolState::AdvancedBrushDrawing { stroke } = &mut app.session.tool_state {
+            for sample in samples {
+                crate::advanced_brush::advanced_add_sample(stroke, settings, sample);
+            }
+        }
+    }
+
+    if response.drag_stopped_by(PointerButton::Primary) {
+        if let ToolState::AdvancedBrushDrawing { stroke } =
+            std::mem::replace(&mut app.session.tool_state, ToolState::Idle)
+        {
+            let region = crate::advanced_brush::advanced_finish(stroke);
+            let classic_bridge = crate::brush::BrushSettings {
+                color: settings.color,
+                size: settings.size,
+                smoothing: 0,
+                nib: crate::brush::BrushNib::Circle,
+                scale_with_stage: settings.scale_with_stage,
+                sync_with_eraser: app.session.brush.sync_with_eraser,
+            };
+            crate::brush::commit_brush_region_with_material(
+                app,
+                region,
+                classic_bridge,
+                advanced_material(settings),
+            );
+        }
+        return;
+    }
+
+    if response.clicked_by(PointerButton::Primary)
+        && matches!(app.session.tool_state, ToolState::Idle)
+    {
+        if let Some(screen) = response
+            .interact_pointer_pos()
+            .or_else(|| response.hover_pos())
+        {
+            let time = ctx.input(|input| input.time);
+            let stroke = crate::advanced_brush::advanced_begin(
+                settings,
+                crate::advanced_brush::AdvancedBrushSample::mouse(
+                    screen_to_stage(screen, view),
+                    time,
+                ),
+            );
+            let region = crate::advanced_brush::advanced_finish(stroke);
+            let classic_bridge = crate::brush::BrushSettings {
+                color: settings.color,
+                size: settings.size,
+                smoothing: 0,
+                nib: crate::brush::BrushNib::Circle,
+                scale_with_stage: settings.scale_with_stage,
+                sync_with_eraser: app.session.brush.sync_with_eraser,
+            };
+            crate::brush::commit_brush_region_with_material(
+                app,
+                region,
+                classic_bridge,
+                advanced_material(settings),
+            );
+        }
+    }
 }
 
 fn brush_cursor_radius_px(settings: crate::brush::BrushSettings, view_scale: f32) -> f32 {
@@ -2180,8 +2364,37 @@ fn draw_brush_cursor(app: &EditorApp, painter: &Painter, view: &StageView) {
     if !painter.clip_rect().contains(center) {
         return;
     }
-    let size_px = brush_cursor_radius_px(app.session.brush, view.scale) * 2.0 + 2.5;
-    draw_nib_cursor_outline(painter, center, app.session.brush.nib, size_px);
+    match app.session.brush_mode {
+        crate::advanced_brush::BrushMode::Classic => {
+            let size_px = brush_cursor_radius_px(app.session.brush, view.scale) * 2.0 + 2.5;
+            draw_nib_cursor_outline(painter, center, app.session.brush.nib, size_px);
+        }
+        crate::advanced_brush::BrushMode::Advanced => {
+            let settings = advanced_brush_settings_for_view(app, view.scale);
+            let major = settings.size * view.scale * 0.5 + 1.25;
+            let minor = major * settings.roundness;
+            let angle = settings.angle_degrees.to_radians();
+            let cos_a = angle.cos();
+            let sin_a = angle.sin();
+            let points = (0..=40)
+                .map(|index| {
+                    let phase = std::f32::consts::TAU * index as f32 / 40.0;
+                    let x = phase.cos() * major;
+                    let y = phase.sin() * minor;
+                    pos2(
+                        center.x + x * cos_a - y * sin_a,
+                        center.y + x * sin_a + y * cos_a,
+                    )
+                })
+                .collect();
+            painter.add(Shape::Path(PathShape {
+                points,
+                closed: true,
+                fill: Color32::TRANSPARENT,
+                stroke: Stroke::new(1.0_f32, Color32::from_white_alpha(210)),
+            }));
+        }
+    }
 }
 
 /// Draw the active eraser footprint. When brush/eraser sync is enabled this
@@ -6203,6 +6416,110 @@ fn paint_classic_nib_preview(
         }
     }
 }
+fn advanced_preview_mesh(
+    dabs: &[crate::advanced_brush::AdvancedDab],
+    view: &StageView,
+    color: Color32,
+    expansion: f32,
+) -> Mesh {
+    const SEGMENTS: usize = 18;
+    let mut mesh = Mesh::default();
+    let mut rings: Vec<[Pos2; SEGMENTS]> = Vec::with_capacity(dabs.len());
+
+    for dab in dabs {
+        let center = stage_to_screen(dab.center, view);
+        let major = (dab.major_radius + expansion).max(0.05) * view.scale;
+        let minor = (dab.minor_radius + expansion).max(0.05) * view.scale;
+        let cos_a = dab.angle_radians.cos();
+        let sin_a = dab.angle_radians.sin();
+        let ring = std::array::from_fn(|index| {
+            let phase = std::f32::consts::TAU * index as f32 / SEGMENTS as f32;
+            let x = phase.cos() * major;
+            let y = phase.sin() * minor;
+            pos2(
+                center.x + x * cos_a - y * sin_a,
+                center.y + x * sin_a + y * cos_a,
+            )
+        });
+
+        let center_index = mesh.vertices.len() as u32;
+        mesh.colored_vertex(center, color);
+        let ring_start = mesh.vertices.len() as u32;
+        for point in ring {
+            mesh.colored_vertex(point, color);
+        }
+        for index in 0..SEGMENTS {
+            mesh.add_triangle(
+                center_index,
+                ring_start + index as u32,
+                ring_start + ((index + 1) % SEGMENTS) as u32,
+            );
+        }
+        rings.push(ring);
+    }
+
+    // Morph one oriented nib ring into the next with a GPU triangle strip.
+    // This tracks roundness/angle/taper much more closely than a centre-line
+    // ribbon, while still avoiding all boolean geometry during live input.
+    for pair in rings.windows(2) {
+        let first = &pair[0];
+        let second = &pair[1];
+        for index in 0..SEGMENTS {
+            let next = (index + 1) % SEGMENTS;
+            let base = mesh.vertices.len() as u32;
+            mesh.colored_vertex(first[index], color);
+            mesh.colored_vertex(first[next], color);
+            mesh.colored_vertex(second[next], color);
+            mesh.colored_vertex(second[index], color);
+            mesh.add_triangle(base, base + 1, base + 2);
+            mesh.add_triangle(base, base + 2, base + 3);
+        }
+    }
+    mesh
+}
+
+fn paint_advanced_gpu_preview(
+    painter: &Painter,
+    stroke: &crate::advanced_brush::AdvancedBrushStroke,
+    view: &StageView,
+) {
+    let dabs = crate::advanced_brush::advanced_dabs(stroke);
+    if dabs.is_empty() {
+        return;
+    }
+    let settings = stroke.settings.sanitized();
+    if settings.glow {
+        // Preview-only soft halo approximation: a handful of translucent GPU
+        // mesh passes. Commit/export use the canonical material renderer.
+        for layer in (1..=5).rev() {
+            let t = layer as f32 / 5.0;
+            let alpha = (settings.glow_opacity * (1.0 - t).powi(2) * 90.0).clamp(0.0, 80.0) as u8;
+            if alpha == 0 {
+                continue;
+            }
+            let glow = Color32::from_rgba_unmultiplied(
+                settings.color.r,
+                settings.color.g,
+                settings.color.b,
+                alpha,
+            );
+            painter.add(Shape::Mesh(advanced_preview_mesh(
+                &dabs,
+                view,
+                glow,
+                settings.glow_radius * t,
+            )));
+        }
+    }
+    let body = Color32::from_rgba_unmultiplied(
+        settings.color.r,
+        settings.color.g,
+        settings.color.b,
+        settings.color.a,
+    );
+    painter.add(Shape::Mesh(advanced_preview_mesh(&dabs, view, body, 0.0)));
+}
+
 fn draw_in_progress_overlay(app: &EditorApp, painter: &Painter, view: &StageView) {
     let red = Color32::from_rgb(0xCC, 0x33, 0x33);
     let cursor = painter.ctx().pointer_hover_pos();
@@ -6264,6 +6581,9 @@ fn draw_in_progress_overlay(app: &EditorApp, painter: &Painter, view: &StageView
                 app.session.brush.color.a,
             );
             paint_classic_nib_preview(painter, stroke, view, color, None);
+        }
+        ToolState::AdvancedBrushDrawing { stroke } => {
+            paint_advanced_gpu_preview(painter, stroke, view);
         }
         ToolState::EraserDrawing { stroke } => {
             let fill = Color32::from_rgba_unmultiplied(0xCC, 0x22, 0x22, 40);

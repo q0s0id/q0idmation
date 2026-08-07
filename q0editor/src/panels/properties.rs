@@ -300,64 +300,312 @@ fn tool_hint(app: &EditorApp, ui: &mut Ui, text: &str) {
 }
 
 fn brush_properties(app: &mut EditorApp, ui: &mut Ui) {
-    tool_hint(
-        app,
-        ui,
-        "Static fill nib. The chosen pen shape keeps one fixed angle; smoothing is applied after the gesture.",
-    );
-    let brush_before = app.session.brush;
-    egui::Grid::new("classic_brush_settings")
-        .num_columns(2)
-        .show(ui, |ui| {
-            ui.label("Fill color");
-            let mut color = rgba_to_color32(app.session.brush.color);
-            if ui.color_edit_button_srgba(&mut color).changed() {
-                app.session.brush.color = color32_to_rgba(color);
-            }
-            ui.end_row();
+    let mode_before = app.session.brush_mode;
+    let classic_before = app.session.brush;
+    let advanced_before = app.session.advanced_brush;
+    let presets_before = app.settings.advanced_brush_presets.clone();
 
-            ui.label("Opacity");
-            opacity_control(ui, &mut app.session.brush.color.a);
-            ui.end_row();
+    ui.horizontal(|ui| {
+        ui.label("Mode");
+        for mode in crate::advanced_brush::BrushMode::ALL {
+            ui.selectable_value(&mut app.session.brush_mode, mode, mode.label());
+        }
+    });
+    ui.separator();
 
-            ui.label("Nib");
-            egui::ComboBox::from_id_source("classic_brush_nib")
-                .selected_text(app.session.brush.nib.label())
+    match app.session.brush_mode {
+        crate::advanced_brush::BrushMode::Classic => {
+            tool_hint(
+                app,
+                ui,
+                "Flash-style vector brush: static nib, continuous sweep and boundary smoothing. No stabilizer, taper, velocity or raster materials.",
+            );
+            egui::Grid::new("classic_brush_settings")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    ui.label("Fill color");
+                    let mut color = rgba_to_color32(app.session.brush.color);
+                    if ui.color_edit_button_srgba(&mut color).changed() {
+                        app.session.brush.color = color32_to_rgba(color);
+                    }
+                    ui.end_row();
+
+                    ui.label("Opacity");
+                    opacity_control(ui, &mut app.session.brush.color.a);
+                    ui.end_row();
+
+                    ui.label("Nib");
+                    egui::ComboBox::from_id_source("classic_brush_nib")
+                        .selected_text(app.session.brush.nib.label())
+                        .show_ui(ui, |ui| {
+                            for nib in crate::brush::BrushNib::ALL {
+                                ui.selectable_value(&mut app.session.brush.nib, nib, nib.label());
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label("Size");
+                    ui.add(
+                        egui::DragValue::new(&mut app.session.brush.size)
+                            .speed(0.25)
+                            .clamp_range(0.1..=512.0),
+                    );
+                    ui.end_row();
+
+                    ui.label("Smoothing");
+                    ui.add(egui::Slider::new(&mut app.session.brush.smoothing, 0..=100));
+                    ui.end_row();
+
+                    ui.label("Scale with stage");
+                    ui.checkbox(&mut app.session.brush.scale_with_stage, "");
+                    ui.end_row();
+
+                    ui.label("Sync with eraser");
+                    ui.checkbox(&mut app.session.brush.sync_with_eraser, "");
+                    ui.end_row();
+                });
+        }
+        crate::advanced_brush::BrushMode::Advanced => {
+            tool_hint(
+                app,
+                ui,
+                "Dynamic vector brush with a GPU-mesh live preview. Stabilizer, pressure, velocity, taper and tip dynamics are resolved into compact fill geometry; Glow is an optional material effect.",
+            );
+            ui.label(
+                egui::RichText::new("GPU preview: OpenGL / eframe Glow")
+                    .small()
+                    .color(app.settings.theme.text_dim.to_color32()),
+            );
+
+            egui::ComboBox::from_id_source("advanced_builtin_presets")
+                .selected_text("Built-in brushes…")
                 .show_ui(ui, |ui| {
-                    for nib in crate::brush::BrushNib::ALL {
-                        ui.selectable_value(&mut app.session.brush.nib, nib, nib.label());
+                    for (name, preset) in crate::advanced_brush::builtin_presets() {
+                        if ui.button(name).clicked() {
+                            app.session.advanced_brush = preset;
+                            app.session.advanced_brush_preset_name = name.to_string();
+                            app.session.advanced_brush_selected_preset = None;
+                            ui.close_menu();
+                        }
                     }
                 });
-            ui.end_row();
 
-            ui.label("Size");
-            ui.add(
-                egui::DragValue::new(&mut app.session.brush.size)
-                    .speed(0.25)
-                    .clamp_range(0.1..=512.0),
-            );
-            ui.end_row();
-
-            ui.label("Smoothing");
-            ui.add(egui::Slider::new(&mut app.session.brush.smoothing, 0..=100));
-            ui.end_row();
-
-            #[cfg(feature = "appearance-mask-eraser")]
-            {
-                ui.label("Glow");
-                ui.checkbox(&mut app.session.brush.glow, "");
-                ui.end_row();
+            let custom_presets = app.settings.advanced_brush_presets.clone();
+            if !custom_presets.is_empty() {
+                egui::ComboBox::from_id_source("advanced_custom_presets")
+                    .selected_text("My brushes…")
+                    .show_ui(ui, |ui| {
+                        for preset in &custom_presets {
+                            if ui.button(&preset.name).clicked() {
+                                app.session.advanced_brush = preset.settings.to_runtime();
+                                app.session.advanced_brush_preset_name = preset.name.clone();
+                                app.session.advanced_brush_selected_preset =
+                                    Some(preset.name.clone());
+                                ui.close_menu();
+                            }
+                        }
+                    });
             }
 
-            ui.label("Scale with stage");
-            ui.checkbox(&mut app.session.brush.scale_with_stage, "");
-            ui.end_row();
+            egui::Grid::new("advanced_brush_settings")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    ui.label("Color");
+                    let mut color = rgba_to_color32(app.session.advanced_brush.color);
+                    if ui.color_edit_button_srgba(&mut color).changed() {
+                        app.session.advanced_brush.color = color32_to_rgba(color);
+                    }
+                    ui.end_row();
 
-            ui.label("Sync with eraser");
-            ui.checkbox(&mut app.session.brush.sync_with_eraser, "");
-            ui.end_row();
-        });
-    persist_brush_preferences(app, brush_before);
+                    ui.label("Opacity");
+                    opacity_control(ui, &mut app.session.advanced_brush.color.a);
+                    ui.end_row();
+
+                    ui.label("Size");
+                    ui.add(
+                        egui::DragValue::new(&mut app.session.advanced_brush.size)
+                            .speed(0.25)
+                            .clamp_range(0.1..=1024.0),
+                    );
+                    ui.end_row();
+
+                    ui.label("Smoothing");
+                    ui.add(egui::Slider::new(
+                        &mut app.session.advanced_brush.smoothing,
+                        0..=100,
+                    ));
+                    ui.end_row();
+
+                    ui.label("Stabilizer");
+                    ui.add(egui::Slider::new(
+                        &mut app.session.advanced_brush.stabilizer,
+                        0..=100,
+                    ));
+                    ui.end_row();
+
+                    ui.label("Roundness");
+                    ui.add(egui::Slider::new(
+                        &mut app.session.advanced_brush.roundness,
+                        0.05..=1.0,
+                    ));
+                    ui.end_row();
+
+                    ui.label("Angle");
+                    ui.add(
+                        egui::DragValue::new(&mut app.session.advanced_brush.angle_degrees)
+                            .speed(0.5)
+                            .clamp_range(-180.0..=180.0)
+                            .suffix("°"),
+                    );
+                    ui.end_row();
+
+                    ui.label("Auto angle");
+                    ui.checkbox(&mut app.session.advanced_brush.auto_angle, "");
+                    ui.end_row();
+
+                    ui.label("Taper start");
+                    ui.add(egui::Slider::new(
+                        &mut app.session.advanced_brush.taper_start,
+                        0.0..=0.95,
+                    ));
+                    ui.end_row();
+
+                    ui.label("Taper end");
+                    ui.add(egui::Slider::new(
+                        &mut app.session.advanced_brush.taper_end,
+                        0.0..=0.95,
+                    ));
+                    ui.end_row();
+
+                    ui.label("Pressure size");
+                    ui.checkbox(&mut app.session.advanced_brush.pressure_size, "");
+                    ui.end_row();
+
+                    ui.label("Pressure min size");
+                    ui.add_enabled(
+                        app.session.advanced_brush.pressure_size,
+                        egui::Slider::new(
+                            &mut app.session.advanced_brush.pressure_min_size,
+                            0.01..=1.0,
+                        ),
+                    );
+                    ui.end_row();
+
+                    ui.label("Velocity size");
+                    ui.add(egui::Slider::new(
+                        &mut app.session.advanced_brush.velocity_size,
+                        0.0..=1.0,
+                    ));
+                    ui.end_row();
+
+                    #[cfg(feature = "appearance-mask-eraser")]
+                    {
+                        ui.label("Glow");
+                        ui.checkbox(&mut app.session.advanced_brush.glow, "");
+                        ui.end_row();
+
+                        ui.label("Glow radius");
+                        ui.add_enabled(
+                            app.session.advanced_brush.glow,
+                            egui::DragValue::new(&mut app.session.advanced_brush.glow_radius)
+                                .speed(0.25)
+                                .clamp_range(0.25..=256.0),
+                        );
+                        ui.end_row();
+
+                        ui.label("Glow opacity");
+                        ui.add_enabled(
+                            app.session.advanced_brush.glow,
+                            egui::Slider::new(
+                                &mut app.session.advanced_brush.glow_opacity,
+                                0.0..=1.0,
+                            ),
+                        );
+                        ui.end_row();
+                    }
+
+                    ui.label("Scale with stage");
+                    ui.checkbox(&mut app.session.advanced_brush.scale_with_stage, "");
+                    ui.end_row();
+                });
+
+            ui.separator();
+            ui.label("Brush library");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.session.advanced_brush_preset_name)
+                        .desired_width(120.0),
+                );
+                if ui.button("Save / update").clicked() {
+                    let name: String = app
+                        .session
+                        .advanced_brush_preset_name
+                        .trim()
+                        .chars()
+                        .take(48)
+                        .collect();
+                    if !name.is_empty() {
+                        let settings = crate::settings::AdvancedBrushPreferences::from_runtime(
+                            app.session.advanced_brush,
+                        );
+                        let original = app.session.advanced_brush_selected_preset.clone();
+                        let existing_index = original
+                            .as_deref()
+                            .and_then(|original| {
+                                app.settings
+                                    .advanced_brush_presets
+                                    .iter()
+                                    .position(|preset| preset.name.eq_ignore_ascii_case(original))
+                            })
+                            .or_else(|| {
+                                app.settings
+                                    .advanced_brush_presets
+                                    .iter()
+                                    .position(|preset| preset.name.eq_ignore_ascii_case(&name))
+                            });
+                        if let Some(index) = existing_index {
+                            app.settings.advanced_brush_presets[index].name = name.clone();
+                            app.settings.advanced_brush_presets[index].settings = settings;
+                            app.session.advanced_brush_selected_preset = Some(name);
+                        } else if app.settings.advanced_brush_presets.len() < 64 {
+                            app.settings.advanced_brush_presets.push(
+                                crate::settings::AdvancedBrushPreset {
+                                    name: name.clone(),
+                                    settings,
+                                },
+                            );
+                            app.session.advanced_brush_selected_preset = Some(name);
+                        }
+                    }
+                }
+                let can_delete = app.session.advanced_brush_selected_preset.is_some();
+                if ui
+                    .add_enabled(can_delete, egui::Button::new("Delete"))
+                    .clicked()
+                {
+                    if let Some(original) = app.session.advanced_brush_selected_preset.take() {
+                        app.settings
+                            .advanced_brush_presets
+                            .retain(|preset| !preset.name.eq_ignore_ascii_case(&original));
+                    }
+                }
+            });
+        }
+    }
+
+    app.session.advanced_brush = app.session.advanced_brush.sanitized();
+    if app.session.brush_mode != mode_before
+        || app.session.brush != classic_before
+        || app.session.advanced_brush != advanced_before
+        || app.settings.advanced_brush_presets != presets_before
+    {
+        app.settings.brush_mode = app.session.brush_mode.into();
+        app.settings.brush.update_from_runtime(app.session.brush);
+        app.settings
+            .advanced_brush
+            .update_from_runtime(app.session.advanced_brush);
+        app.settings.save();
+    }
 }
 
 fn eraser_properties(app: &mut EditorApp, ui: &mut Ui) {

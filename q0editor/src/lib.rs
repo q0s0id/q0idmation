@@ -1,3 +1,4 @@
+pub mod advanced_brush;
 pub mod app;
 #[cfg(feature = "appearance-mask-eraser")]
 pub mod appearance;

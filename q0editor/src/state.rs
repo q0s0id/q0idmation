@@ -7,6 +7,7 @@ use q0s_format::v2::{
     Transform2D, Vec2, VectorAppearance, VectorAsset,
 };
 
+use crate::advanced_brush::{AdvancedBrushSettings, AdvancedBrushStroke, BrushMode};
 use crate::brush::{BrushSettings, BrushStroke};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -380,6 +381,9 @@ pub enum ToolState {
     BrushDrawing {
         stroke: BrushStroke,
     },
+    AdvancedBrushDrawing {
+        stroke: AdvancedBrushStroke,
+    },
     EraserDrawing {
         stroke: BrushStroke,
     },
@@ -593,6 +597,13 @@ pub struct Session {
     pub stroke_width: f32,
     pub fill_color: Option<Rgba>,
     pub brush: BrushSettings,
+    pub brush_mode: BrushMode,
+    pub advanced_brush: AdvancedBrushSettings,
+    /// Draft name used by the Advanced preset library.
+    pub advanced_brush_preset_name: String,
+    /// Original custom preset name being edited, so rename/update/delete act on
+    /// one library entry instead of accidentally duplicating it.
+    pub advanced_brush_selected_preset: Option<String>,
     /// Independent classic eraser size while brush/eraser sync is disabled.
     pub eraser_size: f32,
     /// Cap shape applied to brush strokes when committing them, and to
@@ -667,6 +678,10 @@ impl Session {
             stroke_width: 1.0,
             fill_color: None,
             brush: BrushSettings::default(),
+            brush_mode: BrushMode::Classic,
+            advanced_brush: AdvancedBrushSettings::default(),
+            advanced_brush_preset_name: "My Brush".to_string(),
+            advanced_brush_selected_preset: None,
             eraser_size: 18.0,
             brush_cap: CapShape::Round,
             show_credits: false,
