@@ -6,20 +6,37 @@ on:
       - ci/appearance-experiment-v2
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   verify:
     runs-on: windows-latest
     steps:
-      - name: Checkout
+      - name: Checkout experiment branch
         uses: actions/checkout@v4
+        with:
+          ref: experiment/appearance-mask-eraser
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
-      - name: Format working tree
-        run: cargo fmt --all
+      - name: Rustfmt experiment
+        shell: pwsh
+        run: |
+          cargo fmt --all
+          if (-not (git diff --quiet)) {
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add q0editor/src q0editor/Cargo.toml
+            git commit -m "style: rustfmt appearance eraser experiment"
+            git push origin HEAD:experiment/appearance-mask-eraser
+          }
+
+      - name: Format check
+        run: cargo fmt --all -- --check
 
       - name: Workspace check
         run: cargo check --workspace --locked
@@ -35,3 +52,10 @@ jobs:
 
       - name: Legacy fallback check
         run: cargo check --locked -p q0editor --no-default-features
+
+      - name: Upload q0editor experiment
+        uses: actions/upload-artifact@v4
+        with:
+          name: q0editor-appearance-mask-eraser
+          path: target/release/q0editor.exe
+          if-no-files-found: error
