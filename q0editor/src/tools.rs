@@ -1,6 +1,7 @@
 use egui::epaint::{PathShape, Vertex};
 use egui::{
-    pos2, Color32, Context, Key, Mesh, Painter, PointerButton, Pos2, Response, Shape, Stroke,
+    pos2, Color32, ColorImage, Context, Key, Mesh, Painter, PointerButton, Pos2, Response, Shape,
+    Stroke, TextureHandle, TextureOptions,
 };
 use geo::{
     Area, BooleanOps, BoundingRect, Contains, Coord, LineString, MultiPolygon, Point, Polygon,
@@ -6503,7 +6504,7 @@ fn draw_transform_pivot_overlay(app: &EditorApp, painter: &Painter, view: &Stage
     );
 }
 
-const SELECTION_STIPPLE_SPACING_PX: f32 = 3.0;
+const SELECTION_STIPPLE_SPACING_PX: f32 = 4.0;
 const SELECTION_CONTOUR_SPACING_PX: f32 = 1.0;
 
 fn clip_segment_to_rect(a: Pos2, b: Pos2, rect: egui::Rect) -> Option<(Pos2, Pos2)> {
@@ -6577,8 +6578,45 @@ fn draw_dense_selection_contour(painter: &Painter, contours: &[Vec<Pos2>], accen
     draw_stipple_batch(painter, &points, 0.24, accent);
 }
 
+#[cfg(feature = "appearance-mask-eraser")]
 fn fixed_selection_grid_start(min: f32) -> f32 {
     (min / SELECTION_STIPPLE_SPACING_PX).ceil() * SELECTION_STIPPLE_SPACING_PX
+}
+
+fn selection_stipple_texture(painter: &Painter) -> TextureHandle {
+    let id = egui::Id::new("q0editor.selection-stipple-texture.v1");
+    if let Some(handle) = painter
+        .ctx()
+        .data(|data| data.get_temp::<TextureHandle>(id))
+    {
+        return handle;
+    }
+    let side = SELECTION_STIPPLE_SPACING_PX.round().max(2.0) as usize;
+    let mut rgba = vec![0_u8; side * side * 4];
+    rgba[0..4].copy_from_slice(&[255, 255, 255, 255]);
+    let image = ColorImage::from_rgba_unmultiplied([side, side], &rgba);
+    let handle = painter.ctx().load_texture(
+        "q0editor-selection-stipple",
+        image,
+        TextureOptions::NEAREST_REPEAT,
+    );
+    painter
+        .ctx()
+        .data_mut(|data| data.insert_temp(id, handle.clone()));
+    handle
+}
+
+fn paint_selection_stipple_pattern(painter: &Painter, contours: &[Vec<Pos2>]) {
+    if contours.is_empty() {
+        return;
+    }
+    let texture = selection_stipple_texture(painter);
+    crate::render::paint_complex_fill_pattern(
+        painter,
+        contours,
+        texture.id(),
+        SELECTION_STIPPLE_SPACING_PX,
+    );
 }
 
 fn stipple_mesh(points: &[Pos2], half_size: f32, color: Color32) -> Mesh {
@@ -6614,6 +6652,7 @@ fn draw_stipple_batch(painter: &Painter, points: &[Pos2], half_size: f32, color:
     painter.add(Shape::Mesh(stipple_mesh(points, half_size, color)));
 }
 
+#[cfg(feature = "appearance-mask-eraser")]
 fn selection_stipple_step() -> f32 {
     SELECTION_STIPPLE_SPACING_PX
 }
@@ -6732,24 +6771,8 @@ fn draw_raw_area_selection(
     // remain empty. Density is fixed in screen space at every zoom; only the
     // visible viewport is sampled so off-screen geometry does not create work.
     let surface = geo::unary_union(surfaces.iter());
-    let step = selection_stipple_step();
-    let mut stipple_points = Vec::new();
-    let mut y = fixed_selection_grid_start(visible_rect.top());
-    while y <= visible_rect.bottom() {
-        let mut x = fixed_selection_grid_start(visible_rect.left());
-        while x <= visible_rect.right() {
-            let stage = Point::new(
-                ((x - view.origin.x) / view.scale) as f64,
-                ((y - view.origin.y) / view.scale) as f64,
-            );
-            if surface.contains(&stage) {
-                stipple_points.push(Pos2::new(x, y));
-            }
-            x += step;
-        }
-        y += step;
-    }
-    draw_stipple_batch(&clipped, &stipple_points, 0.42, Color32::WHITE);
+    let stipple_contours = surface_to_screen_contours(&surface, view);
+    paint_selection_stipple_pattern(&clipped, &stipple_contours);
     if draw_box {
         draw_flash_selection_box(painter, selection_rect, selection_color(app));
     }
@@ -6997,24 +7020,7 @@ fn draw_partial_raw_selection(
 
     // Keep the dotted raw-area cue at one fixed screen-space density. Work is
     // clipped to the viewport rather than thinning the pattern on large areas.
-    let step = selection_stipple_step();
-    let mut stipple_points = Vec::new();
-    let mut y = fixed_selection_grid_start(visible_rect.top());
-    while y <= visible_rect.bottom() {
-        let mut x = fixed_selection_grid_start(visible_rect.left());
-        while x <= visible_rect.right() {
-            let stage = Vec2::new(
-                (x - view.origin.x) / view.scale,
-                (y - view.origin.y) / view.scale,
-            );
-            if point_in_polygon(&local, stage) {
-                stipple_points.push(Pos2::new(x, y));
-            }
-            x += step;
-        }
-        y += step;
-    }
-    draw_stipple_batch(&clipped, &stipple_points, 0.42, Color32::WHITE);
+    paint_selection_stipple_pattern(&clipped, std::slice::from_ref(&screen));
     draw_flash_selection_box(painter, selection_rect, selection_color(app));
 }
 
@@ -9604,10 +9610,8 @@ mod tests {
 
     #[test]
     fn selection_stipple_density_is_fixed_in_screen_space() {
-        assert_eq!(selection_stipple_step(), 3.0);
-        assert_eq!(fixed_selection_grid_start(0.0), 0.0);
-        assert_eq!(fixed_selection_grid_start(1.0), 3.0);
-        assert_eq!(fixed_selection_grid_start(37.1), 39.0);
+        assert_eq!(SELECTION_STIPPLE_SPACING_PX, 4.0);
+        assert_eq!(SELECTION_CONTOUR_SPACING_PX, 1.0);
     }
 
     #[test]

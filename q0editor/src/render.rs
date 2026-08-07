@@ -5,7 +5,7 @@ use std::hash::{Hash, Hasher};
 use egui::epaint::{PathShape, Vertex};
 use egui::{
     pos2, Color32, ColorImage, Context, Mesh, Painter, Pos2, Rect, Shape, Stroke, TextureHandle,
-    TextureOptions,
+    TextureId, TextureOptions,
 };
 use geo::{Buffer, Coord, LineString};
 use lyon_path::math::point as lyon_point;
@@ -519,6 +519,41 @@ pub fn paint_complex_fill(painter: &Painter, contours: &[Vec<Pos2>], color: Colo
     // The native framebuffer is 4x multisampled. Keeping the fill as one mesh
     // avoids double-blending translucent edges and lets MSAA resolve coverage.
     paint_lyon_buffers(painter, buffers, color);
+}
+
+/// Paint one tessellated fill with a repeating screen-space texture. UVs are
+/// derived from absolute screen coordinates, so the pattern density is stable
+/// through smooth zoom and does not require one CPU shape per visual dot.
+fn complex_fill_pattern_mesh(
+    contours: &[Vec<Pos2>],
+    texture_id: TextureId,
+    tile_size_points: f32,
+) -> Option<Mesh> {
+    let buffers = tessellate_complex_fill(contours)?;
+    let tile = tile_size_points.max(1.0);
+    let mut mesh = Mesh::with_texture(texture_id);
+    mesh.vertices.reserve(buffers.vertices.len());
+    for point in buffers.vertices {
+        let pos = Pos2::new(point.x, point.y);
+        mesh.vertices.push(Vertex {
+            pos,
+            uv: Pos2::new(pos.x / tile, pos.y / tile),
+            color: Color32::WHITE,
+        });
+    }
+    mesh.indices = buffers.indices;
+    Some(mesh)
+}
+
+pub fn paint_complex_fill_pattern(
+    painter: &Painter,
+    contours: &[Vec<Pos2>],
+    texture_id: TextureId,
+    tile_size_points: f32,
+) {
+    if let Some(mesh) = complex_fill_pattern_mesh(contours, texture_id, tile_size_points) {
+        painter.add(Shape::Mesh(mesh));
+    }
 }
 
 /// Live preview for the classic circular nib. The centreline is buffered
@@ -2007,6 +2042,28 @@ mod tests {
         assert_eq!(mid.ty, 25.0);
         assert_eq!(mid.sx, 1.5);
         assert_eq!(mid.rotation, 0.5);
+    }
+
+    #[test]
+    fn repeated_stipple_mesh_cost_depends_on_contour_not_selected_area() {
+        let rect = |size: f32| {
+            vec![vec![
+                Pos2::new(0.0, 0.0),
+                Pos2::new(size, 0.0),
+                Pos2::new(size, size),
+                Pos2::new(0.0, size),
+            ]]
+        };
+        let small = complex_fill_pattern_mesh(&rect(100.0), TextureId::Managed(1), 4.0)
+            .expect("small stipple mesh");
+        let huge = complex_fill_pattern_mesh(&rect(100_000.0), TextureId::Managed(1), 4.0)
+            .expect("huge stipple mesh");
+        assert_eq!(small.vertices.len(), huge.vertices.len());
+        assert_eq!(small.indices.len(), huge.indices.len());
+        assert!(
+            huge.vertices.len() <= 8,
+            "rectangle stipple should stay contour-sized"
+        );
     }
 
     #[test]
