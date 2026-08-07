@@ -19,13 +19,6 @@ pub mod state;
 pub mod theme;
 pub mod timeline_edit;
 
-#[cfg(not(feature = "appearance-mask-eraser"))]
 pub mod tools;
-#[cfg(feature = "appearance-mask-eraser")]
-#[path = "tools_experimental.rs"]
-pub mod tools;
-#[cfg(feature = "appearance-mask-eraser")]
-#[path = "tools.rs"]
-mod tools_legacy;
 
 pub use app::EditorApp;

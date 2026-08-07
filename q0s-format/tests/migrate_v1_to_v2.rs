@@ -13,6 +13,10 @@ fn migrate_one_scene_v1_to_v2_preserves_data() {
     assert_eq!(v2.meta.stage_width, v1.meta.stage_width);
     assert_eq!(v2.meta.stage_height, v1.meta.stage_height);
     assert_eq!(v2.meta.entry_q0rg_id, v1.meta.entry_scene_id);
+    assert!(
+        v2.asset_appearances.is_empty(),
+        "v1 migration must not invent vector appearance state"
+    );
 
     assert_eq!(v2.assets.len(), v1.assets.len());
     for (a, expected) in v2.assets.iter().zip(v1.assets.iter()) {

@@ -1,112 +1,162 @@
-use std::collections::{BTreeSet, HashMap};
-use std::sync::{Mutex, OnceLock};
+use std::collections::BTreeSet;
 
-use egui::{Color32, Painter, Pos2};
-use geo::{Area, BooleanOps, Buffer, Contains, Coord, LineString, MultiPolygon, Point, Polygon};
+use geo::{BooleanOps, Buffer, MultiPolygon};
 use q0s_format::v2::{
-    Asset, Path as VPath, ProjectV2, Rgba, Target, Transform2D, Tween, VectorAsset,
+    Asset, Path as VPath, ProjectV2, Rgba, Target, Transform2D, Tween, VectorAppearance,
+    VectorAsset, VectorMaterial,
 };
 
 use crate::app::EditorApp;
-use crate::render::{active_placements_at, StageView};
 
-const HALO_STEPS: usize = 8;
-const GEOMETRY_EPSILON: f64 = 1.0e-8;
+pub const DEFAULT_HALO_RADIUS: f32 = 10.0;
+pub const DEFAULT_HALO_OPACITY: f32 = 0.55;
 
-/// Experimental live appearance attached to a raw vector surface.
-///
-/// This deliberately does not enter q0s-format yet. The classic project data
-/// stays an ordinary fill-only VectorAsset, so disabling the cargo feature or
-/// returning to main gives the exact legacy behaviour and file format.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum BrushMaterial {
-    Solid,
-    /// Finite-support soft halo around the vector source. `radius` is in stage
-    /// units and is also the support radius used by the appearance-aware eraser.
-    SoftHalo {
-        radius: f32,
-        opacity: f32,
-    },
-}
-
-impl BrushMaterial {
-    pub fn support_radius(self) -> f32 {
-        match self {
-            Self::Solid => 0.0,
-            Self::SoftHalo { radius, .. } => radius.max(0.0),
-        }
+pub fn default_brush_appearance() -> VectorAppearance {
+    VectorAppearance {
+        material: VectorMaterial::SoftHalo {
+            radius: DEFAULT_HALO_RADIUS,
+            opacity: DEFAULT_HALO_OPACITY,
+        },
+        erase_mask: Vec::new(),
     }
 }
 
-#[derive(Debug)]
-struct AppearanceRegistry {
-    by_asset: HashMap<u16, BrushMaterial>,
-    current: BrushMaterial,
+/// Build the appearance for the single merged raw-fill asset produced by a
+/// classic brush commit. Existing mask cuts follow same-colour paint through
+/// merge drawing, while the freshly painted region clears those cuts so a new
+/// stroke can genuinely paint back over an erased area.
+pub(crate) fn merged_brush_appearance(
+    project: &ProjectV2,
+    same_color_asset_ids: &BTreeSet<u16>,
+    freshly_painted: &MultiPolygon<f64>,
+) -> VectorAppearance {
+    let mut material = None;
+    let mut mask = MultiPolygon(Vec::new());
+    for asset_id in same_color_asset_ids {
+        let Some(appearance) = project.asset_appearances.get(asset_id) else {
+            continue;
+        };
+        material.get_or_insert(appearance.material);
+        let coverage = mask_paths_to_coverage(&appearance.erase_mask);
+        if !coverage.0.is_empty() {
+            mask = mask.union(&coverage);
+        }
+    }
+    if !freshly_painted.0.is_empty() && !mask.0.is_empty() {
+        mask = mask.difference(freshly_painted);
+    }
+    VectorAppearance {
+        material: material.unwrap_or_else(|| default_brush_appearance().material),
+        erase_mask: crate::brush::coverage_to_paths(&mask),
+    }
 }
 
-impl Default for AppearanceRegistry {
-    fn default() -> Self {
-        Self {
-            by_asset: HashMap::new(),
-            // The experiment branch intentionally starts visibly enabled. The
-            // normal branch does not compile this module at all.
-            current: BrushMaterial::SoftHalo {
-                radius: 10.0,
-                opacity: 0.55,
+pub(crate) fn clone_asset_appearance(project: &mut ProjectV2, source: u16, destination: u16) {
+    if let Some(appearance) = project.asset_appearances.get(&source).cloned() {
+        project.asset_appearances.insert(destination, appearance);
+    }
+}
+
+pub(crate) fn split_asset_appearance(
+    project: &mut ProjectV2,
+    source_asset_id: u16,
+    selected_asset_id: u16,
+) {
+    let Some(original) = project.asset_appearances.get(&source_asset_id).cloned() else {
+        return;
+    };
+    let old_mask = mask_paths_to_coverage(&original.erase_mask);
+    let source_support = project
+        .assets
+        .iter()
+        .find(|asset| asset.id() == source_asset_id)
+        .and_then(|asset| match asset {
+            Asset::Vector(vector) if vector.fill.is_some() && vector.stroke.is_none() => {
+                Some(material_support(
+                    &crate::brush::vector_fill_geometry(vector),
+                    original.material,
+                ))
+            }
+            _ => None,
+        });
+    let selected_support = project
+        .assets
+        .iter()
+        .find(|asset| asset.id() == selected_asset_id)
+        .and_then(|asset| match asset {
+            Asset::Vector(vector) if vector.fill.is_some() && vector.stroke.is_none() => {
+                Some(material_support(
+                    &crate::brush::vector_fill_geometry(vector),
+                    original.material,
+                ))
+            }
+            _ => None,
+        });
+
+    if let Some(selected_support) = selected_support {
+        let selected_mask = if old_mask.0.is_empty() {
+            MultiPolygon(Vec::new())
+        } else {
+            old_mask.intersection(&selected_support)
+        };
+        project.asset_appearances.insert(
+            selected_asset_id,
+            VectorAppearance {
+                material: original.material,
+                erase_mask: crate::brush::coverage_to_paths(&selected_mask),
             },
-        }
+        );
+    }
+    if let Some(source_support) = source_support {
+        let source_mask = if old_mask.0.is_empty() {
+            MultiPolygon(Vec::new())
+        } else {
+            old_mask.intersection(&source_support)
+        };
+        project.asset_appearances.insert(
+            source_asset_id,
+            VectorAppearance {
+                material: original.material,
+                erase_mask: crate::brush::coverage_to_paths(&source_mask),
+            },
+        );
     }
 }
 
-fn registry() -> &'static Mutex<AppearanceRegistry> {
-    static REGISTRY: OnceLock<Mutex<AppearanceRegistry>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(AppearanceRegistry::default()))
+fn mask_paths_to_coverage(paths: &[VPath]) -> MultiPolygon<f64> {
+    if paths.is_empty() {
+        return MultiPolygon(Vec::new());
+    }
+    crate::brush::vector_fill_geometry(&VectorAsset {
+        asset_id: 0,
+        paths: paths.to_vec(),
+        fill: Some(Rgba {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 255,
+        }),
+        stroke: None,
+    })
 }
 
-pub fn current_material() -> BrushMaterial {
-    registry()
-        .lock()
-        .map(|state| state.current)
-        .unwrap_or(BrushMaterial::Solid)
-}
-
-pub fn material_for_asset(asset_id: u16) -> BrushMaterial {
-    registry()
-        .lock()
-        .ok()
-        .and_then(|state| state.by_asset.get(&asset_id).copied())
-        .unwrap_or(BrushMaterial::Solid)
-}
-
-fn remember_material(asset_id: u16, material: BrushMaterial) {
-    if let Ok(mut state) = registry().lock() {
-        match material {
-            BrushMaterial::Solid => {
-                state.by_asset.remove(&asset_id);
-            }
-            _ => {
-                state.by_asset.insert(asset_id, material);
-            }
-        }
+fn material_support(source: &MultiPolygon<f64>, material: VectorMaterial) -> MultiPolygon<f64> {
+    match material {
+        VectorMaterial::Solid => source.clone(),
+        VectorMaterial::SoftHalo { radius, .. } => source.buffer(f64::from(radius.max(0.0))),
     }
 }
 
-fn clone_material_mapping(source_asset_id: u16, target_asset_id: u16) {
-    let material = material_for_asset(source_asset_id);
-    remember_material(target_asset_id, material);
-}
-
-/// After the legacy classic-brush commit, attach the currently selected live
-/// material to the resulting same-colour raw paint surface. Classic drawing
-/// already merges same-colour paint into one planar asset, so tagging the active
-/// surface here keeps the experiment isolated from the trusted commit path.
-pub fn tag_current_brush_surface(app: &EditorApp) {
-    let material = current_material();
+/// Erase the resolved appearance, not the source vector. The exact eraser
+/// footprint is intersected with the finite material support and then unioned
+/// into the asset-local mask. No radius is added to the eraser region.
+pub fn erase_visible_region(app: &mut EditorApp, region: MultiPolygon<f64>) -> bool {
+    if region.0.is_empty() {
+        return false;
+    }
     let q0rg_id = app.session.current_q0rg_id;
     let layer_id = app.session.current_layer_id;
     let frame = app.session.current_frame;
-    let color = app.session.brush.color;
-
     let Some(layer) = app
         .state
         .project
@@ -115,10 +165,11 @@ pub fn tag_current_brush_surface(app: &EditorApp) {
         .find(|q0rg| q0rg.q0rg_id == q0rg_id)
         .and_then(|q0rg| q0rg.layers.iter().find(|layer| layer.layer_id == layer_id))
     else {
-        return;
+        return false;
     };
 
-    for (placement_idx, _) in active_placements_at(layer, frame) {
+    let mut hit_asset_ids = BTreeSet::new();
+    for (placement_idx, _) in crate::render::active_placements_at(layer, frame) {
         let Some(placement) = layer.placements.get(placement_idx) else {
             continue;
         };
@@ -126,6 +177,9 @@ pub fn tag_current_brush_surface(app: &EditorApp) {
             continue;
         }
         let Target::Asset(asset_id) = placement.target else {
+            continue;
+        };
+        let Some(appearance) = app.state.project.asset_appearances.get(&asset_id) else {
             continue;
         };
         let Some(Asset::Vector(vector)) = app
@@ -137,131 +191,25 @@ pub fn tag_current_brush_surface(app: &EditorApp) {
         else {
             continue;
         };
-        if vector.fill == Some(color) && vector.stroke.is_none() {
-            remember_material(asset_id, material);
-        }
-    }
-}
-
-/// Convert the visible eraser footprint into source geometry that must be
-/// removed for the selected finite-support material.
-///
-/// For a solid fill this is exactly the legacy eraser. For a halo with support
-/// radius R, every source point within R of the visible erase region can
-/// contribute pixels back into that region, so it must also be removed. This is
-/// the Minkowski sum `erase ⊕ disk(R)`.
-pub fn source_cut_for_visible_erase(
-    visible_erase: &MultiPolygon<f64>,
-    material: BrushMaterial,
-) -> MultiPolygon<f64> {
-    let radius = f64::from(material.support_radius());
-    if radius <= GEOMETRY_EPSILON {
-        visible_erase.clone()
-    } else {
-        visible_erase.buffer(radius)
-    }
-}
-
-fn visible_support(geometry: &MultiPolygon<f64>, material: BrushMaterial) -> MultiPolygon<f64> {
-    let radius = f64::from(material.support_radius());
-    if radius <= GEOMETRY_EPSILON {
-        geometry.clone()
-    } else {
-        geometry.buffer(radius)
-    }
-}
-
-#[derive(Debug, Clone)]
-struct RawAppearanceCandidate {
-    asset_id: u16,
-    geometry: MultiPolygon<f64>,
-    material: BrushMaterial,
-}
-
-fn collect_raw_candidates(
-    project: &ProjectV2,
-    q0rg_id: u16,
-    layer_id: u16,
-    frame: u16,
-) -> Vec<RawAppearanceCandidate> {
-    let Some(layer) = project
-        .q0rgs
-        .iter()
-        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
-        .and_then(|q0rg| q0rg.layers.iter().find(|layer| layer.layer_id == layer_id))
-    else {
-        return Vec::new();
-    };
-
-    active_placements_at(layer, frame)
-        .into_iter()
-        .filter_map(|(placement_idx, _)| {
-            let placement = layer.placements.get(placement_idx)?;
-            if placement.transform != Transform2D::IDENTITY
-                || !matches!(placement.tween, Tween::None)
-            {
-                return None;
-            }
-            let Target::Asset(asset_id) = placement.target else {
-                return None;
-            };
-            let Some(Asset::Vector(vector)) =
-                project.assets.iter().find(|asset| asset.id() == asset_id)
-            else {
-                return None;
-            };
-            if vector.fill.is_none() || vector.stroke.is_some() {
-                return None;
-            }
-            let geometry = vector_fill_geometry(vector);
-            (!geometry.0.is_empty()).then_some(RawAppearanceCandidate {
-                asset_id,
-                geometry,
-                material: material_for_asset(asset_id),
-            })
-        })
-        .collect()
-}
-
-/// Erase the visible appearance rather than only the source contour.
-///
-/// Each raw asset gets its own cut radius. This is important when a solid fill
-/// sits next to a halo fill: using one global maximum radius would over-erase
-/// the solid neighbour. Returns false when no visible raw appearance was hit so
-/// the legacy eraser can retain its open-stroke/display-object fallback.
-pub fn erase_visible_region(app: &mut EditorApp, visible_erase: MultiPolygon<f64>) -> bool {
-    if visible_erase.0.is_empty() {
-        return false;
-    }
-
-    let q0rg_id = app.session.current_q0rg_id;
-    let layer_id = app.session.current_layer_id;
-    let frame = app.session.current_frame;
-    let candidates = collect_raw_candidates(&app.state.project, q0rg_id, layer_id, frame);
-
-    let mut updates = Vec::new();
-    let mut update_asset_ids = BTreeSet::new();
-    for candidate in candidates {
-        if !update_asset_ids.insert(candidate.asset_id) {
+        if vector.fill.is_none() || vector.stroke.is_some() {
             continue;
         }
-        let support = visible_support(&candidate.geometry, candidate.material);
-        if support.intersection(&visible_erase).unsigned_area() <= GEOMETRY_EPSILON {
-            update_asset_ids.remove(&candidate.asset_id);
+        let source = crate::brush::vector_fill_geometry(vector);
+        if source.0.is_empty() {
             continue;
         }
-
-        let source_cut = source_cut_for_visible_erase(&visible_erase, candidate.material);
-        if candidate.geometry.intersection(&source_cut).unsigned_area() <= GEOMETRY_EPSILON {
-            update_asset_ids.remove(&candidate.asset_id);
-            continue;
+        let support = material_support(&source, appearance.material);
+        let old_mask = mask_paths_to_coverage(&appearance.erase_mask);
+        let visible_support = if old_mask.0.is_empty() {
+            support
+        } else {
+            support.difference(&old_mask)
+        };
+        if !visible_support.intersection(&region).0.is_empty() {
+            hit_asset_ids.insert(asset_id);
         }
-        updates.push((
-            candidate.asset_id,
-            candidate.geometry.difference(&source_cut),
-        ));
     }
-    if updates.is_empty() {
+    if hit_asset_ids.is_empty() {
         return false;
     }
 
@@ -276,303 +224,89 @@ pub fn erase_visible_region(app: &mut EditorApp, visible_erase: MultiPolygon<f64
     {
         return false;
     }
-
-    let writable_assets = crate::brush::prepare_writable_raw_assets(
+    let writable = crate::brush::prepare_writable_raw_assets(
         &mut app.state.project,
         q0rg_id,
         layer_id,
         frame,
-        &update_asset_ids,
+        &hit_asset_ids,
     );
-    for (source, target) in &writable_assets {
-        if source != target {
-            clone_material_mapping(*source, *target);
-        }
-    }
 
-    let mut remove_asset_ids = BTreeSet::new();
-    for (original_asset_id, geometry) in &updates {
-        let asset_id = *writable_assets
-            .get(original_asset_id)
+    let mut changed = false;
+    for original_asset_id in hit_asset_ids {
+        let asset_id = writable
+            .get(&original_asset_id)
+            .copied()
             .unwrap_or(original_asset_id);
-        let paths = crate::brush::coverage_to_paths(geometry);
-        if paths.is_empty() {
-            remove_asset_ids.insert(asset_id);
-        } else if let Some(Asset::Vector(vector)) = app
+        let Some(appearance) = app.state.project.asset_appearances.get(&asset_id).cloned() else {
+            continue;
+        };
+        let Some(Asset::Vector(vector)) = app
             .state
             .project
             .assets
-            .iter_mut()
+            .iter()
             .find(|asset| asset.id() == asset_id)
-        {
-            vector.paths = paths;
-            vector.stroke = None;
-        }
-    }
-
-    remove_current_layer_asset_placements(
-        &mut app.state.project,
-        q0rg_id,
-        layer_id,
-        frame,
-        &remove_asset_ids,
-    );
-    remove_unreferenced_assets(&mut app.state.project, &remove_asset_ids);
-
-    app.session.selection = crate::state::Selection::None;
-    app.session.status = "Appearance-aware raw fill erased".to_string();
-    app.state.dirty = true;
-    true
-}
-
-fn remove_current_layer_asset_placements(
-    project: &mut ProjectV2,
-    q0rg_id: u16,
-    layer_id: u16,
-    frame: u16,
-    asset_ids: &BTreeSet<u16>,
-) {
-    if asset_ids.is_empty() {
-        return;
-    }
-    if let Some(layer) = project
-        .q0rgs
-        .iter_mut()
-        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
-        .and_then(|q0rg| {
-            q0rg.layers
-                .iter_mut()
-                .find(|layer| layer.layer_id == layer_id)
-        })
-    {
-        layer.placements.retain(|placement| {
-            placement.frame != frame
-                || placement.transform != Transform2D::IDENTITY
-                || !matches!(placement.tween, Tween::None)
-                || !matches!(placement.target, Target::Asset(id) if asset_ids.contains(&id))
-        });
-    }
-}
-
-fn remove_unreferenced_assets(project: &mut ProjectV2, candidates: &BTreeSet<u16>) {
-    if candidates.is_empty() {
-        return;
-    }
-    let referenced: BTreeSet<u16> = project
-        .q0rgs
-        .iter()
-        .flat_map(|q0rg| &q0rg.layers)
-        .flat_map(|layer| &layer.placements)
-        .filter_map(|placement| match placement.target {
-            Target::Asset(asset_id) => Some(asset_id),
-            Target::Q0rg(_) => None,
-        })
-        .collect();
-    project
-        .assets
-        .retain(|asset| !candidates.contains(&asset.id()) || referenced.contains(&asset.id()));
-}
-
-/// Paint the experimental halo after the trusted ProjectV2 renderer. The base
-/// fill is still rendered by the normal path; these are non-overlapping outer
-/// bands only, which avoids repeatedly alpha-blending the same halo pixels.
-pub fn render_registered_appearances(app: &EditorApp, painter: &Painter, view: &StageView) {
-    let q0rg_id = app.session.current_q0rg_id;
-    let frame = app.session.current_frame;
-    let Some(q0rg) = app
-        .state
-        .project
-        .q0rgs
-        .iter()
-        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
-    else {
-        return;
-    };
-
-    for layer in &q0rg.layers {
-        for (placement_idx, _) in active_placements_at(layer, frame) {
-            let Some(placement) = layer.placements.get(placement_idx) else {
-                continue;
-            };
-            if placement.transform != Transform2D::IDENTITY
-                || !matches!(placement.tween, Tween::None)
-            {
-                continue;
-            }
-            let Target::Asset(asset_id) = placement.target else {
-                continue;
-            };
-            let material = material_for_asset(asset_id);
-            let BrushMaterial::SoftHalo { radius, opacity } = material else {
-                continue;
-            };
-            if radius <= 0.0 || opacity <= 0.0 {
-                continue;
-            }
-            let Some(Asset::Vector(vector)) = app
-                .state
-                .project
-                .assets
-                .iter()
-                .find(|asset| asset.id() == asset_id)
-            else {
-                continue;
-            };
-            let Some(fill) = vector.fill else {
-                continue;
-            };
-            let geometry = vector_fill_geometry(vector);
-            if geometry.0.is_empty() {
-                continue;
-            }
-            paint_soft_halo(painter, view, &geometry, fill, radius, opacity);
-        }
-    }
-}
-
-fn paint_soft_halo(
-    painter: &Painter,
-    view: &StageView,
-    geometry: &MultiPolygon<f64>,
-    fill: Rgba,
-    radius: f32,
-    opacity: f32,
-) {
-    let mut previous = geometry.clone();
-    for step in 1..=HALO_STEPS {
-        let t = step as f32 / HALO_STEPS as f32;
-        let outer = geometry.buffer(f64::from(radius.max(0.0) * t));
-        let band = outer.difference(&previous);
-        previous = outer;
-        if band.0.is_empty() {
+        else {
+            continue;
+        };
+        let source = crate::brush::vector_fill_geometry(vector);
+        let support = material_support(&source, appearance.material);
+        let visible_cut = support.intersection(&region);
+        if visible_cut.0.is_empty() {
             continue;
         }
-        let falloff = (1.0 - (t - 0.5 / HALO_STEPS as f32)).clamp(0.0, 1.0);
-        let alpha = (f32::from(fill.a) * opacity.clamp(0.0, 1.0) * falloff * falloff)
-            .round()
-            .clamp(0.0, 255.0) as u8;
-        if alpha == 0 {
-            continue;
-        }
-        let contours = multipolygon_to_screen_contours(&band, view);
-        if contours.is_empty() {
-            continue;
-        }
-        crate::render::paint_complex_fill(
-            painter,
-            &contours,
-            Color32::from_rgba_unmultiplied(fill.r, fill.g, fill.b, alpha),
-        );
-    }
-}
-
-fn multipolygon_to_screen_contours(
-    geometry: &MultiPolygon<f64>,
-    view: &StageView,
-) -> Vec<Vec<Pos2>> {
-    let mut contours = Vec::new();
-    for polygon in &geometry.0 {
-        push_ring_screen(&mut contours, polygon.exterior(), view);
-        for hole in polygon.interiors() {
-            push_ring_screen(&mut contours, hole, view);
+        let old_mask = mask_paths_to_coverage(&appearance.erase_mask);
+        let new_mask = if old_mask.0.is_empty() {
+            visible_cut
+        } else {
+            old_mask.union(&visible_cut)
+        };
+        let new_paths = crate::brush::coverage_to_paths(&new_mask);
+        if new_paths != appearance.erase_mask {
+            if let Some(entry) = app.state.project.asset_appearances.get_mut(&asset_id) {
+                entry.erase_mask = new_paths;
+                changed = true;
+            }
         }
     }
-    contours
-}
 
-fn push_ring_screen(contours: &mut Vec<Vec<Pos2>>, ring: &LineString<f64>, view: &StageView) {
-    let mut points: Vec<Pos2> = ring
-        .0
-        .iter()
-        .map(|coord| {
-            Pos2::new(
-                view.origin.x + coord.x as f32 * view.scale,
-                view.origin.y + coord.y as f32 * view.scale,
-            )
-        })
-        .collect();
-    if points.len() > 1 && points.first() == points.last() {
-        points.pop();
+    if changed {
+        app.textures.invalidate();
+        app.session.selection = crate::state::Selection::None;
+        app.session.status = "Appearance mask erased".to_string();
+        app.state.dirty = true;
     }
-    if points.len() >= 3 {
-        contours.push(points);
-    }
-}
-
-fn vector_fill_geometry(vector: &VectorAsset) -> MultiPolygon<f64> {
-    let mut rings: Vec<(&VPath, Polygon<f64>, f64)> = vector
-        .paths
-        .iter()
-        .filter(|path| path.closed)
-        .filter_map(|path| {
-            let polygon = path_to_polygon(path)?;
-            let area = signed_ring_area(polygon.exterior());
-            (area.abs() > GEOMETRY_EPSILON).then_some((path, polygon, area))
-        })
-        .collect();
-    rings.sort_by(|left, right| right.2.abs().total_cmp(&left.2.abs()));
-
-    let mut surface = MultiPolygon(Vec::new());
-    let mut inside_windings: Vec<i32> = Vec::with_capacity(rings.len());
-    for index in 0..rings.len() {
-        let (_, polygon, area) = &rings[index];
-        let sample = polygon
-            .exterior()
-            .0
-            .first()
-            .map(|coord| Point::new(coord.x, coord.y));
-        let parent = sample.and_then(|point| {
-            (0..index)
-                .rev()
-                .find(|candidate| rings[*candidate].1.contains(&point))
-        });
-        let outside_winding = parent.map(|parent| inside_windings[parent]).unwrap_or(0);
-        let inside_winding = outside_winding + if *area > 0.0 { 1 } else { -1 };
-        if outside_winding == 0 && inside_winding != 0 {
-            surface = surface.union(polygon);
-        } else if outside_winding != 0 && inside_winding == 0 {
-            surface = surface.difference(polygon);
-        }
-        inside_windings.push(inside_winding);
-    }
-    surface
-}
-
-fn path_to_polygon(path: &VPath) -> Option<Polygon<f64>> {
-    if path.anchors.len() < 3 {
-        return None;
-    }
-    let mut coords: Vec<Coord<f64>> = path
-        .anchors
-        .iter()
-        .map(|anchor| Coord {
-            x: f64::from(anchor.point.x),
-            y: f64::from(anchor.point.y),
-        })
-        .collect();
-    coords.dedup();
-    if coords.len() < 3 {
-        return None;
-    }
-    if coords.first() != coords.last() {
-        coords.push(coords[0]);
-    }
-    Some(Polygon::new(LineString::new(coords), Vec::new()))
-}
-
-fn signed_ring_area(ring: &LineString<f64>) -> f64 {
-    ring.0
-        .windows(2)
-        .map(|pair| pair[0].x * pair[1].y - pair[1].x * pair[0].y)
-        .sum::<f64>()
-        * 0.5
+    changed
 }
 
 #[cfg(test)]
 mod tests {
+    use geo::{Area, BoundingRect, Coord, LineString, Polygon};
+    use q0s_format::v2::{Anchor, Placement};
+
     use super::*;
 
-    fn rect(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> MultiPolygon<f64> {
+    fn square_path(min_x: f32, min_y: f32, max_x: f32, max_y: f32) -> VPath {
+        VPath {
+            anchors: [
+                (min_x, min_y),
+                (max_x, min_y),
+                (max_x, max_y),
+                (min_x, max_y),
+            ]
+            .into_iter()
+            .map(|(x, y)| Anchor {
+                point: q0s_format::v2::Vec2::new(x, y),
+                in_handle: None,
+                out_handle: None,
+            })
+            .collect(),
+            closed: true,
+        }
+    }
+
+    fn rect_region(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> MultiPolygon<f64> {
         MultiPolygon(vec![Polygon::new(
             LineString::new(vec![
                 Coord { x: min_x, y: min_y },
@@ -585,60 +319,90 @@ mod tests {
         )])
     }
 
-    #[test]
-    fn solid_visible_erase_is_exactly_the_legacy_source_cut() {
-        let erase = rect(45.0, 20.0, 55.0, 80.0);
-        let cut = source_cut_for_visible_erase(&erase, BrushMaterial::Solid);
-        let mismatch = erase.difference(&cut).union(&cut.difference(&erase));
-        assert!(mismatch.unsigned_area() <= GEOMETRY_EPSILON);
-    }
-
-    #[test]
-    fn halo_source_cut_expands_by_the_material_support_radius() {
-        let erase = rect(45.0, 20.0, 55.0, 80.0);
-        let cut = source_cut_for_visible_erase(
-            &erase,
-            BrushMaterial::SoftHalo {
-                radius: 10.0,
-                opacity: 0.5,
+    fn app_with_appearance() -> EditorApp {
+        let mut app = EditorApp::default();
+        app.state.project.assets.push(Asset::Vector(VectorAsset {
+            asset_id: 1,
+            paths: vec![square_path(0.0, 0.0, 10.0, 10.0)],
+            fill: Some(Rgba {
+                r: 255,
+                g: 255,
+                b: 255,
+                a: 255,
+            }),
+            stroke: None,
+        }));
+        app.state.project.asset_appearances.insert(
+            1,
+            VectorAppearance {
+                material: VectorMaterial::SoftHalo {
+                    radius: 10.0,
+                    opacity: 0.5,
+                },
+                erase_mask: Vec::new(),
             },
         );
-        let bounds = geo::BoundingRect::bounding_rect(&cut).expect("buffered erase bounds");
-        assert!((bounds.min().x - 35.0).abs() < 0.05);
-        assert!((bounds.max().x - 65.0).abs() < 0.05);
-        assert!((bounds.min().y - 10.0).abs() < 0.05);
-        assert!((bounds.max().y - 90.0).abs() < 0.05);
+        app.state.project.q0rgs[0].layers[0]
+            .placements
+            .push(Placement {
+                frame: 0,
+                target: Target::Asset(1),
+                transform: Transform2D::IDENTITY,
+                tween: Tween::None,
+            });
+        app
     }
 
     #[test]
-    fn reapplying_halo_cannot_bleed_back_into_the_visible_erase_region() {
-        let source = rect(0.0, 0.0, 100.0, 100.0);
-        let visible_erase = rect(45.0, -5.0, 55.0, 105.0);
-        let material = BrushMaterial::SoftHalo {
-            radius: 10.0,
-            opacity: 0.5,
+    fn mask_eraser_never_mutates_source_geometry() {
+        let mut app = app_with_appearance();
+        let before = match &app.state.project.assets[0] {
+            Asset::Vector(vector) => vector.paths.clone(),
+            _ => unreachable!(),
         };
-        let source_cut = source_cut_for_visible_erase(&visible_erase, material);
-        let remaining_source = source.difference(&source_cut);
-        let rerendered_support = visible_support(&remaining_source, material);
-        let bleed = rerendered_support
-            .intersection(&visible_erase)
-            .unsigned_area();
-        assert!(
-            bleed <= 1.0e-6,
-            "halo bled {bleed} area back into erased pixels"
+        let eraser = rect_region(15.0, 4.0, 17.0, 6.0);
+        assert!(erase_visible_region(&mut app, eraser));
+        let after = match &app.state.project.assets[0] {
+            Asset::Vector(vector) => vector.paths.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            before, after,
+            "appearance erasing must not cut source paths"
         );
     }
 
     #[test]
-    fn halo_is_hittable_outside_the_source_geometry() {
-        let source = rect(0.0, 0.0, 20.0, 20.0);
-        let material = BrushMaterial::SoftHalo {
-            radius: 8.0,
-            opacity: 0.5,
+    fn classic_geometry_eraser_refuses_to_cut_appearance_source_paths() {
+        let mut app = app_with_appearance();
+        let before = match &app.state.project.assets[0] {
+            Asset::Vector(vector) => vector.paths.clone(),
+            _ => unreachable!(),
         };
-        let point = Point::new(25.0, 10.0);
-        assert!(!source.contains(&point));
-        assert!(visible_support(&source, material).contains(&point));
+        let eraser = rect_region(2.0, 2.0, 8.0, 8.0);
+        assert!(
+            !crate::brush::erase_brush_region(&mut app, eraser),
+            "appearance assets must be owned exclusively by the mask eraser"
+        );
+        let after = match &app.state.project.assets[0] {
+            Asset::Vector(vector) => vector.paths.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn mask_eraser_records_exact_footprint_not_halo_expansion() {
+        let mut app = app_with_appearance();
+        let eraser = rect_region(15.0, 4.0, 17.0, 6.0);
+        let eraser_area = eraser.unsigned_area();
+        assert!(erase_visible_region(&mut app, eraser));
+        let mask = mask_paths_to_coverage(&app.state.project.asset_appearances[&1].erase_mask);
+        let bounds = mask.bounding_rect().expect("mask bounds");
+        assert!((bounds.min().x - 15.0).abs() < 0.05);
+        assert!((bounds.max().x - 17.0).abs() < 0.05);
+        assert!((bounds.min().y - 4.0).abs() < 0.05);
+        assert!((bounds.max().y - 6.0).abs() < 0.05);
+        assert!((mask.unsigned_area() - eraser_area).abs() < 0.1);
     }
 }

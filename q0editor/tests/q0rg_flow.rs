@@ -189,6 +189,92 @@ fn convert_to_q0rg_replaces_placement_with_q0rg_instance() {
 }
 
 #[test]
+fn convert_to_q0rg_keeps_vector_appearance_attached_to_the_asset() {
+    let mut app = EditorApp::default();
+    let asset_id = seed_simple_shape(&mut app);
+    let Asset::Vector(vector) = app
+        .state
+        .project
+        .assets
+        .iter_mut()
+        .find(|asset| asset.id() == asset_id)
+        .expect("seed asset")
+    else {
+        unreachable!();
+    };
+    vector.fill = Some(q0s_format::v2::Rgba {
+        r: 220,
+        g: 50,
+        b: 30,
+        a: 255,
+    });
+    vector.stroke = None;
+    let appearance = q0s_format::v2::VectorAppearance {
+        material: q0s_format::v2::VectorMaterial::SoftHalo {
+            radius: 7.0,
+            opacity: 0.6,
+        },
+        erase_mask: vec![VPath {
+            anchors: vec![
+                Anchor {
+                    point: Vec2::new(2.0, 2.0),
+                    in_handle: None,
+                    out_handle: None,
+                },
+                Anchor {
+                    point: Vec2::new(5.0, 2.0),
+                    in_handle: None,
+                    out_handle: None,
+                },
+                Anchor {
+                    point: Vec2::new(5.0, 5.0),
+                    in_handle: None,
+                    out_handle: None,
+                },
+            ],
+            closed: true,
+        }],
+    };
+    app.state
+        .project
+        .asset_appearances
+        .insert(asset_id, appearance.clone());
+    let q0rg_id = app.session.current_q0rg_id;
+    let layer_id = app.session.current_layer_id;
+    app.session.selection = Selection::Placement {
+        q0rg_id,
+        layer_id,
+        placement_idx: 0,
+    };
+
+    invoke_convert(&mut app);
+
+    assert_eq!(app.state.project.asset_appearances[&asset_id], appearance);
+    let outer = app
+        .state
+        .project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+        .expect("stage q0rg");
+    let Target::Q0rg(inner_id) = outer.layers[0].placements[0].target else {
+        panic!("converted placement must target q0rg");
+    };
+    let inner = app
+        .state
+        .project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == inner_id)
+        .expect("converted q0rg");
+    assert!(matches!(
+        inner.layers[0].placements[0].target,
+        Target::Asset(id) if id == asset_id
+    ));
+    q0s_format::v2::validate(&app.state.project).expect("appearance survives valid conversion");
+}
+
+#[test]
 fn convert_to_q0rg_packs_marquee_multi_selection_into_one_symbol() {
     use q0editor::state::PlacementRef;
 

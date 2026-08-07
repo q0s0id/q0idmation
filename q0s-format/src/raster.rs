@@ -21,8 +21,8 @@
 use crate::geom::{brush_outline, flatten_path};
 use crate::transform::Affine;
 use crate::v2::{
-    Asset, BitmapAsset, ProjectV2, Rgba, Target, Transform2D, Vec2, VectorAsset,
-    MAX_Q0RG_NESTING_DEPTH,
+    Asset, BitmapAsset, ProjectV2, Rgba, Target, Transform2D, Vec2, VectorAppearance, VectorAsset,
+    VectorMaterial, MAX_Q0RG_NESTING_DEPTH,
 };
 
 /// Render one frame of `q0rg_id` (resolved against `project`) into an
@@ -176,15 +176,15 @@ fn render_to_buffer(
             match placement.target {
                 Target::Asset(id) => {
                     if let Some(asset) = project.assets.iter().find(|a| a.id() == id) {
-                        rasterize_asset(
-                            asset,
-                            composed,
+                        let mut context = AssetRasterContext {
+                            transform: composed,
                             buffer,
-                            w,
-                            h,
-                            local_frame.saturating_sub(placement.frame),
-                            project.meta.fps,
-                        );
+                            width: w,
+                            height: h,
+                            elapsed_host_frames: local_frame.saturating_sub(placement.frame),
+                            host_fps: project.meta.fps,
+                        };
+                        rasterize_asset(asset, project.asset_appearances.get(&id), &mut context);
                     }
                 }
                 Target::Q0rg(child_id) if child_id != q0rg_id => {
@@ -275,25 +275,43 @@ fn lerp_transform(a: Transform2D, b: Transform2D, t: f32) -> Transform2D {
 
 const FLATTEN_SAMPLES: usize = 16;
 
-fn rasterize_asset(
-    asset: &Asset,
-    t: Affine,
-    buffer: &mut [u8],
-    w: u32,
-    h: u32,
+struct AssetRasterContext<'a> {
+    transform: Affine,
+    buffer: &'a mut [u8],
+    width: u32,
+    height: u32,
     elapsed_host_frames: u16,
     host_fps: u16,
+}
+
+fn rasterize_asset(
+    asset: &Asset,
+    appearance: Option<&VectorAppearance>,
+    context: &mut AssetRasterContext<'_>,
 ) {
     match asset {
-        Asset::Bitmap(b) => rasterize_bitmap(b, t, buffer, w, h),
-        Asset::Vector(v) => rasterize_vector(v, t, buffer, w, h),
+        Asset::Bitmap(b) => rasterize_bitmap(
+            b,
+            context.transform,
+            context.buffer,
+            context.width,
+            context.height,
+        ),
+        Asset::Vector(v) => rasterize_vector(
+            v,
+            appearance,
+            context.transform,
+            context.buffer,
+            context.width,
+            context.height,
+        ),
         Asset::Q0v(v) => {
             let Ok(media) = q0video::q0v::Q0vFile::parse(v.bytes.clone()) else {
                 return;
             };
             let Some(frame_index) = media.spec.video_frame_for_host_frame(
-                u32::from(elapsed_host_frames),
-                u32::from(host_fps.max(1)),
+                u32::from(context.elapsed_host_frames),
+                u32::from(context.host_fps.max(1)),
             ) else {
                 return;
             };
@@ -313,16 +331,221 @@ fn rasterize_asset(
                     height,
                     rgba,
                 },
-                t,
-                buffer,
-                w,
-                h,
+                context.transform,
+                context.buffer,
+                context.width,
+                context.height,
             );
         }
     }
 }
 
-fn rasterize_vector(v: &VectorAsset, t: Affine, buffer: &mut [u8], w: u32, h: u32) {
+#[derive(Debug, Clone)]
+pub struct RasterizedVectorAppearance {
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub local_min: Vec2,
+    pub pixels_per_unit: f32,
+}
+
+/// Rasterize one vector material in asset-local space. The material is resolved
+/// first and the erase mask is multiplied afterwards, so erasing never changes
+/// source geometry and a regenerated blur cannot grow back into an erased area.
+pub fn rasterize_vector_appearance_local(
+    vector: &VectorAsset,
+    appearance: &VectorAppearance,
+    pixels_per_unit: f32,
+) -> Option<RasterizedVectorAppearance> {
+    let fill = vector.fill?;
+    let pixels_per_unit = pixels_per_unit.clamp(0.5, 8.0);
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for path in vector.paths.iter().filter(|path| path.closed) {
+        for point in flatten_path(path, FLATTEN_SAMPLES) {
+            min_x = min_x.min(point.x);
+            min_y = min_y.min(point.y);
+            max_x = max_x.max(point.x);
+            max_y = max_y.max(point.y);
+        }
+    }
+    if !min_x.is_finite() || !min_y.is_finite() || !max_x.is_finite() || !max_y.is_finite() {
+        return None;
+    }
+    let material_margin = match appearance.material {
+        VectorMaterial::Solid => 0.0,
+        VectorMaterial::SoftHalo { radius, .. } => radius.max(0.0),
+    };
+    let antialias_margin = 2.0 / pixels_per_unit;
+    let margin = material_margin + antialias_margin;
+    let local_min = Vec2::new(min_x - margin, min_y - margin);
+    let local_max = Vec2::new(max_x + margin, max_y + margin);
+    let width = (((local_max.x - local_min.x) * pixels_per_unit).ceil() as u32).max(1);
+    let height = (((local_max.y - local_min.y) * pixels_per_unit).ceil() as u32).max(1);
+    const MAX_SIDE: u32 = 8192;
+    if width > MAX_SIDE || height > MAX_SIDE {
+        return None;
+    }
+
+    let local_to_pixel = Affine {
+        a11: pixels_per_unit,
+        a12: 0.0,
+        a21: 0.0,
+        a22: pixels_per_unit,
+        tx: -local_min.x * pixels_per_unit,
+        ty: -local_min.y * pixels_per_unit,
+    };
+    let source_contours: Vec<Vec<Vec2>> = vector
+        .paths
+        .iter()
+        .filter(|path| path.closed)
+        .map(|path| {
+            flatten_path(path, FLATTEN_SAMPLES)
+                .into_iter()
+                .map(|point| local_to_pixel.apply(point))
+                .collect()
+        })
+        .collect();
+    let pixel_count = (width as usize).saturating_mul(height as usize);
+    let mut source_rgba = vec![0u8; pixel_count.saturating_mul(4)];
+    scanline_fill_multi(
+        &source_contours,
+        Rgba {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 255,
+        },
+        &mut source_rgba,
+        width,
+        height,
+    );
+    let source_alpha: Vec<u8> = source_rgba.chunks_exact(4).map(|pixel| pixel[3]).collect();
+
+    let material_alpha = match appearance.material {
+        VectorMaterial::Solid => source_alpha
+            .iter()
+            .map(|alpha| ((u16::from(*alpha) * u16::from(fill.a) + 127) / 255) as u8)
+            .collect::<Vec<_>>(),
+        VectorMaterial::SoftHalo { radius, opacity } => {
+            let blurred =
+                gaussian_blur_alpha(&source_alpha, width, height, radius * pixels_per_unit);
+            source_alpha
+                .iter()
+                .zip(blurred)
+                .map(|(source, blur)| {
+                    let base = (f32::from(*source) * f32::from(fill.a) / 255.0).round();
+                    let halo = f32::from(blur) * f32::from(fill.a) / 255.0 * opacity;
+                    base.max(halo).clamp(0.0, 255.0).round() as u8
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let mut mask_rgba = vec![0u8; pixel_count.saturating_mul(4)];
+    if !appearance.erase_mask.is_empty() {
+        let mask_contours: Vec<Vec<Vec2>> = appearance
+            .erase_mask
+            .iter()
+            .filter(|path| path.closed)
+            .map(|path| {
+                flatten_path(path, FLATTEN_SAMPLES)
+                    .into_iter()
+                    .map(|point| local_to_pixel.apply(point))
+                    .collect()
+            })
+            .collect();
+        scanline_fill_multi(
+            &mask_contours,
+            Rgba {
+                r: 255,
+                g: 255,
+                b: 255,
+                a: 255,
+            },
+            &mut mask_rgba,
+            width,
+            height,
+        );
+    }
+
+    let mut rgba = vec![0u8; pixel_count.saturating_mul(4)];
+    for (index, out) in rgba.chunks_exact_mut(4).enumerate() {
+        let mask = mask_rgba[index * 4 + 3];
+        let alpha = ((u16::from(material_alpha[index]) * u16::from(255 - mask) + 127) / 255) as u8;
+        out.copy_from_slice(&[fill.r, fill.g, fill.b, alpha]);
+    }
+    Some(RasterizedVectorAppearance {
+        rgba,
+        width,
+        height,
+        local_min,
+        pixels_per_unit,
+    })
+}
+
+fn gaussian_blur_alpha(source: &[u8], width: u32, height: u32, support_radius: f32) -> Vec<u8> {
+    if source.is_empty() || support_radius <= 0.5 {
+        return source.to_vec();
+    }
+    let radius = support_radius.ceil().clamp(1.0, 128.0) as i32;
+    let sigma = (support_radius / 3.5).max(0.45);
+    let mut kernel = Vec::with_capacity((radius * 2 + 1) as usize);
+    let mut sum = 0.0f32;
+    for offset in -radius..=radius {
+        let x = offset as f32;
+        let weight = (-0.5 * x * x / (sigma * sigma)).exp();
+        kernel.push(weight);
+        sum += weight;
+    }
+    for weight in &mut kernel {
+        *weight /= sum.max(f32::EPSILON);
+    }
+    let w = width as i32;
+    let h = height as i32;
+    let mut horizontal = vec![0.0f32; source.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let mut value = 0.0;
+            for offset in -radius..=radius {
+                let sx = (x + offset).clamp(0, w - 1);
+                value +=
+                    f32::from(source[(y * w + sx) as usize]) * kernel[(offset + radius) as usize];
+            }
+            horizontal[(y * w + x) as usize] = value;
+        }
+    }
+    let mut output = vec![0u8; source.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let mut value = 0.0;
+            for offset in -radius..=radius {
+                let sy = (y + offset).clamp(0, h - 1);
+                value += horizontal[(sy * w + x) as usize] * kernel[(offset + radius) as usize];
+            }
+            output[(y * w + x) as usize] = value.clamp(0.0, 255.0).round() as u8;
+        }
+    }
+    output
+}
+
+fn rasterize_vector(
+    v: &VectorAsset,
+    appearance: Option<&VectorAppearance>,
+    t: Affine,
+    buffer: &mut [u8],
+    w: u32,
+    h: u32,
+) {
+    if let Some(appearance) = appearance {
+        let pixels_per_unit = t.uniform_scale().clamp(1.0, 4.0);
+        if let Some(tile) = rasterize_vector_appearance_local(v, appearance, pixels_per_unit) {
+            composite_appearance_tile(&tile, t, buffer, w, h);
+            return;
+        }
+    }
     if let Some(fill) = v.fill {
         let contours: Vec<Vec<Vec2>> = v
             .paths
@@ -352,6 +575,98 @@ fn rasterize_vector(v: &VectorAsset, t: Affine, buffer: &mut [u8], w: u32, h: u3
             }
         }
     }
+}
+
+fn composite_appearance_tile(
+    tile: &RasterizedVectorAppearance,
+    t: Affine,
+    buffer: &mut [u8],
+    w: u32,
+    h: u32,
+) {
+    let local_max = Vec2::new(
+        tile.local_min.x + tile.width as f32 / tile.pixels_per_unit,
+        tile.local_min.y + tile.height as f32 / tile.pixels_per_unit,
+    );
+    let corners = [
+        tile.local_min,
+        Vec2::new(local_max.x, tile.local_min.y),
+        local_max,
+        Vec2::new(tile.local_min.x, local_max.y),
+    ];
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for corner in corners {
+        let point = t.apply(corner);
+        min_x = min_x.min(point.x);
+        min_y = min_y.min(point.y);
+        max_x = max_x.max(point.x);
+        max_y = max_y.max(point.y);
+    }
+    let Some(inv) = t.inverse() else {
+        return;
+    };
+    let x0 = (min_x.floor() as i32).max(0);
+    let y0 = (min_y.floor() as i32).max(0);
+    let x1 = (max_x.ceil() as i32).min(w as i32 - 1);
+    let y1 = (max_y.ceil() as i32).min(h as i32 - 1);
+    if x0 > x1 || y0 > y1 {
+        return;
+    }
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let local = inv.apply(Vec2::new(x as f32 + 0.5, y as f32 + 0.5));
+            let tx = (local.x - tile.local_min.x) * tile.pixels_per_unit - 0.5;
+            let ty = (local.y - tile.local_min.y) * tile.pixels_per_unit - 0.5;
+            let Some(color) = sample_tile_bilinear(tile, tx, ty) else {
+                continue;
+            };
+            if color.a == 0 {
+                continue;
+            }
+            let dst = ((y as u32 * w + x as u32) * 4) as usize;
+            blend_pixel(buffer, dst, color);
+        }
+    }
+}
+
+fn sample_tile_bilinear(tile: &RasterizedVectorAppearance, x: f32, y: f32) -> Option<Rgba> {
+    if x < -0.5 || y < -0.5 || x > tile.width as f32 - 0.5 || y > tile.height as f32 - 0.5 {
+        return None;
+    }
+    let x0 = x.floor().clamp(0.0, tile.width.saturating_sub(1) as f32) as u32;
+    let y0 = y.floor().clamp(0.0, tile.height.saturating_sub(1) as f32) as u32;
+    let x1 = (x0 + 1).min(tile.width - 1);
+    let y1 = (y0 + 1).min(tile.height - 1);
+    let fx = (x - x.floor()).clamp(0.0, 1.0);
+    let fy = (y - y.floor()).clamp(0.0, 1.0);
+    let sample = |sx: u32, sy: u32| -> [u8; 4] {
+        let index = ((sy * tile.width + sx) * 4) as usize;
+        [
+            tile.rgba[index],
+            tile.rgba[index + 1],
+            tile.rgba[index + 2],
+            tile.rgba[index + 3],
+        ]
+    };
+    let a = sample(x0, y0);
+    let b = sample(x1, y0);
+    let c = sample(x0, y1);
+    let d = sample(x1, y1);
+    let lerp = |p: u8, q: u8, t: f32| f32::from(p) + (f32::from(q) - f32::from(p)) * t;
+    let channel = |index: usize| {
+        let top = lerp(a[index], b[index], fx);
+        let bottom = lerp(c[index], d[index], fx);
+        (top + (bottom - top) * fy).clamp(0.0, 255.0).round() as u8
+    };
+    Some(Rgba {
+        r: channel(0),
+        g: channel(1),
+        b: channel(2),
+        a: channel(3),
+    })
 }
 
 fn rasterize_bitmap(b: &BitmapAsset, t: Affine, buffer: &mut [u8], w: u32, h: u32) {
@@ -534,7 +849,7 @@ fn blend_pixel(buffer: &mut [u8], idx: usize, c: Rgba) {
 #[cfg(test)]
 mod resolver_tests {
     use super::*;
-    use crate::v2::{Layer, Placement, Tween};
+    use crate::v2::{Anchor, Layer, Path as VPath, Placement, ProjectMeta, Q0rg, Tween};
 
     fn placement(frame: u16, asset: u16, tx: f32, tween: Tween) -> Placement {
         Placement {
@@ -637,6 +952,207 @@ mod resolver_tests {
         assert_eq!(downscaled[3], 64);
     }
 
+    fn rectangle_path(min_x: f32, min_y: f32, max_x: f32, max_y: f32) -> VPath {
+        VPath {
+            anchors: [
+                (min_x, min_y),
+                (max_x, min_y),
+                (max_x, max_y),
+                (min_x, max_y),
+            ]
+            .into_iter()
+            .map(|(x, y)| Anchor {
+                point: Vec2::new(x, y),
+                in_handle: None,
+                out_handle: None,
+            })
+            .collect(),
+            closed: true,
+        }
+    }
+
+    fn appearance_pixel(tile: &RasterizedVectorAppearance, local: Vec2) -> [u8; 4] {
+        let x = ((local.x - tile.local_min.x) * tile.pixels_per_unit)
+            .floor()
+            .clamp(0.0, tile.width.saturating_sub(1) as f32) as u32;
+        let y = ((local.y - tile.local_min.y) * tile.pixels_per_unit)
+            .floor()
+            .clamp(0.0, tile.height.saturating_sub(1) as f32) as u32;
+        let index = ((y * tile.width + x) * 4) as usize;
+        [
+            tile.rgba[index],
+            tile.rgba[index + 1],
+            tile.rgba[index + 2],
+            tile.rgba[index + 3],
+        ]
+    }
+
+    #[test]
+    fn soft_halo_is_a_continuous_alpha_gradient_not_polygon_bands() {
+        let fill = Rgba {
+            r: 210,
+            g: 70,
+            b: 25,
+            a: 255,
+        };
+        let vector = VectorAsset {
+            asset_id: 1,
+            paths: vec![rectangle_path(0.0, 0.0, 20.0, 20.0)],
+            fill: Some(fill),
+            stroke: None,
+        };
+        let appearance = VectorAppearance {
+            material: VectorMaterial::SoftHalo {
+                radius: 12.0,
+                opacity: 0.7,
+            },
+            erase_mask: Vec::new(),
+        };
+        let tile =
+            rasterize_vector_appearance_local(&vector, &appearance, 4.0).expect("appearance tile");
+
+        let mut outside_levels = std::collections::BTreeSet::new();
+        for step in 1..=44 {
+            let x = -(step as f32) * 0.25;
+            let alpha = appearance_pixel(&tile, Vec2::new(x, 10.0))[3];
+            if alpha > 0 && alpha < 255 {
+                outside_levels.insert(alpha);
+            }
+        }
+        assert!(
+            outside_levels.len() > 16,
+            "gaussian halo must expose many alpha levels, got {outside_levels:?}"
+        );
+        let edge = appearance_pixel(&tile, Vec2::new(-1.0, 10.0));
+        assert!(edge[3] > 0 && edge[3] < 255);
+        for pixel in tile.rgba.chunks_exact(4).filter(|pixel| pixel[3] > 0) {
+            assert_eq!(&pixel[..3], &[fill.r, fill.g, fill.b]);
+        }
+    }
+
+    #[test]
+    fn appearance_mask_is_applied_after_blur_so_halo_cannot_grow_back() {
+        let vector = VectorAsset {
+            asset_id: 1,
+            paths: vec![rectangle_path(0.0, 0.0, 20.0, 20.0)],
+            fill: Some(Rgba {
+                r: 255,
+                g: 80,
+                b: 40,
+                a: 255,
+            }),
+            stroke: None,
+        };
+        let appearance = VectorAppearance {
+            material: VectorMaterial::SoftHalo {
+                radius: 12.0,
+                opacity: 0.8,
+            },
+            erase_mask: vec![rectangle_path(22.0, 7.0, 26.0, 13.0)],
+        };
+        let tile =
+            rasterize_vector_appearance_local(&vector, &appearance, 4.0).expect("appearance tile");
+        assert_eq!(appearance_pixel(&tile, Vec2::new(24.0, 10.0))[3], 0);
+        assert!(
+            appearance_pixel(&tile, Vec2::new(21.0, 10.0))[3] > 0,
+            "unmasked neighbouring halo must remain visible"
+        );
+    }
+
+    #[test]
+    fn nested_transformed_q0rg_keeps_appearance_and_erase_mask() {
+        let vector = VectorAsset {
+            asset_id: 1,
+            paths: vec![rectangle_path(0.0, 0.0, 10.0, 10.0)],
+            fill: Some(Rgba {
+                r: 230,
+                g: 30,
+                b: 20,
+                a: 255,
+            }),
+            stroke: None,
+        };
+        let mut appearances = std::collections::HashMap::new();
+        appearances.insert(
+            1,
+            VectorAppearance {
+                material: VectorMaterial::SoftHalo {
+                    radius: 6.0,
+                    opacity: 0.8,
+                },
+                erase_mask: vec![rectangle_path(3.0, 3.0, 7.0, 7.0)],
+            },
+        );
+        let project = ProjectV2 {
+            meta: ProjectMeta {
+                name: "nested appearance".into(),
+                fps: 24,
+                stage_width: 64,
+                stage_height: 64,
+                entry_q0rg_id: 1,
+            },
+            assets: vec![Asset::Vector(vector)],
+            asset_names: std::collections::HashMap::new(),
+            asset_appearances: appearances,
+            layer_metadata: std::collections::HashMap::new(),
+            q0rgs: vec![
+                Q0rg {
+                    q0rg_id: 1,
+                    name: "stage".into(),
+                    frame_count: 1,
+                    script: String::new(),
+                    layers: vec![Layer {
+                        layer_id: 1,
+                        name: "instance".into(),
+                        explicit_keyframes: Vec::new(),
+                        placements: vec![Placement {
+                            frame: 0,
+                            target: Target::Q0rg(2),
+                            transform: Transform2D {
+                                tx: 20.0,
+                                ty: 15.0,
+                                sx: 2.0,
+                                sy: 2.0,
+                                ..Transform2D::IDENTITY
+                            },
+                            tween: Tween::None,
+                        }],
+                    }],
+                },
+                Q0rg {
+                    q0rg_id: 2,
+                    name: "symbol".into(),
+                    frame_count: 1,
+                    script: String::new(),
+                    layers: vec![Layer {
+                        layer_id: 1,
+                        name: "art".into(),
+                        explicit_keyframes: Vec::new(),
+                        placements: vec![Placement {
+                            frame: 0,
+                            target: Target::Asset(1),
+                            transform: Transform2D::IDENTITY,
+                            tween: Tween::None,
+                        }],
+                    }],
+                },
+            ],
+        };
+
+        let frame = rasterize_q0rg_frame(&project, 1, 0, 64, 64, 1, [0, 0, 0, 0]);
+        let alpha = |x: u32, y: u32| frame[((y * 64 + x) * 4 + 3) as usize];
+        assert_eq!(
+            alpha(30, 25),
+            0,
+            "transformed mask centre must remain erased"
+        );
+        assert!(alpha(24, 25) > 200, "transformed source must remain opaque");
+        assert!(
+            alpha(18, 25) > 0,
+            "transformed halo must survive q0rg nesting"
+        );
+    }
+
     #[test]
     fn scaled_offscreen_render_maps_the_whole_stage_to_output() {
         use crate::v2::{BitmapAsset, ProjectMeta, Q0rg};
@@ -656,6 +1172,7 @@ mod resolver_tests {
                 rgba: [255, 0, 0, 255].repeat(4),
             })],
             asset_names: std::collections::HashMap::new(),
+            asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,

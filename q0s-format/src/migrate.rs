@@ -64,6 +64,7 @@ pub fn migrate_v1_to_v2(v1: Q1Project) -> Result<ProjectV2, Error> {
         },
         assets,
         asset_names: std::collections::HashMap::new(),
+        asset_appearances: std::collections::HashMap::new(),
         layer_metadata: std::collections::HashMap::new(),
         q0rgs,
     };

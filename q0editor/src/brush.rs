@@ -1065,6 +1065,8 @@ pub fn commit_brush_region(
     let layer_id = app.session.current_layer_id;
     let frame = app.session.current_frame;
     let candidates = collect_raw_fill_candidates(&app.state.project, q0rg_id, layer_id, frame);
+    #[cfg(feature = "appearance-mask-eraser")]
+    let freshly_painted = region.clone();
 
     // A raw drawing is one planar paint surface, not a stack of overlapping
     // same-style containers. Existing paint of this colour joins the new
@@ -1080,6 +1082,12 @@ pub fn commit_brush_region(
     if painted_paths.is_empty() {
         return;
     }
+    #[cfg(feature = "appearance-mask-eraser")]
+    let merged_appearance = crate::appearance::merged_brush_appearance(
+        &app.state.project,
+        &same_color_assets,
+        &freshly_painted,
+    );
 
     let mut different_updates = Vec::new();
     let mut seen_different = BTreeSet::new();
@@ -1137,7 +1145,7 @@ pub fn commit_brush_region(
     );
     remove_unreferenced_assets(&mut app.state.project, &remove_asset_ids);
 
-    append_raw_fill(
+    let painted_asset_id = append_raw_fill(
         &mut app.state.project,
         q0rg_id,
         layer_id,
@@ -1145,6 +1153,16 @@ pub fn commit_brush_region(
         settings.color,
         painted_paths,
     );
+    #[cfg(not(feature = "appearance-mask-eraser"))]
+    let _ = painted_asset_id;
+    #[cfg(feature = "appearance-mask-eraser")]
+    {
+        app.state
+            .project
+            .asset_appearances
+            .insert(painted_asset_id, merged_appearance);
+        app.textures.invalidate();
+    }
 
     app.session.selection = crate::state::Selection::None;
     app.session.status = format!("Brush merge drawing updated ({} regions)", painted.0.len());
@@ -1276,6 +1294,21 @@ fn merged_paths_preserve_every_source(
 /// Subtract one already-unioned eraser gesture from every raw fill on the
 /// current layer/frame. Returns whether any geometry actually changed.
 pub fn erase_brush_region(app: &mut EditorApp, region: MultiPolygon<f64>) -> bool {
+    erase_brush_region_impl(app, region, true)
+}
+
+pub(crate) fn erase_brush_region_without_snapshot(
+    app: &mut EditorApp,
+    region: MultiPolygon<f64>,
+) -> bool {
+    erase_brush_region_impl(app, region, false)
+}
+
+fn erase_brush_region_impl(
+    app: &mut EditorApp,
+    region: MultiPolygon<f64>,
+    snapshot_history: bool,
+) -> bool {
     if region.0.is_empty() {
         return false;
     }
@@ -1288,6 +1321,17 @@ pub fn erase_brush_region(app: &mut EditorApp, region: MultiPolygon<f64>) -> boo
     let mut updates = Vec::new();
     let mut seen_assets = BTreeSet::new();
     for candidate in &candidates {
+        #[cfg(feature = "appearance-mask-eraser")]
+        if app
+            .state
+            .project
+            .asset_appearances
+            .contains_key(&candidate.asset_id)
+        {
+            // Appearance-enabled fills are erased only by the post-material
+            // mask. The classic geometry eraser must never cut their source.
+            continue;
+        }
         if !seen_assets.insert(candidate.asset_id) {
             continue;
         }
@@ -1300,7 +1344,9 @@ pub fn erase_brush_region(app: &mut EditorApp, region: MultiPolygon<f64>) -> boo
         return false;
     }
 
-    app.history.snapshot(&app.state.project);
+    if snapshot_history {
+        app.history.snapshot(&app.state.project);
+    }
     if crate::tools::materialize_layer_keyframe_for_edit(
         &mut app.state.project,
         q0rg_id,
@@ -1441,6 +1487,8 @@ pub(crate) fn prepare_writable_raw_assets(
         let new_asset_id = next_asset_id(project);
         clone.asset_id = new_asset_id;
         project.assets.push(Asset::Vector(clone));
+        #[cfg(feature = "appearance-mask-eraser")]
+        crate::appearance::clone_asset_appearance(project, *asset_id, new_asset_id);
 
         if let Some(layer) = project
             .q0rgs
@@ -1526,7 +1574,7 @@ fn append_raw_fill(
     frame: u16,
     color: Rgba,
     paths: Vec<VPath>,
-) {
+) -> u16 {
     let asset_id = next_asset_id(project);
     project.assets.push(Asset::Vector(VectorAsset {
         asset_id,
@@ -1551,8 +1599,9 @@ fn append_raw_fill(
             tween: Tween::None,
         });
     }
+    asset_id
 }
-fn vector_fill_geometry(vector: &VectorAsset) -> MultiPolygon<f64> {
+pub(crate) fn vector_fill_geometry(vector: &VectorAsset) -> MultiPolygon<f64> {
     let mut rings: Vec<(&VPath, Polygon<f64>, f64)> = vector
         .paths
         .iter()
@@ -1647,9 +1696,18 @@ fn remove_unreferenced_assets(project: &mut ProjectV2, candidates: &BTreeSet<u16
             Target::Q0rg(_) => None,
         })
         .collect();
+    let removed: Vec<u16> = candidates
+        .iter()
+        .copied()
+        .filter(|asset_id| !referenced.contains(asset_id))
+        .collect();
     project
         .assets
-        .retain(|asset| !candidates.contains(&asset.id()) || referenced.contains(&asset.id()));
+        .retain(|asset| !removed.contains(&asset.id()));
+    for asset_id in removed {
+        project.asset_names.remove(&asset_id);
+        project.asset_appearances.remove(&asset_id);
+    }
 }
 
 #[cfg(test)]
@@ -2814,6 +2872,9 @@ mod tests {
         let horizontal = stroke(&[Vec2::new(0.0, 20.0), Vec2::new(60.0, 20.0)], paint);
         let cut = stroke(&[Vec2::new(30.0, -20.0), Vec2::new(30.0, 60.0)], eraser);
         commit_brush_region(&mut app, brush_finish(horizontal, paint), paint);
+        // This test exercises the legacy raw-geometry eraser specifically.
+        // Appearance-enabled brush assets are owned by the mask eraser instead.
+        app.state.project.asset_appearances.clear();
 
         assert!(erase_brush_region(&mut app, brush_finish(cut, eraser)));
         let Asset::Vector(vector) = &app.state.project.assets[0] else {
@@ -2831,6 +2892,8 @@ mod tests {
         let paint = settings(10.0, 0);
         let dab = stroke(&[Vec2::new(20.0, 20.0)], paint);
         commit_brush_region(&mut app, brush_finish(dab, paint), paint);
+        // This test exercises complete deletion in the legacy raw-geometry path.
+        app.state.project.asset_appearances.clear();
 
         let mut large_eraser = settings(40.0, 0);
         large_eraser.color = paint.color;

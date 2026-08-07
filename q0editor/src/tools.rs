@@ -1632,7 +1632,16 @@ fn eraser(app: &mut EditorApp, response: &Response, view: &StageView, ctx: &Cont
         {
             let fallback_point = stroke.samples.last().map(|sample| sample.position);
             let region = crate::brush::brush_finish(stroke, settings);
-            if !crate::brush::erase_brush_region(app, region) {
+            #[cfg(feature = "appearance-mask-eraser")]
+            let appearance_erased = crate::appearance::erase_visible_region(app, region.clone());
+            #[cfg(not(feature = "appearance-mask-eraser"))]
+            let appearance_erased = false;
+            let geometry_erased = if appearance_erased {
+                crate::brush::erase_brush_region_without_snapshot(app, region)
+            } else {
+                crate::brush::erase_brush_region(app, region)
+            };
+            if !appearance_erased && !geometry_erased {
                 if let Some(point) = fallback_point {
                     erase_fallback_at(app, point, settings.size.max(0.1) * 0.5);
                 }
@@ -1653,7 +1662,16 @@ fn eraser(app: &mut EditorApp, response: &Response, view: &StageView, ctx: &Cont
             let stroke =
                 crate::brush::brush_begin(settings, crate::brush::BrushSample::mouse(point));
             let region = crate::brush::brush_finish(stroke, settings);
-            if !crate::brush::erase_brush_region(app, region) {
+            #[cfg(feature = "appearance-mask-eraser")]
+            let appearance_erased = crate::appearance::erase_visible_region(app, region.clone());
+            #[cfg(not(feature = "appearance-mask-eraser"))]
+            let appearance_erased = false;
+            let geometry_erased = if appearance_erased {
+                crate::brush::erase_brush_region_without_snapshot(app, region)
+            } else {
+                crate::brush::erase_brush_region(app, region)
+            };
+            if !appearance_erased && !geometry_erased {
                 erase_fallback_at(app, point, settings.size.max(0.1) * 0.5);
             }
         }
@@ -3289,6 +3307,12 @@ pub(crate) fn materialize_raw_paths_as_placements(
             let new_id = next_asset_id(&app.state.project);
             clone.asset_id = new_id;
             app.state.project.assets.push(Asset::Vector(clone));
+            #[cfg(feature = "appearance-mask-eraser")]
+            crate::appearance::clone_asset_appearance(
+                &mut app.state.project,
+                original_asset_id,
+                new_id,
+            );
             let target = app
                 .state
                 .project
@@ -3349,6 +3373,12 @@ pub(crate) fn materialize_raw_paths_as_placements(
             fill,
             stroke,
         }));
+        #[cfg(feature = "appearance-mask-eraser")]
+        crate::appearance::split_asset_appearance(
+            &mut app.state.project,
+            writable_asset_id,
+            selected_asset_id,
+        );
         let layer = app
             .state
             .project
@@ -3381,6 +3411,10 @@ pub(crate) fn materialize_raw_paths_as_placements(
             .project
             .assets
             .retain(|asset| !emptied_assets.contains(&asset.id()));
+        for asset_id in &emptied_assets {
+            app.state.project.asset_names.remove(asset_id);
+            app.state.project.asset_appearances.remove(asset_id);
+        }
     }
 
     let mut placements = Vec::new();
@@ -6942,6 +6976,7 @@ mod tests {
             },
             assets: vec![asset],
             asset_names: std::collections::HashMap::new(),
+            asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
@@ -6993,6 +7028,7 @@ mod tests {
                 stroke: None,
             })],
             asset_names: std::collections::HashMap::new(),
+            asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
             q0rgs: vec![
                 Q0rg {
@@ -7085,6 +7121,7 @@ mod tests {
                 }),
             ],
             asset_names: std::collections::HashMap::new(),
+            asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
@@ -7373,6 +7410,7 @@ mod tests {
                 stroke: None,
             })],
             asset_names: std::collections::HashMap::new(),
+            asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
@@ -7521,6 +7559,7 @@ mod tests {
                 }),
             ],
             asset_names: std::collections::HashMap::new(),
+            asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
@@ -7688,6 +7727,7 @@ mod tests {
                 stroke: None,
             })],
             asset_names: std::collections::HashMap::new(),
+            asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
@@ -7776,6 +7816,7 @@ mod tests {
                 stroke: None,
             })],
             asset_names: std::collections::HashMap::new(),
+            asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
@@ -7845,6 +7886,7 @@ mod tests {
                 stroke: None,
             })],
             asset_names: std::collections::HashMap::new(),
+            asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
             q0rgs: vec![
                 Q0rg {
@@ -8237,6 +8279,7 @@ mod tests {
                 stroke: None,
             })],
             asset_names: std::collections::HashMap::new(),
+            asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
@@ -8641,6 +8684,7 @@ mod tests {
                 stroke: None,
             })],
             asset_names: std::collections::HashMap::new(),
+            asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
@@ -8718,6 +8762,7 @@ mod tests {
                 stroke: None,
             })],
             asset_names: std::collections::HashMap::new(),
+            asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
@@ -8860,6 +8905,7 @@ mod tests {
             },
             assets: vec![square(1, 20.0), square(2, 10.0)],
             asset_names: std::collections::HashMap::new(),
+            asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
             q0rgs: vec![
                 Q0rg {
@@ -9143,5 +9189,26 @@ mod tests {
         let moved_object = placement_ref_transform(&app.state.project, objects[0]).expect("object");
         assert!((moved_object.tx - (start_transforms[0].tx + 10.0)).abs() < 1.0e-4);
         assert!((moved_object.ty - (start_transforms[0].ty + 5.0)).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn synced_eraser_preserves_every_classic_brush_nib() {
+        for nib in crate::brush::BrushNib::ALL {
+            let mut app = EditorApp::default();
+            app.session.brush.nib = nib;
+            app.session.brush.sync_with_eraser = true;
+            let settings = eraser_settings(&app, 1.0);
+            assert_eq!(settings.nib, nib, "eraser lost {} nib", nib.label());
+        }
+    }
+
+    #[test]
+    fn independent_eraser_remains_circle_without_destroying_brush_nib() {
+        let mut app = EditorApp::default();
+        app.session.brush.nib = crate::brush::BrushNib::Slash;
+        app.session.brush.sync_with_eraser = false;
+        let settings = eraser_settings(&app, 1.0);
+        assert_eq!(settings.nib, crate::brush::BrushNib::Circle);
+        assert_eq!(app.session.brush.nib, crate::brush::BrushNib::Slash);
     }
 }

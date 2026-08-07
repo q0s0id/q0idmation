@@ -4,7 +4,7 @@
 //!
 //!   Header:
 //!     [4]   magic "Q1S\0"
-//!     [2]   version = 2 (legacy) | 3 (skew) | 4 (blank keyframes) | 5 (asset names) | 6 (layer folders) | 7 (q0v assets) | 8 (easing)
+//!     [2]   version = 2 (legacy) | 3 (skew) | 4 (blank keyframes) | 5 (asset names) | 6 (layer folders) | 7 (q0v assets) | 8 (easing) | 9 (vector appearance masks)
 //!     [2]   flags (reserved = 0)
 //!     [2]   asset_count
 //!     [2]   q0rg_count
@@ -27,12 +27,14 @@
 //!       v4+: [2] explicit_keyframe_count, explicit_keyframes[]: [2] frame
 //!   v6 layer metadata: [2] entry_count, then entries:
 //!     [2] q0rg_id, [2] layer_id, [1] kind, [1] parent flag, [2 if present] parent id, [1] collapsed
+//!   v9 vector appearance metadata: [2] entry_count, then entries:
+//!     [2] asset_id, [1] material kind, material payload, [2] erase path count, erase paths[]
 //!
-//! Reading: v2 through v8 are accepted; v2 placements get skew_x/y = 0,
+//! Reading: v2 through v9 are accepted; v2 placements get skew_x/y = 0,
 //! v2/v3 layers get no explicit blank-keyframe markers, v2-v4 assets
 //! keep deterministic default labels, and v2-v5 projects have ordinary
 //! top-level layers without folders.
-//! Writing: always v8 (see `Q1S_VERSION_CURRENT`).
+//! Writing: always v9 (see `Q1S_VERSION_CURRENT`).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -47,7 +49,8 @@ pub const Q1S_VERSION_ASSET_NAMES: u16 = 5;
 pub const Q1S_VERSION_LAYER_FOLDERS: u16 = 6;
 pub const Q1S_VERSION_Q0V_ASSETS: u16 = 7;
 pub const Q1S_VERSION_EASING: u16 = 8;
-pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_EASING;
+pub const Q1S_VERSION_APPEARANCE_MASKS: u16 = 9;
+pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_APPEARANCE_MASKS;
 /// Kept as an alias so external code that imported the v2-era constant keeps
 /// compiling. It now means "the current write-out version".
 pub const Q1S_V2_VERSION: u16 = Q1S_VERSION_CURRENT;
@@ -72,6 +75,8 @@ const EASING_KIND_PRESET: u8 = 1;
 const EASING_KIND_CUBIC_BEZIER: u8 = 2;
 const LAYER_KIND_NORMAL: u8 = 0;
 const LAYER_KIND_FOLDER: u8 = 1;
+const VECTOR_MATERIAL_SOLID: u8 = 0;
+const VECTOR_MATERIAL_SOFT_HALO: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Vec2 {
@@ -144,6 +149,24 @@ pub struct VectorAsset {
     pub paths: Vec<Path>,
     pub fill: Option<Rgba>,
     pub stroke: Option<Stroke>,
+}
+
+/// Rendering material attached to a vector asset. Geometry stays canonical;
+/// material rendering and destructive-looking edits such as the mask eraser
+/// live on top of it instead of rewriting the source paths.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum VectorMaterial {
+    Solid,
+    SoftHalo { radius: f32, opacity: f32 },
+}
+
+/// Sparse per-vector appearance state. `erase_mask` is expressed in the
+/// vector asset's local coordinates and is applied after material evaluation.
+/// Moving/scaling/nesting the asset therefore moves the mask with the artwork.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorAppearance {
+    pub material: VectorMaterial,
+    pub erase_mask: Vec<Path>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -550,6 +573,9 @@ pub struct ProjectV2 {
     /// Optional user-facing names for assets. Missing entries keep the
     /// deterministic legacy label (for example `Vector 7`).
     pub asset_names: HashMap<u16, String>,
+    /// Sparse appearance state for vector assets. Missing entries render with
+    /// the legacy fill/stroke path and preserve old project behaviour exactly.
+    pub asset_appearances: HashMap<u16, VectorAppearance>,
     /// Sparse structural metadata for timeline layers. Missing entries are
     /// ordinary top-level layers, preserving legacy project behaviour.
     pub layer_metadata: HashMap<LayerKey, LayerMetadata>,
@@ -581,6 +607,7 @@ pub(crate) fn canonicalized_for_wire(project: &ProjectV2) -> ProjectV2 {
 pub fn wire_equivalent(left: &ProjectV2, right: &ProjectV2) -> bool {
     if left.meta != right.meta
         || left.asset_names != right.asset_names
+        || left.asset_appearances != right.asset_appearances
         || left.layer_metadata != right.layer_metadata
         || left.assets.len() != right.assets.len()
         || left.q0rgs.len() != right.q0rgs.len()
@@ -727,6 +754,54 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
         }
         if name.len() > usize::from(u16::MAX) {
             return Err(Error::Overflow("asset name length exceeds u16"));
+        }
+    }
+
+    for (&asset_id, appearance) in &project.asset_appearances {
+        let Some(Asset::Vector(vector)) =
+            project.assets.iter().find(|asset| asset.id() == asset_id)
+        else {
+            return Err(Error::Validation(
+                "vector appearance references a missing or non-vector asset",
+            ));
+        };
+        if vector.fill.is_none() || vector.stroke.is_some() {
+            return Err(Error::Validation(
+                "vector appearance requires a fill-only vector asset",
+            ));
+        }
+        match appearance.material {
+            VectorMaterial::Solid => {}
+            VectorMaterial::SoftHalo { radius, opacity } => {
+                if !radius.is_finite() || radius <= 0.0 {
+                    return Err(Error::Validation("soft halo radius must be finite and > 0"));
+                }
+                if !opacity.is_finite() || !(0.0..=1.0).contains(&opacity) {
+                    return Err(Error::Validation(
+                        "soft halo opacity must be finite and between 0 and 1",
+                    ));
+                }
+            }
+        }
+        for path in &appearance.erase_mask {
+            if !path.closed || path.anchors.len() < 3 {
+                return Err(Error::Validation(
+                    "appearance erase mask paths must be closed with >= 3 anchors",
+                ));
+            }
+            for anchor in &path.anchors {
+                if !anchor.point.is_finite()
+                    || anchor
+                        .in_handle
+                        .into_iter()
+                        .chain(anchor.out_handle)
+                        .any(|handle| !handle.is_finite())
+                {
+                    return Err(Error::Validation(
+                        "appearance erase mask anchors must be finite",
+                    ));
+                }
+            }
         }
     }
 
@@ -973,6 +1048,7 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
         && version != Q1S_VERSION_ASSET_NAMES
         && version != Q1S_VERSION_LAYER_FOLDERS
         && version != Q1S_VERSION_Q0V_ASSETS
+        && version != Q1S_VERSION_EASING
         && version != Q1S_VERSION_CURRENT
     {
         return Err(Error::UnsupportedVersion(version));
@@ -1008,6 +1084,12 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
             "legacy q1s versions cannot store q0v assets",
         ));
     }
+    if version < Q1S_VERSION_APPEARANCE_MASKS && !project.asset_appearances.is_empty() {
+        return Err(Error::Validation(
+            "legacy q1s versions cannot store vector appearance masks",
+        ));
+    }
+
     if version < Q1S_VERSION_EASING
         && project
             .q0rgs
@@ -1077,6 +1159,31 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
                 None => out.push(0),
             }
             out.push(u8::from(value.collapsed));
+        }
+    }
+
+    if version >= Q1S_VERSION_APPEARANCE_MASKS {
+        let appearance_count = u16::try_from(project.asset_appearances.len())
+            .map_err(|_| Error::Overflow("vector appearance count exceeds u16"))?;
+        out.extend_from_slice(&appearance_count.to_le_bytes());
+        let mut appearances: Vec<_> = project.asset_appearances.iter().collect();
+        appearances.sort_by_key(|(asset_id, _)| **asset_id);
+        for (asset_id, appearance) in appearances {
+            out.extend_from_slice(&asset_id.to_le_bytes());
+            match appearance.material {
+                VectorMaterial::Solid => out.push(VECTOR_MATERIAL_SOLID),
+                VectorMaterial::SoftHalo { radius, opacity } => {
+                    out.push(VECTOR_MATERIAL_SOFT_HALO);
+                    out.extend_from_slice(&radius.to_le_bytes());
+                    out.extend_from_slice(&opacity.to_le_bytes());
+                }
+            }
+            let path_count = u16::try_from(appearance.erase_mask.len())
+                .map_err(|_| Error::Overflow("appearance erase path count exceeds u16"))?;
+            out.extend_from_slice(&path_count.to_le_bytes());
+            for path in &appearance.erase_mask {
+                write_mask_path(&mut out, path)?;
+            }
         }
     }
 
@@ -1160,6 +1267,20 @@ fn write_asset(
             out.extend_from_slice(&payload_len.to_le_bytes());
             out.extend_from_slice(&v.bytes);
         }
+    }
+    Ok(())
+}
+
+fn write_mask_path(out: &mut Vec<u8>, path: &Path) -> Result<(), Error> {
+    out.push(u8::from(path.closed));
+    let anchor_count = u16::try_from(path.anchors.len())
+        .map_err(|_| Error::Overflow("appearance mask anchor count exceeds u16"))?;
+    out.extend_from_slice(&anchor_count.to_le_bytes());
+    for anchor in &path.anchors {
+        out.extend_from_slice(&anchor.point.x.to_le_bytes());
+        out.extend_from_slice(&anchor.point.y.to_le_bytes());
+        write_optional_vec2(out, anchor.in_handle);
+        write_optional_vec2(out, anchor.out_handle);
     }
     Ok(())
 }
@@ -1283,6 +1404,7 @@ pub fn parse(bytes: &[u8]) -> Result<ProjectV2, Error> {
         && version != Q1S_VERSION_ASSET_NAMES
         && version != Q1S_VERSION_LAYER_FOLDERS
         && version != Q1S_VERSION_Q0V_ASSETS
+        && version != Q1S_VERSION_EASING
         && version != Q1S_VERSION_CURRENT
     {
         return Err(Error::UnsupportedVersion(version));
@@ -1365,6 +1487,40 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
         }
     }
 
+    let mut asset_appearances = HashMap::new();
+    if version >= Q1S_VERSION_APPEARANCE_MASKS {
+        let count = c.read_u16()?;
+        asset_appearances.reserve(usize::from(count));
+        for _ in 0..count {
+            let asset_id = c.read_u16()?;
+            let material = match c.read_u8()? {
+                VECTOR_MATERIAL_SOLID => VectorMaterial::Solid,
+                VECTOR_MATERIAL_SOFT_HALO => VectorMaterial::SoftHalo {
+                    radius: c.read_f32()?,
+                    opacity: c.read_f32()?,
+                },
+                _ => return Err(Error::Validation("invalid vector material kind")),
+            };
+            let path_count = c.read_u16()?;
+            let mut erase_mask = Vec::with_capacity(usize::from(path_count));
+            for _ in 0..path_count {
+                erase_mask.push(read_mask_path(&mut c)?);
+            }
+            if asset_appearances
+                .insert(
+                    asset_id,
+                    VectorAppearance {
+                        material,
+                        erase_mask,
+                    },
+                )
+                .is_some()
+            {
+                return Err(Error::Validation("duplicate vector appearance entry"));
+            }
+        }
+    }
+
     c.finish()?;
 
     let project = ProjectV2 {
@@ -1377,6 +1533,7 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
         },
         assets,
         asset_names,
+        asset_appearances,
         layer_metadata,
         q0rgs,
     };
@@ -1499,6 +1656,24 @@ fn parse_asset(c: &mut Cursor, version: u16) -> Result<(Asset, Option<String>), 
         other => return Err(Error::InvalidAssetKind(other)),
     };
     Ok((asset, asset_name))
+}
+
+fn read_mask_path(c: &mut Cursor) -> Result<Path, Error> {
+    let closed = match c.read_u8()? {
+        0 => false,
+        1 => true,
+        _ => return Err(Error::Validation("invalid appearance mask closed flag")),
+    };
+    let anchor_count = c.read_u16()?;
+    let mut anchors = Vec::with_capacity(usize::from(anchor_count));
+    for _ in 0..anchor_count {
+        anchors.push(Anchor {
+            point: Vec2::new(c.read_f32()?, c.read_f32()?),
+            in_handle: read_optional_vec2(c)?,
+            out_handle: read_optional_vec2(c)?,
+        });
+    }
+    Ok(Path { anchors, closed })
 }
 
 fn read_optional_vec2(c: &mut Cursor) -> Result<Option<Vec2>, Error> {
@@ -1655,6 +1830,7 @@ mod compatibility_tests {
                 stroke: None,
             })],
             asset_names: std::collections::HashMap::new(),
+            asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
@@ -1893,6 +2069,112 @@ mod compatibility_tests {
             Q1S_VERSION_CURRENT
         );
         assert_eq!(parse(&bytes).expect("parse q0v project"), project);
+    }
+
+    fn appearance_project() -> ProjectV2 {
+        let mut project = legacy_project();
+        let Asset::Vector(vector) = &mut project.assets[0] else {
+            unreachable!();
+        };
+        vector.paths = vec![Path {
+            closed: true,
+            anchors: vec![
+                Anchor {
+                    point: Vec2::new(0.0, 0.0),
+                    in_handle: None,
+                    out_handle: None,
+                },
+                Anchor {
+                    point: Vec2::new(20.0, 0.0),
+                    in_handle: None,
+                    out_handle: None,
+                },
+                Anchor {
+                    point: Vec2::new(20.0, 20.0),
+                    in_handle: None,
+                    out_handle: None,
+                },
+                Anchor {
+                    point: Vec2::new(0.0, 20.0),
+                    in_handle: None,
+                    out_handle: None,
+                },
+            ],
+        }];
+        vector.fill = Some(Rgba {
+            r: 240,
+            g: 120,
+            b: 20,
+            a: 230,
+        });
+        vector.stroke = None;
+        project.asset_appearances.insert(
+            1,
+            VectorAppearance {
+                material: VectorMaterial::SoftHalo {
+                    radius: 9.5,
+                    opacity: 0.42,
+                },
+                erase_mask: vec![Path {
+                    closed: true,
+                    anchors: vec![
+                        Anchor {
+                            point: Vec2::new(7.0, 7.0),
+                            in_handle: None,
+                            out_handle: None,
+                        },
+                        Anchor {
+                            point: Vec2::new(13.0, 7.0),
+                            in_handle: None,
+                            out_handle: None,
+                        },
+                        Anchor {
+                            point: Vec2::new(13.0, 13.0),
+                            in_handle: None,
+                            out_handle: None,
+                        },
+                        Anchor {
+                            point: Vec2::new(7.0, 13.0),
+                            in_handle: None,
+                            out_handle: None,
+                        },
+                    ],
+                }],
+            },
+        );
+        project
+    }
+
+    #[test]
+    fn current_q1s_roundtrip_preserves_vector_appearance_and_mask() {
+        let project = appearance_project();
+        let bytes = write(&project).expect("write appearance q1s");
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            Q1S_VERSION_APPEARANCE_MASKS
+        );
+        let parsed = parse(&bytes).expect("parse appearance q1s");
+        assert_eq!(parsed, project);
+        assert_eq!(parsed.asset_appearances[&1], project.asset_appearances[&1]);
+    }
+
+    #[test]
+    fn q1s_v8_remains_readable_and_has_no_appearance_state() {
+        let project = legacy_project();
+        let bytes = write_version(&project, Q1S_VERSION_EASING).expect("write q1s v8 fixture");
+        let parsed = parse(&bytes).expect("parse q1s v8 fixture");
+        assert_eq!(parsed, project);
+        assert!(parsed.asset_appearances.is_empty());
+    }
+
+    #[test]
+    fn q1s_v8_writer_rejects_appearance_instead_of_dropping_it() {
+        let project = appearance_project();
+        assert_eq!(
+            write_version(&project, Q1S_VERSION_EASING)
+                .expect_err("q1s v8 cannot store appearance masks"),
+            Error::Validation("legacy q1s versions cannot store vector appearance masks")
+        );
     }
 
     #[test]

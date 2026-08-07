@@ -64,6 +64,7 @@ fn sample_v2_project() -> ProjectV2 {
             }),
         ],
         asset_names: std::collections::HashMap::new(),
+        asset_appearances: std::collections::HashMap::new(),
         layer_metadata: std::collections::HashMap::new(),
         q0rgs: vec![
             Q0rg {
@@ -169,6 +170,7 @@ fn q0rg_chain(edge_count: usize) -> ProjectV2 {
         },
         assets: Vec::new(),
         asset_names: std::collections::HashMap::new(),
+        asset_appearances: std::collections::HashMap::new(),
         layer_metadata: std::collections::HashMap::new(),
         q0rgs,
     }

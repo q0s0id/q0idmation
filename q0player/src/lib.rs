@@ -665,6 +665,7 @@ mod tests {
             },
             assets: Vec::new(),
             asset_names: std::collections::HashMap::new(),
+            asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,

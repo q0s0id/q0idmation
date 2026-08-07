@@ -12,6 +12,7 @@ use lyon_tessellation::{FillOptions, FillRule as LyonFillRule, FillTessellator};
 use q0s_format::transform::Affine;
 use q0s_format::v2::{
     Anchor, Asset, Path as VPath, Placement, ProjectV2, Rgba, Target, Transform2D, Tween, Vec2,
+    VectorAppearance,
 };
 
 const Q0RG_RECURSION_LIMIT: u8 = 8;
@@ -26,11 +27,21 @@ pub struct StageView {
     pub stage_rect: Rect,
 }
 
+#[derive(Clone)]
+struct CachedAppearanceTexture {
+    texture: TextureHandle,
+    local_min: Vec2,
+    width: u32,
+    height: u32,
+    pixels_per_unit: f32,
+}
+
 #[derive(Default)]
 pub struct TextureCache {
     by_asset_id: HashMap<u16, TextureHandle>,
     by_q0v_frame: HashMap<(u16, u32), TextureHandle>,
     q0v_media: HashMap<u16, q0video::q0v::Q0vFile>,
+    appearance_by_asset: HashMap<(u16, u16), CachedAppearanceTexture>,
 }
 
 impl TextureCache {
@@ -38,6 +49,7 @@ impl TextureCache {
         self.by_asset_id.clear();
         self.by_q0v_frame.clear();
         self.q0v_media.clear();
+        self.appearance_by_asset.clear();
     }
 }
 
@@ -130,6 +142,7 @@ fn render_q0rg(
                         render_asset(
                             painter,
                             asset,
+                            project.asset_appearances.get(&asset_id),
                             composed,
                             view,
                             textures,
@@ -270,6 +283,7 @@ fn resolve_layer_at_frame(layer: &q0s_format::v2::Layer, frame: u16) -> Vec<Reso
 fn render_asset(
     painter: &Painter,
     asset: &Asset,
+    appearance: Option<&VectorAppearance>,
     transform: Affine,
     view: &StageView,
     textures: &mut TextureCache,
@@ -391,6 +405,13 @@ fn render_asset(
             painter.add(Shape::Mesh(mesh));
         }
         Asset::Vector(v) => {
+            if let Some(appearance) = appearance {
+                if paint_vector_appearance(
+                    painter, v, appearance, transform, view, textures, ctx, tint,
+                ) {
+                    return;
+                }
+            }
             // Multiply the on-disk stroke width by the composed area
             // scale so a 2Р вЂњРІР‚вЂќ scaled q0rg actually renders 2Р вЂњРІР‚вЂќ-thick
             // outlines. Otherwise stroked vectors look comically thin
@@ -929,6 +950,7 @@ pub fn render_target_preview(
                 render_asset(
                     painter,
                     asset,
+                    project.asset_appearances.get(&asset_id),
                     affine,
                     view,
                     textures,
@@ -987,6 +1009,7 @@ pub fn render_asset_preview(
     render_asset(
         painter,
         asset,
+        project.asset_appearances.get(&asset_id),
         Affine::IDENTITY,
         view,
         textures,
@@ -1221,6 +1244,83 @@ fn lerp_transform(a: Transform2D, b: Transform2D, t: f32) -> Transform2D {
         skew_x: lerp(a.skew_x, b.skew_x, t),
         skew_y: lerp(a.skew_y, b.skew_y, t),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_vector_appearance(
+    painter: &Painter,
+    vector: &q0s_format::v2::VectorAsset,
+    appearance: &VectorAppearance,
+    transform: Affine,
+    view: &StageView,
+    textures: &mut TextureCache,
+    ctx: &Context,
+    tint: Color32,
+) -> bool {
+    if vector.fill.is_none() || vector.stroke.is_some() {
+        return false;
+    }
+    let target_ppu = (view.scale * transform.uniform_scale() * 2.0).clamp(1.0, 4.0);
+    let bucket = (target_ppu * 4.0).round().clamp(4.0, 16.0) as u16;
+    let ppu = f32::from(bucket) / 4.0;
+    let key = (vector.asset_id, bucket);
+    let cached = match textures.appearance_by_asset.entry(key) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            let Some(tile) =
+                q0s_format::raster::rasterize_vector_appearance_local(vector, appearance, ppu)
+            else {
+                return false;
+            };
+            let image = ColorImage::from_rgba_unmultiplied(
+                [tile.width as usize, tile.height as usize],
+                &tile.rgba,
+            );
+            let texture = ctx.load_texture(
+                format!("q0s_appearance_{}_{}", vector.asset_id, bucket),
+                image,
+                TextureOptions::LINEAR,
+            );
+            entry.insert(CachedAppearanceTexture {
+                texture,
+                local_min: tile.local_min,
+                width: tile.width,
+                height: tile.height,
+                pixels_per_unit: tile.pixels_per_unit,
+            })
+        }
+    };
+    let local_max = Vec2::new(
+        cached.local_min.x + cached.width as f32 / cached.pixels_per_unit,
+        cached.local_min.y + cached.height as f32 / cached.pixels_per_unit,
+    );
+    let local_corners = [
+        cached.local_min,
+        Vec2::new(local_max.x, cached.local_min.y),
+        local_max,
+        Vec2::new(cached.local_min.x, local_max.y),
+    ];
+    let screen_corners: Vec<Pos2> = local_corners
+        .iter()
+        .map(|point| stage_to_screen(transform.apply(*point), view))
+        .collect();
+    let mut mesh = Mesh::with_texture(cached.texture.id());
+    let uv = [
+        pos2(0.0, 0.0),
+        pos2(1.0, 0.0),
+        pos2(1.0, 1.0),
+        pos2(0.0, 1.0),
+    ];
+    for (corner, uv) in screen_corners.iter().zip(uv.iter()) {
+        mesh.vertices.push(Vertex {
+            pos: *corner,
+            uv: *uv,
+            color: tint,
+        });
+    }
+    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+    painter.add(Shape::Mesh(mesh));
+    true
 }
 
 fn rgba_to_color32(c: Rgba) -> Color32 {
