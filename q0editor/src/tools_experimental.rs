@@ -32,7 +32,10 @@ pub fn handle(
     if app.session.viewport.hand_active
         || app.session.viewport.panning
         || (current_layer_is_folder
-            && !matches!(app.session.current_tool, Tool::Select | Tool::Subselect | Tool::Hand))
+            && !matches!(
+                app.session.current_tool,
+                Tool::Select | Tool::Subselect | Tool::Hand
+            ))
     {
         crate::tools_legacy::handle(app, response, painter, view, ctx);
         crate::appearance::render_registered_appearances(app, painter, view);
