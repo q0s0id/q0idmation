@@ -277,13 +277,14 @@ fn select_cursor(
     // by the shared drawing Placement's bounding box. Display objects (q0rg,
     // bitmap, transformed vector instances) keep normal object hit-testing.
     let cursor_stage = screen_to_stage(cursor_screen, view);
-    if hit_test_raw_selection(
-        &app.state.project,
-        app.session.current_q0rg_id,
-        app.session.current_frame,
-        cursor_stage,
-    )
-    .is_some()
+    if selected_raw_body_contains_point(app, cursor_stage)
+        || hit_test_raw_selection(
+            &app.state.project,
+            app.session.current_q0rg_id,
+            app.session.current_frame,
+            cursor_stage,
+        )
+        .is_some()
         || hit_test_selectable_placement(
             &app.state.project,
             app.session.current_q0rg_id,
@@ -2560,10 +2561,13 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
             } = app.session.selection.clone()
             {
                 if objects.is_empty()
-                    && p.x >= bounds_min.x
-                    && p.x <= bounds_max.x
-                    && p.y >= bounds_min.y
-                    && p.y <= bounds_max.y
+                    && raw_area_selection_contains_point(
+                        &app.state.project,
+                        &placements,
+                        bounds_min,
+                        bounds_max,
+                        p,
+                    )
                 {
                     let start_pivot = selection_transform_pivot(app);
                     let refs = cut_raw_areas_for_drag(
@@ -2604,13 +2608,8 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 }
             }
             if let Some(refs) = selection_raw_path_refs(&app.session.selection) {
-                if point_hits_selected_raw_paths(
-                    &app.state.project,
-                    &refs,
-                    app.session.current_q0rg_id,
-                    app.session.current_frame,
-                    p,
-                ) && begin_dragging_raw_paths(app, refs, p, "Moving selected raw graphics")
+                if point_hits_selected_raw_paths(&app.state.project, &refs, p)
+                    && begin_dragging_raw_paths(app, refs, p, "Moving selected raw graphics")
                 {
                     return;
                 }
@@ -3939,17 +3938,227 @@ fn raw_selection_supports_axis_resize(bounds: (f32, f32, f32, f32)) -> bool {
         && max_y - min_y > 1.0e-3
 }
 
-fn point_hits_selected_raw_paths(
+fn point_hits_selected_raw_paths(project: &ProjectV2, refs: &[PathRef], point: Vec2) -> bool {
+    if refs.is_empty() {
+        return false;
+    }
+    let mut grouped: std::collections::BTreeMap<(u16, u16, usize), Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for reference in refs {
+        grouped
+            .entry((
+                reference.q0rg_id,
+                reference.layer_id,
+                reference.placement_idx,
+            ))
+            .or_default()
+            .push(reference.path_idx);
+    }
+
+    for ((q0rg_id, layer_id, placement_idx), mut path_indices) in grouped {
+        path_indices.sort_unstable();
+        path_indices.dedup();
+        let Some(placement) = project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+            .and_then(|q0rg| q0rg.layers.iter().find(|layer| layer.layer_id == layer_id))
+            .and_then(|layer| layer.placements.get(placement_idx))
+        else {
+            continue;
+        };
+        let Target::Asset(asset_id) = placement.target else {
+            continue;
+        };
+        let Some(Asset::Vector(vector)) =
+            project.assets.iter().find(|asset| asset.id() == asset_id)
+        else {
+            continue;
+        };
+
+        let closed_indices: Vec<usize> = path_indices
+            .iter()
+            .copied()
+            .filter(|index| vector.paths.get(*index).is_some_and(|path| path.closed))
+            .collect();
+        if vector.fill.is_some() && !closed_indices.is_empty() {
+            #[cfg(feature = "appearance-mask-eraser")]
+            if let Some(appearance) = project.asset_appearances.get(&asset_id) {
+                let Some(tester) = crate::appearance::prepare_visible_material_hit_tester(
+                    vector,
+                    Some(appearance),
+                ) else {
+                    continue;
+                };
+                if tester.contains(point, 2.0) {
+                    let all_closed_selected = vector
+                        .paths
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, path)| path.closed)
+                        .all(|(index, _)| closed_indices.contains(&index));
+                    if all_closed_selected {
+                        return true;
+                    }
+                    let subset = VectorAsset {
+                        asset_id: vector.asset_id,
+                        paths: closed_indices
+                            .iter()
+                            .filter_map(|index| vector.paths.get(*index).cloned())
+                            .collect(),
+                        fill: vector.fill,
+                        stroke: None,
+                    };
+                    let subset_surface = vector_fill_geometry(&subset);
+                    if let Some(inverse_field) = appearance.field_transform.inverse() {
+                        let canonical_subset =
+                            crate::appearance::transform_surface(&subset_surface, inverse_field);
+                        if crate::appearance::material_support_contains_point(
+                            &canonical_subset,
+                            appearance.material,
+                            tester.canonical_point(point),
+                            2.0,
+                        ) {
+                            return true;
+                        }
+                    }
+                }
+                // Appearance owns the visible body. Never fall through to the
+                // hidden source vector for cursor/drag hit-testing.
+                continue;
+            }
+
+            let subset = VectorAsset {
+                asset_id: vector.asset_id,
+                paths: closed_indices
+                    .iter()
+                    .filter_map(|index| vector.paths.get(*index).cloned())
+                    .collect(),
+                fill: vector.fill,
+                stroke: None,
+            };
+            let surface = vector_fill_geometry(&subset);
+            let geo_point = Point::new(f64::from(point.x), f64::from(point.y));
+            if surface.contains(&geo_point)
+                || surface
+                    .0
+                    .iter()
+                    .any(|polygon| polygon_boundary_near_cursor(polygon, point, 2.0))
+            {
+                return true;
+            }
+        }
+
+        for path_idx in path_indices {
+            let Some(path) = vector.paths.get(path_idx) else {
+                continue;
+            };
+            if path.closed && vector.fill.is_some() {
+                continue;
+            }
+            let points = flatten_path(path);
+            let radius = vector
+                .stroke
+                .as_ref()
+                .map(|stroke| stroke.width.max(1.0) * 0.5 + 3.0)
+                .unwrap_or(3.0);
+            if points.len() >= 2 && nearest_segment_distance(&points, point) <= radius {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn raw_area_selection_contains_point(
     project: &ProjectV2,
-    refs: &[PathRef],
-    q0rg_id: u16,
-    frame: u16,
+    placements: &[PlacementRef],
+    bounds_min: Vec2,
+    bounds_max: Vec2,
     point: Vec2,
 ) -> bool {
-    match hit_test_raw_selection(project, q0rg_id, frame, point) {
-        Some(RawSelectionHit::Fill(hit_refs)) => hit_refs.iter().any(|hit| refs.contains(hit)),
-        Some(RawSelectionHit::Path(hit)) => refs.contains(&hit),
-        None => false,
+    if point.x < bounds_min.x
+        || point.x > bounds_max.x
+        || point.y < bounds_min.y
+        || point.y > bounds_max.y
+    {
+        return false;
+    }
+    placements.iter().any(|reference| {
+        let Some(placement) = project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == reference.q0rg_id)
+            .and_then(|q0rg| {
+                q0rg.layers
+                    .iter()
+                    .find(|layer| layer.layer_id == reference.layer_id)
+            })
+            .and_then(|layer| layer.placements.get(reference.placement_idx))
+        else {
+            return false;
+        };
+        let Target::Asset(asset_id) = placement.target else {
+            return false;
+        };
+        let Some(Asset::Vector(vector)) =
+            project.assets.iter().find(|asset| asset.id() == asset_id)
+        else {
+            return false;
+        };
+        #[cfg(feature = "appearance-mask-eraser")]
+        if let Some(appearance) = project.asset_appearances.get(&asset_id) {
+            return crate::appearance::visible_material_contains_point(
+                vector,
+                Some(appearance),
+                point,
+                2.0,
+            );
+        }
+        let surface = vector_fill_geometry(vector);
+        let geo_point = Point::new(f64::from(point.x), f64::from(point.y));
+        surface.contains(&geo_point)
+            || surface
+                .0
+                .iter()
+                .any(|polygon| polygon_boundary_near_cursor(polygon, point, 2.0))
+    })
+}
+
+fn selected_raw_body_contains_point(app: &EditorApp, point: Vec2) -> bool {
+    match &app.session.selection {
+        Selection::Path {
+            q0rg_id,
+            layer_id,
+            placement_idx,
+            path_idx,
+        } => point_hits_selected_raw_paths(
+            &app.state.project,
+            &[PathRef {
+                q0rg_id: *q0rg_id,
+                layer_id: *layer_id,
+                placement_idx: *placement_idx,
+                path_idx: *path_idx,
+            }],
+            point,
+        ),
+        Selection::Paths(refs) => point_hits_selected_raw_paths(&app.state.project, refs, point),
+        Selection::RawArea {
+            placements,
+            bounds_min,
+            bounds_max,
+            ..
+        } => raw_area_selection_contains_point(
+            &app.state.project,
+            placements,
+            *bounds_min,
+            *bounds_max,
+            point,
+        ),
+        Selection::Mixed { paths, .. } => {
+            point_hits_selected_raw_paths(&app.state.project, paths, point)
+        }
+        _ => false,
     }
 }
 
@@ -8731,6 +8940,112 @@ mod tests {
             hit_test_raw_selection(&project, 1, 0, Vec2::new(10.0, 10.0)),
             None,
             "pixels removed by the appearance mask must not remain selectable"
+        );
+        let selected = vec![PathRef {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: 0,
+            path_idx: 0,
+        }];
+        assert!(
+            !point_hits_selected_raw_paths(&project, &selected, Vec2::new(10.0, 10.0)),
+            "selected-body drag hit must not resurrect an erased appearance hole"
+        );
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn selected_glow_body_hit_is_not_stolen_by_topmost_other_raw_graphics() {
+        let mut project = appearance_selection_project(false);
+        let top = VPath {
+            anchors: vec![
+                anchor(Vec2::new(-8.0, 6.0)),
+                anchor(Vec2::new(-2.0, 6.0)),
+                anchor(Vec2::new(-2.0, 14.0)),
+                anchor(Vec2::new(-8.0, 14.0)),
+            ],
+            closed: true,
+        };
+        project.assets.push(Asset::Vector(VectorAsset {
+            asset_id: 2,
+            paths: vec![top],
+            fill: Some(Rgba {
+                r: 20,
+                g: 20,
+                b: 20,
+                a: 255,
+            }),
+            stroke: None,
+        }));
+        project.q0rgs[0].layers[0].placements.push(Placement {
+            frame: 0,
+            target: Target::Asset(2),
+            transform: Transform2D::IDENTITY,
+            tween: Tween::None,
+        });
+        let point = Vec2::new(-5.0, 10.0);
+        let Some(RawSelectionHit::Fill(global_hit)) = hit_test_raw_selection(&project, 1, 0, point)
+        else {
+            panic!("overlapping raw graphics must produce a global hit");
+        };
+        assert_eq!(
+            global_hit[0].placement_idx, 1,
+            "top raw fill owns global hit"
+        );
+
+        let selected = vec![PathRef {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: 0,
+            path_idx: 0,
+        }];
+        assert!(
+            point_hits_selected_raw_paths(&project, &selected, point),
+            "an already-selected glow must keep its own body hit even when another raw fill is topmost"
+        );
+
+        let mut app = EditorApp::default();
+        app.state.project = project;
+        app.session.current_q0rg_id = 1;
+        app.session.current_frame = 0;
+        app.session.selection = Selection::Paths(selected);
+        assert!(
+            selected_raw_body_contains_point(&app, point),
+            "cursor and drag-start must share the selected-glow body hit"
+        );
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn raw_area_body_hit_uses_visible_selected_pixels_not_only_its_bbox() {
+        let project = appearance_selection_project(true);
+        let selection = select_raw_area_by_rect(&project, 1, 0, (-8.0, -8.0, 28.0, 28.0))
+            .expect("visible glow marquee");
+        let Selection::RawArea {
+            placements,
+            bounds_min,
+            bounds_max,
+            ..
+        } = selection
+        else {
+            panic!("expected raw area");
+        };
+        assert!(raw_area_selection_contains_point(
+            &project,
+            &placements,
+            bounds_min,
+            bounds_max,
+            Vec2::new(-5.0, 10.0),
+        ));
+        assert!(
+            !raw_area_selection_contains_point(
+                &project,
+                &placements,
+                bounds_min,
+                bounds_max,
+                Vec2::new(10.0, 10.0),
+            ),
+            "an erased hole inside the marquee bbox must not start a drag"
         );
     }
 
