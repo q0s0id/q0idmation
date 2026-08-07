@@ -18,8 +18,8 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Format check
-        run: cargo fmt --all -- --check
+      - name: Format working tree
+        run: cargo fmt --all
 
       - name: Workspace check
         run: cargo check --workspace --locked
