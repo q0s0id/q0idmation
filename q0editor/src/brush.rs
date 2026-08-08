@@ -228,6 +228,24 @@ pub fn brush_prerender_dabs(stroke: &BrushStroke) -> Vec<(Vec2, f32)> {
         .collect()
 }
 
+/// One raw pre-render dab without scanning the complete gesture. Used by the
+/// incremental texture preview so adding a new pointer sample stays O(1).
+pub fn brush_prerender_dab_at(stroke: &BrushStroke, index: usize) -> Option<(Vec2, f32)> {
+    let sample = stroke.samples.get(index)?;
+    let settings = BrushSettings {
+        size: stroke.size,
+        pressure_size: stroke.pressure_size,
+        velocity_size: stroke.velocity_size,
+        dynamics_sensitivity: stroke.dynamics_sensitivity,
+        dynamics_min_size: stroke.dynamics_min_size,
+        ..BrushSettings::default()
+    };
+    Some((
+        sample.position,
+        dynamic_sample_size(&stroke.samples, index, settings),
+    ))
+}
+
 /// Current dynamic nib diameter in stage units. This intentionally evaluates
 /// only the latest raw sample, so cursor feedback stays O(1) even on a very
 /// long gesture and cannot reintroduce progressive preview lag.

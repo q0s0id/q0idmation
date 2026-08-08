@@ -834,6 +834,12 @@ fn pointer_pressure_at(ctx: &Context, screen: Pos2) -> Option<f32> {
 
 fn classic_brush(app: &mut EditorApp, response: &Response, view: &StageView, ctx: &Context) {
     let settings = brush_settings_for_view(app, view.scale);
+    let preview_color = Color32::from_rgba_unmultiplied(
+        app.session.brush.color.r,
+        app.session.brush.color.g,
+        app.session.brush.color.b,
+        app.session.brush.color.a,
+    );
 
     if response.drag_started_by(PointerButton::Primary) {
         if let Some(screen) = response.interact_pointer_pos() {
@@ -845,6 +851,18 @@ fn classic_brush(app: &mut EditorApp, response: &Response, view: &StageView, ctx
             app.session.tool_state = ToolState::BrushDrawing {
                 stroke: crate::brush::brush_begin(settings, sample),
             };
+            app.textures.begin_classic_brush_preview(ctx, response.rect);
+            if let ToolState::BrushDrawing { stroke } = &app.session.tool_state {
+                if let Some((position, size)) = crate::brush::brush_prerender_dab_at(stroke, 0) {
+                    let contour = classic_prerender_nib_outline(
+                        settings.nib,
+                        stage_to_screen(position, view),
+                        size * view.scale,
+                    );
+                    app.textures
+                        .raster_classic_brush_preview(&[contour], preview_color);
+                }
+            }
             app.session.status = "Brush: drawing".to_string();
         }
     }
@@ -854,14 +872,44 @@ fn classic_brush(app: &mut EditorApp, response: &Response, view: &StageView, ctx
         || response.drag_stopped_by(PointerButton::Primary)
     {
         let samples = classic_input_samples(ctx, response, view);
+        let mut new_contours = Vec::new();
         if let ToolState::BrushDrawing { stroke } = &mut app.session.tool_state {
+            let old_len = stroke.samples.len();
             for sample in samples {
                 crate::brush::brush_add_sample(stroke, settings, sample);
             }
+            let new_len = stroke.samples.len();
+            if new_len > old_len {
+                for index in old_len.max(1)..new_len {
+                    let Some((start_position, start_size)) =
+                        crate::brush::brush_prerender_dab_at(stroke, index - 1)
+                    else {
+                        continue;
+                    };
+                    let Some((end_position, end_size)) =
+                        crate::brush::brush_prerender_dab_at(stroke, index)
+                    else {
+                        continue;
+                    };
+                    new_contours.push(classic_prerender_segment_contour(
+                        settings.nib,
+                        (
+                            stage_to_screen(start_position, view),
+                            start_size * view.scale,
+                        ),
+                        (stage_to_screen(end_position, view), end_size * view.scale),
+                    ));
+                }
+            }
+        }
+        if !new_contours.is_empty() {
+            app.textures
+                .raster_classic_brush_preview(&new_contours, preview_color);
         }
     }
 
     if response.drag_stopped_by(PointerButton::Primary) {
+        app.textures.clear_classic_brush_preview();
         if let ToolState::BrushDrawing { stroke } =
             std::mem::replace(&mut app.session.tool_state, ToolState::Idle)
         {
@@ -7321,14 +7369,8 @@ fn draw_in_progress_overlay(app: &EditorApp, painter: &Painter, view: &StageView
                 }));
             }
         }
-        ToolState::BrushDrawing { stroke } => {
-            let color = Color32::from_rgba_unmultiplied(
-                app.session.brush.color.r,
-                app.session.brush.color.g,
-                app.session.brush.color.b,
-                app.session.brush.color.a,
-            );
-            paint_classic_nib_preview(painter, stroke, view, color, None);
+        ToolState::BrushDrawing { .. } => {
+            app.textures.paint_classic_brush_preview(painter);
         }
         ToolState::AdvancedBrushDrawing { stroke } => {
             paint_advanced_gpu_preview(painter, stroke, view);

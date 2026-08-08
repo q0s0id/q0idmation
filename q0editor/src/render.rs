@@ -34,6 +34,36 @@ pub struct StageView {
     pub stage_rect: Rect,
 }
 
+struct ClassicBrushPreviewTexture {
+    texture: TextureHandle,
+    pixels: Vec<Color32>,
+    size: [usize; 2],
+    screen_rect: Rect,
+    pixels_per_point: f32,
+}
+
+fn preview_polygon_contains(point: Pos2, polygon: &[Pos2]) -> bool {
+    if polygon.len() < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut previous = polygon[polygon.len() - 1];
+    for &current in polygon {
+        let crosses = (current.y > point.y) != (previous.y > point.y);
+        if crosses {
+            let dy = previous.y - current.y;
+            if dy.abs() > 1.0e-8 {
+                let x = current.x + (point.y - current.y) * (previous.x - current.x) / dy;
+                if point.x < x {
+                    inside = !inside;
+                }
+            }
+        }
+        previous = current;
+    }
+    inside
+}
+
 #[cfg(feature = "appearance-mask-eraser")]
 #[derive(Clone)]
 struct CachedAppearanceTexture {
@@ -208,6 +238,11 @@ pub struct TextureCache {
     by_asset_id: HashMap<u16, TextureHandle>,
     by_q0v_frame: HashMap<(u16, u32), TextureHandle>,
     q0v_media: HashMap<u16, q0video::q0v::Q0vFile>,
+    classic_brush_preview: Option<ClassicBrushPreviewTexture>,
+    #[cfg(test)]
+    classic_preview_candidate_pixels: usize,
+    #[cfg(test)]
+    classic_preview_uploaded_pixels: usize,
     #[cfg(feature = "appearance-mask-eraser")]
     appearance_by_asset: HashMap<(u16, u16, u64), CachedAppearanceTexture>,
     #[cfg(feature = "appearance-mask-eraser")]
@@ -245,10 +280,150 @@ pub struct TextureCache {
 }
 
 impl TextureCache {
+    pub fn begin_classic_brush_preview(&mut self, ctx: &Context, screen_rect: Rect) {
+        let pixels_per_point = ctx.pixels_per_point().clamp(1.0, 2.0);
+        let width = (screen_rect.width().max(1.0) * pixels_per_point)
+            .ceil()
+            .max(1.0) as usize;
+        let height = (screen_rect.height().max(1.0) * pixels_per_point)
+            .ceil()
+            .max(1.0) as usize;
+        let size = [width, height];
+        let image = ColorImage::new(size, Color32::TRANSPARENT);
+        let texture = ctx.load_texture("classic_brush_prerender", image, TextureOptions::LINEAR);
+        self.classic_brush_preview = Some(ClassicBrushPreviewTexture {
+            texture,
+            pixels: vec![Color32::TRANSPARENT; width * height],
+            size,
+            screen_rect,
+            pixels_per_point,
+        });
+    }
+
+    pub fn clear_classic_brush_preview(&mut self) {
+        self.classic_brush_preview = None;
+    }
+
+    pub fn raster_classic_brush_preview(&mut self, polygons: &[Vec<Pos2>], color: Color32) {
+        let Some(preview) = self.classic_brush_preview.as_mut() else {
+            return;
+        };
+        let width = preview.size[0] as isize;
+        let height = preview.size[1] as isize;
+        let ppp = preview.pixels_per_point;
+        let mut dirty: Option<(usize, usize, usize, usize)> = None;
+
+        for polygon in polygons.iter().filter(|polygon| polygon.len() >= 3) {
+            let min_x_screen = polygon.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+            let min_y_screen = polygon.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+            let max_x_screen = polygon
+                .iter()
+                .map(|p| p.x)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let max_y_screen = polygon
+                .iter()
+                .map(|p| p.y)
+                .fold(f32::NEG_INFINITY, f32::max);
+            if !min_x_screen.is_finite()
+                || !min_y_screen.is_finite()
+                || !max_x_screen.is_finite()
+                || !max_y_screen.is_finite()
+            {
+                continue;
+            }
+
+            let min_x = (((min_x_screen - preview.screen_rect.min.x) * ppp).floor() as isize - 1)
+                .clamp(0, width.saturating_sub(1));
+            let min_y = (((min_y_screen - preview.screen_rect.min.y) * ppp).floor() as isize - 1)
+                .clamp(0, height.saturating_sub(1));
+            let max_x = (((max_x_screen - preview.screen_rect.min.x) * ppp).ceil() as isize + 1)
+                .clamp(0, width.saturating_sub(1));
+            let max_y = (((max_y_screen - preview.screen_rect.min.y) * ppp).ceil() as isize + 1)
+                .clamp(0, height.saturating_sub(1));
+            if min_x > max_x || min_y > max_y {
+                continue;
+            }
+
+            #[cfg(test)]
+            {
+                self.classic_preview_candidate_pixels +=
+                    (max_x - min_x + 1) as usize * (max_y - min_y + 1) as usize;
+            }
+            for y in min_y..=max_y {
+                let screen_y = preview.screen_rect.min.y + (y as f32 + 0.5) / ppp;
+                let row = y as usize * preview.size[0];
+                for x in min_x..=max_x {
+                    let screen_x = preview.screen_rect.min.x + (x as f32 + 0.5) / ppp;
+                    if preview_polygon_contains(pos2(screen_x, screen_y), polygon) {
+                        preview.pixels[row + x as usize] = color;
+                    }
+                }
+            }
+
+            let bounds = (
+                min_x as usize,
+                min_y as usize,
+                max_x as usize,
+                max_y as usize,
+            );
+            dirty = Some(match dirty {
+                None => bounds,
+                Some((x0, y0, x1, y1)) => (
+                    x0.min(bounds.0),
+                    y0.min(bounds.1),
+                    x1.max(bounds.2),
+                    y1.max(bounds.3),
+                ),
+            });
+        }
+
+        let Some((x0, y0, x1, y1)) = dirty else {
+            return;
+        };
+        let sub_width = x1 - x0 + 1;
+        let sub_height = y1 - y0 + 1;
+        let mut sub_pixels = Vec::with_capacity(sub_width * sub_height);
+        for y in y0..=y1 {
+            let row = y * preview.size[0];
+            sub_pixels.extend_from_slice(&preview.pixels[row + x0..=row + x1]);
+        }
+        #[cfg(test)]
+        {
+            self.classic_preview_uploaded_pixels += sub_width * sub_height;
+        }
+        preview.texture.set_partial(
+            [x0, y0],
+            ColorImage {
+                size: [sub_width, sub_height],
+                pixels: sub_pixels,
+            },
+            TextureOptions::LINEAR,
+        );
+    }
+
+    pub fn paint_classic_brush_preview(&self, painter: &Painter) -> bool {
+        let Some(preview) = self.classic_brush_preview.as_ref() else {
+            return false;
+        };
+        painter.image(
+            preview.texture.id(),
+            preview.screen_rect,
+            Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+        true
+    }
+
     pub fn invalidate(&mut self) {
         self.by_asset_id.clear();
         self.by_q0v_frame.clear();
         self.q0v_media.clear();
+        self.classic_brush_preview = None;
+        #[cfg(test)]
+        {
+            self.classic_preview_candidate_pixels = 0;
+            self.classic_preview_uploaded_pixels = 0;
+        }
         #[cfg(feature = "appearance-mask-eraser")]
         {
             self.appearance_by_asset.clear();
@@ -2577,6 +2752,57 @@ fn rgba_to_color32(c: Rgba) -> Color32 {
 mod tests {
     use super::*;
     use q0s_format::v2::{Anchor, Layer, Path as VPath};
+
+    #[test]
+    fn classic_brush_texture_updates_only_new_dirty_tail() {
+        let ctx = Context::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let mut cache = TextureCache::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ctx| {
+                cache.begin_classic_brush_preview(ctx, rect);
+                let started = std::time::Instant::now();
+                for index in 0..600 {
+                    let x = 20.0 + (index % 120) as f32 * 6.0;
+                    let y = 20.0 + ((index / 120) % 4) as f32 * 40.0;
+                    cache.raster_classic_brush_preview(
+                        &[vec![
+                            pos2(x - 5.0, y - 5.0),
+                            pos2(x + 5.0, y - 5.0),
+                            pos2(x + 5.0, y + 5.0),
+                            pos2(x - 5.0, y + 5.0),
+                        ]],
+                        Color32::from_rgba_unmultiplied(20, 30, 40, 128),
+                    );
+                }
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(2),
+                    "incremental classic preview regressed into whole-stroke work: {:?}",
+                    started.elapsed()
+                );
+                let full_canvas_pixels = 800 * 600;
+                assert!(
+                    cache.classic_preview_uploaded_pixels < full_canvas_pixels * 2,
+                    "partial updates rewrote the whole canvas repeatedly: {} uploaded pixels",
+                    cache.classic_preview_uploaded_pixels
+                );
+                assert!(
+                    cache.classic_preview_candidate_pixels < full_canvas_pixels * 2,
+                    "raster work grew with stroke history: {} candidate pixels",
+                    cache.classic_preview_candidate_pixels
+                );
+                let painter = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Middle,
+                    egui::Id::new("classic-preview-regression"),
+                ));
+                assert!(cache.paint_classic_brush_preview(&painter));
+            },
+        );
+    }
 
     fn test_placement(frame: u16, asset_id: u16, tx: f32, tween: Tween) -> Placement {
         Placement {
