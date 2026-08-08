@@ -574,6 +574,26 @@ impl Default for Viewport {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BrushLibraryFilter {
+    #[default]
+    All,
+    Builtin,
+    Created,
+}
+
+impl BrushLibraryFilter {
+    pub const ALL: [Self; 3] = [Self::All, Self::Builtin, Self::Created];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Builtin => "Builtin",
+            Self::Created => "Created",
+        }
+    }
+}
+
 pub struct Session {
     pub current_q0rg_id: u16,
     pub current_layer_id: u16,
@@ -611,6 +631,8 @@ pub struct Session {
     /// Original custom preset name being edited, so rename/update/delete act on
     /// one library entry instead of accidentally duplicating it.
     pub advanced_brush_selected_preset: Option<String>,
+    /// Transient source filter for the unified Advanced brush library.
+    pub advanced_brush_library_filter: BrushLibraryFilter,
     /// Independent classic eraser size while brush/eraser sync is disabled.
     pub eraser_size: f32,
     /// Cap shape applied to brush strokes when committing them, and to
@@ -689,6 +711,7 @@ impl Session {
             advanced_brush: AdvancedBrushSettings::default(),
             advanced_brush_preset_name: "My Brush".to_string(),
             advanced_brush_selected_preset: None,
+            advanced_brush_library_filter: BrushLibraryFilter::All,
             eraser_size: 18.0,
             brush_cap: CapShape::Round,
             show_credits: false,

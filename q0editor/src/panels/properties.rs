@@ -2,7 +2,7 @@ use egui::{Color32, ScrollArea, Ui};
 use q0s_format::v2::{Asset, Rgba, Stroke as VStroke};
 
 use crate::app::{Action, EditorApp};
-use crate::state::{Selection, Tool};
+use crate::state::{BrushLibraryFilter, Selection, Tool};
 
 pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     ui.heading("Properties");
@@ -299,6 +299,223 @@ fn tool_hint(app: &EditorApp, ui: &mut Ui, text: &str) {
     );
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrushLibrarySource {
+    Builtin,
+    Created,
+}
+
+impl BrushLibrarySource {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::Created => "created",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BrushLibraryEntry {
+    name: String,
+    settings: crate::advanced_brush::AdvancedBrushSettings,
+    source: BrushLibrarySource,
+}
+
+fn advanced_brush_library_entries(
+    custom: &[crate::settings::AdvancedBrushPreset],
+) -> Vec<BrushLibraryEntry> {
+    crate::advanced_brush::builtin_presets()
+        .into_iter()
+        .map(|(name, settings)| BrushLibraryEntry {
+            name: name.to_string(),
+            settings,
+            source: BrushLibrarySource::Builtin,
+        })
+        .chain(custom.iter().map(|preset| BrushLibraryEntry {
+            name: preset.name.clone(),
+            settings: preset.settings.to_runtime(),
+            source: BrushLibrarySource::Created,
+        }))
+        .collect()
+}
+
+fn brush_library_entry_visible(filter: BrushLibraryFilter, source: BrushLibrarySource) -> bool {
+    match filter {
+        BrushLibraryFilter::All => true,
+        BrushLibraryFilter::Builtin => source == BrushLibrarySource::Builtin,
+        BrushLibraryFilter::Created => source == BrushLibrarySource::Created,
+    }
+}
+
+fn render_advanced_brush_library(app: &mut EditorApp, ui: &mut Ui) {
+    ui.separator();
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new("Brush library").strong());
+        for filter in BrushLibraryFilter::ALL {
+            ui.selectable_value(
+                &mut app.session.advanced_brush_library_filter,
+                filter,
+                filter.label(),
+            );
+        }
+    });
+
+    let entries = advanced_brush_library_entries(&app.settings.advanced_brush_presets);
+    let filter = app.session.advanced_brush_library_filter;
+    let mut visible = 0usize;
+    for entry in entries
+        .iter()
+        .filter(|entry| brush_library_entry_visible(filter, entry.source))
+    {
+        visible += 1;
+        let selected = match entry.source {
+            BrushLibrarySource::Builtin => {
+                app.session.advanced_brush_selected_preset.is_none()
+                    && app.session.advanced_brush_preset_name == entry.name
+            }
+            BrushLibrarySource::Created => app
+                .session
+                .advanced_brush_selected_preset
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(&entry.name)),
+        };
+
+        if advanced_brush_library_card(ui, entry, selected) {
+            app.session.advanced_brush = entry.settings;
+            app.session.advanced_brush_preset_name = entry.name.clone();
+            app.session.advanced_brush_selected_preset = match entry.source {
+                BrushLibrarySource::Builtin => None,
+                BrushLibrarySource::Created => Some(entry.name.clone()),
+            };
+        }
+    }
+
+    if visible == 0 {
+        ui.label(
+            egui::RichText::new("No created brushes yet")
+                .small()
+                .color(app.settings.theme.text_dim.to_color32()),
+        );
+    }
+    ui.add_space(4.0);
+}
+
+fn advanced_brush_library_card(ui: &mut Ui, entry: &BrushLibraryEntry, selected: bool) -> bool {
+    let width = ui.available_width().max(120.0);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 54.0), egui::Sense::click());
+    let visuals = ui.visuals();
+    let widget = if selected {
+        &visuals.widgets.active
+    } else if response.hovered() {
+        &visuals.widgets.hovered
+    } else {
+        &visuals.widgets.inactive
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, 6.0, widget.bg_fill);
+    painter.rect_stroke(rect, 6.0, widget.bg_stroke);
+
+    painter.text(
+        rect.left_top() + egui::vec2(8.0, 6.0),
+        egui::Align2::LEFT_TOP,
+        &entry.name,
+        egui::FontId::proportional(12.5),
+        visuals.text_color(),
+    );
+    painter.text(
+        rect.right_top() + egui::vec2(-8.0, 7.0),
+        egui::Align2::RIGHT_TOP,
+        entry.source.label(),
+        egui::FontId::proportional(9.5),
+        visuals.weak_text_color(),
+    );
+
+    let preview_rect = egui::Rect::from_min_max(
+        rect.left_top() + egui::vec2(8.0, 25.0),
+        rect.right_bottom() - egui::vec2(8.0, 6.0),
+    );
+    paint_advanced_brush_preview(ui, preview_rect, entry.settings);
+    response.clicked()
+}
+
+fn paint_advanced_brush_preview(
+    ui: &Ui,
+    rect: egui::Rect,
+    settings: crate::advanced_brush::AdvancedBrushSettings,
+) {
+    if rect.width() <= 1.0 || rect.height() <= 1.0 {
+        return;
+    }
+
+    let mut preview_settings = settings;
+    preview_settings.size = (4.5 + settings.size.sqrt()).clamp(5.0, 12.0);
+    let mut time = 0.0f64;
+    let sample_count = 34usize;
+    let samples = (0..sample_count)
+        .map(|index| {
+            let t = index as f32 / (sample_count - 1) as f32;
+            let x = egui::lerp(rect.left()..=rect.right(), t);
+            let wave = (t * std::f32::consts::TAU * 1.15).sin() * rect.height() * 0.10;
+            let wobble = (t * std::f32::consts::TAU * 6.0).sin() * rect.height() * 0.035;
+            let y = rect.center().y + wave + wobble;
+            if index > 0 {
+                time += if t < 0.58 { 0.032 } else { 0.008 };
+            }
+            let pressure = 0.28 + 0.72 * (std::f32::consts::PI * t).sin().sqrt();
+            crate::advanced_brush::AdvancedBrushSample {
+                position: q0s_format::v2::Vec2::new(x, y),
+                pressure: Some(pressure),
+                time_seconds: time,
+            }
+        })
+        .collect::<Vec<_>>();
+    let stroke = crate::advanced_brush::AdvancedBrushStroke {
+        samples,
+        settings: preview_settings,
+    };
+    let dabs = crate::advanced_brush::advanced_dabs(&stroke);
+    let base = ui.visuals().strong_text_color();
+    let alpha = settings.color.a.max(96);
+    let ink = Color32::from_rgba_premultiplied(base.r(), base.g(), base.b(), alpha);
+
+    if settings.glow {
+        let halo = Color32::from_rgba_premultiplied(base.r(), base.g(), base.b(), 34);
+        let halo_scale = (1.4 + settings.glow_radius / settings.size.max(1.0) * 0.22).min(3.0);
+        for dab in &dabs {
+            paint_preview_dab(ui.painter(), *dab, halo, halo_scale);
+        }
+    }
+    for dab in dabs {
+        paint_preview_dab(ui.painter(), dab, ink, 1.0);
+    }
+}
+
+fn paint_preview_dab(
+    painter: &egui::Painter,
+    dab: crate::advanced_brush::AdvancedDab,
+    fill: Color32,
+    scale: f32,
+) {
+    let cos_a = dab.angle_radians.cos();
+    let sin_a = dab.angle_radians.sin();
+    let points = (0..12)
+        .map(|index| {
+            let phase = std::f32::consts::TAU * index as f32 / 12.0;
+            let local_x = phase.cos() * dab.major_radius * scale;
+            let local_y = phase.sin() * dab.minor_radius * scale;
+            egui::pos2(
+                dab.center.x + local_x * cos_a - local_y * sin_a,
+                dab.center.y + local_x * sin_a + local_y * cos_a,
+            )
+        })
+        .collect();
+    painter.add(egui::Shape::convex_polygon(
+        points,
+        fill,
+        egui::Stroke::NONE,
+    ));
+}
+
 fn brush_properties(app: &mut EditorApp, ui: &mut Ui) {
     let mode_before = app.session.brush_mode;
     let classic_before = app.session.brush;
@@ -377,35 +594,7 @@ fn brush_properties(app: &mut EditorApp, ui: &mut Ui) {
                     .color(app.settings.theme.text_dim.to_color32()),
             );
 
-            egui::ComboBox::from_id_source("advanced_builtin_presets")
-                .selected_text("Built-in brushes…")
-                .show_ui(ui, |ui| {
-                    for (name, preset) in crate::advanced_brush::builtin_presets() {
-                        if ui.button(name).clicked() {
-                            app.session.advanced_brush = preset;
-                            app.session.advanced_brush_preset_name = name.to_string();
-                            app.session.advanced_brush_selected_preset = None;
-                            ui.close_menu();
-                        }
-                    }
-                });
-
-            let custom_presets = app.settings.advanced_brush_presets.clone();
-            if !custom_presets.is_empty() {
-                egui::ComboBox::from_id_source("advanced_custom_presets")
-                    .selected_text("My brushes…")
-                    .show_ui(ui, |ui| {
-                        for preset in &custom_presets {
-                            if ui.button(&preset.name).clicked() {
-                                app.session.advanced_brush = preset.settings.to_runtime();
-                                app.session.advanced_brush_preset_name = preset.name.clone();
-                                app.session.advanced_brush_selected_preset =
-                                    Some(preset.name.clone());
-                                ui.close_menu();
-                            }
-                        }
-                    });
-            }
+            render_advanced_brush_library(app, ui);
 
             egui::Grid::new("advanced_brush_settings")
                 .num_columns(2)
@@ -530,7 +719,7 @@ fn brush_properties(app: &mut EditorApp, ui: &mut Ui) {
                 });
 
             ui.separator();
-            ui.label("Brush library");
+            ui.label("Save current brush");
             ui.horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut app.session.advanced_brush_preset_name)
@@ -1204,6 +1393,51 @@ fn apply_placement_transform_at_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn brush_library_unifies_builtin_and_created_entries_with_source_filters() {
+        let custom = vec![crate::settings::AdvancedBrushPreset {
+            name: "My Needle".to_string(),
+            settings: crate::settings::AdvancedBrushPreferences::from_runtime(
+                crate::advanced_brush::AdvancedBrushSettings {
+                    size: 7.0,
+                    roundness: 0.2,
+                    ..Default::default()
+                },
+            ),
+        }];
+        let entries = advanced_brush_library_entries(&custom);
+        let builtin_count = crate::advanced_brush::builtin_presets().len();
+
+        assert_eq!(entries.len(), builtin_count + 1);
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| brush_library_entry_visible(
+                    BrushLibraryFilter::Builtin,
+                    entry.source
+                ))
+                .count(),
+            builtin_count
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| brush_library_entry_visible(
+                    BrushLibraryFilter::Created,
+                    entry.source
+                ))
+                .count(),
+            1
+        );
+        let created = entries
+            .iter()
+            .find(|entry| entry.source == BrushLibrarySource::Created)
+            .expect("created brush must be present in the unified library");
+        assert_eq!(created.name, "My Needle");
+        assert_eq!(created.settings.size, 7.0);
+        assert_eq!(created.settings.roundness, 0.2);
+    }
 
     #[test]
     fn properties_transform_on_held_object_creates_current_keyframe() {
