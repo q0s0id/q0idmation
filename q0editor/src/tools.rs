@@ -2387,12 +2387,7 @@ fn draw_brush_cursor(app: &EditorApp, painter: &Painter, view: &StageView) {
                     )
                 })
                 .collect();
-            painter.add(Shape::Path(PathShape {
-                points,
-                closed: true,
-                fill: Color32::TRANSPARENT,
-                stroke: Stroke::new(1.0_f32, Color32::from_white_alpha(210)),
-            }));
+            draw_nib_cursor_points(painter, points);
         }
     }
 }
@@ -2431,18 +2426,28 @@ fn draw_nib_cursor_outline(
     if points.len() < 3 {
         return;
     }
-    painter.add(Shape::Path(PathShape {
-        points: points.clone(),
-        closed: true,
-        fill: Color32::TRANSPARENT,
-        stroke: Stroke::new(2.5_f32, Color32::from_black_alpha(210)),
-    }));
-    painter.add(Shape::Path(PathShape {
-        points,
-        closed: true,
-        fill: Color32::TRANSPARENT,
-        stroke: Stroke::new(1.0_f32, Color32::WHITE),
-    }));
+    draw_nib_cursor_points(painter, points);
+}
+
+fn nib_cursor_strokes() -> [Stroke; 2] {
+    [
+        Stroke::new(2.5_f32, Color32::from_black_alpha(210)),
+        Stroke::new(1.0_f32, Color32::WHITE),
+    ]
+}
+
+fn draw_nib_cursor_points(painter: &Painter, points: Vec<Pos2>) {
+    if points.len() < 3 {
+        return;
+    }
+    for stroke in nib_cursor_strokes() {
+        painter.add(Shape::Path(PathShape {
+            points: points.clone(),
+            closed: true,
+            fill: Color32::TRANSPARENT,
+            stroke,
+        }));
+    }
 }
 fn active_custom_transform_cursor(
     app: &EditorApp,
@@ -8501,6 +8506,15 @@ mod tests {
             found, None,
             "transformed placements are not part of the merge surface"
         );
+    }
+
+    #[test]
+    fn brush_nib_cursor_keeps_dark_outer_outline_for_white_stage_visibility() {
+        let [outer, inner] = nib_cursor_strokes();
+        assert_eq!(outer.width, 2.5);
+        assert_eq!(outer.color, Color32::from_black_alpha(210));
+        assert_eq!(inner.width, 1.0);
+        assert_eq!(inner.color, Color32::WHITE);
     }
 
     #[test]
