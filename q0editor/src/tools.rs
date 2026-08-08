@@ -2463,6 +2463,17 @@ fn draw_brush_cursor(app: &EditorApp, painter: &Painter, view: &StageView) {
         crate::advanced_brush::BrushMode::Classic => {
             let size_px = brush_cursor_radius_px(app.session.brush, view.scale) * 2.0 + 2.5;
             draw_nib_cursor_outline(painter, center, app.session.brush.nib, size_px);
+            if let ToolState::BrushDrawing { stroke } = &app.session.tool_state {
+                if let Some(current_size_px) = classic_dynamic_cursor_size_px(stroke, view.scale) {
+                    draw_nib_cursor_accent_outline(
+                        painter,
+                        center,
+                        app.session.brush.nib,
+                        current_size_px,
+                        selection_color(app),
+                    );
+                }
+            }
         }
         crate::advanced_brush::BrushMode::Advanced => {
             let settings = advanced_brush_settings_for_view(app, view.scale);
@@ -2506,6 +2517,36 @@ fn draw_eraser_cursor(app: &EditorApp, painter: &Painter, view: &StageView) {
         settings.nib,
         settings.size * view.scale + 2.0,
     );
+}
+
+fn classic_dynamic_cursor_size_px(
+    stroke: &crate::brush::BrushStroke,
+    view_scale: f32,
+) -> Option<f32> {
+    crate::brush::brush_size_dynamics_enabled(stroke)
+        .then(|| crate::brush::brush_current_size(stroke) * view_scale + 2.5)
+}
+
+fn draw_nib_cursor_accent_outline(
+    painter: &Painter,
+    center: Pos2,
+    nib: crate::brush::BrushNib,
+    size_px: f32,
+    accent: Color32,
+) {
+    let points: Vec<Pos2> = crate::brush::nib_outline(nib, size_px, Vec2::new(center.x, center.y))
+        .into_iter()
+        .map(|point| pos2(point.x, point.y))
+        .collect();
+    if points.len() < 3 {
+        return;
+    }
+    painter.add(Shape::Path(PathShape {
+        points,
+        closed: true,
+        fill: Color32::TRANSPARENT,
+        stroke: Stroke::new(1.75_f32, accent),
+    }));
 }
 
 fn draw_nib_cursor_outline(
@@ -9473,6 +9514,38 @@ mod tests {
         assert_eq!(outer.color, Color32::from_black_alpha(210));
         assert_eq!(inner.width, 1.0);
         assert_eq!(inner.color, Color32::WHITE);
+    }
+
+    #[test]
+    fn dynamic_brush_cursor_reports_current_size_inside_full_nib() {
+        let mut settings = crate::brush::BrushSettings {
+            size: 20.0,
+            pressure_size: true,
+            dynamics_min_size: 0.2,
+            dynamics_sensitivity: 50,
+            ..Default::default()
+        };
+        let mut stroke = crate::brush::brush_begin(
+            settings,
+            crate::brush::BrushSample::pointer(Vec2::new(0.0, 0.0), Some(0.25), 0.0),
+        );
+        crate::brush::brush_add_sample(
+            &mut stroke,
+            settings,
+            crate::brush::BrushSample::pointer(Vec2::new(5.0, 0.0), Some(0.25), 0.1),
+        );
+        let current = classic_dynamic_cursor_size_px(&stroke, 2.0).unwrap();
+        let expected = crate::brush::brush_preview_dabs(&stroke).last().unwrap().1 * 2.0 + 2.5;
+        let full = brush_cursor_radius_px(settings, 2.0) * 2.0 + 2.5;
+        assert!((current - expected).abs() < 1.0e-5);
+        assert!(current < full, "current={current}, full={full}");
+
+        settings.pressure_size = false;
+        let static_stroke = crate::brush::brush_begin(
+            settings,
+            crate::brush::BrushSample::mouse(Vec2::new(0.0, 0.0)),
+        );
+        assert!(classic_dynamic_cursor_size_px(&static_stroke, 2.0).is_none());
     }
 
     #[test]

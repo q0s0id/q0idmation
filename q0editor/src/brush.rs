@@ -214,6 +214,26 @@ pub fn brush_preview_dabs(stroke: &BrushStroke) -> Vec<(Vec2, f32)> {
     trajectory.into_iter().zip(sizes).collect()
 }
 
+/// Current dynamic nib diameter in stage units. This intentionally evaluates
+/// only the latest raw sample, so cursor feedback stays O(1) even on a very
+/// long gesture and cannot reintroduce progressive preview lag.
+pub fn brush_current_size(stroke: &BrushStroke) -> f32 {
+    let settings = BrushSettings {
+        size: stroke.size,
+        pressure_size: stroke.pressure_size,
+        velocity_size: stroke.velocity_size,
+        dynamics_sensitivity: stroke.dynamics_sensitivity,
+        dynamics_min_size: stroke.dynamics_min_size,
+        ..BrushSettings::default()
+    };
+    stroke
+        .samples
+        .len()
+        .checked_sub(1)
+        .map(|index| dynamic_sample_size(&stroke.samples, index, settings))
+        .unwrap_or_else(|| stroke.size.max(0.1))
+}
+
 /// Materialize the current gesture silhouette for non-circular live previews.
 /// Circle stays on the cheaper renderer path; fixed polygon nibs use this exact
 /// sweep so preview and commit cannot disagree about corners or orientation.
@@ -366,30 +386,33 @@ fn sanitized_dynamic_min_size(value: f32) -> f32 {
     }
 }
 
-fn dynamic_sample_sizes(samples: &[BrushSample], settings: BrushSettings) -> Vec<f32> {
+fn dynamic_sample_size(samples: &[BrushSample], index: usize, settings: BrushSettings) -> f32 {
     let min_ratio = sanitized_dynamic_min_size(settings.dynamics_min_size);
     let sensitivity = f32::from(settings.dynamics_sensitivity.min(100)) / 100.0;
     let pressure_gamma = 2.0_f32.powf((sensitivity - 0.5) * 2.0);
     let velocity_reference = settings.size.max(0.1) * (80.0 - sensitivity * 60.0);
+    let sample = samples.get(index);
+    let mut factor = 1.0_f32;
+    if settings.pressure_size {
+        let pressure = sample
+            .and_then(|sample| sample.pressure)
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
+        let shaped = pressure.powf(pressure_gamma);
+        factor *= min_ratio + (1.0 - min_ratio) * shaped;
+    }
+    if settings.velocity_size && sample.is_some() {
+        let speed = brush_sample_speed(samples, index);
+        let normalized = (speed / velocity_reference.max(1.0)).max(0.0);
+        let speed_factor = min_ratio + (1.0 - min_ratio) / (1.0 + normalized);
+        factor *= speed_factor;
+    }
+    settings.size.max(0.1) * factor.clamp(min_ratio, 1.0)
+}
 
-    samples
-        .iter()
-        .enumerate()
-        .map(|(index, sample)| {
-            let mut factor = 1.0_f32;
-            if settings.pressure_size {
-                let pressure = sample.pressure.unwrap_or(1.0).clamp(0.0, 1.0);
-                let shaped = pressure.powf(pressure_gamma);
-                factor *= min_ratio + (1.0 - min_ratio) * shaped;
-            }
-            if settings.velocity_size {
-                let speed = brush_sample_speed(samples, index);
-                let normalized = (speed / velocity_reference.max(1.0)).max(0.0);
-                let speed_factor = min_ratio + (1.0 - min_ratio) / (1.0 + normalized);
-                factor *= speed_factor;
-            }
-            settings.size.max(0.1) * factor.clamp(min_ratio, 1.0)
-        })
+fn dynamic_sample_sizes(samples: &[BrushSample], settings: BrushSettings) -> Vec<f32> {
+    (0..samples.len())
+        .map(|index| dynamic_sample_size(samples, index, settings))
         .collect()
 }
 
