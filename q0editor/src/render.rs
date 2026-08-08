@@ -10,7 +10,10 @@ use egui::{
 use geo::{Buffer, Coord, LineString};
 use lyon_path::math::point as lyon_point;
 use lyon_tessellation::geometry_builder::{BuffersBuilder, Positions, VertexBuffers};
-use lyon_tessellation::{FillOptions, FillRule as LyonFillRule, FillTessellator};
+use lyon_tessellation::{
+    FillOptions, FillRule as LyonFillRule, FillTessellator, LineJoin, StrokeOptions,
+    StrokeTessellator,
+};
 use q0s_format::transform::Affine;
 use q0s_format::v2::{
     Anchor, Asset, Path as VPath, Placement, ProjectV2, Rgba, Target, Transform2D, Tween, Vec2,
@@ -549,6 +552,52 @@ pub fn paint_complex_fill(painter: &Painter, contours: &[Vec<Pos2>], color: Colo
     };
     // The native framebuffer is 4x multisampled. Keeping the fill as one mesh
     // avoids double-blending translucent edges and lets MSAA resolve coverage.
+    paint_lyon_buffers(painter, buffers, color);
+}
+
+fn tessellate_closed_bevel_stroke(
+    points: &[Pos2],
+    width: f32,
+) -> Option<VertexBuffers<lyon_path::math::Point, u32>> {
+    if points.len() < 2 || !width.is_finite() || width <= 0.0 {
+        return None;
+    }
+    let mut path_builder = lyon_path::Path::builder();
+    path_builder.begin(lyon_point(points[0].x, points[0].y));
+    for point in &points[1..] {
+        if !point.x.is_finite() || !point.y.is_finite() {
+            return None;
+        }
+        path_builder.line_to(lyon_point(point.x, point.y));
+    }
+    path_builder.end(true);
+    let path = path_builder.build();
+    let mut buffers: VertexBuffers<lyon_path::math::Point, u32> = VertexBuffers::new();
+    let mut tessellator = StrokeTessellator::new();
+    let options = StrokeOptions::default()
+        .with_line_width(width)
+        .with_line_join(LineJoin::Bevel)
+        .with_tolerance(0.05);
+    if tessellator
+        .tessellate_path(
+            &path,
+            &options,
+            &mut BuffersBuilder::new(&mut buffers, Positions),
+        )
+        .is_err()
+    {
+        return None;
+    }
+    Some(buffers)
+}
+
+/// Closed display stroke with bounded bevel joins. egui 0.27 uses an unlimited
+/// miter for closed PathShape strokes, which can produce giant spikes when a
+/// thin selection contour nearly folds back on itself at low zoom.
+pub fn paint_closed_bevel_stroke(painter: &Painter, points: &[Pos2], width: f32, color: Color32) {
+    let Some(buffers) = tessellate_closed_bevel_stroke(points, width) else {
+        return;
+    };
     paint_lyon_buffers(painter, buffers, color);
 }
 
@@ -2151,6 +2200,28 @@ mod tests {
         assert_eq!(mid.ty, 25.0);
         assert_eq!(mid.sx, 1.5);
         assert_eq!(mid.rotation, 0.5);
+    }
+
+    #[test]
+    fn closed_bevel_selection_stroke_cannot_grow_unbounded_miter_spikes() {
+        // Nearly reversing at a subpixel offset is exactly where egui's closed
+        // miter join can explode. A bevel stroke must remain inside the source
+        // bounds expanded by half the line width.
+        let points = [
+            pos2(0.0, 0.0),
+            pos2(100.0, 0.0),
+            pos2(0.01, 0.001),
+            pos2(100.0, 1.0),
+            pos2(0.0, 1.0),
+        ];
+        let buffers = tessellate_closed_bevel_stroke(&points, 2.0).expect("bevel stroke");
+        assert!(!buffers.vertices.is_empty());
+        for vertex in &buffers.vertices {
+            assert!(
+                vertex.x >= -1.01 && vertex.x <= 101.01 && vertex.y >= -1.01 && vertex.y <= 2.01,
+                "bevel selection stroke escaped bounded source envelope: {vertex:?}",
+            );
+        }
     }
 
     #[test]

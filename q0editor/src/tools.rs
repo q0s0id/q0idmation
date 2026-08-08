@@ -7454,28 +7454,47 @@ fn paint_selection_stipple_pattern(painter: &Painter, contours: &[Vec<Pos2>], ac
     );
 }
 
+/// Selection outline must preserve the exact topology of the fill contour.
+/// Display-space simplification is unsafe here: at low zoom two opposite sides
+/// of a thin brush shape can become subpixel-near, and a "hairpin cleanup" may
+/// then remove the turn and connect distant contour vertices with a long chord.
+/// Only exact duplicates/non-finite points are removed; no geometric tolerance
+/// is allowed to change adjacency.
+fn selection_contour_points(contour: &[Pos2]) -> Vec<Pos2> {
+    let mut points = Vec::with_capacity(contour.len());
+    for point in contour
+        .iter()
+        .copied()
+        .filter(|point| point.x.is_finite() && point.y.is_finite())
+    {
+        if points.last().is_some_and(|previous| *previous == point) {
+            continue;
+        }
+        points.push(point);
+    }
+    if points.len() > 1 && points.first() == points.last() {
+        points.pop();
+    }
+    points
+}
+
 /// Selection outline uses the exact same transformed contours as the fill
 /// pattern. It is a normal path stroke, not one quad per screen pixel, so its
 /// cost depends on vector complexity and it cannot drift independently of the
 /// selected geometry.
 fn draw_selection_contour(painter: &Painter, contours: &[Vec<Pos2>], accent: Color32) {
     for contour in contours {
-        let outline = crate::render::sanitize_display_polyline(contour, 1.0, true);
+        let outline = selection_contour_points(contour);
         if outline.len() < 3 {
             continue;
         }
-        painter.add(Shape::Path(PathShape {
-            points: outline.clone(),
-            closed: true,
-            fill: Color32::TRANSPARENT,
-            stroke: Stroke::new(2.0_f32, Color32::from_black_alpha(180)),
-        }));
-        painter.add(Shape::Path(PathShape {
-            points: outline,
-            closed: true,
-            fill: Color32::TRANSPARENT,
-            stroke: Stroke::new(1.0_f32, accent),
-        }));
+        crate::render::paint_closed_bevel_stroke(
+            painter,
+            &outline,
+            2.0,
+            Color32::from_black_alpha(180),
+        );
+        crate::render::paint_closed_bevel_stroke(painter, &outline, 1.0, accent);
     }
 }
 
@@ -11230,10 +11249,44 @@ mod tests {
             Pos2::new(100_000.0, 100_000.0),
             Pos2::new(0.0, 100_000.0),
         ];
-        let small_outline = crate::render::sanitize_display_polyline(&small, 1.0, true);
-        let huge_outline = crate::render::sanitize_display_polyline(&huge, 1.0, true);
+        let small_outline = selection_contour_points(&small);
+        let huge_outline = selection_contour_points(&huge);
         assert_eq!(small_outline.len(), huge_outline.len());
-        assert!(huge_outline.len() <= 4);
+        assert_eq!(huge_outline.len(), 4);
+    }
+
+    #[test]
+    fn selection_contour_zoom_out_preserves_thin_hairpin_topology_without_chords() {
+        // A thin ribbon with a deep return bend. At 0.5% zoom the two sides are
+        // only 0.02 screen pixels apart. The old display-space sanitizer treated
+        // them as a hairpin and progressively removed turns, producing the long
+        // diagonal chords seen in the selection overlay.
+        let stage = [
+            Pos2::new(0.0, 0.0),
+            Pos2::new(100.0, 0.0),
+            Pos2::new(100.0, 4.0),
+            Pos2::new(70.0, 4.0),
+            Pos2::new(70.0, 80.0),
+            Pos2::new(30.0, 80.0),
+            Pos2::new(30.0, 4.0),
+            Pos2::new(0.0, 4.0),
+        ];
+        let screen: Vec<Pos2> = stage
+            .iter()
+            .map(|point| Pos2::new(point.x * 0.005, point.y * 0.005))
+            .chain(std::iter::once(Pos2::new(0.0, 0.0)))
+            .collect();
+        let outline = selection_contour_points(&screen);
+
+        assert_eq!(outline.len(), stage.len());
+        for (actual, expected) in outline.iter().zip(stage.iter()) {
+            assert!((actual.x - expected.x * 0.005).abs() <= f32::EPSILON);
+            assert!((actual.y - expected.y * 0.005).abs() <= f32::EPSILON);
+        }
+        assert!(
+            outline[1].distance(outline[2]) < 0.03,
+            "subpixel-separated opposite sides must stay distinct instead of collapsing the turn",
+        );
     }
 
     #[cfg(feature = "appearance-mask-eraser")]
