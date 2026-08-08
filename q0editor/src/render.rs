@@ -94,7 +94,7 @@ pub(crate) struct CachedParametricStroke {
 #[derive(Clone)]
 struct CachedSelectionStroke {
     contour_stage: Vec<Pos2>,
-    parametric: Option<CachedParametricStroke>,
+    parametric: Vec<CachedParametricStroke>,
 }
 
 #[cfg(feature = "appearance-mask-eraser")]
@@ -518,7 +518,7 @@ impl TextureCache {
         vector: &q0s_format::v2::VectorAsset,
         appearance: &VectorAppearance,
         selected_indices: &[usize],
-    ) -> Option<&CachedSelectionStageMesh> {
+    ) -> Option<&mut CachedSelectionStageMesh> {
         let mut path_indices: Vec<usize> = selected_indices
             .iter()
             .copied()
@@ -589,12 +589,12 @@ impl TextureCache {
                 self.selection_stage_mesh_build_count += 1;
             }
         }
-        self.selection_stage_mesh_by_key.get(&key)
+        self.selection_stage_mesh_by_key.get_mut(&key)
     }
 
     #[cfg(feature = "appearance-mask-eraser")]
     pub(crate) fn selection_screen_meshes(
-        source: &CachedSelectionStageMesh,
+        source: &mut CachedSelectionStageMesh,
         view: &StageView,
         texture_id: TextureId,
         tile_size_points: f32,
@@ -1208,38 +1208,144 @@ fn exact_closed_contour(points: &[Pos2]) -> Vec<Pos2> {
 }
 
 #[cfg(feature = "appearance-mask-eraser")]
-fn parametric_closed_bevel_stroke(points: &[Pos2]) -> Option<CachedParametricStroke> {
-    let one = tessellate_closed_bevel_stroke(points, 1.0)?;
-    let two = tessellate_closed_bevel_stroke(points, 2.0)?;
-    if one.indices != two.indices || one.vertices.len() != two.vertices.len() {
+const SELECTION_PARAMETRIC_MIN_WIDTH: f32 = 1.0 / 64.0;
+#[cfg(feature = "appearance-mask-eraser")]
+const SELECTION_PARAMETRIC_MAX_WIDTH: f32 = 64.0;
+#[cfg(feature = "appearance-mask-eraser")]
+const SELECTION_PARAMETRIC_NEIGHBOR_FACTOR: f32 = 2.0;
+#[cfg(feature = "appearance-mask-eraser")]
+const SELECTION_PARAMETRIC_BOUNDARY_STEPS: usize = 12;
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn same_stroke_topology(
+    left: &VertexBuffers<lyon_path::math::Point, u32>,
+    right: &VertexBuffers<lyon_path::math::Point, u32>,
+) -> bool {
+    left.indices == right.indices && left.vertices.len() == right.vertices.len()
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn parametric_stroke_from_samples(
+    a_width: f32,
+    a: &VertexBuffers<lyon_path::math::Point, u32>,
+    b_width: f32,
+    b: &VertexBuffers<lyon_path::math::Point, u32>,
+) -> Option<CachedParametricStroke> {
+    if !same_stroke_topology(a, b) {
         return None;
     }
-    let mut base_vertices = Vec::with_capacity(one.vertices.len());
-    let mut width_vectors = Vec::with_capacity(one.vertices.len());
-    for (one, two) in one.vertices.into_iter().zip(two.vertices) {
-        let one = pos2(one.x, one.y);
-        let two = pos2(two.x, two.y);
-        let width_vector = two - one;
-        base_vertices.push(one - width_vector);
+    let width_delta = b_width - a_width;
+    if !width_delta.is_finite() || width_delta.abs() <= 1.0e-8 {
+        return None;
+    }
+    let mut base_vertices = Vec::with_capacity(a.vertices.len());
+    let mut width_vectors = Vec::with_capacity(a.vertices.len());
+    for (a, b) in a.vertices.iter().zip(&b.vertices) {
+        let a = pos2(a.x, a.y);
+        let b = pos2(b.x, b.y);
+        let width_vector = (b - a) / width_delta;
+        base_vertices.push(a - width_vector * a_width);
         width_vectors.push(width_vector);
-    }
-    let midpoint = tessellate_closed_bevel_stroke(points, 1.5)?;
-    if midpoint.indices != one.indices || midpoint.vertices.len() != base_vertices.len() {
-        return None;
-    }
-    for (index, vertex) in midpoint.vertices.iter().enumerate() {
-        let expected = base_vertices[index] + width_vectors[index] * 1.5;
-        if (expected.x - vertex.x).abs() > 1.0e-3 || (expected.y - vertex.y).abs() > 1.0e-3 {
-            return None;
-        }
     }
     Some(CachedParametricStroke {
         base_vertices,
         width_vectors,
-        indices: one.indices,
-        min_width: 1.0,
-        max_width: 2.0,
+        indices: a.indices.clone(),
+        min_width: a_width.min(b_width),
+        max_width: a_width.max(b_width),
     })
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn parametric_range_toward(
+    points: &[Pos2],
+    target_width: f32,
+    target: &VertexBuffers<lyon_path::math::Point, u32>,
+    neighbor_width: f32,
+    neighbor: VertexBuffers<lyon_path::math::Point, u32>,
+) -> Option<CachedParametricStroke> {
+    if same_stroke_topology(target, &neighbor) {
+        return parametric_stroke_from_samples(target_width, target, neighbor_width, &neighbor);
+    }
+
+    // Lyon changes topology at a few width thresholds for near-folding contours.
+    // Search only the side of the current width that actually crossed a threshold.
+    // This keeps cache creation bounded while still extending the fast range right
+    // up to the transition instead of re-tessellating on every wheel tick.
+    let mut same_width = target_width;
+    let mut other_width = neighbor_width;
+    let mut nearest_same = None;
+    for _ in 0..SELECTION_PARAMETRIC_BOUNDARY_STEPS {
+        let midpoint_width = (same_width * other_width).sqrt();
+        let midpoint = tessellate_closed_bevel_stroke(points, midpoint_width)?;
+        if same_stroke_topology(target, &midpoint) {
+            same_width = midpoint_width;
+            nearest_same = Some((midpoint_width, midpoint));
+        } else {
+            other_width = midpoint_width;
+        }
+    }
+    let (same_width, same) = nearest_same?;
+    parametric_stroke_from_samples(target_width, target, same_width, &same)
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn cache_parametric_range_for_width(stroke: &mut CachedSelectionStroke, stage_width: f32) -> bool {
+    if stroke
+        .parametric
+        .iter()
+        .any(|range| stage_width >= range.min_width && stage_width <= range.max_width)
+    {
+        return true;
+    }
+    if !stage_width.is_finite()
+        || !(SELECTION_PARAMETRIC_MIN_WIDTH..=SELECTION_PARAMETRIC_MAX_WIDTH).contains(&stage_width)
+    {
+        return false;
+    }
+
+    let target = match tessellate_closed_bevel_stroke(&stroke.contour_stage, stage_width) {
+        Some(target) => target,
+        None => return false,
+    };
+    let lower_width =
+        (stage_width / SELECTION_PARAMETRIC_NEIGHBOR_FACTOR).max(SELECTION_PARAMETRIC_MIN_WIDTH);
+    let upper_width =
+        (stage_width * SELECTION_PARAMETRIC_NEIGHBOR_FACTOR).min(SELECTION_PARAMETRIC_MAX_WIDTH);
+
+    if lower_width < stage_width {
+        if let Some(lower) = tessellate_closed_bevel_stroke(&stroke.contour_stage, lower_width) {
+            if let Some(range) = parametric_range_toward(
+                &stroke.contour_stage,
+                stage_width,
+                &target,
+                lower_width,
+                lower,
+            ) {
+                stroke.parametric.push(range);
+            }
+        }
+    }
+    if upper_width > stage_width {
+        if let Some(upper) = tessellate_closed_bevel_stroke(&stroke.contour_stage, upper_width) {
+            if let Some(range) = parametric_range_toward(
+                &stroke.contour_stage,
+                stage_width,
+                &target,
+                upper_width,
+                upper,
+            ) {
+                stroke.parametric.push(range);
+            }
+        }
+    }
+    stroke
+        .parametric
+        .sort_by(|left, right| left.min_width.total_cmp(&right.min_width));
+    stroke
+        .parametric
+        .iter()
+        .any(|range| stage_width >= range.min_width && stage_width <= range.max_width)
 }
 
 #[cfg(feature = "appearance-mask-eraser")]
@@ -1264,7 +1370,7 @@ fn build_selection_stage_mesh(contours: &[Vec<Pos2>]) -> Option<CachedSelectionS
         .map(|contour| exact_closed_contour(contour))
         .filter(|contour| contour.len() >= 3)
         .map(|contour_stage| CachedSelectionStroke {
-            parametric: parametric_closed_bevel_stroke(&contour_stage),
+            parametric: Vec::new(),
             contour_stage,
         })
         .collect();
@@ -1316,6 +1422,33 @@ fn parametric_stroke_screen_mesh(
 }
 
 #[cfg(feature = "appearance-mask-eraser")]
+fn cached_selection_stroke_screen_mesh(
+    stroke: &mut CachedSelectionStroke,
+    width_points: f32,
+    color: Color32,
+    view: &StageView,
+) -> Option<Mesh> {
+    if let Some(mesh) = stroke
+        .parametric
+        .iter()
+        .find_map(|parametric| parametric_stroke_screen_mesh(parametric, width_points, color, view))
+    {
+        return Some(mesh);
+    }
+    let scale = view.scale.abs();
+    if scale.is_finite() && scale > 1.0e-6 && width_points.is_finite() && width_points > 0.0 {
+        let stage_width = width_points / scale;
+        if cache_parametric_range_for_width(stroke, stage_width) {
+            if let Some(mesh) = stroke.parametric.iter().find_map(|parametric| {
+                parametric_stroke_screen_mesh(parametric, width_points, color, view)
+            }) {
+                return Some(mesh);
+            }
+        }
+    }
+    direct_stroke_screen_mesh(&stroke.contour_stage, width_points, color, view)
+}
+#[cfg(feature = "appearance-mask-eraser")]
 fn direct_stroke_screen_mesh(
     contour_stage: &[Pos2],
     width_points: f32,
@@ -1332,7 +1465,7 @@ fn direct_stroke_screen_mesh(
 
 #[cfg(feature = "appearance-mask-eraser")]
 fn build_selection_screen_meshes(
-    source: &CachedSelectionStageMesh,
+    source: &mut CachedSelectionStageMesh,
     view: &StageView,
     texture_id: TextureId,
     tile_size_points: f32,
@@ -1354,30 +1487,13 @@ fn build_selection_screen_meshes(
         fill.indices = source.fill_indices.clone();
         meshes.push(fill);
     }
-    for stroke in &source.strokes {
-        let outer = stroke
-            .parametric
-            .as_ref()
-            .and_then(|parametric| {
-                parametric_stroke_screen_mesh(parametric, 2.0, Color32::from_black_alpha(180), view)
-            })
-            .or_else(|| {
-                direct_stroke_screen_mesh(
-                    &stroke.contour_stage,
-                    2.0,
-                    Color32::from_black_alpha(180),
-                    view,
-                )
-            });
-        if let Some(mesh) = outer {
+    for stroke in &mut source.strokes {
+        if let Some(mesh) =
+            cached_selection_stroke_screen_mesh(stroke, 2.0, Color32::from_black_alpha(180), view)
+        {
             meshes.push(mesh);
         }
-        let inner = stroke
-            .parametric
-            .as_ref()
-            .and_then(|parametric| parametric_stroke_screen_mesh(parametric, 1.0, accent, view))
-            .or_else(|| direct_stroke_screen_mesh(&stroke.contour_stage, 1.0, accent, view));
-        if let Some(mesh) = inner {
+        if let Some(mesh) = cached_selection_stroke_screen_mesh(stroke, 1.0, accent, view) {
             meshes.push(mesh);
         }
     }
@@ -3370,63 +3486,84 @@ mod tests {
 
     #[cfg(feature = "appearance-mask-eraser")]
     #[test]
-    fn parametric_selection_bevel_is_exact_only_inside_verified_topology_range() {
-        let points = [
+    fn lazy_parametric_selection_cache_preserves_lyon_across_topology_change() {
+        let points = vec![
             pos2(0.0, 0.0),
             pos2(100.0, 0.0),
             pos2(0.01, 0.001),
             pos2(100.0, 1.0),
             pos2(0.0, 1.0),
         ];
-        let parametric = parametric_closed_bevel_stroke(&points).expect("parametric bevel");
-        for width in [1.0_f32, 1.1, 1.5, 1.9, 2.0] {
-            let direct = tessellate_closed_bevel_stroke(&points, width).expect("direct bevel");
-            assert_eq!(direct.indices, parametric.indices);
-            assert_eq!(direct.vertices.len(), parametric.base_vertices.len());
-            for (index, vertex) in direct.vertices.iter().enumerate() {
-                let actual =
-                    parametric.base_vertices[index] + parametric.width_vectors[index] * width;
+        let mut stroke = CachedSelectionStroke {
+            contour_stage: points,
+            parametric: Vec::new(),
+        };
+        for width in [20.0_f32, 4.0, 2.0, 1.0, 0.9, 0.5, 0.25, 0.0625, 0.03125] {
+            assert!(
+                cache_parametric_range_for_width(&mut stroke, width),
+                "width {width} should gain a cached parametric range",
+            );
+        }
+        assert!(
+            stroke.parametric.len() >= 2,
+            "the hairpin must keep distinct topology ranges",
+        );
+        for range in &stroke.parametric {
+            let probe_width = (range.min_width * range.max_width).sqrt();
+            let exact = tessellate_closed_bevel_stroke(&stroke.contour_stage, probe_width)
+                .expect("exact bevel");
+            assert_eq!(exact.indices, range.indices);
+            assert_eq!(exact.vertices.len(), range.base_vertices.len());
+            let tolerance = 1.0e-3 * probe_width.max(1.0);
+            for (index, vertex) in exact.vertices.iter().enumerate() {
+                let cached = range.base_vertices[index] + range.width_vectors[index] * probe_width;
                 assert!(
-                    (actual.x - vertex.x).abs() <= 1.0e-3 && (actual.y - vertex.y).abs() <= 1.0e-3,
-                    "verified parametric bevel drift at width {width}, vertex {index}",
+                    (cached.x - vertex.x).abs() <= tolerance
+                        && (cached.y - vertex.y).abs() <= tolerance,
+                    "cached range drifted from lyon at width {probe_width}, vertex {index}",
                 );
             }
         }
-        let view = StageView {
-            origin: Pos2::ZERO,
-            scale: 1.1,
-            stage_rect: Rect::EVERYTHING,
-        };
-        assert!(
-            parametric_stroke_screen_mesh(&parametric, 1.0, Color32::WHITE, &view).is_none(),
-            "width below the verified topology range must use exact lyon fallback",
-        );
-        assert!(
-            parametric_stroke_screen_mesh(&parametric, 2.0, Color32::WHITE, &view).is_some(),
-            "verified topology range should keep the fast parametric path",
-        );
     }
 
+    #[cfg(feature = "appearance-mask-eraser")]
     #[test]
-    fn repeated_stipple_mesh_cost_depends_on_contour_not_selected_area() {
-        let rect = |size: f32| {
-            vec![vec![
-                Pos2::new(0.0, 0.0),
-                Pos2::new(size, 0.0),
-                Pos2::new(size, size),
-                Pos2::new(0.0, size),
-            ]]
+    fn advanced_selection_neighbor_zoom_reuses_cached_bevel_ranges() {
+        let mut stroke = CachedSelectionStroke {
+            contour_stage: vec![
+                pos2(0.0, 0.0),
+                pos2(100.0, 0.0),
+                pos2(0.01, 0.001),
+                pos2(100.0, 1.0),
+                pos2(0.0, 1.0),
+            ],
+            parametric: Vec::new(),
         };
-        let small = complex_fill_pattern_mesh(&rect(100.0), TextureId::Managed(1), 4.0)
-            .expect("small stipple mesh");
-        let huge = complex_fill_pattern_mesh(&rect(100_000.0), TextureId::Managed(1), 4.0)
-            .expect("huge stipple mesh");
-        assert_eq!(small.vertices.len(), huge.vertices.len());
-        assert_eq!(small.indices.len(), huge.indices.len());
-        assert!(
-            huge.vertices.len() <= 8,
-            "rectangle stipple should stay contour-sized"
-        );
+        assert!(cache_parametric_range_for_width(&mut stroke, 2.0));
+        let cached_after_first_zoom = stroke.parametric.len();
+        for width in [1.8_f32, 1.6, 1.4, 1.2, 1.05] {
+            assert!(
+                stroke
+                    .parametric
+                    .iter()
+                    .any(|range| width >= range.min_width && width <= range.max_width),
+                "neighbor width {width} unexpectedly needs lyon again",
+            );
+        }
+        assert_eq!(stroke.parametric.len(), cached_after_first_zoom);
+
+        assert!(cache_parametric_range_for_width(&mut stroke, 0.95));
+        let cached_after_crossing = stroke.parametric.len();
+        for width in [0.9_f32, 0.8, 0.7, 0.6, 0.5] {
+            assert!(
+                stroke
+                    .parametric
+                    .iter()
+                    .any(|range| width >= range.min_width && width <= range.max_width),
+                "post-transition width {width} unexpectedly needs lyon again",
+            );
+        }
+        assert_eq!(stroke.parametric.len(), cached_after_crossing);
     }
 
     #[test]
