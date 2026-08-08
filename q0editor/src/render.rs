@@ -70,13 +70,6 @@ impl TextureCache {
     }
 
     #[cfg(feature = "appearance-mask-eraser")]
-    pub(crate) fn appearance_fingerprint(&self, asset_id: u16) -> Option<u64> {
-        self.appearance_signature_by_asset
-            .get(&asset_id)
-            .map(|(fingerprint, _)| *fingerprint)
-    }
-
-    #[cfg(feature = "appearance-mask-eraser")]
     fn appearance_signature(
         &mut self,
         vector: &q0s_format::v2::VectorAsset,
