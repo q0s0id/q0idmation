@@ -25,11 +25,6 @@ use q0s_format::v2::{
 const Q0RG_RECURSION_LIMIT: u8 = 8;
 const BEZIER_SAMPLES_PER_SEGMENT: usize = 16;
 
-#[cfg(feature = "appearance-mask-eraser")]
-pub(crate) fn viewport_zoom_gesture_active(ctx: &Context) -> bool {
-    ctx.input(|input| input.smooth_scroll_delta.y.abs() > 0.5)
-}
-
 pub struct StageView {
     /// Top-left corner of the stage rectangle in screen pixels.
     pub origin: Pos2,
@@ -220,6 +215,8 @@ pub struct TextureCache {
     #[cfg(feature = "appearance-mask-eraser")]
     visible_body_by_asset: HashMap<u16, Vec<Vec<Vec2>>>,
     #[cfg(feature = "appearance-mask-eraser")]
+    visible_selection_body_by_asset: HashMap<u16, Vec<Vec<Vec2>>>,
+    #[cfg(feature = "appearance-mask-eraser")]
     appearance_hit_by_asset: HashMap<u16, CachedAppearanceHitGeometry>,
     #[cfg(feature = "appearance-mask-eraser")]
     raw_selection_components_by_key: HashMap<(u16, [u32; 6]), CachedRawSelectionComponents>,
@@ -257,6 +254,7 @@ impl TextureCache {
             self.appearance_by_asset.clear();
             self.appearance_signature_by_asset.clear();
             self.visible_body_by_asset.clear();
+            self.visible_selection_body_by_asset.clear();
             self.appearance_hit_by_asset.clear();
             self.raw_selection_components_by_key.clear();
             self.selection_source_surface_by_key.clear();
@@ -281,6 +279,7 @@ impl TextureCache {
                 .retain(|(id, _, _), _| *id != asset_id);
             self.appearance_signature_by_asset.remove(&asset_id);
             self.visible_body_by_asset.remove(&asset_id);
+            self.visible_selection_body_by_asset.remove(&asset_id);
             self.appearance_hit_by_asset.remove(&asset_id);
             self.raw_selection_components_by_key
                 .retain(|(id, _), _| *id != asset_id);
@@ -428,7 +427,11 @@ impl TextureCache {
                 .filter(|(_, path)| path.closed)
                 .all(|(index, _)| key.1.binary_search(&index).is_ok());
             let cached_full_body = all_closed_selected
-                .then(|| self.visible_body_by_asset.get(&vector.asset_id).cloned())
+                .then(|| {
+                    self.visible_selection_body_by_asset
+                        .get(&vector.asset_id)
+                        .cloned()
+                })
                 .flatten();
             let (canonical_body, body) = if let Some(body) = cached_full_body {
                 // The stage renderer runs before tool interaction and has already
@@ -468,7 +471,7 @@ impl TextureCache {
                         &subset, appearance,
                     )?
                 };
-                let body = crate::brush::coverage_to_paths(&canonical_body)
+                let body = crate::brush::coverage_to_linear_paths(&canonical_body)
                     .iter()
                     .map(flatten_path)
                     .collect();
@@ -487,7 +490,7 @@ impl TextureCache {
                     } else {
                         clip.difference(&erase)
                     };
-                    crate::brush::coverage_to_paths(&visible)
+                    crate::brush::coverage_to_linear_paths(&visible)
                         .iter()
                         .map(flatten_path)
                         .collect()
@@ -2276,76 +2279,58 @@ fn paint_vector_appearance_halo(
         return;
     }
     let field_transform = Affine::compose(transform, appearance.field_transform);
-    let target_ppu = (view.scale * field_transform.uniform_scale() * 2.0).clamp(1.0, 4.0);
-    let bucket = (target_ppu * 4.0).round().clamp(4.0, 16.0) as u16;
-    let ppu = f32::from(bucket) / 4.0;
+    // Raster resolution belongs to the canonical material field, not to the
+    // editor camera or to an affine placement. The fingerprint deliberately
+    // ignores `field_transform`, so move/scale/rotate must reuse this texture too.
+    // The real vector body stays resolution-independent; only the soft halo is a
+    // linearly filtered GPU texture. Two samples per stage unit are enough for
+    // this deliberately blurred layer and, crucially, never create zoom buckets.
+    const MATERIAL_CACHE_PPU: f32 = 2.0;
+    const MATERIAL_CACHE_BUCKET: u16 = 8;
+    let bucket = MATERIAL_CACHE_BUCKET;
+    let ppu = MATERIAL_CACHE_PPU;
     // The raster signature depends on frozen material/mask content, not on the
     // field affine. Computing it walks every anchor, so do it only after an
     // explicit texture-cache invalidation rather than on every repaint/drag tick.
     let (fingerprint, origin) = textures.appearance_signature(vector, appearance);
     let key = (vector.asset_id, bucket, fingerprint);
-    let exact_cached = textures.appearance_by_asset.contains_key(&key);
-    let reuse_key = if !exact_cached && viewport_zoom_gesture_active(ctx) {
+    if !textures.appearance_by_asset.contains_key(&key) {
         textures
             .appearance_by_asset
-            .keys()
-            .filter(|(asset_id, _, cached_fingerprint)| {
-                *asset_id == vector.asset_id && *cached_fingerprint == fingerprint
+            .retain(|(asset_id, cached_bucket, _), _| {
+                *asset_id != vector.asset_id || *cached_bucket != bucket
+            });
+    }
+    let cached = match textures.appearance_by_asset.entry(key) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            let Some(tile) =
+                q0s_format::raster::rasterize_vector_halo_local(vector, appearance, ppu)
+            else {
+                return;
+            };
+            let image = ColorImage::from_rgba_unmultiplied(
+                [tile.width as usize, tile.height as usize],
+                &tile.rgba,
+            );
+            let texture = ctx.load_texture(
+                format!(
+                    "q0s_appearance_{}_{}_{}",
+                    vector.asset_id, bucket, fingerprint
+                ),
+                image,
+                TextureOptions::LINEAR,
+            );
+            entry.insert(CachedAppearanceTexture {
+                texture,
+                local_min_offset: Vec2::new(
+                    tile.local_min.x - origin.x,
+                    tile.local_min.y - origin.y,
+                ),
+                width: tile.width,
+                height: tile.height,
+                pixels_per_unit: tile.pixels_per_unit,
             })
-            .min_by_key(|(_, cached_bucket, _)| cached_bucket.abs_diff(bucket))
-            .copied()
-    } else {
-        None
-    };
-
-    // During a smooth wheel gesture the view may cross many raster PPU buckets.
-    // Re-rasterizing the same halo at every crossing makes zoom hitch even though
-    // the already-cached texture can be scaled perfectly well for those transient
-    // frames. Once scrolling stops, the exact target bucket is built once.
-    let cached = if let Some(reuse_key) = reuse_key {
-        textures
-            .appearance_by_asset
-            .get_mut(&reuse_key)
-            .expect("appearance reuse key came from the cache")
-    } else {
-        if !exact_cached {
-            textures
-                .appearance_by_asset
-                .retain(|(asset_id, cached_bucket, _), _| {
-                    *asset_id != vector.asset_id || *cached_bucket != bucket
-                });
-        }
-        match textures.appearance_by_asset.entry(key) {
-            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                let Some(tile) =
-                    q0s_format::raster::rasterize_vector_halo_local(vector, appearance, ppu)
-                else {
-                    return;
-                };
-                let image = ColorImage::from_rgba_unmultiplied(
-                    [tile.width as usize, tile.height as usize],
-                    &tile.rgba,
-                );
-                let texture = ctx.load_texture(
-                    format!(
-                        "q0s_appearance_{}_{}_{}",
-                        vector.asset_id, bucket, fingerprint
-                    ),
-                    image,
-                    TextureOptions::LINEAR,
-                );
-                entry.insert(CachedAppearanceTexture {
-                    texture,
-                    local_min_offset: Vec2::new(
-                        tile.local_min.x - origin.x,
-                        tile.local_min.y - origin.y,
-                    ),
-                    width: tile.width,
-                    height: tile.height,
-                    pixels_per_unit: tile.pixels_per_unit,
-                })
-            }
         }
     };
     let local_min = Vec2::new(
@@ -2436,7 +2421,14 @@ fn masked_vector_body_contours(
             .iter()
             .map(flatten_path)
             .collect();
+        let selection_contours: Vec<Vec<Vec2>> = crate::brush::coverage_to_linear_paths(&visible)
+            .iter()
+            .map(flatten_path)
+            .collect();
         entry.insert(local_contours);
+        textures
+            .visible_selection_body_by_asset
+            .insert(vector.asset_id, selection_contours);
         built_body_cache = true;
     }
     #[cfg(all(test, feature = "appearance-mask-eraser"))]
@@ -2562,6 +2554,187 @@ mod tests {
             moved_hash, changed_field_hash,
             "changing frozen field content must invalidate the halo texture"
         );
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn selection_geometry_keeps_boolean_boundary_linear_without_16x_resampling() {
+        let anchors: Vec<Anchor> = (0..256)
+            .map(|index| {
+                let angle = index as f32 / 256.0 * std::f32::consts::TAU;
+                Anchor {
+                    point: Vec2::new(angle.cos() * 50.0, angle.sin() * 50.0),
+                    in_handle: None,
+                    out_handle: None,
+                }
+            })
+            .collect();
+        let path = VPath {
+            anchors,
+            closed: true,
+        };
+        let vector = q0s_format::v2::VectorAsset {
+            asset_id: 87,
+            paths: vec![path.clone()],
+            fill: Some(Rgba {
+                r: 20,
+                g: 30,
+                b: 40,
+                a: 255,
+            }),
+            stroke: None,
+        };
+        let appearance = VectorAppearance {
+            material: q0s_format::v2::VectorMaterial::SoftHalo {
+                radius: 6.0,
+                opacity: 0.6,
+            },
+            erase_mask: Vec::new(),
+            material_source: vec![path.clone()],
+            clip_mask: vec![path],
+            field_transform: Affine::IDENTITY,
+        };
+        let mut cache = TextureCache::default();
+        let geometry = cache
+            .selection_geometry(&vector, &appearance, &[0])
+            .expect("selection geometry");
+        let point_count: usize = geometry.body.iter().map(Vec::len).sum();
+        assert!(
+            (200..=300).contains(&point_count),
+            "linear boolean boundary was expanded into sampled pseudo-Beziers: {point_count} points",
+        );
+        assert!(geometry.fallback_material_support.is_empty());
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn halo_texture_cache_is_invariant_to_view_zoom_and_affine_scale() {
+        let path = VPath {
+            anchors: [
+                Vec2::new(0.0, 0.0),
+                Vec2::new(24.0, 0.0),
+                Vec2::new(24.0, 24.0),
+                Vec2::new(0.0, 24.0),
+            ]
+            .into_iter()
+            .map(|point| Anchor {
+                point,
+                in_handle: None,
+                out_handle: None,
+            })
+            .collect(),
+            closed: true,
+        };
+        let vector = q0s_format::v2::VectorAsset {
+            asset_id: 88,
+            paths: vec![path.clone()],
+            fill: Some(Rgba {
+                r: 20,
+                g: 30,
+                b: 40,
+                a: 255,
+            }),
+            stroke: None,
+        };
+        let appearance = VectorAppearance {
+            material: q0s_format::v2::VectorMaterial::SoftHalo {
+                radius: 8.0,
+                opacity: 0.65,
+            },
+            erase_mask: Vec::new(),
+            material_source: vec![path],
+            clip_mask: Vec::new(),
+            field_transform: Affine::IDENTITY,
+        };
+        let ctx = Context::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(640.0, 480.0));
+        let mut cache = TextureCache::default();
+
+        for (index, scale) in [0.25_f32, 0.5, 1.0, 2.0, 4.0, 8.0].into_iter().enumerate() {
+            let view = StageView {
+                origin: Pos2::new(40.0, 30.0),
+                scale,
+                stage_rect: rect,
+            };
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let painter = ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Middle,
+                        egui::Id::new(("halo-view-cache", index)),
+                    ));
+                    paint_vector_appearance_halo(
+                        &painter,
+                        &vector,
+                        &appearance,
+                        Affine::IDENTITY,
+                        &view,
+                        &mut cache,
+                        ctx,
+                        Color32::WHITE,
+                    );
+                },
+            );
+            assert_eq!(
+                cache
+                    .appearance_by_asset
+                    .keys()
+                    .filter(|(asset_id, _, _)| *asset_id == vector.asset_id)
+                    .count(),
+                1,
+                "viewport zoom created another CPU halo raster bucket",
+            );
+        }
+
+        let scaled = Affine {
+            a11: 3.0,
+            a22: 3.0,
+            tx: 120.0,
+            ty: -40.0,
+            ..Affine::IDENTITY
+        };
+        let view = StageView {
+            origin: Pos2::ZERO,
+            scale: 3.0,
+            stage_rect: rect,
+        };
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Middle,
+                    egui::Id::new("halo-affine-cache"),
+                ));
+                paint_vector_appearance_halo(
+                    &painter,
+                    &vector,
+                    &appearance,
+                    scaled,
+                    &view,
+                    &mut cache,
+                    ctx,
+                    Color32::WHITE,
+                );
+            },
+        );
+        let entries: Vec<_> = cache
+            .appearance_by_asset
+            .iter()
+            .filter(|((asset_id, _, _), _)| *asset_id == vector.asset_id)
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "affine scale rebuilt canonical halo texture"
+        );
+        assert_eq!(entries[0].0 .1, 8);
+        assert_eq!(entries[0].1.pixels_per_unit, 2.0);
     }
 
     #[cfg(feature = "appearance-mask-eraser")]

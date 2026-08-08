@@ -677,7 +677,7 @@ pub fn coverage_to_paths(coverage: &MultiPolygon<f64>) -> Vec<VPath> {
     paths
 }
 
-fn coverage_to_linear_paths(coverage: &MultiPolygon<f64>) -> Vec<VPath> {
+pub(crate) fn coverage_to_linear_paths(coverage: &MultiPolygon<f64>) -> Vec<VPath> {
     let mut paths = Vec::new();
     for polygon in &coverage.0 {
         if let Some(path) = linear_ring_to_path(polygon.exterior()) {
