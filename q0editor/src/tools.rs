@@ -805,22 +805,36 @@ fn brush_cursor_radius_px(settings: crate::brush::BrushSettings, view_scale: f32
     stage_size.max(0.1) * view_scale * 0.5
 }
 
+fn classic_drag_frame_accepts_samples(
+    drag_started: bool,
+    dragged: bool,
+    drag_stopped: bool,
+) -> bool {
+    !drag_stopped && (drag_started || dragged)
+}
+
 fn classic_input_samples(
     ctx: &Context,
     response: &Response,
     view: &StageView,
 ) -> Vec<crate::brush::BrushSample> {
-    advanced_input_samples(
-        ctx,
-        response,
-        view,
-        !response.drag_stopped_by(PointerButton::Primary),
-    )
-    .into_iter()
-    .map(|sample| {
-        crate::brush::BrushSample::pointer(sample.position, sample.pressure, sample.time_seconds)
-    })
-    .collect()
+    // Pointer-up terminates the gesture. Never interpret PointerMoved events
+    // from the same egui frame as paint: Windows pen input can report a final
+    // pressureless move around release, which would otherwise stamp a nominal
+    // full-size nib at the end of a pressure/velocity stroke.
+    if response.drag_stopped_by(PointerButton::Primary) {
+        return Vec::new();
+    }
+    advanced_input_samples(ctx, response, view, true)
+        .into_iter()
+        .map(|sample| {
+            crate::brush::BrushSample::pointer(
+                sample.position,
+                sample.pressure,
+                sample.time_seconds,
+            )
+        })
+        .collect()
 }
 
 fn pointer_pressure_at(ctx: &Context, screen: Pos2) -> Option<f32> {
@@ -867,10 +881,10 @@ fn classic_brush(app: &mut EditorApp, response: &Response, view: &StageView, ctx
         }
     }
 
-    if response.drag_started_by(PointerButton::Primary)
-        || response.dragged_by(PointerButton::Primary)
-        || response.drag_stopped_by(PointerButton::Primary)
-    {
+    let drag_started = response.drag_started_by(PointerButton::Primary);
+    let dragged = response.dragged_by(PointerButton::Primary);
+    let drag_stopped = response.drag_stopped_by(PointerButton::Primary);
+    if classic_drag_frame_accepts_samples(drag_started, dragged, drag_stopped) {
         let samples = classic_input_samples(ctx, response, view);
         let mut new_contours = Vec::new();
         if let ToolState::BrushDrawing { stroke } = &mut app.session.tool_state {
@@ -8920,6 +8934,21 @@ mod tests {
         left.difference(right)
             .union(&right.difference(left))
             .unsigned_area()
+    }
+
+    #[test]
+    fn classic_release_frame_never_accepts_paint_samples() {
+        assert!(classic_drag_frame_accepts_samples(true, false, false));
+        assert!(classic_drag_frame_accepts_samples(false, true, false));
+        assert!(!classic_drag_frame_accepts_samples(false, false, true));
+        assert!(
+            !classic_drag_frame_accepts_samples(false, true, true),
+            "a release frame must not paint even if egui also reports it as dragged"
+        );
+        assert!(
+            !classic_drag_frame_accepts_samples(true, true, true),
+            "pointer-up is a terminator, never another dab"
+        );
     }
 
     #[test]
