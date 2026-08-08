@@ -748,6 +748,10 @@ pub struct BrushPreferences {
     pub size: PersistBrushSize,
     pub smoothing: u8,
     pub nib: PersistBrushNib,
+    pub pressure_size: bool,
+    pub velocity_size: bool,
+    pub dynamics_sensitivity: u8,
+    pub dynamics_min_size: PersistBrushSize,
     pub glow: bool,
     pub scale_with_stage: bool,
     pub sync_with_eraser: bool,
@@ -773,6 +777,10 @@ impl BrushPreferences {
                 BrushNib::Slash => PersistBrushNib::Slash,
                 BrushNib::Backslash => PersistBrushNib::Backslash,
             },
+            pressure_size: settings.pressure_size,
+            velocity_size: settings.velocity_size,
+            dynamics_sensitivity: settings.dynamics_sensitivity.min(100),
+            dynamics_min_size: PersistBrushSize(settings.dynamics_min_size),
             glow: false,
             scale_with_stage: settings.scale_with_stage,
             sync_with_eraser: settings.sync_with_eraser,
@@ -796,6 +804,14 @@ impl BrushPreferences {
                 PersistBrushNib::Vertical => BrushNib::Vertical,
                 PersistBrushNib::Slash => BrushNib::Slash,
                 PersistBrushNib::Backslash => BrushNib::Backslash,
+            },
+            pressure_size: self.pressure_size,
+            velocity_size: self.velocity_size,
+            dynamics_sensitivity: self.dynamics_sensitivity.min(100),
+            dynamics_min_size: if self.dynamics_min_size.0.is_finite() {
+                self.dynamics_min_size.0.clamp(0.01, 1.0)
+            } else {
+                BrushSettings::default().dynamics_min_size
             },
             scale_with_stage: self.scale_with_stage,
             sync_with_eraser: self.sync_with_eraser,
@@ -1192,6 +1208,10 @@ mod tests {
             size: 27.5,
             smoothing: 83,
             nib: BrushNib::Backslash,
+            pressure_size: true,
+            velocity_size: true,
+            dynamics_sensitivity: 77,
+            dynamics_min_size: 0.15,
             scale_with_stage: false,
             sync_with_eraser: false,
         };

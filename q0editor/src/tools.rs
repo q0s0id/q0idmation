@@ -742,6 +742,7 @@ fn advanced_brush(app: &mut EditorApp, response: &Response, view: &StageView, ct
                 nib: crate::brush::BrushNib::Circle,
                 scale_with_stage: settings.scale_with_stage,
                 sync_with_eraser: app.session.brush.sync_with_eraser,
+                ..crate::brush::BrushSettings::default()
             };
             crate::brush::commit_brush_region_with_material(
                 app,
@@ -776,6 +777,7 @@ fn advanced_brush(app: &mut EditorApp, response: &Response, view: &StageView, ct
                 nib: crate::brush::BrushNib::Circle,
                 scale_with_stage: settings.scale_with_stage,
                 sync_with_eraser: app.session.brush.sync_with_eraser,
+                ..crate::brush::BrushSettings::default()
             };
             crate::brush::commit_brush_region_with_material(
                 app,
@@ -796,12 +798,42 @@ fn brush_cursor_radius_px(settings: crate::brush::BrushSettings, view_scale: f32
     stage_size.max(0.1) * view_scale * 0.5
 }
 
+fn classic_input_samples(
+    ctx: &Context,
+    response: &Response,
+    view: &StageView,
+) -> Vec<crate::brush::BrushSample> {
+    advanced_input_samples(ctx, response, view)
+        .into_iter()
+        .map(|sample| {
+            crate::brush::BrushSample::pointer(
+                sample.position,
+                sample.pressure,
+                sample.time_seconds,
+            )
+        })
+        .collect()
+}
+
+fn pointer_pressure_at(ctx: &Context, screen: Pos2) -> Option<f32> {
+    ctx.input(|input| {
+        input.events.iter().rev().find_map(|event| match event {
+            egui::Event::Touch { pos, force, .. } if (*pos - screen).length_sq() <= 9.0 => *force,
+            _ => None,
+        })
+    })
+}
+
 fn classic_brush(app: &mut EditorApp, response: &Response, view: &StageView, ctx: &Context) {
     let settings = brush_settings_for_view(app, view.scale);
 
     if response.drag_started_by(PointerButton::Primary) {
         if let Some(screen) = response.interact_pointer_pos() {
-            let sample = crate::brush::BrushSample::mouse(screen_to_stage(screen, view));
+            let sample = crate::brush::BrushSample::pointer(
+                screen_to_stage(screen, view),
+                pointer_pressure_at(ctx, screen),
+                ctx.input(|input| input.time),
+            );
             app.session.tool_state = ToolState::BrushDrawing {
                 stroke: crate::brush::brush_begin(settings, sample),
             };
@@ -813,42 +845,10 @@ fn classic_brush(app: &mut EditorApp, response: &Response, view: &StageView, ctx
         || response.dragged_by(PointerButton::Primary)
         || response.drag_stopped_by(PointerButton::Primary)
     {
-        let event_positions: Vec<Pos2> = ctx.input(|input| {
-            input
-                .events
-                .iter()
-                .filter_map(|event| match event {
-                    egui::Event::PointerMoved(position) => Some(*position),
-                    _ => None,
-                })
-                .collect()
-        });
-
+        let samples = classic_input_samples(ctx, response, view);
         if let ToolState::BrushDrawing { stroke } = &mut app.session.tool_state {
-            for screen in event_positions {
-                if response.rect.contains(screen) {
-                    crate::brush::brush_add_sample(
-                        stroke,
-                        settings,
-                        crate::brush::BrushSample::mouse(screen_to_stage(screen, view)),
-                    );
-                }
-            }
-            if let Some(screen) = response.interact_pointer_pos() {
-                if response.rect.contains(screen) {
-                    let point = screen_to_stage(screen, view);
-                    if stroke
-                        .samples
-                        .last()
-                        .is_none_or(|sample| sample.position != point)
-                    {
-                        crate::brush::brush_add_sample(
-                            stroke,
-                            settings,
-                            crate::brush::BrushSample::mouse(point),
-                        );
-                    }
-                }
+            for sample in samples {
+                crate::brush::brush_add_sample(stroke, settings, sample);
             }
         }
     }
@@ -873,7 +873,11 @@ fn classic_brush(app: &mut EditorApp, response: &Response, view: &StageView, ctx
         {
             let stroke = crate::brush::brush_begin(
                 settings,
-                crate::brush::BrushSample::mouse(screen_to_stage(screen, view)),
+                crate::brush::BrushSample::pointer(
+                    screen_to_stage(screen, view),
+                    pointer_pressure_at(ctx, screen),
+                    ctx.input(|input| input.time),
+                ),
             );
             let region = crate::brush::brush_finish(stroke, settings);
             crate::brush::commit_brush_region(app, region, settings);
@@ -6981,6 +6985,51 @@ fn hit_test_selectable_placement(
     None
 }
 
+fn paint_variable_round_stroke_preview(
+    painter: &Painter,
+    dabs: &[(Vec2, f32)],
+    view: &StageView,
+    expansion_px: f32,
+    color: Color32,
+) {
+    if dabs.is_empty() {
+        return;
+    }
+    for &(position, size) in dabs {
+        painter.circle_filled(
+            stage_to_screen(position, view),
+            size.max(0.1) * view.scale * 0.5 + expansion_px,
+            color,
+        );
+    }
+    for pair in dabs.windows(2) {
+        let p0 = stage_to_screen(pair[0].0, view);
+        let p1 = stage_to_screen(pair[1].0, view);
+        let r0 = pair[0].1.max(0.1) * view.scale * 0.5 + expansion_px;
+        let r1 = pair[1].1.max(0.1) * view.scale * 0.5 + expansion_px;
+        let delta = p1 - p0;
+        let distance = delta.length();
+        if distance <= (r0 - r1).abs() + 1.0e-4 {
+            continue;
+        }
+        let theta = delta.y.atan2(delta.x);
+        let alpha = ((r0 - r1) / distance).clamp(-1.0, 1.0).acos();
+        let offset = |center: Pos2, radius: f32, angle: f32| {
+            center + egui::vec2(angle.cos() * radius, angle.sin() * radius)
+        };
+        painter.add(Shape::convex_polygon(
+            vec![
+                offset(p0, r0, theta + alpha),
+                offset(p1, r1, theta + alpha),
+                offset(p1, r1, theta - alpha),
+                offset(p0, r0, theta - alpha),
+            ],
+            color,
+            Stroke::NONE,
+        ));
+    }
+}
+
 fn paint_classic_nib_preview(
     painter: &Painter,
     stroke: &crate::brush::BrushStroke,
@@ -6989,15 +7038,23 @@ fn paint_classic_nib_preview(
     outline: Option<Color32>,
 ) {
     if crate::brush::brush_preview_nib(stroke) == crate::brush::BrushNib::Circle {
-        let points: Vec<Pos2> = crate::brush::brush_preview_trajectory(stroke)
-            .into_iter()
-            .map(|point| stage_to_screen(point, view))
-            .collect();
-        let width = crate::brush::brush_preview_size(stroke) * view.scale;
-        if let Some(outline) = outline {
-            paint_round_stroke_preview(painter, &points, width + 2.0, outline);
+        if crate::brush::brush_size_dynamics_enabled(stroke) {
+            let dabs = crate::brush::brush_preview_dabs(stroke);
+            if let Some(outline) = outline {
+                paint_variable_round_stroke_preview(painter, &dabs, view, 1.0, outline);
+            }
+            paint_variable_round_stroke_preview(painter, &dabs, view, 0.0, fill);
+        } else {
+            let points: Vec<Pos2> = crate::brush::brush_preview_trajectory(stroke)
+                .into_iter()
+                .map(|point| stage_to_screen(point, view))
+                .collect();
+            let width = crate::brush::brush_preview_size(stroke) * view.scale;
+            if let Some(outline) = outline {
+                paint_round_stroke_preview(painter, &points, width + 2.0, outline);
+            }
+            paint_round_stroke_preview(painter, &points, width, fill);
         }
-        paint_round_stroke_preview(painter, &points, width, fill);
         return;
     }
 
@@ -10198,6 +10255,7 @@ mod tests {
             nib: crate::brush::BrushNib::Circle,
             scale_with_stage: true,
             sync_with_eraser: true,
+            ..crate::brush::BrushSettings::default()
         };
         crate::brush::commit_brush_region_with_material(
             &mut app,

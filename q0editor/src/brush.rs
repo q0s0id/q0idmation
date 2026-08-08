@@ -51,6 +51,14 @@ pub struct BrushSettings {
     pub size: f32,
     pub smoothing: u8,
     pub nib: BrushNib,
+    /// Use tablet/touch pressure to modulate the nib size.
+    pub pressure_size: bool,
+    /// Use pointer velocity to make fast motion thinner.
+    pub velocity_size: bool,
+    /// Shared response strength for pressure and velocity, 0..=100.
+    pub dynamics_sensitivity: u8,
+    /// Smallest dynamic diameter as a fraction of the nominal size, 0.01..=1.
+    pub dynamics_min_size: f32,
     pub scale_with_stage: bool,
     pub sync_with_eraser: bool,
 }
@@ -67,6 +75,10 @@ impl Default for BrushSettings {
             size: 10.0,
             smoothing: 50,
             nib: BrushNib::Circle,
+            pressure_size: false,
+            velocity_size: false,
+            dynamics_sensitivity: 50,
+            dynamics_min_size: 0.2,
             scale_with_stage: true,
             sync_with_eraser: true,
         }
@@ -77,6 +89,7 @@ impl Default for BrushSettings {
 pub struct BrushSample {
     pub position: Vec2,
     pub pressure: Option<f32>,
+    pub time_seconds: f64,
 }
 
 impl BrushSample {
@@ -84,6 +97,15 @@ impl BrushSample {
         Self {
             position,
             pressure: None,
+            time_seconds: 0.0,
+        }
+    }
+
+    pub fn pointer(position: Vec2, pressure: Option<f32>, time_seconds: f64) -> Self {
+        Self {
+            position,
+            pressure,
+            time_seconds,
         }
     }
 }
@@ -96,16 +118,16 @@ pub struct BrushStroke {
     nib: BrushNib,
     size: f32,
     smoothing: u8,
+    pressure_size: bool,
+    velocity_size: bool,
+    dynamics_sensitivity: u8,
+    dynamics_min_size: f32,
     pub dirty_preview: bool,
 }
 
 pub fn brush_begin(settings: BrushSettings, sample: BrushSample) -> BrushStroke {
-    let coverage = sweep_nib(
-        settings.nib,
-        settings.size,
-        sample.position,
-        sample.position,
-    );
+    let initial_size = dynamic_sample_sizes(&[sample], settings)[0];
+    let coverage = sweep_nib(settings.nib, initial_size, sample.position, sample.position);
     let preview_paths = coverage_to_linear_paths(&coverage);
     BrushStroke {
         samples: vec![sample],
@@ -114,15 +136,33 @@ pub fn brush_begin(settings: BrushSettings, sample: BrushSample) -> BrushStroke 
         nib: settings.nib,
         size: settings.size,
         smoothing: settings.smoothing,
+        pressure_size: settings.pressure_size,
+        velocity_size: settings.velocity_size,
+        dynamics_sensitivity: settings.dynamics_sensitivity.min(100),
+        dynamics_min_size: sanitized_dynamic_min_size(settings.dynamics_min_size),
         dirty_preview: false,
     }
 }
 
 pub fn brush_add_sample(stroke: &mut BrushStroke, settings: BrushSettings, sample: BrushSample) {
-    stroke.samples.push(sample);
+    if stroke
+        .samples
+        .last()
+        .is_some_and(|last| vec2_distance(last.position, sample.position) <= 1.0e-5)
+    {
+        if let Some(last) = stroke.samples.last_mut() {
+            *last = sample;
+        }
+    } else {
+        stroke.samples.push(sample);
+    }
     stroke.nib = settings.nib;
     stroke.size = settings.size;
     stroke.smoothing = settings.smoothing;
+    stroke.pressure_size = settings.pressure_size;
+    stroke.velocity_size = settings.velocity_size;
+    stroke.dynamics_sensitivity = settings.dynamics_sensitivity.min(100);
+    stroke.dynamics_min_size = sanitized_dynamic_min_size(settings.dynamics_min_size);
     stroke.dirty_preview = true;
 }
 
@@ -135,7 +175,12 @@ pub fn brush_flush_pending(stroke: &mut BrushStroke) {
         return;
     }
     let trajectory = build_sweep_trajectory(&stroke.samples, stroke.smoothing, stroke.size);
-    stroke.coverage = sweep_trajectory_nib(stroke.nib, stroke.size, &trajectory);
+    let sizes = stroke_sample_sizes(stroke);
+    stroke.coverage = if brush_size_dynamics_enabled(stroke) {
+        sweep_variable_trajectory_nib(stroke.nib, &trajectory, &sizes)
+    } else {
+        sweep_trajectory_nib(stroke.nib, stroke.size, &trajectory)
+    };
     stroke.preview_paths = coverage_to_linear_paths(&stroke.coverage);
     stroke.dirty_preview = false;
 }
@@ -152,6 +197,16 @@ pub fn brush_preview_nib(stroke: &BrushStroke) -> BrushNib {
     stroke.nib
 }
 
+pub fn brush_size_dynamics_enabled(stroke: &BrushStroke) -> bool {
+    stroke.pressure_size || stroke.velocity_size
+}
+
+pub fn brush_preview_dabs(stroke: &BrushStroke) -> Vec<(Vec2, f32)> {
+    let trajectory = build_sweep_trajectory(&stroke.samples, stroke.smoothing, stroke.size);
+    let sizes = stroke_sample_sizes(stroke);
+    trajectory.into_iter().zip(sizes).collect()
+}
+
 /// Materialize the current gesture silhouette for non-circular live previews.
 /// Circle stays on the cheaper renderer path; fixed polygon nibs use this exact
 /// sweep so preview and commit cannot disagree about corners or orientation.
@@ -160,7 +215,13 @@ pub fn brush_preview_paths_for_render(stroke: &BrushStroke) -> Vec<VPath> {
         return stroke.preview_paths.clone();
     }
     let trajectory = build_sweep_trajectory(&stroke.samples, stroke.smoothing, stroke.size);
-    coverage_to_linear_paths(&sweep_trajectory_nib(stroke.nib, stroke.size, &trajectory))
+    let coverage = if brush_size_dynamics_enabled(stroke) {
+        let sizes = stroke_sample_sizes(stroke);
+        sweep_variable_trajectory_nib(stroke.nib, &trajectory, &sizes)
+    } else {
+        sweep_trajectory_nib(stroke.nib, stroke.size, &trajectory)
+    };
+    coverage_to_linear_paths(&coverage)
 }
 
 /// The live preview and committed coverage share this exact centre trajectory.
@@ -176,6 +237,10 @@ pub fn brush_finish(mut stroke: BrushStroke, settings: BrushSettings) -> MultiPo
     stroke.nib = settings.nib;
     stroke.size = settings.size;
     stroke.smoothing = settings.smoothing;
+    stroke.pressure_size = settings.pressure_size;
+    stroke.velocity_size = settings.velocity_size;
+    stroke.dynamics_sensitivity = settings.dynamics_sensitivity.min(100);
+    stroke.dynamics_min_size = sanitized_dynamic_min_size(settings.dynamics_min_size);
     stroke.dirty_preview = true;
     brush_flush_pending(&mut stroke);
     if is_single_dab {
@@ -190,11 +255,22 @@ pub fn brush_finish(mut stroke: BrushStroke, settings: BrushSettings) -> MultiPo
         // back in after smoothing resurrects the very sharp corners smoothing
         // just removed. Their caps therefore stay part of the smoothed boundary.
         if settings.nib == BrushNib::Circle {
-            if let Some(first) = stroke.samples.first().map(|sample| sample.position) {
-                finished = finished.union(&sweep_nib(settings.nib, settings.size, first, first));
+            let sizes = stroke_sample_sizes(&stroke);
+            if let Some((first, size)) = stroke.samples.first().zip(sizes.first()) {
+                finished = finished.union(&sweep_nib(
+                    settings.nib,
+                    *size,
+                    first.position,
+                    first.position,
+                ));
             }
-            if let Some(last) = stroke.samples.last().map(|sample| sample.position) {
-                finished = finished.union(&sweep_nib(settings.nib, settings.size, last, last));
+            if let Some((last, size)) = stroke.samples.last().zip(sizes.last()) {
+                finished = finished.union(&sweep_nib(
+                    settings.nib,
+                    *size,
+                    last.position,
+                    last.position,
+                ));
             }
         }
         finished
@@ -273,6 +349,114 @@ fn build_sweep_trajectory(samples: &[BrushSample], smoothing: u8, brush_size: f3
     }
 
     points
+}
+
+fn sanitized_dynamic_min_size(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.01, 1.0)
+    } else {
+        BrushSettings::default().dynamics_min_size
+    }
+}
+
+fn dynamic_sample_sizes(samples: &[BrushSample], settings: BrushSettings) -> Vec<f32> {
+    let min_ratio = sanitized_dynamic_min_size(settings.dynamics_min_size);
+    let sensitivity = f32::from(settings.dynamics_sensitivity.min(100)) / 100.0;
+    let pressure_gamma = 2.0_f32.powf((sensitivity - 0.5) * 2.0);
+    let velocity_reference = settings.size.max(0.1) * (80.0 - sensitivity * 60.0);
+
+    samples
+        .iter()
+        .enumerate()
+        .map(|(index, sample)| {
+            let mut factor = 1.0_f32;
+            if settings.pressure_size {
+                let pressure = sample.pressure.unwrap_or(1.0).clamp(0.0, 1.0);
+                let shaped = pressure.powf(pressure_gamma);
+                factor *= min_ratio + (1.0 - min_ratio) * shaped;
+            }
+            if settings.velocity_size {
+                let speed = brush_sample_speed(samples, index);
+                let normalized = (speed / velocity_reference.max(1.0)).max(0.0);
+                let speed_factor = min_ratio + (1.0 - min_ratio) / (1.0 + normalized);
+                factor *= speed_factor;
+            }
+            settings.size.max(0.1) * factor.clamp(min_ratio, 1.0)
+        })
+        .collect()
+}
+
+fn brush_sample_speed(samples: &[BrushSample], index: usize) -> f32 {
+    if samples.len() <= 1 {
+        return 0.0;
+    }
+    let (a, b) = if index == 0 {
+        (0, 1)
+    } else {
+        (index - 1, index)
+    };
+    let dt = (samples[b].time_seconds - samples[a].time_seconds)
+        .abs()
+        .max(1.0 / 1000.0) as f32;
+    vec2_distance(samples[a].position, samples[b].position) / dt
+}
+
+fn stroke_sample_sizes(stroke: &BrushStroke) -> Vec<f32> {
+    dynamic_sample_sizes(
+        &stroke.samples,
+        BrushSettings {
+            size: stroke.size,
+            pressure_size: stroke.pressure_size,
+            velocity_size: stroke.velocity_size,
+            dynamics_sensitivity: stroke.dynamics_sensitivity,
+            dynamics_min_size: stroke.dynamics_min_size,
+            ..BrushSettings::default()
+        },
+    )
+}
+
+fn sweep_variable_trajectory_nib(
+    nib: BrushNib,
+    trajectory: &[Vec2],
+    sizes: &[f32],
+) -> MultiPolygon<f64> {
+    let Some(first) = trajectory.first().copied() else {
+        return MultiPolygon(Vec::new());
+    };
+    let first_size = sizes.first().copied().unwrap_or(0.1).max(0.1);
+    if trajectory.len() == 1 {
+        return sweep_nib(nib, first_size, first, first);
+    }
+
+    let mut coverage = sweep_nib(nib, first_size, first, first);
+    for index in 1..trajectory.len() {
+        let start = trajectory[index - 1];
+        let end = trajectory[index];
+        let start_size = sizes.get(index - 1).copied().unwrap_or(first_size).max(0.1);
+        let end_size = sizes.get(index).copied().unwrap_or(start_size).max(0.1);
+        let segment = if (start_size - end_size).abs() <= 1.0e-4 {
+            sweep_nib(nib, start_size, start, end)
+        } else {
+            variable_nib_segment(nib, start, start_size, end, end_size)
+        };
+        coverage = coverage.union(&segment);
+    }
+    coverage
+}
+
+fn variable_nib_segment(
+    nib: BrushNib,
+    start: Vec2,
+    start_size: f32,
+    end: Vec2,
+    end_size: f32,
+) -> MultiPolygon<f64> {
+    let points = nib_outline(nib, start_size, start)
+        .into_iter()
+        .chain(nib_outline(nib, end_size, end))
+        .map(|point| Point::new(f64::from(point.x), f64::from(point.y)))
+        .collect::<Vec<_>>();
+    MultiPolygon(vec![MultiPoint(points).convex_hull()])
 }
 
 fn sweep_trajectory_nib(nib: BrushNib, size: f32, trajectory: &[Vec2]) -> MultiPolygon<f64> {
@@ -1974,6 +2158,93 @@ mod tests {
             .difference(&stroke.coverage)
             .union(&stroke.coverage.difference(&expected));
         assert!(mismatch.unsigned_area() < 1.0e-6);
+    }
+
+    #[test]
+    fn pressure_dynamics_respects_minimum_size() {
+        let mut dynamic = settings(20.0, 0);
+        dynamic.pressure_size = true;
+        dynamic.dynamics_sensitivity = 50;
+        dynamic.dynamics_min_size = 0.25;
+        let mut gesture = brush_begin(
+            dynamic,
+            BrushSample::pointer(Vec2::new(0.0, 0.0), Some(0.0), 0.0),
+        );
+        brush_add_sample(
+            &mut gesture,
+            dynamic,
+            BrushSample::pointer(Vec2::new(20.0, 0.0), Some(1.0), 0.1),
+        );
+        let dabs = brush_preview_dabs(&gesture);
+        assert!((dabs[0].1 - 5.0).abs() < 1.0e-4);
+        assert!((dabs[1].1 - 20.0).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn pressure_sensitivity_changes_the_response_curve() {
+        let sample = BrushSample::pointer(Vec2::new(0.0, 0.0), Some(0.5), 0.0);
+        let mut gentle = settings(20.0, 0);
+        gentle.pressure_size = true;
+        gentle.dynamics_min_size = 0.2;
+        gentle.dynamics_sensitivity = 0;
+        let mut sensitive = gentle;
+        sensitive.dynamics_sensitivity = 100;
+        let gentle_size = brush_preview_dabs(&brush_begin(gentle, sample))[0].1;
+        let sensitive_size = brush_preview_dabs(&brush_begin(sensitive, sample))[0].1;
+        assert!(sensitive_size < gentle_size * 0.7);
+    }
+
+    #[test]
+    fn pressure_mode_keeps_plain_mouse_at_nominal_size() {
+        let mut dynamic = settings(20.0, 0);
+        dynamic.pressure_size = true;
+        dynamic.dynamics_min_size = 0.1;
+        let gesture = brush_begin(dynamic, BrushSample::mouse(Vec2::new(10.0, 10.0)));
+        assert!((brush_preview_dabs(&gesture)[0].1 - 20.0).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn velocity_dynamics_makes_fast_motion_thinner_without_crossing_minimum() {
+        let mut dynamic = settings(20.0, 0);
+        dynamic.velocity_size = true;
+        dynamic.dynamics_sensitivity = 50;
+        dynamic.dynamics_min_size = 0.2;
+        let mut gesture = brush_begin(
+            dynamic,
+            BrushSample::pointer(Vec2::new(0.0, 0.0), None, 0.0),
+        );
+        brush_add_sample(
+            &mut gesture,
+            dynamic,
+            BrushSample::pointer(Vec2::new(10.0, 0.0), None, 1.0),
+        );
+        brush_add_sample(
+            &mut gesture,
+            dynamic,
+            BrushSample::pointer(Vec2::new(100.0, 0.0), None, 1.01),
+        );
+        let dabs = brush_preview_dabs(&gesture);
+        assert!(dabs[2].1 < dabs[1].1 * 0.5, "{dabs:?}");
+        assert!(dabs[2].1 >= 4.0 - 1.0e-4, "{dabs:?}");
+    }
+
+    #[test]
+    fn variable_size_sparse_samples_still_form_one_continuous_sweep() {
+        let mut dynamic = settings(24.0, 0);
+        dynamic.pressure_size = true;
+        dynamic.dynamics_min_size = 0.2;
+        let mut gesture = brush_begin(
+            dynamic,
+            BrushSample::pointer(Vec2::new(0.0, 0.0), Some(0.2), 0.0),
+        );
+        brush_add_sample(
+            &mut gesture,
+            dynamic,
+            BrushSample::pointer(Vec2::new(100.0, 0.0), Some(1.0), 0.1),
+        );
+        let finished = brush_finish(gesture, dynamic);
+        assert_eq!(finished.0.len(), 1);
+        assert!(finished.contains(&Point::new(50.0, 0.0)));
     }
 
     #[test]

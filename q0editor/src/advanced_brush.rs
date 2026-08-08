@@ -614,6 +614,7 @@ mod tests {
             nib: crate::brush::BrushNib::Circle,
             scale_with_stage: true,
             sync_with_eraser: true,
+            ..crate::brush::BrushSettings::default()
         };
         crate::brush::commit_brush_region_with_material(
             &mut app,
@@ -687,6 +688,7 @@ mod tests {
             nib: crate::brush::BrushNib::Circle,
             scale_with_stage: true,
             sync_with_eraser: true,
+            ..crate::brush::BrushSettings::default()
         };
         crate::brush::commit_brush_region_with_material(&mut app, region, bridge, None);
         let vector = app

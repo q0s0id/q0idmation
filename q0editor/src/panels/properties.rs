@@ -535,7 +535,7 @@ fn brush_properties(app: &mut EditorApp, ui: &mut Ui) {
             tool_hint(
                 app,
                 ui,
-                "Flash-style vector brush: static nib, continuous sweep and boundary smoothing. No stabilizer, taper, velocity or raster materials.",
+                "Flash-style vector brush: continuous fill-only sweep and boundary smoothing, with optional pressure/speed size dynamics. No stabilizer, taper or raster materials.",
             );
             egui::Grid::new("classic_brush_settings")
                 .num_columns(2)
@@ -571,6 +571,31 @@ fn brush_properties(app: &mut EditorApp, ui: &mut Ui) {
 
                     ui.label("Smoothing");
                     ui.add(egui::Slider::new(&mut app.session.brush.smoothing, 0..=100));
+                    ui.end_row();
+
+                    ui.label("Pressure size");
+                    ui.checkbox(&mut app.session.brush.pressure_size, "");
+                    ui.end_row();
+
+                    ui.label("Speed size");
+                    ui.checkbox(&mut app.session.brush.velocity_size, "");
+                    ui.end_row();
+
+                    let dynamics_enabled =
+                        app.session.brush.pressure_size || app.session.brush.velocity_size;
+                    ui.label("Sensitivity");
+                    ui.add_enabled(
+                        dynamics_enabled,
+                        egui::Slider::new(&mut app.session.brush.dynamics_sensitivity, 0..=100),
+                    );
+                    ui.end_row();
+
+                    ui.label("Minimum size");
+                    ui.add_enabled(
+                        dynamics_enabled,
+                        egui::Slider::new(&mut app.session.brush.dynamics_min_size, 0.01..=1.0)
+                            .suffix("×"),
+                    );
                     ui.end_row();
 
                     ui.label("Scale with stage");
