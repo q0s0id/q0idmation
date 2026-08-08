@@ -1,4 +1,4 @@
-use geo::{BooleanOps, ConvexHull, Coord, LineString, MultiPoint, MultiPolygon, Point, Polygon};
+use geo::{ConvexHull, Coord, LineString, MultiPoint, MultiPolygon, Point, Polygon};
 use q0s_format::v2::{Rgba, Vec2, VectorMaterial};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -407,24 +407,34 @@ fn dabs_to_coverage(dabs: &[AdvancedDab]) -> MultiPolygon<f64> {
     let Some(first) = dabs.first().copied() else {
         return MultiPolygon(Vec::new());
     };
-    let mut coverage = MultiPolygon(vec![ellipse_polygon(first, 20)]);
+    if dabs.len() == 1 {
+        return MultiPolygon(vec![ellipse_polygon(first, 20)]);
+    }
+
+    // Every bridge is the convex hull of two complete elliptical nib rings, so
+    // it already contains both endpoint dabs. Build all sweep surfaces first
+    // and union them in one balanced operation instead of repeatedly unioning
+    // a growing polygon after every pointer sample. The old left-fold became
+    // dramatically slower as a stroke grew even though no boolean work was
+    // needed until pointer-up.
+    let mut surfaces = Vec::with_capacity(dabs.len().saturating_sub(1));
     let mut previous_points = ellipse_points(first, 20);
     for &dab in &dabs[1..] {
         let points = ellipse_points(dab, 20);
-        let bridge = MultiPoint::new(
-            previous_points
-                .iter()
-                .chain(points.iter())
-                .copied()
-                .map(Point::from)
-                .collect::<Vec<_>>(),
-        )
-        .convex_hull();
-        coverage = coverage.union(&MultiPolygon(vec![bridge]));
-        coverage = coverage.union(&MultiPolygon(vec![ellipse_polygon(dab, 20)]));
+        surfaces.push(
+            MultiPoint::new(
+                previous_points
+                    .iter()
+                    .chain(points.iter())
+                    .copied()
+                    .map(Point::from)
+                    .collect::<Vec<_>>(),
+            )
+            .convex_hull(),
+        );
         previous_points = points;
     }
-    coverage
+    geo::unary_union(surfaces.iter())
 }
 
 fn ellipse_polygon(dab: AdvancedDab, segments: usize) -> Polygon<f64> {
@@ -630,6 +640,69 @@ mod tests {
                 radius: 15.0,
                 opacity: 0.48,
             }
+        );
+    }
+
+    #[test]
+    fn dense_advanced_commit_keeps_one_continuous_surface_after_batched_union() {
+        let settings = AdvancedBrushSettings {
+            stabilizer: 0,
+            smoothing: 0,
+            pressure_size: false,
+            ..AdvancedBrushSettings::default()
+        };
+        let samples = (0..240)
+            .map(|index| {
+                let x = index as f32 * 2.0;
+                let y = (index as f32 * 0.09).sin() * 18.0;
+                sample(x, y, 1.0, index as f64 / 240.0)
+            })
+            .collect();
+        let coverage = advanced_finish(AdvancedBrushStroke { samples, settings });
+        assert_eq!(coverage.0.len(), 1);
+        assert!(coverage.unsigned_area() > 4_000.0);
+    }
+
+    #[test]
+    fn dense_advanced_full_commit_keeps_raw_boundary_bounded() {
+        let mut app = crate::app::EditorApp::default();
+        let settings = AdvancedBrushSettings {
+            stabilizer: 0,
+            smoothing: 35,
+            pressure_size: false,
+            ..AdvancedBrushSettings::default()
+        };
+        let samples = (0..240)
+            .map(|index| {
+                let x = 20.0 + index as f32 * 2.0;
+                let y = 120.0 + (index as f32 * 0.09).sin() * 18.0;
+                sample(x, y, 1.0, index as f64 / 240.0)
+            })
+            .collect();
+        let region = advanced_finish(AdvancedBrushStroke { samples, settings });
+        let bridge = crate::brush::BrushSettings {
+            color: settings.color,
+            size: settings.size,
+            smoothing: 0,
+            nib: crate::brush::BrushNib::Circle,
+            scale_with_stage: true,
+            sync_with_eraser: true,
+        };
+        crate::brush::commit_brush_region_with_material(&mut app, region, bridge, None);
+        let vector = app
+            .state
+            .project
+            .assets
+            .iter()
+            .find_map(|asset| match asset {
+                q0s_format::v2::Asset::Vector(vector) if vector.asset_id != 0 => Some(vector),
+                _ => None,
+            })
+            .expect("dense advanced raw vector");
+        let anchors: usize = vector.paths.iter().map(|path| path.anchors.len()).sum();
+        assert!(
+            anchors < 2_500,
+            "dense advanced boundary exploded to {anchors} anchors"
         );
     }
 

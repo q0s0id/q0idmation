@@ -6421,15 +6421,26 @@ fn paint_classic_nib_preview(
         }
     }
 }
-fn advanced_preview_mesh(
+fn append_advanced_preview_surface(
+    mesh: &mut Mesh,
     dabs: &[crate::advanced_brush::AdvancedDab],
     view: &StageView,
     color: Color32,
     expansion: f32,
-) -> Mesh {
+) {
     const SEGMENTS: usize = 18;
-    let mut mesh = Mesh::default();
-    let mut rings: Vec<[Pos2; SEGMENTS]> = Vec::with_capacity(dabs.len());
+    if dabs.is_empty() {
+        return;
+    }
+
+    mesh.vertices
+        .reserve(dabs.len().saturating_mul(SEGMENTS + 1));
+    mesh.indices
+        .reserve(dabs.len().saturating_mul(SEGMENTS * 6 + 6));
+
+    let mut previous_ring: Option<[u32; SEGMENTS]> = None;
+    let mut first_ring: Option<[u32; SEGMENTS]> = None;
+    let mut last_ring = [0_u32; SEGMENTS];
 
     for dab in dabs {
         let center = stage_to_screen(dab.center, view);
@@ -6437,49 +6448,91 @@ fn advanced_preview_mesh(
         let minor = (dab.minor_radius + expansion).max(0.05) * view.scale;
         let cos_a = dab.angle_radians.cos();
         let sin_a = dab.angle_radians.sin();
-        let ring = std::array::from_fn(|index| {
+        let ring: [u32; SEGMENTS] = std::array::from_fn(|index| {
             let phase = std::f32::consts::TAU * index as f32 / SEGMENTS as f32;
             let x = phase.cos() * major;
             let y = phase.sin() * minor;
-            pos2(
+            let point = pos2(
                 center.x + x * cos_a - y * sin_a,
                 center.y + x * sin_a + y * cos_a,
-            )
+            );
+            let vertex = mesh.vertices.len() as u32;
+            mesh.colored_vertex(point, color);
+            vertex
         });
 
-        let center_index = mesh.vertices.len() as u32;
-        mesh.colored_vertex(center, color);
-        let ring_start = mesh.vertices.len() as u32;
-        for point in ring {
-            mesh.colored_vertex(point, color);
+        if first_ring.is_none() {
+            first_ring = Some(ring);
         }
-        for index in 0..SEGMENTS {
-            mesh.add_triangle(
-                center_index,
-                ring_start + index as u32,
-                ring_start + ((index + 1) % SEGMENTS) as u32,
-            );
+        if let Some(previous) = previous_ring {
+            for index in 0..SEGMENTS {
+                let next = (index + 1) % SEGMENTS;
+                mesh.add_triangle(previous[index], previous[next], ring[next]);
+                mesh.add_triangle(previous[index], ring[next], ring[index]);
+            }
         }
-        rings.push(ring);
+        previous_ring = Some(ring);
+        last_ring = ring;
     }
 
-    // Morph one oriented nib ring into the next with a GPU triangle strip.
-    // This tracks roundness/angle/taper much more closely than a centre-line
-    // ribbon, while still avoiding all boolean geometry during live input.
-    for pair in rings.windows(2) {
-        let first = &pair[0];
-        let second = &pair[1];
+    // Only the two end caps need triangle fans. The ring strips already fill
+    // the sweep between intermediate nibs, so adding a centre + fan for every
+    // pointer sample just bloats the live mesh without changing the silhouette.
+    let mut cap = |ring: [u32; SEGMENTS], center: Pos2| {
+        let center_index = mesh.vertices.len() as u32;
+        mesh.colored_vertex(center, color);
         for index in 0..SEGMENTS {
-            let next = (index + 1) % SEGMENTS;
-            let base = mesh.vertices.len() as u32;
-            mesh.colored_vertex(first[index], color);
-            mesh.colored_vertex(first[next], color);
-            mesh.colored_vertex(second[next], color);
-            mesh.colored_vertex(second[index], color);
-            mesh.add_triangle(base, base + 1, base + 2);
-            mesh.add_triangle(base, base + 2, base + 3);
+            mesh.add_triangle(center_index, ring[index], ring[(index + 1) % SEGMENTS]);
+        }
+    };
+    let first_center = stage_to_screen(dabs[0].center, view);
+    cap(
+        first_ring.expect("non-empty advanced preview ring"),
+        first_center,
+    );
+    if dabs.len() > 1 {
+        let last_center = stage_to_screen(dabs[dabs.len() - 1].center, view);
+        cap(last_ring, last_center);
+    }
+}
+
+fn advanced_preview_mesh(
+    dabs: &[crate::advanced_brush::AdvancedDab],
+    view: &StageView,
+    settings: crate::advanced_brush::AdvancedBrushSettings,
+) -> Mesh {
+    let mut mesh = Mesh::default();
+    if dabs.is_empty() {
+        return mesh;
+    }
+
+    if settings.glow {
+        // Keep the same layered halo look, but append every layer into one
+        // epaint mesh. This is one shape / GPU submission instead of rebuilding
+        // and submitting a separate full stroke mesh for every glow layer.
+        for layer in (1..=5).rev() {
+            let t = layer as f32 / 5.0;
+            let alpha = (settings.glow_opacity * (1.0 - t).powi(2) * 90.0).clamp(0.0, 80.0) as u8;
+            if alpha == 0 {
+                continue;
+            }
+            let glow = Color32::from_rgba_unmultiplied(
+                settings.color.r,
+                settings.color.g,
+                settings.color.b,
+                alpha,
+            );
+            append_advanced_preview_surface(&mut mesh, dabs, view, glow, settings.glow_radius * t);
         }
     }
+
+    let body = Color32::from_rgba_unmultiplied(
+        settings.color.r,
+        settings.color.g,
+        settings.color.b,
+        settings.color.a,
+    );
+    append_advanced_preview_surface(&mut mesh, dabs, view, body, 0.0);
     mesh
 }
 
@@ -6493,36 +6546,7 @@ fn paint_advanced_gpu_preview(
         return;
     }
     let settings = stroke.settings.sanitized();
-    if settings.glow {
-        // Preview-only soft halo approximation: a handful of translucent GPU
-        // mesh passes. Commit/export use the canonical material renderer.
-        for layer in (1..=5).rev() {
-            let t = layer as f32 / 5.0;
-            let alpha = (settings.glow_opacity * (1.0 - t).powi(2) * 90.0).clamp(0.0, 80.0) as u8;
-            if alpha == 0 {
-                continue;
-            }
-            let glow = Color32::from_rgba_unmultiplied(
-                settings.color.r,
-                settings.color.g,
-                settings.color.b,
-                alpha,
-            );
-            painter.add(Shape::Mesh(advanced_preview_mesh(
-                &dabs,
-                view,
-                glow,
-                settings.glow_radius * t,
-            )));
-        }
-    }
-    let body = Color32::from_rgba_unmultiplied(
-        settings.color.r,
-        settings.color.g,
-        settings.color.b,
-        settings.color.a,
-    );
-    painter.add(Shape::Mesh(advanced_preview_mesh(&dabs, view, body, 0.0)));
+    painter.add(Shape::Mesh(advanced_preview_mesh(&dabs, view, settings)));
 }
 
 fn draw_in_progress_overlay(app: &EditorApp, painter: &Painter, view: &StageView) {
@@ -8506,6 +8530,121 @@ mod tests {
             found, None,
             "transformed placements are not part of the merge surface"
         );
+    }
+
+    #[test]
+    fn advanced_preview_reuses_ring_vertices_instead_of_duplicating_every_bridge() {
+        let settings = crate::advanced_brush::AdvancedBrushSettings {
+            glow: false,
+            stabilizer: 0,
+            smoothing: 0,
+            pressure_size: false,
+            ..Default::default()
+        };
+        let mut stroke = crate::advanced_brush::advanced_begin(
+            settings,
+            crate::advanced_brush::AdvancedBrushSample::mouse(Vec2::new(0.0, 0.0), 0.0),
+        );
+        for index in 1..200 {
+            crate::advanced_brush::advanced_add_sample(
+                &mut stroke,
+                settings,
+                crate::advanced_brush::AdvancedBrushSample::mouse(
+                    Vec2::new(index as f32 * 2.0, (index as f32 * 0.1).sin() * 12.0),
+                    index as f64 / 120.0,
+                ),
+            );
+        }
+        let dabs = crate::advanced_brush::advanced_dabs(&stroke);
+        let view = StageView {
+            origin: Pos2::ZERO,
+            scale: 1.0,
+            stage_rect: egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(800.0, 600.0)),
+        };
+        let mesh = advanced_preview_mesh(&dabs, &view, settings);
+        assert!(
+            mesh.vertices.len() <= dabs.len() * 19 + 2,
+            "preview duplicated bridge vertices: {} vertices for {} dabs",
+            mesh.vertices.len(),
+            dabs.len()
+        );
+
+        let glow_settings = crate::advanced_brush::AdvancedBrushSettings {
+            glow: true,
+            glow_radius: 18.0,
+            glow_opacity: 0.7,
+            ..settings
+        };
+        let glow_mesh = advanced_preview_mesh(&dabs, &view, glow_settings);
+        assert!(
+            glow_mesh.vertices.len() <= dabs.len() * 91 + 10,
+            "glow preview escaped its linear mesh budget: {} vertices for {} dabs",
+            glow_mesh.vertices.len(),
+            dabs.len()
+        );
+    }
+
+    #[test]
+    fn advanced_preview_strip_keeps_intermediate_dab_centers_filled() {
+        fn triangle_contains(point: Pos2, a: Pos2, b: Pos2, c: Pos2) -> bool {
+            let cross =
+                |u: Pos2, v: Pos2, w: Pos2| (v.x - u.x) * (w.y - u.y) - (v.y - u.y) * (w.x - u.x);
+            let ab = cross(a, b, point);
+            let bc = cross(b, c, point);
+            let ca = cross(c, a, point);
+            (ab >= -1.0e-4 && bc >= -1.0e-4 && ca >= -1.0e-4)
+                || (ab <= 1.0e-4 && bc <= 1.0e-4 && ca <= 1.0e-4)
+        }
+
+        let settings = crate::advanced_brush::AdvancedBrushSettings {
+            size: 30.0,
+            roundness: 0.35,
+            angle_degrees: 35.0,
+            stabilizer: 0,
+            smoothing: 0,
+            pressure_size: false,
+            ..Default::default()
+        };
+        let mut stroke = crate::advanced_brush::advanced_begin(
+            settings,
+            crate::advanced_brush::AdvancedBrushSample::mouse(Vec2::new(40.0, 40.0), 0.0),
+        );
+        for (index, position) in [Vec2::new(100.0, 60.0), Vec2::new(125.0, 125.0)]
+            .into_iter()
+            .enumerate()
+        {
+            crate::advanced_brush::advanced_add_sample(
+                &mut stroke,
+                settings,
+                crate::advanced_brush::AdvancedBrushSample::mouse(
+                    position,
+                    (index + 1) as f64 * 0.1,
+                ),
+            );
+        }
+        let dabs = crate::advanced_brush::advanced_dabs(&stroke);
+        let view = StageView {
+            origin: Pos2::ZERO,
+            scale: 1.0,
+            stage_rect: egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(300.0, 300.0)),
+        };
+        let mesh = advanced_preview_mesh(&dabs, &view, settings);
+        for dab in &dabs {
+            let point = stage_to_screen(dab.center, &view);
+            let covered = mesh.indices.chunks_exact(3).any(|triangle| {
+                triangle_contains(
+                    point,
+                    mesh.vertices[triangle[0] as usize].pos,
+                    mesh.vertices[triangle[1] as usize].pos,
+                    mesh.vertices[triangle[2] as usize].pos,
+                )
+            });
+            assert!(
+                covered,
+                "preview strip left a hole at dab center {:?}",
+                dab.center
+            );
+        }
     }
 
     #[test]
