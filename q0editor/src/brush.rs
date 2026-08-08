@@ -122,6 +122,7 @@ pub struct BrushStroke {
     velocity_size: bool,
     dynamics_sensitivity: u8,
     dynamics_min_size: f32,
+    last_pressure: Option<f32>,
     pub dirty_preview: bool,
 }
 
@@ -140,22 +141,41 @@ pub fn brush_begin(settings: BrushSettings, sample: BrushSample) -> BrushStroke 
         velocity_size: settings.velocity_size,
         dynamics_sensitivity: settings.dynamics_sensitivity.min(100),
         dynamics_min_size: sanitized_dynamic_min_size(settings.dynamics_min_size),
+        last_pressure: sample.pressure,
         dirty_preview: false,
     }
 }
 
-pub fn brush_add_sample(stroke: &mut BrushStroke, settings: BrushSettings, sample: BrushSample) {
+pub fn brush_add_sample(
+    stroke: &mut BrushStroke,
+    settings: BrushSettings,
+    mut sample: BrushSample,
+) {
+    // Windows pen input is not guaranteed to attach pressure to every motion
+    // event. Once a gesture has produced real pen pressure, a pressureless
+    // motion sample is missing data, not a mouse sample at 100% pressure.
+    // Carry the last real value across those gaps. If pressure first appears a
+    // few events into the gesture, backfill the short pressureless prefix too,
+    // otherwise the committed vector gets a full-size circular start blob.
+    if let Some(pressure) = sample.pressure {
+        if stroke.last_pressure.is_none() {
+            for previous in &mut stroke.samples {
+                if previous.pressure.is_none() {
+                    previous.pressure = Some(pressure);
+                }
+            }
+        }
+        stroke.last_pressure = Some(pressure);
+    } else if let Some(pressure) = stroke.last_pressure {
+        sample.pressure = Some(pressure);
+    }
+
     if stroke
         .samples
         .last()
         .is_some_and(|last| vec2_distance(last.position, sample.position) <= 1.0e-5)
     {
         if let Some(last) = stroke.samples.last_mut() {
-            // Pointer-up can arrive as a pressureless fallback at the exact same
-            // position as the final pen sample. Replacing the sample wholesale
-            // turns that endpoint back into a full-size mouse dab and also makes
-            // velocity appear to drop to zero. Preserve arrival time and only
-            // accept a real pressure update while the pointer is stationary.
             if sample.pressure.is_some() {
                 last.pressure = sample.pressure;
             }
@@ -313,7 +333,7 @@ pub fn brush_finish(mut stroke: BrushStroke, settings: BrushSettings) -> MultiPo
         // Polygon nibs are different: unioning their literal endpoint imprint
         // back in after smoothing resurrects the very sharp corners smoothing
         // just removed. Their caps therefore stay part of the smoothed boundary.
-        if settings.nib == BrushNib::Circle {
+        if settings.nib == BrushNib::Circle && !brush_size_dynamics_enabled(&stroke) {
             let sizes = stroke_sample_sizes(&stroke);
             if let Some((first, size)) = stroke.samples.first().zip(sizes.first()) {
                 finished = finished.union(&sweep_nib(
@@ -448,19 +468,29 @@ fn dynamic_sample_sizes(samples: &[BrushSample], settings: BrushSettings) -> Vec
         .collect()
 }
 
-fn brush_sample_speed(samples: &[BrushSample], index: usize) -> f32 {
-    if samples.len() <= 1 {
-        return 0.0;
-    }
-    let (a, b) = if index == 0 {
-        (0, 1)
-    } else {
-        (index - 1, index)
-    };
+fn brush_segment_speed(samples: &[BrushSample], a: usize, b: usize) -> f32 {
     let dt = (samples[b].time_seconds - samples[a].time_seconds)
         .abs()
         .max(1.0 / 1000.0) as f32;
     vec2_distance(samples[a].position, samples[b].position) / dt
+}
+
+fn brush_sample_speed(samples: &[BrushSample], index: usize) -> f32 {
+    if samples.len() <= 1 {
+        return 0.0;
+    }
+    if index == 0 {
+        return brush_segment_speed(samples, 0, 1);
+    }
+    let current = brush_segment_speed(samples, index - 1, index);
+    if index < 2 {
+        return current;
+    }
+    // One tiny terminal move is common immediately before pen-up. Treat it as
+    // event jitter instead of letting velocity dynamics jump back to a full-size
+    // circular dab. A genuinely slow gesture still becomes thick after two
+    // consecutive slow segments.
+    current.max(brush_segment_speed(samples, index - 2, index - 1))
 }
 
 fn stroke_sample_sizes(stroke: &BrushStroke) -> Vec<f32> {
@@ -2223,6 +2253,112 @@ mod tests {
             .difference(&stroke.coverage)
             .union(&stroke.coverage.difference(&expected));
         assert!(mismatch.unsigned_area() < 1.0e-6);
+    }
+
+    #[test]
+    fn intermittent_missing_pen_pressure_never_becomes_full_size_dabs() {
+        let mut dynamic = settings(40.0, 0);
+        dynamic.pressure_size = true;
+        dynamic.dynamics_sensitivity = 50;
+        dynamic.dynamics_min_size = 0.1;
+        let mut gesture = brush_begin(
+            dynamic,
+            BrushSample::pointer(Vec2::new(0.0, 0.0), None, 0.0),
+        );
+        brush_add_sample(
+            &mut gesture,
+            dynamic,
+            BrushSample::pointer(Vec2::new(10.0, 0.0), Some(0.2), 0.01),
+        );
+        brush_add_sample(
+            &mut gesture,
+            dynamic,
+            BrushSample::pointer(Vec2::new(20.0, 0.0), None, 0.02),
+        );
+        brush_add_sample(
+            &mut gesture,
+            dynamic,
+            BrushSample::pointer(Vec2::new(30.0, 0.0), Some(0.2), 0.03),
+        );
+
+        assert!(gesture
+            .samples
+            .iter()
+            .all(|sample| sample.pressure == Some(0.2)));
+        let dabs = brush_preview_dabs(&gesture);
+        let min = dabs
+            .iter()
+            .map(|(_, size)| *size)
+            .fold(f32::INFINITY, f32::min);
+        let max = dabs
+            .iter()
+            .map(|(_, size)| *size)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            (max - min).abs() < 1.0e-4,
+            "pressure gaps created size beads: {dabs:?}"
+        );
+        assert!(
+            max < dynamic.size * 0.6,
+            "pressure gap became a full nib: {max}"
+        );
+    }
+
+    #[test]
+    fn velocity_terminal_micro_move_does_not_create_a_stop_dot() {
+        let mut dynamic = settings(40.0, 0);
+        dynamic.velocity_size = true;
+        dynamic.dynamics_sensitivity = 50;
+        dynamic.dynamics_min_size = 0.1;
+        let mut gesture = brush_begin(
+            dynamic,
+            BrushSample::pointer(Vec2::new(0.0, 0.0), None, 0.0),
+        );
+        brush_add_sample(
+            &mut gesture,
+            dynamic,
+            BrushSample::pointer(Vec2::new(100.0, 0.0), None, 0.05),
+        );
+        brush_add_sample(
+            &mut gesture,
+            dynamic,
+            BrushSample::pointer(Vec2::new(101.0, 0.0), None, 0.10),
+        );
+        let dabs = brush_preview_dabs(&gesture);
+        assert!(
+            dabs[2].1 <= dabs[1].1 * 1.05,
+            "terminal micro-move inflated velocity cap: {dabs:?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_finish_does_not_reunion_literal_endpoint_discs() {
+        let mut dynamic = settings(40.0, 100);
+        dynamic.pressure_size = true;
+        dynamic.dynamics_sensitivity = 50;
+        dynamic.dynamics_min_size = 0.1;
+        let mut gesture = brush_begin(
+            dynamic,
+            BrushSample::pointer(Vec2::new(0.0, 0.0), Some(0.2), 0.0),
+        );
+        brush_add_sample(
+            &mut gesture,
+            dynamic,
+            BrushSample::pointer(Vec2::new(60.0, 0.0), Some(0.2), 0.05),
+        );
+        brush_add_sample(
+            &mut gesture,
+            dynamic,
+            BrushSample::pointer(Vec2::new(120.0, 0.0), Some(0.2), 0.10),
+        );
+        let last_size = brush_preview_dabs(&gesture).last().unwrap().1;
+        let finished = brush_finish(gesture, dynamic);
+        let bounds = finished.bounding_rect().expect("dynamic brush bounds");
+        assert!(
+            bounds.max().x <= 120.0 + f64::from(last_size) * 0.60,
+            "finish restored an oversized literal endpoint disc: {:?}, size={last_size}",
+            bounds
+        );
     }
 
     #[test]
