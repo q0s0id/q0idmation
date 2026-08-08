@@ -7,6 +7,8 @@ use egui::{
     pos2, Color32, ColorImage, Context, Mesh, Painter, Pos2, Rect, Shape, Stroke, TextureHandle,
     TextureId, TextureOptions,
 };
+#[cfg(feature = "appearance-mask-eraser")]
+use geo::BooleanOps;
 use geo::{Buffer, Coord, LineString};
 use lyon_path::math::point as lyon_point;
 use lyon_tessellation::geometry_builder::{BuffersBuilder, Positions, VertexBuffers};
@@ -47,6 +49,89 @@ struct CachedAppearanceTexture {
     pixels_per_unit: f32,
 }
 
+#[cfg(feature = "appearance-mask-eraser")]
+#[derive(Clone)]
+pub(crate) struct CachedInteractivePath {
+    pub points: Vec<Vec2>,
+    pub signed_area: f64,
+    pub bounds: Option<(f32, f32, f32, f32)>,
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+#[derive(Clone, Default)]
+pub(crate) struct CachedAppearanceHitGeometry {
+    pub source: Vec<CachedInteractivePath>,
+    pub clip: Vec<CachedInteractivePath>,
+    pub erase: Vec<CachedInteractivePath>,
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+#[derive(Clone, Default)]
+pub(crate) struct CachedSelectionGeometry {
+    pub body: Vec<Vec<Vec2>>,
+    pub fallback_material_support: Vec<Vec<Vec2>>,
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SelectionPaintKey {
+    pub asset_id: u16,
+    pub path_indices: Vec<usize>,
+    pub field_transform_bits: [u32; 6],
+    pub view_origin_bits: [u32; 2],
+    pub view_scale_bits: u32,
+    pub accent_rgba: [u8; 4],
+    pub texture_id: TextureId,
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+#[derive(Clone, Default)]
+pub(crate) struct CachedSelectionPaint {
+    pub meshes: Vec<Mesh>,
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn cache_interactive_paths(paths: &[VPath]) -> Vec<CachedInteractivePath> {
+    paths
+        .iter()
+        .filter(|path| path.closed)
+        .filter_map(|path| {
+            let points = flatten_path(path);
+            if points.len() < 3 {
+                return None;
+            }
+            let signed_area = points
+                .iter()
+                .zip(points.iter().cycle().skip(1))
+                .take(points.len())
+                .map(|(a, b)| f64::from(a.x) * f64::from(b.y) - f64::from(b.x) * f64::from(a.y))
+                .sum::<f64>()
+                * 0.5;
+            let mut bounds = (
+                f32::INFINITY,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+            );
+            for point in &points {
+                bounds.0 = bounds.0.min(point.x);
+                bounds.1 = bounds.1.min(point.y);
+                bounds.2 = bounds.2.max(point.x);
+                bounds.3 = bounds.3.max(point.y);
+            }
+            Some(CachedInteractivePath {
+                points,
+                signed_area,
+                bounds: (bounds.0.is_finite()
+                    && bounds.1.is_finite()
+                    && bounds.2.is_finite()
+                    && bounds.3.is_finite())
+                .then_some(bounds),
+            })
+        })
+        .collect()
+}
+
 #[derive(Default)]
 pub struct TextureCache {
     by_asset_id: HashMap<u16, TextureHandle>,
@@ -58,10 +143,22 @@ pub struct TextureCache {
     appearance_signature_by_asset: HashMap<u16, (u64, Vec2)>,
     #[cfg(feature = "appearance-mask-eraser")]
     visible_body_by_asset: HashMap<u16, Vec<Vec<Vec2>>>,
+    #[cfg(feature = "appearance-mask-eraser")]
+    appearance_hit_by_asset: HashMap<u16, CachedAppearanceHitGeometry>,
+    #[cfg(feature = "appearance-mask-eraser")]
+    selection_geometry_by_key: HashMap<(u16, Vec<usize>), CachedSelectionGeometry>,
+    #[cfg(feature = "appearance-mask-eraser")]
+    selection_paint_by_key: HashMap<SelectionPaintKey, CachedSelectionPaint>,
     #[cfg(all(test, feature = "appearance-mask-eraser"))]
     appearance_signature_build_count: usize,
     #[cfg(all(test, feature = "appearance-mask-eraser"))]
     visible_body_build_count: usize,
+    #[cfg(all(test, feature = "appearance-mask-eraser"))]
+    appearance_hit_build_count: usize,
+    #[cfg(all(test, feature = "appearance-mask-eraser"))]
+    selection_geometry_build_count: usize,
+    #[cfg(all(test, feature = "appearance-mask-eraser"))]
+    selection_paint_build_count: usize,
 }
 
 impl TextureCache {
@@ -74,6 +171,9 @@ impl TextureCache {
             self.appearance_by_asset.clear();
             self.appearance_signature_by_asset.clear();
             self.visible_body_by_asset.clear();
+            self.appearance_hit_by_asset.clear();
+            self.selection_geometry_by_key.clear();
+            self.selection_paint_by_key.clear();
         }
     }
 
@@ -92,6 +192,11 @@ impl TextureCache {
                 .retain(|(id, _, _), _| *id != asset_id);
             self.appearance_signature_by_asset.remove(&asset_id);
             self.visible_body_by_asset.remove(&asset_id);
+            self.appearance_hit_by_asset.remove(&asset_id);
+            self.selection_geometry_by_key
+                .retain(|(id, _), _| *id != asset_id);
+            self.selection_paint_by_key
+                .retain(|key, _| key.asset_id != asset_id);
         }
     }
 
@@ -100,6 +205,129 @@ impl TextureCache {
         for asset_id in asset_ids {
             self.invalidate_asset(asset_id);
         }
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    pub(crate) fn appearance_hit_geometry(
+        &mut self,
+        vector: &q0s_format::v2::VectorAsset,
+        appearance: Option<&VectorAppearance>,
+    ) -> &CachedAppearanceHitGeometry {
+        let asset_id = vector.asset_id;
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            self.appearance_hit_by_asset.entry(asset_id)
+        {
+            let source_paths = appearance
+                .filter(|appearance| !appearance.material_source.is_empty())
+                .map(|appearance| appearance.material_source.as_slice())
+                .unwrap_or(vector.paths.as_slice());
+            let clip_paths = appearance
+                .map(|appearance| appearance.clip_mask.as_slice())
+                .unwrap_or(&[]);
+            let erase_paths = appearance
+                .map(|appearance| appearance.erase_mask.as_slice())
+                .unwrap_or(&[]);
+            entry.insert(CachedAppearanceHitGeometry {
+                source: cache_interactive_paths(source_paths),
+                clip: cache_interactive_paths(clip_paths),
+                erase: cache_interactive_paths(erase_paths),
+            });
+            #[cfg(all(test, feature = "appearance-mask-eraser"))]
+            {
+                self.appearance_hit_build_count += 1;
+            }
+        }
+        self.appearance_hit_by_asset
+            .get(&asset_id)
+            .expect("appearance hit geometry inserted above")
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    pub(crate) fn selection_geometry(
+        &mut self,
+        vector: &q0s_format::v2::VectorAsset,
+        appearance: &VectorAppearance,
+        selected_indices: &[usize],
+    ) -> Option<&CachedSelectionGeometry> {
+        appearance.field_transform.inverse()?;
+        let mut key_indices = selected_indices.to_vec();
+        key_indices.sort_unstable();
+        key_indices.dedup();
+        let key = (vector.asset_id, key_indices);
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            self.selection_geometry_by_key.entry(key.clone())
+        {
+            let subset = q0s_format::v2::VectorAsset {
+                asset_id: vector.asset_id,
+                paths: key
+                    .1
+                    .iter()
+                    .filter_map(|index| vector.paths.get(*index).cloned())
+                    .collect(),
+                fill: vector.fill,
+                stroke: None,
+            };
+            let canonical_body = crate::appearance::canonical_visible_source_surface_for_vector(
+                &subset, appearance,
+            )?;
+            let body = crate::brush::coverage_to_paths(&canonical_body)
+                .iter()
+                .map(flatten_path)
+                .collect();
+            let fallback_material_support =
+                if canonical_body.0.is_empty() && !appearance.clip_mask.is_empty() {
+                    let clip = crate::appearance::mask_paths_to_coverage(&appearance.clip_mask);
+                    let erase = crate::appearance::mask_paths_to_coverage(&appearance.erase_mask);
+                    let visible = if erase.0.is_empty() {
+                        clip
+                    } else {
+                        clip.difference(&erase)
+                    };
+                    crate::brush::coverage_to_paths(&visible)
+                        .iter()
+                        .map(flatten_path)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+            entry.insert(CachedSelectionGeometry {
+                body,
+                fallback_material_support,
+            });
+            #[cfg(all(test, feature = "appearance-mask-eraser"))]
+            {
+                self.selection_geometry_build_count += 1;
+            }
+        }
+        self.selection_geometry_by_key.get(&key)
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    pub(crate) fn selection_paint(&self, key: &SelectionPaintKey) -> Option<&CachedSelectionPaint> {
+        self.selection_paint_by_key.get(key)
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    pub(crate) fn insert_selection_paint(
+        &mut self,
+        key: SelectionPaintKey,
+        paint: CachedSelectionPaint,
+    ) {
+        self.selection_paint_by_key.insert(key, paint);
+        #[cfg(all(test, feature = "appearance-mask-eraser"))]
+        {
+            self.selection_paint_build_count += 1;
+        }
+    }
+
+    #[cfg(all(test, feature = "appearance-mask-eraser"))]
+    pub(crate) fn appearance_hit_build_count(&self) -> usize {
+        self.appearance_hit_build_count
+    }
+
+    #[cfg(all(test, feature = "appearance-mask-eraser"))]
+    pub(crate) fn selection_paint_build_count(&self) -> usize {
+        self.selection_paint_build_count
     }
 
     #[cfg(feature = "appearance-mask-eraser")]
@@ -625,17 +853,25 @@ fn tessellate_closed_bevel_stroke(
 /// Closed display stroke with bounded bevel joins. egui 0.27 uses an unlimited
 /// miter for closed PathShape strokes, which can produce giant spikes when a
 /// thin selection contour nearly folds back on itself at low zoom.
+pub(crate) fn closed_bevel_stroke_mesh(
+    points: &[Pos2],
+    width: f32,
+    color: Color32,
+) -> Option<Mesh> {
+    let buffers = tessellate_closed_bevel_stroke(points, width)?;
+    Some(lyon_buffers_mesh(buffers, color))
+}
+
 pub fn paint_closed_bevel_stroke(painter: &Painter, points: &[Pos2], width: f32, color: Color32) {
-    let Some(buffers) = tessellate_closed_bevel_stroke(points, width) else {
-        return;
-    };
-    paint_lyon_buffers(painter, buffers, color);
+    if let Some(mesh) = closed_bevel_stroke_mesh(points, width, color) {
+        painter.add(Shape::Mesh(mesh));
+    }
 }
 
 /// Paint one tessellated fill with a repeating screen-space texture. UVs are
 /// derived from absolute screen coordinates, so the pattern density is stable
 /// through smooth zoom and does not require one CPU shape per visual dot.
-fn complex_fill_pattern_mesh(
+pub(crate) fn complex_fill_pattern_mesh(
     contours: &[Vec<Pos2>],
     texture_id: TextureId,
     tile_size_points: f32,
@@ -677,12 +913,9 @@ pub fn paint_round_stroke_preview(painter: &Painter, points: &[Pos2], width: f32
     paint_complex_fill(painter, &contours, color);
 }
 
-fn paint_lyon_buffers(
-    painter: &Painter,
-    buffers: VertexBuffers<lyon_path::math::Point, u32>,
-    color: Color32,
-) {
+fn lyon_buffers_mesh(buffers: VertexBuffers<lyon_path::math::Point, u32>, color: Color32) -> Mesh {
     let mut mesh = Mesh::default();
+    mesh.vertices.reserve(buffers.vertices.len());
     for point in buffers.vertices {
         mesh.vertices.push(Vertex {
             pos: Pos2::new(point.x, point.y),
@@ -691,7 +924,15 @@ fn paint_lyon_buffers(
         });
     }
     mesh.indices = buffers.indices;
-    painter.add(Shape::Mesh(mesh));
+    mesh
+}
+
+fn paint_lyon_buffers(
+    painter: &Painter,
+    buffers: VertexBuffers<lyon_path::math::Point, u32>,
+    color: Color32,
+) {
+    painter.add(Shape::Mesh(lyon_buffers_mesh(buffers, color)));
 }
 
 fn round_stroke_preview_contours(points: &[Pos2], width: f32) -> Option<Vec<Vec<Pos2>>> {

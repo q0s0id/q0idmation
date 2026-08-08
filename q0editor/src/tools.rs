@@ -15,8 +15,11 @@ use q0s_format::v2::{
 use crate::app::EditorApp;
 use crate::render::{
     flatten_path, flatten_path_for_stroke, paint_complex_fill, paint_round_stroke_preview,
-    placement_bbox, placement_local_bbox, StageView,
+    placement_bbox, placement_local_bbox, StageView, TextureCache,
 };
+#[cfg(feature = "appearance-mask-eraser")]
+use crate::render::{CachedInteractivePath, CachedSelectionPaint, SelectionPaintKey};
+
 use crate::state::{
     AppearanceTransformSnapshot, GroupTransformOperation, Handle, PathRef, PlacementRef, Selection,
     Tool, ToolState, TransformEdge, TransformPivot,
@@ -131,7 +134,11 @@ fn subselect(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>) {
 /// handles vs. placement bodies so the user sees exactly what the next
 /// click will do: corners resize both axes, edge handles resize one axis,
 /// and the body moves the selection.
-fn pick_cursor(app: &EditorApp, response: &Response, view: &StageView) -> Option<egui::CursorIcon> {
+fn pick_cursor(
+    app: &mut EditorApp,
+    response: &Response,
+    view: &StageView,
+) -> Option<egui::CursorIcon> {
     use egui::CursorIcon;
     // Mid-drag: the cursor freezes on whatever icon was shown when the
     // drag started, otherwise it flickers between Move/Resize as the
@@ -257,7 +264,7 @@ fn selected_transform_hit(
 }
 
 fn select_cursor(
-    app: &EditorApp,
+    app: &mut EditorApp,
     response: &Response,
     view: &StageView,
 ) -> Option<egui::CursorIcon> {
@@ -277,13 +284,20 @@ fn select_cursor(
     // by the shared drawing Placement's bounding box. Display objects (q0rg,
     // bitmap, transformed vector instances) keep normal object hit-testing.
     let cursor_stage = screen_to_stage(cursor_screen, view);
-    if selected_raw_body_contains_point(app, cursor_stage)
-        || hit_test_raw_hover(
+    let selected_body_hit = selected_raw_body_contains_point(app, cursor_stage);
+    let raw_hover_hit = if selected_body_hit {
+        false
+    } else {
+        hit_test_raw_hover_cached(
             &app.state.project,
+            &mut app.textures,
             app.session.current_q0rg_id,
             app.session.current_frame,
             cursor_stage,
         )
+    };
+    if selected_body_hit
+        || raw_hover_hit
         || hit_test_selectable_placement(
             &app.state.project,
             app.session.current_q0rg_id,
@@ -3598,6 +3612,132 @@ fn raw_edit_layers(state: &ToolState) -> std::collections::BTreeSet<(u16, u16)> 
     layers
 }
 
+#[cfg(feature = "appearance-mask-eraser")]
+fn cached_paths_contain_or_near(
+    paths: &[CachedInteractivePath],
+    point: Vec2,
+    distance: f32,
+) -> bool {
+    let distance = distance.max(0.0);
+    let mut winding = 0_i32;
+    let mut near_boundary = false;
+    for path in paths {
+        let Some((min_x, min_y, max_x, max_y)) = path.bounds else {
+            continue;
+        };
+        if point.x < min_x - distance
+            || point.x > max_x + distance
+            || point.y < min_y - distance
+            || point.y > max_y + distance
+        {
+            continue;
+        }
+        if point_in_polygon(&path.points, point) {
+            winding += if path.signed_area >= 0.0 { 1 } else { -1 };
+        }
+        if distance > 0.0 && nearest_segment_distance(&path.points, point) <= distance {
+            near_boundary = true;
+        }
+    }
+    winding != 0 || near_boundary
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn interactive_visible_fill_hit_cached(
+    vector: &VectorAsset,
+    appearance: Option<&q0s_format::v2::VectorAppearance>,
+    point: Vec2,
+    edge_tolerance: f32,
+    textures: &mut TextureCache,
+) -> bool {
+    let geometry = textures.appearance_hit_geometry(vector, appearance);
+    let Some(appearance) = appearance else {
+        return cached_paths_contain_or_near(&geometry.source, point, edge_tolerance);
+    };
+    let Some(inverse_field) = appearance.field_transform.inverse() else {
+        return false;
+    };
+    let canonical = inverse_field.apply(point);
+    let support_hit = if geometry.clip.is_empty() {
+        let radius = match appearance.material {
+            q0s_format::v2::VectorMaterial::Solid => 0.0,
+            q0s_format::v2::VectorMaterial::SoftHalo { radius, .. } => radius.max(0.0),
+        };
+        cached_paths_contain_or_near(
+            &geometry.source,
+            canonical,
+            radius + edge_tolerance.max(0.0),
+        )
+    } else {
+        cached_paths_contain_or_near(&geometry.clip, canonical, edge_tolerance.max(0.0))
+    };
+    support_hit && !cached_paths_contain_or_near(&geometry.erase, canonical, 0.001)
+}
+
+fn hit_test_raw_hover_cached(
+    project: &ProjectV2,
+    textures: &mut TextureCache,
+    q0rg_id: u16,
+    frame: u16,
+    cursor: Vec2,
+) -> bool {
+    #[cfg(not(feature = "appearance-mask-eraser"))]
+    {
+        let _ = textures;
+        return hit_test_raw_hover(project, q0rg_id, frame, cursor);
+    }
+    #[cfg(feature = "appearance-mask-eraser")]
+    {
+        let Some(q) = project.q0rgs.iter().find(|q| q.q0rg_id == q0rg_id) else {
+            return false;
+        };
+        for layer in q.layers.iter().rev() {
+            for placement_idx in active_raw_placement_indices(project, layer, frame)
+                .into_iter()
+                .rev()
+            {
+                let placement = &layer.placements[placement_idx];
+                let Target::Asset(asset_id) = placement.target else {
+                    continue;
+                };
+                let Some(Asset::Vector(vector)) =
+                    project.assets.iter().find(|asset| asset.id() == asset_id)
+                else {
+                    continue;
+                };
+                if vector.fill.is_some()
+                    && interactive_visible_fill_hit_cached(
+                        vector,
+                        project.asset_appearances.get(&asset_id),
+                        cursor,
+                        2.0,
+                        textures,
+                    )
+                {
+                    return true;
+                }
+                let stroke_radius = vector
+                    .stroke
+                    .as_ref()
+                    .map(|stroke| stroke.width.max(1.0) * 0.5 + 3.0)
+                    .unwrap_or(3.0);
+                for path in vector.paths.iter().rev() {
+                    if path.closed && vector.fill.is_some() {
+                        continue;
+                    }
+                    let points = flatten_path(path);
+                    if points.len() >= 2
+                        && nearest_segment_distance(&points, cursor) <= stroke_radius
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RawSelectionHit {
     /// One connected filled surface. The refs include every source contour
@@ -3612,6 +3752,7 @@ enum RawSelectionHit {
 /// selects the connected filled region, not the asset/placement that happens
 /// to store it. This is intentionally separate from `hit_test_raw_path`, which
 /// remains contour-oriented for Subselect and low-level editing tools.
+#[cfg(not(feature = "appearance-mask-eraser"))]
 fn hit_test_raw_hover(project: &ProjectV2, q0rg_id: u16, frame: u16, cursor: Vec2) -> bool {
     let Some(q) = project.q0rgs.iter().find(|q| q.q0rg_id == q0rg_id) else {
         return false;
@@ -7012,13 +7153,13 @@ fn draw_in_progress_overlay(app: &EditorApp, painter: &Painter, view: &StageView
 }
 
 /// Draw selection bounds using the current theme accent.
-pub fn draw_selection_overlay(app: &EditorApp, painter: &Painter, view: &StageView) {
+pub fn draw_selection_overlay(app: &mut EditorApp, painter: &Painter, view: &StageView) {
     draw_selection_content_overlay(app, painter, view);
     draw_group_transform_frame(app, painter, view);
     draw_transform_pivot_overlay(app, painter, view);
 }
 
-fn draw_selection_content_overlay(app: &EditorApp, painter: &Painter, view: &StageView) {
+fn draw_selection_content_overlay(app: &mut EditorApp, painter: &Painter, view: &StageView) {
     let accent = selection_color(app);
     if let Selection::Multi(refs) = &app.session.selection {
         for r in refs {
@@ -7065,22 +7206,22 @@ fn draw_selection_content_overlay(app: &EditorApp, painter: &Painter, view: &Sta
         return;
     }
     if let Selection::RawArea {
-        ref placements,
-        ref objects,
+        placements,
+        objects,
         bounds_min,
         bounds_max,
-    } = app.session.selection
+    } = app.session.selection.clone()
     {
         draw_raw_area_selection(
             app,
             painter,
             view,
-            placements,
+            &placements,
             bounds_min,
             bounds_max,
             objects.is_empty(),
         );
-        for reference in objects {
+        for reference in &objects {
             let Some(layer) = app
                 .state
                 .project
@@ -7125,13 +7266,9 @@ fn draw_selection_content_overlay(app: &EditorApp, painter: &Painter, view: &Sta
         }
         return;
     }
-    if let Selection::Mixed {
-        ref paths,
-        ref objects,
-    } = app.session.selection
-    {
-        draw_raw_paths_overlay(app, painter, view, paths, false);
-        draw_object_reference_outlines(app, painter, view, objects);
+    if let Selection::Mixed { paths, objects } = app.session.selection.clone() {
+        draw_raw_paths_overlay(app, painter, view, &paths, false);
+        draw_object_reference_outlines(app, painter, view, &objects);
         return;
     }
     if let Selection::PathPoints {
@@ -7152,8 +7289,8 @@ fn draw_selection_content_overlay(app: &EditorApp, painter: &Painter, view: &Sta
         );
         return;
     }
-    if let Selection::Paths(ref refs) = app.session.selection {
-        draw_raw_paths_overlay(app, painter, view, refs, true);
+    if let Selection::Paths(refs) = app.session.selection.clone() {
+        draw_raw_paths_overlay(app, painter, view, &refs, true);
         return;
     }
     if let Selection::Path {
@@ -7498,11 +7635,10 @@ fn draw_selection_contour(painter: &Painter, contours: &[Vec<Pos2>], accent: Col
     }
 }
 
-fn paint_selection_surface(painter: &Painter, contours: &[Vec<Pos2>], app: &EditorApp) {
+fn paint_selection_surface(painter: &Painter, contours: &[Vec<Pos2>], accent: Color32) {
     if contours.is_empty() {
         return;
     }
-    let accent = selection_color(app);
     paint_selection_stipple_pattern(painter, contours, accent);
     draw_selection_contour(painter, contours, accent);
 }
@@ -7513,6 +7649,7 @@ fn appearance_selection_body_contours(
     appearance: &q0s_format::v2::VectorAppearance,
     subset_path_indices: Option<&[usize]>,
     view: &StageView,
+    textures: &mut TextureCache,
 ) -> Vec<Vec<Pos2>> {
     let selected_indices: Vec<usize> = match subset_path_indices {
         Some(indices) => indices
@@ -7531,9 +7668,8 @@ fn appearance_selection_body_contours(
         return Vec::new();
     }
 
-    // Normal Glow stays entirely borrowed here: no VPath/anchor clone and no
-    // material reconstruction on repaint. Hit-testing may use the soft halo, but
-    // the visual selection cue follows the selected vector body.
+    // Unmasked material is already cheap and preserves the original bezier body
+    // exactly. Only masked/post-material fragments need the heavier boolean body.
     if appearance.erase_mask.is_empty() && appearance.clip_mask.is_empty() {
         return selected_indices
             .iter()
@@ -7548,58 +7684,140 @@ fn appearance_selection_body_contours(
             .collect();
     }
 
-    // Masked/fractured material needs geometric clipping. Clone only those
-    // selected paths, never the common unmasked Advanced Brush path above.
-    let selected_paths: Vec<VPath> = selected_indices
-        .iter()
-        .filter_map(|index| vector.paths.get(*index).cloned())
-        .collect();
-    let subset = VectorAsset {
-        asset_id: vector.asset_id,
-        paths: selected_paths,
-        fill: vector.fill,
-        stroke: None,
+    // Masked raw selections used to rebuild geo intersections/differences on
+    // every repaint. Cache the result in canonical appearance-field space, then
+    // apply only the affine field transform + view transform each frame.
+    let Some(cached) = textures.selection_geometry(vector, appearance, &selected_indices) else {
+        return Vec::new();
     };
-    let body = crate::appearance::visible_source_surface_for_vector(&subset, Some(appearance));
-    let body_contours = surface_to_screen_contours(&body, view);
-    if !body_contours.is_empty() {
-        return body_contours;
-    }
+    let canonical = if cached.body.is_empty() {
+        &cached.fallback_material_support
+    } else {
+        &cached.body
+    };
+    canonical
+        .iter()
+        .map(|contour| {
+            contour
+                .iter()
+                .map(|point| stage_to_screen(appearance.field_transform.apply(*point), view))
+                .collect()
+        })
+        .collect()
+}
 
-    // A post-material split can contain only halo with no opaque carrier pixels.
-    // In that rare case use the finite resolved fragment itself as the cue so the
-    // selection never becomes invisible. This path has an explicit clip, so it
-    // avoids buffering the original dense brush source.
-    if !appearance.clip_mask.is_empty() {
-        let support =
-            crate::appearance::visible_material_surface_for_vector(&subset, Some(appearance));
-        return surface_to_screen_contours(&support, view);
-    }
-    Vec::new()
+#[cfg(feature = "appearance-mask-eraser")]
+struct AppearanceSelectionOverlay<'a> {
+    view: &'a StageView,
+    rect: egui::Rect,
+    vector: &'a VectorAsset,
+    appearance: &'a q0s_format::v2::VectorAppearance,
+    subset_path_indices: Option<&'a [usize]>,
+    accent: Color32,
 }
 
 #[cfg(feature = "appearance-mask-eraser")]
 fn draw_appearance_selection_overlay(
-    app: &EditorApp,
     painter: &Painter,
-    view: &StageView,
-    rect: egui::Rect,
-    vector: &VectorAsset,
-    appearance: &q0s_format::v2::VectorAppearance,
-    subset_path_indices: Option<&[usize]>,
+    textures: &mut TextureCache,
+    request: AppearanceSelectionOverlay<'_>,
 ) {
+    let AppearanceSelectionOverlay {
+        view,
+        rect,
+        vector,
+        appearance,
+        subset_path_indices,
+        accent,
+    } = request;
     let visible_rect = rect.intersect(painter.clip_rect());
     if !visible_rect.is_positive() {
         return;
     }
     let clipped = painter.with_clip_rect(visible_rect);
+    let mut path_indices: Vec<usize> = match subset_path_indices {
+        Some(indices) => indices
+            .iter()
+            .copied()
+            .filter(|index| vector.paths.get(*index).is_some_and(|path| path.closed))
+            .collect(),
+        None => vector
+            .paths
+            .iter()
+            .enumerate()
+            .filter_map(|(index, path)| path.closed.then_some(index))
+            .collect(),
+    };
+    path_indices.sort_unstable();
+    path_indices.dedup();
+    if path_indices.is_empty() {
+        return;
+    }
+
+    // The selection visual is screen-space: both the repeating dot UVs and the
+    // one/two-pixel bevel strokes depend on the current view. Cache the exact
+    // final meshes for a stable selection/view instead of asking lyon to
+    // tessellate the same 30k-point contours every repaint.
+    let texture = selection_stipple_texture(&clipped, accent);
+    let field = appearance.field_transform;
+    let key = SelectionPaintKey {
+        asset_id: vector.asset_id,
+        path_indices: path_indices.clone(),
+        field_transform_bits: [
+            field.a11.to_bits(),
+            field.a12.to_bits(),
+            field.a21.to_bits(),
+            field.a22.to_bits(),
+            field.tx.to_bits(),
+            field.ty.to_bits(),
+        ],
+        view_origin_bits: [view.origin.x.to_bits(), view.origin.y.to_bits()],
+        view_scale_bits: view.scale.to_bits(),
+        accent_rgba: [accent.r(), accent.g(), accent.b(), accent.a()],
+        texture_id: texture.id(),
+    };
+    if let Some(cached) = textures.selection_paint(&key) {
+        for mesh in &cached.meshes {
+            clipped.add(Shape::Mesh(mesh.clone()));
+        }
+        return;
+    }
+
     let contours =
-        appearance_selection_body_contours(vector, appearance, subset_path_indices, view);
-    paint_selection_surface(&clipped, &contours, app);
+        appearance_selection_body_contours(vector, appearance, Some(&path_indices), view, textures);
+    if contours.is_empty() {
+        return;
+    }
+    let mut meshes = Vec::new();
+    if let Some(mesh) = crate::render::complex_fill_pattern_mesh(
+        &contours,
+        texture.id(),
+        SELECTION_STIPPLE_SPACING_PX,
+    ) {
+        meshes.push(mesh);
+    }
+    for contour in &contours {
+        let outline = selection_contour_points(contour);
+        if outline.len() < 3 {
+            continue;
+        }
+        if let Some(mesh) =
+            crate::render::closed_bevel_stroke_mesh(&outline, 2.0, Color32::from_black_alpha(180))
+        {
+            meshes.push(mesh);
+        }
+        if let Some(mesh) = crate::render::closed_bevel_stroke_mesh(&outline, 1.0, accent) {
+            meshes.push(mesh);
+        }
+    }
+    for mesh in &meshes {
+        clipped.add(Shape::Mesh(mesh.clone()));
+    }
+    textures.insert_selection_paint(key, CachedSelectionPaint { meshes });
 }
 
 fn draw_raw_area_selection(
-    app: &EditorApp,
+    app: &mut EditorApp,
     painter: &Painter,
     view: &StageView,
     placements: &[PlacementRef],
@@ -7613,6 +7831,7 @@ fn draw_raw_area_selection(
     );
     let visible_rect = selection_rect.intersect(painter.clip_rect());
     let clipped = painter.with_clip_rect(visible_rect);
+    let accent = selection_color(app);
     let mut surfaces = Vec::new();
     for r in placements {
         let Some(placement) = app
@@ -7637,13 +7856,16 @@ fn draw_raw_area_selection(
         #[cfg(feature = "appearance-mask-eraser")]
         if let Some(appearance) = app.state.project.asset_appearances.get(&asset_id) {
             draw_appearance_selection_overlay(
-                app,
                 &clipped,
-                view,
-                selection_rect,
-                vector,
-                appearance,
-                None,
+                &mut app.textures,
+                AppearanceSelectionOverlay {
+                    view,
+                    rect: selection_rect,
+                    vector,
+                    appearance,
+                    subset_path_indices: None,
+                    accent,
+                },
             );
             // Appearance visuals are painted directly from the selected geometry; keep
             // them out of the plain raw-fill union below.
@@ -7662,14 +7884,14 @@ fn draw_raw_area_selection(
         _ => geo::unary_union(surfaces.iter()),
     };
     let selection_contours = surface_to_screen_contours(&surface, view);
-    paint_selection_surface(&clipped, &selection_contours, app);
+    paint_selection_surface(&clipped, &selection_contours, accent);
     if draw_box {
-        draw_flash_selection_box(painter, selection_rect, selection_color(app));
+        draw_flash_selection_box(painter, selection_rect, accent);
     }
 }
 
 fn draw_raw_paths_overlay(
-    app: &EditorApp,
+    app: &mut EditorApp,
     painter: &Painter,
     view: &StageView,
     refs: &[PathRef],
@@ -7679,6 +7901,7 @@ fn draw_raw_paths_overlay(
     // splitting. That is an implementation detail: one logical selection gets
     // exactly one transform frame. Per-carrier boxes make a single glow look
     // like two independent selections.
+    let accent = selection_color(app);
     let selection_frame = draw_boxes
         .then(|| raw_path_refs_ui_bounds(&app.state.project, refs))
         .flatten();
@@ -7800,13 +8023,16 @@ fn draw_raw_paths_overlay(
                     stage_to_screen(Vec2::new(max_x, max_y), view),
                 );
                 draw_appearance_selection_overlay(
-                    app,
                     painter,
-                    view,
-                    rect,
-                    vector,
-                    appearance,
-                    Some(&closed_indices),
+                    &mut app.textures,
+                    AppearanceSelectionOverlay {
+                        view,
+                        rect,
+                        vector,
+                        appearance,
+                        subset_path_indices: Some(&closed_indices),
+                        accent,
+                    },
                 );
             }
             continue;
@@ -7818,7 +8044,7 @@ fn draw_raw_paths_overlay(
         if contours.is_empty() {
             continue;
         }
-        paint_selection_surface(painter, &contours, app);
+        paint_selection_surface(painter, &contours, accent);
     }
 
     if let Some((min_x, min_y, max_x, max_y)) = selection_frame {
@@ -7830,7 +8056,12 @@ fn draw_raw_paths_overlay(
     }
 }
 
-fn draw_whole_raw_fill_overlay(app: &EditorApp, painter: &Painter, view: &StageView, r: PathRef) {
+fn draw_whole_raw_fill_overlay(
+    app: &mut EditorApp,
+    painter: &Painter,
+    view: &StageView,
+    r: PathRef,
+) {
     draw_raw_paths_overlay(app, painter, view, &[r], true);
 }
 
@@ -7865,7 +8096,11 @@ fn draw_partial_raw_selection(
     let visible_rect = selection_rect.intersect(painter.clip_rect());
     let clipped = painter.with_clip_rect(visible_rect);
     if path.closed && screen.len() >= 3 {
-        paint_selection_surface(&clipped, std::slice::from_ref(&screen), app);
+        paint_selection_surface(
+            &clipped,
+            std::slice::from_ref(&screen),
+            selection_color(app),
+        );
     } else {
         crate::render::paint_concave_fill(&clipped, &screen, selection_fill_color(app, 40));
     }
@@ -9731,6 +9966,7 @@ mod tests {
             Asset::Bitmap(_) | Asset::Q0v(_) => unreachable!(),
         };
         let appearance = project.asset_appearances.get(&1).expect("appearance");
+        let mut cache = TextureCache::default();
         for point in [
             Vec2::new(-5.0, 10.0),
             Vec2::new(2.0, 2.0),
@@ -9738,8 +9974,20 @@ mod tests {
             Vec2::new(25.0, 10.0),
             Vec2::new(40.0, 40.0),
         ] {
+            let exact = interactive_visible_fill_hit(vector, Some(appearance), point, 2.0);
             assert_eq!(
-                interactive_visible_fill_hit(vector, Some(appearance), point, 2.0),
+                interactive_visible_fill_hit_cached(
+                    vector,
+                    Some(appearance),
+                    point,
+                    2.0,
+                    &mut cache,
+                ),
+                exact,
+                "cached interactive hover changed raw hit semantics at {point:?}",
+            );
+            assert_eq!(
+                exact,
                 crate::appearance::visible_material_contains_point(
                     vector,
                     Some(appearance),
@@ -9749,8 +9997,25 @@ mod tests {
                 "interactive hover diverged from exact visible material at {point:?}",
             );
         }
-        assert!(hit_test_raw_hover(&project, 1, 0, Vec2::new(-5.0, 10.0)));
-        assert!(!hit_test_raw_hover(&project, 1, 0, Vec2::new(10.0, 10.0)));
+        assert_eq!(
+            cache.appearance_hit_build_count(),
+            1,
+            "one immutable raw asset must flatten source/clip/erase paths once",
+        );
+        assert!(hit_test_raw_hover_cached(
+            &project,
+            &mut cache,
+            1,
+            0,
+            Vec2::new(-5.0, 10.0),
+        ));
+        assert!(!hit_test_raw_hover_cached(
+            &project,
+            &mut cache,
+            1,
+            0,
+            Vec2::new(10.0, 10.0),
+        ));
     }
 
     #[cfg(feature = "appearance-mask-eraser")]
@@ -9797,6 +10062,7 @@ mod tests {
             settings.material(),
         );
 
+        let mut hover_cache = TextureCache::default();
         let start = std::time::Instant::now();
         for index in 0..64 {
             let point = if index % 2 == 0 {
@@ -9804,8 +10070,13 @@ mod tests {
             } else {
                 Vec2::new(600.0, 440.0)
             };
-            let _ = hit_test_raw_hover(&app.state.project, 1, 0, point);
+            let _ = hit_test_raw_hover_cached(&app.state.project, &mut hover_cache, 1, 0, point);
         }
+        assert_eq!(
+            hover_cache.appearance_hit_build_count(),
+            1,
+            "dense Advanced Glow hover must reuse one flattened hit geometry cache",
+        );
         assert!(
             start.elapsed() < std::time::Duration::from_secs(2),
             "dense Advanced Glow hover fell back to frame-by-frame component reconstruction: {:?}",
@@ -10336,7 +10607,9 @@ mod tests {
             scale: 1.0,
             stage_rect: egui::Rect::from_min_max(Pos2::new(-20.0, -20.0), Pos2::new(50.0, 50.0)),
         };
-        let contours = appearance_selection_body_contours(vector, appearance, None, &view);
+        let mut cache = TextureCache::default();
+        let contours =
+            appearance_selection_body_contours(vector, appearance, None, &view, &mut cache);
         assert!(
             !contours.is_empty(),
             "selected glow body needs a visible cue"
@@ -11291,6 +11564,92 @@ mod tests {
 
     #[cfg(feature = "appearance-mask-eraser")]
     #[test]
+    fn masked_raw_selection_reuses_exact_tessellated_mesh_until_view_changes() {
+        let mut app = EditorApp::default();
+        app.state.project = appearance_selection_project(true);
+        app.session.current_q0rg_id = 1;
+        app.session.current_frame = 0;
+        app.session.selection = Selection::Paths(vec![PathRef {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: 0,
+            path_idx: 0,
+        }]);
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(200.0, 200.0));
+        let view = StageView {
+            origin: Pos2::new(20.0, 20.0),
+            scale: 2.0,
+            stage_rect: rect,
+        };
+        for _ in 0..2 {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let painter = ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Middle,
+                        egui::Id::new("selection-mesh-cache"),
+                    ));
+                    draw_selection_overlay(&mut app, &painter, &view);
+                },
+            );
+        }
+        assert_eq!(
+            app.textures.selection_paint_build_count(),
+            1,
+            "stable masked raw selection retessellated the same stipple/contour meshes",
+        );
+
+        let zoomed = StageView {
+            origin: view.origin,
+            scale: 3.0,
+            stage_rect: rect,
+        };
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Middle,
+                    egui::Id::new("selection-mesh-cache-zoom"),
+                ));
+                draw_selection_overlay(&mut app, &painter, &zoomed);
+            },
+        );
+        assert_eq!(
+            app.textures.selection_paint_build_count(),
+            2,
+            "screen-space selection mesh must rebuild when zoom changes",
+        );
+
+        app.textures.invalidate_asset(1);
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Middle,
+                    egui::Id::new("selection-mesh-cache-invalidated"),
+                ));
+                draw_selection_overlay(&mut app, &painter, &zoomed);
+            },
+        );
+        assert_eq!(
+            app.textures.selection_paint_build_count(),
+            3,
+            "asset mutation must evict cached raw selection meshes",
+        );
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
     fn glow_selection_visual_point_count_is_independent_of_viewport_area() {
         let project = appearance_selection_project(false);
         let vector = match &project.assets[0] {
@@ -11308,8 +11667,9 @@ mod tests {
             scale: 12.0,
             stage_rect: egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(8000.0, 6000.0)),
         };
-        let a = appearance_selection_body_contours(vector, appearance, None, &view_a);
-        let b = appearance_selection_body_contours(vector, appearance, None, &view_b);
+        let mut cache = TextureCache::default();
+        let a = appearance_selection_body_contours(vector, appearance, None, &view_a, &mut cache);
+        let b = appearance_selection_body_contours(vector, appearance, None, &view_b, &mut cache);
         assert_eq!(
             a.iter().map(Vec::len).collect::<Vec<_>>(),
             b.iter().map(Vec::len).collect::<Vec<_>>(),
