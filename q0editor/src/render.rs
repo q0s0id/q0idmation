@@ -46,6 +46,8 @@ pub struct TextureCache {
     q0v_media: HashMap<u16, q0video::q0v::Q0vFile>,
     #[cfg(feature = "appearance-mask-eraser")]
     appearance_by_asset: HashMap<(u16, u16, u64), CachedAppearanceTexture>,
+    #[cfg(feature = "appearance-mask-eraser")]
+    appearance_fingerprint_by_asset: HashMap<u16, u64>,
 }
 
 impl TextureCache {
@@ -54,7 +56,15 @@ impl TextureCache {
         self.by_q0v_frame.clear();
         self.q0v_media.clear();
         #[cfg(feature = "appearance-mask-eraser")]
-        self.appearance_by_asset.clear();
+        {
+            self.appearance_by_asset.clear();
+            self.appearance_fingerprint_by_asset.clear();
+        }
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    pub(crate) fn appearance_fingerprint(&self, asset_id: u16) -> Option<u64> {
+        self.appearance_fingerprint_by_asset.get(&asset_id).copied()
     }
 }
 
@@ -1415,6 +1425,9 @@ fn paint_vector_appearance_halo(
     let bucket = (target_ppu * 4.0).round().clamp(4.0, 16.0) as u16;
     let ppu = f32::from(bucket) / 4.0;
     let (fingerprint, origin) = appearance_cache_signature(vector, appearance);
+    textures
+        .appearance_fingerprint_by_asset
+        .insert(vector.asset_id, fingerprint);
     let key = (vector.asset_id, bucket, fingerprint);
     if !textures.appearance_by_asset.contains_key(&key) {
         textures

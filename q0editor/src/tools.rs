@@ -7346,7 +7346,11 @@ fn appearance_selection_stipple_points(
 #[derive(Clone)]
 struct CachedAppearanceSelectionStipple {
     key: u64,
-    points: std::sync::Arc<Vec<Pos2>>,
+    texture: TextureHandle,
+    texture_rect: egui::Rect,
+    body_contours: std::sync::Arc<Vec<Vec<Pos2>>>,
+    #[cfg(test)]
+    point_count: usize,
 }
 
 #[cfg(all(test, feature = "appearance-mask-eraser"))]
@@ -7355,24 +7359,16 @@ static APPEARANCE_SELECTION_STIPPLE_BUILD_COUNT: std::sync::atomic::AtomicUsize 
 
 #[cfg(feature = "appearance-mask-eraser")]
 fn appearance_selection_stipple_cache_key(
-    vector: &VectorAsset,
-    appearance: &q0s_format::v2::VectorAppearance,
+    appearance_fingerprint: u64,
     view: &StageView,
     rect: egui::Rect,
     subset_path_indices: Option<&[usize]>,
 ) -> u64 {
     use std::hash::{Hash, Hasher};
 
-    let (appearance_fingerprint, _) = crate::render::appearance_cache_signature(vector, appearance);
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     appearance_fingerprint.hash(&mut hasher);
     for value in [
-        appearance.field_transform.a11,
-        appearance.field_transform.a12,
-        appearance.field_transform.a21,
-        appearance.field_transform.a22,
-        appearance.field_transform.tx,
-        appearance.field_transform.ty,
         view.origin.x,
         view.origin.y,
         view.scale,
@@ -7383,47 +7379,105 @@ fn appearance_selection_stipple_cache_key(
     ] {
         value.to_bits().hash(&mut hasher);
     }
-    if let Some(indices) = subset_path_indices {
-        indices.len().hash(&mut hasher);
-        for index in indices {
-            index.hash(&mut hasher);
-            if let Some(path) = vector.paths.get(*index) {
-                path.closed.hash(&mut hasher);
-                path.anchors.len().hash(&mut hasher);
-                for anchor in &path.anchors {
-                    anchor.point.x.to_bits().hash(&mut hasher);
-                    anchor.point.y.to_bits().hash(&mut hasher);
-                    anchor
-                        .in_handle
-                        .map(|point| (point.x.to_bits(), point.y.to_bits()))
-                        .hash(&mut hasher);
-                    anchor
-                        .out_handle
-                        .map(|point| (point.x.to_bits(), point.y.to_bits()))
-                        .hash(&mut hasher);
-                }
-            }
-        }
-    } else {
-        0_usize.hash(&mut hasher);
-    }
+    subset_path_indices.unwrap_or(&[]).hash(&mut hasher);
     hasher.finish()
 }
 
 #[cfg(feature = "appearance-mask-eraser")]
-fn cached_appearance_selection_stipple_points(
+fn appearance_selection_body_contours(
+    vector: &VectorAsset,
+    appearance: &q0s_format::v2::VectorAppearance,
+    subset_path_indices: Option<&[usize]>,
+    view: &StageView,
+) -> Vec<Vec<Pos2>> {
+    let selected_paths: Vec<VPath> = match subset_path_indices {
+        Some(indices) => indices
+            .iter()
+            .filter_map(|index| vector.paths.get(*index))
+            .filter(|path| path.closed)
+            .cloned()
+            .collect(),
+        None => vector
+            .paths
+            .iter()
+            .filter(|path| path.closed)
+            .cloned()
+            .collect(),
+    };
+    if selected_paths.is_empty() {
+        return Vec::new();
+    }
+
+    // Normal Glow has no post-material clip/erase. Its opaque body is exactly
+    // the source vector, so reconstructing a MultiPolygon every repaint is pure
+    // wasted work (and catastrophic for a dense Advanced Brush stroke).
+    if appearance.erase_mask.is_empty() && appearance.clip_mask.is_empty() {
+        return selected_paths
+            .iter()
+            .map(|path| {
+                flatten_path(path)
+                    .into_iter()
+                    .map(|point| stage_to_screen(point, view))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|contour| contour.len() >= 2)
+            .collect();
+    }
+
+    // Masked/fractured appearance does need resolved body geometry, but this
+    // helper is only called on selection-cache miss, never on every repaint.
+    let subset = VectorAsset {
+        asset_id: vector.asset_id,
+        paths: selected_paths,
+        fill: vector.fill,
+        stroke: None,
+    };
+    let body = crate::appearance::visible_source_surface_for_vector(&subset, Some(appearance));
+    surface_to_screen_contours(&body, view)
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn appearance_selection_texture_rect(sample_rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        Pos2::new(sample_rect.left().floor(), sample_rect.top().floor()),
+        Pos2::new(
+            sample_rect.right().ceil() + 1.0,
+            sample_rect.bottom().ceil() + 1.0,
+        ),
+    )
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn appearance_selection_stipple_image(texture_rect: egui::Rect, points: &[Pos2]) -> ColorImage {
+    let width = texture_rect.width().ceil().max(1.0) as usize;
+    let height = texture_rect.height().ceil().max(1.0) as usize;
+    let mut rgba = vec![0_u8; width.saturating_mul(height).saturating_mul(4)];
+    for point in points {
+        let x = (point.x - texture_rect.left()).round() as isize;
+        let y = (point.y - texture_rect.top()).round() as isize;
+        if x < 0 || y < 0 || x >= width as isize || y >= height as isize {
+            continue;
+        }
+        let offset = (y as usize * width + x as usize) * 4;
+        rgba[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
+    }
+    ColorImage::from_rgba_unmultiplied([width, height], &rgba)
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn cached_appearance_selection_stipple(
     painter: &Painter,
     view: &StageView,
     sample_rect: egui::Rect,
     vector: &VectorAsset,
     appearance: &q0s_format::v2::VectorAppearance,
+    appearance_fingerprint: u64,
     subset_path_indices: Option<&[usize]>,
-) -> std::sync::Arc<Vec<Pos2>> {
+) -> CachedAppearanceSelectionStipple {
     use std::hash::{Hash, Hasher};
 
     let key = appearance_selection_stipple_cache_key(
-        vector,
-        appearance,
+        appearance_fingerprint,
         view,
         sample_rect,
         subset_path_indices,
@@ -7431,7 +7485,7 @@ fn cached_appearance_selection_stipple_points(
     let mut subset_hasher = std::collections::hash_map::DefaultHasher::new();
     subset_path_indices.unwrap_or(&[]).hash(&mut subset_hasher);
     let id = egui::Id::new((
-        "q0editor.appearance-selection-stipple.v2",
+        "q0editor.appearance-selection-stipple.v3",
         vector.asset_id,
         subset_hasher.finish(),
     ));
@@ -7440,7 +7494,7 @@ fn cached_appearance_selection_stipple_points(
         .data(|data| data.get_temp::<CachedAppearanceSelectionStipple>(id))
     {
         if cached.key == key {
-            return cached.points;
+            return cached;
         }
     }
 
@@ -7473,21 +7527,66 @@ fn cached_appearance_selection_stipple_points(
     } else {
         Vec::new()
     };
-    let points = std::sync::Arc::new(points);
-    painter.ctx().data_mut(|data| {
-        data.insert_temp(
-            id,
-            CachedAppearanceSelectionStipple {
-                key,
-                points: points.clone(),
-            },
-        )
-    });
-    points
+    let texture_rect = appearance_selection_texture_rect(sample_rect);
+    let image = appearance_selection_stipple_image(texture_rect, &points);
+    let texture = painter.ctx().load_texture(
+        format!("q0editor-appearance-selection-{}-{key}", vector.asset_id),
+        image,
+        TextureOptions::NEAREST,
+    );
+    let body_contours = std::sync::Arc::new(appearance_selection_body_contours(
+        vector,
+        appearance,
+        subset_path_indices,
+        view,
+    ));
+    let cached = CachedAppearanceSelectionStipple {
+        key,
+        texture,
+        texture_rect,
+        body_contours,
+        #[cfg(test)]
+        point_count: points.len(),
+    };
+    painter
+        .ctx()
+        .data_mut(|data| data.insert_temp(id, cached.clone()));
+    cached
 }
 
 #[cfg(feature = "appearance-mask-eraser")]
-fn draw_appearance_selection_stipple(
+fn cached_appearance_selection_stipple_mesh(cached: &CachedAppearanceSelectionStipple) -> Mesh {
+    let mut mesh = Mesh::with_texture(cached.texture.id());
+    let rect = cached.texture_rect;
+    for (pos, uv) in [
+        (rect.left_top(), Pos2::new(0.0, 0.0)),
+        (rect.right_top(), Pos2::new(1.0, 0.0)),
+        (rect.right_bottom(), Pos2::new(1.0, 1.0)),
+        (rect.left_bottom(), Pos2::new(0.0, 1.0)),
+    ] {
+        mesh.vertices.push(Vertex {
+            pos,
+            uv,
+            color: Color32::WHITE,
+        });
+    }
+    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+    mesh
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn paint_cached_appearance_selection_stipple(
+    painter: &Painter,
+    cached: &CachedAppearanceSelectionStipple,
+) {
+    painter.add(Shape::Mesh(cached_appearance_selection_stipple_mesh(
+        cached,
+    )));
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn draw_appearance_selection_overlay(
+    app: &EditorApp,
     painter: &Painter,
     view: &StageView,
     rect: egui::Rect,
@@ -7495,20 +7594,27 @@ fn draw_appearance_selection_stipple(
     appearance: &q0s_format::v2::VectorAppearance,
     subset_path_indices: Option<&[usize]>,
 ) {
+    let appearance_fingerprint = app
+        .textures
+        .appearance_fingerprint(vector.asset_id)
+        .unwrap_or_else(|| crate::render::appearance_cache_signature(vector, appearance).0);
+    let accent = selection_color(app);
     let sample_rect = rect.intersect(painter.clip_rect());
     if !sample_rect.is_positive() {
         return;
     }
     let clipped = painter.with_clip_rect(sample_rect);
-    let points = cached_appearance_selection_stipple_points(
+    let cached = cached_appearance_selection_stipple(
         painter,
         view,
         sample_rect,
         vector,
         appearance,
+        appearance_fingerprint,
         subset_path_indices,
     );
-    draw_stipple_batch(&clipped, points.as_ref(), 0.38, Color32::WHITE);
+    paint_cached_appearance_selection_stipple(&clipped, &cached);
+    draw_dense_selection_contour(&clipped, cached.body_contours.as_ref(), accent);
 }
 
 fn draw_raw_area_selection(
@@ -7549,20 +7655,17 @@ fn draw_raw_area_selection(
         };
         #[cfg(feature = "appearance-mask-eraser")]
         if let Some(appearance) = app.state.project.asset_appearances.get(&asset_id) {
-            draw_appearance_selection_stipple(
-                painter,
+            draw_appearance_selection_overlay(
+                app,
+                &clipped,
                 view,
                 selection_rect,
                 vector,
                 appearance,
                 None,
             );
-            let body =
-                crate::appearance::visible_source_surface_for_vector(vector, Some(appearance));
-            let body_contours = surface_to_screen_contours(&body, view);
-            draw_dense_selection_contour(&clipped, &body_contours, selection_color(app));
-            // Do not add the appearance to `surfaces`: doing so would rebuild
-            // the expensive buffered glow for the legacy stipple pass below.
+            // Do not add the appearance to `surfaces`: its screen-space overlay
+            // is already a cached texture and must never become a per-dot mesh.
             continue;
         }
         let surface = raw_selectable_fill_surface(&app.state.project, asset_id, vector);
@@ -7714,20 +7817,8 @@ fn draw_raw_paths_overlay(
                     stage_to_screen(Vec2::new(min_x, min_y), view),
                     stage_to_screen(Vec2::new(max_x, max_y), view),
                 );
-                let subset = VectorAsset {
-                    asset_id: vector.asset_id,
-                    paths: closed_indices
-                        .iter()
-                        .filter_map(|index| vector.paths.get(*index).cloned())
-                        .collect(),
-                    fill: vector.fill,
-                    stroke: None,
-                };
-                let body =
-                    crate::appearance::visible_source_surface_for_vector(&subset, Some(appearance));
-                let body_contours = surface_to_screen_contours(&body, view);
-                draw_dense_selection_contour(painter, &body_contours, selection_color(app));
-                draw_appearance_selection_stipple(
+                draw_appearance_selection_overlay(
+                    app,
                     painter,
                     view,
                     rect,
@@ -9755,7 +9846,7 @@ mod tests {
 
     #[cfg(feature = "appearance-mask-eraser")]
     #[test]
-    fn unchanged_glow_selection_reuses_cached_stipple_points() {
+    fn unchanged_glow_selection_reuses_one_textured_stipple_quad() {
         use std::sync::atomic::Ordering;
 
         let project = appearance_selection_project(true);
@@ -9764,6 +9855,7 @@ mod tests {
             Asset::Bitmap(_) | Asset::Q0v(_) => unreachable!(),
         };
         let appearance = project.asset_appearances.get(&1).expect("appearance");
+        let fingerprint = crate::render::appearance_cache_signature(vector, appearance).0;
         let context = egui::Context::default();
         let painter = context.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
@@ -9776,13 +9868,36 @@ mod tests {
         };
         let rect = egui::Rect::from_min_max(Pos2::new(-10.0, -10.0), Pos2::new(30.0, 30.0));
         APPEARANCE_SELECTION_STIPPLE_BUILD_COUNT.store(0, Ordering::SeqCst);
-        let first = cached_appearance_selection_stipple_points(
-            &painter, &view, rect, vector, appearance, None,
+        let first = cached_appearance_selection_stipple(
+            &painter,
+            &view,
+            rect,
+            vector,
+            appearance,
+            fingerprint,
+            None,
         );
-        let second = cached_appearance_selection_stipple_points(
-            &painter, &view, rect, vector, appearance, None,
+        let second = cached_appearance_selection_stipple(
+            &painter,
+            &view,
+            rect,
+            vector,
+            appearance,
+            fingerprint,
+            None,
         );
-        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(first.texture.id(), second.texture.id());
+        assert!(std::sync::Arc::ptr_eq(
+            &first.body_contours,
+            &second.body_contours
+        ));
+        assert!(
+            first.point_count > 20,
+            "test must exercise many stipple dots"
+        );
+        let mesh = cached_appearance_selection_stipple_mesh(&second);
+        assert_eq!(mesh.vertices.len(), 4, "stipple must stay one GPU quad");
+        assert_eq!(mesh.indices.len(), 6, "stipple must stay two triangles");
         assert_eq!(
             APPEARANCE_SELECTION_STIPPLE_BUILD_COUNT.load(Ordering::SeqCst),
             1,
