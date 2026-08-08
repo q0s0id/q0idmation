@@ -20,6 +20,11 @@ use q0s_format::v2::{
 const Q0RG_RECURSION_LIMIT: u8 = 8;
 const BEZIER_SAMPLES_PER_SEGMENT: usize = 16;
 
+#[cfg(feature = "appearance-mask-eraser")]
+pub(crate) fn viewport_zoom_gesture_active(ctx: &Context) -> bool {
+    ctx.input(|input| input.smooth_scroll_delta.y.abs() > 0.5)
+}
+
 pub struct StageView {
     /// Top-left corner of the stage rectangle in screen pixels.
     pub origin: Pos2,
@@ -1452,43 +1457,68 @@ fn paint_vector_appearance_halo(
     // explicit texture-cache invalidation rather than on every repaint/drag tick.
     let (fingerprint, origin) = textures.appearance_signature(vector, appearance);
     let key = (vector.asset_id, bucket, fingerprint);
-    if !textures.appearance_by_asset.contains_key(&key) {
+    let exact_cached = textures.appearance_by_asset.contains_key(&key);
+    let reuse_key = if !exact_cached && viewport_zoom_gesture_active(ctx) {
         textures
             .appearance_by_asset
-            .retain(|(asset_id, cached_bucket, _), _| {
-                *asset_id != vector.asset_id || *cached_bucket != bucket
-            });
-    }
-    let cached = match textures.appearance_by_asset.entry(key) {
-        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-        std::collections::hash_map::Entry::Vacant(entry) => {
-            let Some(tile) =
-                q0s_format::raster::rasterize_vector_halo_local(vector, appearance, ppu)
-            else {
-                return;
-            };
-            let image = ColorImage::from_rgba_unmultiplied(
-                [tile.width as usize, tile.height as usize],
-                &tile.rgba,
-            );
-            let texture = ctx.load_texture(
-                format!(
-                    "q0s_appearance_{}_{}_{}",
-                    vector.asset_id, bucket, fingerprint
-                ),
-                image,
-                TextureOptions::LINEAR,
-            );
-            entry.insert(CachedAppearanceTexture {
-                texture,
-                local_min_offset: Vec2::new(
-                    tile.local_min.x - origin.x,
-                    tile.local_min.y - origin.y,
-                ),
-                width: tile.width,
-                height: tile.height,
-                pixels_per_unit: tile.pixels_per_unit,
+            .keys()
+            .filter(|(asset_id, _, cached_fingerprint)| {
+                *asset_id == vector.asset_id && *cached_fingerprint == fingerprint
             })
+            .min_by_key(|(_, cached_bucket, _)| cached_bucket.abs_diff(bucket))
+            .copied()
+    } else {
+        None
+    };
+
+    // During a smooth wheel gesture the view may cross many raster PPU buckets.
+    // Re-rasterizing the same halo at every crossing makes zoom hitch even though
+    // the already-cached texture can be scaled perfectly well for those transient
+    // frames. Once scrolling stops, the exact target bucket is built once.
+    let cached = if let Some(reuse_key) = reuse_key {
+        textures
+            .appearance_by_asset
+            .get_mut(&reuse_key)
+            .expect("appearance reuse key came from the cache")
+    } else {
+        if !exact_cached {
+            textures
+                .appearance_by_asset
+                .retain(|(asset_id, cached_bucket, _), _| {
+                    *asset_id != vector.asset_id || *cached_bucket != bucket
+                });
+        }
+        match textures.appearance_by_asset.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let Some(tile) =
+                    q0s_format::raster::rasterize_vector_halo_local(vector, appearance, ppu)
+                else {
+                    return;
+                };
+                let image = ColorImage::from_rgba_unmultiplied(
+                    [tile.width as usize, tile.height as usize],
+                    &tile.rgba,
+                );
+                let texture = ctx.load_texture(
+                    format!(
+                        "q0s_appearance_{}_{}_{}",
+                        vector.asset_id, bucket, fingerprint
+                    ),
+                    image,
+                    TextureOptions::LINEAR,
+                );
+                entry.insert(CachedAppearanceTexture {
+                    texture,
+                    local_min_offset: Vec2::new(
+                        tile.local_min.x - origin.x,
+                        tile.local_min.y - origin.y,
+                    ),
+                    width: tile.width,
+                    height: tile.height,
+                    pixels_per_unit: tile.pixels_per_unit,
+                })
+            }
         }
     };
     let local_min = Vec2::new(

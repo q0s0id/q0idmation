@@ -101,6 +101,58 @@ pub(crate) fn partition_appearance(
     Some((make(source_clip), make(selected_clip)))
 }
 
+/// Fast partition for the common case where the appearance has no existing
+/// post-material clip. Instead of buffering the entire material support just to
+/// subtract one selected component, the stationary remainder keeps the original
+/// source and records the selected resolved support as an additional erase mask.
+/// The moving fragment freezes the original material source and clips that same
+/// resolved field to the selected support. The two visible results are identical
+/// to `partition_appearance`, but work scales with the selected component rather
+/// than with the whole Advanced Brush asset.
+pub(crate) fn partition_unclipped_appearance_by_source_subset(
+    original: &VectorAppearance,
+    original_paths: &[VPath],
+    selected_paths: &[VPath],
+) -> Option<(VectorAppearance, VectorAppearance)> {
+    if !original.clip_mask.is_empty() || selected_paths.is_empty() {
+        return None;
+    }
+    let inverse_field = original.field_transform.inverse()?;
+    let selected_source = paths_to_coverage(selected_paths);
+    if selected_source.0.is_empty() {
+        return None;
+    }
+    let canonical_selected_source = transform_surface(&selected_source, inverse_field);
+    let selected_support = material_support(&canonical_selected_source, original.material);
+    if selected_support.0.is_empty() {
+        return None;
+    }
+
+    let old_erase = mask_paths_to_coverage(&original.erase_mask);
+    let remainder_erase = if old_erase.0.is_empty() {
+        selected_support.clone()
+    } else {
+        old_erase.union(&selected_support)
+    };
+
+    let mut remainder = original.clone();
+    remainder.erase_mask = crate::brush::coverage_to_paths(&remainder_erase);
+
+    let material_source = if original.material_source.is_empty() {
+        original_paths.to_vec()
+    } else {
+        original.material_source.clone()
+    };
+    let selected = VectorAppearance {
+        material: original.material,
+        erase_mask: original.erase_mask.clone(),
+        material_source,
+        clip_mask: crate::brush::coverage_to_paths(&selected_support),
+        field_transform: original.field_transform,
+    };
+    Some((remainder, selected))
+}
+
 pub(crate) fn split_asset_appearance(
     project: &mut ProjectV2,
     source_asset_id: u16,
@@ -1017,6 +1069,87 @@ mod tests {
         assert!(
             right_bounds.min().x >= 4.95,
             "right fragment must not generate a new halo across the cut edge: {right_bounds:?}"
+        );
+    }
+
+    #[test]
+    fn fast_unclipped_partition_matches_exact_resolved_material() {
+        let left = square_path(0.0, 0.0, 20.0, 20.0);
+        let right = square_path(28.0, 0.0, 48.0, 20.0);
+        let vector = VectorAsset {
+            asset_id: 1,
+            paths: vec![left.clone(), right.clone()],
+            fill: Some(Rgba {
+                r: 32,
+                g: 48,
+                b: 64,
+                a: 255,
+            }),
+            stroke: None,
+        };
+        let mut original = VectorAppearance {
+            material: VectorMaterial::SoftHalo {
+                radius: 8.0,
+                opacity: 0.7,
+            },
+            erase_mask: Vec::new(),
+            material_source: Vec::new(),
+            clip_mask: Vec::new(),
+            field_transform: Affine::IDENTITY,
+        };
+        // Exercise pre-existing mask content too: both partition paths must retain
+        // the same already-erased pixels while assigning the selected glow support.
+        original.erase_mask = crate::brush::coverage_to_paths(&rect_region(5.0, 5.0, 9.0, 9.0));
+
+        let selected_visible = visible_material_surface_for_paths(&vector, Some(&original), &[0]);
+        let (exact_remainder, exact_selected) =
+            partition_appearance(&original, &vector.paths, &selected_visible).expect("exact split");
+        let (fast_remainder, fast_selected) = partition_unclipped_appearance_by_source_subset(
+            &original,
+            &vector.paths,
+            std::slice::from_ref(&left),
+        )
+        .expect("fast split");
+
+        let selected_vector = VectorAsset {
+            asset_id: 1,
+            paths: vec![left],
+            fill: vector.fill,
+            stroke: None,
+        };
+        let remainder_vector = VectorAsset {
+            asset_id: 2,
+            paths: vec![right],
+            fill: vector.fill,
+            stroke: None,
+        };
+        let mismatch = |left: &MultiPolygon<f64>, right: &MultiPolygon<f64>| {
+            left.difference(right).unsigned_area() + right.difference(left).unsigned_area()
+        };
+        let exact_selected_surface =
+            visible_material_surface_for_vector(&selected_vector, Some(&exact_selected));
+        let fast_selected_surface =
+            visible_material_surface_for_vector(&selected_vector, Some(&fast_selected));
+        let exact_remainder_surface =
+            visible_material_surface_for_vector(&remainder_vector, Some(&exact_remainder));
+        let fast_remainder_surface =
+            visible_material_surface_for_vector(&remainder_vector, Some(&fast_remainder));
+
+        assert!(
+            mismatch(&fast_selected_surface, &exact_selected_surface) < 0.05,
+            "fast selected fragment changed resolved material",
+        );
+        assert!(
+            mismatch(&fast_remainder_surface, &exact_remainder_surface) < 0.05,
+            "fast remainder changed resolved material",
+        );
+        assert!(
+            fast_remainder.material_source.is_empty(),
+            "first split must not freeze the whole dense source into the stationary remainder",
+        );
+        assert_eq!(
+            fast_selected.material_source, vector.paths,
+            "moving fragment needs the original source so its post-material slice cannot regrow halo",
         );
     }
 

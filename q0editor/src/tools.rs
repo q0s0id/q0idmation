@@ -18,8 +18,8 @@ use crate::render::{
     placement_bbox, placement_local_bbox, StageView,
 };
 use crate::state::{
-    GroupTransformOperation, Handle, PathRef, PlacementRef, Selection, Tool, ToolState,
-    TransformEdge, TransformPivot,
+    AppearanceTransformSnapshot, GroupTransformOperation, Handle, PathRef, PlacementRef, Selection,
+    Tool, ToolState, TransformEdge, TransformPivot,
 };
 
 const HIT_RADIUS: f32 = 6.0;
@@ -1687,7 +1687,7 @@ enum GroupTransformIntent {
 struct GroupTransformData<'a> {
     refs: &'a [PathRef],
     start_paths: &'a [VPath],
-    start_appearances: &'a [(u16, q0s_format::v2::VectorAppearance)],
+    start_appearances: &'a [AppearanceTransformSnapshot],
     objects: &'a [PlacementRef],
     start_transforms: &'a [Transform2D],
     operation: GroupTransformOperation,
@@ -4572,41 +4572,22 @@ fn isolate_partial_appearance_raw_refs(app: &mut EditorApp, refs: Vec<PathRef>) 
         let Target::Asset(asset_id) = source_placement.target else {
             return refs;
         };
-        let Some(original) = app
+        let selected_indices: std::collections::BTreeSet<usize> =
+            refs.iter().map(|reference| reference.path_idx).collect();
+        let Some(original_ref) = app
             .state
             .project
             .assets
             .iter()
             .find(|asset| asset.id() == asset_id)
             .and_then(|asset| match asset {
-                Asset::Vector(vector) => Some(vector.clone()),
+                Asset::Vector(vector) => Some(vector),
                 Asset::Bitmap(_) | Asset::Q0v(_) => None,
             })
         else {
             return refs;
         };
-        let Some(mut original_appearance) =
-            app.state.project.asset_appearances.get(&asset_id).cloned()
-        else {
-            return refs;
-        };
-        if crate::appearance::freeze_material_source_from_current_body(
-            &original,
-            &mut original_appearance,
-        ) {
-            // Repair legacy/broken drag state before partitioning it. Otherwise
-            // an empty source with a non-identity field would treat the already-
-            // transformed carrier as canonical and split the wrong glow space.
-            app.state
-                .project
-                .asset_appearances
-                .insert(asset_id, original_appearance.clone());
-            app.textures.invalidate();
-        }
-
-        let selected_indices: std::collections::BTreeSet<usize> =
-            refs.iter().map(|reference| reference.path_idx).collect();
-        let all_closed: std::collections::BTreeSet<usize> = original
+        let all_closed: std::collections::BTreeSet<usize> = original_ref
             .paths
             .iter()
             .enumerate()
@@ -4614,30 +4595,39 @@ fn isolate_partial_appearance_raw_refs(app: &mut EditorApp, refs: Vec<PathRef>) 
             .collect();
         if selected_indices.is_empty()
             || selected_indices == all_closed
-            || !selected_indices
-                .iter()
-                .all(|index| original.paths.get(*index).is_some_and(|path| path.closed))
+            || !selected_indices.iter().all(|index| {
+                original_ref
+                    .paths
+                    .get(*index)
+                    .is_some_and(|path| path.closed)
+            })
         {
+            // The overwhelmingly common post-split/whole-fill drag needs no
+            // appearance partition. Return before cloning dense vector/material data.
             return refs;
         }
-
-        let selected_visible = crate::appearance::visible_material_surface_for_paths(
-            &original,
-            Some(&original_appearance),
-            &selected_indices.iter().copied().collect::<Vec<_>>(),
-        );
-        if selected_visible.0.is_empty() {
-            return refs;
-        }
-        let Some((remainder_appearance, selected_appearance)) =
-            crate::appearance::partition_appearance(
-                &original_appearance,
-                &original.paths,
-                &selected_visible,
-            )
+        let original = original_ref.clone();
+        let Some(mut original_appearance) =
+            app.state.project.asset_appearances.get(&asset_id).cloned()
         else {
             return refs;
         };
+        if original_appearance.material_source.is_empty()
+            && original_appearance.field_transform != Affine::IDENTITY
+            && crate::appearance::freeze_material_source_from_current_body(
+                &original,
+                &mut original_appearance,
+            )
+        {
+            // Repair only the impossible state emitted by the old buggy drag path.
+            // A fresh identity-field appearance stays unfrozen so the fast split can
+            // keep the stationary remainder lightweight.
+            app.state
+                .project
+                .asset_appearances
+                .insert(asset_id, original_appearance.clone());
+            app.textures.invalidate();
+        }
 
         let mut selected_paths = Vec::new();
         let mut remainder_paths = Vec::new();
@@ -4653,6 +4643,34 @@ fn isolate_partial_appearance_raw_refs(app: &mut EditorApp, refs: Vec<PathRef>) 
         if selected_paths.is_empty() || !remainder_paths.iter().any(|path| path.closed) {
             return refs;
         }
+
+        let partition = if original_appearance.clip_mask.is_empty() {
+            crate::appearance::partition_unclipped_appearance_by_source_subset(
+                &original_appearance,
+                &original.paths,
+                &selected_paths,
+            )
+        } else {
+            // Already-fragmented material has an explicit finite clip. Preserve
+            // the exact old path for that rarer case; the common first split above
+            // avoids buffering the complete glow support.
+            let selected_visible = crate::appearance::visible_material_surface_for_paths(
+                &original,
+                Some(&original_appearance),
+                &selected_indices.iter().copied().collect::<Vec<_>>(),
+            );
+            if selected_visible.0.is_empty() {
+                return refs;
+            }
+            crate::appearance::partition_appearance(
+                &original_appearance,
+                &original.paths,
+                &selected_visible,
+            )
+        };
+        let Some((remainder_appearance, selected_appearance)) = partition else {
+            return refs;
+        };
 
         let remainder_asset_id = next_asset_id(&app.state.project);
         let Some(Asset::Vector(selected_vector)) = app
@@ -4715,7 +4733,7 @@ fn isolate_partial_appearance_raw_refs(app: &mut EditorApp, refs: Vec<PathRef>) 
 fn capture_whole_asset_appearances_for_raw_refs(
     app: &mut EditorApp,
     refs: &[PathRef],
-) -> Vec<(u16, q0s_format::v2::VectorAppearance)> {
+) -> Vec<AppearanceTransformSnapshot> {
     #[cfg(not(feature = "appearance-mask-eraser"))]
     {
         let _ = (app, refs);
@@ -4753,35 +4771,47 @@ fn capture_whole_asset_appearances_for_raw_refs(
         let mut captured = Vec::new();
         let mut froze_source = false;
         for (asset_id, selected) in grouped {
-            let Some(Asset::Vector(vector)) = project
-                .assets
-                .iter()
-                .find(|asset| asset.id() == asset_id)
-                .cloned()
+            let Some(Asset::Vector(vector)) =
+                project.assets.iter().find(|asset| asset.id() == asset_id)
             else {
                 continue;
             };
-            let editable: std::collections::BTreeSet<usize> = vector
-                .paths
-                .iter()
-                .enumerate()
-                .filter_map(|(index, path)| path.closed.then_some(index))
-                .collect();
-            if selected != editable {
+            let editable_matches = vector.paths.iter().filter(|path| path.closed).count()
+                == selected.len()
+                && selected
+                    .iter()
+                    .all(|index| vector.paths.get(*index).is_some_and(|path| path.closed));
+            if !editable_matches {
                 continue;
             }
+            let Some(appearance) = project.asset_appearances.get(&asset_id) else {
+                continue;
+            };
+            if !appearance.material_source.is_empty() {
+                captured.push(AppearanceTransformSnapshot {
+                    asset_id,
+                    field_transform: appearance.field_transform,
+                });
+                continue;
+            }
+
+            // Only the first affine edit needs a dense vector clone: it becomes the
+            // frozen pre-transform material source. Subsequent drag starts never copy
+            // the carrier just to capture six affine floats.
+            let vector = vector.clone();
             let Some(appearance) = project.asset_appearances.get_mut(&asset_id) else {
                 continue;
             };
             // Persist the frozen material source in the project itself before raw
-            // geometry starts moving. Keeping it only in the drag snapshot makes
-            // the renderer fall back to the already-moved carrier and then apply
-            // field_transform a second time. If an older buggy edit left an empty
-            // source with a non-identity field, reconstruct canonical source space
-            // through the inverse field first.
+            // geometry starts moving. If an older buggy edit left a non-identity
+            // field, freeze_material_source_from_current_body maps it back through
+            // the inverse field first.
             froze_source |=
                 crate::appearance::freeze_material_source_from_current_body(&vector, appearance);
-            captured.push((asset_id, appearance.clone()));
+            captured.push(AppearanceTransformSnapshot {
+                asset_id,
+                field_transform: appearance.field_transform,
+            });
         }
         if froze_source {
             app.textures.invalidate();
@@ -4792,7 +4822,7 @@ fn capture_whole_asset_appearances_for_raw_refs(
 
 fn transform_captured_appearances(
     project: &mut ProjectV2,
-    start_appearances: &[(u16, q0s_format::v2::VectorAppearance)],
+    start_appearances: &[AppearanceTransformSnapshot],
     transform: Affine,
 ) -> bool {
     #[cfg(not(feature = "appearance-mask-eraser"))]
@@ -4803,23 +4833,16 @@ fn transform_captured_appearances(
     #[cfg(feature = "appearance-mask-eraser")]
     {
         let mut changed = false;
-        for (asset_id, source) in start_appearances {
+        for source in start_appearances {
             let next_field = Affine::compose(transform, source.field_transform);
-            if let Some(current) = project.asset_appearances.get_mut(asset_id) {
+            if let Some(current) = project.asset_appearances.get_mut(&source.asset_id) {
                 if current.field_transform != next_field {
-                    // Dragging an appearance changes only its resolved field transform.
-                    // Never clone/compare material_source or masks per pointer event: an
-                    // Advanced stroke can contain thousands of anchors there.
+                    // Drag state needs only the original field affine. Keeping a full
+                    // VectorAppearance here used to clone material_source/masks with
+                    // thousands of anchors on every mouse-down.
                     current.field_transform = next_field;
                     changed = true;
                 }
-            } else {
-                // Defensive recovery for a malformed edit state. This allocation can only
-                // happen once because subsequent drag updates hit the in-place branch.
-                let mut restored = source.clone();
-                restored.field_transform = next_field;
-                project.asset_appearances.insert(*asset_id, restored);
-                changed = true;
             }
         }
         changed
@@ -4828,7 +4851,7 @@ fn transform_captured_appearances(
 
 fn translate_captured_appearances(
     project: &mut ProjectV2,
-    start_appearances: &[(u16, q0s_format::v2::VectorAppearance)],
+    start_appearances: &[AppearanceTransformSnapshot],
     delta: Vec2,
 ) -> bool {
     transform_captured_appearances(
@@ -4846,7 +4869,7 @@ fn apply_raw_affine_snapshot(
     project: &mut ProjectV2,
     refs: &[PathRef],
     start_paths: &[VPath],
-    start_appearances: &[(u16, q0s_format::v2::VectorAppearance)],
+    start_appearances: &[AppearanceTransformSnapshot],
     transform: Affine,
 ) -> bool {
     let mut changed = false;
@@ -7558,6 +7581,7 @@ fn appearance_selection_stipple_points(
 #[derive(Clone)]
 struct CachedAppearanceSelectionStipple {
     key: u64,
+    content_key: u64,
     texture: TextureHandle,
     texture_rect: egui::Rect,
     #[cfg(test)]
@@ -7569,11 +7593,9 @@ static APPEARANCE_SELECTION_STIPPLE_BUILD_COUNT: std::sync::atomic::AtomicUsize 
     std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(feature = "appearance-mask-eraser")]
-fn appearance_selection_stipple_cache_key(
+fn appearance_selection_stipple_content_key(
     appearance_fingerprint: u64,
     appearance: &q0s_format::v2::VectorAppearance,
-    view: &StageView,
-    rect: egui::Rect,
     subset_path_indices: Option<&[usize]>,
     accent: Color32,
 ) -> u64 {
@@ -7581,10 +7603,10 @@ fn appearance_selection_stipple_cache_key(
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     appearance_fingerprint.hash(&mut hasher);
-    // Translation is deliberately absent from this key. Moving a selected glow
-    // must reuse the already-rasterized overlay and only move its quad.
+    // Translation and viewport zoom are deliberately absent. Translation moves
+    // the quad, while zoom may temporarily stretch the cached bitmap during the
+    // wheel gesture instead of synchronously rebuilding thousands of hit samples.
     for value in [
-        view.scale,
         appearance.field_transform.a11,
         appearance.field_transform.a12,
         appearance.field_transform.a21,
@@ -7592,11 +7614,25 @@ fn appearance_selection_stipple_cache_key(
     ] {
         value.to_bits().hash(&mut hasher);
     }
+    [accent.r(), accent.g(), accent.b(), accent.a()].hash(&mut hasher);
+    subset_path_indices.unwrap_or(&[]).hash(&mut hasher);
+    hasher.finish()
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn appearance_selection_stipple_cache_key(
+    content_key: u64,
+    view: &StageView,
+    rect: egui::Rect,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content_key.hash(&mut hasher);
+    view.scale.to_bits().hash(&mut hasher);
     let texture_rect = appearance_selection_texture_rect(rect);
     (texture_rect.width().round() as u32).hash(&mut hasher);
     (texture_rect.height().round() as u32).hash(&mut hasher);
-    [accent.r(), accent.g(), accent.b(), accent.a()].hash(&mut hasher);
-    subset_path_indices.unwrap_or(&[]).hash(&mut hasher);
     hasher.finish()
 }
 
@@ -7716,6 +7752,18 @@ struct AppearanceSelectionStippleRequest<'a> {
 }
 
 #[cfg(feature = "appearance-mask-eraser")]
+fn appearance_selection_cache_can_reuse(
+    cached_key: u64,
+    cached_content_key: u64,
+    requested_key: u64,
+    requested_content_key: u64,
+    zoom_gesture_active: bool,
+) -> bool {
+    cached_key == requested_key
+        || (zoom_gesture_active && cached_content_key == requested_content_key)
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
 fn cached_appearance_selection_stipple(
     painter: &Painter,
     view: &StageView,
@@ -7732,14 +7780,13 @@ fn cached_appearance_selection_stipple(
         accent,
     } = request;
 
-    let key = appearance_selection_stipple_cache_key(
+    let content_key = appearance_selection_stipple_content_key(
         appearance_fingerprint,
         appearance,
-        view,
-        sample_rect,
         subset_path_indices,
         accent,
     );
+    let key = appearance_selection_stipple_cache_key(content_key, view, sample_rect);
     let mut subset_hasher = std::collections::hash_map::DefaultHasher::new();
     subset_path_indices.unwrap_or(&[]).hash(&mut subset_hasher);
     let id = egui::Id::new((
@@ -7751,9 +7798,16 @@ fn cached_appearance_selection_stipple(
         .ctx()
         .data(|data| data.get_temp::<CachedAppearanceSelectionStipple>(id))
     {
-        if cached.key == key {
-            // The cached bitmap is translation-invariant; only its screen quad
-            // follows the current selected bounds during a move.
+        if appearance_selection_cache_can_reuse(
+            cached.key,
+            cached.content_key,
+            key,
+            content_key,
+            crate::render::viewport_zoom_gesture_active(painter.ctx()),
+        ) {
+            // Translation always moves the quad. During smooth wheel zoom we also
+            // scale the existing bitmap with the artwork; once the wheel settles,
+            // the exact fixed-screen-density texture is rebuilt once.
             cached.texture_rect = appearance_selection_texture_rect(sample_rect);
             return cached;
         }
@@ -7799,6 +7853,7 @@ fn cached_appearance_selection_stipple(
     );
     let cached = CachedAppearanceSelectionStipple {
         key,
+        content_key,
         texture,
         texture_rect,
         #[cfg(test)]
@@ -10110,6 +10165,69 @@ mod tests {
 
     #[cfg(feature = "appearance-mask-eraser")]
     #[test]
+    fn glow_selection_zoom_reuses_content_only_during_active_gesture() {
+        let project = appearance_selection_project(true);
+        let vector = match &project.assets[0] {
+            Asset::Vector(vector) => vector,
+            Asset::Bitmap(_) | Asset::Q0v(_) => unreachable!(),
+        };
+        let appearance = project.asset_appearances.get(&1).expect("appearance");
+        let fingerprint = crate::render::appearance_cache_signature(vector, appearance).0;
+        let accent = Color32::from_rgb(220, 40, 60);
+        let rect = egui::Rect::from_min_max(Pos2::new(-10.0, -10.0), Pos2::new(30.0, 30.0));
+        let view_one = StageView {
+            origin: Pos2::ZERO,
+            scale: 1.0,
+            stage_rect: egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(100.0, 100.0)),
+        };
+        let view_zoomed = StageView {
+            origin: Pos2::ZERO,
+            scale: 1.37,
+            stage_rect: view_one.stage_rect,
+        };
+        let content_key =
+            appearance_selection_stipple_content_key(fingerprint, appearance, None, accent);
+        let exact_one = appearance_selection_stipple_cache_key(content_key, &view_one, rect);
+        let exact_zoomed = appearance_selection_stipple_cache_key(
+            content_key,
+            &view_zoomed,
+            egui::Rect::from_center_size(rect.center(), rect.size() * 1.37),
+        );
+        assert_ne!(
+            exact_one, exact_zoomed,
+            "settled zoom must rebuild fixed-screen-density stipple at its final scale",
+        );
+        assert!(appearance_selection_cache_can_reuse(
+            exact_one,
+            content_key,
+            exact_zoomed,
+            content_key,
+            true,
+        ));
+        assert!(
+            !appearance_selection_cache_can_reuse(
+                exact_one,
+                content_key,
+                exact_zoomed,
+                content_key,
+                false,
+            ),
+            "after wheel settles the exact zoom texture must be generated once",
+        );
+        assert!(
+            !appearance_selection_cache_can_reuse(
+                exact_one,
+                content_key,
+                exact_zoomed,
+                content_key.wrapping_add(1),
+                true,
+            ),
+            "zoom reuse may never cross a real material-content change",
+        );
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
     fn unchanged_glow_selection_reuses_one_textured_stipple_quad() {
         use std::sync::atomic::Ordering;
 
@@ -10528,14 +10646,15 @@ mod tests {
             Asset::Bitmap(_) | Asset::Q0v(_) => unreachable!(),
         };
         let paths = std::sync::Arc::new(vector.paths.clone());
-        let appearances = std::sync::Arc::new(vec![(
-            1,
-            project
-                .asset_appearances
-                .get(&1)
-                .expect("appearance")
-                .clone(),
-        )]);
+        let appearance = project.asset_appearances.get(&1).expect("appearance");
+        let appearances = std::sync::Arc::new(vec![AppearanceTransformSnapshot {
+            asset_id: 1,
+            field_transform: appearance.field_transform,
+        }]);
+        assert!(
+            std::mem::size_of::<AppearanceTransformSnapshot>() <= 32,
+            "drag transform snapshot must stay independent of material-source size",
+        );
         let state = ToolState::DraggingPaths {
             refs: vec![PathRef {
                 q0rg_id: 1,
@@ -10575,14 +10694,14 @@ mod tests {
             let appearance = project.asset_appearances.get_mut(&1).expect("appearance");
             appearance.material_source = vec![dense_path];
         }
-        let start = vec![(
-            1,
-            project
+        let start = vec![AppearanceTransformSnapshot {
+            asset_id: 1,
+            field_transform: project
                 .asset_appearances
                 .get(&1)
                 .expect("appearance")
-                .clone(),
-        )];
+                .field_transform,
+        }];
         let before_paths_ptr = project.asset_appearances[&1].material_source.as_ptr();
         let before_anchors_ptr = project.asset_appearances[&1].material_source[0]
             .anchors

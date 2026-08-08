@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 pub use q0s_format::geom::CapShape;
+use q0s_format::transform::Affine;
 use q0s_format::v2::{
     Anchor, Layer, LayerMetadata, Path as VPath, Placement, ProjectMeta, ProjectV2, Q0rg, Rgba,
     Transform2D, Vec2, VectorAppearance, VectorAsset,
@@ -35,6 +36,12 @@ pub struct LayerRename {
 pub struct TimelineLayerDrag {
     pub q0rg_id: u16,
     pub layer_id: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AppearanceTransformSnapshot {
+    pub asset_id: u16,
+    pub field_transform: Affine,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,7 +418,7 @@ pub enum ToolState {
         refs: Vec<PathRef>,
         start_cursor: Vec2,
         start_paths: std::sync::Arc<Vec<VPath>>,
-        start_appearances: std::sync::Arc<Vec<(u16, VectorAppearance)>>,
+        start_appearances: std::sync::Arc<Vec<AppearanceTransformSnapshot>>,
         start_pivot: Option<Vec2>,
     },
     /// Axis-scale one connected raw-graphics selection without turning the
@@ -419,7 +426,7 @@ pub enum ToolState {
     DraggingRawHandle {
         refs: Vec<PathRef>,
         start_paths: std::sync::Arc<Vec<VPath>>,
-        start_appearances: std::sync::Arc<Vec<(u16, VectorAppearance)>>,
+        start_appearances: std::sync::Arc<Vec<AppearanceTransformSnapshot>>,
         handle: Handle,
         start_bounds: (f32, f32, f32, f32),
         start_pivot: Vec2,
@@ -427,14 +434,14 @@ pub enum ToolState {
     DraggingRawRotate {
         refs: Vec<PathRef>,
         start_paths: std::sync::Arc<Vec<VPath>>,
-        start_appearances: std::sync::Arc<Vec<(u16, VectorAppearance)>>,
+        start_appearances: std::sync::Arc<Vec<AppearanceTransformSnapshot>>,
         center: Vec2,
         start_angle: f32,
     },
     DraggingRawSkew {
         refs: Vec<PathRef>,
         start_paths: std::sync::Arc<Vec<VPath>>,
-        start_appearances: std::sync::Arc<Vec<(u16, VectorAppearance)>>,
+        start_appearances: std::sync::Arc<Vec<AppearanceTransformSnapshot>>,
         edge: TransformEdge,
         start_bounds: (f32, f32, f32, f32),
         start_cursor: Vec2,
@@ -485,7 +492,7 @@ pub enum ToolState {
     DraggingGroup {
         refs: Vec<PathRef>,
         start_paths: std::sync::Arc<Vec<VPath>>,
-        start_appearances: std::sync::Arc<Vec<(u16, VectorAppearance)>>,
+        start_appearances: std::sync::Arc<Vec<AppearanceTransformSnapshot>>,
         objects: Vec<PlacementRef>,
         start_transforms: Vec<Transform2D>,
         operation: GroupTransformOperation,
