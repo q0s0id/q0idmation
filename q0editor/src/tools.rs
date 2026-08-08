@@ -640,6 +640,7 @@ fn advanced_input_samples(
     ctx: &Context,
     response: &Response,
     view: &StageView,
+    allow_pointer_fallback: bool,
 ) -> Vec<crate::advanced_brush::AdvancedBrushSample> {
     let (now, dt, events) =
         ctx.input(|input| (input.time, input.unstable_dt, input.events.clone()));
@@ -669,7 +670,7 @@ fn advanced_input_samples(
     } else {
         touch
     };
-    if raw.is_empty() {
+    if raw.is_empty() && allow_pointer_fallback {
         if let Some(pos) = response
             .interact_pointer_pos()
             .filter(|pos| response.rect.contains(*pos))
@@ -722,7 +723,12 @@ fn advanced_brush(app: &mut EditorApp, response: &Response, view: &StageView, ct
         || response.dragged_by(PointerButton::Primary)
         || response.drag_stopped_by(PointerButton::Primary)
     {
-        let samples = advanced_input_samples(ctx, response, view);
+        let samples = advanced_input_samples(
+            ctx,
+            response,
+            view,
+            !response.drag_stopped_by(PointerButton::Primary),
+        );
         if let ToolState::AdvancedBrushDrawing { stroke } = &mut app.session.tool_state {
             for sample in samples {
                 crate::advanced_brush::advanced_add_sample(stroke, settings, sample);
@@ -803,16 +809,17 @@ fn classic_input_samples(
     response: &Response,
     view: &StageView,
 ) -> Vec<crate::brush::BrushSample> {
-    advanced_input_samples(ctx, response, view)
-        .into_iter()
-        .map(|sample| {
-            crate::brush::BrushSample::pointer(
-                sample.position,
-                sample.pressure,
-                sample.time_seconds,
-            )
-        })
-        .collect()
+    advanced_input_samples(
+        ctx,
+        response,
+        view,
+        !response.drag_stopped_by(PointerButton::Primary),
+    )
+    .into_iter()
+    .map(|sample| {
+        crate::brush::BrushSample::pointer(sample.position, sample.pressure, sample.time_seconds)
+    })
+    .collect()
 }
 
 fn pointer_pressure_at(ctx: &Context, screen: Pos2) -> Option<f32> {
@@ -6985,6 +6992,73 @@ fn hit_test_selectable_placement(
     None
 }
 
+fn variable_round_preview_mesh(
+    dabs: &[(Vec2, f32)],
+    view: &StageView,
+    expansion_px: f32,
+    color: Color32,
+) -> Mesh {
+    const SEGMENTS: usize = 18;
+    let mut mesh = Mesh::default();
+    if dabs.is_empty() {
+        return mesh;
+    }
+
+    mesh.vertices
+        .reserve(dabs.len().saturating_mul(SEGMENTS).saturating_add(2));
+    mesh.indices.reserve(
+        dabs.len()
+            .saturating_sub(1)
+            .saturating_mul(SEGMENTS * 6)
+            .saturating_add(SEGMENTS * 6),
+    );
+
+    let mut previous_ring: Option<[u32; SEGMENTS]> = None;
+    let mut first_ring: Option<[u32; SEGMENTS]> = None;
+    let mut last_ring = [0_u32; SEGMENTS];
+    for &(position, size) in dabs {
+        let center = stage_to_screen(position, view);
+        let radius = size.max(0.1) * view.scale * 0.5 + expansion_px;
+        let ring: [u32; SEGMENTS] = std::array::from_fn(|index| {
+            let phase = std::f32::consts::TAU * index as f32 / SEGMENTS as f32;
+            let vertex = mesh.vertices.len() as u32;
+            mesh.colored_vertex(
+                center + egui::vec2(phase.cos() * radius, phase.sin() * radius),
+                color,
+            );
+            vertex
+        });
+        if first_ring.is_none() {
+            first_ring = Some(ring);
+        }
+        if let Some(previous) = previous_ring {
+            for index in 0..SEGMENTS {
+                let next = (index + 1) % SEGMENTS;
+                mesh.add_triangle(previous[index], previous[next], ring[next]);
+                mesh.add_triangle(previous[index], ring[next], ring[index]);
+            }
+        }
+        previous_ring = Some(ring);
+        last_ring = ring;
+    }
+
+    let mut cap = |ring: [u32; SEGMENTS], center: Pos2| {
+        let center_index = mesh.vertices.len() as u32;
+        mesh.colored_vertex(center, color);
+        for index in 0..SEGMENTS {
+            mesh.add_triangle(center_index, ring[index], ring[(index + 1) % SEGMENTS]);
+        }
+    };
+    cap(
+        first_ring.expect("non-empty classic dynamic preview ring"),
+        stage_to_screen(dabs[0].0, view),
+    );
+    if dabs.len() > 1 {
+        cap(last_ring, stage_to_screen(dabs[dabs.len() - 1].0, view));
+    }
+    mesh
+}
+
 fn paint_variable_round_stroke_preview(
     painter: &Painter,
     dabs: &[(Vec2, f32)],
@@ -6992,44 +7066,11 @@ fn paint_variable_round_stroke_preview(
     expansion_px: f32,
     color: Color32,
 ) {
-    if dabs.is_empty() {
-        return;
-    }
-    for &(position, size) in dabs {
-        painter.circle_filled(
-            stage_to_screen(position, view),
-            size.max(0.1) * view.scale * 0.5 + expansion_px,
-            color,
-        );
-    }
-    for pair in dabs.windows(2) {
-        let p0 = stage_to_screen(pair[0].0, view);
-        let p1 = stage_to_screen(pair[1].0, view);
-        let r0 = pair[0].1.max(0.1) * view.scale * 0.5 + expansion_px;
-        let r1 = pair[1].1.max(0.1) * view.scale * 0.5 + expansion_px;
-        let delta = p1 - p0;
-        let distance = delta.length();
-        if distance <= (r0 - r1).abs() + 1.0e-4 {
-            continue;
-        }
-        let theta = delta.y.atan2(delta.x);
-        let alpha = ((r0 - r1) / distance).clamp(-1.0, 1.0).acos();
-        let offset = |center: Pos2, radius: f32, angle: f32| {
-            center + egui::vec2(angle.cos() * radius, angle.sin() * radius)
-        };
-        painter.add(Shape::convex_polygon(
-            vec![
-                offset(p0, r0, theta + alpha),
-                offset(p1, r1, theta + alpha),
-                offset(p1, r1, theta - alpha),
-                offset(p0, r0, theta - alpha),
-            ],
-            color,
-            Stroke::NONE,
-        ));
+    let mesh = variable_round_preview_mesh(dabs, view, expansion_px, color);
+    if !mesh.vertices.is_empty() {
+        painter.add(Shape::Mesh(mesh));
     }
 }
-
 fn paint_classic_nib_preview(
     painter: &Painter,
     stroke: &crate::brush::BrushStroke,
@@ -9247,6 +9288,69 @@ mod tests {
         );
     }
 
+    #[test]
+    fn classic_dynamic_preview_is_one_linear_mesh_for_a_long_stroke() {
+        let dabs: Vec<(Vec2, f32)> = (0..5_000)
+            .map(|index| {
+                (
+                    Vec2::new(index as f32 * 0.5, (index as f32 * 0.03).sin() * 30.0),
+                    4.0 + (index as f32 * 0.07).sin().abs() * 18.0,
+                )
+            })
+            .collect();
+        let view = StageView {
+            origin: Pos2::ZERO,
+            scale: 1.0,
+            stage_rect: egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(800.0, 600.0)),
+        };
+        let mesh = variable_round_preview_mesh(&dabs, &view, 0.0, Color32::WHITE);
+
+        assert_eq!(mesh.vertices.len(), dabs.len() * 18 + 2);
+        assert!(
+            mesh.indices.len() <= dabs.len() * 108 + 108,
+            "dynamic preview escaped its linear mesh budget: {} indices for {} dabs",
+            mesh.indices.len(),
+            dabs.len()
+        );
+    }
+
+    #[test]
+    fn classic_dynamic_preview_strip_covers_intermediate_dab_center() {
+        fn triangle_contains(point: Pos2, a: Pos2, b: Pos2, c: Pos2) -> bool {
+            let cross =
+                |u: Pos2, v: Pos2, w: Pos2| (v.x - u.x) * (w.y - u.y) - (v.y - u.y) * (w.x - u.x);
+            let ab = cross(a, b, point);
+            let bc = cross(b, c, point);
+            let ca = cross(c, a, point);
+            (ab >= -1.0e-4 && bc >= -1.0e-4 && ca >= -1.0e-4)
+                || (ab <= 1.0e-4 && bc <= 1.0e-4 && ca <= 1.0e-4)
+        }
+
+        let dabs = [
+            (Vec2::new(20.0, 20.0), 8.0),
+            (Vec2::new(70.0, 35.0), 24.0),
+            (Vec2::new(115.0, 75.0), 6.0),
+        ];
+        let view = StageView {
+            origin: Pos2::ZERO,
+            scale: 1.0,
+            stage_rect: egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(200.0, 120.0)),
+        };
+        let mesh = variable_round_preview_mesh(&dabs, &view, 0.0, Color32::WHITE);
+        let point = stage_to_screen(dabs[1].0, &view);
+        let covered = mesh.indices.chunks_exact(3).any(|triangle| {
+            triangle_contains(
+                point,
+                mesh.vertices[triangle[0] as usize].pos,
+                mesh.vertices[triangle[1] as usize].pos,
+                mesh.vertices[triangle[2] as usize].pos,
+            )
+        });
+        assert!(
+            covered,
+            "variable-width preview left a hole at the middle dab"
+        );
+    }
     #[test]
     fn advanced_preview_reuses_ring_vertices_instead_of_duplicating_every_bridge() {
         let settings = crate::advanced_brush::AdvancedBrushSettings {

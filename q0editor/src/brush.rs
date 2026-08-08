@@ -151,7 +151,14 @@ pub fn brush_add_sample(stroke: &mut BrushStroke, settings: BrushSettings, sampl
         .is_some_and(|last| vec2_distance(last.position, sample.position) <= 1.0e-5)
     {
         if let Some(last) = stroke.samples.last_mut() {
-            *last = sample;
+            // Pointer-up can arrive as a pressureless fallback at the exact same
+            // position as the final pen sample. Replacing the sample wholesale
+            // turns that endpoint back into a full-size mouse dab and also makes
+            // velocity appear to drop to zero. Preserve arrival time and only
+            // accept a real pressure update while the pointer is stationary.
+            if sample.pressure.is_some() {
+                last.pressure = sample.pressure;
+            }
         }
     } else {
         stroke.samples.push(sample);
@@ -428,20 +435,23 @@ fn sweep_variable_trajectory_nib(
         return sweep_nib(nib, first_size, first, first);
     }
 
-    let mut coverage = sweep_nib(nib, first_size, first, first);
+    // A left-fold union repeatedly booleaned a growing contour against every
+    // new segment, so long pressure/velocity strokes became progressively more
+    // expensive at pointer-up. Build independent bridge surfaces first and let
+    // geo merge the whole set with its balanced unary-union path instead.
+    let mut surfaces: Vec<Polygon<f64>> = Vec::with_capacity(trajectory.len() - 1);
     for index in 1..trajectory.len() {
         let start = trajectory[index - 1];
         let end = trajectory[index];
         let start_size = sizes.get(index - 1).copied().unwrap_or(first_size).max(0.1);
         let end_size = sizes.get(index).copied().unwrap_or(start_size).max(0.1);
-        let segment = if (start_size - end_size).abs() <= 1.0e-4 {
-            sweep_nib(nib, start_size, start, end)
+        if (start_size - end_size).abs() <= 1.0e-4 {
+            surfaces.extend(sweep_nib(nib, start_size, start, end).0);
         } else {
-            variable_nib_segment(nib, start, start_size, end, end_size)
-        };
-        coverage = coverage.union(&segment);
+            surfaces.push(variable_nib_segment(nib, start, start_size, end, end_size));
+        }
     }
-    coverage
+    geo::unary_union(surfaces.iter())
 }
 
 fn variable_nib_segment(
@@ -450,13 +460,13 @@ fn variable_nib_segment(
     start_size: f32,
     end: Vec2,
     end_size: f32,
-) -> MultiPolygon<f64> {
+) -> Polygon<f64> {
     let points = nib_outline(nib, start_size, start)
         .into_iter()
         .chain(nib_outline(nib, end_size, end))
         .map(|point| Point::new(f64::from(point.x), f64::from(point.y)))
         .collect::<Vec<_>>();
-    MultiPolygon(vec![MultiPoint(points).convex_hull()])
+    MultiPoint(points).convex_hull()
 }
 
 fn sweep_trajectory_nib(nib: BrushNib, size: f32, trajectory: &[Vec2]) -> MultiPolygon<f64> {
@@ -2161,6 +2171,36 @@ mod tests {
     }
 
     #[test]
+    fn pressureless_release_sample_does_not_inflate_the_endpoint() {
+        let mut dynamic = settings(20.0, 0);
+        dynamic.pressure_size = true;
+        dynamic.velocity_size = true;
+        dynamic.dynamics_sensitivity = 50;
+        dynamic.dynamics_min_size = 0.2;
+        let mut gesture = brush_begin(
+            dynamic,
+            BrushSample::pointer(Vec2::new(0.0, 0.0), Some(0.4), 0.0),
+        );
+        brush_add_sample(
+            &mut gesture,
+            dynamic,
+            BrushSample::pointer(Vec2::new(20.0, 0.0), Some(0.35), 0.05),
+        );
+        let before = brush_preview_dabs(&gesture);
+        brush_add_sample(
+            &mut gesture,
+            dynamic,
+            BrushSample::pointer(Vec2::new(20.0, 0.0), None, 0.30),
+        );
+        let after = brush_preview_dabs(&gesture);
+
+        assert_eq!(gesture.samples.len(), 2);
+        assert_eq!(gesture.samples[1].pressure, Some(0.35));
+        assert!((gesture.samples[1].time_seconds - 0.05).abs() < f64::EPSILON);
+        assert!((before[1].1 - after[1].1).abs() < 1.0e-5);
+    }
+
+    #[test]
     fn pressure_dynamics_respects_minimum_size() {
         let mut dynamic = settings(20.0, 0);
         dynamic.pressure_size = true;
@@ -2245,6 +2285,38 @@ mod tests {
         let finished = brush_finish(gesture, dynamic);
         assert_eq!(finished.0.len(), 1);
         assert!(finished.contains(&Point::new(50.0, 0.0)));
+    }
+
+    #[test]
+    fn long_variable_width_commit_uses_batched_union_without_progressive_freeze() {
+        let mut dynamic = settings(18.0, 0);
+        dynamic.pressure_size = true;
+        dynamic.dynamics_min_size = 0.15;
+        let mut gesture = brush_begin(
+            dynamic,
+            BrushSample::pointer(Vec2::new(0.0, 0.0), Some(0.5), 0.0),
+        );
+        for index in 1..=1_200 {
+            let pressure = 0.15 + (index as f32 * 0.031).sin().abs() * 0.85;
+            brush_add_sample(
+                &mut gesture,
+                dynamic,
+                BrushSample::pointer(
+                    Vec2::new(index as f32 * 0.75, (index as f32 * 0.045).sin() * 28.0),
+                    Some(pressure),
+                    index as f64 / 240.0,
+                ),
+            );
+        }
+
+        let started = std::time::Instant::now();
+        brush_flush_pending(&mut gesture);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "1200-sample variable-width commit took {:?}",
+            started.elapsed()
+        );
+        assert!(!gesture.coverage.0.is_empty());
     }
 
     #[test]
