@@ -1316,7 +1316,7 @@ fn lerp_transform(a: Transform2D, b: Transform2D, t: f32) -> Transform2D {
 }
 
 #[cfg(feature = "appearance-mask-eraser")]
-fn appearance_cache_signature(
+pub(crate) fn appearance_cache_signature(
     vector: &q0s_format::v2::VectorAsset,
     appearance: &VectorAppearance,
 ) -> (u64, Vec2) {

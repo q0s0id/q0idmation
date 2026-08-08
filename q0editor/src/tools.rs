@@ -278,13 +278,12 @@ fn select_cursor(
     // bitmap, transformed vector instances) keep normal object hit-testing.
     let cursor_stage = screen_to_stage(cursor_screen, view);
     if selected_raw_body_contains_point(app, cursor_stage)
-        || hit_test_raw_selection(
+        || hit_test_raw_hover(
             &app.state.project,
             app.session.current_q0rg_id,
             app.session.current_frame,
             cursor_stage,
         )
-        .is_some()
         || hit_test_selectable_placement(
             &app.state.project,
             app.session.current_q0rg_id,
@@ -925,6 +924,78 @@ fn signed_path_area(path: &VPath) -> f64 {
         .map(|(a, b)| (a.x as f64 * b.y as f64) - (b.x as f64 * a.y as f64))
         .sum::<f64>()
         * 0.5
+}
+
+/// Cheap exact-at-a-point NonZero fill test for interactive cursor/body hit-testing.
+/// Unlike `vector_fill_geometry`, this never reconstructs or unions the complete
+/// filled surface. That distinction matters for dense Advanced Brush contours:
+/// Select asks this question every pointer frame, while full component geometry
+/// is only required after the user actually clicks or starts a drag.
+fn interactive_paths_contain_or_near(paths: &[VPath], point: Vec2, distance: f32) -> bool {
+    let mut winding = 0_i32;
+    let mut near_boundary = false;
+    let distance = distance.max(0.0);
+    for path in paths.iter().filter(|path| path.closed) {
+        let points = flatten_path(path);
+        if points.len() < 3 {
+            continue;
+        }
+        if point_in_polygon(&points, point) {
+            let area = points
+                .iter()
+                .zip(points.iter().cycle().skip(1))
+                .take(points.len())
+                .map(|(a, b)| f64::from(a.x) * f64::from(b.y) - f64::from(b.x) * f64::from(a.y))
+                .sum::<f64>()
+                * 0.5;
+            winding += if area >= 0.0 { 1 } else { -1 };
+        }
+        if distance > 0.0 && nearest_segment_distance(&points, point) <= distance {
+            near_boundary = true;
+        }
+    }
+    winding != 0 || near_boundary
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn interactive_visible_fill_hit(
+    vector: &VectorAsset,
+    appearance: Option<&q0s_format::v2::VectorAppearance>,
+    point: Vec2,
+    edge_tolerance: f32,
+) -> bool {
+    let Some(appearance) = appearance else {
+        return interactive_paths_contain_or_near(&vector.paths, point, edge_tolerance);
+    };
+    let Some(inverse_field) = appearance.field_transform.inverse() else {
+        return false;
+    };
+    let canonical = inverse_field.apply(point);
+    let support_hit = if appearance.clip_mask.is_empty() {
+        let source = if appearance.material_source.is_empty() {
+            &vector.paths
+        } else {
+            &appearance.material_source
+        };
+        let radius = match appearance.material {
+            q0s_format::v2::VectorMaterial::Solid => 0.0,
+            q0s_format::v2::VectorMaterial::SoftHalo { radius, .. } => radius.max(0.0),
+        };
+        interactive_paths_contain_or_near(source, canonical, radius + edge_tolerance.max(0.0))
+    } else {
+        interactive_paths_contain_or_near(&appearance.clip_mask, canonical, edge_tolerance.max(0.0))
+    };
+    support_hit && !interactive_paths_contain_or_near(&appearance.erase_mask, canonical, 0.001)
+}
+
+#[cfg(not(feature = "appearance-mask-eraser"))]
+fn interactive_visible_fill_hit(
+    vector: &VectorAsset,
+    _appearance: Option<&q0s_format::v2::VectorAppearance>,
+    point: Vec2,
+    edge_tolerance: f32,
+) -> bool {
+    interactive_paths_contain_or_near(&vector.paths, point, edge_tolerance)
 }
 
 /// Reconstruct the final NonZero-filled surface, rather than treating each
@@ -3542,6 +3613,53 @@ enum RawSelectionHit {
 /// selects the connected filled region, not the asset/placement that happens
 /// to store it. This is intentionally separate from `hit_test_raw_path`, which
 /// remains contour-oriented for Subselect and low-level editing tools.
+fn hit_test_raw_hover(project: &ProjectV2, q0rg_id: u16, frame: u16, cursor: Vec2) -> bool {
+    let Some(q) = project.q0rgs.iter().find(|q| q.q0rg_id == q0rg_id) else {
+        return false;
+    };
+    for layer in q.layers.iter().rev() {
+        for placement_idx in active_raw_placement_indices(project, layer, frame)
+            .into_iter()
+            .rev()
+        {
+            let placement = &layer.placements[placement_idx];
+            let Target::Asset(asset_id) = placement.target else {
+                continue;
+            };
+            let Some(Asset::Vector(vector)) =
+                project.assets.iter().find(|asset| asset.id() == asset_id)
+            else {
+                continue;
+            };
+            if vector.fill.is_some()
+                && interactive_visible_fill_hit(
+                    vector,
+                    project.asset_appearances.get(&asset_id),
+                    cursor,
+                    2.0,
+                )
+            {
+                return true;
+            }
+            let stroke_radius = vector
+                .stroke
+                .as_ref()
+                .map(|stroke| stroke.width.max(1.0) * 0.5 + 3.0)
+                .unwrap_or(3.0);
+            for path in vector.paths.iter().rev() {
+                if path.closed && vector.fill.is_some() {
+                    continue;
+                }
+                let points = flatten_path(path);
+                if points.len() >= 2 && nearest_segment_distance(&points, cursor) <= stroke_radius {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn hit_test_raw_selection(
     project: &ProjectV2,
     q0rg_id: u16,
@@ -4202,13 +4320,7 @@ fn point_hits_selected_raw_paths(project: &ProjectV2, refs: &[PathRef], point: V
         if vector.fill.is_some() && !closed_indices.is_empty() {
             #[cfg(feature = "appearance-mask-eraser")]
             if let Some(appearance) = project.asset_appearances.get(&asset_id) {
-                let Some(tester) = crate::appearance::prepare_visible_material_hit_tester(
-                    vector,
-                    Some(appearance),
-                ) else {
-                    continue;
-                };
-                if tester.contains(point, 2.0) {
+                if interactive_visible_fill_hit(vector, Some(appearance), point, 2.0) {
                     let all_closed_selected = vector
                         .paths
                         .iter()
@@ -4218,27 +4330,24 @@ fn point_hits_selected_raw_paths(project: &ProjectV2, refs: &[PathRef], point: V
                     if all_closed_selected {
                         return true;
                     }
-                    let subset = VectorAsset {
-                        asset_id: vector.asset_id,
-                        paths: closed_indices
-                            .iter()
-                            .filter_map(|index| vector.paths.get(*index).cloned())
-                            .collect(),
-                        fill: vector.fill,
-                        stroke: None,
+                    let Some(inverse_field) = appearance.field_transform.inverse() else {
+                        continue;
                     };
-                    let subset_surface = vector_fill_geometry(&subset);
-                    if let Some(inverse_field) = appearance.field_transform.inverse() {
-                        let canonical_subset =
-                            crate::appearance::transform_surface(&subset_surface, inverse_field);
-                        if crate::appearance::material_support_contains_point(
-                            &canonical_subset,
-                            appearance.material,
-                            tester.canonical_point(point),
-                            2.0,
-                        ) {
-                            return true;
-                        }
+                    let canonical_point = inverse_field.apply(point);
+                    let selected_paths: Vec<VPath> = closed_indices
+                        .iter()
+                        .filter_map(|index| vector.paths.get(*index).cloned())
+                        .collect();
+                    let radius = match appearance.material {
+                        q0s_format::v2::VectorMaterial::Solid => 0.0,
+                        q0s_format::v2::VectorMaterial::SoftHalo { radius, .. } => radius.max(0.0),
+                    };
+                    if interactive_paths_contain_or_near(
+                        &selected_paths,
+                        canonical_point,
+                        radius + 2.0,
+                    ) {
+                        return true;
                     }
                 }
                 // Appearance owns the visible body. Never fall through to the
@@ -4246,23 +4355,11 @@ fn point_hits_selected_raw_paths(project: &ProjectV2, refs: &[PathRef], point: V
                 continue;
             }
 
-            let subset = VectorAsset {
-                asset_id: vector.asset_id,
-                paths: closed_indices
-                    .iter()
-                    .filter_map(|index| vector.paths.get(*index).cloned())
-                    .collect(),
-                fill: vector.fill,
-                stroke: None,
-            };
-            let surface = vector_fill_geometry(&subset);
-            let geo_point = Point::new(f64::from(point.x), f64::from(point.y));
-            if surface.contains(&geo_point)
-                || surface
-                    .0
-                    .iter()
-                    .any(|polygon| polygon_boundary_near_cursor(polygon, point, 2.0))
-            {
+            let selected_paths: Vec<VPath> = closed_indices
+                .iter()
+                .filter_map(|index| vector.paths.get(*index).cloned())
+                .collect();
+            if interactive_paths_contain_or_near(&selected_paths, point, 2.0) {
                 return true;
             }
         }
@@ -4326,12 +4423,7 @@ fn raw_area_selection_contains_point(
         };
         #[cfg(feature = "appearance-mask-eraser")]
         if let Some(appearance) = project.asset_appearances.get(&asset_id) {
-            return crate::appearance::visible_material_contains_point(
-                vector,
-                Some(appearance),
-                point,
-                2.0,
-            );
+            return interactive_visible_fill_hit(vector, Some(appearance), point, 2.0);
         }
         let surface = vector_fill_geometry(vector);
         let geo_point = Point::new(f64::from(point.x), f64::from(point.y));
@@ -7251,20 +7343,172 @@ fn appearance_selection_stipple_points(
 }
 
 #[cfg(feature = "appearance-mask-eraser")]
+#[derive(Clone)]
+struct CachedAppearanceSelectionStipple {
+    key: u64,
+    points: std::sync::Arc<Vec<Pos2>>,
+}
+
+#[cfg(all(test, feature = "appearance-mask-eraser"))]
+static APPEARANCE_SELECTION_STIPPLE_BUILD_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn appearance_selection_stipple_cache_key(
+    vector: &VectorAsset,
+    appearance: &q0s_format::v2::VectorAppearance,
+    view: &StageView,
+    rect: egui::Rect,
+    subset_path_indices: Option<&[usize]>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let (appearance_fingerprint, _) = crate::render::appearance_cache_signature(vector, appearance);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    appearance_fingerprint.hash(&mut hasher);
+    for value in [
+        appearance.field_transform.a11,
+        appearance.field_transform.a12,
+        appearance.field_transform.a21,
+        appearance.field_transform.a22,
+        appearance.field_transform.tx,
+        appearance.field_transform.ty,
+        view.origin.x,
+        view.origin.y,
+        view.scale,
+        rect.left(),
+        rect.top(),
+        rect.right(),
+        rect.bottom(),
+    ] {
+        value.to_bits().hash(&mut hasher);
+    }
+    if let Some(indices) = subset_path_indices {
+        indices.len().hash(&mut hasher);
+        for index in indices {
+            index.hash(&mut hasher);
+            if let Some(path) = vector.paths.get(*index) {
+                path.closed.hash(&mut hasher);
+                path.anchors.len().hash(&mut hasher);
+                for anchor in &path.anchors {
+                    anchor.point.x.to_bits().hash(&mut hasher);
+                    anchor.point.y.to_bits().hash(&mut hasher);
+                    anchor
+                        .in_handle
+                        .map(|point| (point.x.to_bits(), point.y.to_bits()))
+                        .hash(&mut hasher);
+                    anchor
+                        .out_handle
+                        .map(|point| (point.x.to_bits(), point.y.to_bits()))
+                        .hash(&mut hasher);
+                }
+            }
+        }
+    } else {
+        0_usize.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn cached_appearance_selection_stipple_points(
+    painter: &Painter,
+    view: &StageView,
+    sample_rect: egui::Rect,
+    vector: &VectorAsset,
+    appearance: &q0s_format::v2::VectorAppearance,
+    subset_path_indices: Option<&[usize]>,
+) -> std::sync::Arc<Vec<Pos2>> {
+    use std::hash::{Hash, Hasher};
+
+    let key = appearance_selection_stipple_cache_key(
+        vector,
+        appearance,
+        view,
+        sample_rect,
+        subset_path_indices,
+    );
+    let mut subset_hasher = std::collections::hash_map::DefaultHasher::new();
+    subset_path_indices.unwrap_or(&[]).hash(&mut subset_hasher);
+    let id = egui::Id::new((
+        "q0editor.appearance-selection-stipple.v2",
+        vector.asset_id,
+        subset_hasher.finish(),
+    ));
+    if let Some(cached) = painter
+        .ctx()
+        .data(|data| data.get_temp::<CachedAppearanceSelectionStipple>(id))
+    {
+        if cached.key == key {
+            return cached.points;
+        }
+    }
+
+    #[cfg(all(test, feature = "appearance-mask-eraser"))]
+    APPEARANCE_SELECTION_STIPPLE_BUILD_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+    let points = if let Some(tester) =
+        crate::appearance::prepare_visible_material_hit_tester(vector, Some(appearance))
+    {
+        let subset_surface = subset_path_indices.and_then(|indices| {
+            let subset = VectorAsset {
+                asset_id: vector.asset_id,
+                paths: indices
+                    .iter()
+                    .filter_map(|index| vector.paths.get(*index).cloned())
+                    .collect(),
+                fill: vector.fill,
+                stroke: None,
+            };
+            let surface = vector_fill_geometry(&subset);
+            appearance
+                .field_transform
+                .inverse()
+                .map(|inverse| crate::appearance::transform_surface(&surface, inverse))
+        });
+        let subset_support = subset_surface
+            .as_ref()
+            .map(|surface| (surface, appearance.material));
+        appearance_selection_stipple_points(view, sample_rect, &tester, subset_support)
+    } else {
+        Vec::new()
+    };
+    let points = std::sync::Arc::new(points);
+    painter.ctx().data_mut(|data| {
+        data.insert_temp(
+            id,
+            CachedAppearanceSelectionStipple {
+                key,
+                points: points.clone(),
+            },
+        )
+    });
+    points
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
 fn draw_appearance_selection_stipple(
     painter: &Painter,
     view: &StageView,
     rect: egui::Rect,
-    tester: &crate::appearance::VisibleMaterialHitTester,
-    subset_support: Option<(&MultiPolygon<f64>, q0s_format::v2::VectorMaterial)>,
+    vector: &VectorAsset,
+    appearance: &q0s_format::v2::VectorAppearance,
+    subset_path_indices: Option<&[usize]>,
 ) {
     let sample_rect = rect.intersect(painter.clip_rect());
     if !sample_rect.is_positive() {
         return;
     }
     let clipped = painter.with_clip_rect(sample_rect);
-    let points = appearance_selection_stipple_points(view, sample_rect, tester, subset_support);
-    draw_stipple_batch(&clipped, &points, 0.38, Color32::WHITE);
+    let points = cached_appearance_selection_stipple_points(
+        painter,
+        view,
+        sample_rect,
+        vector,
+        appearance,
+        subset_path_indices,
+    );
+    draw_stipple_batch(&clipped, points.as_ref(), 0.38, Color32::WHITE);
 }
 
 fn draw_raw_area_selection(
@@ -7305,11 +7549,14 @@ fn draw_raw_area_selection(
         };
         #[cfg(feature = "appearance-mask-eraser")]
         if let Some(appearance) = app.state.project.asset_appearances.get(&asset_id) {
-            if let Some(tester) =
-                crate::appearance::prepare_visible_material_hit_tester(vector, Some(appearance))
-            {
-                draw_appearance_selection_stipple(painter, view, selection_rect, &tester, None);
-            }
+            draw_appearance_selection_stipple(
+                painter,
+                view,
+                selection_rect,
+                vector,
+                appearance,
+                None,
+            );
             let body =
                 crate::appearance::visible_source_surface_for_vector(vector, Some(appearance));
             let body_contours = surface_to_screen_contours(&body, view);
@@ -7480,18 +7727,14 @@ fn draw_raw_paths_overlay(
                     crate::appearance::visible_source_surface_for_vector(&subset, Some(appearance));
                 let body_contours = surface_to_screen_contours(&body, view);
                 draw_dense_selection_contour(painter, &body_contours, selection_color(app));
-                if let Some(tester) =
-                    crate::appearance::prepare_visible_material_hit_tester(vector, Some(appearance))
-                {
-                    let subset_surface = vector_fill_geometry(&subset);
-                    let canonical_subset = appearance.field_transform.inverse().map(|inverse| {
-                        crate::appearance::transform_surface(&subset_surface, inverse)
-                    });
-                    let subset_support = canonical_subset
-                        .as_ref()
-                        .map(|surface| (surface, appearance.material));
-                    draw_appearance_selection_stipple(painter, view, rect, &tester, subset_support);
-                }
+                draw_appearance_selection_stipple(
+                    painter,
+                    view,
+                    rect,
+                    vector,
+                    appearance,
+                    Some(&closed_indices),
+                );
             }
             continue;
         }
@@ -9416,6 +9659,134 @@ mod tests {
         assert!(
             !point_hits_selected_raw_paths(&project, &selected, Vec2::new(10.0, 10.0)),
             "selected-body drag hit must not resurrect an erased appearance hole"
+        );
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn interactive_glow_hover_matches_exact_material_hit_without_component_rebuild() {
+        let project = appearance_selection_project(true);
+        let vector = match &project.assets[0] {
+            Asset::Vector(vector) => vector,
+            Asset::Bitmap(_) | Asset::Q0v(_) => unreachable!(),
+        };
+        let appearance = project.asset_appearances.get(&1).expect("appearance");
+        for point in [
+            Vec2::new(-5.0, 10.0),
+            Vec2::new(2.0, 2.0),
+            Vec2::new(10.0, 10.0),
+            Vec2::new(25.0, 10.0),
+            Vec2::new(40.0, 40.0),
+        ] {
+            assert_eq!(
+                interactive_visible_fill_hit(vector, Some(appearance), point, 2.0),
+                crate::appearance::visible_material_contains_point(
+                    vector,
+                    Some(appearance),
+                    point,
+                    2.0,
+                ),
+                "interactive hover diverged from exact visible material at {point:?}",
+            );
+        }
+        assert!(hit_test_raw_hover(&project, 1, 0, Vec2::new(-5.0, 10.0)));
+        assert!(!hit_test_raw_hover(&project, 1, 0, Vec2::new(10.0, 10.0)));
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn dense_advanced_glow_hover_does_not_reenter_full_component_geometry_per_frame() {
+        let mut app = EditorApp::default();
+        let settings = crate::advanced_brush::AdvancedBrushSettings {
+            size: 18.0,
+            smoothing: 35,
+            stabilizer: 0,
+            pressure_size: false,
+            glow: true,
+            glow_radius: 14.0,
+            glow_opacity: 0.6,
+            ..Default::default()
+        };
+        let samples = (0..240)
+            .map(|index| crate::advanced_brush::AdvancedBrushSample {
+                position: Vec2::new(
+                    40.0 + index as f32 * 1.8,
+                    180.0 + (index as f32 * 0.11).sin() * 45.0,
+                ),
+                pressure: None,
+                time_seconds: index as f64 / 120.0,
+            })
+            .collect();
+        let region =
+            crate::advanced_brush::advanced_finish(crate::advanced_brush::AdvancedBrushStroke {
+                samples,
+                settings,
+            });
+        let bridge = crate::brush::BrushSettings {
+            color: settings.color,
+            size: settings.size,
+            smoothing: 0,
+            nib: crate::brush::BrushNib::Circle,
+            scale_with_stage: true,
+            sync_with_eraser: true,
+        };
+        crate::brush::commit_brush_region_with_material(
+            &mut app,
+            region,
+            bridge,
+            settings.material(),
+        );
+
+        let start = std::time::Instant::now();
+        for index in 0..64 {
+            let point = if index % 2 == 0 {
+                Vec2::new(120.0 + index as f32, 180.0)
+            } else {
+                Vec2::new(600.0, 440.0)
+            };
+            let _ = hit_test_raw_hover(&app.state.project, 1, 0, point);
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "dense Advanced Glow hover fell back to frame-by-frame component reconstruction: {:?}",
+            start.elapsed(),
+        );
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn unchanged_glow_selection_reuses_cached_stipple_points() {
+        use std::sync::atomic::Ordering;
+
+        let project = appearance_selection_project(true);
+        let vector = match &project.assets[0] {
+            Asset::Vector(vector) => vector,
+            Asset::Bitmap(_) | Asset::Q0v(_) => unreachable!(),
+        };
+        let appearance = project.asset_appearances.get(&1).expect("appearance");
+        let context = egui::Context::default();
+        let painter = context.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("selection-cache-test"),
+        ));
+        let view = StageView {
+            origin: Pos2::ZERO,
+            scale: 1.0,
+            stage_rect: egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(100.0, 100.0)),
+        };
+        let rect = egui::Rect::from_min_max(Pos2::new(-10.0, -10.0), Pos2::new(30.0, 30.0));
+        APPEARANCE_SELECTION_STIPPLE_BUILD_COUNT.store(0, Ordering::SeqCst);
+        let first = cached_appearance_selection_stipple_points(
+            &painter, &view, rect, vector, appearance, None,
+        );
+        let second = cached_appearance_selection_stipple_points(
+            &painter, &view, rect, vector, appearance, None,
+        );
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            APPEARANCE_SELECTION_STIPPLE_BUILD_COUNT.load(Ordering::SeqCst),
+            1,
+            "unchanged selected glow rebuilt its expensive stipple mask every frame",
         );
     }
 
