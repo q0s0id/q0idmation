@@ -691,6 +691,29 @@ pub(crate) fn visible_source_surface_for_vector(
     }
 }
 
+/// Same visible vector body expressed in the appearance field's canonical
+/// coordinates. Clip/erase masks already live in this space. Caching this result
+/// lets affine edits change only `field_transform`; the expensive booleans do not
+/// need to run again for every repaint while the object moves or the view zooms.
+pub(crate) fn canonical_visible_source_surface_for_vector(
+    vector: &VectorAsset,
+    appearance: &VectorAppearance,
+) -> Option<MultiPolygon<f64>> {
+    let inverse_field = appearance.field_transform.inverse()?;
+    let source = transform_surface(&crate::brush::vector_fill_geometry(vector), inverse_field);
+    let clipped = if appearance.clip_mask.is_empty() {
+        source
+    } else {
+        source.intersection(&mask_paths_to_coverage(&appearance.clip_mask))
+    };
+    let erase = mask_paths_to_coverage(&appearance.erase_mask);
+    Some(if erase.0.is_empty() {
+        clipped
+    } else {
+        clipped.difference(&erase)
+    })
+}
+
 /// Full selectable visual support. Split fragments keep a frozen material
 /// source and a post-material clip, so moving a cut piece carries the exact
 /// resolved slice instead of generating a fresh glow along the cut edge.
@@ -1069,6 +1092,62 @@ mod tests {
         assert!(
             right_bounds.min().x >= 4.95,
             "right fragment must not generate a new halo across the cut edge: {right_bounds:?}"
+        );
+    }
+
+    #[test]
+    fn canonical_visible_body_matches_current_space_clip_and_erase_after_affine() {
+        let canonical_path = square_path(0.0, 0.0, 20.0, 20.0);
+        let field = Affine::from_transform(Transform2D {
+            tx: 31.0,
+            ty: -17.0,
+            sx: 1.2,
+            sy: 0.85,
+            rotation: 0.23,
+            skew_x: 0.08,
+            skew_y: -0.04,
+        });
+        let mut current_path = canonical_path.clone();
+        for anchor in &mut current_path.anchors {
+            anchor.point = field.apply(anchor.point);
+            if let Some(point) = &mut anchor.in_handle {
+                *point = field.apply(*point);
+            }
+            if let Some(point) = &mut anchor.out_handle {
+                *point = field.apply(*point);
+            }
+        }
+        let vector = VectorAsset {
+            asset_id: 17,
+            paths: vec![current_path],
+            fill: Some(Rgba {
+                r: 10,
+                g: 20,
+                b: 30,
+                a: 255,
+            }),
+            stroke: None,
+        };
+        let appearance = VectorAppearance {
+            material: VectorMaterial::SoftHalo {
+                radius: 9.0,
+                opacity: 0.6,
+            },
+            erase_mask: vec![square_path(3.0, 3.0, 6.0, 6.0)],
+            material_source: vec![canonical_path],
+            clip_mask: vec![square_path(-2.0, -2.0, 13.0, 22.0)],
+            field_transform: field,
+        };
+
+        let current = visible_source_surface_for_vector(&vector, Some(&appearance));
+        let canonical = canonical_visible_source_surface_for_vector(&vector, &appearance)
+            .expect("invertible field");
+        let rebuilt_current = transform_surface(&canonical, field);
+        let mismatch = current.difference(&rebuilt_current).unsigned_area()
+            + rebuilt_current.difference(&current).unsigned_area();
+        assert!(
+            mismatch < 0.05,
+            "canonical cached body changed visible vector pixels: mismatch={mismatch}",
         );
     }
 

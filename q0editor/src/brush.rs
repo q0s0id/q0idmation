@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use geo::{
-    Area, BooleanOps, BoundingRect, Buffer, Contains, ConvexHull, Coord, Line, LineString,
-    MultiPoint, MultiPolygon, Point, Polygon, SimplifyVwPreserve,
+    Area, BooleanOps, BoundingRect, Buffer, Contains, ConvexHull, Coord, Intersects, Line,
+    LineString, MultiPoint, MultiPolygon, Point, Polygon, SimplifyVwPreserve,
 };
 use q0s_format::v2::{
     Anchor, Asset, Path as VPath, Placement, ProjectV2, Rgba, Target, Transform2D, Tween, Vec2,
@@ -1110,11 +1110,37 @@ pub fn commit_brush_region_with_material(
     // toggling Glow would silently restyle older artwork.
     let mut painted = region;
     let mut same_style_assets = BTreeSet::new();
-    for candidate in &candidates {
-        if raw_fill_style(&app.state.project, candidate) == requested_style
-            && same_style_assets.insert(candidate.asset_id)
-        {
-            painted = painted.union(&candidate.geometry);
+    if requested_material.is_some() {
+        // Filtered Advanced paint must not collapse every disconnected stroke of
+        // the same style into one giant raster field. Disconnected components
+        // are visually identical when kept separate and can then cache/rasterize
+        // independently. Only geometry connected to the fresh stroke (including
+        // transitive touching components) participates in merge drawing.
+        loop {
+            let mut changed = false;
+            for candidate in &candidates {
+                if raw_fill_style(&app.state.project, candidate) == requested_style
+                    && !same_style_assets.contains(&candidate.asset_id)
+                    && candidate.geometry.intersects(&painted)
+                {
+                    same_style_assets.insert(candidate.asset_id);
+                    painted = painted.union(&candidate.geometry);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    } else {
+        // Preserve classic Flash-style planar merge drawing. Raw vector fills are
+        // cheap and have no filtered field whose raster cost grows with distance.
+        for candidate in &candidates {
+            if raw_fill_style(&app.state.project, candidate) == requested_style
+                && same_style_assets.insert(candidate.asset_id)
+            {
+                painted = painted.union(&candidate.geometry);
+            }
         }
     }
     let painted_paths = coverage_to_paths(&painted);
@@ -1207,7 +1233,16 @@ pub fn commit_brush_region_with_material(
                 .asset_appearances
                 .insert(painted_asset_id, appearance);
         }
-        app.textures.invalidate();
+        let mut changed_asset_ids = remove_asset_ids;
+        for (original_asset_id, _) in &different_updates {
+            changed_asset_ids.insert(
+                *writable_different
+                    .get(original_asset_id)
+                    .unwrap_or(original_asset_id),
+            );
+        }
+        changed_asset_ids.insert(painted_asset_id);
+        app.textures.invalidate_assets(changed_asset_ids);
     }
 
     app.session.selection = crate::state::Selection::None;
@@ -2616,6 +2651,101 @@ mod tests {
 
         assert_eq!(app.state.project.assets.len(), 2);
         assert_eq!(app.state.project.asset_appearances.len(), 1);
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn disconnected_advanced_glow_strokes_keep_independent_material_fields() {
+        let mut app = EditorApp::default();
+        let brush = settings(12.0, 0);
+        let material = VectorMaterial::SoftHalo {
+            radius: 12.0,
+            opacity: 0.55,
+        };
+
+        for x in [20.0_f32, 140.0, 260.0] {
+            let gesture = stroke(&[Vec2::new(x, 40.0), Vec2::new(x + 40.0, 40.0)], brush);
+            commit_brush_region_with_material(
+                &mut app,
+                brush_finish(gesture, brush),
+                brush,
+                Some(material),
+            );
+        }
+
+        assert_eq!(app.state.project.assets.len(), 3);
+        assert_eq!(app.state.project.asset_appearances.len(), 3);
+        assert!(app
+            .state
+            .project
+            .asset_appearances
+            .values()
+            .all(|appearance| {
+                appearance.material_source.is_empty()
+                    && appearance.clip_mask.is_empty()
+                    && appearance.erase_mask.is_empty()
+            }));
+
+        // Touch the first stroke. It should merge with that one field only; the
+        // two distant cached fields must remain independent.
+        let touching = stroke(&[Vec2::new(45.0, 40.0), Vec2::new(90.0, 40.0)], brush);
+        commit_brush_region_with_material(
+            &mut app,
+            brush_finish(touching, brush),
+            brush,
+            Some(material),
+        );
+        assert_eq!(
+            app.state.project.assets.len(),
+            3,
+            "touching Advanced paint merges only its connected material field",
+        );
+        assert_eq!(app.state.project.asset_appearances.len(), 3);
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn twenty_distant_advanced_glow_strokes_do_not_grow_one_monolithic_source() {
+        let mut app = EditorApp::default();
+        let brush = settings(8.0, 0);
+        let material = VectorMaterial::SoftHalo {
+            radius: 10.0,
+            opacity: 0.55,
+        };
+        for index in 0..20 {
+            let x = 12.0 + (index % 5) as f32 * 110.0;
+            let y = 20.0 + (index / 5) as f32 * 90.0;
+            let gesture = stroke(&[Vec2::new(x, y), Vec2::new(x + 35.0, y + 8.0)], brush);
+            commit_brush_region_with_material(
+                &mut app,
+                brush_finish(gesture, brush),
+                brush,
+                Some(material),
+            );
+        }
+        assert_eq!(app.state.project.asset_appearances.len(), 20);
+        assert_eq!(app.state.project.assets.len(), 20);
+        let largest_body = app
+            .state
+            .project
+            .assets
+            .iter()
+            .filter_map(|asset| match asset {
+                Asset::Vector(vector) => Some(
+                    vector
+                        .paths
+                        .iter()
+                        .map(|path| path.anchors.len())
+                        .sum::<usize>(),
+                ),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(
+            largest_body < 300,
+            "a distant stroke accidentally accumulated the geometry of its neighbours: {largest_body} anchors",
+        );
     }
 
     #[cfg(not(feature = "appearance-mask-eraser"))]

@@ -56,8 +56,12 @@ pub struct TextureCache {
     appearance_by_asset: HashMap<(u16, u16, u64), CachedAppearanceTexture>,
     #[cfg(feature = "appearance-mask-eraser")]
     appearance_signature_by_asset: HashMap<u16, (u64, Vec2)>,
+    #[cfg(feature = "appearance-mask-eraser")]
+    visible_body_by_asset: HashMap<u16, Vec<Vec<Vec2>>>,
     #[cfg(all(test, feature = "appearance-mask-eraser"))]
     appearance_signature_build_count: usize,
+    #[cfg(all(test, feature = "appearance-mask-eraser"))]
+    visible_body_build_count: usize,
 }
 
 impl TextureCache {
@@ -69,6 +73,32 @@ impl TextureCache {
         {
             self.appearance_by_asset.clear();
             self.appearance_signature_by_asset.clear();
+            self.visible_body_by_asset.clear();
+        }
+    }
+
+    /// Drop cached render data only for assets whose model data actually changed.
+    /// Brush commits used to clear every halo/body texture in the project, so the
+    /// Nth Advanced stroke forced all previous strokes through raster/boolean work
+    /// again. Unrelated assets are immutable and can safely keep their caches.
+    #[cfg(feature = "appearance-mask-eraser")]
+    pub(crate) fn invalidate_asset(&mut self, asset_id: u16) {
+        self.by_asset_id.remove(&asset_id);
+        self.by_q0v_frame.retain(|(id, _), _| *id != asset_id);
+        self.q0v_media.remove(&asset_id);
+        #[cfg(feature = "appearance-mask-eraser")]
+        {
+            self.appearance_by_asset
+                .retain(|(id, _, _), _| *id != asset_id);
+            self.appearance_signature_by_asset.remove(&asset_id);
+            self.visible_body_by_asset.remove(&asset_id);
+        }
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    pub(crate) fn invalidate_assets(&mut self, asset_ids: impl IntoIterator<Item = u16>) {
+        for asset_id in asset_ids {
+            self.invalidate_asset(asset_id);
         }
     }
 
@@ -451,7 +481,8 @@ fn render_asset(
                 );
                 if let Some(fill) = v.fill {
                     let fill_color = modulate(rgba_to_color32(fill), tint);
-                    let contours = masked_vector_body_contours(v, appearance, transform, view);
+                    let contours =
+                        masked_vector_body_contours(v, appearance, transform, view, textures);
                     paint_complex_fill(painter, &contours, fill_color);
                 }
                 // Appearance metadata is validated only for fill-only vectors.
@@ -1605,6 +1636,7 @@ fn masked_vector_body_contours(
     appearance: &VectorAppearance,
     transform: Affine,
     view: &StageView,
+    textures: &mut TextureCache,
 ) -> Vec<Vec<Pos2>> {
     if appearance.erase_mask.is_empty() && appearance.clip_mask.is_empty() {
         // Preserve the exact normal vector-render path until there is an actual
@@ -1621,13 +1653,55 @@ fn masked_vector_body_contours(
             })
             .collect();
     }
-    let visible = crate::appearance::visible_source_surface_for_vector(vector, Some(appearance));
-    crate::brush::coverage_to_paths(&visible)
-        .iter()
-        .map(|path| {
-            flatten_path(path)
+
+    // Fragment clips/erase masks used to run vector -> geo booleans -> paths ->
+    // flattening on every repaint. A real Advanced smoke project spent >1 s in
+    // this warm-frame path even with all glow textures already cached. Resolve
+    // the body once in canonical field-space. Affine drag/scale/rotate then only
+    // changes `field_transform`, so the same cached contours remain valid.
+    let mut built_body_cache = false;
+    if let std::collections::hash_map::Entry::Vacant(entry) =
+        textures.visible_body_by_asset.entry(vector.asset_id)
+    {
+        let Some(visible) =
+            crate::appearance::canonical_visible_source_surface_for_vector(vector, appearance)
+        else {
+            let visible =
+                crate::appearance::visible_source_surface_for_vector(vector, Some(appearance));
+            return crate::brush::coverage_to_paths(&visible)
                 .iter()
-                .map(|point| stage_to_screen(transform.apply(*point), view))
+                .map(|path| {
+                    flatten_path(path)
+                        .iter()
+                        .map(|point| stage_to_screen(transform.apply(*point), view))
+                        .collect()
+                })
+                .collect();
+        };
+        let local_contours: Vec<Vec<Vec2>> = crate::brush::coverage_to_paths(&visible)
+            .iter()
+            .map(flatten_path)
+            .collect();
+        entry.insert(local_contours);
+        built_body_cache = true;
+    }
+    #[cfg(all(test, feature = "appearance-mask-eraser"))]
+    if built_body_cache {
+        textures.visible_body_build_count += 1;
+    }
+    #[cfg(not(all(test, feature = "appearance-mask-eraser")))]
+    let _ = built_body_cache;
+
+    let body_transform = Affine::compose(transform, appearance.field_transform);
+    textures
+        .visible_body_by_asset
+        .get(&vector.asset_id)
+        .expect("visible body inserted above")
+        .iter()
+        .map(|contour| {
+            contour
+                .iter()
+                .map(|point| stage_to_screen(body_transform.apply(*point), view))
                 .collect()
         })
         .collect()
@@ -1738,6 +1812,37 @@ mod tests {
 
     #[cfg(feature = "appearance-mask-eraser")]
     #[test]
+    fn per_asset_invalidation_preserves_unrelated_fragment_caches() {
+        let mut cache = TextureCache::default();
+        cache
+            .appearance_signature_by_asset
+            .insert(1, (11, Vec2::new(1.0, 2.0)));
+        cache
+            .appearance_signature_by_asset
+            .insert(2, (22, Vec2::new(3.0, 4.0)));
+        cache
+            .visible_body_by_asset
+            .insert(1, vec![vec![Vec2::new(1.0, 1.0)]]);
+        cache
+            .visible_body_by_asset
+            .insert(2, vec![vec![Vec2::new(2.0, 2.0)]]);
+
+        cache.invalidate_asset(1);
+
+        assert!(!cache.appearance_signature_by_asset.contains_key(&1));
+        assert!(!cache.visible_body_by_asset.contains_key(&1));
+        assert_eq!(
+            cache.appearance_signature_by_asset.get(&2),
+            Some(&(22, Vec2::new(3.0, 4.0))),
+        );
+        assert_eq!(
+            cache.visible_body_by_asset.get(&2),
+            Some(&vec![vec![Vec2::new(2.0, 2.0)]]),
+        );
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
     fn texture_cache_hashes_dense_appearance_only_once_until_invalidation() {
         let path = VPath {
             anchors: (0..4096)
@@ -1784,6 +1889,116 @@ mod tests {
         cache.invalidate();
         let _ = cache.appearance_signature(&vector, &moved);
         assert_eq!(cache.appearance_signature_build_count, 2);
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn fragmented_body_cache_survives_affine_move_without_rebuilding_booleans() {
+        let path = VPath {
+            anchors: [
+                Vec2::new(0.0, 0.0),
+                Vec2::new(20.0, 0.0),
+                Vec2::new(20.0, 20.0),
+                Vec2::new(0.0, 20.0),
+            ]
+            .into_iter()
+            .map(|point| Anchor {
+                point,
+                in_handle: None,
+                out_handle: None,
+            })
+            .collect(),
+            closed: true,
+        };
+        let mut vector = q0s_format::v2::VectorAsset {
+            asset_id: 91,
+            paths: vec![path.clone()],
+            fill: Some(Rgba {
+                r: 20,
+                g: 30,
+                b: 40,
+                a: 255,
+            }),
+            stroke: None,
+        };
+        let mut appearance = VectorAppearance {
+            material: q0s_format::v2::VectorMaterial::SoftHalo {
+                radius: 8.0,
+                opacity: 0.5,
+            },
+            erase_mask: vec![VPath {
+                anchors: [
+                    Vec2::new(2.0, 2.0),
+                    Vec2::new(4.0, 2.0),
+                    Vec2::new(4.0, 4.0),
+                    Vec2::new(2.0, 4.0),
+                ]
+                .into_iter()
+                .map(|point| Anchor {
+                    point,
+                    in_handle: None,
+                    out_handle: None,
+                })
+                .collect(),
+                closed: true,
+            }],
+            material_source: vec![path],
+            clip_mask: vec![VPath {
+                anchors: [
+                    Vec2::new(-2.0, -2.0),
+                    Vec2::new(15.0, -2.0),
+                    Vec2::new(15.0, 22.0),
+                    Vec2::new(-2.0, 22.0),
+                ]
+                .into_iter()
+                .map(|point| Anchor {
+                    point,
+                    in_handle: None,
+                    out_handle: None,
+                })
+                .collect(),
+                closed: true,
+            }],
+            field_transform: Affine::IDENTITY,
+        };
+        let view = StageView {
+            origin: Pos2::ZERO,
+            scale: 1.0,
+            stage_rect: egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(200.0, 200.0)),
+        };
+        let mut cache = TextureCache::default();
+        let first =
+            masked_vector_body_contours(&vector, &appearance, Affine::IDENTITY, &view, &mut cache);
+        assert_eq!(cache.visible_body_build_count, 1);
+
+        let delta = Vec2::new(37.0, 19.0);
+        for path in &mut vector.paths {
+            for anchor in &mut path.anchors {
+                anchor.point.x += delta.x;
+                anchor.point.y += delta.y;
+                if let Some(point) = &mut anchor.in_handle {
+                    point.x += delta.x;
+                    point.y += delta.y;
+                }
+                if let Some(point) = &mut anchor.out_handle {
+                    point.x += delta.x;
+                    point.y += delta.y;
+                }
+            }
+        }
+        appearance.field_transform.tx += delta.x;
+        appearance.field_transform.ty += delta.y;
+        let moved =
+            masked_vector_body_contours(&vector, &appearance, Affine::IDENTITY, &view, &mut cache);
+        assert_eq!(
+            cache.visible_body_build_count, 1,
+            "pure affine movement must reuse canonical fragment body cache",
+        );
+        assert_eq!(first.len(), moved.len());
+        for (before, after) in first.iter().flatten().zip(moved.iter().flatten()) {
+            assert!((after.x - before.x - delta.x).abs() < 1.0e-3);
+            assert!((after.y - before.y - delta.y).abs() < 1.0e-3);
+        }
     }
 
     #[cfg(feature = "appearance-mask-eraser")]
@@ -1845,7 +2060,9 @@ mod tests {
             scale: 1.0,
             stage_rect: egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(100.0, 100.0)),
         };
-        let contours = masked_vector_body_contours(&vector, &appearance, Affine::IDENTITY, &view);
+        let mut cache = TextureCache::default();
+        let contours =
+            masked_vector_body_contours(&vector, &appearance, Affine::IDENTITY, &view, &mut cache);
         let min_x = contours
             .iter()
             .flatten()
