@@ -4,7 +4,8 @@ use egui::{
     Stroke, TextureHandle, TextureOptions,
 };
 use geo::{
-    Area, BooleanOps, BoundingRect, Contains, Coord, LineString, MultiPolygon, Point, Polygon,
+    Area, BooleanOps, BoundingRect, Contains, ConvexHull, Coord, LineString, MultiPoint,
+    MultiPolygon, Point, Polygon,
 };
 use q0s_format::transform::Affine;
 use q0s_format::v2::{
@@ -7033,85 +7034,76 @@ fn hit_test_selectable_placement(
     None
 }
 
-fn variable_round_preview_mesh(
-    dabs: &[(Vec2, f32)],
-    view: &StageView,
-    expansion_px: f32,
-    color: Color32,
-) -> Mesh {
-    const SEGMENTS: usize = 18;
-    let mut mesh = Mesh::default();
-    if dabs.is_empty() {
-        return mesh;
+fn classic_prerender_nib_outline(
+    nib: crate::brush::BrushNib,
+    center: Pos2,
+    size_px: f32,
+) -> Vec<Pos2> {
+    if nib == crate::brush::BrushNib::Circle {
+        const SEGMENTS: usize = 24;
+        let radius = size_px.max(0.1) * 0.5;
+        return (0..SEGMENTS)
+            .map(|index| {
+                let phase = std::f32::consts::TAU * index as f32 / SEGMENTS as f32;
+                center + egui::vec2(phase.cos() * radius, phase.sin() * radius)
+            })
+            .collect();
     }
-
-    mesh.vertices
-        .reserve(dabs.len().saturating_mul(SEGMENTS).saturating_add(2));
-    mesh.indices.reserve(
-        dabs.len()
-            .saturating_sub(1)
-            .saturating_mul(SEGMENTS * 6)
-            .saturating_add(SEGMENTS * 6),
-    );
-
-    let mut previous_ring: Option<[u32; SEGMENTS]> = None;
-    let mut first_ring: Option<[u32; SEGMENTS]> = None;
-    let mut last_ring = [0_u32; SEGMENTS];
-    for &(position, size) in dabs {
-        let center = stage_to_screen(position, view);
-        let radius = size.max(0.1) * view.scale * 0.5 + expansion_px;
-        let ring: [u32; SEGMENTS] = std::array::from_fn(|index| {
-            let phase = std::f32::consts::TAU * index as f32 / SEGMENTS as f32;
-            let vertex = mesh.vertices.len() as u32;
-            mesh.colored_vertex(
-                center + egui::vec2(phase.cos() * radius, phase.sin() * radius),
-                color,
-            );
-            vertex
-        });
-        if first_ring.is_none() {
-            first_ring = Some(ring);
-        }
-        if let Some(previous) = previous_ring {
-            for index in 0..SEGMENTS {
-                let next = (index + 1) % SEGMENTS;
-                mesh.add_triangle(previous[index], previous[next], ring[next]);
-                mesh.add_triangle(previous[index], ring[next], ring[index]);
-            }
-        }
-        previous_ring = Some(ring);
-        last_ring = ring;
-    }
-
-    let mut cap = |ring: [u32; SEGMENTS], center: Pos2| {
-        let center_index = mesh.vertices.len() as u32;
-        mesh.colored_vertex(center, color);
-        for index in 0..SEGMENTS {
-            mesh.add_triangle(center_index, ring[index], ring[(index + 1) % SEGMENTS]);
-        }
-    };
-    cap(
-        first_ring.expect("non-empty classic dynamic preview ring"),
-        stage_to_screen(dabs[0].0, view),
-    );
-    if dabs.len() > 1 {
-        cap(last_ring, stage_to_screen(dabs[dabs.len() - 1].0, view));
-    }
-    mesh
+    crate::brush::nib_outline(nib, size_px.max(0.1), Vec2::new(center.x, center.y))
+        .into_iter()
+        .map(|point| pos2(point.x, point.y))
+        .collect()
 }
 
-fn paint_variable_round_stroke_preview(
-    painter: &Painter,
+fn classic_prerender_segment_contour(
+    nib: crate::brush::BrushNib,
+    start: (Pos2, f32),
+    end: (Pos2, f32),
+) -> Vec<Pos2> {
+    let points = classic_prerender_nib_outline(nib, start.0, start.1)
+        .into_iter()
+        .chain(classic_prerender_nib_outline(nib, end.0, end.1))
+        .map(|point| Point::new(f64::from(point.x), f64::from(point.y)))
+        .collect::<Vec<_>>();
+    let hull = MultiPoint::new(points).convex_hull();
+    let mut contour: Vec<Pos2> = hull
+        .exterior()
+        .0
+        .iter()
+        .map(|coord| pos2(coord.x as f32, coord.y as f32))
+        .collect();
+    if contour.len() > 1 && contour.first() == contour.last() {
+        contour.pop();
+    }
+    contour
+}
+
+fn classic_prerender_contours(
     dabs: &[(Vec2, f32)],
+    nib: crate::brush::BrushNib,
     view: &StageView,
     expansion_px: f32,
-    color: Color32,
-) {
-    let mesh = variable_round_preview_mesh(dabs, view, expansion_px, color);
-    if !mesh.vertices.is_empty() {
-        painter.add(Shape::Mesh(mesh));
+) -> Vec<Vec<Pos2>> {
+    let screen_dabs: Vec<(Pos2, f32)> = dabs
+        .iter()
+        .map(|(position, size)| {
+            (
+                stage_to_screen(*position, view),
+                size.max(0.1) * view.scale + expansion_px * 2.0,
+            )
+        })
+        .collect();
+    match screen_dabs.as_slice() {
+        [] => Vec::new(),
+        [(center, size)] => vec![classic_prerender_nib_outline(nib, *center, *size)],
+        many => many
+            .windows(2)
+            .map(|pair| classic_prerender_segment_contour(nib, pair[0], pair[1]))
+            .filter(|contour| contour.len() >= 3)
+            .collect(),
     }
 }
+
 fn paint_classic_nib_preview(
     painter: &Painter,
     stroke: &crate::brush::BrushStroke,
@@ -7119,48 +7111,34 @@ fn paint_classic_nib_preview(
     fill: Color32,
     outline: Option<Color32>,
 ) {
-    if crate::brush::brush_preview_nib(stroke) == crate::brush::BrushNib::Circle {
-        if crate::brush::brush_size_dynamics_enabled(stroke) {
-            let dabs = crate::brush::brush_preview_dabs(stroke);
-            if let Some(outline) = outline {
-                paint_variable_round_stroke_preview(painter, &dabs, view, 1.0, outline);
-            }
-            paint_variable_round_stroke_preview(painter, &dabs, view, 0.0, fill);
-        } else {
-            let points: Vec<Pos2> = crate::brush::brush_preview_trajectory(stroke)
-                .into_iter()
-                .map(|point| stage_to_screen(point, view))
-                .collect();
-            let width = crate::brush::brush_preview_size(stroke) * view.scale;
-            if let Some(outline) = outline {
-                paint_round_stroke_preview(painter, &points, width + 2.0, outline);
-            }
-            paint_round_stroke_preview(painter, &points, width, fill);
+    let dabs = crate::brush::brush_prerender_dabs(stroke);
+    let nib = crate::brush::brush_preview_nib(stroke);
+
+    // Keep the proven cheap circular pre-render for the common static brush.
+    // It is a transient centerline buffer, not committed raw vector geometry.
+    if nib == crate::brush::BrushNib::Circle && !crate::brush::brush_size_dynamics_enabled(stroke) {
+        let points: Vec<Pos2> = dabs
+            .iter()
+            .map(|(point, _)| stage_to_screen(*point, view))
+            .collect();
+        let width = crate::brush::brush_preview_size(stroke) * view.scale;
+        if let Some(outline) = outline {
+            paint_round_stroke_preview(painter, &points, width + 2.0, outline);
         }
+        paint_round_stroke_preview(painter, &points, width, fill);
         return;
     }
 
-    let contours: Vec<Vec<Pos2>> = crate::brush::brush_preview_paths_for_render(stroke)
-        .iter()
-        .map(|path| {
-            flatten_path(path)
-                .into_iter()
-                .map(|point| stage_to_screen(point, view))
-                .collect()
-        })
-        .filter(|points: &Vec<Pos2>| points.len() >= 3)
-        .collect();
-    paint_complex_fill(painter, &contours, fill);
+    // Dynamic circles and fixed polygon nibs use segment-local temporary
+    // footprints. No boolean union, contour reconstruction, or smoothing runs
+    // while the pointer is down; overlapping contours are tessellated as one
+    // preview surface so translucent paint is still blended only once.
     if let Some(outline) = outline {
-        for points in contours {
-            painter.add(Shape::Path(PathShape {
-                points,
-                closed: true,
-                fill: Color32::TRANSPARENT,
-                stroke: Stroke::new(1.5_f32, outline),
-            }));
-        }
+        let contours = classic_prerender_contours(&dabs, nib, view, 1.0);
+        paint_complex_fill(painter, &contours, outline);
     }
+    let contours = classic_prerender_contours(&dabs, nib, view, 0.0);
+    paint_complex_fill(painter, &contours, fill);
 }
 fn append_advanced_preview_surface(
     mesh: &mut Mesh,
@@ -9330,7 +9308,7 @@ mod tests {
     }
 
     #[test]
-    fn classic_dynamic_preview_is_one_linear_mesh_for_a_long_stroke() {
+    fn classic_prerender_stays_segment_local_for_a_long_polygon_stroke() {
         let dabs: Vec<(Vec2, f32)> = (0..5_000)
             .map(|index| {
                 (
@@ -9344,53 +9322,63 @@ mod tests {
             scale: 1.0,
             stage_rect: egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(800.0, 600.0)),
         };
-        let mesh = variable_round_preview_mesh(&dabs, &view, 0.0, Color32::WHITE);
+        let contours =
+            classic_prerender_contours(&dabs, crate::brush::BrushNib::Horizontal, &view, 0.0);
 
-        assert_eq!(mesh.vertices.len(), dabs.len() * 18 + 2);
+        assert_eq!(contours.len(), dabs.len() - 1);
+        let points: usize = contours.iter().map(Vec::len).sum();
         assert!(
-            mesh.indices.len() <= dabs.len() * 108 + 108,
-            "dynamic preview escaped its linear mesh budget: {} indices for {} dabs",
-            mesh.indices.len(),
+            points <= dabs.len() * 8,
+            "pre-render rebuilt a monolithic contour: {points} points for {} dabs",
             dabs.len()
         );
     }
 
     #[test]
-    fn classic_dynamic_preview_strip_covers_intermediate_dab_center() {
-        fn triangle_contains(point: Pos2, a: Pos2, b: Pos2, c: Pos2) -> bool {
-            let cross =
-                |u: Pos2, v: Pos2, w: Pos2| (v.x - u.x) * (w.y - u.y) - (v.y - u.y) * (w.x - u.x);
-            let ab = cross(a, b, point);
-            let bc = cross(b, c, point);
-            let ca = cross(c, a, point);
-            (ab >= -1.0e-4 && bc >= -1.0e-4 && ca >= -1.0e-4)
-                || (ab <= 1.0e-4 && bc <= 1.0e-4 && ca <= 1.0e-4)
-        }
+    fn classic_polygon_prerender_never_draws_outside_zero_smoothing_commit() {
+        use geo::Intersects;
 
-        let dabs = [
-            (Vec2::new(20.0, 20.0), 8.0),
-            (Vec2::new(70.0, 35.0), 24.0),
-            (Vec2::new(115.0, 75.0), 6.0),
+        let settings = crate::brush::BrushSettings {
+            size: 42.0,
+            smoothing: 0,
+            nib: crate::brush::BrushNib::Horizontal,
+            pressure_size: true,
+            dynamics_min_size: 0.2,
+            ..Default::default()
+        };
+        let samples = [
+            (Vec2::new(40.0, 60.0), 0.25, 0.0),
+            (Vec2::new(110.0, 60.0), 1.0, 0.05),
+            (Vec2::new(135.0, 115.0), 0.35, 0.10),
+            (Vec2::new(205.0, 115.0), 0.8, 0.15),
+            (Vec2::new(230.0, 55.0), 0.3, 0.20),
         ];
+        let mut stroke = crate::brush::brush_begin(
+            settings,
+            crate::brush::BrushSample::pointer(samples[0].0, Some(samples[0].1), samples[0].2),
+        );
+        for &(position, pressure, time) in &samples[1..] {
+            crate::brush::brush_add_sample(
+                &mut stroke,
+                settings,
+                crate::brush::BrushSample::pointer(position, Some(pressure), time),
+            );
+        }
+        let dabs = crate::brush::brush_prerender_dabs(&stroke);
         let view = StageView {
             origin: Pos2::ZERO,
             scale: 1.0,
-            stage_rect: egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(200.0, 120.0)),
+            stage_rect: egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(300.0, 180.0)),
         };
-        let mesh = variable_round_preview_mesh(&dabs, &view, 0.0, Color32::WHITE);
-        let point = stage_to_screen(dabs[1].0, &view);
-        let covered = mesh.indices.chunks_exact(3).any(|triangle| {
-            triangle_contains(
-                point,
-                mesh.vertices[triangle[0] as usize].pos,
-                mesh.vertices[triangle[1] as usize].pos,
-                mesh.vertices[triangle[2] as usize].pos,
-            )
-        });
-        assert!(
-            covered,
-            "variable-width preview left a hole at the middle dab"
-        );
+        let contours = classic_prerender_contours(&dabs, settings.nib, &view, 0.0);
+        let committed = crate::brush::brush_finish(stroke, settings);
+
+        for point in contours.iter().flatten() {
+            assert!(
+                committed.intersects(&Point::new(f64::from(point.x), f64::from(point.y))),
+                "pre-render spike escaped committed sweep at {point:?}"
+            );
+        }
     }
     #[test]
     fn advanced_preview_reuses_ring_vertices_instead_of_duplicating_every_bridge() {

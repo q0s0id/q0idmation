@@ -214,6 +214,20 @@ pub fn brush_preview_dabs(stroke: &BrushStroke) -> Vec<(Vec2, f32)> {
     trajectory.into_iter().zip(sizes).collect()
 }
 
+/// Raw, temporary classic-brush preview samples. Unlike the committed vector
+/// sweep this deliberately skips trajectory/boundary smoothing and boolean
+/// reconstruction: pointer-down paints a transient pre-render, pointer-up is
+/// where the authoritative vector fill is produced.
+pub fn brush_prerender_dabs(stroke: &BrushStroke) -> Vec<(Vec2, f32)> {
+    let sizes = stroke_sample_sizes(stroke);
+    stroke
+        .samples
+        .iter()
+        .map(|sample| sample.position)
+        .zip(sizes)
+        .collect()
+}
+
 /// Current dynamic nib diameter in stage units. This intentionally evaluates
 /// only the latest raw sample, so cursor feedback stays O(1) even on a very
 /// long gesture and cannot reintroduce progressive preview lag.
