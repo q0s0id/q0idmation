@@ -1799,8 +1799,7 @@ fn begin_group_transform(
     if start_paths.len() != paths.len() || start_transforms.len() != objects.len() {
         return false;
     }
-    let start_appearances =
-        capture_whole_asset_appearances_for_raw_refs(&app.state.project, &paths);
+    let start_appearances = capture_whole_asset_appearances_for_raw_refs(app, &paths);
     app.session.selection = selection_from_group_parts(paths.clone(), objects.clone());
     set_selection_transform_pivot(app, pivot);
     let operation = match intent {
@@ -1982,7 +1981,7 @@ fn begin_transforming_raw_area(
     }
     app.session.selection = selection_from_group_parts(refs.clone(), Vec::new());
     set_selection_transform_pivot(app, pivot);
-    let start_appearances = capture_whole_asset_appearances_for_raw_refs(&app.state.project, &refs);
+    let start_appearances = capture_whole_asset_appearances_for_raw_refs(app, &refs);
     match hit {
         TransformHit::Scale(handle) => {
             app.session.tool_state = ToolState::DraggingRawHandle {
@@ -2883,7 +2882,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                             set_selection_transform_pivot(app, pivot);
                         }
                         let start_appearances =
-                            capture_whole_asset_appearances_for_raw_refs(&app.state.project, &refs);
+                            capture_whole_asset_appearances_for_raw_refs(app, &refs);
                         app.session.tool_state = ToolState::DraggingPaths {
                             refs,
                             start_cursor: p,
@@ -4532,17 +4531,199 @@ pub(crate) fn prepare_raw_path_refs_for_edit(
     Some(mapped)
 }
 
+fn isolate_partial_appearance_raw_refs(app: &mut EditorApp, refs: Vec<PathRef>) -> Vec<PathRef> {
+    #[cfg(not(feature = "appearance-mask-eraser"))]
+    {
+        let _ = app;
+        return refs;
+    }
+    #[cfg(feature = "appearance-mask-eraser")]
+    {
+        let Some(first) = refs.first().copied() else {
+            return refs;
+        };
+        if refs.iter().any(|reference| {
+            reference.q0rg_id != first.q0rg_id
+                || reference.layer_id != first.layer_id
+                || reference.placement_idx != first.placement_idx
+        }) {
+            // Mixed/marquee selections are materialized through the raw-area
+            // partition path. This helper is specifically the normal Select
+            // click path: one connected fill inside one raw placement.
+            return refs;
+        }
+
+        let Some(source_placement) = app
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == first.q0rg_id)
+            .and_then(|q0rg| {
+                q0rg.layers
+                    .iter()
+                    .find(|layer| layer.layer_id == first.layer_id)
+            })
+            .and_then(|layer| layer.placements.get(first.placement_idx))
+            .cloned()
+        else {
+            return refs;
+        };
+        let Target::Asset(asset_id) = source_placement.target else {
+            return refs;
+        };
+        let Some(original) = app
+            .state
+            .project
+            .assets
+            .iter()
+            .find(|asset| asset.id() == asset_id)
+            .and_then(|asset| match asset {
+                Asset::Vector(vector) => Some(vector.clone()),
+                Asset::Bitmap(_) | Asset::Q0v(_) => None,
+            })
+        else {
+            return refs;
+        };
+        let Some(mut original_appearance) =
+            app.state.project.asset_appearances.get(&asset_id).cloned()
+        else {
+            return refs;
+        };
+        if crate::appearance::freeze_material_source_from_current_body(
+            &original,
+            &mut original_appearance,
+        ) {
+            // Repair legacy/broken drag state before partitioning it. Otherwise
+            // an empty source with a non-identity field would treat the already-
+            // transformed carrier as canonical and split the wrong glow space.
+            app.state
+                .project
+                .asset_appearances
+                .insert(asset_id, original_appearance.clone());
+            app.textures.invalidate();
+        }
+
+        let selected_indices: std::collections::BTreeSet<usize> =
+            refs.iter().map(|reference| reference.path_idx).collect();
+        let all_closed: std::collections::BTreeSet<usize> = original
+            .paths
+            .iter()
+            .enumerate()
+            .filter_map(|(index, path)| path.closed.then_some(index))
+            .collect();
+        if selected_indices.is_empty()
+            || selected_indices == all_closed
+            || !selected_indices
+                .iter()
+                .all(|index| original.paths.get(*index).is_some_and(|path| path.closed))
+        {
+            return refs;
+        }
+
+        let selected_visible = crate::appearance::visible_material_surface_for_paths(
+            &original,
+            Some(&original_appearance),
+            &selected_indices.iter().copied().collect::<Vec<_>>(),
+        );
+        if selected_visible.0.is_empty() {
+            return refs;
+        }
+        let Some((remainder_appearance, selected_appearance)) =
+            crate::appearance::partition_appearance(
+                &original_appearance,
+                &original.paths,
+                &selected_visible,
+            )
+        else {
+            return refs;
+        };
+
+        let mut selected_paths = Vec::new();
+        let mut remainder_paths = Vec::new();
+        let mut path_remap = std::collections::BTreeMap::new();
+        for (old_index, path) in original.paths.iter().cloned().enumerate() {
+            if selected_indices.contains(&old_index) {
+                path_remap.insert(old_index, selected_paths.len());
+                selected_paths.push(path);
+            } else {
+                remainder_paths.push(path);
+            }
+        }
+        if selected_paths.is_empty() || !remainder_paths.iter().any(|path| path.closed) {
+            return refs;
+        }
+
+        let remainder_asset_id = next_asset_id(&app.state.project);
+        let Some(Asset::Vector(selected_vector)) = app
+            .state
+            .project
+            .assets
+            .iter_mut()
+            .find(|asset| asset.id() == asset_id)
+        else {
+            return refs;
+        };
+        selected_vector.paths = selected_paths;
+        app.state.project.assets.push(Asset::Vector(VectorAsset {
+            asset_id: remainder_asset_id,
+            paths: remainder_paths,
+            fill: original.fill,
+            stroke: original.stroke,
+        }));
+        app.state
+            .project
+            .asset_appearances
+            .insert(asset_id, selected_appearance);
+        app.state
+            .project
+            .asset_appearances
+            .insert(remainder_asset_id, remainder_appearance);
+
+        let Some(layer) = app
+            .state
+            .project
+            .q0rgs
+            .iter_mut()
+            .find(|q0rg| q0rg.q0rg_id == first.q0rg_id)
+            .and_then(|q0rg| {
+                q0rg.layers
+                    .iter_mut()
+                    .find(|layer| layer.layer_id == first.layer_id)
+            })
+        else {
+            return refs;
+        };
+        let mut remainder_placement = source_placement;
+        remainder_placement.target = Target::Asset(remainder_asset_id);
+        let insertion = (first.placement_idx + 1).min(layer.placements.len());
+        layer.placements.insert(insertion, remainder_placement);
+
+        let remapped = refs
+            .into_iter()
+            .filter_map(|mut reference| {
+                reference.path_idx = *path_remap.get(&reference.path_idx)?;
+                Some(reference)
+            })
+            .collect();
+        app.textures.invalidate();
+        app.state.dirty = true;
+        remapped
+    }
+}
+
 fn capture_whole_asset_appearances_for_raw_refs(
-    project: &ProjectV2,
+    app: &mut EditorApp,
     refs: &[PathRef],
 ) -> Vec<(u16, q0s_format::v2::VectorAppearance)> {
     #[cfg(not(feature = "appearance-mask-eraser"))]
     {
-        let _ = (project, refs);
+        let _ = (app, refs);
         return Vec::new();
     }
     #[cfg(feature = "appearance-mask-eraser")]
     {
+        let project = &mut app.state.project;
         let mut grouped: std::collections::BTreeMap<u16, std::collections::BTreeSet<usize>> =
             std::collections::BTreeMap::new();
         for reference in refs {
@@ -4568,29 +4749,44 @@ fn capture_whole_asset_appearances_for_raw_refs(
                 .or_default()
                 .insert(reference.path_idx);
         }
-        grouped
-            .into_iter()
-            .filter_map(|(asset_id, selected)| {
-                let mut appearance = project.asset_appearances.get(&asset_id)?.clone();
-                let Asset::Vector(vector) =
-                    project.assets.iter().find(|asset| asset.id() == asset_id)?
-                else {
-                    return None;
-                };
-                if appearance.material_source.is_empty() {
-                    // The first affine edit freezes the pre-transform material source.
-                    // From now on field_transform moves the already-resolved glow.
-                    appearance.material_source = vector.paths.clone();
-                }
-                let editable: std::collections::BTreeSet<usize> = vector
-                    .paths
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, path)| path.closed.then_some(index))
-                    .collect();
-                (selected == editable).then_some((asset_id, appearance))
-            })
-            .collect()
+
+        let mut captured = Vec::new();
+        let mut froze_source = false;
+        for (asset_id, selected) in grouped {
+            let Some(Asset::Vector(vector)) = project
+                .assets
+                .iter()
+                .find(|asset| asset.id() == asset_id)
+                .cloned()
+            else {
+                continue;
+            };
+            let editable: std::collections::BTreeSet<usize> = vector
+                .paths
+                .iter()
+                .enumerate()
+                .filter_map(|(index, path)| path.closed.then_some(index))
+                .collect();
+            if selected != editable {
+                continue;
+            }
+            let Some(appearance) = project.asset_appearances.get_mut(&asset_id) else {
+                continue;
+            };
+            // Persist the frozen material source in the project itself before raw
+            // geometry starts moving. Keeping it only in the drag snapshot makes
+            // the renderer fall back to the already-moved carrier and then apply
+            // field_transform a second time. If an older buggy edit left an empty
+            // source with a non-identity field, reconstruct canonical source space
+            // through the inverse field first.
+            froze_source |=
+                crate::appearance::freeze_material_source_from_current_body(&vector, appearance);
+            captured.push((asset_id, appearance.clone()));
+        }
+        if froze_source {
+            app.textures.invalidate();
+        }
+        captured
     }
 }
 
@@ -4677,6 +4873,7 @@ fn begin_dragging_raw_paths(
     else {
         return false;
     };
+    let refs = isolate_partial_appearance_raw_refs(app, refs);
     let start_paths: Vec<VPath> = refs
         .iter()
         .filter_map(|r| {
@@ -4696,7 +4893,7 @@ fn begin_dragging_raw_paths(
     if let Some(pivot) = start_pivot {
         set_selection_transform_pivot(app, pivot);
     }
-    let start_appearances = capture_whole_asset_appearances_for_raw_refs(&app.state.project, &refs);
+    let start_appearances = capture_whole_asset_appearances_for_raw_refs(app, &refs);
     app.session.tool_state = ToolState::DraggingPaths {
         refs,
         start_cursor,
@@ -4729,6 +4926,7 @@ fn begin_scaling_raw_paths(
     else {
         return false;
     };
+    let refs = isolate_partial_appearance_raw_refs(app, refs);
     let start_paths: Vec<VPath> = refs
         .iter()
         .filter_map(|r| {
@@ -4746,7 +4944,7 @@ fn begin_scaling_raw_paths(
     }
     app.session.selection = selection_from_group_parts(refs.clone(), Vec::new());
     set_selection_transform_pivot(app, start_pivot);
-    let start_appearances = capture_whole_asset_appearances_for_raw_refs(&app.state.project, &refs);
+    let start_appearances = capture_whole_asset_appearances_for_raw_refs(app, &refs);
     app.session.tool_state = ToolState::DraggingRawHandle {
         refs,
         start_paths: std::sync::Arc::new(start_paths),
@@ -4775,6 +4973,7 @@ fn begin_rotating_raw_paths(
     else {
         return false;
     };
+    let refs = isolate_partial_appearance_raw_refs(app, refs);
     let start_paths: Vec<VPath> = refs
         .iter()
         .filter_map(|r| {
@@ -4792,7 +4991,7 @@ fn begin_rotating_raw_paths(
     }
     app.session.selection = selection_from_group_parts(refs.clone(), Vec::new());
     set_selection_transform_pivot(app, center);
-    let start_appearances = capture_whole_asset_appearances_for_raw_refs(&app.state.project, &refs);
+    let start_appearances = capture_whole_asset_appearances_for_raw_refs(app, &refs);
     app.session.tool_state = ToolState::DraggingRawRotate {
         refs,
         start_paths: std::sync::Arc::new(start_paths),
@@ -4822,6 +5021,7 @@ fn begin_skewing_raw_paths(
     else {
         return false;
     };
+    let refs = isolate_partial_appearance_raw_refs(app, refs);
     let start_paths: Vec<VPath> = refs
         .iter()
         .filter_map(|r| {
@@ -4839,7 +5039,7 @@ fn begin_skewing_raw_paths(
     }
     app.session.selection = selection_from_group_parts(refs.clone(), Vec::new());
     set_selection_transform_pivot(app, start_pivot);
-    let start_appearances = capture_whole_asset_appearances_for_raw_refs(&app.state.project, &refs);
+    let start_appearances = capture_whole_asset_appearances_for_raw_refs(app, &refs);
     app.session.tool_state = ToolState::DraggingRawSkew {
         refs,
         start_paths: std::sync::Arc::new(start_paths),
@@ -8497,6 +8697,13 @@ mod tests {
     use super::*;
     use q0s_format::v2::{Layer, ProjectMeta, Q0rg};
 
+    #[cfg(feature = "appearance-mask-eraser")]
+    fn surface_mismatch_area(left: &MultiPolygon<f64>, right: &MultiPolygon<f64>) -> f64 {
+        left.difference(right)
+            .union(&right.difference(left))
+            .unsigned_area()
+    }
+
     #[test]
     fn rectangle_geometry_is_independent_of_drag_direction() {
         let drags = [
@@ -9207,8 +9414,7 @@ mod tests {
                 .unwrap()
             })
             .collect();
-        let start_appearances =
-            capture_whole_asset_appearances_for_raw_refs(&app.state.project, &refs);
+        let start_appearances = capture_whole_asset_appearances_for_raw_refs(&mut app, &refs);
         assert_eq!(start_appearances.len(), 1);
         let delta = Vec2::new(30.0, 15.0);
         for (reference, source) in refs.iter().zip(&start_paths) {
@@ -9991,6 +10197,330 @@ mod tests {
 
     #[cfg(feature = "appearance-mask-eraser")]
     #[test]
+    fn first_glow_drag_freezes_material_source_in_project_before_moving_body() {
+        let mut app = EditorApp::default();
+        app.state.project = appearance_selection_project(false);
+        let before_vector = match &app.state.project.assets[0] {
+            Asset::Vector(vector) => vector.clone(),
+            Asset::Bitmap(_) | Asset::Q0v(_) => unreachable!(),
+        };
+        let before_appearance = app.state.project.asset_appearances[&1].clone();
+        let before_visible = crate::appearance::visible_material_surface_for_vector(
+            &before_vector,
+            Some(&before_appearance),
+        );
+        assert!(before_appearance.material_source.is_empty());
+        let reference = PathRef {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: 0,
+            path_idx: 0,
+        };
+        let before_bounds = raw_path_refs_ui_bounds(&app.state.project, &[reference])
+            .expect("initial glow selection bounds");
+
+        assert!(begin_dragging_raw_paths(
+            &mut app,
+            vec![reference],
+            Vec2::new(10.0, 10.0),
+            "test drag",
+        ));
+        let frozen = app
+            .state
+            .project
+            .asset_appearances
+            .get(&1)
+            .expect("frozen appearance");
+        assert_eq!(
+            frozen.material_source, before_vector.paths,
+            "the renderer must not keep falling back to a carrier that is about to move",
+        );
+
+        let ToolState::DraggingPaths {
+            refs,
+            start_paths,
+            start_appearances,
+            ..
+        } = app.session.tool_state.clone()
+        else {
+            unreachable!();
+        };
+        let delta = Vec2::new(31.0, 17.0);
+        let transform = Affine {
+            tx: delta.x,
+            ty: delta.y,
+            ..Affine::IDENTITY
+        };
+        assert!(apply_raw_affine_snapshot(
+            &mut app.state.project,
+            &refs,
+            &start_paths,
+            &start_appearances,
+            transform,
+        ));
+        let moved_vector = match &app.state.project.assets[0] {
+            Asset::Vector(vector) => vector,
+            Asset::Bitmap(_) | Asset::Q0v(_) => unreachable!(),
+        };
+        let moved_appearance = app
+            .state
+            .project
+            .asset_appearances
+            .get(&1)
+            .expect("moved appearance");
+        let moved_visible = crate::appearance::visible_material_surface_for_vector(
+            moved_vector,
+            Some(moved_appearance),
+        );
+        let expected_visible = crate::appearance::transform_surface(&before_visible, transform);
+        assert!(
+            surface_mismatch_area(&moved_visible, &expected_visible) < 0.05,
+            "resolved glow did not follow the carrier by exactly one drag affine",
+        );
+        assert_eq!(moved_vector.paths[0].anchors[0].point, delta);
+        assert_eq!(moved_appearance.field_transform.tx, delta.x);
+        assert_eq!(moved_appearance.field_transform.ty, delta.y);
+        let moved_bounds = raw_path_refs_ui_bounds(&app.state.project, &[refs[0]])
+            .expect("moved glow selection bounds");
+        for (actual, expected) in [
+            (moved_bounds.0, before_bounds.0 + delta.x),
+            (moved_bounds.1, before_bounds.1 + delta.y),
+            (moved_bounds.2, before_bounds.2 + delta.x),
+            (moved_bounds.3, before_bounds.3 + delta.y),
+        ] {
+            assert!(
+                (actual - expected).abs() < 0.01,
+                "selection frame did not follow moved body/glow: actual={actual}, expected={expected}"
+            );
+        }
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn old_empty_source_with_moved_field_is_repaired_to_canonical_space() {
+        let mut app = EditorApp::default();
+        app.state.project = appearance_selection_project(false);
+        let old_delta = Vec2::new(40.0, -13.0);
+        let old_field = Affine {
+            tx: old_delta.x,
+            ty: old_delta.y,
+            ..Affine::IDENTITY
+        };
+        let Asset::Vector(vector) = &mut app.state.project.assets[0] else {
+            unreachable!();
+        };
+        for path in &mut vector.paths {
+            for anchor in &mut path.anchors {
+                anchor.point = old_field.apply(anchor.point);
+                if let Some(point) = &mut anchor.in_handle {
+                    *point = old_field.apply(*point);
+                }
+                if let Some(point) = &mut anchor.out_handle {
+                    *point = old_field.apply(*point);
+                }
+            }
+        }
+        app.state
+            .project
+            .asset_appearances
+            .get_mut(&1)
+            .unwrap()
+            .field_transform = old_field;
+        assert!(app.state.project.asset_appearances[&1]
+            .material_source
+            .is_empty());
+
+        assert!(begin_dragging_raw_paths(
+            &mut app,
+            vec![PathRef {
+                q0rg_id: 1,
+                layer_id: 1,
+                placement_idx: 0,
+                path_idx: 0,
+            }],
+            Vec2::new(old_delta.x + 10.0, old_delta.y + 10.0),
+            "repair drag",
+        ));
+        let repaired = app
+            .state
+            .project
+            .asset_appearances
+            .get(&1)
+            .expect("repaired appearance");
+        assert_eq!(
+            repaired.material_source[0].anchors[0].point,
+            Vec2::new(0.0, 0.0)
+        );
+        assert_eq!(repaired.field_transform, old_field);
+        let current_vector = match &app.state.project.assets[0] {
+            Asset::Vector(vector) => vector,
+            Asset::Bitmap(_) | Asset::Q0v(_) => unreachable!(),
+        };
+        let expected = crate::appearance::material_support(
+            &vector_fill_geometry(current_vector),
+            repaired.material,
+        );
+        let visible =
+            crate::appearance::visible_material_surface_for_vector(current_vector, Some(repaired));
+        assert!(surface_mismatch_area(&visible, &expected) < 0.05);
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn moving_one_glowing_region_splits_its_material_and_keeps_neighbor_stationary() {
+        let mut app = EditorApp::default();
+        app.state.project = appearance_selection_project(false);
+        let square = |min_x: f32, max_x: f32| VPath {
+            anchors: vec![
+                anchor(Vec2::new(min_x, 0.0)),
+                anchor(Vec2::new(max_x, 0.0)),
+                anchor(Vec2::new(max_x, 20.0)),
+                anchor(Vec2::new(min_x, 20.0)),
+            ],
+            closed: true,
+        };
+        let Asset::Vector(vector) = &mut app.state.project.assets[0] else {
+            unreachable!();
+        };
+        vector.paths.push(square(60.0, 80.0));
+
+        let Some(RawSelectionHit::Fill(left_refs)) =
+            hit_test_raw_selection(&app.state.project, 1, 0, Vec2::new(10.0, 10.0))
+        else {
+            panic!("left glowing region must be independently selectable");
+        };
+        assert_eq!(left_refs.len(), 1);
+        assert_eq!(left_refs[0].path_idx, 0);
+        assert!(begin_dragging_raw_paths(
+            &mut app,
+            left_refs,
+            Vec2::new(10.0, 10.0),
+            "move left glow",
+        ));
+        assert_eq!(app.state.project.q0rgs[0].layers[0].placements.len(), 2);
+        assert_eq!(app.state.project.asset_appearances.len(), 2);
+        assert!(matches!(
+            app.session.selection,
+            Selection::Path { .. } | Selection::Paths(_)
+        ));
+
+        let ToolState::DraggingPaths {
+            refs,
+            start_paths,
+            start_appearances,
+            ..
+        } = app.session.tool_state.clone()
+        else {
+            unreachable!();
+        };
+        let selected_asset_id =
+            match app.state.project.q0rgs[0].layers[0].placements[refs[0].placement_idx].target {
+                Target::Asset(asset_id) => asset_id,
+                Target::Q0rg(_) => unreachable!(),
+            };
+        let neighbor_placement = app.state.project.q0rgs[0].layers[0]
+            .placements
+            .iter()
+            .find(|placement| placement.target != Target::Asset(selected_asset_id))
+            .expect("remainder placement");
+        let Target::Asset(neighbor_asset_id) = neighbor_placement.target else {
+            unreachable!();
+        };
+        let selected_before = match app
+            .state
+            .project
+            .assets
+            .iter()
+            .find(|asset| asset.id() == selected_asset_id)
+            .unwrap()
+        {
+            Asset::Vector(vector) => crate::appearance::visible_material_surface_for_vector(
+                vector,
+                app.state.project.asset_appearances.get(&selected_asset_id),
+            ),
+            Asset::Bitmap(_) | Asset::Q0v(_) => unreachable!(),
+        };
+        let neighbor_before = match app
+            .state
+            .project
+            .assets
+            .iter()
+            .find(|asset| asset.id() == neighbor_asset_id)
+            .unwrap()
+        {
+            Asset::Vector(vector) => crate::appearance::visible_material_surface_for_vector(
+                vector,
+                app.state.project.asset_appearances.get(&neighbor_asset_id),
+            ),
+            Asset::Bitmap(_) | Asset::Q0v(_) => unreachable!(),
+        };
+        let neighbor_vector_before = app
+            .state
+            .project
+            .assets
+            .iter()
+            .find(|asset| asset.id() == neighbor_asset_id)
+            .cloned()
+            .unwrap();
+
+        let delta = Vec2::new(25.0, 30.0);
+        let transform = Affine {
+            tx: delta.x,
+            ty: delta.y,
+            ..Affine::IDENTITY
+        };
+        assert!(apply_raw_affine_snapshot(
+            &mut app.state.project,
+            &refs,
+            &start_paths,
+            &start_appearances,
+            transform,
+        ));
+        let selected_after = match app
+            .state
+            .project
+            .assets
+            .iter()
+            .find(|asset| asset.id() == selected_asset_id)
+            .unwrap()
+        {
+            Asset::Vector(vector) => crate::appearance::visible_material_surface_for_vector(
+                vector,
+                app.state.project.asset_appearances.get(&selected_asset_id),
+            ),
+            Asset::Bitmap(_) | Asset::Q0v(_) => unreachable!(),
+        };
+        let neighbor_after = match app
+            .state
+            .project
+            .assets
+            .iter()
+            .find(|asset| asset.id() == neighbor_asset_id)
+            .unwrap()
+        {
+            Asset::Vector(vector) => crate::appearance::visible_material_surface_for_vector(
+                vector,
+                app.state.project.asset_appearances.get(&neighbor_asset_id),
+            ),
+            Asset::Bitmap(_) | Asset::Q0v(_) => unreachable!(),
+        };
+        let expected_selected = crate::appearance::transform_surface(&selected_before, transform);
+        assert!(surface_mismatch_area(&selected_after, &expected_selected) < 0.05);
+        assert!(surface_mismatch_area(&neighbor_after, &neighbor_before) < 0.05);
+        assert_eq!(
+            app.state
+                .project
+                .assets
+                .iter()
+                .find(|asset| asset.id() == neighbor_asset_id)
+                .unwrap(),
+            &neighbor_vector_before,
+            "moving one connected glowing region mutated its disconnected neighbor",
+        );
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
     fn cloning_glow_drag_state_reuses_shared_snapshots() {
         let project = appearance_selection_project(false);
         let vector = match &project.assets[0] {
@@ -10347,8 +10877,7 @@ mod tests {
                 .unwrap()
             })
             .collect();
-        let start_appearances =
-            capture_whole_asset_appearances_for_raw_refs(&app.state.project, &refs);
+        let start_appearances = capture_whole_asset_appearances_for_raw_refs(&mut app, &refs);
         let delta = Vec2::new(40.0, 0.0);
         for (reference, source) in refs.iter().zip(&start_paths) {
             assert!(replace_raw_path_translated(

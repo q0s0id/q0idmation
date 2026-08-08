@@ -129,6 +129,36 @@ pub(crate) fn split_asset_appearance(
     project.asset_appearances.insert(source_asset_id, source);
 }
 
+pub(crate) fn freeze_material_source_from_current_body(
+    vector: &VectorAsset,
+    appearance: &mut VectorAppearance,
+) -> bool {
+    if !appearance.material_source.is_empty() {
+        return false;
+    }
+    let Some(inverse_field) = appearance.field_transform.inverse() else {
+        return false;
+    };
+    appearance.material_source = vector
+        .paths
+        .iter()
+        .cloned()
+        .map(|mut path| {
+            for anchor in &mut path.anchors {
+                anchor.point = inverse_field.apply(anchor.point);
+                if let Some(point) = &mut anchor.in_handle {
+                    *point = inverse_field.apply(*point);
+                }
+                if let Some(point) = &mut anchor.out_handle {
+                    *point = inverse_field.apply(*point);
+                }
+            }
+            path
+        })
+        .collect();
+    true
+}
+
 pub(crate) fn transform_appearance(
     appearance: &VectorAppearance,
     transform: Affine,
@@ -442,6 +472,26 @@ pub(crate) fn fast_visible_material_bounds_for_paths(
         return Some(selected_bounds);
     };
 
+    // Fresh, untransformed glow has no separate frozen field yet. Its visible
+    // support is exactly the selected body bounds expanded by the material
+    // radius, so the selection UI must not walk a dense source path every frame.
+    if appearance.material_source.is_empty()
+        && appearance.clip_mask.is_empty()
+        && appearance.erase_mask.is_empty()
+        && appearance.field_transform == Affine::IDENTITY
+    {
+        let radius = match appearance.material {
+            VectorMaterial::Solid => 0.0,
+            VectorMaterial::SoftHalo { radius, .. } => radius.max(0.0),
+        };
+        return Some((
+            selected_bounds.0 - radius,
+            selected_bounds.1 - radius,
+            selected_bounds.2 + radius,
+            selected_bounds.3 + radius,
+        ));
+    }
+
     let all_closed_selected = vector
         .paths
         .iter()
@@ -644,8 +694,14 @@ pub(crate) fn visible_material_surface_for_paths(
     if all_closed_selected {
         return visible_material_surface_for_vector(vector, Some(appearance));
     }
-    let subset_support = material_support(&subset_source, appearance.material);
-    visible_material_surface_for_vector(vector, Some(appearance)).intersection(&subset_support)
+    let Some(inverse_field) = appearance.field_transform.inverse() else {
+        return MultiPolygon(Vec::new());
+    };
+    let canonical_subset = transform_surface(&subset_source, inverse_field);
+    let canonical_support = material_support(&canonical_subset, appearance.material);
+    let visible_subset_support = transform_surface(&canonical_support, appearance.field_transform);
+    visible_material_surface_for_vector(vector, Some(appearance))
+        .intersection(&visible_subset_support)
 }
 
 pub(crate) fn asset_visible_material_bounds_fast(

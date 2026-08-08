@@ -47,7 +47,9 @@ pub struct TextureCache {
     #[cfg(feature = "appearance-mask-eraser")]
     appearance_by_asset: HashMap<(u16, u16, u64), CachedAppearanceTexture>,
     #[cfg(feature = "appearance-mask-eraser")]
-    appearance_fingerprint_by_asset: HashMap<u16, u64>,
+    appearance_signature_by_asset: HashMap<u16, (u64, Vec2)>,
+    #[cfg(all(test, feature = "appearance-mask-eraser"))]
+    appearance_signature_build_count: usize,
 }
 
 impl TextureCache {
@@ -58,13 +60,34 @@ impl TextureCache {
         #[cfg(feature = "appearance-mask-eraser")]
         {
             self.appearance_by_asset.clear();
-            self.appearance_fingerprint_by_asset.clear();
+            self.appearance_signature_by_asset.clear();
         }
     }
 
     #[cfg(feature = "appearance-mask-eraser")]
     pub(crate) fn appearance_fingerprint(&self, asset_id: u16) -> Option<u64> {
-        self.appearance_fingerprint_by_asset.get(&asset_id).copied()
+        self.appearance_signature_by_asset
+            .get(&asset_id)
+            .map(|(fingerprint, _)| *fingerprint)
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    fn appearance_signature(
+        &mut self,
+        vector: &q0s_format::v2::VectorAsset,
+        appearance: &VectorAppearance,
+    ) -> (u64, Vec2) {
+        if let Some(signature) = self.appearance_signature_by_asset.get(&vector.asset_id) {
+            return *signature;
+        }
+        let signature = appearance_cache_signature(vector, appearance);
+        self.appearance_signature_by_asset
+            .insert(vector.asset_id, signature);
+        #[cfg(all(test, feature = "appearance-mask-eraser"))]
+        {
+            self.appearance_signature_build_count += 1;
+        }
+        signature
     }
 }
 
@@ -1424,10 +1447,10 @@ fn paint_vector_appearance_halo(
     let target_ppu = (view.scale * field_transform.uniform_scale() * 2.0).clamp(1.0, 4.0);
     let bucket = (target_ppu * 4.0).round().clamp(4.0, 16.0) as u16;
     let ppu = f32::from(bucket) / 4.0;
-    let (fingerprint, origin) = appearance_cache_signature(vector, appearance);
-    textures
-        .appearance_fingerprint_by_asset
-        .insert(vector.asset_id, fingerprint);
+    // The raster signature depends on frozen material/mask content, not on the
+    // field affine. Computing it walks every anchor, so do it only after an
+    // explicit texture-cache invalidation rather than on every repaint/drag tick.
+    let (fingerprint, origin) = textures.appearance_signature(vector, appearance);
     let key = (vector.asset_id, bucket, fingerprint);
     if !textures.appearance_by_asset.contains_key(&key) {
         textures
@@ -1639,6 +1662,56 @@ mod tests {
             moved_hash, changed_field_hash,
             "changing frozen field content must invalidate the halo texture"
         );
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn texture_cache_hashes_dense_appearance_only_once_until_invalidation() {
+        let path = VPath {
+            anchors: (0..4096)
+                .map(|index| Anchor {
+                    point: Vec2::new(index as f32 * 0.25, (index % 23) as f32),
+                    in_handle: None,
+                    out_handle: None,
+                })
+                .collect(),
+            closed: true,
+        };
+        let vector = q0s_format::v2::VectorAsset {
+            asset_id: 77,
+            paths: vec![path.clone()],
+            fill: Some(Rgba {
+                r: 10,
+                g: 20,
+                b: 30,
+                a: 255,
+            }),
+            stroke: None,
+        };
+        let appearance = VectorAppearance {
+            material: q0s_format::v2::VectorMaterial::SoftHalo {
+                radius: 18.0,
+                opacity: 0.7,
+            },
+            erase_mask: Vec::new(),
+            material_source: vec![path],
+            clip_mask: Vec::new(),
+            field_transform: Affine::IDENTITY,
+        };
+        let mut cache = TextureCache::default();
+        let first = cache.appearance_signature(&vector, &appearance);
+        let mut moved = appearance.clone();
+        moved.field_transform.tx = 300.0;
+        moved.field_transform.ty = -125.0;
+        let second = cache.appearance_signature(&vector, &moved);
+        assert_eq!(first, second);
+        assert_eq!(
+            cache.appearance_signature_build_count, 1,
+            "stationary/drag repaint rehashed every Advanced material anchor",
+        );
+        cache.invalidate();
+        let _ = cache.appearance_signature(&vector, &moved);
+        assert_eq!(cache.appearance_signature_build_count, 2);
     }
 
     #[cfg(feature = "appearance-mask-eraser")]
