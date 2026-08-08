@@ -8,7 +8,7 @@ use egui::{
     TextureId, TextureOptions,
 };
 #[cfg(feature = "appearance-mask-eraser")]
-use geo::BooleanOps;
+use geo::{BooleanOps, MultiPolygon, Point, Polygon};
 use geo::{Buffer, Coord, LineString};
 use lyon_path::math::point as lyon_point;
 use lyon_tessellation::geometry_builder::{BuffersBuilder, Positions, VertexBuffers};
@@ -66,10 +66,56 @@ pub(crate) struct CachedAppearanceHitGeometry {
 }
 
 #[cfg(feature = "appearance-mask-eraser")]
+#[derive(Clone)]
+pub(crate) struct CachedRawSelectionComponent {
+    pub canonical_surface: MultiPolygon<f64>,
+    pub path_indices: Vec<usize>,
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+#[derive(Clone, Default)]
+pub(crate) struct CachedRawSelectionComponents {
+    pub components: Vec<CachedRawSelectionComponent>,
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
 #[derive(Clone, Default)]
 pub(crate) struct CachedSelectionGeometry {
     pub body: Vec<Vec<Vec2>>,
     pub fallback_material_support: Vec<Vec<Vec2>>,
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+#[derive(Clone)]
+pub(crate) struct CachedParametricStroke {
+    base_vertices: Vec<Pos2>,
+    width_vectors: Vec<egui::Vec2>,
+    indices: Vec<u32>,
+    min_width: f32,
+    max_width: f32,
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+#[derive(Clone)]
+struct CachedSelectionStroke {
+    contour_stage: Vec<Pos2>,
+    parametric: Option<CachedParametricStroke>,
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+#[derive(Clone, Default)]
+pub(crate) struct CachedSelectionStageMesh {
+    fill_vertices: Vec<Pos2>,
+    fill_indices: Vec<u32>,
+    strokes: Vec<CachedSelectionStroke>,
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SelectionStageMeshKey {
+    asset_id: u16,
+    path_indices: Vec<usize>,
+    field_transform_bits: [u32; 6],
 }
 
 #[cfg(feature = "appearance-mask-eraser")]
@@ -132,6 +178,36 @@ fn cache_interactive_paths(paths: &[VPath]) -> Vec<CachedInteractivePath> {
         .collect()
 }
 
+#[cfg(feature = "appearance-mask-eraser")]
+fn geo_segment_distance_sq(point: Point<f64>, start: Coord<f64>, end: Coord<f64>) -> f64 {
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let length_sq = dx * dx + dy * dy;
+    if length_sq <= 1.0e-20 {
+        let px = point.x() - start.x;
+        let py = point.y() - start.y;
+        return px * px + py * py;
+    }
+    let t = (((point.x() - start.x) * dx + (point.y() - start.y) * dy) / length_sq).clamp(0.0, 1.0);
+    let nearest_x = start.x + dx * t;
+    let nearest_y = start.y + dy * t;
+    let px = point.x() - nearest_x;
+    let py = point.y() - nearest_y;
+    px * px + py * py
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn polygon_boundary_near_point(polygon: &Polygon<f64>, point: Vec2, radius: f32) -> bool {
+    let point = Point::new(f64::from(point.x), f64::from(point.y));
+    let limit_sq = f64::from(radius.max(0.0)).powi(2);
+    let ring_near = |ring: &LineString<f64>| {
+        ring.0
+            .windows(2)
+            .any(|segment| geo_segment_distance_sq(point, segment[0], segment[1]) <= limit_sq)
+    };
+    ring_near(polygon.exterior()) || polygon.interiors().iter().any(ring_near)
+}
+
 #[derive(Default)]
 pub struct TextureCache {
     by_asset_id: HashMap<u16, TextureHandle>,
@@ -146,7 +222,13 @@ pub struct TextureCache {
     #[cfg(feature = "appearance-mask-eraser")]
     appearance_hit_by_asset: HashMap<u16, CachedAppearanceHitGeometry>,
     #[cfg(feature = "appearance-mask-eraser")]
+    raw_selection_components_by_key: HashMap<(u16, [u32; 6]), CachedRawSelectionComponents>,
+    #[cfg(feature = "appearance-mask-eraser")]
+    selection_source_surface_by_key: HashMap<(u16, Vec<usize>), MultiPolygon<f64>>,
+    #[cfg(feature = "appearance-mask-eraser")]
     selection_geometry_by_key: HashMap<(u16, Vec<usize>), CachedSelectionGeometry>,
+    #[cfg(feature = "appearance-mask-eraser")]
+    selection_stage_mesh_by_key: HashMap<SelectionStageMeshKey, CachedSelectionStageMesh>,
     #[cfg(feature = "appearance-mask-eraser")]
     selection_paint_by_key: HashMap<SelectionPaintKey, CachedSelectionPaint>,
     #[cfg(all(test, feature = "appearance-mask-eraser"))]
@@ -156,7 +238,11 @@ pub struct TextureCache {
     #[cfg(all(test, feature = "appearance-mask-eraser"))]
     appearance_hit_build_count: usize,
     #[cfg(all(test, feature = "appearance-mask-eraser"))]
+    raw_selection_components_build_count: usize,
+    #[cfg(all(test, feature = "appearance-mask-eraser"))]
     selection_geometry_build_count: usize,
+    #[cfg(all(test, feature = "appearance-mask-eraser"))]
+    selection_stage_mesh_build_count: usize,
     #[cfg(all(test, feature = "appearance-mask-eraser"))]
     selection_paint_build_count: usize,
 }
@@ -172,7 +258,10 @@ impl TextureCache {
             self.appearance_signature_by_asset.clear();
             self.visible_body_by_asset.clear();
             self.appearance_hit_by_asset.clear();
+            self.raw_selection_components_by_key.clear();
+            self.selection_source_surface_by_key.clear();
             self.selection_geometry_by_key.clear();
+            self.selection_stage_mesh_by_key.clear();
             self.selection_paint_by_key.clear();
         }
     }
@@ -193,8 +282,14 @@ impl TextureCache {
             self.appearance_signature_by_asset.remove(&asset_id);
             self.visible_body_by_asset.remove(&asset_id);
             self.appearance_hit_by_asset.remove(&asset_id);
+            self.raw_selection_components_by_key
+                .retain(|(id, _), _| *id != asset_id);
+            self.selection_source_surface_by_key
+                .retain(|(id, _), _| *id != asset_id);
             self.selection_geometry_by_key
                 .retain(|(id, _), _| *id != asset_id);
+            self.selection_stage_mesh_by_key
+                .retain(|key, _| key.asset_id != asset_id);
             self.selection_paint_by_key
                 .retain(|key, _| key.asset_id != asset_id);
         }
@@ -243,39 +338,148 @@ impl TextureCache {
     }
 
     #[cfg(feature = "appearance-mask-eraser")]
+    pub(crate) fn raw_selection_components(
+        &mut self,
+        vector: &q0s_format::v2::VectorAsset,
+        appearance: Option<&VectorAppearance>,
+    ) -> Option<&CachedRawSelectionComponents> {
+        let field = appearance
+            .map(|appearance| appearance.field_transform)
+            .unwrap_or(Affine::IDENTITY);
+        let inverse_field = field.inverse()?;
+        let field_bits = [
+            field.a11.to_bits(),
+            field.a12.to_bits(),
+            field.a21.to_bits(),
+            field.a22.to_bits(),
+            field.tx.to_bits(),
+            field.ty.to_bits(),
+        ];
+        let key = (vector.asset_id, field_bits);
+        if !self.raw_selection_components_by_key.contains_key(&key) {
+            let source = crate::brush::vector_fill_geometry(vector);
+            let mut components = Vec::with_capacity(source.0.len());
+            let mut remembered = Vec::new();
+            for polygon in source.0 {
+                let mut path_indices: Vec<usize> = vector
+                    .paths
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, path)| path.closed)
+                    .filter_map(|(index, path)| {
+                        path.anchors
+                            .iter()
+                            .any(|anchor| polygon_boundary_near_point(&polygon, anchor.point, 0.5))
+                            .then_some(index)
+                    })
+                    .collect();
+                path_indices.sort_unstable();
+                path_indices.dedup();
+                if path_indices.is_empty() {
+                    continue;
+                }
+                let stage_surface = MultiPolygon(vec![polygon]);
+                let canonical_surface = if appearance.is_some() {
+                    crate::appearance::transform_surface(&stage_surface, inverse_field)
+                } else {
+                    stage_surface.clone()
+                };
+                remembered.push(((vector.asset_id, path_indices.clone()), stage_surface));
+                components.push(CachedRawSelectionComponent {
+                    canonical_surface,
+                    path_indices,
+                });
+            }
+            for (surface_key, surface) in remembered {
+                self.selection_source_surface_by_key
+                    .entry(surface_key)
+                    .or_insert(surface);
+            }
+            self.raw_selection_components_by_key
+                .insert(key, CachedRawSelectionComponents { components });
+            #[cfg(all(test, feature = "appearance-mask-eraser"))]
+            {
+                self.raw_selection_components_build_count += 1;
+            }
+        }
+        self.raw_selection_components_by_key.get(&key)
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
     pub(crate) fn selection_geometry(
         &mut self,
         vector: &q0s_format::v2::VectorAsset,
         appearance: &VectorAppearance,
         selected_indices: &[usize],
     ) -> Option<&CachedSelectionGeometry> {
-        appearance.field_transform.inverse()?;
+        let inverse_field = appearance.field_transform.inverse()?;
         let mut key_indices = selected_indices.to_vec();
         key_indices.sort_unstable();
         key_indices.dedup();
         let key = (vector.asset_id, key_indices);
-        if let std::collections::hash_map::Entry::Vacant(entry) =
-            self.selection_geometry_by_key.entry(key.clone())
-        {
-            let subset = q0s_format::v2::VectorAsset {
-                asset_id: vector.asset_id,
-                paths: key
-                    .1
-                    .iter()
-                    .filter_map(|index| vector.paths.get(*index).cloned())
-                    .collect(),
-                fill: vector.fill,
-                stroke: None,
-            };
-            let canonical_body = crate::appearance::canonical_visible_source_surface_for_vector(
-                &subset, appearance,
-            )?;
-            let body = crate::brush::coverage_to_paths(&canonical_body)
+        if !self.selection_geometry_by_key.contains_key(&key) {
+            // A normal click already resolved the exact connected source component.
+            // Reuse that surface instead of reconstructing the same dense VectorAsset
+            // from anchors again when the selection overlay appears one frame later.
+            let all_closed_selected = vector
+                .paths
                 .iter()
-                .map(flatten_path)
-                .collect();
+                .enumerate()
+                .filter(|(_, path)| path.closed)
+                .all(|(index, _)| key.1.binary_search(&index).is_ok());
+            let cached_full_body = all_closed_selected
+                .then(|| self.visible_body_by_asset.get(&vector.asset_id).cloned())
+                .flatten();
+            let (canonical_body, body) = if let Some(body) = cached_full_body {
+                // The stage renderer runs before tool interaction and has already
+                // resolved this exact full-asset body for masked vectors. Reuse its
+                // canonical contours instead of repeating clip/erase booleans on
+                // the first selection repaint.
+                (None, body)
+            } else {
+                let cached_source = self.selection_source_surface_by_key.get(&key).cloned();
+                let canonical_body = if let Some(source_stage) = cached_source {
+                    let source = crate::appearance::transform_surface(&source_stage, inverse_field);
+                    let clipped = if appearance.clip_mask.is_empty() {
+                        source
+                    } else {
+                        source.intersection(&crate::appearance::mask_paths_to_coverage(
+                            &appearance.clip_mask,
+                        ))
+                    };
+                    let erase = crate::appearance::mask_paths_to_coverage(&appearance.erase_mask);
+                    if erase.0.is_empty() {
+                        clipped
+                    } else {
+                        clipped.difference(&erase)
+                    }
+                } else {
+                    let subset = q0s_format::v2::VectorAsset {
+                        asset_id: vector.asset_id,
+                        paths: key
+                            .1
+                            .iter()
+                            .filter_map(|index| vector.paths.get(*index).cloned())
+                            .collect(),
+                        fill: vector.fill,
+                        stroke: None,
+                    };
+                    crate::appearance::canonical_visible_source_surface_for_vector(
+                        &subset, appearance,
+                    )?
+                };
+                let body = crate::brush::coverage_to_paths(&canonical_body)
+                    .iter()
+                    .map(flatten_path)
+                    .collect();
+                (Some(canonical_body), body)
+            };
+            let canonical_body_is_empty = canonical_body
+                .as_ref()
+                .map(|surface| surface.0.is_empty())
+                .unwrap_or_else(|| body.is_empty());
             let fallback_material_support =
-                if canonical_body.0.is_empty() && !appearance.clip_mask.is_empty() {
+                if canonical_body_is_empty && !appearance.clip_mask.is_empty() {
                     let clip = crate::appearance::mask_paths_to_coverage(&appearance.clip_mask);
                     let erase = crate::appearance::mask_paths_to_coverage(&appearance.erase_mask);
                     let visible = if erase.0.is_empty() {
@@ -290,16 +494,110 @@ impl TextureCache {
                 } else {
                     Vec::new()
                 };
-            entry.insert(CachedSelectionGeometry {
-                body,
-                fallback_material_support,
-            });
+            self.selection_geometry_by_key.insert(
+                key.clone(),
+                CachedSelectionGeometry {
+                    body,
+                    fallback_material_support,
+                },
+            );
             #[cfg(all(test, feature = "appearance-mask-eraser"))]
             {
                 self.selection_geometry_build_count += 1;
             }
         }
         self.selection_geometry_by_key.get(&key)
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    pub(crate) fn selection_stage_mesh(
+        &mut self,
+        vector: &q0s_format::v2::VectorAsset,
+        appearance: &VectorAppearance,
+        selected_indices: &[usize],
+    ) -> Option<&CachedSelectionStageMesh> {
+        let mut path_indices: Vec<usize> = selected_indices
+            .iter()
+            .copied()
+            .filter(|index| vector.paths.get(*index).is_some_and(|path| path.closed))
+            .collect();
+        path_indices.sort_unstable();
+        path_indices.dedup();
+        if path_indices.is_empty() {
+            return None;
+        }
+        let field = appearance.field_transform;
+        let field_bits = [
+            field.a11.to_bits(),
+            field.a12.to_bits(),
+            field.a21.to_bits(),
+            field.a22.to_bits(),
+            field.tx.to_bits(),
+            field.ty.to_bits(),
+        ];
+        let key = SelectionStageMeshKey {
+            asset_id: vector.asset_id,
+            path_indices: path_indices.clone(),
+            field_transform_bits: field_bits,
+        };
+        if !self.selection_stage_mesh_by_key.contains_key(&key) {
+            let stage_contours: Vec<Vec<Pos2>> = if appearance.erase_mask.is_empty()
+                && appearance.clip_mask.is_empty()
+            {
+                path_indices
+                    .iter()
+                    .filter_map(|index| vector.paths.get(*index))
+                    .map(flatten_path)
+                    .filter(|contour| contour.len() >= 3)
+                    .map(|contour| {
+                        contour
+                            .into_iter()
+                            .map(|point| pos2(point.x, point.y))
+                            .collect()
+                    })
+                    .collect()
+            } else {
+                let canonical = {
+                    let geometry = self.selection_geometry(vector, appearance, &path_indices)?;
+                    if geometry.body.is_empty() {
+                        geometry.fallback_material_support.clone()
+                    } else {
+                        geometry.body.clone()
+                    }
+                };
+                canonical
+                    .into_iter()
+                    .map(|contour| {
+                        contour
+                            .into_iter()
+                            .map(|point| {
+                                let point = field.apply(point);
+                                pos2(point.x, point.y)
+                            })
+                            .collect()
+                    })
+                    .collect()
+            };
+            let stage_mesh = build_selection_stage_mesh(&stage_contours)?;
+            self.selection_stage_mesh_by_key
+                .insert(key.clone(), stage_mesh);
+            #[cfg(all(test, feature = "appearance-mask-eraser"))]
+            {
+                self.selection_stage_mesh_build_count += 1;
+            }
+        }
+        self.selection_stage_mesh_by_key.get(&key)
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    pub(crate) fn selection_screen_meshes(
+        source: &CachedSelectionStageMesh,
+        view: &StageView,
+        texture_id: TextureId,
+        tile_size_points: f32,
+        accent: Color32,
+    ) -> Vec<Mesh> {
+        build_selection_screen_meshes(source, view, texture_id, tile_size_points, accent)
     }
 
     #[cfg(feature = "appearance-mask-eraser")]
@@ -313,6 +611,15 @@ impl TextureCache {
         key: SelectionPaintKey,
         paint: CachedSelectionPaint,
     ) {
+        self.selection_paint_by_key.retain(|existing, _| {
+            existing.asset_id != key.asset_id
+                || existing.path_indices != key.path_indices
+                || existing.field_transform_bits != key.field_transform_bits
+                || existing.accent_rgba != key.accent_rgba
+                || existing.texture_id != key.texture_id
+                || (existing.view_origin_bits == key.view_origin_bits
+                    && existing.view_scale_bits == key.view_scale_bits)
+        });
         self.selection_paint_by_key.insert(key, paint);
         #[cfg(all(test, feature = "appearance-mask-eraser"))]
         {
@@ -321,8 +628,18 @@ impl TextureCache {
     }
 
     #[cfg(all(test, feature = "appearance-mask-eraser"))]
+    pub(crate) fn raw_selection_components_build_count(&self) -> usize {
+        self.raw_selection_components_build_count
+    }
+
+    #[cfg(all(test, feature = "appearance-mask-eraser"))]
     pub(crate) fn appearance_hit_build_count(&self) -> usize {
         self.appearance_hit_build_count
+    }
+
+    #[cfg(all(test, feature = "appearance-mask-eraser"))]
+    pub(crate) fn selection_stage_mesh_build_count(&self) -> usize {
+        self.selection_stage_mesh_build_count
     }
 
     #[cfg(all(test, feature = "appearance-mask-eraser"))]
@@ -866,6 +1183,202 @@ pub fn paint_closed_bevel_stroke(painter: &Painter, points: &[Pos2], width: f32,
     if let Some(mesh) = closed_bevel_stroke_mesh(points, width, color) {
         painter.add(Shape::Mesh(mesh));
     }
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn exact_closed_contour(points: &[Pos2]) -> Vec<Pos2> {
+    let mut result = Vec::with_capacity(points.len());
+    for point in points
+        .iter()
+        .copied()
+        .filter(|point| point.x.is_finite() && point.y.is_finite())
+    {
+        if result.last().is_some_and(|previous| *previous == point) {
+            continue;
+        }
+        result.push(point);
+    }
+    if result.len() > 1 && result.first() == result.last() {
+        result.pop();
+    }
+    result
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn parametric_closed_bevel_stroke(points: &[Pos2]) -> Option<CachedParametricStroke> {
+    let one = tessellate_closed_bevel_stroke(points, 1.0)?;
+    let two = tessellate_closed_bevel_stroke(points, 2.0)?;
+    if one.indices != two.indices || one.vertices.len() != two.vertices.len() {
+        return None;
+    }
+    let mut base_vertices = Vec::with_capacity(one.vertices.len());
+    let mut width_vectors = Vec::with_capacity(one.vertices.len());
+    for (one, two) in one.vertices.into_iter().zip(two.vertices) {
+        let one = pos2(one.x, one.y);
+        let two = pos2(two.x, two.y);
+        let width_vector = two - one;
+        base_vertices.push(one - width_vector);
+        width_vectors.push(width_vector);
+    }
+    let midpoint = tessellate_closed_bevel_stroke(points, 1.5)?;
+    if midpoint.indices != one.indices || midpoint.vertices.len() != base_vertices.len() {
+        return None;
+    }
+    for (index, vertex) in midpoint.vertices.iter().enumerate() {
+        let expected = base_vertices[index] + width_vectors[index] * 1.5;
+        if (expected.x - vertex.x).abs() > 1.0e-3 || (expected.y - vertex.y).abs() > 1.0e-3 {
+            return None;
+        }
+    }
+    Some(CachedParametricStroke {
+        base_vertices,
+        width_vectors,
+        indices: one.indices,
+        min_width: 1.0,
+        max_width: 2.0,
+    })
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn build_selection_stage_mesh(contours: &[Vec<Pos2>]) -> Option<CachedSelectionStageMesh> {
+    if contours.is_empty() {
+        return None;
+    }
+    let (fill_vertices, fill_indices) = tessellate_complex_fill(contours)
+        .map(|buffers| {
+            (
+                buffers
+                    .vertices
+                    .into_iter()
+                    .map(|point| pos2(point.x, point.y))
+                    .collect::<Vec<_>>(),
+                buffers.indices,
+            )
+        })
+        .unwrap_or_default();
+    let strokes: Vec<CachedSelectionStroke> = contours
+        .iter()
+        .map(|contour| exact_closed_contour(contour))
+        .filter(|contour| contour.len() >= 3)
+        .map(|contour_stage| CachedSelectionStroke {
+            parametric: parametric_closed_bevel_stroke(&contour_stage),
+            contour_stage,
+        })
+        .collect();
+    if fill_vertices.is_empty() && strokes.is_empty() {
+        return None;
+    }
+    Some(CachedSelectionStageMesh {
+        fill_vertices,
+        fill_indices,
+        strokes,
+    })
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn stage_pos_to_screen(point: Pos2, view: &StageView) -> Pos2 {
+    pos2(
+        view.origin.x + point.x * view.scale,
+        view.origin.y + point.y * view.scale,
+    )
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn parametric_stroke_screen_mesh(
+    stroke: &CachedParametricStroke,
+    width_points: f32,
+    color: Color32,
+    view: &StageView,
+) -> Option<Mesh> {
+    let scale = view.scale.abs();
+    if !scale.is_finite() || scale <= 1.0e-6 || !width_points.is_finite() || width_points <= 0.0 {
+        return None;
+    }
+    let stage_width = width_points / scale;
+    if stage_width < stroke.min_width || stage_width > stroke.max_width {
+        return None;
+    }
+    let mut mesh = Mesh::default();
+    mesh.vertices.reserve(stroke.base_vertices.len());
+    for (base, width_vector) in stroke.base_vertices.iter().zip(&stroke.width_vectors) {
+        let stage = *base + *width_vector * stage_width;
+        mesh.vertices.push(Vertex {
+            pos: stage_pos_to_screen(stage, view),
+            uv: Pos2::ZERO,
+            color,
+        });
+    }
+    mesh.indices = stroke.indices.clone();
+    Some(mesh)
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn direct_stroke_screen_mesh(
+    contour_stage: &[Pos2],
+    width_points: f32,
+    color: Color32,
+    view: &StageView,
+) -> Option<Mesh> {
+    let screen: Vec<Pos2> = contour_stage
+        .iter()
+        .copied()
+        .map(|point| stage_pos_to_screen(point, view))
+        .collect();
+    closed_bevel_stroke_mesh(&screen, width_points, color)
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn build_selection_screen_meshes(
+    source: &CachedSelectionStageMesh,
+    view: &StageView,
+    texture_id: TextureId,
+    tile_size_points: f32,
+    accent: Color32,
+) -> Vec<Mesh> {
+    let mut meshes = Vec::with_capacity(1 + source.strokes.len() * 2);
+    if !source.fill_vertices.is_empty() && !source.fill_indices.is_empty() {
+        let tile = tile_size_points.max(1.0);
+        let mut fill = Mesh::with_texture(texture_id);
+        fill.vertices.reserve(source.fill_vertices.len());
+        for stage in &source.fill_vertices {
+            let pos = stage_pos_to_screen(*stage, view);
+            fill.vertices.push(Vertex {
+                pos,
+                uv: pos2(pos.x / tile, pos.y / tile),
+                color: Color32::WHITE,
+            });
+        }
+        fill.indices = source.fill_indices.clone();
+        meshes.push(fill);
+    }
+    for stroke in &source.strokes {
+        let outer = stroke
+            .parametric
+            .as_ref()
+            .and_then(|parametric| {
+                parametric_stroke_screen_mesh(parametric, 2.0, Color32::from_black_alpha(180), view)
+            })
+            .or_else(|| {
+                direct_stroke_screen_mesh(
+                    &stroke.contour_stage,
+                    2.0,
+                    Color32::from_black_alpha(180),
+                    view,
+                )
+            });
+        if let Some(mesh) = outer {
+            meshes.push(mesh);
+        }
+        let inner = stroke
+            .parametric
+            .as_ref()
+            .and_then(|parametric| parametric_stroke_screen_mesh(parametric, 1.0, accent, view))
+            .or_else(|| direct_stroke_screen_mesh(&stroke.contour_stage, 1.0, accent, view));
+        if let Some(mesh) = inner {
+            meshes.push(mesh);
+        }
+    }
+    meshes
 }
 
 /// Paint one tessellated fill with a repeating screen-space texture. UVs are
@@ -2680,6 +3193,45 @@ mod tests {
                 "bevel selection stroke escaped bounded source envelope: {vertex:?}",
             );
         }
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn parametric_selection_bevel_is_exact_only_inside_verified_topology_range() {
+        let points = [
+            pos2(0.0, 0.0),
+            pos2(100.0, 0.0),
+            pos2(0.01, 0.001),
+            pos2(100.0, 1.0),
+            pos2(0.0, 1.0),
+        ];
+        let parametric = parametric_closed_bevel_stroke(&points).expect("parametric bevel");
+        for width in [1.0_f32, 1.1, 1.5, 1.9, 2.0] {
+            let direct = tessellate_closed_bevel_stroke(&points, width).expect("direct bevel");
+            assert_eq!(direct.indices, parametric.indices);
+            assert_eq!(direct.vertices.len(), parametric.base_vertices.len());
+            for (index, vertex) in direct.vertices.iter().enumerate() {
+                let actual =
+                    parametric.base_vertices[index] + parametric.width_vectors[index] * width;
+                assert!(
+                    (actual.x - vertex.x).abs() <= 1.0e-3 && (actual.y - vertex.y).abs() <= 1.0e-3,
+                    "verified parametric bevel drift at width {width}, vertex {index}",
+                );
+            }
+        }
+        let view = StageView {
+            origin: Pos2::ZERO,
+            scale: 1.1,
+            stage_rect: Rect::EVERYTHING,
+        };
+        assert!(
+            parametric_stroke_screen_mesh(&parametric, 1.0, Color32::WHITE, &view).is_none(),
+            "width below the verified topology range must use exact lyon fallback",
+        );
+        assert!(
+            parametric_stroke_screen_mesh(&parametric, 2.0, Color32::WHITE, &view).is_some(),
+            "verified topology range should keep the fast parametric path",
+        );
     }
 
     #[test]

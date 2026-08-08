@@ -218,13 +218,15 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 (p.x - view.origin.x) / view.scale,
                 (p.y - view.origin.y) / view.scale,
             );
-            app.session.selection = crate::tools::selection_at_point_pub(
+            let selection = crate::tools::selection_at_point_cached(
                 &app.state.project,
+                &mut app.textures,
                 q0rg_id,
                 app.session.current_frame,
                 stage_pos,
             )
             .unwrap_or(crate::state::Selection::None);
+            app.session.selection = selection;
         }
     }
     response.context_menu(|ui| stage_context_menu(app, ui));

@@ -2698,8 +2698,9 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
     // q0rg, bitmap and transformed vector instances remain display objects.
     if response.clicked_by(PointerButton::Primary) {
         if let Some(p) = cursor {
-            if let Some(hit) = hit_test_raw_selection(
+            if let Some(hit) = hit_test_raw_selection_cached(
                 &app.state.project,
+                &mut app.textures,
                 app.session.current_q0rg_id,
                 app.session.current_frame,
                 p,
@@ -3070,8 +3071,9 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
             }
             // 2. Raw fill dragging moves only the connected region under the
             // pointer. Open strokes still move as individual contours.
-            if let Some(hit) = hit_test_raw_selection(
+            if let Some(hit) = hit_test_raw_selection_cached(
                 &app.state.project,
+                &mut app.textures,
                 app.session.current_q0rg_id,
                 app.session.current_frame,
                 p,
@@ -3798,6 +3800,111 @@ fn hit_test_raw_hover(project: &ProjectV2, q0rg_id: u16, frame: u16, cursor: Vec
         }
     }
     false
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn hit_test_raw_selection_cached(
+    project: &ProjectV2,
+    textures: &mut TextureCache,
+    q0rg_id: u16,
+    frame: u16,
+    cursor: Vec2,
+) -> Option<RawSelectionHit> {
+    let q = project.q0rgs.iter().find(|q| q.q0rg_id == q0rg_id)?;
+    for layer in q.layers.iter().rev() {
+        for placement_idx in active_raw_placement_indices(project, layer, frame)
+            .into_iter()
+            .rev()
+        {
+            let placement = &layer.placements[placement_idx];
+            let Target::Asset(asset_id) = placement.target else {
+                continue;
+            };
+            let Some(Asset::Vector(vector)) =
+                project.assets.iter().find(|asset| asset.id() == asset_id)
+            else {
+                continue;
+            };
+
+            if vector.fill.is_some() {
+                let appearance = project.asset_appearances.get(&asset_id);
+                if interactive_visible_fill_hit_cached(vector, appearance, cursor, 2.0, textures) {
+                    let field = appearance
+                        .map(|appearance| appearance.field_transform)
+                        .unwrap_or(Affine::IDENTITY);
+                    let canonical_cursor = field.inverse()?.apply(cursor);
+                    if let Some(components) = textures.raw_selection_components(vector, appearance)
+                    {
+                        for component in &components.components {
+                            let owns_point = if let Some(appearance) = appearance {
+                                crate::appearance::material_support_contains_point(
+                                    &component.canonical_surface,
+                                    appearance.material,
+                                    canonical_cursor,
+                                    2.0,
+                                )
+                            } else {
+                                crate::appearance::surface_contains_or_near(
+                                    &component.canonical_surface,
+                                    canonical_cursor,
+                                    2.0,
+                                )
+                            };
+                            if !owns_point {
+                                continue;
+                            }
+                            let refs: Vec<PathRef> = component
+                                .path_indices
+                                .iter()
+                                .copied()
+                                .map(|path_idx| PathRef {
+                                    q0rg_id,
+                                    layer_id: layer.layer_id,
+                                    placement_idx,
+                                    path_idx,
+                                })
+                                .collect();
+                            if !refs.is_empty() {
+                                return Some(RawSelectionHit::Fill(refs));
+                            }
+                        }
+                    }
+                }
+            }
+
+            let stroke_radius = vector
+                .stroke
+                .as_ref()
+                .map(|stroke| stroke.width.max(1.0) * 0.5 + 3.0)
+                .unwrap_or(3.0);
+            for (path_idx, path) in vector.paths.iter().enumerate().rev() {
+                if path.closed && vector.fill.is_some() {
+                    continue;
+                }
+                let points = flatten_path(path);
+                if points.len() >= 2 && nearest_segment_distance(&points, cursor) <= stroke_radius {
+                    return Some(RawSelectionHit::Path(PathRef {
+                        q0rg_id,
+                        layer_id: layer.layer_id,
+                        placement_idx,
+                        path_idx,
+                    }));
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(feature = "appearance-mask-eraser"))]
+fn hit_test_raw_selection_cached(
+    project: &ProjectV2,
+    _textures: &mut TextureCache,
+    q0rg_id: u16,
+    frame: u16,
+    cursor: Vec2,
+) -> Option<RawSelectionHit> {
+    hit_test_raw_selection(project, q0rg_id, frame, cursor)
 }
 
 fn hit_test_raw_selection(
@@ -6553,6 +6660,33 @@ pub fn hit_test_placement_pub(
 /// Shared canvas/context-menu selection semantics. Raw graphics resolve to a
 /// connected fill region or individual stroke path; only actual display
 /// objects resolve to `Selection::Placement`.
+pub(crate) fn selection_at_point_cached(
+    project: &ProjectV2,
+    textures: &mut TextureCache,
+    q0rg_id: u16,
+    frame: u16,
+    p: Vec2,
+) -> Option<Selection> {
+    if let Some(hit) = hit_test_raw_selection_cached(project, textures, q0rg_id, frame, p) {
+        return Some(match hit {
+            RawSelectionHit::Fill(refs) => Selection::Paths(refs),
+            RawSelectionHit::Path(path) => Selection::Path {
+                q0rg_id: path.q0rg_id,
+                layer_id: path.layer_id,
+                placement_idx: path.placement_idx,
+                path_idx: path.path_idx,
+            },
+        });
+    }
+    hit_test_selectable_placement(project, q0rg_id, frame, p).map(|(layer_id, placement_idx)| {
+        Selection::Placement {
+            q0rg_id,
+            layer_id,
+            placement_idx,
+        }
+    })
+}
+
 pub fn selection_at_point_pub(
     project: &ProjectV2,
     q0rg_id: u16,
@@ -7643,7 +7777,7 @@ fn paint_selection_surface(painter: &Painter, contours: &[Vec<Pos2>], accent: Co
     draw_selection_contour(painter, contours, accent);
 }
 
-#[cfg(feature = "appearance-mask-eraser")]
+#[cfg(all(test, feature = "appearance-mask-eraser"))]
 fn appearance_selection_body_contours(
     vector: &VectorAsset,
     appearance: &q0s_format::v2::VectorAppearance,
@@ -7783,33 +7917,18 @@ fn draw_appearance_selection_overlay(
         return;
     }
 
-    let contours =
-        appearance_selection_body_contours(vector, appearance, Some(&path_indices), view, textures);
-    if contours.is_empty() {
-        return;
-    }
-    let mut meshes = Vec::new();
-    if let Some(mesh) = crate::render::complex_fill_pattern_mesh(
-        &contours,
-        texture.id(),
-        SELECTION_STIPPLE_SPACING_PX,
-    ) {
-        meshes.push(mesh);
-    }
-    for contour in &contours {
-        let outline = selection_contour_points(contour);
-        if outline.len() < 3 {
-            continue;
-        }
-        if let Some(mesh) =
-            crate::render::closed_bevel_stroke_mesh(&outline, 2.0, Color32::from_black_alpha(180))
-        {
-            meshes.push(mesh);
-        }
-        if let Some(mesh) = crate::render::closed_bevel_stroke_mesh(&outline, 1.0, accent) {
-            meshes.push(mesh);
-        }
-    }
+    let meshes = {
+        let Some(source) = textures.selection_stage_mesh(vector, appearance, &path_indices) else {
+            return;
+        };
+        TextureCache::selection_screen_meshes(
+            source,
+            view,
+            texture.id(),
+            SELECTION_STIPPLE_SPACING_PX,
+            accent,
+        )
+    };
     for mesh in &meshes {
         clipped.add(Shape::Mesh(mesh.clone()));
     }
@@ -9959,6 +10078,31 @@ mod tests {
 
     #[cfg(feature = "appearance-mask-eraser")]
     #[test]
+    fn cached_connected_selection_matches_exact_halo_hole_semantics_and_reuses_components() {
+        let project = appearance_selection_project(true);
+        let mut cache = TextureCache::default();
+        for point in [
+            Vec2::new(-5.0, 10.0),
+            Vec2::new(2.0, 2.0),
+            Vec2::new(10.0, 10.0),
+            Vec2::new(25.0, 10.0),
+            Vec2::new(40.0, 40.0),
+        ] {
+            assert_eq!(
+                selection_at_point_cached(&project, &mut cache, 1, 0, point),
+                selection_at_point_pub(&project, 1, 0, point),
+                "cached connected selection changed exact raw semantics at {point:?}",
+            );
+        }
+        assert_eq!(
+            cache.raw_selection_components_build_count(),
+            1,
+            "one immutable raw asset must resolve its connected source components once",
+        );
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
     fn interactive_glow_hover_matches_exact_material_hit_without_component_rebuild() {
         let project = appearance_selection_project(true);
         let vector = match &project.assets[0] {
@@ -11600,7 +11744,12 @@ mod tests {
         assert_eq!(
             app.textures.selection_paint_build_count(),
             1,
-            "stable masked raw selection retessellated the same stipple/contour meshes",
+            "stable masked raw selection rebuilt the same final screen mesh",
+        );
+        assert_eq!(
+            app.textures.selection_stage_mesh_build_count(),
+            1,
+            "stable selection must build stage-space fill/stroke topology once",
         );
 
         let zoomed = StageView {
@@ -11626,6 +11775,11 @@ mod tests {
             2,
             "screen-space selection mesh must rebuild when zoom changes",
         );
+        assert_eq!(
+            app.textures.selection_stage_mesh_build_count(),
+            1,
+            "zoom must transform cached stage topology instead of retessellating it",
+        );
 
         app.textures.invalidate_asset(1);
         let _ = ctx.run(
@@ -11645,6 +11799,11 @@ mod tests {
             app.textures.selection_paint_build_count(),
             3,
             "asset mutation must evict cached raw selection meshes",
+        );
+        assert_eq!(
+            app.textures.selection_stage_mesh_build_count(),
+            2,
+            "asset mutation must evict cached stage-space selection topology",
         );
     }
 
