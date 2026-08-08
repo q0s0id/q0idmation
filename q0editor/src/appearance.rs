@@ -415,12 +415,29 @@ pub(crate) fn fast_visible_material_bounds_for_paths(
     appearance: Option<&VectorAppearance>,
     path_indices: &[usize],
 ) -> Option<(f32, f32, f32, f32)> {
-    let selected_paths: Vec<VPath> = path_indices
+    let mut selected_bounds: Option<(f32, f32, f32, f32)> = None;
+    for path in path_indices
         .iter()
-        .filter_map(|index| vector.paths.get(*index).cloned())
+        .filter_map(|index| vector.paths.get(*index))
         .filter(|path| path.closed)
-        .collect();
-    let selected_bounds = path_anchor_bounds(&selected_paths)?;
+    {
+        for anchor in &path.anchors {
+            let point = anchor.point;
+            if !point.x.is_finite() || !point.y.is_finite() {
+                continue;
+            }
+            selected_bounds = Some(match selected_bounds {
+                Some((min_x, min_y, max_x, max_y)) => (
+                    min_x.min(point.x),
+                    min_y.min(point.y),
+                    max_x.max(point.x),
+                    max_y.max(point.y),
+                ),
+                None => (point.x, point.y, point.x, point.y),
+            });
+        }
+    }
+    let selected_bounds = selected_bounds?;
     let Some(appearance) = appearance else {
         return Some(selected_bounds);
     };
@@ -431,6 +448,17 @@ pub(crate) fn fast_visible_material_bounds_for_paths(
         .enumerate()
         .filter(|(_, path)| path.closed)
         .all(|(index, _)| path_indices.contains(&index));
+
+    let radius = match appearance.material {
+        VectorMaterial::Solid => 0.0,
+        VectorMaterial::SoftHalo { radius, .. } => radius.max(0.0),
+    };
+    let row_x = (appearance.field_transform.a11 * appearance.field_transform.a11
+        + appearance.field_transform.a12 * appearance.field_transform.a12)
+        .sqrt();
+    let row_y = (appearance.field_transform.a21 * appearance.field_transform.a21
+        + appearance.field_transform.a22 * appearance.field_transform.a22)
+        .sqrt();
 
     let canonical_whole_bounds = if appearance.clip_mask.is_empty() {
         let source_paths = if appearance.material_source.is_empty() {
@@ -504,16 +532,6 @@ pub(crate) fn fast_visible_material_bounds_for_paths(
         return Some(whole_bounds);
     }
 
-    let radius = match appearance.material {
-        VectorMaterial::Solid => 0.0,
-        VectorMaterial::SoftHalo { radius, .. } => radius.max(0.0),
-    };
-    let row_x = (appearance.field_transform.a11 * appearance.field_transform.a11
-        + appearance.field_transform.a12 * appearance.field_transform.a12)
-        .sqrt();
-    let row_y = (appearance.field_transform.a21 * appearance.field_transform.a21
-        + appearance.field_transform.a22 * appearance.field_transform.a22)
-        .sqrt();
     let partial = (
         selected_bounds.0 - radius * row_x,
         selected_bounds.1 - radius * row_y,

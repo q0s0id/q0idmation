@@ -1821,8 +1821,8 @@ fn begin_group_transform(
     };
     app.session.tool_state = ToolState::DraggingGroup {
         refs: paths,
-        start_paths,
-        start_appearances,
+        start_paths: std::sync::Arc::new(start_paths),
+        start_appearances: std::sync::Arc::new(start_appearances),
         objects,
         start_transforms,
         operation,
@@ -1987,8 +1987,8 @@ fn begin_transforming_raw_area(
         TransformHit::Scale(handle) => {
             app.session.tool_state = ToolState::DraggingRawHandle {
                 refs,
-                start_paths,
-                start_appearances,
+                start_paths: std::sync::Arc::new(start_paths),
+                start_appearances: std::sync::Arc::new(start_appearances),
                 handle,
                 start_bounds: bounds,
                 start_pivot: pivot,
@@ -1998,8 +1998,8 @@ fn begin_transforming_raw_area(
         TransformHit::Rotate(_) => {
             app.session.tool_state = ToolState::DraggingRawRotate {
                 refs,
-                start_paths,
-                start_appearances,
+                start_paths: std::sync::Arc::new(start_paths),
+                start_appearances: std::sync::Arc::new(start_appearances),
                 center: pivot,
                 start_angle: (start_cursor.y - pivot.y).atan2(start_cursor.x - pivot.x),
             };
@@ -2008,8 +2008,8 @@ fn begin_transforming_raw_area(
         TransformHit::Skew(edge) => {
             app.session.tool_state = ToolState::DraggingRawSkew {
                 refs,
-                start_paths,
-                start_appearances,
+                start_paths: std::sync::Arc::new(start_paths),
+                start_appearances: std::sync::Arc::new(start_appearances),
                 edge,
                 start_bounds: bounds,
                 start_cursor,
@@ -2887,8 +2887,8 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                         app.session.tool_state = ToolState::DraggingPaths {
                             refs,
                             start_cursor: p,
-                            start_paths,
-                            start_appearances,
+                            start_paths: std::sync::Arc::new(start_paths),
+                            start_appearances: std::sync::Arc::new(start_appearances),
                             start_pivot,
                         };
                         app.session.status = "Moving selected fill".to_string();
@@ -4608,9 +4608,21 @@ fn transform_captured_appearances(
     {
         let mut changed = false;
         for (asset_id, source) in start_appearances {
-            let transformed = crate::appearance::transform_appearance(source, transform);
-            if project.asset_appearances.get(asset_id) != Some(&transformed) {
-                project.asset_appearances.insert(*asset_id, transformed);
+            let next_field = Affine::compose(transform, source.field_transform);
+            if let Some(current) = project.asset_appearances.get_mut(asset_id) {
+                if current.field_transform != next_field {
+                    // Dragging an appearance changes only its resolved field transform.
+                    // Never clone/compare material_source or masks per pointer event: an
+                    // Advanced stroke can contain thousands of anchors there.
+                    current.field_transform = next_field;
+                    changed = true;
+                }
+            } else {
+                // Defensive recovery for a malformed edit state. This allocation can only
+                // happen once because subsequent drag updates hit the in-place branch.
+                let mut restored = source.clone();
+                restored.field_transform = next_field;
+                project.asset_appearances.insert(*asset_id, restored);
                 changed = true;
             }
         }
@@ -4688,8 +4700,8 @@ fn begin_dragging_raw_paths(
     app.session.tool_state = ToolState::DraggingPaths {
         refs,
         start_cursor,
-        start_paths,
-        start_appearances,
+        start_paths: std::sync::Arc::new(start_paths),
+        start_appearances: std::sync::Arc::new(start_appearances),
         start_pivot,
     };
     app.session.status = status.to_string();
@@ -4737,8 +4749,8 @@ fn begin_scaling_raw_paths(
     let start_appearances = capture_whole_asset_appearances_for_raw_refs(&app.state.project, &refs);
     app.session.tool_state = ToolState::DraggingRawHandle {
         refs,
-        start_paths,
-        start_appearances,
+        start_paths: std::sync::Arc::new(start_paths),
+        start_appearances: std::sync::Arc::new(start_appearances),
         handle,
         start_bounds,
         start_pivot,
@@ -4783,8 +4795,8 @@ fn begin_rotating_raw_paths(
     let start_appearances = capture_whole_asset_appearances_for_raw_refs(&app.state.project, &refs);
     app.session.tool_state = ToolState::DraggingRawRotate {
         refs,
-        start_paths,
-        start_appearances,
+        start_paths: std::sync::Arc::new(start_paths),
+        start_appearances: std::sync::Arc::new(start_appearances),
         center,
         start_angle: (start_cursor.y - center.y).atan2(start_cursor.x - center.x),
     };
@@ -4830,8 +4842,8 @@ fn begin_skewing_raw_paths(
     let start_appearances = capture_whole_asset_appearances_for_raw_refs(&app.state.project, &refs);
     app.session.tool_state = ToolState::DraggingRawSkew {
         refs,
-        start_paths,
-        start_appearances,
+        start_paths: std::sync::Arc::new(start_paths),
+        start_appearances: std::sync::Arc::new(start_appearances),
         edge,
         start_bounds: bounds,
         start_cursor,
@@ -7348,7 +7360,6 @@ struct CachedAppearanceSelectionStipple {
     key: u64,
     texture: TextureHandle,
     texture_rect: egui::Rect,
-    body_contours: std::sync::Arc<Vec<Vec<Pos2>>>,
     #[cfg(test)]
     point_count: usize,
 }
@@ -7360,25 +7371,31 @@ static APPEARANCE_SELECTION_STIPPLE_BUILD_COUNT: std::sync::atomic::AtomicUsize 
 #[cfg(feature = "appearance-mask-eraser")]
 fn appearance_selection_stipple_cache_key(
     appearance_fingerprint: u64,
+    appearance: &q0s_format::v2::VectorAppearance,
     view: &StageView,
     rect: egui::Rect,
     subset_path_indices: Option<&[usize]>,
+    accent: Color32,
 ) -> u64 {
     use std::hash::{Hash, Hasher};
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     appearance_fingerprint.hash(&mut hasher);
+    // Translation is deliberately absent from this key. Moving a selected glow
+    // must reuse the already-rasterized overlay and only move its quad.
     for value in [
-        view.origin.x,
-        view.origin.y,
         view.scale,
-        rect.left(),
-        rect.top(),
-        rect.right(),
-        rect.bottom(),
+        appearance.field_transform.a11,
+        appearance.field_transform.a12,
+        appearance.field_transform.a21,
+        appearance.field_transform.a22,
     ] {
         value.to_bits().hash(&mut hasher);
     }
+    let texture_rect = appearance_selection_texture_rect(rect);
+    (texture_rect.width().round() as u32).hash(&mut hasher);
+    (texture_rect.height().round() as u32).hash(&mut hasher);
+    [accent.r(), accent.g(), accent.b(), accent.a()].hash(&mut hasher);
     subset_path_indices.unwrap_or(&[]).hash(&mut hasher);
     hasher.finish()
 }
@@ -7438,30 +7455,64 @@ fn appearance_selection_body_contours(
 
 #[cfg(feature = "appearance-mask-eraser")]
 fn appearance_selection_texture_rect(sample_rect: egui::Rect) -> egui::Rect {
-    egui::Rect::from_min_max(
-        Pos2::new(sample_rect.left().floor(), sample_rect.top().floor()),
-        Pos2::new(
-            sample_rect.right().ceil() + 1.0,
-            sample_rect.bottom().ceil() + 1.0,
-        ),
-    )
+    let min = Pos2::new(sample_rect.left().floor(), sample_rect.top().floor());
+    // Size depends only on the selected support size, not its absolute screen
+    // position. This keeps the cache stable through pure translation.
+    let size = egui::vec2(
+        sample_rect.width().ceil().max(1.0) + 2.0,
+        sample_rect.height().ceil().max(1.0) + 2.0,
+    );
+    egui::Rect::from_min_size(min, size)
 }
 
 #[cfg(feature = "appearance-mask-eraser")]
-fn appearance_selection_stipple_image(texture_rect: egui::Rect, points: &[Pos2]) -> ColorImage {
+fn appearance_selection_stipple_image(
+    texture_rect: egui::Rect,
+    points: &[Pos2],
+    body_contours: &[Vec<Pos2>],
+    accent: Color32,
+) -> ColorImage {
     let width = texture_rect.width().ceil().max(1.0) as usize;
     let height = texture_rect.height().ceil().max(1.0) as usize;
     let mut rgba = vec![0_u8; width.saturating_mul(height).saturating_mul(4)];
+    let mut put_pixel = |x: isize, y: isize, color: [u8; 4]| {
+        if x < 0 || y < 0 || x >= width as isize || y >= height as isize {
+            return;
+        }
+        let offset = (y as usize * width + x as usize) * 4;
+        rgba[offset..offset + 4].copy_from_slice(&color);
+    };
+
     for point in points {
         let x = (point.x - texture_rect.left()).round() as isize;
         let y = (point.y - texture_rect.top()).round() as isize;
-        if x < 0 || y < 0 || x >= width as isize || y >= height as isize {
-            continue;
+        put_pixel(x, y, [255, 255, 255, 255]);
+    }
+
+    // Bake the dense contour into the same cached texture. Re-sampling and
+    // re-uploading a 1 px contour mesh every repaint defeats the whole cache on
+    // long Advanced strokes.
+    let contour_points = dense_selection_contour_points(body_contours, texture_rect);
+    for point in contour_points {
+        let x = (point.x - texture_rect.left()).round() as isize;
+        let y = (point.y - texture_rect.top()).round() as isize;
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                put_pixel(x + dx, y + dy, [0, 0, 0, 220]);
+            }
         }
-        let offset = (y as usize * width + x as usize) * 4;
-        rgba[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
+        put_pixel(x, y, [accent.r(), accent.g(), accent.b(), accent.a()]);
     }
     ColorImage::from_rgba_unmultiplied([width, height], &rgba)
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+struct AppearanceSelectionStippleRequest<'a> {
+    vector: &'a VectorAsset,
+    appearance: &'a q0s_format::v2::VectorAppearance,
+    appearance_fingerprint: u64,
+    subset_path_indices: Option<&'a [usize]>,
+    accent: Color32,
 }
 
 #[cfg(feature = "appearance-mask-eraser")]
@@ -7469,18 +7520,25 @@ fn cached_appearance_selection_stipple(
     painter: &Painter,
     view: &StageView,
     sample_rect: egui::Rect,
-    vector: &VectorAsset,
-    appearance: &q0s_format::v2::VectorAppearance,
-    appearance_fingerprint: u64,
-    subset_path_indices: Option<&[usize]>,
+    request: AppearanceSelectionStippleRequest<'_>,
 ) -> CachedAppearanceSelectionStipple {
     use std::hash::{Hash, Hasher};
 
+    let AppearanceSelectionStippleRequest {
+        vector,
+        appearance,
+        appearance_fingerprint,
+        subset_path_indices,
+        accent,
+    } = request;
+
     let key = appearance_selection_stipple_cache_key(
         appearance_fingerprint,
+        appearance,
         view,
         sample_rect,
         subset_path_indices,
+        accent,
     );
     let mut subset_hasher = std::collections::hash_map::DefaultHasher::new();
     subset_path_indices.unwrap_or(&[]).hash(&mut subset_hasher);
@@ -7489,11 +7547,14 @@ fn cached_appearance_selection_stipple(
         vector.asset_id,
         subset_hasher.finish(),
     ));
-    if let Some(cached) = painter
+    if let Some(mut cached) = painter
         .ctx()
         .data(|data| data.get_temp::<CachedAppearanceSelectionStipple>(id))
     {
         if cached.key == key {
+            // The cached bitmap is translation-invariant; only its screen quad
+            // follows the current selected bounds during a move.
+            cached.texture_rect = appearance_selection_texture_rect(sample_rect);
             return cached;
         }
     }
@@ -7528,23 +7589,18 @@ fn cached_appearance_selection_stipple(
         Vec::new()
     };
     let texture_rect = appearance_selection_texture_rect(sample_rect);
-    let image = appearance_selection_stipple_image(texture_rect, &points);
+    let body_contours =
+        appearance_selection_body_contours(vector, appearance, subset_path_indices, view);
+    let image = appearance_selection_stipple_image(texture_rect, &points, &body_contours, accent);
     let texture = painter.ctx().load_texture(
         format!("q0editor-appearance-selection-{}-{key}", vector.asset_id),
         image,
         TextureOptions::NEAREST,
     );
-    let body_contours = std::sync::Arc::new(appearance_selection_body_contours(
-        vector,
-        appearance,
-        subset_path_indices,
-        view,
-    ));
     let cached = CachedAppearanceSelectionStipple {
         key,
         texture,
         texture_rect,
-        body_contours,
         #[cfg(test)]
         point_count: points.len(),
     };
@@ -7608,13 +7664,15 @@ fn draw_appearance_selection_overlay(
         painter,
         view,
         sample_rect,
-        vector,
-        appearance,
-        appearance_fingerprint,
-        subset_path_indices,
+        AppearanceSelectionStippleRequest {
+            vector,
+            appearance,
+            appearance_fingerprint,
+            subset_path_indices,
+            accent,
+        },
     );
     paint_cached_appearance_selection_stipple(&clipped, &cached);
-    draw_dense_selection_contour(&clipped, cached.body_contours.as_ref(), accent);
 }
 
 fn draw_raw_area_selection(
@@ -9867,30 +9925,33 @@ mod tests {
             stage_rect: egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(100.0, 100.0)),
         };
         let rect = egui::Rect::from_min_max(Pos2::new(-10.0, -10.0), Pos2::new(30.0, 30.0));
+        let accent = Color32::from_rgb(220, 40, 60);
         APPEARANCE_SELECTION_STIPPLE_BUILD_COUNT.store(0, Ordering::SeqCst);
         let first = cached_appearance_selection_stipple(
             &painter,
             &view,
             rect,
-            vector,
-            appearance,
-            fingerprint,
-            None,
+            AppearanceSelectionStippleRequest {
+                vector,
+                appearance,
+                appearance_fingerprint: fingerprint,
+                subset_path_indices: None,
+                accent,
+            },
         );
         let second = cached_appearance_selection_stipple(
             &painter,
             &view,
             rect,
-            vector,
-            appearance,
-            fingerprint,
-            None,
+            AppearanceSelectionStippleRequest {
+                vector,
+                appearance,
+                appearance_fingerprint: fingerprint,
+                subset_path_indices: None,
+                accent,
+            },
         );
         assert_eq!(first.texture.id(), second.texture.id());
-        assert!(std::sync::Arc::ptr_eq(
-            &first.body_contours,
-            &second.body_contours
-        ));
         assert!(
             first.point_count > 20,
             "test must exercise many stipple dots"
@@ -9898,11 +9959,122 @@ mod tests {
         let mesh = cached_appearance_selection_stipple_mesh(&second);
         assert_eq!(mesh.vertices.len(), 4, "stipple must stay one GPU quad");
         assert_eq!(mesh.indices.len(), 6, "stipple must stay two triangles");
+
+        let mut moved_appearance = appearance.clone();
+        moved_appearance.field_transform.tx += 17.25;
+        moved_appearance.field_transform.ty += 9.5;
+        let moved_rect = rect.translate(egui::vec2(17.25, 9.5));
+        let moved = cached_appearance_selection_stipple(
+            &painter,
+            &view,
+            moved_rect,
+            AppearanceSelectionStippleRequest {
+                vector,
+                appearance: &moved_appearance,
+                appearance_fingerprint: fingerprint,
+                subset_path_indices: None,
+                accent,
+            },
+        );
+        assert_eq!(
+            first.texture.id(),
+            moved.texture.id(),
+            "pure translation must move the cached quad instead of rebuilding/uploading the glow overlay",
+        );
+        assert_ne!(first.texture_rect.min, moved.texture_rect.min);
         assert_eq!(
             APPEARANCE_SELECTION_STIPPLE_BUILD_COUNT.load(Ordering::SeqCst),
             1,
-            "unchanged selected glow rebuilt its expensive stipple mask every frame",
+            "moving selected glow rebuilt its expensive stipple mask every drag frame",
         );
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn cloning_glow_drag_state_reuses_shared_snapshots() {
+        let project = appearance_selection_project(false);
+        let vector = match &project.assets[0] {
+            Asset::Vector(vector) => vector,
+            Asset::Bitmap(_) | Asset::Q0v(_) => unreachable!(),
+        };
+        let paths = std::sync::Arc::new(vector.paths.clone());
+        let appearances = std::sync::Arc::new(vec![(
+            1,
+            project
+                .asset_appearances
+                .get(&1)
+                .expect("appearance")
+                .clone(),
+        )]);
+        let state = ToolState::DraggingPaths {
+            refs: vec![PathRef {
+                q0rg_id: 1,
+                layer_id: 1,
+                placement_idx: 0,
+                path_idx: 0,
+            }],
+            start_cursor: Vec2::new(0.0, 0.0),
+            start_paths: paths.clone(),
+            start_appearances: appearances.clone(),
+            start_pivot: None,
+        };
+        let cloned = state.clone();
+        let ToolState::DraggingPaths {
+            start_paths: cloned_paths,
+            start_appearances: cloned_appearances,
+            ..
+        } = cloned
+        else {
+            unreachable!();
+        };
+        assert!(std::sync::Arc::ptr_eq(&paths, &cloned_paths));
+        assert!(std::sync::Arc::ptr_eq(&appearances, &cloned_appearances));
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn glow_drag_updates_only_field_transform_without_cloning_material_source() {
+        let mut project = appearance_selection_project(false);
+        let dense_path = VPath {
+            anchors: (0..2048)
+                .map(|index| anchor(Vec2::new(index as f32 * 0.25, (index % 17) as f32)))
+                .collect(),
+            closed: true,
+        };
+        {
+            let appearance = project.asset_appearances.get_mut(&1).expect("appearance");
+            appearance.material_source = vec![dense_path];
+        }
+        let start = vec![(
+            1,
+            project
+                .asset_appearances
+                .get(&1)
+                .expect("appearance")
+                .clone(),
+        )];
+        let before_paths_ptr = project.asset_appearances[&1].material_source.as_ptr();
+        let before_anchors_ptr = project.asset_appearances[&1].material_source[0]
+            .anchors
+            .as_ptr();
+
+        assert!(transform_captured_appearances(
+            &mut project,
+            &start,
+            Affine {
+                tx: 37.0,
+                ty: -12.0,
+                ..Affine::IDENTITY
+            },
+        ));
+        let moved = project.asset_appearances.get(&1).expect("moved appearance");
+        assert_eq!(moved.material_source.as_ptr(), before_paths_ptr);
+        assert_eq!(
+            moved.material_source[0].anchors.as_ptr(),
+            before_anchors_ptr
+        );
+        assert_eq!(moved.field_transform.tx, 37.0);
+        assert_eq!(moved.field_transform.ty, -12.0);
     }
 
     #[cfg(feature = "appearance-mask-eraser")]
