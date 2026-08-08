@@ -951,19 +951,96 @@ fn scanline_fill(polygon: &[Vec2], color: Rgba, buffer: &mut [u8], w: u32, h: u3
 }
 
 fn scanline_fill_multi(polygons: &[Vec<Vec2>], color: Rgba, buffer: &mut [u8], w: u32, h: u32) {
+    if polygons.is_empty() || color.a == 0 || h == 0 {
+        return;
+    }
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for polygon in polygons {
+        for point in polygon {
+            min_y = min_y.min(point.y);
+            max_y = max_y.max(point.y);
+        }
+    }
+    if !min_y.is_finite() {
+        return;
+    }
+    let y_start = (min_y.floor() as i32).max(0);
+    let y_end = (max_y.ceil() as i32).min(h as i32 - 1);
+    if y_start > y_end {
+        return;
+    }
+
+    // The previous rasterizer scanned every polygon edge for every output row.
+    // Bucket the exact same half-open winding crossings by scanline once so a
+    // dense brush contour pays for edges only on rows those edges can cross.
+    let row_count = (y_end - y_start + 1) as usize;
+    let mut crossings_by_row: Vec<Vec<(f32, i32)>> = vec![Vec::new(); row_count];
+    for polygon in polygons {
+        if polygon.len() < 3 {
+            continue;
+        }
+        for index in 0..polygon.len() {
+            let a = polygon[index];
+            let b = polygon[(index + 1) % polygon.len()];
+            let denom = b.y - a.y;
+            if denom.abs() < 1e-6 {
+                continue;
+            }
+            let low_y = a.y.min(b.y);
+            let high_y = a.y.max(b.y);
+            let edge_start = ((low_y - 0.5).ceil() as i32).max(y_start);
+            let edge_end = (((high_y - 0.5).ceil() as i32) - 1).min(y_end);
+            if edge_start > edge_end {
+                continue;
+            }
+            let sign = if b.y > a.y { 1 } else { -1 };
+            for yi in edge_start..=edge_end {
+                let y = yi as f32 + 0.5;
+                let t = (y - a.y) / denom;
+                let x = a.x + t * (b.x - a.x);
+                crossings_by_row[(yi - y_start) as usize].push((x, sign));
+            }
+        }
+    }
+
+    for (row_index, crossings) in crossings_by_row.iter_mut().enumerate() {
+        if crossings.is_empty() {
+            continue;
+        }
+        crossings.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let yi = y_start + row_index as i32;
+        let mut winding = 0i32;
+        let mut last_x: Option<f32> = None;
+        for (x, sign) in crossings.iter() {
+            if winding != 0 {
+                if let Some(left_x) = last_x {
+                    paint_span(buffer, w, yi, left_x, *x, color);
+                }
+            }
+            winding += sign;
+            last_x = Some(*x);
+        }
+    }
+}
+
+#[cfg(test)]
+fn scanline_fill_multi_reference(
+    polygons: &[Vec<Vec2>],
+    color: Rgba,
+    buffer: &mut [u8],
+    w: u32,
+    h: u32,
+) {
     if polygons.is_empty() || color.a == 0 {
         return;
     }
     let mut min_y = f32::INFINITY;
     let mut max_y = f32::NEG_INFINITY;
     for polygon in polygons {
-        for p in polygon {
-            if p.y < min_y {
-                min_y = p.y;
-            }
-            if p.y > max_y {
-                max_y = p.y;
-            }
+        for point in polygon {
+            min_y = min_y.min(point.y);
+            max_y = max_y.max(point.y);
         }
     }
     if !min_y.is_finite() {
@@ -982,9 +1059,9 @@ fn scanline_fill_multi(polygons: &[Vec<Vec2>], color: Rgba, buffer: &mut [u8], w
             if polygon.len() < 3 {
                 continue;
             }
-            for i in 0..polygon.len() {
-                let a = polygon[i];
-                let b = polygon[(i + 1) % polygon.len()];
+            for index in 0..polygon.len() {
+                let a = polygon[index];
+                let b = polygon[(index + 1) % polygon.len()];
                 let cross = (a.y <= y && b.y > y) || (b.y <= y && a.y > y);
                 if !cross {
                     continue;
@@ -1004,8 +1081,8 @@ fn scanline_fill_multi(polygons: &[Vec<Vec2>], color: Rgba, buffer: &mut [u8], w
         let mut last_x: Option<f32> = None;
         for (x, sign) in &crossings {
             if winding != 0 {
-                if let Some(lx) = last_x {
-                    paint_span(buffer, w, yi, lx, *x, color);
+                if let Some(left_x) = last_x {
+                    paint_span(buffer, w, yi, left_x, *x, color);
                 }
             }
             winding += sign;
@@ -1013,7 +1090,6 @@ fn scanline_fill_multi(polygons: &[Vec<Vec2>], color: Rgba, buffer: &mut [u8], w
         }
     }
 }
-
 fn paint_span(buffer: &mut [u8], w: u32, yi: i32, x0: f32, x1: f32, color: Rgba) {
     if yi < 0 {
         return;
@@ -1194,6 +1270,41 @@ mod resolver_tests {
         }
     }
 
+    #[test]
+    fn bucketed_scanline_fill_matches_reference_pixels() {
+        let outer = vec![
+            Vec2::new(-4.2, 2.0),
+            Vec2::new(25.7, 1.5),
+            Vec2::new(29.2, 13.2),
+            Vec2::new(17.1, 27.9),
+            Vec2::new(3.2, 22.4),
+        ];
+        let mut hole = vec![
+            Vec2::new(8.0, 7.0),
+            Vec2::new(18.0, 8.0),
+            Vec2::new(17.0, 17.0),
+            Vec2::new(7.0, 16.0),
+        ];
+        hole.reverse();
+        let island = vec![
+            Vec2::new(10.0, 10.0),
+            Vec2::new(14.0, 10.0),
+            Vec2::new(14.0, 14.0),
+            Vec2::new(10.0, 14.0),
+        ];
+        let polygons = vec![outer, hole, island];
+        let color = Rgba {
+            r: 17,
+            g: 91,
+            b: 203,
+            a: 173,
+        };
+        let mut expected = vec![0u8; 32 * 32 * 4];
+        let mut actual = expected.clone();
+        scanline_fill_multi_reference(&polygons, color, &mut expected, 32, 32);
+        scanline_fill_multi(&polygons, color, &mut actual, 32, 32);
+        assert_eq!(actual, expected);
+    }
     fn appearance_pixel(tile: &RasterizedVectorAppearance, local: Vec2) -> [u8; 4] {
         let x = ((local.x - tile.local_min.x) * tile.pixels_per_unit)
             .floor()

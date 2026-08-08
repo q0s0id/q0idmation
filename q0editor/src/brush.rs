@@ -1349,6 +1349,21 @@ fn raw_fill_style(project: &ProjectV2, candidate: &RawFillCandidate) -> RawFillS
     }
 }
 
+fn raw_regions_intersect(left: &MultiPolygon<f64>, right: &MultiPolygon<f64>) -> bool {
+    let (Some(left_bounds), Some(right_bounds)) = (left.bounding_rect(), right.bounding_rect())
+    else {
+        return false;
+    };
+    if left_bounds.max().x < right_bounds.min().x
+        || right_bounds.max().x < left_bounds.min().x
+        || left_bounds.max().y < right_bounds.min().y
+        || right_bounds.max().y < left_bounds.min().y
+    {
+        return false;
+    }
+    left.intersects(right)
+}
+
 pub fn commit_brush_region(
     app: &mut EditorApp,
     region: MultiPolygon<f64>,
@@ -1375,7 +1390,8 @@ pub fn commit_brush_region_with_material(
     let q0rg_id = app.session.current_q0rg_id;
     let layer_id = app.session.current_layer_id;
     let frame = app.session.current_frame;
-    let candidates = collect_raw_fill_candidates(&app.state.project, q0rg_id, layer_id, frame);
+    let candidates =
+        collect_raw_fill_candidates(&app.state.project, q0rg_id, layer_id, frame, false);
     #[cfg(feature = "appearance-mask-eraser")]
     let freshly_painted = region.clone();
     let requested_style = RawFillStyle {
@@ -1389,37 +1405,25 @@ pub fn commit_brush_region_with_material(
     // toggling Glow would silently restyle older artwork.
     let mut painted = region;
     let mut same_style_assets = BTreeSet::new();
-    if requested_material.is_some() {
-        // Filtered Advanced paint must not collapse every disconnected stroke of
-        // the same style into one giant raster field. Disconnected components
-        // are visually identical when kept separate and can then cache/rasterize
-        // independently. Only geometry connected to the fresh stroke (including
-        // transitive touching components) participates in merge drawing.
-        loop {
-            let mut changed = false;
-            for candidate in &candidates {
-                if raw_fill_style(&app.state.project, candidate) == requested_style
-                    && !same_style_assets.contains(&candidate.asset_id)
-                    && candidate.geometry.intersects(&painted)
-                {
-                    same_style_assets.insert(candidate.asset_id);
-                    painted = painted.union(&candidate.geometry);
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-    } else {
-        // Preserve classic Flash-style planar merge drawing. Raw vector fills are
-        // cheap and have no filtered field whose raster cost grows with distance.
+    // Merge drawing is local topology, not a reason to rewrite every same-colour
+    // fill in the frame. Keep disconnected raw components as independent assets;
+    // only the connected component reached by this fresh stroke is absorbed.
+    // This preserves Flash-style boundary merging while making commit cost depend
+    // on nearby geometry instead of the total amount of artwork already drawn.
+    loop {
+        let mut changed = false;
         for candidate in &candidates {
             if raw_fill_style(&app.state.project, candidate) == requested_style
-                && same_style_assets.insert(candidate.asset_id)
+                && !same_style_assets.contains(&candidate.asset_id)
+                && raw_regions_intersect(&candidate.geometry, &painted)
             {
+                same_style_assets.insert(candidate.asset_id);
                 painted = painted.union(&candidate.geometry);
+                changed = true;
             }
+        }
+        if !changed {
+            break;
         }
     }
     let painted_paths = coverage_to_paths(&painted);
@@ -1440,6 +1444,7 @@ pub fn commit_brush_region_with_material(
     let mut seen_different = BTreeSet::new();
     for candidate in &candidates {
         if raw_fill_style(&app.state.project, candidate) != requested_style
+            && raw_regions_intersect(&candidate.geometry, &painted)
             && seen_different.insert(candidate.asset_id)
         {
             different_updates.push((candidate.asset_id, candidate.geometry.difference(&painted)));
@@ -1540,7 +1545,7 @@ pub(crate) fn merge_touching_raw_fills_after_edit(
     layer_id: u16,
     frame: u16,
 ) -> bool {
-    let candidates = collect_raw_fill_candidates(project, q0rg_id, layer_id, frame);
+    let candidates = collect_raw_fill_candidates(project, q0rg_id, layer_id, frame, true);
     let mut groups: Vec<(RawFillStyle, Vec<RawFillCandidate>)> = Vec::new();
     for candidate in candidates {
         let style = raw_fill_style(project, &candidate);
@@ -1699,7 +1704,8 @@ fn erase_brush_region_impl(
     let q0rg_id = app.session.current_q0rg_id;
     let layer_id = app.session.current_layer_id;
     let frame = app.session.current_frame;
-    let candidates = collect_raw_fill_candidates(&app.state.project, q0rg_id, layer_id, frame);
+    let candidates =
+        collect_raw_fill_candidates(&app.state.project, q0rg_id, layer_id, frame, false);
 
     let mut updates = Vec::new();
     let mut seen_assets = BTreeSet::new();
@@ -1787,6 +1793,7 @@ fn collect_raw_fill_candidates(
     q0rg_id: u16,
     layer_id: u16,
     frame: u16,
+    include_source_surfaces: bool,
 ) -> Vec<RawFillCandidate> {
     let Some(layer) = project
         .q0rgs
@@ -1797,6 +1804,11 @@ fn collect_raw_fill_candidates(
         return Vec::new();
     };
 
+    let assets_by_id: HashMap<u16, &Asset> = project
+        .assets
+        .iter()
+        .map(|asset| (asset.id(), asset))
+        .collect();
     crate::render::active_placements_at(layer, frame)
         .into_iter()
         .filter_map(|(placement_idx, _)| {
@@ -1809,9 +1821,7 @@ fn collect_raw_fill_candidates(
             let Target::Asset(asset_id) = placement.target else {
                 return None;
             };
-            let Some(Asset::Vector(vector)) =
-                project.assets.iter().find(|asset| asset.id() == asset_id)
-            else {
+            let Some(Asset::Vector(vector)) = assets_by_id.get(&asset_id).copied() else {
                 return None;
             };
             let color = vector.fill?;
@@ -1819,21 +1829,25 @@ fn collect_raw_fill_candidates(
                 return None;
             }
             let geometry = vector_fill_geometry(vector);
-            let source_surfaces = vector
-                .paths
-                .iter()
-                .filter(|path| path.closed)
-                .filter_map(|path| {
-                    let single = VectorAsset {
-                        asset_id: 0,
-                        paths: vec![path.clone()],
-                        fill: Some(color),
-                        stroke: None,
-                    };
-                    let surface = vector_fill_geometry(&single);
-                    (!surface.0.is_empty()).then_some(surface)
-                })
-                .collect();
+            let source_surfaces = if include_source_surfaces {
+                vector
+                    .paths
+                    .iter()
+                    .filter(|path| path.closed)
+                    .filter_map(|path| {
+                        let single = VectorAsset {
+                            asset_id: 0,
+                            paths: vec![path.clone()],
+                            fill: Some(color),
+                            stroke: None,
+                        };
+                        let surface = vector_fill_geometry(&single);
+                        (!surface.0.is_empty()).then_some(surface)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             (!geometry.0.is_empty()).then_some(RawFillCandidate {
                 asset_id,
                 color,
@@ -2892,7 +2906,7 @@ mod tests {
             "three medium commits took {:?}",
             started.elapsed()
         );
-        assert_eq!(app.state.project.q0rgs[0].layers[0].placements.len(), 1);
+        assert_eq!(app.state.project.q0rgs[0].layers[0].placements.len(), 3);
     }
 
     #[test]
@@ -3488,6 +3502,144 @@ mod tests {
     }
 
     #[test]
+    fn brush_candidate_collection_skips_edit_only_source_surfaces() {
+        let mut app = EditorApp::default();
+        let paint = settings(16.0, 40);
+        let gesture = stroke(
+            &[
+                Vec2::new(10.0, 20.0),
+                Vec2::new(50.0, 24.0),
+                Vec2::new(90.0, 20.0),
+            ],
+            paint,
+        );
+        commit_brush_region(&mut app, brush_finish(gesture, paint), paint);
+
+        let cheap = collect_raw_fill_candidates(
+            &app.state.project,
+            app.session.current_q0rg_id,
+            app.session.current_layer_id,
+            app.session.current_frame,
+            false,
+        );
+        assert!(!cheap.is_empty());
+        assert!(cheap
+            .iter()
+            .all(|candidate| candidate.source_surfaces.is_empty()));
+
+        let edit = collect_raw_fill_candidates(
+            &app.state.project,
+            app.session.current_q0rg_id,
+            app.session.current_layer_id,
+            app.session.current_frame,
+            true,
+        );
+        assert!(
+            edit.iter()
+                .any(|candidate| !candidate.source_surfaces.is_empty()),
+            "post-transform merge still needs individual source surfaces",
+        );
+    }
+
+    #[test]
+    fn distant_different_colour_commit_does_not_rebuild_old_vector() {
+        let mut app = EditorApp::default();
+        let mut red = settings(18.0, 50);
+        red.color = Rgba {
+            r: 220,
+            g: 30,
+            b: 30,
+            a: 255,
+        };
+        let mut blue = red;
+        blue.color = Rgba {
+            r: 30,
+            g: 60,
+            b: 220,
+            a: 255,
+        };
+
+        let first = stroke(&[Vec2::new(10.0, 20.0), Vec2::new(90.0, 28.0)], red);
+        commit_brush_region(&mut app, brush_finish(first, red), red);
+        let before = app
+            .state
+            .project
+            .assets
+            .iter()
+            .find_map(|asset| match asset {
+                Asset::Vector(vector) if vector.fill == Some(red.color) => Some(vector.clone()),
+                _ => None,
+            })
+            .expect("red vector");
+
+        let distant = stroke(
+            &[Vec2::new(2_000.0, 2_000.0), Vec2::new(2_080.0, 2_008.0)],
+            blue,
+        );
+        commit_brush_region(&mut app, brush_finish(distant, blue), blue);
+        let after = app
+            .state
+            .project
+            .assets
+            .iter()
+            .find_map(|asset| match asset {
+                Asset::Vector(vector) if vector.asset_id == before.asset_id => Some(vector),
+                _ => None,
+            })
+            .expect("distant paint must keep old red asset");
+        assert_eq!(
+            after, &before,
+            "distant paint rebuilt unrelated vector geometry"
+        );
+    }
+
+    #[test]
+    fn distant_same_colour_commit_keeps_old_raw_asset_untouched() {
+        let mut app = EditorApp::default();
+        let paint = settings(18.0, 50);
+        let first = stroke(&[Vec2::new(10.0, 20.0), Vec2::new(90.0, 28.0)], paint);
+        commit_brush_region(&mut app, brush_finish(first, paint), paint);
+        let before = app
+            .state
+            .project
+            .assets
+            .iter()
+            .find_map(|asset| match asset {
+                Asset::Vector(vector) if vector.fill == Some(paint.color) => Some(vector.clone()),
+                _ => None,
+            })
+            .expect("first raw vector");
+
+        let distant = stroke(
+            &[Vec2::new(2_000.0, 2_000.0), Vec2::new(2_080.0, 2_008.0)],
+            paint,
+        );
+        commit_brush_region(&mut app, brush_finish(distant, paint), paint);
+
+        let after = app
+            .state
+            .project
+            .assets
+            .iter()
+            .find_map(|asset| match asset {
+                Asset::Vector(vector) if vector.asset_id == before.asset_id => Some(vector),
+                _ => None,
+            })
+            .expect("distant same-colour paint must preserve the old raw asset");
+        assert_eq!(after, &before);
+        assert_eq!(
+            app.state
+                .project
+                .assets
+                .iter()
+                .filter(|asset| matches!(asset, Asset::Vector(_)))
+                .count(),
+            2,
+            "disconnected same-colour components must not collapse into one growing asset",
+        );
+    }
+
+    #[test]
     fn disconnected_same_colour_brush_strokes_survive_later_commits() {
         let mut app = EditorApp::default();
         let paint = settings(18.0, 50);
@@ -3507,20 +3659,22 @@ mod tests {
             );
             commit_brush_region(&mut app, brush_finish(gesture, paint), paint);
 
-            let vector = app
+            let vectors: Vec<&VectorAsset> = app
                 .state
                 .project
                 .assets
                 .iter()
-                .find_map(|asset| match asset {
+                .filter_map(|asset| match asset {
                     Asset::Vector(vector) if vector.fill == Some(paint.color) => Some(vector),
                     _ => None,
                 })
-                .expect("merged brush vector");
-            let geometry = vector_fill_geometry(vector);
+                .collect();
             for expected in &centers[..=index] {
                 assert!(
-                    geometry.contains(&Point::new(expected.x as f64, expected.y as f64)),
+                    vectors.iter().any(|vector| {
+                        vector_fill_geometry(vector)
+                            .contains(&Point::new(expected.x as f64, expected.y as f64))
+                    }),
                     "stroke at {expected:?} vanished after commit {}",
                     index + 1
                 );
@@ -3557,24 +3711,28 @@ mod tests {
                 paint,
             );
             commit_brush_region(&mut app, brush_finish(gesture, paint), paint);
-            let vector = app
+            let vectors: Vec<&VectorAsset> = app
                 .state
                 .project
                 .assets
                 .iter()
-                .find_map(|asset| match asset {
+                .filter_map(|asset| match asset {
                     Asset::Vector(vector) if vector.fill == Some(paint.color) => Some(vector),
                     _ => None,
                 })
-                .expect("ring plus inner strokes");
-            let geometry = vector_fill_geometry(vector);
+                .collect();
             assert!(
-                !geometry.contains(&Point::new(100.0, 60.0)),
+                !vectors.iter().any(|vector| {
+                    vector_fill_geometry(vector).contains(&Point::new(100.0, 60.0))
+                }),
                 "untouched part of the ring hole must remain empty"
             );
             for expected in &centers[..=index] {
                 assert!(
-                    geometry.contains(&Point::new(expected.x as f64, expected.y as f64)),
+                    vectors.iter().any(|vector| {
+                        vector_fill_geometry(vector)
+                            .contains(&Point::new(expected.x as f64, expected.y as f64))
+                    }),
                     "inner stroke at {expected:?} vanished after commit {}",
                     index + 1
                 );

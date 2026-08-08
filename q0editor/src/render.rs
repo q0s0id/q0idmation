@@ -1,6 +1,11 @@
 use std::collections::HashMap;
 #[cfg(feature = "appearance-mask-eraser")]
 use std::hash::{Hash, Hasher};
+#[cfg(feature = "appearance-mask-eraser")]
+use std::sync::{
+    mpsc::{self, Receiver, Sender, TryRecvError},
+    Arc, Mutex, OnceLock,
+};
 
 use egui::epaint::{PathShape, Vertex};
 use egui::{
@@ -18,8 +23,8 @@ use lyon_tessellation::{
 };
 use q0s_format::transform::Affine;
 use q0s_format::v2::{
-    Anchor, Asset, Path as VPath, Placement, ProjectV2, Rgba, Target, Transform2D, Tween, Vec2,
-    VectorAppearance,
+    Anchor, Asset, Path as VPath, Placement, ProjectV2, Q0rg, Rgba, Target, Transform2D, Tween,
+    Vec2, VectorAppearance, VectorAsset,
 };
 
 const Q0RG_RECURSION_LIMIT: u8 = 8;
@@ -72,6 +77,47 @@ struct CachedAppearanceTexture {
     width: u32,
     height: u32,
     pixels_per_unit: f32,
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+type AppearanceRasterResult = Option<q0s_format::raster::RasterizedVectorAppearance>;
+
+#[cfg(feature = "appearance-mask-eraser")]
+struct AppearanceRasterRequest {
+    vector: VectorAsset,
+    appearance: VectorAppearance,
+    pixels_per_unit: f32,
+    reply: Sender<AppearanceRasterResult>,
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn appearance_raster_worker() -> &'static Sender<AppearanceRasterRequest> {
+    static WORKER: OnceLock<Sender<AppearanceRasterRequest>> = OnceLock::new();
+    WORKER.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel::<AppearanceRasterRequest>();
+        let receiver = Arc::new(Mutex::new(receiver));
+        for _ in 0..2 {
+            let receiver = Arc::clone(&receiver);
+            std::thread::spawn(move || loop {
+                let request = {
+                    let Ok(receiver) = receiver.lock() else {
+                        return;
+                    };
+                    receiver.recv()
+                };
+                let Ok(request) = request else {
+                    return;
+                };
+                let tile = q0s_format::raster::rasterize_vector_halo_local(
+                    &request.vector,
+                    &request.appearance,
+                    request.pixels_per_unit,
+                );
+                let _ = request.reply.send(tile);
+            });
+        }
+        sender
+    })
 }
 
 #[cfg(feature = "appearance-mask-eraser")]
@@ -233,9 +279,39 @@ fn polygon_boundary_near_point(polygon: &Polygon<f64>, point: Vec2, radius: f32)
     ring_near(polygon.exterior()) || polygon.interiors().iter().any(ring_near)
 }
 
+#[derive(Clone, Default)]
+struct CachedVectorRenderGeometry {
+    fill_vertices: Vec<Vec2>,
+    fill_indices: Vec<u32>,
+    stroke_paths: Vec<(Vec<Vec2>, bool)>,
+}
+
+struct RenderLookup<'a> {
+    assets: HashMap<u16, &'a Asset>,
+    q0rgs: HashMap<u16, &'a Q0rg>,
+}
+
+impl<'a> RenderLookup<'a> {
+    fn new(project: &'a ProjectV2) -> Self {
+        Self {
+            assets: project
+                .assets
+                .iter()
+                .map(|asset| (asset.id(), asset))
+                .collect(),
+            q0rgs: project
+                .q0rgs
+                .iter()
+                .map(|q0rg| (q0rg.q0rg_id, q0rg))
+                .collect(),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct TextureCache {
     by_asset_id: HashMap<u16, TextureHandle>,
+    vector_render_by_asset: HashMap<u16, CachedVectorRenderGeometry>,
     by_q0v_frame: HashMap<(u16, u32), TextureHandle>,
     q0v_media: HashMap<u16, q0video::q0v::Q0vFile>,
     classic_brush_preview: Option<ClassicBrushPreviewTexture>,
@@ -246,9 +322,13 @@ pub struct TextureCache {
     #[cfg(feature = "appearance-mask-eraser")]
     appearance_by_asset: HashMap<(u16, u16, u64), CachedAppearanceTexture>,
     #[cfg(feature = "appearance-mask-eraser")]
+    appearance_raster_jobs: HashMap<(u16, u16, u64), Receiver<AppearanceRasterResult>>,
+    #[cfg(feature = "appearance-mask-eraser")]
     appearance_signature_by_asset: HashMap<u16, (u64, Vec2)>,
     #[cfg(feature = "appearance-mask-eraser")]
     visible_body_by_asset: HashMap<u16, Vec<Vec<Vec2>>>,
+    #[cfg(feature = "appearance-mask-eraser")]
+    visible_body_mesh_by_asset: HashMap<u16, CachedVectorRenderGeometry>,
     #[cfg(feature = "appearance-mask-eraser")]
     visible_selection_body_by_asset: HashMap<u16, Vec<Vec<Vec2>>>,
     #[cfg(feature = "appearance-mask-eraser")]
@@ -277,6 +357,8 @@ pub struct TextureCache {
     selection_stage_mesh_build_count: usize,
     #[cfg(all(test, feature = "appearance-mask-eraser"))]
     selection_paint_build_count: usize,
+    #[cfg(test)]
+    vector_render_geometry_build_count: usize,
 }
 
 impl TextureCache {
@@ -416,6 +498,7 @@ impl TextureCache {
 
     pub fn invalidate(&mut self) {
         self.by_asset_id.clear();
+        self.vector_render_by_asset.clear();
         self.by_q0v_frame.clear();
         self.q0v_media.clear();
         self.classic_brush_preview = None;
@@ -427,8 +510,10 @@ impl TextureCache {
         #[cfg(feature = "appearance-mask-eraser")]
         {
             self.appearance_by_asset.clear();
+            self.appearance_raster_jobs.clear();
             self.appearance_signature_by_asset.clear();
             self.visible_body_by_asset.clear();
+            self.visible_body_mesh_by_asset.clear();
             self.visible_selection_body_by_asset.clear();
             self.appearance_hit_by_asset.clear();
             self.raw_selection_components_by_key.clear();
@@ -443,17 +528,20 @@ impl TextureCache {
     /// Brush commits used to clear every halo/body texture in the project, so the
     /// Nth Advanced stroke forced all previous strokes through raster/boolean work
     /// again. Unrelated assets are immutable and can safely keep their caches.
-    #[cfg(feature = "appearance-mask-eraser")]
     pub(crate) fn invalidate_asset(&mut self, asset_id: u16) {
         self.by_asset_id.remove(&asset_id);
+        self.vector_render_by_asset.remove(&asset_id);
         self.by_q0v_frame.retain(|(id, _), _| *id != asset_id);
         self.q0v_media.remove(&asset_id);
         #[cfg(feature = "appearance-mask-eraser")]
         {
             self.appearance_by_asset
                 .retain(|(id, _, _), _| *id != asset_id);
+            self.appearance_raster_jobs
+                .retain(|(id, _, _), _| *id != asset_id);
             self.appearance_signature_by_asset.remove(&asset_id);
             self.visible_body_by_asset.remove(&asset_id);
+            self.visible_body_mesh_by_asset.remove(&asset_id);
             self.visible_selection_body_by_asset.remove(&asset_id);
             self.appearance_hit_by_asset.remove(&asset_id);
             self.raw_selection_components_by_key
@@ -469,11 +557,31 @@ impl TextureCache {
         }
     }
 
-    #[cfg(feature = "appearance-mask-eraser")]
     pub(crate) fn invalidate_assets(&mut self, asset_ids: impl IntoIterator<Item = u16>) {
         for asset_id in asset_ids {
             self.invalidate_asset(asset_id);
         }
+    }
+
+    fn vector_render_geometry(&mut self, vector: &VectorAsset) -> &CachedVectorRenderGeometry {
+        let asset_id = vector.asset_id;
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            self.vector_render_by_asset.entry(asset_id)
+        {
+            entry.insert(build_cached_vector_render_geometry(vector));
+            #[cfg(test)]
+            {
+                self.vector_render_geometry_build_count += 1;
+            }
+        }
+        self.vector_render_by_asset
+            .get(&asset_id)
+            .expect("vector render geometry inserted above")
+    }
+
+    #[cfg(test)]
+    fn vector_render_geometry_build_count(&self) -> usize {
+        self.vector_render_geometry_build_count
     }
 
     #[cfg(feature = "appearance-mask-eraser")]
@@ -845,6 +953,97 @@ impl TextureCache {
     }
 }
 
+fn build_cached_fill_geometry(contours: &[Vec<Vec2>]) -> CachedVectorRenderGeometry {
+    let fill_contours: Vec<Vec<Pos2>> = contours
+        .iter()
+        .map(|contour| contour.iter().map(|point| pos2(point.x, point.y)).collect())
+        .collect();
+    let (fill_vertices, fill_indices) = tessellate_complex_fill(&fill_contours)
+        .map(|buffers| {
+            (
+                buffers
+                    .vertices
+                    .into_iter()
+                    .map(|point| Vec2::new(point.x, point.y))
+                    .collect(),
+                buffers.indices,
+            )
+        })
+        .unwrap_or_default();
+    CachedVectorRenderGeometry {
+        fill_vertices,
+        fill_indices,
+        stroke_paths: Vec::new(),
+    }
+}
+
+fn build_cached_vector_render_geometry(vector: &VectorAsset) -> CachedVectorRenderGeometry {
+    let fill_contours: Vec<Vec<Pos2>> = if vector.fill.is_some() {
+        vector
+            .paths
+            .iter()
+            .filter(|path| path.closed)
+            .map(|path| {
+                flatten_path(path)
+                    .into_iter()
+                    .map(|point| pos2(point.x, point.y))
+                    .collect()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let (fill_vertices, fill_indices) = tessellate_complex_fill(&fill_contours)
+        .map(|buffers| {
+            (
+                buffers
+                    .vertices
+                    .into_iter()
+                    .map(|point| Vec2::new(point.x, point.y))
+                    .collect(),
+                buffers.indices,
+            )
+        })
+        .unwrap_or_default();
+    let stroke_paths = if vector.stroke.is_some() {
+        vector
+            .paths
+            .iter()
+            .map(|path| (flatten_path_for_stroke(path), path.closed))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    CachedVectorRenderGeometry {
+        fill_vertices,
+        fill_indices,
+        stroke_paths,
+    }
+}
+
+fn paint_cached_vector_fill(
+    painter: &Painter,
+    geometry: &CachedVectorRenderGeometry,
+    transform: Affine,
+    view: &StageView,
+    color: Color32,
+) {
+    if geometry.fill_vertices.is_empty() || geometry.fill_indices.is_empty() {
+        return;
+    }
+    let mut mesh = Mesh::default();
+    mesh.vertices.reserve(geometry.fill_vertices.len());
+    for point in &geometry.fill_vertices {
+        mesh.vertices.push(Vertex {
+            pos: stage_to_screen(transform.apply(*point), view),
+            uv: Pos2::ZERO,
+            color,
+        });
+    }
+    mesh.indices = geometry.fill_indices.clone();
+    painter.add(Shape::Mesh(mesh));
+}
+
 pub fn render_stage(
     painter: &Painter,
     project: &ProjectV2,
@@ -881,9 +1080,11 @@ pub fn render_stage_tinted(
     ctx: &Context,
     tint: Color32,
 ) {
+    let lookup = RenderLookup::new(project);
     render_q0rg(
         painter,
         project,
+        &lookup,
         q0rg_id,
         frame,
         Affine::IDENTITY,
@@ -899,6 +1100,7 @@ pub fn render_stage_tinted(
 fn render_q0rg(
     painter: &Painter,
     project: &ProjectV2,
+    lookup: &RenderLookup<'_>,
     q0rg_id: u16,
     frame: u16,
     parent: Affine,
@@ -911,7 +1113,7 @@ fn render_q0rg(
     if depth > Q0RG_RECURSION_LIMIT {
         return;
     }
-    let Some(q0rg) = project.q0rgs.iter().find(|q| q.q0rg_id == q0rg_id) else {
+    let Some(q0rg) = lookup.q0rgs.get(&q0rg_id).copied() else {
         return;
     };
     let local_frame = if q0rg.frame_count > 0 {
@@ -930,7 +1132,7 @@ fn render_q0rg(
             let composed = Affine::compose(parent, Affine::from_transform(interp));
             match placement.target {
                 Target::Asset(asset_id) => {
-                    if let Some(asset) = project.assets.iter().find(|a| a.id() == asset_id) {
+                    if let Some(asset) = lookup.assets.get(&asset_id).copied() {
                         render_asset(
                             painter,
                             asset,
@@ -950,6 +1152,7 @@ fn render_q0rg(
                         render_q0rg(
                             painter,
                             project,
+                            lookup,
                             child_id,
                             local_frame,
                             composed,
@@ -1204,9 +1407,14 @@ fn render_asset(
                 );
                 if let Some(fill) = v.fill {
                     let fill_color = modulate(rgba_to_color32(fill), tint);
-                    let contours =
-                        masked_vector_body_contours(v, appearance, transform, view, textures);
-                    paint_complex_fill(painter, &contours, fill_color);
+                    if appearance.erase_mask.is_empty() && appearance.clip_mask.is_empty() {
+                        let geometry = textures.vector_render_geometry(v);
+                        paint_cached_vector_fill(painter, geometry, transform, view, fill_color);
+                    } else {
+                        paint_masked_vector_body_cached(
+                            painter, v, appearance, transform, view, textures, fill_color,
+                        );
+                    }
                 }
                 // Appearance metadata is validated only for fill-only vectors.
                 // The body above stays real tessellated vector geometry; only
@@ -1224,66 +1432,37 @@ fn render_asset(
                 .fill
                 .map(|color| modulate(rgba_to_color32(color), tint))
                 .unwrap_or(Color32::TRANSPARENT);
+            let geometry = textures.vector_render_geometry(v);
             if fill_color != Color32::TRANSPARENT {
-                let contours: Vec<Vec<Pos2>> = v
-                    .paths
-                    .iter()
-                    .filter(|path| path.closed)
-                    .map(|path| {
-                        flatten_path(path)
-                            .iter()
-                            .map(|point| stage_to_screen(transform.apply(*point), view))
-                            .collect()
-                    })
-                    .collect();
-                paint_complex_fill(painter, &contours, fill_color);
+                paint_cached_vector_fill(painter, geometry, transform, view, fill_color);
             }
-            for path in &v.paths {
-                let polyline_local = flatten_path_for_stroke(path);
-                if polyline_local.len() < 2 {
-                    continue;
-                }
-                let polyline_screen: Vec<Pos2> = polyline_local
-                    .iter()
-                    .map(|p| stage_to_screen(transform.apply(*p), view))
-                    .collect();
-
-                let stroke = match &v.stroke {
-                    Some(s) => Stroke::new(
-                        s.width.max(0.5) * parent_scale * view.scale,
-                        modulate(rgba_to_color32(s.color), tint),
-                    ),
-                    None => Stroke::NONE,
-                };
-                // egui 0.27 only supports fills for *convex* PathShape
-                // polygons. Brush outlines are normally concave; feeding
-                // them directly to PathShape creates the giant diagonal
-                // triangle fans that look like lasso selections. Tessellate
-                // closed fills ourselves, then ask egui only for the outline.
-                if stroke != Stroke::NONE {
+            if let Some(s) = &v.stroke {
+                let stroke = Stroke::new(
+                    s.width.max(0.5) * parent_scale * view.scale,
+                    modulate(rgba_to_color32(s.color), tint),
+                );
+                for (polyline_local, closed) in &geometry.stroke_paths {
+                    if polyline_local.len() < 2 {
+                        continue;
+                    }
+                    let polyline_screen: Vec<Pos2> = polyline_local
+                        .iter()
+                        .map(|point| stage_to_screen(transform.apply(*point), view))
+                        .collect();
                     painter.add(Shape::Path(PathShape {
                         points: polyline_screen.clone(),
-                        closed: path.closed,
+                        closed: *closed,
                         fill: Color32::TRANSPARENT,
                         stroke,
                     }));
-                }
-                // egui draws stroked open paths with butt caps; if the
-                // user picked Round we tack a filled circle on each end
-                // of the centerline so the visual cap matches what
-                // q0player and the exporter will produce.
-                if let Some(s) = &v.stroke {
-                    if !path.closed
-                        && polyline_screen.len() >= 2
-                        && matches!(s.cap, q0s_format::geom::CapShape::Round)
-                    {
-                        let r = s.width.max(0.5) * parent_scale * view.scale * 0.5;
-                        let col = modulate(rgba_to_color32(s.color), tint);
-                        if let Some(p) = polyline_screen.first() {
-                            painter.circle_filled(*p, r, col);
+                    if !*closed && matches!(s.cap, q0s_format::geom::CapShape::Round) {
+                        let radius = s.width.max(0.5) * parent_scale * view.scale * 0.5;
+                        let color = modulate(rgba_to_color32(s.color), tint);
+                        if let Some(point) = polyline_screen.first() {
+                            painter.circle_filled(*point, radius, color);
                         }
-                        if let Some(p) = polyline_screen.last() {
-                            painter.circle_filled(*p, r, col);
+                        if let Some(point) = polyline_screen.last() {
+                            painter.circle_filled(*point, radius, color);
                         }
                     }
                 }
@@ -2153,9 +2332,10 @@ pub fn render_target_preview(
     tint: Color32,
 ) {
     let affine = Affine::from_transform(transform);
+    let lookup = RenderLookup::new(project);
     match target {
         Target::Asset(asset_id) => {
-            if let Some(asset) = project.assets.iter().find(|asset| asset.id() == asset_id) {
+            if let Some(asset) = lookup.assets.get(&asset_id).copied() {
                 render_asset(
                     painter,
                     asset,
@@ -2171,7 +2351,7 @@ pub fn render_target_preview(
             }
         }
         Target::Q0rg(q0rg_id) => render_q0rg(
-            painter, project, q0rg_id, frame, affine, view, textures, ctx, 0, tint,
+            painter, project, &lookup, q0rg_id, frame, affine, view, textures, ctx, 0, tint,
         ),
     }
 }
@@ -2555,6 +2735,33 @@ pub(crate) fn appearance_cache_signature(
 }
 
 #[cfg(feature = "appearance-mask-eraser")]
+fn cache_appearance_raster_tile(
+    textures: &mut TextureCache,
+    ctx: &Context,
+    key: (u16, u16, u64),
+    origin: Vec2,
+    tile: q0s_format::raster::RasterizedVectorAppearance,
+) {
+    let image =
+        ColorImage::from_rgba_unmultiplied([tile.width as usize, tile.height as usize], &tile.rgba);
+    let texture = ctx.load_texture(
+        format!("q0s_appearance_{}_{}_{}", key.0, key.1, key.2),
+        image,
+        TextureOptions::LINEAR,
+    );
+    textures.appearance_by_asset.insert(
+        key,
+        CachedAppearanceTexture {
+            texture,
+            local_min_offset: Vec2::new(tile.local_min.x - origin.x, tile.local_min.y - origin.y),
+            width: tile.width,
+            height: tile.height,
+            pixels_per_unit: tile.pixels_per_unit,
+        },
+    );
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
 #[allow(clippy::too_many_arguments)]
 fn paint_vector_appearance_halo(
     painter: &Painter,
@@ -2588,41 +2795,73 @@ fn paint_vector_appearance_halo(
     if !textures.appearance_by_asset.contains_key(&key) {
         textures
             .appearance_by_asset
-            .retain(|(asset_id, cached_bucket, _), _| {
-                *asset_id != vector.asset_id || *cached_bucket != bucket
+            .retain(|(asset_id, cached_bucket, cached_fingerprint), _| {
+                *asset_id != vector.asset_id
+                    || *cached_bucket != bucket
+                    || *cached_fingerprint == fingerprint
             });
-    }
-    let cached = match textures.appearance_by_asset.entry(key) {
-        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-        std::collections::hash_map::Entry::Vacant(entry) => {
-            let Some(tile) =
-                q0s_format::raster::rasterize_vector_halo_local(vector, appearance, ppu)
-            else {
+        textures.appearance_raster_jobs.retain(
+            |(asset_id, cached_bucket, cached_fingerprint), _| {
+                *asset_id != vector.asset_id
+                    || *cached_bucket != bucket
+                    || *cached_fingerprint == fingerprint
+            },
+        );
+
+        match textures
+            .appearance_raster_jobs
+            .get(&key)
+            .map(Receiver::try_recv)
+        {
+            Some(Ok(tile)) => {
+                textures.appearance_raster_jobs.remove(&key);
+                let Some(tile) = tile else {
+                    return;
+                };
+                cache_appearance_raster_tile(textures, ctx, key, origin, tile);
+            }
+            Some(Err(TryRecvError::Empty)) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(8));
                 return;
-            };
-            let image = ColorImage::from_rgba_unmultiplied(
-                [tile.width as usize, tile.height as usize],
-                &tile.rgba,
-            );
-            let texture = ctx.load_texture(
-                format!(
-                    "q0s_appearance_{}_{}_{}",
-                    vector.asset_id, bucket, fingerprint
-                ),
-                image,
-                TextureOptions::LINEAR,
-            );
-            entry.insert(CachedAppearanceTexture {
-                texture,
-                local_min_offset: Vec2::new(
-                    tile.local_min.x - origin.x,
-                    tile.local_min.y - origin.y,
-                ),
-                width: tile.width,
-                height: tile.height,
-                pixels_per_unit: tile.pixels_per_unit,
-            })
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                textures.appearance_raster_jobs.remove(&key);
+            }
+            None => {}
         }
+
+        if !textures.appearance_by_asset.contains_key(&key)
+            && !textures.appearance_raster_jobs.contains_key(&key)
+        {
+            let (reply, receiver) = mpsc::channel();
+            let request = AppearanceRasterRequest {
+                vector: vector.clone(),
+                appearance: appearance.clone(),
+                pixels_per_unit: ppu,
+                reply,
+            };
+            match appearance_raster_worker().send(request) {
+                Ok(()) => {
+                    textures.appearance_raster_jobs.insert(key, receiver);
+                    ctx.request_repaint_after(std::time::Duration::from_millis(8));
+                    return;
+                }
+                Err(error) => {
+                    let request = error.0;
+                    let Some(tile) = q0s_format::raster::rasterize_vector_halo_local(
+                        &request.vector,
+                        &request.appearance,
+                        request.pixels_per_unit,
+                    ) else {
+                        return;
+                    };
+                    cache_appearance_raster_tile(textures, ctx, key, origin, tile);
+                }
+            }
+        }
+    }
+    let Some(cached) = textures.appearance_by_asset.get(&key) else {
+        return;
     };
     let local_min = Vec2::new(
         origin.x + cached.local_min_offset.x,
@@ -2658,6 +2897,37 @@ fn paint_vector_appearance_halo(
     }
     mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
     painter.add(Shape::Mesh(mesh));
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn paint_masked_vector_body_cached(
+    painter: &Painter,
+    vector: &VectorAsset,
+    appearance: &VectorAppearance,
+    transform: Affine,
+    view: &StageView,
+    textures: &mut TextureCache,
+    color: Color32,
+) {
+    if !textures
+        .visible_body_mesh_by_asset
+        .contains_key(&vector.asset_id)
+    {
+        let fallback_contours =
+            masked_vector_body_contours(vector, appearance, transform, view, textures);
+        let Some(local_contours) = textures.visible_body_by_asset.get(&vector.asset_id) else {
+            paint_complex_fill(painter, &fallback_contours, color);
+            return;
+        };
+        let geometry = build_cached_fill_geometry(local_contours);
+        textures
+            .visible_body_mesh_by_asset
+            .insert(vector.asset_id, geometry);
+    }
+    let body_transform = Affine::compose(transform, appearance.field_transform);
+    if let Some(geometry) = textures.visible_body_mesh_by_asset.get(&vector.asset_id) {
+        paint_cached_vector_fill(painter, geometry, body_transform, view, color);
+    }
 }
 
 #[cfg(feature = "appearance-mask-eraser")]
@@ -2698,7 +2968,7 @@ fn masked_vector_body_contours(
         else {
             let visible =
                 crate::appearance::visible_source_surface_for_vector(vector, Some(appearance));
-            return crate::brush::coverage_to_paths(&visible)
+            return crate::brush::coverage_to_linear_paths(&visible)
                 .iter()
                 .map(|path| {
                     flatten_path(path)
@@ -2708,18 +2978,19 @@ fn masked_vector_body_contours(
                 })
                 .collect();
         };
-        let local_contours: Vec<Vec<Vec2>> = crate::brush::coverage_to_paths(&visible)
+        // `visible` is already the authoritative boolean boundary. Re-fitting it
+        // to Beziers and immediately flattening those Beziers again made first
+        // render cost explode on dense fragmented artwork and could only move the
+        // boundary away from the exact mask result. Cache the linear boundary
+        // directly for both fill tessellation and interaction geometry.
+        let local_contours: Vec<Vec<Vec2>> = crate::brush::coverage_to_linear_paths(&visible)
             .iter()
             .map(flatten_path)
             .collect();
-        let selection_contours: Vec<Vec<Vec2>> = crate::brush::coverage_to_linear_paths(&visible)
-            .iter()
-            .map(flatten_path)
-            .collect();
-        entry.insert(local_contours);
+        entry.insert(local_contours.clone());
         textures
             .visible_selection_body_by_asset
-            .insert(vector.asset_id, selection_contours);
+            .insert(vector.asset_id, local_contours);
         built_body_cache = true;
     }
     #[cfg(all(test, feature = "appearance-mask-eraser"))]
@@ -2752,6 +3023,108 @@ fn rgba_to_color32(c: Rgba) -> Color32 {
 mod tests {
     use super::*;
     use q0s_format::v2::{Anchor, Layer, Path as VPath};
+
+    #[test]
+    fn warm_fill_repaints_reuse_cached_vector_tessellation_across_zoom() {
+        let anchors: Vec<Anchor> = (0..512)
+            .map(|index| {
+                let angle = index as f32 / 512.0 * std::f32::consts::TAU;
+                let wobble = 4.0 * (angle * 13.0).sin();
+                let radius = 80.0 + wobble;
+                Anchor {
+                    point: Vec2::new(120.0 + radius * angle.cos(), 120.0 + radius * angle.sin()),
+                    in_handle: None,
+                    out_handle: None,
+                }
+            })
+            .collect();
+        let asset = Asset::Vector(VectorAsset {
+            asset_id: 91,
+            paths: vec![VPath {
+                anchors,
+                closed: true,
+            }],
+            fill: Some(Rgba {
+                r: 70,
+                g: 80,
+                b: 90,
+                a: 255,
+            }),
+            stroke: None,
+        });
+        let ctx = Context::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let mut cache = TextureCache::default();
+
+        for (index, scale) in [0.25_f32, 0.5, 1.0, 2.0, 4.0].into_iter().enumerate() {
+            let view = StageView {
+                origin: Pos2::new(20.0, 30.0),
+                scale,
+                stage_rect: rect,
+            };
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let painter = ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Middle,
+                        egui::Id::new(("vector-render-cache", index)),
+                    ));
+                    render_asset(
+                        &painter,
+                        &asset,
+                        None,
+                        Affine::IDENTITY,
+                        &view,
+                        &mut cache,
+                        ctx,
+                        Color32::WHITE,
+                        0,
+                        24,
+                    );
+                },
+            );
+        }
+        assert_eq!(
+            cache.vector_render_geometry_build_count(),
+            1,
+            "warm repaints/zoom rebuilt flattened+tessellated vector geometry",
+        );
+
+        cache.invalidate_asset(91);
+        let view = StageView {
+            origin: Pos2::ZERO,
+            scale: 1.0,
+            stage_rect: rect,
+        };
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Middle,
+                    egui::Id::new("vector-render-cache-after-invalidate"),
+                ));
+                render_asset(
+                    &painter,
+                    &asset,
+                    None,
+                    Affine::IDENTITY,
+                    &view,
+                    &mut cache,
+                    ctx,
+                    Color32::WHITE,
+                    0,
+                    24,
+                );
+            },
+        );
+        assert_eq!(cache.vector_render_geometry_build_count(), 2);
+    }
 
     #[test]
     fn classic_brush_texture_updates_only_new_dirty_tail() {
@@ -2991,6 +3364,81 @@ mod tests {
         let ctx = Context::default();
         let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(640.0, 480.0));
         let mut cache = TextureCache::default();
+        let warm_view = StageView {
+            origin: Pos2::new(40.0, 30.0),
+            scale: 1.0,
+            stage_rect: rect,
+        };
+        let paint_once = |cache: &mut TextureCache, id: usize| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let painter = ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Middle,
+                        egui::Id::new(("halo-async-warm", id)),
+                    ));
+                    paint_vector_appearance_halo(
+                        &painter,
+                        &vector,
+                        &appearance,
+                        Affine::IDENTITY,
+                        &warm_view,
+                        cache,
+                        ctx,
+                        Color32::WHITE,
+                    );
+                },
+            );
+        };
+        paint_once(&mut cache, 0);
+        assert_eq!(
+            cache
+                .appearance_by_asset
+                .keys()
+                .filter(|(asset_id, _, _)| *asset_id == vector.asset_id)
+                .count(),
+            0,
+            "first halo paint must not block the UI thread on CPU rasterization",
+        );
+        assert_eq!(
+            cache
+                .appearance_raster_jobs
+                .keys()
+                .filter(|(asset_id, _, _)| *asset_id == vector.asset_id)
+                .count(),
+            1,
+            "first halo paint must schedule exactly one background raster job",
+        );
+        for attempt in 1..=100 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            paint_once(&mut cache, attempt);
+            if cache
+                .appearance_by_asset
+                .keys()
+                .any(|(asset_id, _, _)| *asset_id == vector.asset_id)
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            cache
+                .appearance_by_asset
+                .keys()
+                .filter(|(asset_id, _, _)| *asset_id == vector.asset_id)
+                .count(),
+            1,
+            "background halo raster never reached the texture cache",
+        );
+        assert!(
+            cache
+                .appearance_raster_jobs
+                .keys()
+                .all(|(asset_id, _, _)| *asset_id != vector.asset_id),
+            "completed halo job was not retired",
+        );
 
         for (index, scale) in [0.25_f32, 0.5, 1.0, 2.0, 4.0, 8.0].into_iter().enumerate() {
             let view = StageView {
