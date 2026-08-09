@@ -2136,6 +2136,26 @@ pub fn next_asset_id_pub(project: &ProjectV2) -> u16 {
     next_asset_id(project)
 }
 
+/// Remove project asset records as one invariant-preserving operation.
+/// Sparse metadata is owned by the asset id, so it must never outlive the
+/// corresponding asset. Callers are responsible for removing placements first.
+pub(crate) fn remove_assets_and_metadata<I>(project: &mut ProjectV2, asset_ids: I)
+where
+    I: IntoIterator<Item = u16>,
+{
+    let removed: std::collections::BTreeSet<u16> = asset_ids.into_iter().collect();
+    if removed.is_empty() {
+        return;
+    }
+    project
+        .assets
+        .retain(|asset| !removed.contains(&asset.id()));
+    for asset_id in removed {
+        project.asset_names.remove(&asset_id);
+        project.asset_appearances.remove(&asset_id);
+    }
+}
+
 /// Convert a polyline of sampled mouse positions into bezier anchors so the
 /// resulting path renders as a smooth curve through every sample, not as a
 /// chain of straight segments. Uses Catmull-Rom-to-Bezier conversion: for
@@ -2325,10 +2345,7 @@ fn erase_fallback_at(app: &mut EditorApp, point: Vec2, eraser_radius: f32) {
                     );
                 }
             }
-            app.state
-                .project
-                .assets
-                .retain(|asset| asset.id() != hit.asset_id);
+            remove_assets_and_metadata(&mut app.state.project, [hit.asset_id]);
         }
         app.session.selection = Selection::None;
         app.state.dirty = true;
@@ -4446,14 +4463,7 @@ pub(crate) fn materialize_raw_paths_as_placements(
     }
 
     if !emptied_assets.is_empty() {
-        app.state
-            .project
-            .assets
-            .retain(|asset| !emptied_assets.contains(&asset.id()));
-        for asset_id in &emptied_assets {
-            app.state.project.asset_names.remove(asset_id);
-            app.state.project.asset_appearances.remove(asset_id);
-        }
+        remove_assets_and_metadata(&mut app.state.project, emptied_assets.iter().copied());
     }
 
     let mut placements = Vec::new();

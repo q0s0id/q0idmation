@@ -3107,10 +3107,7 @@ impl EditorApp {
             })
             .and_then(|layer| layer.placements.get_mut(mapped_idx))
         else {
-            self.state
-                .project
-                .assets
-                .retain(|asset| asset.id() != new_asset_id);
+            crate::tools::remove_assets_and_metadata(&mut self.state.project, [new_asset_id]);
             return;
         };
         placement.target = Target::Asset(new_asset_id);
@@ -3574,10 +3571,7 @@ impl EditorApp {
                     .find(|layer| layer.layer_id == layer_id)
             })
         else {
-            self.state
-                .project
-                .assets
-                .retain(|asset| asset.id() != new_asset_id);
+            crate::tools::remove_assets_and_metadata(&mut self.state.project, [new_asset_id]);
             return;
         };
         let placement_idx = layer.placements.len();
@@ -3774,10 +3768,10 @@ impl EditorApp {
                     });
                 }
             }
-            self.state
-                .project
-                .assets
-                .retain(|asset| !empty_assets.contains(&asset.id()));
+            crate::tools::remove_assets_and_metadata(
+                &mut self.state.project,
+                empty_assets.iter().copied(),
+            );
         }
         for (q0rg_id, layer_id) in affected_layers {
             crate::tools::preserve_blank_keyframe_after_content_delete(
@@ -4083,8 +4077,7 @@ impl EditorApp {
             }
             Selection::Asset(asset_id) => {
                 self.history.snapshot(&self.state.project);
-                self.state.project.assets.retain(|a| a.id() != asset_id);
-                self.state.project.asset_names.remove(&asset_id);
+                crate::tools::remove_assets_and_metadata(&mut self.state.project, [asset_id]);
                 for q in &mut self.state.project.q0rgs {
                     for layer in &mut q.layers {
                         layer.placements.retain(|p| match p.target {

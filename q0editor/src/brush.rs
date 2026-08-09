@@ -2264,13 +2264,7 @@ fn remove_unreferenced_assets(project: &mut ProjectV2, candidates: &BTreeSet<u16
         .copied()
         .filter(|asset_id| !referenced.contains(asset_id))
         .collect();
-    project
-        .assets
-        .retain(|asset| !removed.contains(&asset.id()));
-    for asset_id in removed {
-        project.asset_names.remove(&asset_id);
-        project.asset_appearances.remove(&asset_id);
-    }
+    crate::tools::remove_assets_and_metadata(project, removed);
 }
 
 #[cfg(test)]

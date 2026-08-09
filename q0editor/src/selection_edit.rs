@@ -464,9 +464,7 @@ pub fn remove_materialized_paths_and_objects(
         }
     }
     if !emptied_assets.is_empty() {
-        project
-            .assets
-            .retain(|asset| !emptied_assets.contains(&asset.id()));
+        crate::tools::remove_assets_and_metadata(project, emptied_assets.iter().copied());
     }
     for (q0rg_id, layer_id) in affected_layers {
         crate::tools::preserve_blank_keyframe_after_content_delete(
@@ -761,4 +759,114 @@ fn vector_bounds(vector: &VectorAsset) -> Option<(Vec2, Vec2)> {
         }
     }
     found.then_some((min, max))
+}
+
+#[cfg(all(test, feature = "appearance-mask-eraser"))]
+mod tests {
+    use super::*;
+    use q0s_format::transform::Affine;
+    use q0s_format::v2::{
+        Anchor, Layer, ProjectMeta, Q0rg, Rgba, VectorAppearance, VectorMaterial,
+    };
+
+    fn appearance_raw_project() -> ProjectV2 {
+        let path = VPath {
+            anchors: vec![
+                Anchor {
+                    point: Vec2::new(0.0, 0.0),
+                    in_handle: None,
+                    out_handle: None,
+                },
+                Anchor {
+                    point: Vec2::new(20.0, 0.0),
+                    in_handle: None,
+                    out_handle: None,
+                },
+                Anchor {
+                    point: Vec2::new(20.0, 20.0),
+                    in_handle: None,
+                    out_handle: None,
+                },
+                Anchor {
+                    point: Vec2::new(0.0, 20.0),
+                    in_handle: None,
+                    out_handle: None,
+                },
+            ],
+            closed: true,
+        };
+        let mut appearances = std::collections::HashMap::new();
+        appearances.insert(
+            1,
+            VectorAppearance {
+                material: VectorMaterial::SoftHalo {
+                    radius: 8.0,
+                    opacity: 0.5,
+                },
+                erase_mask: Vec::new(),
+                material_source: Vec::new(),
+                clip_mask: Vec::new(),
+                field_transform: Affine::IDENTITY,
+            },
+        );
+        ProjectV2 {
+            meta: ProjectMeta {
+                name: "delete appearance regression".into(),
+                fps: 24,
+                stage_width: 640,
+                stage_height: 480,
+                entry_q0rg_id: 1,
+            },
+            assets: vec![Asset::Vector(VectorAsset {
+                asset_id: 1,
+                paths: vec![path],
+                fill: Some(Rgba {
+                    r: 20,
+                    g: 30,
+                    b: 40,
+                    a: 255,
+                }),
+                stroke: None,
+            })],
+            asset_names: std::collections::HashMap::new(),
+            asset_appearances: appearances,
+            layer_metadata: std::collections::HashMap::new(),
+            q0rgs: vec![Q0rg {
+                q0rg_id: 1,
+                name: "Stage".into(),
+                frame_count: 1,
+                script: String::new(),
+                layers: vec![Layer {
+                    layer_id: 1,
+                    name: "Layer 1".into(),
+                    explicit_keyframes: vec![0],
+                    placements: vec![Placement {
+                        frame: 0,
+                        target: Target::Asset(1),
+                        transform: Transform2D::IDENTITY,
+                        tween: Tween::None,
+                    }],
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn deleting_last_appearance_raw_path_keeps_project_save_valid() {
+        let mut project = appearance_raw_project();
+        assert!(remove_materialized_paths_and_objects(
+            &mut project,
+            &[PathRef {
+                q0rg_id: 1,
+                layer_id: 1,
+                placement_idx: 0,
+                path_idx: 0
+            }],
+            &[],
+            0,
+        ));
+        q0s_format::v2::validate(&project)
+            .expect("deleting the asset must also remove its sparse appearance metadata");
+        assert!(!project.asset_appearances.contains_key(&1));
+    }
 }
