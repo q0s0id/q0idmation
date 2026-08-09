@@ -4225,6 +4225,8 @@ pub(crate) fn materialize_raw_paths_as_placements(
     let mut created_assets: Vec<(u16, u16, u16)> = Vec::new();
     let mut emptied_assets = std::collections::BTreeSet::new();
     let mut touched_assets = std::collections::BTreeSet::new();
+    #[cfg(feature = "appearance-mask-eraser")]
+    let mut render_seeds = Vec::new();
     for ((q0rg_id, layer_id, placement_idx), mut path_indices) in groups {
         let placement = app
             .state
@@ -4300,6 +4302,28 @@ pub(crate) fn materialize_raw_paths_as_placements(
 
         path_indices.sort_unstable();
         path_indices.dedup();
+        #[cfg(feature = "appearance-mask-eraser")]
+        let render_seed = if writable_asset_id == original_asset_id
+            && !app
+                .state
+                .project
+                .asset_appearances
+                .contains_key(&writable_asset_id)
+        {
+            app.state
+                .project
+                .assets
+                .iter()
+                .find(|asset| asset.id() == writable_asset_id)
+                .and_then(|asset| match asset {
+                    Asset::Vector(vector) if vector.stroke.is_none() => app
+                        .textures
+                        .plain_selection_split_cache_seed(vector, &path_indices),
+                    _ => None,
+                })
+        } else {
+            None
+        };
         let (selected_paths, fill, stroke, source_empty, original_paths) = {
             let Asset::Vector(vector) = app
                 .state
@@ -4345,6 +4369,22 @@ pub(crate) fn materialize_raw_paths_as_placements(
             fill,
             stroke,
         }));
+        #[cfg(feature = "appearance-mask-eraser")]
+        if let Some(seed) = render_seed {
+            let path_count = app
+                .state
+                .project
+                .assets
+                .iter()
+                .find_map(|asset| match asset {
+                    Asset::Vector(vector) if vector.asset_id == selected_asset_id => {
+                        Some(vector.paths.len())
+                    }
+                    _ => None,
+                })
+                .unwrap_or(0);
+            render_seeds.push((selected_asset_id, path_count, seed));
+        }
         #[cfg(not(feature = "appearance-mask-eraser"))]
         let _ = &original_paths;
         #[cfg(feature = "appearance-mask-eraser")]
@@ -4443,6 +4483,11 @@ pub(crate) fn materialize_raw_paths_as_placements(
     }
     app.state.dirty = true;
     app.textures.invalidate_assets(touched_assets);
+    #[cfg(feature = "appearance-mask-eraser")]
+    for (asset_id, path_count, seed) in render_seeds {
+        app.textures
+            .install_plain_selection_split_cache_seed(asset_id, path_count, seed);
+    }
     Some(placements)
 }
 
@@ -12358,6 +12403,33 @@ mod tests {
             outline[1].distance(outline[2]) < 0.03,
             "subpixel-separated opposite sides must stay distinct instead of collapsing the turn",
         );
+
+        #[cfg(feature = "appearance-mask-eraser")]
+        {
+            let path = VPath {
+                anchors: stage
+                    .iter()
+                    .map(|point| anchor(Vec2::new(point.x, point.y)))
+                    .collect(),
+                closed: true,
+            };
+            let view = StageView {
+                origin: Pos2::ZERO,
+                scale: 0.005,
+                stage_rect: egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(100.0, 100.0)),
+            };
+            let adaptive = crate::render::adaptive_selection_bezier_screen_path_for_test(
+                &path,
+                Affine::IDENTITY,
+                &view,
+            );
+            assert_eq!(adaptive.len(), stage.len());
+            for (actual, expected) in adaptive.iter().zip(stage.iter()) {
+                assert!((actual.x - expected.x * 0.005).abs() <= f32::EPSILON);
+                assert!((actual.y - expected.y * 0.005).abs() <= f32::EPSILON);
+            }
+            assert!(adaptive[1].distance(adaptive[2]) < 0.03);
+        }
     }
 
     #[cfg(feature = "appearance-mask-eraser")]
@@ -13368,6 +13440,134 @@ mod tests {
         assert_eq!(
             selection_transform_bounds(&app),
             Some((0.0, 0.0, 120.0, 20.0))
+        );
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn first_partial_raw_drag_reuses_warm_selected_mesh_after_split() {
+        let square = |x: f32| VPath {
+            anchors: vec![
+                anchor(Vec2::new(x, 0.0)),
+                anchor(Vec2::new(x + 20.0, 0.0)),
+                anchor(Vec2::new(x + 20.0, 20.0)),
+                anchor(Vec2::new(x, 20.0)),
+            ],
+            closed: true,
+        };
+        let mut app = EditorApp::default();
+        app.state.project.assets = vec![Asset::Vector(VectorAsset {
+            asset_id: 1,
+            paths: vec![square(0.0), square(100.0)],
+            fill: Some(Rgba {
+                r: 20,
+                g: 30,
+                b: 40,
+                a: 255,
+            }),
+            stroke: None,
+        })];
+        app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            frame: 0,
+            target: Target::Asset(1),
+            transform: Transform2D::IDENTITY,
+            tween: Tween::None,
+        }];
+        let source_ref = PathRef {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: 0,
+            path_idx: 0,
+        };
+        app.session.selection = Selection::Path {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: 0,
+            path_idx: 0,
+        };
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(300.0, 200.0));
+        let view = StageView {
+            origin: Pos2::new(20.0, 20.0),
+            scale: 1.0,
+            stage_rect: rect,
+        };
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Middle,
+                    egui::Id::new("warm-before-partial-drag"),
+                ));
+                crate::render::render_stage(
+                    &painter,
+                    &app.state.project,
+                    1,
+                    0,
+                    &view,
+                    &mut app.textures,
+                    ctx,
+                );
+                draw_selection_overlay(&mut app, &painter, &view);
+            },
+        );
+        let render_builds = app.textures.vector_render_geometry_build_count();
+        let selection_builds = app.textures.selection_stage_mesh_build_count();
+        assert_eq!(render_builds, 1);
+        assert_eq!(selection_builds, 1);
+
+        assert!(begin_dragging_raw_paths(
+            &mut app,
+            vec![source_ref],
+            Vec2::new(10.0, 10.0),
+            "test drag",
+        ));
+        let ToolState::DraggingPaths { refs, .. } = app.session.tool_state.clone() else {
+            panic!("partial raw fill must enter live drag")
+        };
+        assert!(set_raw_refs_live_transform(
+            &mut app.state.project,
+            &refs,
+            Affine {
+                tx: 5.0,
+                ty: 3.0,
+                ..Affine::IDENTITY
+            },
+        ));
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Middle,
+                    egui::Id::new("first-frame-after-partial-drag"),
+                ));
+                crate::render::render_stage(
+                    &painter,
+                    &app.state.project,
+                    1,
+                    0,
+                    &view,
+                    &mut app.textures,
+                    ctx,
+                );
+                draw_selection_overlay(&mut app, &painter, &view);
+            },
+        );
+        assert_eq!(
+            app.textures.vector_render_geometry_build_count(),
+            render_builds + 1,
+            "only the stationary remainder may need a render rebuild; the moved split must inherit its warm mesh",
+        );
+        assert_eq!(
+            app.textures.selection_stage_mesh_build_count(),
+            selection_builds,
+            "the moved split rebuilt a selection stage mesh that was already warm before mouse-down",
         );
     }
 

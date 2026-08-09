@@ -179,6 +179,11 @@ pub(crate) struct CachedSelectionStageMesh {
     fill_vertices: Vec<Pos2>,
     fill_indices: Vec<u32>,
     strokes: Vec<CachedSelectionStroke>,
+    // Plain unmasked vectors keep their source Beziers for the selection outline.
+    // The fill remains the exact tessellated surface, while the outline is
+    // adaptively flattened in screen space so zoom never uploads tens of
+    // thousands of invisible subpixel samples.
+    bezier_strokes: Vec<VPath>,
 }
 
 #[cfg(feature = "appearance-mask-eraser")]
@@ -206,6 +211,13 @@ pub(crate) struct SelectionPaintKey {
 #[derive(Clone, Default)]
 pub(crate) struct CachedSelectionPaint {
     pub meshes: Vec<Mesh>,
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+pub(crate) struct PlainSelectionSplitCacheSeed {
+    render: CachedVectorRenderGeometry,
+    stage: CachedSelectionStageMesh,
+    paints: Vec<(SelectionPaintKey, CachedSelectionPaint)>,
 }
 
 #[cfg(feature = "appearance-mask-eraser")]
@@ -582,7 +594,7 @@ impl TextureCache {
     }
 
     #[cfg(test)]
-    fn vector_render_geometry_build_count(&self) -> usize {
+    pub(crate) fn vector_render_geometry_build_count(&self) -> usize {
         self.vector_render_geometry_build_count
     }
 
@@ -855,9 +867,13 @@ impl TextureCache {
                     .enumerate()
                     .filter_map(|(index, path)| path.closed.then_some(index))
                     .collect();
+                let selected_beziers: Vec<VPath> = path_indices
+                    .iter()
+                    .filter_map(|index| vector.paths.get(*index).cloned())
+                    .collect();
                 let render_geometry = self.vector_render_geometry(vector);
                 if path_indices == all_closed {
-                    cached_vector_fill_as_selection_stage_mesh(render_geometry)?
+                    cached_vector_fill_as_selection_stage_mesh(render_geometry, selected_beziers)?
                 } else {
                     let mut closed_contour = 0usize;
                     let selected: std::collections::BTreeSet<usize> =
@@ -875,7 +891,10 @@ impl TextureCache {
                         }
                         closed_contour += 1;
                     }
-                    build_selection_stage_mesh(&stage_contours)?
+                    let mut mesh = build_selection_stage_mesh(&stage_contours)?;
+                    mesh.bezier_strokes = selected_beziers;
+                    mesh.strokes.clear();
+                    mesh
                 }
             } else {
                 let canonical = {
@@ -908,6 +927,111 @@ impl TextureCache {
             }
         }
         self.selection_stage_mesh_by_key.get_mut(&key)
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    pub(crate) fn plain_selection_split_cache_seed(
+        &self,
+        vector: &VectorAsset,
+        selected_indices: &[usize],
+    ) -> Option<PlainSelectionSplitCacheSeed> {
+        let mut path_indices: Vec<usize> = selected_indices
+            .iter()
+            .copied()
+            .filter(|index| vector.paths.get(*index).is_some_and(|path| path.closed))
+            .collect();
+        path_indices.sort_unstable();
+        path_indices.dedup();
+        if path_indices.is_empty() {
+            return None;
+        }
+        let identity_bits = [
+            1.0_f32.to_bits(),
+            0.0_f32.to_bits(),
+            0.0_f32.to_bits(),
+            1.0_f32.to_bits(),
+            0.0_f32.to_bits(),
+            0.0_f32.to_bits(),
+        ];
+        let stage_key = SelectionStageMeshKey {
+            asset_id: vector.asset_id,
+            path_indices: path_indices.clone(),
+            field_transform_bits: identity_bits,
+        };
+        let stage = self.selection_stage_mesh_by_key.get(&stage_key)?.clone();
+        let source_render = self.vector_render_by_asset.get(&vector.asset_id)?;
+
+        let selected: std::collections::BTreeSet<usize> = path_indices.iter().copied().collect();
+        let mut closed_contour = 0usize;
+        let mut fill_contours = Vec::new();
+        for (path_index, path) in vector.paths.iter().enumerate() {
+            if !path.closed {
+                continue;
+            }
+            if selected.contains(&path_index) {
+                if let Some(contour) = source_render.fill_contours.get(closed_contour) {
+                    fill_contours.push(contour.clone());
+                }
+            }
+            closed_contour += 1;
+        }
+        let render = CachedVectorRenderGeometry {
+            fill_vertices: stage
+                .fill_vertices
+                .iter()
+                .map(|point| Vec2::new(point.x, point.y))
+                .collect(),
+            fill_indices: stage.fill_indices.clone(),
+            fill_contours,
+            stroke_paths: Vec::new(),
+        };
+        let paints = self
+            .selection_paint_by_key
+            .iter()
+            .filter(|(key, _)| {
+                key.asset_id == vector.asset_id
+                    && key.path_indices == path_indices
+                    && key.field_transform_bits == identity_bits
+            })
+            .map(|(key, paint)| (key.clone(), paint.clone()))
+            .collect();
+        Some(PlainSelectionSplitCacheSeed {
+            render,
+            stage,
+            paints,
+        })
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    pub(crate) fn install_plain_selection_split_cache_seed(
+        &mut self,
+        asset_id: u16,
+        path_count: usize,
+        seed: PlainSelectionSplitCacheSeed,
+    ) {
+        let path_indices: Vec<usize> = (0..path_count).collect();
+        let identity_bits = [
+            1.0_f32.to_bits(),
+            0.0_f32.to_bits(),
+            0.0_f32.to_bits(),
+            1.0_f32.to_bits(),
+            0.0_f32.to_bits(),
+            0.0_f32.to_bits(),
+        ];
+        self.vector_render_by_asset.insert(asset_id, seed.render);
+        self.selection_stage_mesh_by_key.insert(
+            SelectionStageMeshKey {
+                asset_id,
+                path_indices: path_indices.clone(),
+                field_transform_bits: identity_bits,
+            },
+            seed.stage,
+        );
+        for (mut key, paint) in seed.paints {
+            key.asset_id = asset_id;
+            key.path_indices = path_indices.clone();
+            self.selection_paint_by_key.insert(key, paint);
+        }
     }
 
     #[cfg(feature = "appearance-mask-eraser")]
@@ -1777,18 +1901,9 @@ fn cache_parametric_range_for_width(stroke: &mut CachedSelectionStroke, stage_wi
 #[cfg(feature = "appearance-mask-eraser")]
 fn cached_vector_fill_as_selection_stage_mesh(
     geometry: &CachedVectorRenderGeometry,
+    bezier_strokes: Vec<VPath>,
 ) -> Option<CachedSelectionStageMesh> {
-    let strokes: Vec<CachedSelectionStroke> = geometry
-        .fill_contours
-        .iter()
-        .map(|contour| exact_closed_contour(contour))
-        .filter(|contour| contour.len() >= 3)
-        .map(|contour_stage| CachedSelectionStroke {
-            parametric: Vec::new(),
-            contour_stage,
-        })
-        .collect();
-    if geometry.fill_vertices.is_empty() && strokes.is_empty() {
+    if geometry.fill_vertices.is_empty() && bezier_strokes.is_empty() {
         return None;
     }
     Some(CachedSelectionStageMesh {
@@ -1798,7 +1913,8 @@ fn cached_vector_fill_as_selection_stage_mesh(
             .map(|point| pos2(point.x, point.y))
             .collect(),
         fill_indices: geometry.fill_indices.clone(),
-        strokes,
+        strokes: Vec::new(),
+        bezier_strokes,
     })
 }
 
@@ -1835,6 +1951,7 @@ fn build_selection_stage_mesh(contours: &[Vec<Pos2>]) -> Option<CachedSelectionS
         fill_vertices,
         fill_indices,
         strokes,
+        bezier_strokes: Vec::new(),
     })
 }
 
@@ -1918,6 +2035,99 @@ fn direct_stroke_screen_mesh(
 }
 
 #[cfg(feature = "appearance-mask-eraser")]
+fn screen_cubic_flatness(p0: Pos2, p1: Pos2, p2: Pos2, p3: Pos2) -> f32 {
+    fn distance_to_chord(point: Pos2, start: Pos2, end: Pos2) -> f32 {
+        let segment = end - start;
+        let len_sq = segment.length_sq();
+        if len_sq <= 1.0e-12 {
+            return point.distance(start);
+        }
+        let t = ((point - start).dot(segment) / len_sq).clamp(0.0, 1.0);
+        point.distance(start + segment * t)
+    }
+    distance_to_chord(p1, p0, p3).max(distance_to_chord(p2, p0, p3))
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn flatten_cubic_screen_adaptive(
+    p0: Pos2,
+    p1: Pos2,
+    p2: Pos2,
+    p3: Pos2,
+    tolerance: f32,
+    depth: u8,
+    out: &mut Vec<Pos2>,
+) {
+    if depth >= 10 || screen_cubic_flatness(p0, p1, p2, p3) <= tolerance {
+        out.push(p3);
+        return;
+    }
+    let p01 = p0.lerp(p1, 0.5);
+    let p12 = p1.lerp(p2, 0.5);
+    let p23 = p2.lerp(p3, 0.5);
+    let p012 = p01.lerp(p12, 0.5);
+    let p123 = p12.lerp(p23, 0.5);
+    let mid = p012.lerp(p123, 0.5);
+    flatten_cubic_screen_adaptive(p0, p01, p012, mid, tolerance, depth + 1, out);
+    flatten_cubic_screen_adaptive(mid, p123, p23, p3, tolerance, depth + 1, out);
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn adaptive_selection_bezier_screen_path(
+    path: &VPath,
+    placement_transform: Affine,
+    view: &StageView,
+) -> Vec<Pos2> {
+    let Some(first) = path.anchors.first() else {
+        return Vec::new();
+    };
+    if path.anchors.len() == 1 {
+        let point = placement_transform.apply(first.point);
+        return vec![stage_pos_to_screen(pos2(point.x, point.y), view)];
+    }
+    let to_screen = |point: Vec2| {
+        let point = placement_transform.apply(point);
+        stage_pos_to_screen(pos2(point.x, point.y), view)
+    };
+    let mut out = Vec::with_capacity(path.anchors.len() * 2);
+    out.push(to_screen(first.point));
+    let segment_count = if path.closed {
+        path.anchors.len()
+    } else {
+        path.anchors.len() - 1
+    };
+    // Quarter-pixel geometric error is below the selection stroke width while
+    // still preserving every source anchor and every segment boundary.
+    const TOLERANCE_PX: f32 = 0.25;
+    for index in 0..segment_count {
+        let a = &path.anchors[index];
+        let b = &path.anchors[(index + 1) % path.anchors.len()];
+        let p0 = to_screen(a.point);
+        let p3 = to_screen(b.point);
+        if a.out_handle.is_none() && b.in_handle.is_none() {
+            out.push(p3);
+            continue;
+        }
+        let p1 = to_screen(a.out_handle.unwrap_or(a.point));
+        let p2 = to_screen(b.in_handle.unwrap_or(b.point));
+        flatten_cubic_screen_adaptive(p0, p1, p2, p3, TOLERANCE_PX, 0, &mut out);
+    }
+    if path.closed && out.len() > 1 && out.first() == out.last() {
+        out.pop();
+    }
+    out
+}
+
+#[cfg(all(test, feature = "appearance-mask-eraser"))]
+pub(crate) fn adaptive_selection_bezier_screen_path_for_test(
+    path: &VPath,
+    placement_transform: Affine,
+    view: &StageView,
+) -> Vec<Pos2> {
+    adaptive_selection_bezier_screen_path(path, placement_transform, view)
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
 fn build_selection_screen_meshes(
     source: &mut CachedSelectionStageMesh,
     placement_transform: Affine,
@@ -1946,6 +2156,31 @@ fn build_selection_screen_meshes(
         }
         fill.indices = source.fill_indices.clone();
         meshes.push(fill);
+    }
+    if !source.bezier_strokes.is_empty() {
+        let mut black_outline = Mesh::default();
+        let mut accent_outline = Mesh::default();
+        for path in &source.bezier_strokes {
+            let screen = adaptive_selection_bezier_screen_path(path, placement_transform, view);
+            if screen.len() < 3 {
+                continue;
+            }
+            if let Some(mesh) =
+                closed_bevel_stroke_mesh(&screen, 2.0, Color32::from_black_alpha(180))
+            {
+                black_outline.append(mesh);
+            }
+            if let Some(mesh) = closed_bevel_stroke_mesh(&screen, 1.0, accent) {
+                accent_outline.append(mesh);
+            }
+        }
+        if !black_outline.is_empty() {
+            meshes.push(black_outline);
+        }
+        if !accent_outline.is_empty() {
+            meshes.push(accent_outline);
+        }
+        return meshes;
     }
     let pure_translation = (placement_transform.a11 - 1.0).abs() <= 1.0e-6
         && placement_transform.a12.abs() <= 1.0e-6
@@ -4473,6 +4708,51 @@ mod tests {
             );
         }
         assert_eq!(stroke.parametric.len(), cached_after_crossing);
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn adaptive_selection_bezier_outline_preserves_anchors_without_fixed_16x_zoom_cost() {
+        let anchors: Vec<Anchor> = (0..512)
+            .map(|index| {
+                let x = index as f32 * 2.0;
+                let y = ((index % 7) as f32 - 3.0) * 0.2;
+                Anchor {
+                    point: Vec2::new(x, y),
+                    in_handle: Some(Vec2::new(x - 0.5, y - 0.05)),
+                    out_handle: Some(Vec2::new(x + 0.5, y + 0.05)),
+                }
+            })
+            .collect();
+        let path = VPath {
+            anchors: anchors.clone(),
+            closed: true,
+        };
+        let view = StageView {
+            origin: Pos2::new(13.0, 17.0),
+            scale: 0.1,
+            stage_rect: Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0)),
+        };
+        let outline = adaptive_selection_bezier_screen_path(&path, Affine::IDENTITY, &view);
+        let fixed = flatten_path(&path);
+        assert!(
+            outline.len() * 4 < fixed.len(),
+            "low-zoom selection still paid nearly the fixed 16-samples-per-segment cost: adaptive={} fixed={}",
+            outline.len(),
+            fixed.len(),
+        );
+        for anchor in &anchors {
+            let expected = pos2(
+                view.origin.x + anchor.point.x * view.scale,
+                view.origin.y + anchor.point.y * view.scale,
+            );
+            assert!(
+                outline
+                    .iter()
+                    .any(|point| point.distance(expected) <= 1.0e-4),
+                "adaptive outline skipped a source anchor/segment boundary at {expected:?}",
+            );
+        }
     }
 
     #[test]
