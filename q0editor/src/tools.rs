@@ -347,6 +347,27 @@ fn union_bounds(
     }
 }
 
+fn transform_axis_aligned_bounds(
+    bounds: (f32, f32, f32, f32),
+    transform: Affine,
+) -> Option<(f32, f32, f32, f32)> {
+    let (min_x, min_y, max_x, max_y) = bounds;
+    let corners = [
+        Vec2::new(min_x, min_y),
+        Vec2::new(max_x, min_y),
+        Vec2::new(max_x, max_y),
+        Vec2::new(min_x, max_y),
+    ];
+    let mut result: Option<(f32, f32, f32, f32)> = None;
+    for point in corners.into_iter().map(|point| transform.apply(point)) {
+        if !point.x.is_finite() || !point.y.is_finite() {
+            continue;
+        }
+        result = union_bounds(result, Some((point.x, point.y, point.x, point.y)));
+    }
+    result
+}
+
 fn placement_ref_world_bounds(
     project: &ProjectV2,
     reference: PlacementRef,
@@ -954,24 +975,6 @@ fn classic_brush(app: &mut EditorApp, response: &Response, view: &StageView, ctx
         }
     }
 }
-fn raw_path_to_geo_polygon(path: &VPath) -> Option<Polygon<f64>> {
-    let points = flatten_path(path);
-    if points.len() < 3 {
-        return None;
-    }
-    let mut coords: Vec<Coord<f64>> = points
-        .into_iter()
-        .map(|point| Coord {
-            x: point.x as f64,
-            y: point.y as f64,
-        })
-        .collect();
-    if coords.first() != coords.last() {
-        coords.push(coords[0]);
-    }
-    Some(Polygon::new(LineString::new(coords), Vec::new()))
-}
-
 pub(crate) fn rect_polygon(rect: (f32, f32, f32, f32)) -> Polygon<f64> {
     Polygon::new(
         LineString::new(vec![
@@ -1086,46 +1089,12 @@ fn interactive_visible_fill_hit(
     interactive_paths_contain_or_near(&vector.paths, point, edge_tolerance)
 }
 
-/// Reconstruct the final NonZero-filled surface, rather than treating each
-/// contour as an independent polygon. Oppositely-wound contours are holes.
 pub(crate) fn vector_fill_geometry(vector: &VectorAsset) -> MultiPolygon<f64> {
-    let mut rings: Vec<(&VPath, Polygon<f64>, f64)> = vector
-        .paths
-        .iter()
-        .filter(|path| path.closed)
-        .filter_map(|path| {
-            let polygon = raw_path_to_geo_polygon(path)?;
-            let area = signed_path_area(path);
-            (area.abs() > 1.0e-4).then_some((path, polygon, area))
-        })
-        .collect();
-    rings.sort_by(|left, right| right.2.abs().total_cmp(&left.2.abs()));
-
-    let mut surface = MultiPolygon(Vec::new());
-    let mut inside_windings: Vec<i32> = Vec::with_capacity(rings.len());
-    for index in 0..rings.len() {
-        let (_, polygon, area) = &rings[index];
-        let sample = polygon
-            .exterior()
-            .0
-            .first()
-            .map(|coord| Point::new(coord.x, coord.y));
-        let parent = sample.and_then(|point| {
-            (0..index)
-                .rev()
-                .find(|candidate| rings[*candidate].1.contains(&point))
-        });
-        let outside_winding = parent.map(|parent| inside_windings[parent]).unwrap_or(0);
-        let inside_winding = outside_winding + if *area > 0.0 { 1 } else { -1 };
-
-        if outside_winding == 0 && inside_winding != 0 {
-            surface = surface.union(polygon);
-        } else if outside_winding != 0 && inside_winding == 0 {
-            surface = surface.difference(polygon);
-        }
-        inside_windings.push(inside_winding);
-    }
-    surface
+    // Raw anchors are the canonical fill boundary. Bezier handles are only the
+    // renderer's smooth approximation, so selection/cut/bucket geometry must
+    // share the brush engine's topology instead of flattening every handle and
+    // rebuilding the same NonZero surface a second time.
+    crate::brush::vector_fill_geometry(vector)
 }
 
 pub(crate) fn raw_selectable_fill_surface(
@@ -1147,6 +1116,7 @@ pub(crate) fn raw_selectable_fill_surface(
     }
 }
 
+#[cfg(any(test, not(feature = "appearance-mask-eraser")))]
 fn raw_selectable_paths_surface(
     project: &ProjectV2,
     asset_id: u16,
@@ -1231,6 +1201,7 @@ fn selectable_component_at_cursor(
     }
 }
 
+#[cfg(not(feature = "appearance-mask-eraser"))]
 fn surface_to_screen_contours(surface: &MultiPolygon<f64>, view: &StageView) -> Vec<Vec<Pos2>> {
     crate::brush::coverage_to_paths(surface)
         .iter()
@@ -1774,8 +1745,6 @@ enum GroupTransformIntent {
 
 struct GroupTransformData<'a> {
     refs: &'a [PathRef],
-    start_paths: &'a [VPath],
-    start_appearances: &'a [AppearanceTransformSnapshot],
     objects: &'a [PlacementRef],
     start_transforms: &'a [Transform2D],
     operation: GroupTransformOperation,
@@ -1863,6 +1832,13 @@ fn begin_group_transform(
     };
     if let Some(rect) = raw_rect {
         paths.extend(cut_raw_areas_for_drag_prepared(app, &raw_placements, rect));
+    }
+    if !paths.is_empty() {
+        paths = isolate_partial_appearance_raw_refs(app, paths);
+        let Some(isolated) = isolate_raw_refs_for_live_transform(app, paths) else {
+            return false;
+        };
+        paths = isolated;
     }
     if paths.is_empty() && objects.is_empty() {
         return false;
@@ -2000,13 +1976,7 @@ fn apply_group_transform(app: &mut EditorApp, data: GroupTransformData<'_>, curs
     let Some(transform) = group_transform_affine(data.operation, cursor) else {
         return false;
     };
-    let mut changed = apply_raw_affine_snapshot(
-        &mut app.state.project,
-        data.refs,
-        data.start_paths,
-        data.start_appearances,
-        transform,
-    );
+    let mut changed = set_raw_refs_live_transform(&mut app.state.project, data.refs, transform);
     for (reference, source) in data
         .objects
         .iter()
@@ -2052,6 +2022,10 @@ fn begin_transforming_raw_area(
     if refs.is_empty() {
         return false;
     }
+    let refs = isolate_partial_appearance_raw_refs(app, refs);
+    let Some(refs) = isolate_raw_refs_for_live_transform(app, refs) else {
+        return false;
+    };
     let start_paths: Vec<VPath> = refs
         .iter()
         .filter_map(|reference| {
@@ -2993,6 +2967,8 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                         &placements,
                         (bounds_min.x, bounds_min.y, bounds_max.x, bounds_max.y),
                     );
+                    let refs = isolate_partial_appearance_raw_refs(app, refs);
+                    let refs = isolate_raw_refs_for_live_transform(app, refs).unwrap_or_default();
                     let start_paths: Vec<VPath> = refs
                         .iter()
                         .filter_map(|r| {
@@ -3335,36 +3311,31 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                         delta,
                     ) {
                         app.state.dirty = true;
+                        if let Some(asset_id) = raw_placement_asset_id(
+                            &app.state.project,
+                            q0rg_id,
+                            layer_id,
+                            placement_idx,
+                        ) {
+                            app.textures.invalidate_asset(asset_id);
+                        }
                     }
                 }
             }
             ToolState::DraggingPaths {
                 refs,
                 start_cursor,
-                start_paths,
-                start_appearances,
                 start_pivot,
+                ..
             } => {
                 if let Some(p) = cursor {
                     let delta = Vec2::new(p.x - start_cursor.x, p.y - start_cursor.y);
-                    let mut changed = false;
-                    for (r, source) in refs.iter().zip(start_paths.iter()) {
-                        changed |= replace_raw_path_translated(
-                            &mut app.state.project,
-                            r.q0rg_id,
-                            r.layer_id,
-                            r.placement_idx,
-                            r.path_idx,
-                            source,
-                            delta,
-                        );
-                    }
-                    changed |= translate_captured_appearances(
-                        &mut app.state.project,
-                        &start_appearances,
-                        delta,
-                    );
-                    if changed {
+                    let transform = Affine {
+                        tx: delta.x,
+                        ty: delta.y,
+                        ..Affine::IDENTITY
+                    };
+                    if set_raw_refs_live_transform(&mut app.state.project, &refs, transform) {
                         app.state.dirty = true;
                         if let Some(pivot) = start_pivot {
                             set_selection_transform_pivot(
@@ -3377,11 +3348,10 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
             }
             ToolState::DraggingRawHandle {
                 refs,
-                start_paths,
-                start_appearances,
                 handle,
                 start_bounds,
                 start_pivot,
+                ..
             } => {
                 if let Some(p) = cursor {
                     if let Some(transform) = group_transform_affine(
@@ -3391,13 +3361,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                         },
                         p,
                     ) {
-                        if apply_raw_affine_snapshot(
-                            &mut app.state.project,
-                            &refs,
-                            &start_paths,
-                            &start_appearances,
-                            transform,
-                        ) {
+                        if set_raw_refs_live_transform(&mut app.state.project, &refs, transform) {
                             app.state.dirty = true;
                             set_selection_transform_pivot(app, transform.apply(start_pivot));
                         }
@@ -3406,10 +3370,9 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
             }
             ToolState::DraggingRawRotate {
                 refs,
-                start_paths,
-                start_appearances,
                 center,
                 start_angle,
+                ..
             } => {
                 if let Some(p) = cursor {
                     if let Some(transform) = group_transform_affine(
@@ -3419,13 +3382,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                         },
                         p,
                     ) {
-                        if apply_raw_affine_snapshot(
-                            &mut app.state.project,
-                            &refs,
-                            &start_paths,
-                            &start_appearances,
-                            transform,
-                        ) {
+                        if set_raw_refs_live_transform(&mut app.state.project, &refs, transform) {
                             app.state.dirty = true;
                         }
                     }
@@ -3433,12 +3390,11 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
             }
             ToolState::DraggingRawSkew {
                 refs,
-                start_paths,
-                start_appearances,
                 edge,
                 start_bounds,
                 start_cursor,
                 start_pivot,
+                ..
             } => {
                 if let Some(p) = cursor {
                     if let Some(transform) = group_transform_affine(
@@ -3449,13 +3405,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                         },
                         p,
                     ) {
-                        if apply_raw_affine_snapshot(
-                            &mut app.state.project,
-                            &refs,
-                            &start_paths,
-                            &start_appearances,
-                            transform,
-                        ) {
+                        if set_raw_refs_live_transform(&mut app.state.project, &refs, transform) {
                             app.state.dirty = true;
                             set_selection_transform_pivot(app, transform.apply(start_pivot));
                         }
@@ -3480,6 +3430,14 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                         delta,
                     ) {
                         app.state.dirty = true;
+                        if let Some(asset_id) = raw_placement_asset_id(
+                            &app.state.project,
+                            path.q0rg_id,
+                            path.layer_id,
+                            path.placement_idx,
+                        ) {
+                            app.textures.invalidate_asset(asset_id);
+                        }
                         app.session.selection = Selection::PathPoints {
                             path,
                             anchor_indices,
@@ -3589,8 +3547,8 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
             }
             ToolState::DraggingGroup {
                 refs,
-                start_paths,
-                start_appearances,
+                start_paths: _,
+                start_appearances: _,
                 objects,
                 start_transforms,
                 operation,
@@ -3601,8 +3559,6 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                         app,
                         GroupTransformData {
                             refs: &refs,
-                            start_paths: &start_paths,
-                            start_appearances: &start_appearances,
                             objects: &objects,
                             start_transforms: &start_transforms,
                             operation,
@@ -3659,6 +3615,11 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
         }
         let finished_state = app.session.tool_state.clone();
         let raw_layers = raw_edit_layers(&finished_state);
+        if let Some(refs) = live_raw_transform_refs(&finished_state) {
+            if bake_raw_refs_live_transform(app, refs) {
+                app.state.dirty = true;
+            }
+        }
         let finished_drag = matches!(
             finished_state,
             ToolState::DraggingPlacement { .. }
@@ -4263,6 +4224,7 @@ pub(crate) fn materialize_raw_paths_as_placements(
 
     let mut created_assets: Vec<(u16, u16, u16)> = Vec::new();
     let mut emptied_assets = std::collections::BTreeSet::new();
+    let mut touched_assets = std::collections::BTreeSet::new();
     for ((q0rg_id, layer_id, placement_idx), mut path_indices) in groups {
         let placement = app
             .state
@@ -4284,6 +4246,7 @@ pub(crate) fn materialize_raw_paths_as_placements(
         let Target::Asset(original_asset_id) = placement.target else {
             return None;
         };
+        touched_assets.insert(original_asset_id);
 
         // Raw editing must never mutate another frame or transformed instance
         // that happens to reference the same vector asset.
@@ -4374,6 +4337,8 @@ pub(crate) fn materialize_raw_paths_as_placements(
         }
 
         let selected_asset_id = next_asset_id(&app.state.project);
+        touched_assets.insert(writable_asset_id);
+        touched_assets.insert(selected_asset_id);
         app.state.project.assets.push(Asset::Vector(VectorAsset {
             asset_id: selected_asset_id,
             paths: selected_paths,
@@ -4477,8 +4442,234 @@ pub(crate) fn materialize_raw_paths_as_placements(
         return None;
     }
     app.state.dirty = true;
-    app.textures.invalidate();
+    app.textures.invalidate_assets(touched_assets);
     Some(placements)
+}
+
+fn raw_refs_cover_whole_placements(project: &ProjectV2, refs: &[PathRef]) -> bool {
+    let mut grouped: std::collections::BTreeMap<
+        (u16, u16, usize),
+        std::collections::BTreeSet<usize>,
+    > = std::collections::BTreeMap::new();
+    for reference in refs {
+        grouped
+            .entry((
+                reference.q0rg_id,
+                reference.layer_id,
+                reference.placement_idx,
+            ))
+            .or_default()
+            .insert(reference.path_idx);
+    }
+    !grouped.is_empty()
+        && grouped
+            .into_iter()
+            .all(|((q0rg_id, layer_id, placement_idx), selected)| {
+                let Some(placement) = project
+                    .q0rgs
+                    .iter()
+                    .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+                    .and_then(|q0rg| q0rg.layers.iter().find(|layer| layer.layer_id == layer_id))
+                    .and_then(|layer| layer.placements.get(placement_idx))
+                else {
+                    return false;
+                };
+                if placement.transform != Transform2D::IDENTITY {
+                    return false;
+                }
+                let Target::Asset(asset_id) = placement.target else {
+                    return false;
+                };
+                let Some(Asset::Vector(vector)) =
+                    project.assets.iter().find(|asset| asset.id() == asset_id)
+                else {
+                    return false;
+                };
+                selected.len() == vector.paths.len()
+                    && selected.iter().copied().eq(0..vector.paths.len())
+            })
+}
+
+fn full_raw_refs_for_placements(
+    project: &ProjectV2,
+    placements: &[PlacementRef],
+) -> Option<Vec<PathRef>> {
+    let mut refs = Vec::new();
+    for placement_ref in placements {
+        let placement = project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == placement_ref.q0rg_id)?
+            .layers
+            .iter()
+            .find(|layer| layer.layer_id == placement_ref.layer_id)?
+            .placements
+            .get(placement_ref.placement_idx)?;
+        let Target::Asset(asset_id) = placement.target else {
+            return None;
+        };
+        let Asset::Vector(vector) = project.assets.iter().find(|asset| asset.id() == asset_id)?
+        else {
+            return None;
+        };
+        refs.extend((0..vector.paths.len()).map(|path_idx| PathRef {
+            q0rg_id: placement_ref.q0rg_id,
+            layer_id: placement_ref.layer_id,
+            placement_idx: placement_ref.placement_idx,
+            path_idx,
+        }));
+    }
+    (!refs.is_empty()).then_some(refs)
+}
+
+/// Live Select transforms must never rewrite/tessellate thousands of raw anchors
+/// on every pointer event. Isolate a partial connected selection once, then the
+/// renderer can move its immutable cached vector through the placement affine.
+fn isolate_raw_refs_for_live_transform(
+    app: &mut EditorApp,
+    refs: Vec<PathRef>,
+) -> Option<Vec<PathRef>> {
+    if refs.is_empty() {
+        return None;
+    }
+    if raw_refs_cover_whole_placements(&app.state.project, &refs) {
+        return Some(refs);
+    }
+    let placements = materialize_raw_paths_as_placements(app, &refs)?;
+    full_raw_refs_for_placements(&app.state.project, &placements)
+}
+
+fn set_raw_refs_live_transform(
+    project: &mut ProjectV2,
+    refs: &[PathRef],
+    transform: Affine,
+) -> bool {
+    let Some(next) = crate::app::affine_to_transform(transform) else {
+        return false;
+    };
+    let unique: std::collections::BTreeSet<(u16, u16, usize)> = refs
+        .iter()
+        .map(|reference| {
+            (
+                reference.q0rg_id,
+                reference.layer_id,
+                reference.placement_idx,
+            )
+        })
+        .collect();
+    let mut changed = false;
+    for (q0rg_id, layer_id, placement_idx) in unique {
+        let Some(placement) = project
+            .q0rgs
+            .iter_mut()
+            .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+            .and_then(|q0rg| {
+                q0rg.layers
+                    .iter_mut()
+                    .find(|layer| layer.layer_id == layer_id)
+            })
+            .and_then(|layer| layer.placements.get_mut(placement_idx))
+        else {
+            continue;
+        };
+        if placement.transform != next {
+            placement.transform = next;
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn bake_raw_refs_live_transform(app: &mut EditorApp, refs: &[PathRef]) -> bool {
+    let unique: std::collections::BTreeSet<(u16, u16, usize)> = refs
+        .iter()
+        .map(|reference| {
+            (
+                reference.q0rg_id,
+                reference.layer_id,
+                reference.placement_idx,
+            )
+        })
+        .collect();
+    let mut changed = false;
+    for (q0rg_id, layer_id, placement_idx) in unique {
+        let Some((asset_id, transform)) = app
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+            .and_then(|q0rg| q0rg.layers.iter().find(|layer| layer.layer_id == layer_id))
+            .and_then(|layer| layer.placements.get(placement_idx))
+            .and_then(|placement| match placement.target {
+                Target::Asset(asset_id) => Some((asset_id, placement.transform)),
+                Target::Q0rg(_) => None,
+            })
+        else {
+            continue;
+        };
+        if transform == Transform2D::IDENTITY {
+            continue;
+        }
+        let affine = Affine::from_transform(transform);
+        if let Some(Asset::Vector(vector)) = app
+            .state
+            .project
+            .assets
+            .iter_mut()
+            .find(|asset| asset.id() == asset_id)
+        {
+            for path in &mut vector.paths {
+                for anchor in &mut path.anchors {
+                    anchor.point = affine.apply(anchor.point);
+                    if let Some(point) = &mut anchor.in_handle {
+                        *point = affine.apply(*point);
+                    }
+                    if let Some(point) = &mut anchor.out_handle {
+                        *point = affine.apply(*point);
+                    }
+                }
+            }
+            changed = true;
+        }
+        #[cfg(feature = "appearance-mask-eraser")]
+        if let Some(appearance) = app.state.project.asset_appearances.get_mut(&asset_id) {
+            appearance.field_transform = Affine::compose(affine, appearance.field_transform);
+            changed = true;
+        }
+        if let Some(placement) = app
+            .state
+            .project
+            .q0rgs
+            .iter_mut()
+            .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+            .and_then(|q0rg| {
+                q0rg.layers
+                    .iter_mut()
+                    .find(|layer| layer.layer_id == layer_id)
+            })
+            .and_then(|layer| layer.placements.get_mut(placement_idx))
+        {
+            placement.transform = Transform2D::IDENTITY;
+        }
+        app.textures.invalidate_asset(asset_id);
+    }
+    changed
+}
+
+fn live_raw_transform_refs(state: &ToolState) -> Option<&[PathRef]> {
+    match state {
+        ToolState::DraggingPaths { refs, .. }
+        | ToolState::DraggingRawHandle { refs, .. }
+        | ToolState::DraggingRawRotate { refs, .. }
+        | ToolState::DraggingRawSkew { refs, .. }
+        | ToolState::DraggingGroup { refs, .. }
+            if !refs.is_empty() =>
+        {
+            Some(refs)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -4591,6 +4782,7 @@ fn raw_path_refs_ui_bounds(project: &ProjectV2, refs: &[PathRef]) -> Option<(f32
             continue;
         };
 
+        let placement_transform = Affine::from_transform(placement.transform);
         #[cfg(feature = "appearance-mask-eraser")]
         if let Some(appearance) = project.asset_appearances.get(&asset_id) {
             if let Some(bounds) = crate::appearance::fast_visible_material_bounds_for_paths(
@@ -4598,7 +4790,10 @@ fn raw_path_refs_ui_bounds(project: &ProjectV2, refs: &[PathRef]) -> Option<(f32
                 Some(appearance),
                 &path_indices,
             ) {
-                result = union_bounds(result, Some(bounds));
+                result = union_bounds(
+                    result,
+                    transform_axis_aligned_bounds(bounds, placement_transform),
+                );
             }
             // Appearance geometry may keep a hidden carrier after erase/split.
             // Never fall back to that carrier for the interactive selection box.
@@ -4610,7 +4805,15 @@ fn raw_path_refs_ui_bounds(project: &ProjectV2, refs: &[PathRef]) -> Option<(f32
             let Some(path) = vector.paths.get(path_idx) else {
                 continue;
             };
-            for point in flatten_path(path) {
+            // Bezier curves are contained by their control-point hull. Using the
+            // anchors + handles gives a conservative transform frame in O(anchors)
+            // without re-flattening a 100k-point display contour every repaint.
+            for point in path.anchors.iter().flat_map(|anchor| {
+                std::iter::once(anchor.point)
+                    .chain(anchor.in_handle)
+                    .chain(anchor.out_handle)
+            }) {
+                let point = placement_transform.apply(point);
                 if !point.x.is_finite() || !point.y.is_finite() {
                     continue;
                 }
@@ -4989,7 +5192,7 @@ fn isolate_partial_appearance_raw_refs(app: &mut EditorApp, refs: Vec<PathRef>) 
                 .project
                 .asset_appearances
                 .insert(asset_id, original_appearance.clone());
-            app.textures.invalidate();
+            app.textures.invalidate_asset(asset_id);
         }
 
         let mut selected_paths = Vec::new();
@@ -5087,7 +5290,7 @@ fn isolate_partial_appearance_raw_refs(app: &mut EditorApp, refs: Vec<PathRef>) 
                 Some(reference)
             })
             .collect();
-        app.textures.invalidate();
+        app.textures.invalidate_asset(asset_id);
         app.state.dirty = true;
         remapped
     }
@@ -5132,7 +5335,7 @@ fn capture_whole_asset_appearances_for_raw_refs(
         }
 
         let mut captured = Vec::new();
-        let mut froze_source = false;
+        let mut frozen_assets = Vec::new();
         for (asset_id, selected) in grouped {
             let Some(Asset::Vector(vector)) =
                 project.assets.iter().find(|asset| asset.id() == asset_id)
@@ -5169,20 +5372,20 @@ fn capture_whole_asset_appearances_for_raw_refs(
             // geometry starts moving. If an older buggy edit left a non-identity
             // field, freeze_material_source_from_current_body maps it back through
             // the inverse field first.
-            froze_source |=
-                crate::appearance::freeze_material_source_from_current_body(&vector, appearance);
+            if crate::appearance::freeze_material_source_from_current_body(&vector, appearance) {
+                frozen_assets.push(asset_id);
+            }
             captured.push(AppearanceTransformSnapshot {
                 asset_id,
                 field_transform: appearance.field_transform,
             });
         }
-        if froze_source {
-            app.textures.invalidate();
-        }
+        app.textures.invalidate_assets(frozen_assets);
         captured
     }
 }
 
+#[cfg(test)]
 fn transform_captured_appearances(
     project: &mut ProjectV2,
     start_appearances: &[AppearanceTransformSnapshot],
@@ -5212,6 +5415,7 @@ fn transform_captured_appearances(
     }
 }
 
+#[cfg(test)]
 fn translate_captured_appearances(
     project: &mut ProjectV2,
     start_appearances: &[AppearanceTransformSnapshot],
@@ -5228,6 +5432,7 @@ fn translate_captured_appearances(
     )
 }
 
+#[cfg(test)]
 fn apply_raw_affine_snapshot(
     project: &mut ProjectV2,
     refs: &[PathRef],
@@ -5260,6 +5465,9 @@ fn begin_dragging_raw_paths(
         return false;
     };
     let refs = isolate_partial_appearance_raw_refs(app, refs);
+    let Some(refs) = isolate_raw_refs_for_live_transform(app, refs) else {
+        return false;
+    };
     let start_paths: Vec<VPath> = refs
         .iter()
         .filter_map(|r| {
@@ -5313,6 +5521,9 @@ fn begin_scaling_raw_paths(
         return false;
     };
     let refs = isolate_partial_appearance_raw_refs(app, refs);
+    let Some(refs) = isolate_raw_refs_for_live_transform(app, refs) else {
+        return false;
+    };
     let start_paths: Vec<VPath> = refs
         .iter()
         .filter_map(|r| {
@@ -5360,6 +5571,9 @@ fn begin_rotating_raw_paths(
         return false;
     };
     let refs = isolate_partial_appearance_raw_refs(app, refs);
+    let Some(refs) = isolate_raw_refs_for_live_transform(app, refs) else {
+        return false;
+    };
     let start_paths: Vec<VPath> = refs
         .iter()
         .filter_map(|r| {
@@ -5408,6 +5622,9 @@ fn begin_skewing_raw_paths(
         return false;
     };
     let refs = isolate_partial_appearance_raw_refs(app, refs);
+    let Some(refs) = isolate_raw_refs_for_live_transform(app, refs) else {
+        return false;
+    };
     let start_paths: Vec<VPath> = refs
         .iter()
         .filter_map(|r| {
@@ -5498,6 +5715,7 @@ fn raw_handle_scale(
     Some((anchor, scale_x, scale_y))
 }
 
+#[cfg(test)]
 fn replace_raw_path_mapped<F>(project: &mut ProjectV2, r: PathRef, source: &VPath, map: F) -> bool
 where
     F: Fn(Vec2) -> Vec2,
@@ -5540,6 +5758,27 @@ where
         }
     }
     true
+}
+
+fn raw_placement_asset_id(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    placement_idx: usize,
+) -> Option<u16> {
+    project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)?
+        .layers
+        .iter()
+        .find(|layer| layer.layer_id == layer_id)?
+        .placements
+        .get(placement_idx)
+        .and_then(|placement| match placement.target {
+            Target::Asset(asset_id) => Some(asset_id),
+            Target::Q0rg(_) => None,
+        })
 }
 
 fn raw_path_clone(
@@ -8019,6 +8258,7 @@ struct AppearanceSelectionOverlay<'a> {
     rect: egui::Rect,
     vector: &'a VectorAsset,
     appearance: &'a q0s_format::v2::VectorAppearance,
+    placement_transform: Affine,
     subset_path_indices: Option<&'a [usize]>,
     accent: Color32,
 }
@@ -8034,6 +8274,7 @@ fn draw_appearance_selection_overlay(
         rect,
         vector,
         appearance,
+        placement_transform,
         subset_path_indices,
         accent,
     } = request;
@@ -8061,12 +8302,20 @@ fn draw_appearance_selection_overlay(
         return;
     }
 
-    // The selection visual is screen-space: both the repeating dot UVs and the
-    // one/two-pixel bevel strokes depend on the current view. Cache the exact
-    // final meshes for a stable selection/view instead of asking lyon to
-    // tessellate the same 30k-point contours every repaint.
     let texture = selection_stipple_texture(&clipped, accent);
     let field = appearance.field_transform;
+    let pure_translation = (placement_transform.a11 - 1.0).abs() <= 1.0e-6
+        && placement_transform.a12.abs() <= 1.0e-6
+        && placement_transform.a21.abs() <= 1.0e-6
+        && (placement_transform.a22 - 1.0).abs() <= 1.0e-6;
+    // Translation is by far the hottest Select path. Keep one screen-space base
+    // paint for the current view and move that mesh cheaply instead of asking
+    // lyon to rebuild 1px/2px bevel geometry on every pointer event.
+    let cache_transform = if pure_translation {
+        Affine::IDENTITY
+    } else {
+        placement_transform
+    };
     let key = SelectionPaintKey {
         asset_id: vector.asset_id,
         path_indices: path_indices.clone(),
@@ -8078,34 +8327,76 @@ fn draw_appearance_selection_overlay(
             field.tx.to_bits(),
             field.ty.to_bits(),
         ],
+        placement_transform_bits: [
+            cache_transform.a11.to_bits(),
+            cache_transform.a12.to_bits(),
+            cache_transform.a21.to_bits(),
+            cache_transform.a22.to_bits(),
+            cache_transform.tx.to_bits(),
+            cache_transform.ty.to_bits(),
+        ],
         view_origin_bits: [view.origin.x.to_bits(), view.origin.y.to_bits()],
         view_scale_bits: view.scale.to_bits(),
         accent_rgba: [accent.r(), accent.g(), accent.b(), accent.a()],
         texture_id: texture.id(),
     };
-    if let Some(cached) = textures.selection_paint(&key) {
+
+    if textures.selection_paint(&key).is_none() {
+        let meshes = {
+            let Some(source) = textures.selection_stage_mesh(vector, appearance, &path_indices)
+            else {
+                return;
+            };
+            if pure_translation {
+                TextureCache::selection_screen_meshes_direct(
+                    source,
+                    Affine::IDENTITY,
+                    view,
+                    texture.id(),
+                    SELECTION_STIPPLE_SPACING_PX,
+                    accent,
+                )
+            } else {
+                TextureCache::selection_screen_meshes(
+                    source,
+                    placement_transform,
+                    view,
+                    texture.id(),
+                    SELECTION_STIPPLE_SPACING_PX,
+                    accent,
+                )
+            }
+        };
+        textures.insert_selection_paint(key.clone(), CachedSelectionPaint { meshes });
+    }
+
+    let Some(cached) = textures.selection_paint(&key) else {
+        return;
+    };
+    if pure_translation
+        && (placement_transform.tx.abs() > 1.0e-6 || placement_transform.ty.abs() > 1.0e-6)
+    {
+        let delta = egui::vec2(
+            placement_transform.tx * view.scale,
+            placement_transform.ty * view.scale,
+        );
+        let tile = SELECTION_STIPPLE_SPACING_PX.max(1.0);
+        for source in &cached.meshes {
+            let mut mesh = source.clone();
+            let stipple = mesh.texture_id == texture.id();
+            for vertex in &mut mesh.vertices {
+                vertex.pos += delta;
+                if stipple {
+                    vertex.uv = pos2(vertex.pos.x / tile, vertex.pos.y / tile);
+                }
+            }
+            clipped.add(Shape::Mesh(mesh));
+        }
+    } else {
         for mesh in &cached.meshes {
             clipped.add(Shape::Mesh(mesh.clone()));
         }
-        return;
     }
-
-    let meshes = {
-        let Some(source) = textures.selection_stage_mesh(vector, appearance, &path_indices) else {
-            return;
-        };
-        TextureCache::selection_screen_meshes(
-            source,
-            view,
-            texture.id(),
-            SELECTION_STIPPLE_SPACING_PX,
-            accent,
-        )
-    };
-    for mesh in &meshes {
-        clipped.add(Shape::Mesh(mesh.clone()));
-    }
-    textures.insert_selection_paint(key, CachedSelectionPaint { meshes });
 }
 
 fn draw_raw_area_selection(
@@ -8124,7 +8415,8 @@ fn draw_raw_area_selection(
     let visible_rect = selection_rect.intersect(painter.clip_rect());
     let clipped = painter.with_clip_rect(visible_rect);
     let accent = selection_color(app);
-    let mut surfaces = Vec::new();
+    #[cfg(not(feature = "appearance-mask-eraser"))]
+    let mut surfaces: Vec<MultiPolygon<f64>> = Vec::new();
     for r in placements {
         let Some(placement) = app
             .state
@@ -8146,7 +8438,30 @@ fn draw_raw_area_selection(
             continue;
         };
         #[cfg(feature = "appearance-mask-eraser")]
-        if let Some(appearance) = app.state.project.asset_appearances.get(&asset_id) {
+        {
+            if let Some(appearance) = app.state.project.asset_appearances.get(&asset_id) {
+                draw_appearance_selection_overlay(
+                    &clipped,
+                    &mut app.textures,
+                    AppearanceSelectionOverlay {
+                        view,
+                        rect: selection_rect,
+                        vector,
+                        appearance,
+                        placement_transform: Affine::from_transform(placement.transform),
+                        subset_path_indices: None,
+                        accent,
+                    },
+                );
+                continue;
+            }
+            let plain_appearance = q0s_format::v2::VectorAppearance {
+                material: q0s_format::v2::VectorMaterial::Solid,
+                erase_mask: Vec::new(),
+                material_source: Vec::new(),
+                clip_mask: Vec::new(),
+                field_transform: Affine::IDENTITY,
+            };
             draw_appearance_selection_overlay(
                 &clipped,
                 &mut app.textures,
@@ -8154,29 +8469,35 @@ fn draw_raw_area_selection(
                     view,
                     rect: selection_rect,
                     vector,
-                    appearance,
+                    appearance: &plain_appearance,
+                    placement_transform: Affine::from_transform(placement.transform),
                     subset_path_indices: None,
                     accent,
                 },
             );
-            // Appearance visuals are painted directly from the selected geometry; keep
-            // them out of the plain raw-fill union below.
             continue;
         }
-        let surface = raw_selectable_fill_surface(&app.state.project, asset_id, vector);
-        surfaces.push(surface);
+        #[cfg(not(feature = "appearance-mask-eraser"))]
+        {
+            let surface = raw_selectable_fill_surface(&app.state.project, asset_id, vector);
+            surfaces.push(surface);
+        }
     }
 
     // Animate-style stipple is evaluated against one unioned surface, so holes
     // remain empty. Density is fixed in screen space at every zoom; only the
     // visible viewport is sampled so off-screen geometry does not create work.
+    #[cfg(not(feature = "appearance-mask-eraser"))]
     let surface = match surfaces.len() {
         0 => MultiPolygon(Vec::new()),
         1 => surfaces.pop().expect("single selected surface"),
         _ => geo::unary_union(surfaces.iter()),
     };
-    let selection_contours = surface_to_screen_contours(&surface, view);
-    paint_selection_surface(&clipped, &selection_contours, accent);
+    #[cfg(not(feature = "appearance-mask-eraser"))]
+    {
+        let selection_contours = surface_to_screen_contours(&surface, view);
+        paint_selection_surface(&clipped, &selection_contours, accent);
+    }
     if draw_box {
         draw_flash_selection_box(painter, selection_rect, accent);
     }
@@ -8247,9 +8568,10 @@ fn draw_raw_paths_overlay(
             if path.closed && vector.fill.is_some() {
                 continue;
             }
+            let placement_transform = Affine::from_transform(placement.transform);
             let raw_points: Vec<Pos2> = flatten_path(path)
                 .into_iter()
-                .map(|point| stage_to_screen(point, view))
+                .map(|point| stage_to_screen(placement_transform.apply(point), view))
                 .collect();
             let points = crate::render::sanitize_display_polyline(&raw_points, 2.0, path.closed);
             if points.len() >= 2 {
@@ -8309,7 +8631,13 @@ fn draw_raw_paths_overlay(
                 }
                 bounds
             };
-            if let Some((min_x, min_y, max_x, max_y)) = fast_bounds.or_else(fallback_bounds) {
+            if let Some(bounds) = fast_bounds.or_else(fallback_bounds) {
+                let placement_transform = Affine::from_transform(placement.transform);
+                let Some((min_x, min_y, max_x, max_y)) =
+                    transform_axis_aligned_bounds(bounds, placement_transform)
+                else {
+                    continue;
+                };
                 let rect = egui::Rect::from_min_max(
                     stage_to_screen(Vec2::new(min_x, min_y), view),
                     stage_to_screen(Vec2::new(max_x, max_y), view),
@@ -8322,6 +8650,7 @@ fn draw_raw_paths_overlay(
                         rect,
                         vector,
                         appearance,
+                        placement_transform: Affine::from_transform(placement.transform),
                         subset_path_indices: Some(&closed_indices),
                         accent,
                     },
@@ -8330,13 +8659,44 @@ fn draw_raw_paths_overlay(
             continue;
         }
 
-        let surface =
-            raw_selectable_paths_surface(&app.state.project, asset_id, vector, &closed_indices);
-        let contours = surface_to_screen_contours(&surface, view);
-        if contours.is_empty() {
+        #[cfg(feature = "appearance-mask-eraser")]
+        {
+            // Plain raw fills use exactly the same cached stage mesh as Advanced
+            // selection. The synthetic solid appearance is render-only metadata:
+            // it keeps the path topology untouched while avoiding a fresh
+            // MultiPolygon -> VPath -> flatten -> tessellate cycle every repaint.
+            let plain_appearance = q0s_format::v2::VectorAppearance {
+                material: q0s_format::v2::VectorMaterial::Solid,
+                erase_mask: Vec::new(),
+                material_source: Vec::new(),
+                clip_mask: Vec::new(),
+                field_transform: Affine::IDENTITY,
+            };
+            draw_appearance_selection_overlay(
+                painter,
+                &mut app.textures,
+                AppearanceSelectionOverlay {
+                    view,
+                    rect: painter.clip_rect(),
+                    vector,
+                    appearance: &plain_appearance,
+                    placement_transform: Affine::from_transform(placement.transform),
+                    subset_path_indices: Some(&closed_indices),
+                    accent,
+                },
+            );
             continue;
         }
-        paint_selection_surface(painter, &contours, accent);
+        #[cfg(not(feature = "appearance-mask-eraser"))]
+        {
+            let surface =
+                raw_selectable_paths_surface(&app.state.project, asset_id, vector, &closed_indices);
+            let contours = surface_to_screen_contours(&surface, view);
+            if contours.is_empty() {
+                continue;
+            }
+            paint_selection_surface(painter, &contours, accent);
+        }
     }
 
     if let Some((min_x, min_y, max_x, max_y)) = selection_frame {
@@ -13012,6 +13372,150 @@ mod tests {
     }
 
     #[test]
+    fn raw_drag_moves_isolated_placement_then_bakes_once_without_moving_neighbor() {
+        let square = |x: f32| VPath {
+            anchors: vec![
+                anchor(Vec2::new(x, 0.0)),
+                anchor(Vec2::new(x + 20.0, 0.0)),
+                anchor(Vec2::new(x + 20.0, 20.0)),
+                anchor(Vec2::new(x, 20.0)),
+            ],
+            closed: true,
+        };
+        let mut app = EditorApp::default();
+        app.state.project.assets = vec![Asset::Vector(VectorAsset {
+            asset_id: 1,
+            paths: vec![square(0.0), square(100.0)],
+            fill: Some(Rgba {
+                r: 20,
+                g: 30,
+                b: 40,
+                a: 255,
+            }),
+            stroke: None,
+        })];
+        app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            frame: 0,
+            target: Target::Asset(1),
+            transform: Transform2D::IDENTITY,
+            tween: Tween::None,
+        }];
+
+        let source_ref = PathRef {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: 0,
+            path_idx: 0,
+        };
+        assert!(begin_dragging_raw_paths(
+            &mut app,
+            vec![source_ref],
+            Vec2::new(10.0, 10.0),
+            "test drag",
+        ));
+        let ToolState::DraggingPaths { refs, .. } = app.session.tool_state.clone() else {
+            panic!("raw fill must enter path drag")
+        };
+        assert_eq!(refs.len(), 1);
+        assert_eq!(app.state.project.q0rgs[0].layers[0].placements.len(), 2);
+
+        let selected_before = raw_path_clone(
+            &app.state.project,
+            refs[0].q0rg_id,
+            refs[0].layer_id,
+            refs[0].placement_idx,
+            refs[0].path_idx,
+        )
+        .expect("isolated selected path");
+        let neighbor_before = app
+            .state
+            .project
+            .assets
+            .iter()
+            .find_map(|asset| match asset {
+                Asset::Vector(vector) if vector.asset_id == 1 => Some(vector.clone()),
+                _ => None,
+            })
+            .expect("stationary neighbor asset");
+        let before_bounds = raw_path_refs_ui_bounds(&app.state.project, &refs).expect("bounds");
+
+        let delta = Vec2::new(25.0, 7.0);
+        assert!(set_raw_refs_live_transform(
+            &mut app.state.project,
+            &refs,
+            Affine {
+                tx: delta.x,
+                ty: delta.y,
+                ..Affine::IDENTITY
+            },
+        ));
+        let selected_during = raw_path_clone(
+            &app.state.project,
+            refs[0].q0rg_id,
+            refs[0].layer_id,
+            refs[0].placement_idx,
+            refs[0].path_idx,
+        )
+        .expect("selected path during drag");
+        assert_eq!(selected_during, selected_before);
+        let during_bounds =
+            raw_path_refs_ui_bounds(&app.state.project, &refs).expect("moved bounds");
+        assert!((during_bounds.0 - (before_bounds.0 + delta.x)).abs() < 1.0e-4);
+        assert!((during_bounds.1 - (before_bounds.1 + delta.y)).abs() < 1.0e-4);
+        let neighbor_during = app
+            .state
+            .project
+            .assets
+            .iter()
+            .find_map(|asset| match asset {
+                Asset::Vector(vector) if vector.asset_id == 1 => Some(vector.clone()),
+                _ => None,
+            })
+            .expect("neighbor during drag");
+        assert_eq!(neighbor_during, neighbor_before);
+
+        assert!(bake_raw_refs_live_transform(&mut app, &refs));
+        let selected_after = raw_path_clone(
+            &app.state.project,
+            refs[0].q0rg_id,
+            refs[0].layer_id,
+            refs[0].placement_idx,
+            refs[0].path_idx,
+        )
+        .expect("selected path after release");
+        assert!(
+            (selected_after.anchors[0].point.x - (selected_before.anchors[0].point.x + delta.x))
+                .abs()
+                < 1.0e-4
+        );
+        assert!(
+            (selected_after.anchors[0].point.y - (selected_before.anchors[0].point.y + delta.y))
+                .abs()
+                < 1.0e-4
+        );
+        let placement = PlacementRef {
+            q0rg_id: refs[0].q0rg_id,
+            layer_id: refs[0].layer_id,
+            placement_idx: refs[0].placement_idx,
+        };
+        assert_eq!(
+            placement_ref_transform(&app.state.project, placement),
+            Some(Transform2D::IDENTITY)
+        );
+        let neighbor_after = app
+            .state
+            .project
+            .assets
+            .iter()
+            .find_map(|asset| match asset {
+                Asset::Vector(vector) if vector.asset_id == 1 => Some(vector.clone()),
+                _ => None,
+            })
+            .expect("neighbor after drag");
+        assert_eq!(neighbor_after, neighbor_before);
+    }
+
+    #[test]
     fn mixed_group_move_transforms_raw_path_and_object_together() {
         let square = |asset_id: u16| {
             Asset::Vector(VectorAsset {
@@ -13076,7 +13580,7 @@ mod tests {
         let ToolState::DraggingGroup {
             refs,
             start_paths,
-            start_appearances,
+            start_appearances: _,
             objects,
             start_transforms,
             operation,
@@ -13092,8 +13596,6 @@ mod tests {
             &mut app,
             GroupTransformData {
                 refs: &refs,
-                start_paths: &start_paths,
-                start_appearances: &start_appearances,
                 objects: &objects,
                 start_transforms: &start_transforms,
                 operation,
@@ -13104,6 +13606,41 @@ mod tests {
         let moved_pivot = selection_transform_pivot(&app).expect("moved pivot");
         assert!((moved_pivot.x - (start_pivot.x + 10.0)).abs() < 1.0e-4);
         assert!((moved_pivot.y - (start_pivot.y + 5.0)).abs() < 1.0e-4);
+        let live_raw_transform = placement_ref_transform(
+            &app.state.project,
+            PlacementRef {
+                q0rg_id: refs[0].q0rg_id,
+                layer_id: refs[0].layer_id,
+                placement_idx: refs[0].placement_idx,
+            },
+        )
+        .expect("live raw placement");
+        assert!((live_raw_transform.tx - 10.0).abs() < 1.0e-4);
+        assert!((live_raw_transform.ty - 5.0).abs() < 1.0e-4);
+        let live_path = raw_path_clone(
+            &app.state.project,
+            refs[0].q0rg_id,
+            refs[0].layer_id,
+            refs[0].placement_idx,
+            refs[0].path_idx,
+        )
+        .expect("live raw path");
+        assert_eq!(
+            live_path, start_paths[0],
+            "live drag must transform the cached placement instead of rewriting raw anchors"
+        );
+
+        assert!(bake_raw_refs_live_transform(&mut app, &refs));
+        let baked_transform = placement_ref_transform(
+            &app.state.project,
+            PlacementRef {
+                q0rg_id: refs[0].q0rg_id,
+                layer_id: refs[0].layer_id,
+                placement_idx: refs[0].placement_idx,
+            },
+        )
+        .expect("baked raw placement");
+        assert_eq!(baked_transform, Transform2D::IDENTITY);
         let moved_path = raw_path_clone(
             &app.state.project,
             refs[0].q0rg_id,
@@ -13111,7 +13648,7 @@ mod tests {
             refs[0].placement_idx,
             refs[0].path_idx,
         )
-        .expect("moved raw path");
+        .expect("baked raw path");
         assert!(
             (moved_path.anchors[0].point.x - (start_paths[0].anchors[0].point.x + 10.0)).abs()
                 < 1.0e-4

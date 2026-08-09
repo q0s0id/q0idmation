@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use geo::sweep::Cross;
 use geo::{
-    Area, BooleanOps, BoundingRect, Buffer, Contains, ConvexHull, Coord, Intersects, Line,
-    LineString, MultiPoint, MultiPolygon, Point, Polygon, SimplifyVwPreserve,
+    Area, BooleanOps, BoundingRect, Buffer, Contains, ConvexHull, Coord, Intersections, Intersects,
+    Line, LineString, MultiPoint, MultiPolygon, Point, Polygon, SimplifyVwPreserve,
 };
 use q0s_format::v2::{
     Anchor, Asset, Path as VPath, Placement, ProjectV2, Rgba, Target, Transform2D, Tween, Vec2,
@@ -1998,23 +1999,180 @@ fn append_raw_fill(
     }
     asset_id
 }
-pub(crate) fn vector_fill_geometry(vector: &VectorAsset) -> MultiPolygon<f64> {
-    let mut rings: Vec<(&VPath, Polygon<f64>, f64)> = vector
+#[derive(Clone, Debug)]
+struct FillBoundarySegment {
+    ring_index: usize,
+    segment_index: usize,
+    segment_count: usize,
+    line: Line<f64>,
+}
+
+impl Cross for FillBoundarySegment {
+    type Scalar = f64;
+
+    fn line(&self) -> Line<f64> {
+        self.line
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct VectorFillTopology {
+    pub surface: MultiPolygon<f64>,
+    /// Present only when the input consists of simple, mutually non-crossing
+    /// rings. In that common/canonical case every output polygon is assembled
+    /// directly from source rings and we know exactly which raw paths own its
+    /// visible exterior + holes without geometric proximity scans.
+    pub component_path_indices: Option<Vec<Vec<usize>>>,
+}
+
+fn canonical_vector_fill_topology(vector: &VectorAsset) -> Option<VectorFillTopology> {
+    struct Ring {
+        path_index: usize,
+        polygon: Polygon<f64>,
+        area: f64,
+        bounds: (f64, f64, f64, f64),
+    }
+
+    let mut rings = Vec::new();
+    let mut segments = Vec::new();
+    for (path_index, path) in vector
+        .paths
+        .iter()
+        .enumerate()
+        .filter(|(_, path)| path.closed)
+    {
+        let polygon = path_to_polygon(path)?;
+        let area = signed_ring_area(polygon.exterior());
+        if area.abs() <= 1.0e-8 {
+            continue;
+        }
+        let bounds = polygon.bounding_rect()?;
+        let coords = &polygon.exterior().0;
+        let segment_count = coords.len().saturating_sub(1);
+        if segment_count < 3 {
+            continue;
+        }
+        let ring_index = rings.len();
+        segments.extend(
+            coords
+                .windows(2)
+                .enumerate()
+                .filter_map(|(segment_index, pair)| {
+                    let line = Line::new(pair[0], pair[1]);
+                    (line.start != line.end).then_some(FillBoundarySegment {
+                        ring_index,
+                        segment_index,
+                        segment_count,
+                        line,
+                    })
+                }),
+        );
+        rings.push(Ring {
+            path_index,
+            polygon,
+            area,
+            bounds: (
+                bounds.min().x,
+                bounds.min().y,
+                bounds.max().x,
+                bounds.max().y,
+            ),
+        });
+    }
+    if rings.is_empty() {
+        return Some(VectorFillTopology {
+            surface: MultiPolygon(Vec::new()),
+            component_path_indices: Some(Vec::new()),
+        });
+    }
+
+    // Canonical raw-fill assets have simple rings that may nest but never cross.
+    // Prove that cheaply with the sweep-line iterator. If an imported/legacy
+    // vector really contains crossing or self-intersecting rings, keep the exact
+    // old boolean path below instead of guessing topology.
+    for (left, right, _) in Intersections::from_iter(segments) {
+        if left.ring_index != right.ring_index {
+            return None;
+        }
+        let distance = left.segment_index.abs_diff(right.segment_index);
+        let adjacent = distance <= 1 || distance + 1 == left.segment_count;
+        if !adjacent {
+            return None;
+        }
+    }
+
+    rings.sort_by(|left, right| right.area.abs().total_cmp(&left.area.abs()));
+    let mut inside_windings = Vec::with_capacity(rings.len());
+    let mut owners: Vec<Option<usize>> = Vec::with_capacity(rings.len());
+    let mut exteriors: Vec<LineString<f64>> = Vec::new();
+    let mut holes: Vec<Vec<LineString<f64>>> = Vec::new();
+    let mut component_path_indices: Vec<Vec<usize>> = Vec::new();
+
+    for index in 0..rings.len() {
+        let ring = &rings[index];
+        let sample_coord = ring.polygon.exterior().0.first().copied()?;
+        let sample = Point::new(sample_coord.x, sample_coord.y);
+        let parent = (0..index).rev().find(|candidate| {
+            let candidate = &rings[*candidate];
+            candidate.bounds.0 <= sample.x()
+                && candidate.bounds.1 <= sample.y()
+                && candidate.bounds.2 >= sample.x()
+                && candidate.bounds.3 >= sample.y()
+                && candidate.polygon.contains(&sample)
+        });
+        let outside_winding = parent.map(|parent| inside_windings[parent]).unwrap_or(0);
+        let inside_winding = outside_winding + if ring.area > 0.0 { 1 } else { -1 };
+        let parent_owner = parent.and_then(|parent| owners[parent]);
+
+        let owner = if outside_winding == 0 && inside_winding != 0 {
+            let owner = exteriors.len();
+            exteriors.push(ring.polygon.exterior().clone());
+            holes.push(Vec::new());
+            component_path_indices.push(vec![ring.path_index]);
+            Some(owner)
+        } else if outside_winding != 0 && inside_winding == 0 {
+            if let Some(owner) = parent_owner {
+                holes[owner].push(ring.polygon.exterior().clone());
+                component_path_indices[owner].push(ring.path_index);
+            }
+            parent_owner
+        } else {
+            parent_owner
+        };
+        owners.push(owner);
+        inside_windings.push(inside_winding);
+    }
+
+    let surface = MultiPolygon(
+        exteriors
+            .into_iter()
+            .zip(holes)
+            .map(|(exterior, interiors)| Polygon::new(exterior, interiors))
+            .collect(),
+    );
+    Some(VectorFillTopology {
+        surface,
+        component_path_indices: Some(component_path_indices),
+    })
+}
+
+fn vector_fill_geometry_boolean(vector: &VectorAsset) -> MultiPolygon<f64> {
+    let mut rings: Vec<(Polygon<f64>, f64)> = vector
         .paths
         .iter()
         .filter(|path| path.closed)
         .filter_map(|path| {
             let polygon = path_to_polygon(path)?;
             let area = signed_ring_area(polygon.exterior());
-            (area.abs() > 1.0e-8).then_some((path, polygon, area))
+            (area.abs() > 1.0e-8).then_some((polygon, area))
         })
         .collect();
-    rings.sort_by(|left, right| right.2.abs().total_cmp(&left.2.abs()));
+    rings.sort_by(|left, right| right.1.abs().total_cmp(&left.1.abs()));
 
     let mut surface = MultiPolygon(Vec::new());
     let mut inside_windings: Vec<i32> = Vec::with_capacity(rings.len());
     for index in 0..rings.len() {
-        let (_, polygon, area) = &rings[index];
+        let (polygon, area) = &rings[index];
         let sample = polygon
             .exterior()
             .0
@@ -2023,14 +2181,11 @@ pub(crate) fn vector_fill_geometry(vector: &VectorAsset) -> MultiPolygon<f64> {
         let parent = sample.and_then(|point| {
             (0..index)
                 .rev()
-                .find(|candidate| rings[*candidate].1.contains(&point))
+                .find(|candidate| rings[*candidate].0.contains(&point))
         });
         let outside_winding = parent.map(|parent| inside_windings[parent]).unwrap_or(0);
         let inside_winding = outside_winding + if *area > 0.0 { 1 } else { -1 };
 
-        // Evaluate NonZero fill at each nested boundary. A positive island
-        // inside a negative hole crosses 0 -> 1 and must be added back; doing
-        // all unions before all differences erased that island entirely.
         if outside_winding == 0 && inside_winding != 0 {
             surface = surface.union(polygon);
         } else if outside_winding != 0 && inside_winding == 0 {
@@ -2039,6 +2194,17 @@ pub(crate) fn vector_fill_geometry(vector: &VectorAsset) -> MultiPolygon<f64> {
         inside_windings.push(inside_winding);
     }
     surface
+}
+
+pub(crate) fn vector_fill_topology(vector: &VectorAsset) -> VectorFillTopology {
+    canonical_vector_fill_topology(vector).unwrap_or_else(|| VectorFillTopology {
+        surface: vector_fill_geometry_boolean(vector),
+        component_path_indices: None,
+    })
+}
+
+pub(crate) fn vector_fill_geometry(vector: &VectorAsset) -> MultiPolygon<f64> {
+    vector_fill_topology(vector).surface
 }
 
 fn path_to_polygon(path: &VPath) -> Option<Polygon<f64>> {
