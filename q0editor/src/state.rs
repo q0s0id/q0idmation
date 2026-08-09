@@ -626,6 +626,14 @@ pub struct Session {
     pub brush: BrushSettings,
     pub brush_mode: BrushMode,
     pub advanced_brush: AdvancedBrushSettings,
+    /// Keeps the last Classic raster draft alive for the release frame. Stage
+    /// rendering happens before tool input, so without this handoff the newly
+    /// committed vector cannot appear until the next frame and the stroke
+    /// flashes invisible for one frame.
+    pub classic_brush_preview_handoff: bool,
+    /// Same one-frame handoff for Advanced Brush. Its preview is generated from
+    /// the stroke itself rather than the Classic preview texture.
+    pub advanced_brush_preview_handoff: Option<AdvancedBrushStroke>,
     /// Draft name used by the Advanced preset library.
     pub advanced_brush_preset_name: String,
     /// Original custom preset name being edited, so rename/update/delete act on
@@ -709,6 +717,8 @@ impl Session {
             brush: BrushSettings::default(),
             brush_mode: BrushMode::Classic,
             advanced_brush: AdvancedBrushSettings::default(),
+            classic_brush_preview_handoff: false,
+            advanced_brush_preview_handoff: None,
             advanced_brush_preset_name: "My Brush".to_string(),
             advanced_brush_selected_preset: None,
             advanced_brush_library_filter: BrushLibraryFilter::All,
