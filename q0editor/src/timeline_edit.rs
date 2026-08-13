@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use q0s_format::v2::{Layer, LayerKey, LayerMetadata, ProjectV2, Tween};
+use q0s_format::v2::{Layer, LayerKey, LayerMetadata, ProjectV2, RigChannel, Tween};
 
 use crate::state::{
     TimelineFrameClipboard, TimelineFrameClipboardRow, TimelineLayerClipboard,
@@ -12,6 +12,142 @@ fn q0rg_index(project: &ProjectV2, q0rg_id: u16) -> Option<usize> {
         .q0rgs
         .iter()
         .position(|q0rg| q0rg.q0rg_id == q0rg_id)
+}
+
+fn used_instance_ids(project: &ProjectV2) -> HashSet<u32> {
+    project
+        .q0rgs
+        .iter()
+        .flat_map(|q0rg| &q0rg.layers)
+        .flat_map(|layer| &layer.placements)
+        .filter_map(|placement| (placement.instance_id != 0).then_some(placement.instance_id))
+        .collect()
+}
+
+fn allocate_instance_id(used: &mut HashSet<u32>, next: &mut u32) -> Option<u32> {
+    while *next != 0 && used.contains(next) {
+        *next = next.checked_add(1)?;
+    }
+    if *next == 0 {
+        return None;
+    }
+    let value = *next;
+    used.insert(value);
+    *next = next.checked_add(1).unwrap_or(0);
+    Some(value)
+}
+
+fn selection_spans_all_drawable_layers(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    selected_layer_ids: &[u16],
+) -> bool {
+    let Some(q0rg) = project.q0rgs.iter().find(|q0rg| q0rg.q0rg_id == q0rg_id) else {
+        return false;
+    };
+    let drawable = q0rg
+        .layers
+        .iter()
+        .filter(|layer| !project.layer_is_folder(q0rg_id, layer.layer_id))
+        .map(|layer| layer.layer_id)
+        .collect::<HashSet<_>>();
+    !drawable.is_empty()
+        && selected_layer_ids.len() == drawable.len()
+        && selected_layer_ids.iter().all(|id| drawable.contains(id))
+}
+
+fn capture_rig_channels(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    first_frame: u16,
+    last_frame: u16,
+) -> Vec<RigChannel> {
+    q0s_format::rig::rig_for_q0rg(project, q0rg_id)
+        .map(|rig| {
+            rig.channels
+                .iter()
+                .filter_map(|channel| {
+                    let keys = channel
+                        .keys
+                        .iter()
+                        .copied()
+                        .filter(|key| (first_frame..=last_frame).contains(&key.frame))
+                        .map(|mut key| {
+                            key.frame -= first_frame;
+                            key
+                        })
+                        .collect::<Vec<_>>();
+                    (!keys.is_empty()).then_some(RigChannel {
+                        property: channel.property,
+                        keys,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn clear_rig_frame_range(project: &mut ProjectV2, q0rg_id: u16, first: u16, last: u16) {
+    if let Some(rig) = q0s_format::rig::rig_for_q0rg_mut(project, q0rg_id) {
+        for channel in &mut rig.channels {
+            channel
+                .keys
+                .retain(|key| !(first..=last).contains(&key.frame));
+        }
+        rig.channels.retain(|channel| !channel.keys.is_empty());
+    }
+}
+
+fn paste_rig_channels(
+    project: &mut ProjectV2,
+    q0rg_id: u16,
+    target_frame: u16,
+    width: u16,
+    channels: &[RigChannel],
+) {
+    if channels.is_empty() || width == 0 {
+        return;
+    }
+    let last = target_frame.saturating_add(width - 1);
+    clear_rig_frame_range(project, q0rg_id, target_frame, last);
+    let Some(rig) = q0s_format::rig::rig_for_q0rg_mut(project, q0rg_id) else {
+        return;
+    };
+    for channel in channels {
+        for key in &channel.keys {
+            q0s_format::rig::upsert_channel_key(
+                rig,
+                channel.property,
+                target_frame.saturating_add(key.frame),
+                key.value,
+                key.easing,
+            );
+        }
+    }
+}
+
+fn shift_rig_keys_after_removed_columns(
+    project: &mut ProjectV2,
+    q0rg_id: u16,
+    first_frame: u16,
+    last_frame: u16,
+    width: u16,
+) {
+    let Some(rig) = q0s_format::rig::rig_for_q0rg_mut(project, q0rg_id) else {
+        return;
+    };
+    for channel in &mut rig.channels {
+        channel
+            .keys
+            .retain(|key| !(first_frame..=last_frame).contains(&key.frame));
+        for key in &mut channel.keys {
+            if key.frame > last_frame {
+                key.frame -= width;
+            }
+        }
+        channel.keys.sort_by_key(|key| key.frame);
+    }
+    rig.channels.retain(|channel| !channel.keys.is_empty());
 }
 
 fn selected_frame_bounds(
@@ -59,7 +195,7 @@ pub fn capture_frames(
     let q0rg = project.q0rgs.iter().find(|q0rg| q0rg.q0rg_id == q0rg_id)?;
     let mut rows = Vec::with_capacity(layer_ids.len());
 
-    for layer_id in layer_ids {
+    for layer_id in layer_ids.iter().copied() {
         let layer = q0rg
             .layers
             .iter()
@@ -110,14 +246,22 @@ pub fn capture_frames(
         explicit_keyframes.sort_unstable();
         explicit_keyframes.dedup();
         rows.push(TimelineFrameClipboardRow {
+            source_layer_id: layer_id,
             explicit_keyframes,
             placements,
         });
     }
 
+    let rig_channels = if selection_spans_all_drawable_layers(project, q0rg_id, &layer_ids) {
+        capture_rig_channels(project, q0rg_id, first_frame, last_frame)
+    } else {
+        Vec::new()
+    };
+
     Some(TimelineFrameClipboard {
         width: last_frame - first_frame + 1,
         rows,
+        rig_channels,
     })
 }
 
@@ -150,6 +294,7 @@ pub fn clear_frames(
     selection: TimelineSelection,
 ) -> Option<usize> {
     let (layer_ids, first_frame, last_frame) = selected_frame_bounds(project, q0rg_id, selection)?;
+    let clear_rig = selection_spans_all_drawable_layers(project, q0rg_id, &layer_ids);
     let q0rg_index = q0rg_index(project, q0rg_id)?;
     let q0rg = &mut project.q0rgs[q0rg_index];
     let mut removed = 0;
@@ -161,6 +306,9 @@ pub fn clear_frames(
         let before = layer.placements.len();
         clear_frame_range(layer, first_frame, last_frame, true);
         removed += before - layer.placements.len();
+    }
+    if clear_rig {
+        clear_rig_frame_range(project, q0rg_id, first_frame, last_frame);
     }
     Some(removed)
 }
@@ -290,6 +438,13 @@ pub fn remove_selected_frame_columns(
     if old_count <= 1 {
         return Some(0);
     }
+    let width = last_frame - first_frame + 1;
+
+    if first_frame == 0 && last_frame == old_count - 1 {
+        clear_rig_frame_range(project, q0rg_id, 0, old_count - 1);
+    } else {
+        shift_rig_keys_after_removed_columns(project, q0rg_id, first_frame, last_frame, width);
+    }
 
     let q0rg = &mut project.q0rgs[q0rg_index];
     if first_frame == 0 && last_frame == old_count - 1 {
@@ -304,7 +459,6 @@ pub fn remove_selected_frame_columns(
         return Some(old_count - 1);
     }
 
-    let width = last_frame - first_frame + 1;
     q0rg.frame_count = old_count - width;
     for layer in &mut q0rg.layers {
         let mut shifted = Vec::with_capacity(layer.placements.len());
@@ -353,6 +507,7 @@ fn remove_frames_for_move(
     selection: TimelineSelection,
 ) -> Option<usize> {
     let (layer_ids, first_frame, last_frame) = selected_frame_bounds(project, q0rg_id, selection)?;
+    let clear_rig = selection_spans_all_drawable_layers(project, q0rg_id, &layer_ids);
     let q0rg_index = q0rg_index(project, q0rg_id)?;
     let q0rg = &mut project.q0rgs[q0rg_index];
     let mut removed = 0;
@@ -367,6 +522,9 @@ fn remove_frames_for_move(
             layer.ensure_explicit_keyframe(0);
         }
         removed += before - layer.placements.len();
+    }
+    if clear_rig {
+        clear_rig_frame_range(project, q0rg_id, first_frame, last_frame);
     }
     Some(removed)
 }
@@ -451,33 +609,79 @@ pub fn paste_frames(
     }
     let last_frame = target_frame.saturating_add(clipboard.width - 1);
     let q0rg_index = q0rg_index(project, q0rg_id)?;
-    let q0rg = &mut project.q0rgs[q0rg_index];
-    q0rg.frame_count = q0rg.frame_count.max(last_frame.saturating_add(1));
-
+    let mut used_ids = used_instance_ids(project);
+    let mut next_id = 1_u32;
+    let mut prepared_rows = Vec::with_capacity(clipboard.rows.len());
     for (layer_id, row) in target_layer_ids.iter().copied().zip(&clipboard.rows) {
-        let layer = q0rg
-            .layers
-            .iter_mut()
-            .find(|layer| layer.layer_id == layer_id)?;
-        clear_frame_range(layer, target_frame, last_frame, false);
-        for relative_frame in &row.explicit_keyframes {
-            layer.ensure_explicit_keyframe(target_frame.saturating_add(*relative_frame));
-        }
-        layer
-            .placements
-            .extend(row.placements.iter().cloned().map(|mut placement| {
-                placement.frame = target_frame.saturating_add(placement.frame);
-                if let Some(to_frame) = placement.tween.to_frame() {
-                    placement.tween = placement
-                        .tween
-                        .with_to_frame(target_frame.saturating_add(to_frame));
+        let mut prepared = row.placements.clone();
+        if layer_id != row.source_layer_id {
+            // If an id still exists after any preceding cut/remove operation,
+            // this is a copy into another layer and must become a new object.
+            let existing = prepared
+                .iter()
+                .filter_map(|placement| {
+                    (placement.instance_id != 0 && used_ids.contains(&placement.instance_id))
+                        .then_some(placement.instance_id)
+                })
+                .collect::<HashSet<_>>();
+            let mut remap = HashMap::<u32, u32>::new();
+            for placement in &mut prepared {
+                if existing.contains(&placement.instance_id) {
+                    let fresh = match remap.get(&placement.instance_id).copied() {
+                        Some(id) => id,
+                        None => {
+                            let id = allocate_instance_id(&mut used_ids, &mut next_id)?;
+                            remap.insert(placement.instance_id, id);
+                            id
+                        }
+                    };
+                    placement.instance_id = fresh;
                 }
-                placement
-            }));
-        if !layer.has_keyframe(target_frame) {
-            layer.ensure_explicit_keyframe(target_frame);
+            }
+        }
+        prepared_rows.push(prepared);
+    }
+    {
+        let q0rg = &mut project.q0rgs[q0rg_index];
+        q0rg.frame_count = q0rg.frame_count.max(last_frame.saturating_add(1));
+
+        for ((layer_id, row), prepared) in target_layer_ids
+            .iter()
+            .copied()
+            .zip(&clipboard.rows)
+            .zip(prepared_rows)
+        {
+            let layer = q0rg
+                .layers
+                .iter_mut()
+                .find(|layer| layer.layer_id == layer_id)?;
+            clear_frame_range(layer, target_frame, last_frame, false);
+            for relative_frame in &row.explicit_keyframes {
+                layer.ensure_explicit_keyframe(target_frame.saturating_add(*relative_frame));
+            }
+            layer
+                .placements
+                .extend(prepared.into_iter().map(|mut placement| {
+                    placement.frame = target_frame.saturating_add(placement.frame);
+                    if let Some(to_frame) = placement.tween.to_frame() {
+                        placement.tween = placement
+                            .tween
+                            .with_to_frame(target_frame.saturating_add(to_frame));
+                    }
+                    placement
+                }));
+            if !layer.has_keyframe(target_frame) {
+                layer.ensure_explicit_keyframe(target_frame);
+            }
         }
     }
+    paste_rig_channels(
+        project,
+        q0rg_id,
+        target_frame,
+        clipboard.width,
+        &clipboard.rig_channels,
+    );
 
     Some(TimelineSelection {
         anchor_layer_id: target_layer_ids[0],
@@ -536,15 +740,17 @@ fn selected_layer_ids(
         .copied()
         .collect::<HashSet<_>>();
 
-    // A folder row owns its children even while collapsed. Copying/cutting the
-    // folder therefore always keeps its real block intact.
-    let folders = selected.iter().copied().collect::<Vec<_>>();
+    // A folder row owns its complete descendant subtree even while collapsed.
+    // Selecting/copying a nested folder therefore cannot orphan grandchildren.
+    let folders = selected
+        .iter()
+        .copied()
+        .filter(|folder_id| project.layer_is_folder(q0rg_id, *folder_id))
+        .collect::<Vec<_>>();
     for folder_id in folders {
-        if project.layer_is_folder(q0rg_id, folder_id) {
-            for layer in &q0rg.layers {
-                if project.layer_parent_folder(q0rg_id, layer.layer_id) == Some(folder_id) {
-                    selected.insert(layer.layer_id);
-                }
+        for layer in &q0rg.layers {
+            if project.layer_is_descendant_of(q0rg_id, layer.layer_id, folder_id) {
+                selected.insert(layer.layer_id);
             }
         }
     }
@@ -601,18 +807,36 @@ pub fn remove_layers(
     }
     let removed = ids.iter().copied().collect::<HashSet<_>>();
     let q0rg_index = q0rg_index(project, q0rg_id)?;
+    let removed_instance_ids = project.q0rgs[q0rg_index]
+        .layers
+        .iter()
+        .filter(|layer| removed.contains(&layer.layer_id))
+        .flat_map(|layer| &layer.placements)
+        .filter_map(|placement| (placement.instance_id != 0).then_some(placement.instance_id))
+        .collect::<HashSet<_>>();
     project.q0rgs[q0rg_index]
         .layers
         .retain(|layer| !removed.contains(&layer.layer_id));
     project
         .layer_metadata
         .retain(|key, _| key.q0rg_id != q0rg_id || !removed.contains(&key.layer_id));
-    for metadata in project.layer_metadata.values_mut() {
-        if metadata
-            .parent_folder_id
-            .is_some_and(|parent| removed.contains(&parent))
+    for (key, metadata) in &mut project.layer_metadata {
+        if key.q0rg_id == q0rg_id
+            && metadata
+                .parent_folder_id
+                .is_some_and(|parent| removed.contains(&parent))
         {
             metadata.parent_folder_id = None;
+        }
+    }
+    if let Some(rig) = q0s_format::rig::rig_for_q0rg_mut(project, q0rg_id) {
+        for node in &mut rig.nodes {
+            if node
+                .binding
+                .is_some_and(|binding| removed_instance_ids.contains(&binding.instance_id))
+            {
+                node.binding = None;
+            }
         }
     }
 
@@ -641,9 +865,15 @@ pub fn remove_layers(
 
 fn layer_insert_index(project: &ProjectV2, q0rg_id: u16, target_layer_id: u16) -> Option<usize> {
     let q0rg = project.q0rgs.iter().find(|q0rg| q0rg.q0rg_id == q0rg_id)?;
-    let block_id = project
-        .layer_parent_folder(q0rg_id, target_layer_id)
-        .unwrap_or(target_layer_id);
+    let mut block_id = target_layer_id;
+    let mut depth = 0usize;
+    while let Some(parent_id) = project.layer_parent_folder(q0rg_id, block_id) {
+        block_id = parent_id;
+        depth += 1;
+        if depth > q0s_format::v2::MAX_LAYER_FOLDER_NESTING_DEPTH {
+            return None;
+        }
+    }
     q0rg.layers
         .iter()
         .position(|layer| layer.layer_id == block_id)
@@ -676,8 +906,25 @@ pub fn paste_layers(
     }
 
     let mut pasted_layers = clipboard.layers.clone();
+    let mut used_ids = used_instance_ids(project);
+    let mut next_instance = 1_u32;
+    let mut identity_remap = HashMap::<u32, u32>::new();
     for layer in &mut pasted_layers {
         layer.layer_id = *id_map.get(&layer.layer_id)?;
+        for placement in &mut layer.placements {
+            if placement.instance_id == 0 {
+                continue;
+            }
+            let fresh = match identity_remap.get(&placement.instance_id).copied() {
+                Some(id) => id,
+                None => {
+                    let id = allocate_instance_id(&mut used_ids, &mut next_instance)?;
+                    identity_remap.insert(placement.instance_id, id);
+                    id
+                }
+            };
+            placement.instance_id = fresh;
+        }
     }
     let pasted_ui_top = pasted_layers.last()?.layer_id;
     let pasted_ui_bottom = pasted_layers.first()?.layer_id;
@@ -730,6 +977,7 @@ mod tests {
 
     fn placement(frame: u16, x: f32, tween: Tween) -> Placement {
         Placement {
+            instance_id: 0,
             frame,
             target: Target::Q0rg(1),
             transform: Transform2D {
@@ -737,6 +985,7 @@ mod tests {
                 ..Transform2D::IDENTITY
             },
             tween,
+            fx: Default::default(),
         }
     }
 
@@ -1176,6 +1425,8 @@ mod tests {
                 kind: LayerKind::Normal,
                 parent_folder_id: Some(3),
                 collapsed: false,
+                hidden: false,
+                locked: false,
             },
         );
         project.layer_metadata.insert(
@@ -1184,6 +1435,8 @@ mod tests {
                 kind: LayerKind::Folder,
                 parent_folder_id: None,
                 collapsed: true,
+                hidden: false,
+                locked: false,
             },
         );
 
@@ -1205,6 +1458,91 @@ mod tests {
     }
 
     #[test]
+    fn layer_clipboard_copies_and_remaps_nested_folder_subtrees() {
+        let mut project = crate::state::default_project();
+        project.q0rgs[0].layers = vec![
+            Layer {
+                layer_id: 2,
+                name: "leaf".into(),
+                explicit_keyframes: vec![3],
+                placements: Vec::new(),
+            },
+            Layer {
+                layer_id: 3,
+                name: "inner".into(),
+                explicit_keyframes: Vec::new(),
+                placements: Vec::new(),
+            },
+            Layer {
+                layer_id: 4,
+                name: "outer".into(),
+                explicit_keyframes: Vec::new(),
+                placements: Vec::new(),
+            },
+            Layer {
+                layer_id: 1,
+                name: "base".into(),
+                explicit_keyframes: vec![0],
+                placements: Vec::new(),
+            },
+        ];
+        project.layer_metadata.insert(
+            LayerKey::new(1, 2),
+            LayerMetadata {
+                parent_folder_id: Some(3),
+                ..Default::default()
+            },
+        );
+        project.layer_metadata.insert(
+            LayerKey::new(1, 3),
+            LayerMetadata {
+                kind: LayerKind::Folder,
+                parent_folder_id: Some(4),
+                ..Default::default()
+            },
+        );
+        project.layer_metadata.insert(
+            LayerKey::new(1, 4),
+            LayerMetadata {
+                kind: LayerKind::Folder,
+                ..Default::default()
+            },
+        );
+        q0s_format::v2::validate(&project).expect("nested clipboard fixture");
+
+        let clipboard = capture_layers(&project, 1, TimelineLayerSelection::single(4))
+            .expect("capture nested tree");
+        assert_eq!(clipboard.layers.len(), 3);
+        paste_layers(&mut project, 1, 1, &clipboard).expect("paste nested tree");
+
+        let pasted_leaf = project.q0rgs[0]
+            .layers
+            .iter()
+            .find(|layer| layer.name == "leaf" && layer.layer_id != 2)
+            .expect("pasted leaf");
+        let pasted_inner = project.q0rgs[0]
+            .layers
+            .iter()
+            .find(|layer| layer.name == "inner" && layer.layer_id != 3)
+            .expect("pasted inner");
+        let pasted_outer = project.q0rgs[0]
+            .layers
+            .iter()
+            .find(|layer| layer.name == "outer" && layer.layer_id != 4)
+            .expect("pasted outer");
+        assert_eq!(
+            project.layer_parent_folder(1, pasted_leaf.layer_id),
+            Some(pasted_inner.layer_id)
+        );
+        assert_eq!(
+            project.layer_parent_folder(1, pasted_inner.layer_id),
+            Some(pasted_outer.layer_id)
+        );
+        assert_eq!(pasted_leaf.explicit_keyframes, vec![3]);
+        q0s_format::v2::validate(&project).expect("pasted nested tree validates");
+    }
+
+    #[test]
     fn cutting_every_layer_leaves_a_drawable_layer() {
         let mut project = crate::state::default_project();
         let removed = remove_layers(&mut project, 1, TimelineLayerSelection::single(1))
@@ -1213,5 +1551,248 @@ mod tests {
         assert_eq!(project.q0rgs[0].layers.len(), 1);
         let layer_id = project.q0rgs[0].layers[0].layer_id;
         assert!(!project.layer_is_folder(1, layer_id));
+    }
+
+    fn add_timeline_test_rig(project: &mut ProjectV2, keys: &[(u16, f32)]) {
+        crate::rigging::ensure_rig(project, 1).expect("create test rig");
+        let rig = q0s_format::rig::rig_for_q0rg_mut(project, 1).unwrap();
+        rig.controls.push(q0s_format::v2::RigControl {
+            control_id: 1,
+            name: "pose".into(),
+            kind: q0s_format::v2::RigControlKind::Slider,
+            target_node: None,
+            rest_x: 0.0,
+            rest_y: 0.0,
+            rest_value: 0.0,
+            min_value: -10.0,
+            max_value: 10.0,
+            public_in_simple: true,
+        });
+        rig.channels.push(q0s_format::v2::RigChannel {
+            property: q0s_format::v2::RigPropertyRef::ControlValue(1),
+            keys: keys
+                .iter()
+                .map(|(frame, value)| q0s_format::v2::RigKey {
+                    frame: *frame,
+                    value: *value,
+                    easing: q0s_format::v2::Easing::Linear,
+                })
+                .collect(),
+        });
+    }
+
+    fn rig_key_frames(project: &ProjectV2) -> Vec<u16> {
+        q0s_format::rig::rig_for_q0rg(project, 1).unwrap().channels[0]
+            .keys
+            .iter()
+            .map(|key| key.frame)
+            .collect()
+    }
+
+    #[test]
+    fn whole_q0rg_frame_clipboard_copies_and_offsets_rig_keys() {
+        let mut project = crate::state::default_project();
+        project.q0rgs[0].frame_count = 12;
+        add_timeline_test_rig(&mut project, &[(2, 0.2), (4, 0.4)]);
+        let selection = TimelineSelection {
+            anchor_layer_id: 1,
+            anchor_frame: 2,
+            focus_layer_id: 1,
+            focus_frame: 4,
+        };
+        let clipboard = capture_frames(&project, 1, selection).expect("capture full q0rg time");
+        assert_eq!(clipboard.rig_channels.len(), 1);
+        assert_eq!(
+            clipboard.rig_channels[0]
+                .keys
+                .iter()
+                .map(|key| key.frame)
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        paste_frames(&mut project, 1, 1, 7, &clipboard).expect("paste full q0rg time");
+        assert_eq!(rig_key_frames(&project), vec![2, 4, 7, 9]);
+    }
+
+    #[test]
+    fn one_layer_copy_does_not_smuggle_global_rig_keys_when_other_layers_exist() {
+        let mut project = crate::state::default_project();
+        project.q0rgs[0].frame_count = 8;
+        project.q0rgs[0].layers.push(Layer {
+            layer_id: 2,
+            name: "other".into(),
+            explicit_keyframes: vec![0],
+            placements: Vec::new(),
+        });
+        add_timeline_test_rig(&mut project, &[(3, 0.3)]);
+        let selection = TimelineSelection {
+            anchor_layer_id: 1,
+            anchor_frame: 2,
+            focus_layer_id: 1,
+            focus_frame: 4,
+        };
+        let clipboard = capture_frames(&project, 1, selection).expect("capture one layer");
+        assert!(clipboard.rig_channels.is_empty());
+    }
+
+    #[test]
+    fn removing_frame_columns_removes_and_shifts_rig_keys_with_time() {
+        let mut project = crate::state::default_project();
+        project.q0rgs[0].frame_count = 10;
+        add_timeline_test_rig(&mut project, &[(1, 0.1), (3, 0.3), (7, 0.7)]);
+        let selection = TimelineSelection {
+            anchor_layer_id: 1,
+            anchor_frame: 2,
+            focus_layer_id: 1,
+            focus_frame: 4,
+        };
+        assert_eq!(
+            remove_selected_frame_columns(&mut project, 1, selection),
+            Some(3)
+        );
+        assert_eq!(rig_key_frames(&project), vec![1, 4]);
+    }
+
+    #[test]
+    fn moving_full_q0rg_frame_range_moves_rig_keys_not_duplicates_them() {
+        let mut project = crate::state::default_project();
+        project.q0rgs[0].frame_count = 12;
+        add_timeline_test_rig(&mut project, &[(2, 0.2), (3, 0.3)]);
+        let selection = TimelineSelection {
+            anchor_layer_id: 1,
+            anchor_frame: 2,
+            focus_layer_id: 1,
+            focus_frame: 3,
+        };
+        move_frames(&mut project, 1, selection, 1, 7).expect("move full q0rg time");
+        assert_eq!(rig_key_frames(&project), vec![7, 8]);
+    }
+
+    #[test]
+    fn deleting_bound_layer_unbinds_rig_instead_of_leaving_invalid_reference() {
+        let mut project = crate::state::default_project();
+        let mut bound = placement(0, 0.0, Tween::None);
+        bound.instance_id = 77;
+        project.q0rgs[0].layers[0].placements.push(bound);
+        crate::rigging::ensure_rig(&mut project, 1).unwrap();
+        let rig = q0s_format::rig::rig_for_q0rg_mut(&mut project, 1).unwrap();
+        rig.nodes.push(q0s_format::v2::RigNode {
+            node_id: 1,
+            name: "bound".into(),
+            parent: None,
+            rest: Transform2D::IDENTITY,
+            length: 10.0,
+            binding: Some(q0s_format::v2::RigBinding {
+                instance_id: 77,
+                bind_offset: q0s_format::transform::Affine::IDENTITY,
+            }),
+        });
+        let selection = TimelineLayerSelection::single(1);
+        remove_layers(&mut project, 1, selection).expect("remove bound layer");
+        let rig = q0s_format::rig::rig_for_q0rg(&project, 1).unwrap();
+        assert!(rig.nodes[0].binding.is_none());
+    }
+
+    #[test]
+    fn frame_copy_to_another_layer_remaps_live_instance_identity() {
+        let mut project = crate::state::default_project();
+        project.q0rgs[0].frame_count = 8;
+        let mut source = placement(1, 10.0, Tween::None);
+        source.instance_id = 42;
+        project.q0rgs[0].layers[0].placements = vec![source];
+        project.q0rgs[0].layers.push(Layer {
+            layer_id: 2,
+            name: "copy target".into(),
+            explicit_keyframes: vec![0],
+            placements: Vec::new(),
+        });
+        let clipboard = capture_frames(&project, 1, TimelineSelection::single(1, 1))
+            .expect("capture source frame");
+        paste_frames(&mut project, 1, 2, 3, &clipboard).expect("paste cross-layer copy");
+        let pasted = project.q0rgs[0]
+            .layers
+            .iter()
+            .find(|layer| layer.layer_id == 2)
+            .and_then(|layer| {
+                layer
+                    .placements
+                    .iter()
+                    .find(|placement| placement.frame == 3)
+            })
+            .expect("pasted placement");
+        assert_ne!(pasted.instance_id, 0);
+        assert_ne!(pasted.instance_id, 42);
+        assert_eq!(project.q0rgs[0].layers[0].placements[0].instance_id, 42);
+    }
+
+    #[test]
+    fn moving_whole_instance_to_another_layer_preserves_identity_when_source_is_gone() {
+        let mut project = crate::state::default_project();
+        project.q0rgs[0].frame_count = 8;
+        let mut source = placement(1, 10.0, Tween::None);
+        source.instance_id = 52;
+        project.q0rgs[0].layers[0].placements = vec![source];
+        project.q0rgs[0].layers.push(Layer {
+            layer_id: 2,
+            name: "move target".into(),
+            explicit_keyframes: vec![0],
+            placements: Vec::new(),
+        });
+        move_frames(&mut project, 1, TimelineSelection::single(1, 1), 2, 3)
+            .expect("move instance cross-layer");
+        assert!(project.q0rgs[0].layers[0]
+            .placements
+            .iter()
+            .all(|placement| placement.instance_id != 52));
+        let moved = project.q0rgs[0]
+            .layers
+            .iter()
+            .find(|layer| layer.layer_id == 2)
+            .and_then(|layer| {
+                layer
+                    .placements
+                    .iter()
+                    .find(|placement| placement.frame == 3)
+            })
+            .expect("moved placement");
+        assert_eq!(moved.instance_id, 52);
+    }
+
+    #[test]
+    fn layer_copy_remaps_instance_identity_consistently_across_keyframes() {
+        let mut project = crate::state::default_project();
+        project.q0rgs[0].frame_count = 8;
+        let mut first = placement(0, 10.0, Tween::None);
+        first.instance_id = 91;
+        let mut second = placement(4, 20.0, Tween::None);
+        second.instance_id = 91;
+        project.q0rgs[0].layers[0].placements = vec![first, second];
+        let clipboard =
+            capture_layers(&project, 1, TimelineLayerSelection::single(1)).expect("capture layer");
+        let selection = paste_layers(&mut project, 1, 1, &clipboard).expect("paste layer copy");
+        let pasted_layer = project.q0rgs[0]
+            .layers
+            .iter()
+            .find(|layer| layer.layer_id == selection.anchor_layer_id)
+            .expect("pasted layer");
+        let ids = pasted_layer
+            .placements
+            .iter()
+            .map(|placement| placement.instance_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(ids.len(), 1);
+        let fresh = *ids.iter().next().unwrap();
+        assert_ne!(fresh, 0);
+        assert_ne!(fresh, 91);
+        assert_eq!(
+            project.q0rgs[0]
+                .layers
+                .iter()
+                .find(|layer| layer.layer_id == 1)
+                .unwrap()
+                .placements[0]
+                .instance_id,
+            91
+        );
     }
 }

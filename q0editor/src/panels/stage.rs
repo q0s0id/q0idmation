@@ -168,10 +168,12 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 Color32::from_white_alpha(176),
             );
             let preview = q0s_format::v2::Placement {
+                instance_id: 0,
                 frame,
                 target,
                 transform,
                 tween: q0s_format::v2::Tween::None,
+                fx: Default::default(),
             };
             if let Some((min_x, min_y, max_x, max_y)) =
                 crate::render::placement_bbox(&app.state.project, &preview)
@@ -209,6 +211,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         crate::tools::handle(app, &response, &painter, &view, &ctx);
     }
     crate::tools::draw_selection_overlay(app, &painter, &view);
+    crate::tools::draw_brush_size_preview(app, &painter, &view);
 
     // Right-click context menu — pre-select the placement under cursor so the
     // menu's actions act on what the user actually right-clicked.

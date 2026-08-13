@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use geo::{Area, BooleanOps, MultiPolygon};
 use q0s_format::v2::{
@@ -239,14 +239,31 @@ fn selected_raw_vectors(project: &ProjectV2, selection: &Selection) -> Vec<RawVe
         }
 
         let selected = source.intersection(&clip);
-        let paths = crate::tools::geo_multi_polygon_to_linear_paths(&selected);
+        if selected.unsigned_area() <= 0.05 {
+            continue;
+        }
+        let whole_body = source.difference(&clip).unsigned_area() <= 0.05;
+        let paths = if whole_body {
+            // A marquee enclosing the complete raw fill is a selection, not a
+            // geometric cut. Keep the authored VPaths verbatim so Convert to
+            // q0rg/copy/paste cannot throw away cubic handles and turn smooth
+            // brush boundaries into anchor-only polygons.
+            vector
+                .paths
+                .iter()
+                .filter(|path| path.closed)
+                .cloned()
+                .collect()
+        } else {
+            crate::tools::geo_multi_polygon_to_linear_paths(&selected)
+        };
         if !paths.is_empty() {
             vectors.push(RawVectorClipboard {
                 vector: VectorAsset {
                     asset_id: 0,
                     paths,
                     fill: vector.fill,
-                    // Partial fill selection must not invent a stroke on the cut edge.
+                    // A true partial fill selection must not invent a stroke on the cut edge.
                     stroke: None,
                 },
                 appearance: None,
@@ -306,10 +323,12 @@ pub fn paste_payload(
         };
         let placement_idx = layer.placements.len();
         layer.placements.push(Placement {
+            instance_id: 0,
             frame,
             target: Target::Asset(asset_id),
             transform: Transform2D::IDENTITY,
             tween: Tween::None,
+            fx: Default::default(),
         });
         let placement_ref = PlacementRef {
             q0rg_id,
@@ -336,6 +355,43 @@ pub fn paste_payload(
         }
     }
 
+    let mut used_instance_ids = project
+        .q0rgs
+        .iter()
+        .flat_map(|q0rg| &q0rg.layers)
+        .flat_map(|layer| &layer.placements)
+        .filter_map(|placement| (placement.instance_id != 0).then_some(placement.instance_id))
+        .collect::<HashSet<_>>();
+    let mut next_instance_id = 1_u32;
+    let mut instance_remap = HashMap::<u32, u32>::new();
+    let mut pasted_objects = Vec::with_capacity(payload.placements.len());
+    for source in &payload.placements {
+        let mut placement = source.clone();
+        if placement.instance_id != 0 {
+            let fresh = match instance_remap.get(&placement.instance_id).copied() {
+                Some(id) => id,
+                None => {
+                    while next_instance_id != 0 && used_instance_ids.contains(&next_instance_id) {
+                        next_instance_id = next_instance_id.checked_add(1).unwrap_or(0);
+                    }
+                    if next_instance_id == 0 {
+                        continue;
+                    }
+                    let id = next_instance_id;
+                    used_instance_ids.insert(id);
+                    instance_remap.insert(placement.instance_id, id);
+                    next_instance_id = next_instance_id.checked_add(1).unwrap_or(0);
+                    id
+                }
+            };
+            placement.instance_id = fresh;
+        }
+        placement.frame = frame;
+        placement.transform.tx += offset.x;
+        placement.transform.ty += offset.y;
+        pasted_objects.push(placement);
+    }
+
     if let Some(layer) = project
         .q0rgs
         .iter_mut()
@@ -346,11 +402,7 @@ pub fn paste_payload(
                 .find(|layer| layer.layer_id == layer_id)
         })
     {
-        for source in &payload.placements {
-            let mut placement = source.clone();
-            placement.frame = frame;
-            placement.transform.tx += offset.x;
-            placement.transform.ty += offset.y;
+        for placement in pasted_objects {
             let placement_idx = layer.placements.len();
             layer.placements.push(placement);
             result.objects.push(PlacementRef {
@@ -841,10 +893,12 @@ mod tests {
                     name: "Layer 1".into(),
                     explicit_keyframes: vec![0],
                     placements: vec![Placement {
+                        instance_id: 0,
                         frame: 0,
                         target: Target::Asset(1),
                         transform: Transform2D::IDENTITY,
                         tween: Tween::None,
+                        fx: Default::default(),
                     }],
                 }],
             }],
@@ -868,5 +922,27 @@ mod tests {
         q0s_format::v2::validate(&project)
             .expect("deleting the asset must also remove its sparse appearance metadata");
         assert!(!project.asset_appearances.contains_key(&1));
+    }
+
+    #[test]
+    fn pasted_display_object_gets_fresh_instance_identity() {
+        let mut project = appearance_raw_project();
+        project.q0rgs[0].layers[0].placements[0].instance_id = 50;
+        let payload = capture_clipboard(
+            &project,
+            &Selection::Placement {
+                q0rg_id: 1,
+                layer_id: 1,
+                placement_idx: 0,
+            },
+        );
+        let result = paste_payload(&mut project, 1, 1, 0, &payload, Vec2::new(40.0, 0.0));
+        assert_eq!(result.objects.len(), 1);
+        let pasted = result.objects[0];
+        let pasted_id = project.q0rgs[0].layers[0].placements[pasted.placement_idx].instance_id;
+        assert_ne!(pasted_id, 0);
+        assert_ne!(pasted_id, 50);
+        assert_eq!(project.q0rgs[0].layers[0].placements[0].instance_id, 50);
+        q0s_format::v2::validate(&project).expect("fresh pasted identity must validate");
     }
 }

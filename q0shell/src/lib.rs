@@ -58,6 +58,13 @@ impl ShellHost {
                 RuntimeAction::GoRun(_) | RuntimeAction::GoStop(_) => {
                     log.push("timeline actions are unavailable in q0shell".to_string());
                 }
+                RuntimeAction::RigSetPosition { .. }
+                | RuntimeAction::RigSetValue { .. }
+                | RuntimeAction::RigReset { .. }
+                | RuntimeAction::RigSetPose { .. }
+                | RuntimeAction::RigResetPose { .. } => {
+                    log.push("rig actions are unavailable in q0shell".to_string());
+                }
             }
         }
         Ok(log)

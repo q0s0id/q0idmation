@@ -67,10 +67,12 @@ fn seed_simple_shape(app: &mut EditorApp) -> u16 {
         .find(|l| l.layer_id == layer_id)
         .unwrap();
     layer.placements.push(Placement {
+        instance_id: 0,
         frame: 0,
         target: Target::Asset(asset_id),
         transform: Transform2D::IDENTITY,
         tween: Tween::None,
+        fx: Default::default(),
     });
     asset_id
 }
@@ -327,10 +329,12 @@ fn convert_clicked_raw_glow_to_q0rg_preserves_material_state() {
         },
     );
     app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+        instance_id: 0,
         frame: 0,
         target: Target::Asset(asset_id),
         transform: Transform2D::IDENTITY,
         tween: Tween::None,
+        fx: Default::default(),
     }];
     let before = q0s_format::raster::rasterize_q0rg_frame(
         &app.state.project,
@@ -439,10 +443,12 @@ fn convert_raw_area_to_q0rg_preserves_resolved_glow_pixels() {
         },
     );
     app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+        instance_id: 0,
         frame: 0,
         target: Target::Asset(asset_id),
         transform: Transform2D::IDENTITY,
         tween: Tween::None,
+        fx: Default::default(),
     }];
 
     let before = q0s_format::raster::rasterize_q0rg_frame(
@@ -572,10 +578,12 @@ fn convert_halo_only_raw_area_to_q0rg_preserves_visible_glow_without_loss() {
         },
     );
     app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+        instance_id: 0,
         frame: 0,
         target: Target::Asset(asset_id),
         transform: Transform2D::IDENTITY,
         tween: Tween::None,
+        fx: Default::default(),
     }];
     let before = q0s_format::raster::rasterize_q0rg_frame(
         &app.state.project,
@@ -832,10 +840,12 @@ fn place_q0rg_instance_rejects_indirect_cycle() {
             name: "Layer 1".to_string(),
             explicit_keyframes: Vec::new(),
             placements: vec![Placement {
+                instance_id: 0,
                 frame: 0,
                 target: Target::Q0rg(root_id),
                 transform: Transform2D::IDENTITY,
                 tween: Tween::None,
+                fx: Default::default(),
             }],
         }],
     });
@@ -891,6 +901,154 @@ fn enter_then_breadcrumb_jump_returns_to_root() {
 }
 
 #[test]
+fn convert_full_marquee_real_bezier_raw_fill_to_q0rg_preserves_curve_handles_exactly() {
+    use q0editor::state::PlacementRef;
+
+    let mut project =
+        q0s_format::v2::parse(include_bytes!("../testdata/marquee_curve_regression.q1s"))
+            .expect("parse real curve regression fixture");
+    project.assets.retain(|asset| asset.id() == 1);
+    project.q0rgs[0].layers[0]
+        .placements
+        .retain(|placement| placement.target == Target::Asset(1));
+    let original = match &project.assets[0] {
+        Asset::Vector(vector) => vector.paths[0].clone(),
+        _ => panic!("fixture asset 1 must be vector"),
+    };
+    let mut bounds_min = Vec2::new(f32::INFINITY, f32::INFINITY);
+    let mut bounds_max = Vec2::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for anchor in &original.anchors {
+        bounds_min.x = bounds_min.x.min(anchor.point.x);
+        bounds_min.y = bounds_min.y.min(anchor.point.y);
+        bounds_max.x = bounds_max.x.max(anchor.point.x);
+        bounds_max.y = bounds_max.y.max(anchor.point.y);
+    }
+
+    let mut app = EditorApp::default();
+    app.state.project = project;
+    app.session.current_q0rg_id = 1;
+    app.session.current_layer_id = 1;
+    app.session.current_frame = 0;
+    app.session.selection = Selection::RawArea {
+        placements: vec![PlacementRef {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: 0,
+        }],
+        objects: Vec::new(),
+        bounds_min,
+        bounds_max,
+    };
+
+    invoke_convert(&mut app);
+
+    let symbol_id = app.state.project.q0rgs[0].layers[0]
+        .placements
+        .iter()
+        .find_map(|placement| match placement.target {
+            Target::Q0rg(id) => Some(id),
+            Target::Asset(_) => None,
+        })
+        .expect("converted q0rg instance");
+    let symbol = app
+        .state
+        .project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == symbol_id)
+        .expect("converted q0rg");
+    let converted_asset_id = match symbol.layers[0].placements[0].target {
+        Target::Asset(id) => id,
+        Target::Q0rg(_) => panic!("converted marquee curve must remain vector asset inside q0rg"),
+    };
+    let converted = app
+        .state
+        .project
+        .assets
+        .iter()
+        .find_map(|asset| match asset {
+            Asset::Vector(vector) if vector.asset_id == converted_asset_id => {
+                Some(&vector.paths[0])
+            }
+            _ => None,
+        })
+        .expect("converted marquee vector curve");
+    assert_eq!(
+        converted, &original,
+        "full marquee Convert to q0rg changed cubic anchors/handles and polygonized the curve"
+    );
+}
+#[test]
+fn convert_real_bezier_raw_fill_to_q0rg_preserves_curve_handles_exactly() {
+    use q0editor::state::PathRef;
+
+    let mut project =
+        q0s_format::v2::parse(include_bytes!("../testdata/marquee_curve_regression.q1s"))
+            .expect("parse real curve regression fixture");
+    project.assets.retain(|asset| asset.id() == 1);
+    project.q0rgs[0].layers[0]
+        .placements
+        .retain(|placement| placement.target == Target::Asset(1));
+    let original = match &project.assets[0] {
+        Asset::Vector(vector) => vector.paths[0].clone(),
+        _ => panic!("fixture asset 1 must be vector"),
+    };
+    assert!(original
+        .anchors
+        .iter()
+        .any(|anchor| anchor.in_handle.is_some() || anchor.out_handle.is_some()));
+
+    let mut app = EditorApp::default();
+    app.state.project = project;
+    app.session.current_q0rg_id = 1;
+    app.session.current_layer_id = 1;
+    app.session.current_frame = 0;
+    app.session.selection = Selection::Paths(vec![PathRef {
+        q0rg_id: 1,
+        layer_id: 1,
+        placement_idx: 0,
+        path_idx: 0,
+    }]);
+
+    invoke_convert(&mut app);
+
+    let symbol_id = app.state.project.q0rgs[0].layers[0]
+        .placements
+        .iter()
+        .find_map(|placement| match placement.target {
+            Target::Q0rg(id) => Some(id),
+            Target::Asset(_) => None,
+        })
+        .expect("converted q0rg instance");
+    let symbol = app
+        .state
+        .project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == symbol_id)
+        .expect("converted q0rg");
+    let converted_asset_id = match symbol.layers[0].placements[0].target {
+        Target::Asset(id) => id,
+        Target::Q0rg(_) => panic!("converted raw curve must remain vector asset inside q0rg"),
+    };
+    let converted = app
+        .state
+        .project
+        .assets
+        .iter()
+        .find_map(|asset| match asset {
+            Asset::Vector(vector) if vector.asset_id == converted_asset_id => {
+                Some(&vector.paths[0])
+            }
+            _ => None,
+        })
+        .expect("converted vector curve");
+    assert_eq!(
+        converted, &original,
+        "Convert to q0rg changed cubic anchors/handles and polygonized the curve"
+    );
+}
+#[test]
 fn convert_selected_raw_fill_to_q0rg_preserves_neighbouring_graphics() {
     use q0editor::state::PathRef;
 
@@ -934,10 +1092,12 @@ fn convert_selected_raw_fill_to_q0rg_preserves_neighbouring_graphics() {
     app.state.project.q0rgs[0].layers[0]
         .placements
         .push(Placement {
+            instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
             transform: Transform2D::IDENTITY,
             tween: Tween::None,
+            fx: Default::default(),
         });
     app.session.selection = Selection::Paths(vec![PathRef {
         q0rg_id: 1,
@@ -1052,10 +1212,12 @@ fn delete_action_removes_selected_raw_fill_but_keeps_its_neighbour() {
     app.state.project.q0rgs[0].layers[0]
         .placements
         .push(Placement {
+            instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
             transform: Transform2D::IDENTITY,
             tween: Tween::None,
+            fx: Default::default(),
         });
     app.session.selection = Selection::Paths(vec![PathRef {
         q0rg_id: 1,
@@ -1146,10 +1308,12 @@ fn seed_mixed_raw_area(app: &mut EditorApp) -> (u16, u16, usize, usize) {
             name: "Layer 1".to_string(),
             explicit_keyframes: Vec::new(),
             placements: vec![Placement {
+                instance_id: 0,
                 frame: 0,
                 target: Target::Asset(raw_asset_id),
                 transform: Transform2D::IDENTITY,
                 tween: Tween::None,
+                fx: Default::default(),
             }],
         }],
     });
@@ -1169,13 +1333,16 @@ fn seed_mixed_raw_area(app: &mut EditorApp) -> (u16, u16, usize, usize) {
         .unwrap();
     let raw_idx = layer.placements.len();
     layer.placements.push(Placement {
+        instance_id: 0,
         frame: 0,
         target: Target::Asset(raw_asset_id),
         transform: Transform2D::IDENTITY,
         tween: Tween::None,
+        fx: Default::default(),
     });
     let object_idx = layer.placements.len();
     layer.placements.push(Placement {
+        instance_id: 0,
         frame: 0,
         target: Target::Q0rg(child_q0rg_id),
         transform: Transform2D {
@@ -1184,6 +1351,7 @@ fn seed_mixed_raw_area(app: &mut EditorApp) -> (u16, u16, usize, usize) {
             ..Transform2D::IDENTITY
         },
         tween: Tween::None,
+        fx: Default::default(),
     });
     (q0rg_id, layer_id, raw_idx, object_idx)
 }
@@ -1305,10 +1473,12 @@ fn copy_paste_raw_glow_carries_appearance_with_fresh_asset_id() {
         },
     );
     app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+        instance_id: 0,
         frame: 0,
         target: Target::Asset(asset_id),
         transform: Transform2D::IDENTITY,
         tween: Tween::None,
+        fx: Default::default(),
     }];
     app.session.selection = Selection::Path {
         q0rg_id,

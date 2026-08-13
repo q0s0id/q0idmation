@@ -2979,6 +2979,7 @@ dependencies = [
  "lyon_path",
  "lyon_tessellation",
  "q0credits",
+ "q0glblend",
  "q0icon",
  "q0s-format",
  "q0theme",
@@ -2988,6 +2989,16 @@ dependencies = [
  "serde_json",
  "winreg",
  "winres",
+]
+
+[[package]]
+name = "q0glblend"
+version = "0.1.0-beta.1"
+dependencies = [
+ "egui",
+ "egui_glow",
+ "glow",
+ "q0s-format",
 ]
 
 [[package]]
@@ -3005,6 +3016,7 @@ dependencies = [
  "lyon_path",
  "lyon_tessellation",
  "q0credits",
+ "q0glblend",
  "q0icon",
  "q0s-format",
  "q0theme",

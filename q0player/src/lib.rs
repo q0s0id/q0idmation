@@ -5,6 +5,7 @@ use std::io::Read;
 use std::path::Path;
 
 use q0s_format::q0lang::runtime::{Runtime, RuntimeAction, RuntimeDiagnostic, TimelineTarget};
+use q0s_format::rig::{RigControlOverride, RigRuntimeOverrides};
 use q0s_format::v2::ProjectV2;
 use q0s_format::{is_q0s_v2, parse_q0s, parse_q0s_v2, Bitmap, Error, Movie, Placement};
 use q0video::q0v::{Q0vFile, Q0vSpec, MAGIC as Q0V_MAGIC};
@@ -72,6 +73,7 @@ pub struct Player {
     inner: Inner,
     q0lang: Option<Runtime>,
     initial_script_diagnostics: Vec<RuntimeDiagnostic>,
+    rig_runtime_overrides: RigRuntimeOverrides,
     playing: bool,
     loop_enabled: bool,
     accumulator_sec: f32,
@@ -131,6 +133,7 @@ impl Player {
             },
             q0lang: None,
             initial_script_diagnostics: Vec::new(),
+            rig_runtime_overrides: RigRuntimeOverrides::new(),
             playing: true,
             loop_enabled: true,
             accumulator_sec: 0.0,
@@ -163,6 +166,7 @@ impl Player {
                 inner,
                 q0lang: Some(Runtime::new()),
                 initial_script_diagnostics: Vec::new(),
+                rig_runtime_overrides: RigRuntimeOverrides::new(),
                 playing: true,
                 loop_enabled: true,
                 accumulator_sec: 0.0,
@@ -178,6 +182,7 @@ impl Player {
                 },
                 q0lang: None,
                 initial_script_diagnostics: Vec::new(),
+                rig_runtime_overrides: RigRuntimeOverrides::new(),
                 playing: true,
                 loop_enabled: true,
                 accumulator_sec: 0.0,
@@ -200,6 +205,10 @@ impl Player {
             Inner::V2 { project, .. } => Some(project),
             _ => None,
         }
+    }
+
+    pub fn rig_runtime_overrides(&self) -> &RigRuntimeOverrides {
+        &self.rig_runtime_overrides
     }
 
     /// Diagnostics produced while executing the entry q0lang script.
@@ -410,6 +419,10 @@ impl Player {
     }
 
     fn apply_q0lang_actions(&mut self, actions: &[RuntimeAction]) {
+        let owner_q0rg_id = match &self.inner {
+            Inner::V2 { entry_q0rg_id, .. } => Some(*entry_q0rg_id),
+            _ => None,
+        };
         for action in actions {
             match action {
                 RuntimeAction::GoRun(target) => {
@@ -425,6 +438,151 @@ impl Player {
                     self.playing = false;
                 }
                 RuntimeAction::ShellCommand { .. } => {}
+                RuntimeAction::RigSetPosition { control, x, y } => {
+                    if let Some(owner) = owner_q0rg_id {
+                        self.apply_rig_position(owner, control, *x as f32, *y as f32);
+                    }
+                }
+                RuntimeAction::RigSetValue { control, value } => {
+                    if let Some(owner) = owner_q0rg_id {
+                        self.apply_rig_value(owner, control, *value as f32);
+                    }
+                }
+                RuntimeAction::RigReset { control } => {
+                    if let Some(owner) = owner_q0rg_id {
+                        self.reset_rig_control(owner, control);
+                    }
+                }
+                RuntimeAction::RigSetPose { pose, weight } => {
+                    if let Some(owner) = owner_q0rg_id {
+                        self.apply_rig_pose(owner, pose, *weight as f32);
+                    }
+                }
+                RuntimeAction::RigResetPose { pose } => {
+                    if let Some(owner) = owner_q0rg_id {
+                        self.reset_rig_pose(owner, pose);
+                    }
+                }
+            }
+        }
+    }
+
+    fn public_rig_control_id(&mut self, q0rg_id: u16, name: &str) -> Option<u16> {
+        let control = self
+            .project_v2()
+            .and_then(|project| q0s_format::rig::rig_for_q0rg(project, q0rg_id))
+            .and_then(|rig| rig.controls.iter().find(|control| control.name == name))
+            .map(|control| (control.control_id, control.public_in_simple));
+        match control {
+            Some((id, true)) => Some(id),
+            Some((_id, false)) => {
+                self.initial_script_diagnostics.push(RuntimeDiagnostic {
+                    line: 0,
+                    message: format!(
+                        "q0.rig control `{name}` is private; enable Visible in Simple to expose it at runtime"
+                    ),
+                });
+                None
+            }
+            None => {
+                self.initial_script_diagnostics.push(RuntimeDiagnostic {
+                    line: 0,
+                    message: format!("q0.rig control `{name}` was not found on q0rg {q0rg_id}"),
+                });
+                None
+            }
+        }
+    }
+
+    fn apply_rig_position(&mut self, q0rg_id: u16, name: &str, x: f32, y: f32) {
+        let Some(control_id) = self.public_rig_control_id(q0rg_id, name) else {
+            return;
+        };
+        let overrides = self.rig_runtime_overrides.entry(q0rg_id).or_default();
+        overrides.retain(|value| {
+            !matches!(
+                value,
+                RigControlOverride::Position { control_id: id, .. } if *id == control_id
+            )
+        });
+        overrides.push(RigControlOverride::Position { control_id, x, y });
+    }
+
+    fn apply_rig_value(&mut self, q0rg_id: u16, name: &str, value: f32) {
+        let Some(control_id) = self.public_rig_control_id(q0rg_id, name) else {
+            return;
+        };
+        let overrides = self.rig_runtime_overrides.entry(q0rg_id).or_default();
+        overrides.retain(|entry| {
+            !matches!(
+                entry,
+                RigControlOverride::Value { control_id: id, .. } if *id == control_id
+            )
+        });
+        overrides.push(RigControlOverride::Value { control_id, value });
+    }
+
+    fn reset_rig_control(&mut self, q0rg_id: u16, name: &str) {
+        let Some(control_id) = self.public_rig_control_id(q0rg_id, name) else {
+            return;
+        };
+        if let Some(overrides) = self.rig_runtime_overrides.get_mut(&q0rg_id) {
+            overrides.retain(|entry| match entry {
+                RigControlOverride::Position { control_id: id, .. }
+                | RigControlOverride::Value { control_id: id, .. } => *id != control_id,
+                RigControlOverride::Pose { .. } => true,
+            });
+            if overrides.is_empty() {
+                self.rig_runtime_overrides.remove(&q0rg_id);
+            }
+        }
+    }
+
+    fn rig_pose_id(&mut self, q0rg_id: u16, name: &str) -> Option<u16> {
+        let pose_id = self
+            .project_v2()
+            .and_then(|project| q0s_format::rig::rig_for_q0rg(project, q0rg_id))
+            .and_then(|rig| rig.poses.iter().find(|pose| pose.name == name))
+            .map(|pose| pose.pose_id);
+        if pose_id.is_none() {
+            self.initial_script_diagnostics.push(RuntimeDiagnostic {
+                line: 0,
+                message: format!("q0.rig pose `{name}` was not found on q0rg {q0rg_id}"),
+            });
+        }
+        pose_id
+    }
+
+    fn apply_rig_pose(&mut self, q0rg_id: u16, name: &str, weight: f32) {
+        let Some(pose_id) = self.rig_pose_id(q0rg_id, name) else {
+            return;
+        };
+        let overrides = self.rig_runtime_overrides.entry(q0rg_id).or_default();
+        overrides.retain(|entry| {
+            !matches!(
+                entry,
+                RigControlOverride::Pose { pose_id: id, .. } if *id == pose_id
+            )
+        });
+        overrides.push(RigControlOverride::Pose {
+            pose_id,
+            weight: weight.clamp(0.0, 1.0),
+        });
+    }
+
+    fn reset_rig_pose(&mut self, q0rg_id: u16, name: &str) {
+        let Some(pose_id) = self.rig_pose_id(q0rg_id, name) else {
+            return;
+        };
+        if let Some(overrides) = self.rig_runtime_overrides.get_mut(&q0rg_id) {
+            overrides.retain(|entry| {
+                !matches!(
+                    entry,
+                    RigControlOverride::Pose { pose_id: id, .. } if *id == pose_id
+                )
+            });
+            if overrides.is_empty() {
+                self.rig_runtime_overrides.remove(&q0rg_id);
             }
         }
     }
@@ -463,7 +621,7 @@ impl Player {
                 frame_index,
                 ..
             } => {
-                let buf = q0s_format::raster::rasterize_q0rg_frame(
+                let buf = q0s_format::raster::rasterize_q0rg_frame_with_rig_overrides(
                     project,
                     *entry_q0rg_id,
                     *frame_index,
@@ -471,6 +629,7 @@ impl Player {
                     viewport_height,
                     ss.max(1) as u32,
                     [0xFF, 0xFF, 0xFF, 0xFF],
+                    &self.rig_runtime_overrides,
                 );
                 let n = (viewport_width as usize)
                     .saturating_mul(viewport_height as usize)
@@ -764,6 +923,209 @@ mod tests {
         assert!(!player.is_playing());
     }
 
+    fn q0s_v2_with_rig_script(script: &str, public: bool) -> Vec<u8> {
+        use q0s_format::transform::Affine;
+        use q0s_format::v2::{
+            Anchor, Asset, Layer, Path, Placement as VPlacement, ProjectMeta, ProjectV2, Q0rg,
+            Rgba, RigAsset, RigBinding, RigControl, RigControlKind, RigNode, Target, Transform2D,
+            Tween, Vec2, VectorAsset,
+        };
+        let project = ProjectV2 {
+            meta: ProjectMeta {
+                name: "rig-runtime".into(),
+                fps: 24,
+                stage_width: 32,
+                stage_height: 16,
+                entry_q0rg_id: 1,
+            },
+            assets: vec![
+                Asset::Vector(VectorAsset {
+                    asset_id: 1,
+                    paths: vec![Path {
+                        closed: true,
+                        anchors: vec![
+                            Anchor {
+                                point: Vec2::new(0.0, 0.0),
+                                in_handle: None,
+                                out_handle: None,
+                            },
+                            Anchor {
+                                point: Vec2::new(4.0, 0.0),
+                                in_handle: None,
+                                out_handle: None,
+                            },
+                            Anchor {
+                                point: Vec2::new(4.0, 4.0),
+                                in_handle: None,
+                                out_handle: None,
+                            },
+                            Anchor {
+                                point: Vec2::new(0.0, 4.0),
+                                in_handle: None,
+                                out_handle: None,
+                            },
+                        ],
+                    }],
+                    fill: Some(Rgba {
+                        r: 0,
+                        g: 0,
+                        b: 0,
+                        a: 255,
+                    }),
+                    stroke: None,
+                }),
+                Asset::Rig(RigAsset {
+                    asset_id: 2,
+                    owner_q0rg_id: 1,
+                    nodes: vec![RigNode {
+                        node_id: 1,
+                        name: "root".into(),
+                        parent: None,
+                        rest: Transform2D::IDENTITY,
+                        length: 4.0,
+                        binding: Some(RigBinding {
+                            instance_id: 1,
+                            bind_offset: Affine::IDENTITY,
+                        }),
+                    }],
+                    controls: vec![RigControl {
+                        control_id: 1,
+                        name: "look".into(),
+                        kind: RigControlKind::Position2D,
+                        target_node: Some(1),
+                        rest_x: 2.0,
+                        rest_y: 4.0,
+                        rest_value: 0.0,
+                        min_value: -100.0,
+                        max_value: 100.0,
+                        public_in_simple: public,
+                    }],
+                    constraints: Vec::new(),
+                    channels: Vec::new(),
+                    drivers: Vec::new(),
+                    poses: Vec::new(),
+                    deformers: Vec::new(),
+                    pose_drivers: Vec::new(),
+                    mirror_pairs: Vec::new(),
+                    variants: Vec::new(),
+                }),
+            ],
+            asset_names: Default::default(),
+            asset_appearances: Default::default(),
+            layer_metadata: Default::default(),
+            q0rgs: vec![Q0rg {
+                q0rg_id: 1,
+                name: "Stage".into(),
+                frame_count: 1,
+                script: script.into(),
+                layers: vec![Layer {
+                    layer_id: 1,
+                    name: "art".into(),
+                    explicit_keyframes: vec![0],
+                    placements: vec![VPlacement {
+                        instance_id: 1,
+                        frame: 0,
+                        target: Target::Asset(1),
+                        transform: Transform2D::IDENTITY,
+                        tween: Tween::None,
+                        fx: Default::default(),
+                    }],
+                }],
+            }],
+        };
+        q0s_format::write_q0s_v2(&project).expect("write rig-runtime q0s")
+    }
+
+    fn non_white_x_bounds(rgba: &[u8], width: usize) -> Option<(usize, usize)> {
+        let mut min_x = usize::MAX;
+        let mut max_x = 0usize;
+        let mut found = false;
+        for (index, pixel) in rgba.chunks_exact(4).enumerate() {
+            if pixel[0..3] != [255, 255, 255] {
+                let x = index % width;
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                found = true;
+            }
+        }
+        found.then_some((min_x, max_x))
+    }
+
+    #[test]
+    fn q0player_rigged_frame_matches_shared_q0s_raster_exactly() {
+        let bytes = q0s_v2_with_rig_script("", true);
+        let project = q0s_format::parse_q0s_v2(&bytes).expect("parse exported rig project");
+        let player = Player::from_bytes(&bytes).expect("load rigged player movie");
+        let mut actual = vec![0_u8; 32 * 16 * 4];
+        player.render_with_quality(&mut actual, 32, 16, 1);
+        let expected = q0s_format::raster::rasterize_q0rg_frame(
+            &project,
+            project.meta.entry_q0rg_id,
+            0,
+            32,
+            16,
+            1,
+            [255, 255, 255, 255],
+        );
+        assert_eq!(actual, expected, "q0player diverged from shared rig raster");
+    }
+
+    #[test]
+    fn q0lang_rig_position_reaches_player_runtime_and_moves_pixels() {
+        let baseline_bytes = q0s_v2_with_rig_script("", true);
+        let scripted_bytes =
+            q0s_v2_with_rig_script("import q0.rig\nq0rig.position! \"look\", 20, 4\n", true);
+        let baseline = Player::from_bytes(&baseline_bytes).expect("baseline player");
+        let scripted = Player::from_bytes(&scripted_bytes).expect("scripted player");
+
+        let mut base_pixels = vec![0_u8; 32 * 16 * 4];
+        let mut scripted_pixels = vec![0_u8; 32 * 16 * 4];
+        baseline.render_with_quality(&mut base_pixels, 32, 16, 1);
+        scripted.render_with_quality(&mut scripted_pixels, 32, 16, 1);
+        let base_bounds = non_white_x_bounds(&base_pixels, 32).expect("baseline painted pixels");
+        let scripted_bounds =
+            non_white_x_bounds(&scripted_pixels, 32).expect("scripted painted pixels");
+        assert!(base_bounds.1 < 10, "baseline bounds={base_bounds:?}");
+        assert!(
+            scripted_bounds.0 >= 19,
+            "scripted bounds={scripted_bounds:?}"
+        );
+        assert_ne!(base_pixels, scripted_pixels);
+        assert!(matches!(
+            scripted.rig_runtime_overrides().get(&1).and_then(|values| values.first()),
+            Some(q0s_format::rig::RigControlOverride::Position { control_id: 1, x, y })
+                if (*x - 20.0).abs() < 1.0e-6 && (*y - 4.0).abs() < 1.0e-6
+        ));
+    }
+
+    #[test]
+    fn q0lang_rig_reset_removes_runtime_override() {
+        let bytes = q0s_v2_with_rig_script(
+            "q0rig.position! \"look\", 20, 4\nq0rig.reset! \"look\"\n",
+            true,
+        );
+        let player = Player::from_bytes(&bytes).expect("player");
+        assert!(player.rig_runtime_overrides().get(&1).is_none());
+        let mut pixels = vec![0_u8; 32 * 16 * 4];
+        player.render_with_quality(&mut pixels, 32, 16, 1);
+        let bounds = non_white_x_bounds(&pixels, 32).expect("painted pixels");
+        assert!(
+            bounds.1 < 10,
+            "reset must restore authored pose; bounds={bounds:?}"
+        );
+    }
+
+    #[test]
+    fn q0lang_cannot_drive_private_rig_control() {
+        let bytes = q0s_v2_with_rig_script("q0rig.position! \"look\", 20, 4\n", false);
+        let player = Player::from_bytes(&bytes).expect("private control still loads movie");
+        assert!(player.rig_runtime_overrides().is_empty());
+        assert!(player
+            .initial_script_diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("private")));
+    }
+
     #[test]
     fn v2_entry_q0lang_gostop_runs_on_load() {
         let bytes = q0s_v2_with_entry_script("gostop! 2\n", 4);
@@ -893,5 +1255,386 @@ mod tests {
         player.render(&mut frame, 1, 1);
         // Background should be intact — alpha-zero source pixel must NOT punch through.
         assert_eq!(frame, vec![50, 60, 70, 255]);
+    }
+
+    fn q0s_v2_with_bend_script(script: &str) -> Vec<u8> {
+        use q0s_format::transform::Affine;
+        use q0s_format::v2::{
+            Anchor, Asset, Layer, Path, Placement as VPlacement, ProjectMeta, ProjectV2, Q0rg,
+            Rgba, RigAsset, RigControl, RigControlKind, RigDeformer, Target, Transform2D, Tween,
+            Vec2, VectorAsset,
+        };
+        let project = ProjectV2 {
+            meta: ProjectMeta {
+                name: "bend-runtime".into(),
+                fps: 24,
+                stage_width: 32,
+                stage_height: 20,
+                entry_q0rg_id: 1,
+            },
+            assets: vec![
+                Asset::Vector(VectorAsset {
+                    asset_id: 1,
+                    paths: vec![Path {
+                        closed: true,
+                        anchors: vec![
+                            Anchor {
+                                point: Vec2::new(0.0, -2.0),
+                                in_handle: None,
+                                out_handle: None,
+                            },
+                            Anchor {
+                                point: Vec2::new(16.0, -2.0),
+                                in_handle: None,
+                                out_handle: None,
+                            },
+                            Anchor {
+                                point: Vec2::new(16.0, 2.0),
+                                in_handle: None,
+                                out_handle: None,
+                            },
+                            Anchor {
+                                point: Vec2::new(0.0, 2.0),
+                                in_handle: None,
+                                out_handle: None,
+                            },
+                        ],
+                    }],
+                    fill: Some(Rgba {
+                        r: 0,
+                        g: 0,
+                        b: 0,
+                        a: 255,
+                    }),
+                    stroke: None,
+                }),
+                Asset::Rig(RigAsset {
+                    asset_id: 2,
+                    owner_q0rg_id: 1,
+                    nodes: Vec::new(),
+                    controls: vec![
+                        RigControl {
+                            control_id: 1,
+                            name: "start".into(),
+                            kind: RigControlKind::Position2D,
+                            target_node: None,
+                            rest_x: 4.0,
+                            rest_y: 10.0,
+                            rest_value: 0.0,
+                            min_value: -100.0,
+                            max_value: 100.0,
+                            public_in_simple: true,
+                        },
+                        RigControl {
+                            control_id: 2,
+                            name: "bend".into(),
+                            kind: RigControlKind::Position2D,
+                            target_node: None,
+                            rest_x: 12.0,
+                            rest_y: 10.0,
+                            rest_value: 0.0,
+                            min_value: -100.0,
+                            max_value: 100.0,
+                            public_in_simple: true,
+                        },
+                        RigControl {
+                            control_id: 3,
+                            name: "end".into(),
+                            kind: RigControlKind::Position2D,
+                            target_node: None,
+                            rest_x: 20.0,
+                            rest_y: 10.0,
+                            rest_value: 0.0,
+                            min_value: -100.0,
+                            max_value: 100.0,
+                            public_in_simple: true,
+                        },
+                    ],
+                    constraints: Vec::new(),
+                    channels: Vec::new(),
+                    drivers: Vec::new(),
+                    poses: Vec::new(),
+                    deformers: vec![RigDeformer::Bend {
+                        deformer_id: 1,
+                        instance_id: 7,
+                        asset_id: 1,
+                        bind_transform: Affine {
+                            tx: 4.0,
+                            ty: 10.0,
+                            ..Affine::IDENTITY
+                        },
+                        axis_start: Vec2::new(0.0, 0.0),
+                        axis_end: Vec2::new(16.0, 0.0),
+                        start_control: 1,
+                        middle_control: 2,
+                        end_control: 3,
+                    }],
+                    pose_drivers: Vec::new(),
+                    mirror_pairs: Vec::new(),
+                    variants: Vec::new(),
+                }),
+            ],
+            asset_names: Default::default(),
+            asset_appearances: Default::default(),
+            layer_metadata: Default::default(),
+            q0rgs: vec![Q0rg {
+                q0rg_id: 1,
+                name: "Stage".into(),
+                frame_count: 1,
+                script: script.into(),
+                layers: vec![Layer {
+                    layer_id: 1,
+                    name: "art".into(),
+                    explicit_keyframes: vec![0],
+                    placements: vec![VPlacement {
+                        instance_id: 7,
+                        frame: 0,
+                        target: Target::Asset(1),
+                        transform: Transform2D {
+                            tx: 4.0,
+                            ty: 10.0,
+                            ..Transform2D::IDENTITY
+                        },
+                        tween: Tween::None,
+                        fx: Default::default(),
+                    }],
+                }],
+            }],
+        };
+        q0s_format::write_q0s_v2(&project).expect("write bend-runtime q0s")
+    }
+
+    #[test]
+    fn q0player_deformer_uses_shared_raster_and_q0lang_runtime_override() {
+        let baseline_bytes = q0s_v2_with_bend_script("");
+        let scripted_bytes =
+            q0s_v2_with_bend_script("import q0.rig\nq0rig.position! \"bend\", 12, 4\n");
+        let baseline_project =
+            q0s_format::parse_q0s_v2(&baseline_bytes).expect("parse baseline bend");
+        let baseline = Player::from_bytes(&baseline_bytes).expect("baseline bend player");
+        let scripted = Player::from_bytes(&scripted_bytes).expect("scripted bend player");
+        let mut baseline_pixels = vec![0_u8; 32 * 20 * 4];
+        let mut scripted_pixels = vec![0_u8; 32 * 20 * 4];
+        baseline.render_with_quality(&mut baseline_pixels, 32, 20, 1);
+        scripted.render_with_quality(&mut scripted_pixels, 32, 20, 1);
+        let expected = q0s_format::raster::rasterize_q0rg_frame(
+            &baseline_project,
+            1,
+            0,
+            32,
+            20,
+            1,
+            [255, 255, 255, 255],
+        );
+        assert_eq!(
+            baseline_pixels, expected,
+            "player baseline diverged from shared deformer raster"
+        );
+        assert_ne!(
+            baseline_pixels, scripted_pixels,
+            "runtime bend control did not deform player pixels"
+        );
+        let scripted_dark_y = scripted_pixels
+            .chunks_exact(4)
+            .enumerate()
+            .filter_map(|(index, pixel)| (pixel[0..3] != [255, 255, 255]).then_some(index / 32))
+            .min()
+            .expect("scripted bend painted pixels");
+        let baseline_dark_y = baseline_pixels
+            .chunks_exact(4)
+            .enumerate()
+            .filter_map(|(index, pixel)| (pixel[0..3] != [255, 255, 255]).then_some(index / 32))
+            .min()
+            .expect("baseline bend painted pixels");
+        assert!(scripted_dark_y < baseline_dark_y, "bend did not move silhouette upward: baseline={baseline_dark_y}, scripted={scripted_dark_y}");
+    }
+
+    fn q0s_v2_with_variant_script(script: &str) -> Vec<u8> {
+        use q0s_format::v2::{
+            Anchor, Asset, Layer, Path, Placement as VPlacement, ProjectMeta, ProjectV2, Q0rg,
+            Rgba, RigAsset, RigControl, RigControlKind, RigPosePreset, RigPoseValue,
+            RigPropertyRef, RigVariantChoice, RigVariantSet, Target, Transform2D, Tween, Vec2,
+            VectorAsset,
+        };
+        let shape = |asset_id: u16, color: Rgba| {
+            Asset::Vector(VectorAsset {
+                asset_id,
+                paths: vec![Path {
+                    closed: true,
+                    anchors: vec![
+                        Anchor {
+                            point: Vec2::new(0.0, 0.0),
+                            in_handle: None,
+                            out_handle: None,
+                        },
+                        Anchor {
+                            point: Vec2::new(12.0, 0.0),
+                            in_handle: None,
+                            out_handle: None,
+                        },
+                        Anchor {
+                            point: Vec2::new(12.0, 8.0),
+                            in_handle: None,
+                            out_handle: None,
+                        },
+                        Anchor {
+                            point: Vec2::new(0.0, 8.0),
+                            in_handle: None,
+                            out_handle: None,
+                        },
+                    ],
+                }],
+                fill: Some(color),
+                stroke: None,
+            })
+        };
+        let project = ProjectV2 {
+            meta: ProjectMeta {
+                name: "variant-runtime".into(),
+                fps: 24,
+                stage_width: 24,
+                stage_height: 16,
+                entry_q0rg_id: 1,
+            },
+            assets: vec![
+                shape(
+                    1,
+                    Rgba {
+                        r: 0,
+                        g: 0,
+                        b: 0,
+                        a: 255,
+                    },
+                ),
+                shape(
+                    2,
+                    Rgba {
+                        r: 255,
+                        g: 0,
+                        b: 0,
+                        a: 255,
+                    },
+                ),
+                Asset::Rig(RigAsset {
+                    asset_id: 3,
+                    owner_q0rg_id: 1,
+                    nodes: Vec::new(),
+                    controls: vec![RigControl {
+                        control_id: 1,
+                        name: "mouth".into(),
+                        kind: RigControlKind::Slider,
+                        target_node: None,
+                        rest_x: 0.0,
+                        rest_y: 0.0,
+                        rest_value: 0.0,
+                        min_value: 0.0,
+                        max_value: 1.0,
+                        public_in_simple: true,
+                    }],
+                    constraints: Vec::new(),
+                    channels: Vec::new(),
+                    drivers: Vec::new(),
+                    poses: vec![RigPosePreset {
+                        pose_id: 1,
+                        name: "red pose".into(),
+                        values: vec![RigPoseValue {
+                            property: RigPropertyRef::ControlValue(1),
+                            value: 1.0,
+                        }],
+                    }],
+                    deformers: Vec::new(),
+                    pose_drivers: Vec::new(),
+                    mirror_pairs: Vec::new(),
+                    variants: vec![RigVariantSet {
+                        variant_id: 1,
+                        name: "mouths".into(),
+                        instance_id: 7,
+                        source_control: 1,
+                        choices: vec![
+                            RigVariantChoice {
+                                name: "black".into(),
+                                target: Target::Asset(1),
+                            },
+                            RigVariantChoice {
+                                name: "red".into(),
+                                target: Target::Asset(2),
+                            },
+                        ],
+                    }],
+                }),
+            ],
+            asset_names: Default::default(),
+            asset_appearances: Default::default(),
+            layer_metadata: Default::default(),
+            q0rgs: vec![Q0rg {
+                q0rg_id: 1,
+                name: "Stage".into(),
+                frame_count: 1,
+                script: script.into(),
+                layers: vec![Layer {
+                    layer_id: 1,
+                    name: "art".into(),
+                    explicit_keyframes: vec![0],
+                    placements: vec![VPlacement {
+                        instance_id: 7,
+                        frame: 0,
+                        target: Target::Asset(1),
+                        transform: Transform2D {
+                            tx: 5.0,
+                            ty: 4.0,
+                            ..Transform2D::IDENTITY
+                        },
+                        tween: Tween::None,
+                        fx: Default::default(),
+                    }],
+                }],
+            }],
+        };
+        q0s_format::write_q0s_v2(&project).expect("write variant-runtime q0s")
+    }
+
+    #[test]
+    fn q0player_pose_apply_and_reset_are_ephemeral() {
+        let bytes = q0s_v2_with_variant_script("");
+        let baseline = Player::from_bytes(&bytes).expect("baseline pose player");
+        let mut posed = Player::from_bytes(&bytes).expect("posed player");
+        posed.apply_rig_pose(1, "red pose", 1.0);
+        let mut reset = Player::from_bytes(&bytes).expect("reset pose player");
+        reset.apply_rig_pose(1, "red pose", 1.0);
+        reset.reset_rig_pose(1, "red pose");
+        let mut baseline_pixels = vec![0_u8; 24 * 16 * 4];
+        let mut posed_pixels = vec![0_u8; 24 * 16 * 4];
+        let mut reset_pixels = vec![0_u8; 24 * 16 * 4];
+        baseline.render_with_quality(&mut baseline_pixels, 24, 16, 1);
+        posed.render_with_quality(&mut posed_pixels, 24, 16, 1);
+        reset.render_with_quality(&mut reset_pixels, 24, 16, 1);
+        assert_ne!(baseline_pixels, posed_pixels);
+        assert_eq!(baseline_pixels, reset_pixels);
+        assert!(posed_pixels
+            .chunks_exact(4)
+            .any(|pixel| pixel[0..3] == [255, 0, 0]));
+    }
+
+    #[test]
+    fn q0player_variant_switches_same_stable_instance_from_q0lang_value() {
+        let baseline_bytes = q0s_v2_with_variant_script("");
+        let scripted_bytes =
+            q0s_v2_with_variant_script("import q0.rig\nq0rig.value! \"mouth\", 1\n");
+        let baseline = Player::from_bytes(&baseline_bytes).expect("baseline variant player");
+        let scripted = Player::from_bytes(&scripted_bytes).expect("scripted variant player");
+        let mut baseline_pixels = vec![0_u8; 24 * 16 * 4];
+        let mut scripted_pixels = vec![0_u8; 24 * 16 * 4];
+        baseline.render_with_quality(&mut baseline_pixels, 24, 16, 1);
+        scripted.render_with_quality(&mut scripted_pixels, 24, 16, 1);
+        assert_ne!(
+            baseline_pixels, scripted_pixels,
+            "variant control did not switch rendered target"
+        );
+        assert!(baseline_pixels
+            .chunks_exact(4)
+            .any(|pixel| pixel[0..3] == [0, 0, 0]));
+        assert!(scripted_pixels
+            .chunks_exact(4)
+            .any(|pixel| pixel[0..3] == [255, 0, 0]));
     }
 }

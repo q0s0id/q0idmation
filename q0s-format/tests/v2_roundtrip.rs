@@ -1,7 +1,7 @@
 use q0s_format::v2::{
-    parse, validate, write, Anchor, Asset, BitmapAsset, Easing, EasingFamily, EasingMode, Layer,
-    Path, Placement, ProjectMeta, ProjectV2, Q0rg, Rgba, Stroke, Target, Transform2D, Tween, Vec2,
-    VectorAsset, MAX_Q0RG_NESTING_DEPTH,
+    parse, validate, write, Anchor, Asset, BitmapAsset, BlendMode, BlurFx, DropShadowFx, Easing,
+    EasingFamily, EasingMode, GlowFx, Layer, Path, Placement, PlacementFx, ProjectMeta, ProjectV2,
+    Q0rg, Rgba, Stroke, Target, Transform2D, Tween, Vec2, VectorAsset, MAX_Q0RG_NESTING_DEPTH,
 };
 use q0s_format::Error;
 
@@ -78,6 +78,7 @@ fn sample_v2_project() -> ProjectV2 {
                     explicit_keyframes: Vec::new(),
                     placements: vec![
                         Placement {
+                            instance_id: 0,
                             frame: 0,
                             target: Target::Asset(1),
                             transform: Transform2D {
@@ -86,8 +87,10 @@ fn sample_v2_project() -> ProjectV2 {
                                 ..Transform2D::IDENTITY
                             },
                             tween: Tween::None,
+                            fx: Default::default(),
                         },
                         Placement {
+                            instance_id: 0,
                             frame: 0,
                             target: Target::Q0rg(2),
                             transform: Transform2D {
@@ -100,6 +103,7 @@ fn sample_v2_project() -> ProjectV2 {
                                 skew_y: -0.1,
                             },
                             tween: Tween::Linear { to_frame: 5 },
+                            fx: Default::default(),
                         },
                     ],
                 }],
@@ -114,10 +118,12 @@ fn sample_v2_project() -> ProjectV2 {
                     name: "Layer 1".to_string(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![Placement {
+                        instance_id: 0,
                         frame: 0,
                         target: Target::Asset(2),
                         transform: Transform2D::IDENTITY,
                         tween: Tween::None,
+                        fx: Default::default(),
                     }],
                 }],
             },
@@ -142,10 +148,12 @@ fn q0rg_chain(edge_count: usize) -> ProjectV2 {
                 name: "Layer".to_string(),
                 explicit_keyframes: Vec::new(),
                 placements: vec![Placement {
+                    instance_id: 0,
                     frame: 0,
                     target: Target::Q0rg(q0rg_id + 1),
                     transform: Transform2D::IDENTITY,
                     tween: Tween::None,
+                    fx: Default::default(),
                 }],
             }]
         } else {
@@ -182,6 +190,44 @@ fn v2_roundtrip_binary() {
     let bytes = write(&project).expect("must serialize");
     let parsed = parse(&bytes).expect("must parse");
     assert_eq!(project, parsed);
+}
+
+#[test]
+fn placement_fx_survive_q1s_roundtrip_without_touching_symbol_contents() {
+    let mut project = sample_v2_project();
+    let child_before = project.q0rgs[1].clone();
+    project.q0rgs[0].layers[0].placements[1].fx = PlacementFx {
+        opacity: 0.42,
+        blend_mode: BlendMode::Screen,
+        blur: Some(BlurFx { radius: 3.5 }),
+        glow: Some(GlowFx {
+            color: Rgba {
+                r: 255,
+                g: 32,
+                b: 12,
+                a: 180,
+            },
+            radius: 9.0,
+            strength: 1.35,
+        }),
+        shadow: Some(DropShadowFx {
+            color: Rgba {
+                r: 10,
+                g: 20,
+                b: 30,
+                a: 160,
+            },
+            blur_radius: 5.0,
+            offset_x: 7.0,
+            offset_y: -4.0,
+            strength: 0.8,
+        }),
+    };
+
+    let decoded = parse(&write(&project).expect("write placement fx")).expect("parse placement fx");
+
+    assert_eq!(decoded, project);
+    assert_eq!(decoded.q0rgs[1], child_before);
 }
 
 #[test]
@@ -254,6 +300,8 @@ fn layer_folders_and_depth_order_survive_q1s_roundtrip() {
             kind: q0s_format::v2::LayerKind::Normal,
             parent_folder_id: Some(90),
             collapsed: false,
+            hidden: false,
+            locked: false,
         },
     );
     project.layer_metadata.insert(
@@ -262,6 +310,8 @@ fn layer_folders_and_depth_order_survive_q1s_roundtrip() {
             kind: q0s_format::v2::LayerKind::Normal,
             parent_folder_id: Some(90),
             collapsed: false,
+            hidden: false,
+            locked: false,
         },
     );
     project.layer_metadata.insert(
@@ -270,6 +320,8 @@ fn layer_folders_and_depth_order_survive_q1s_roundtrip() {
             kind: q0s_format::v2::LayerKind::Folder,
             parent_folder_id: None,
             collapsed: true,
+            hidden: false,
+            locked: false,
         },
     );
 
@@ -296,6 +348,8 @@ fn layer_folder_cannot_hold_keyframes_or_have_noncontiguous_children() {
             kind: q0s_format::v2::LayerKind::Folder,
             parent_folder_id: None,
             collapsed: false,
+            hidden: false,
+            locked: false,
         },
     );
     assert_eq!(
@@ -316,6 +370,8 @@ fn layer_folder_cannot_hold_keyframes_or_have_noncontiguous_children() {
             kind: q0s_format::v2::LayerKind::Normal,
             parent_folder_id: Some(9),
             collapsed: false,
+            hidden: false,
+            locked: false,
         },
     );
     project.layer_metadata.insert(
@@ -324,6 +380,8 @@ fn layer_folder_cannot_hold_keyframes_or_have_noncontiguous_children() {
             kind: q0s_format::v2::LayerKind::Folder,
             parent_folder_id: None,
             collapsed: false,
+            hidden: false,
+            locked: false,
         },
     );
     project.q0rgs[0].layers.insert(
@@ -391,10 +449,12 @@ fn v2_detects_q0rg_cycle() {
     let mut project = sample_v2_project();
     // q0rg 2 references q0rg 1, while q0rg 1 already references 2 в†’ cycle.
     project.q0rgs[1].layers[0].placements.push(Placement {
+        instance_id: 0,
         frame: 0,
         target: Target::Q0rg(1),
         transform: Transform2D::IDENTITY,
         tween: Tween::None,
+        fx: Default::default(),
     });
     let err = validate(&project).expect_err("must fail");
     assert!(matches!(err, Error::Validation("q0rg cycle detected")));

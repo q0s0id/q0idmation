@@ -60,10 +60,12 @@ fn commit_stroke(app: &mut EditorApp, anchors: Vec<Anchor>, closed: bool) -> u16
         .find(|l| l.layer_id == layer_id)
         .expect("layer");
     layer.placements.push(Placement {
+        instance_id: 0,
         frame,
         target: Target::Asset(asset_id),
         transform: Transform2D::IDENTITY,
         tween: Tween::None,
+        fx: Default::default(),
     });
     app.state.dirty = true;
     asset_id

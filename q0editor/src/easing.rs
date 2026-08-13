@@ -984,12 +984,15 @@ mod tests {
         project.q0rgs[0].layers[0].explicit_keyframes.clear();
         project.q0rgs[0].layers[0].placements = vec![
             q0s_format::v2::Placement {
+                instance_id: 0,
                 frame: 0,
                 target: q0s_format::v2::Target::Asset(77),
                 transform: q0s_format::v2::Transform2D::IDENTITY,
                 tween: Tween::None,
+                fx: Default::default(),
             },
             q0s_format::v2::Placement {
+                instance_id: 0,
                 frame: 6,
                 target: q0s_format::v2::Target::Asset(77),
                 transform: q0s_format::v2::Transform2D {
@@ -997,6 +1000,7 @@ mod tests {
                     ..q0s_format::v2::Transform2D::IDENTITY
                 },
                 tween: Tween::None,
+                fx: Default::default(),
             },
         ];
         project
@@ -1078,16 +1082,20 @@ mod tests {
             explicit_keyframes: Vec::new(),
             placements: vec![
                 q0s_format::v2::Placement {
+                    instance_id: 0,
                     frame: 0,
                     target: q0s_format::v2::Target::Asset(88),
                     transform: q0s_format::v2::Transform2D::IDENTITY,
                     tween: Tween::Linear { to_frame: 6 },
+                    fx: Default::default(),
                 },
                 q0s_format::v2::Placement {
+                    instance_id: 0,
                     frame: 6,
                     target: q0s_format::v2::Target::Asset(88),
                     transform: q0s_format::v2::Transform2D::IDENTITY,
                     tween: Tween::None,
+                    fx: Default::default(),
                 },
             ],
         });
@@ -1116,16 +1124,20 @@ mod tests {
                 explicit_keyframes: Vec::new(),
                 placements: vec![
                     q0s_format::v2::Placement {
+                        instance_id: 0,
                         frame: 0,
                         target: q0s_format::v2::Target::Asset(88),
                         transform: q0s_format::v2::Transform2D::IDENTITY,
                         tween: Tween::Linear { to_frame: 6 },
+                        fx: Default::default(),
                     },
                     q0s_format::v2::Placement {
+                        instance_id: 0,
                         frame: 6,
                         target: q0s_format::v2::Target::Asset(88),
                         transform: q0s_format::v2::Transform2D::IDENTITY,
                         tween: Tween::None,
+                        fx: Default::default(),
                     },
                 ],
             });

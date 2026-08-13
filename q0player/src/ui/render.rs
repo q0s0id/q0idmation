@@ -11,7 +11,7 @@
 //! We deliberately mirror q0editor's render module rather than depend on
 //! it, so the player stays free of the editor crate. The shared bits
 //! (path flattening, transform interpolation) live in `q0s_format::geom`
-//! and `q0s_format::raster::active_placements_at`.
+//! and `q0s_format::raster::active_placement_states_at`.
 
 use std::collections::HashMap;
 
@@ -24,20 +24,39 @@ use lyon_path::math::point as lyon_point;
 use lyon_tessellation::geometry_builder::{BuffersBuilder, Positions, VertexBuffers};
 use lyon_tessellation::{FillOptions, FillRule as LyonFillRule, FillTessellator};
 use q0s_format::geom::flatten_path;
-use q0s_format::raster::active_placements_at;
+use q0s_format::raster::active_placement_states_at;
 use q0s_format::transform::Affine;
-use q0s_format::v2::{Asset, ProjectV2, Rgba, Target, Vec2};
+use q0s_format::v2::{Asset, BlendMode, Placement, PlacementFx, ProjectV2, Rgba, Target, Vec2};
 
 const Q0RG_RECURSION_LIMIT: u8 = 8;
 const BEZIER_SAMPLES: usize = 16;
 
 /// Bitmap texture cache keyed by `asset_id`. Lives on `PlayerApp` so we
 /// only upload each bitmap to the GPU once per session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FxPlacementKey {
+    host_q0rg_id: u16,
+    layer_id: u16,
+    placement_idx: usize,
+    local_frame: u16,
+    width: u32,
+    height: u32,
+    affine_bits: [u32; 6],
+}
+
+struct FxPlacementTexture {
+    texture: TextureHandle,
+    crop: [u32; 4],
+    blend_mode: BlendMode,
+}
+
 #[derive(Default)]
 pub struct TextureCache {
     by_asset_id: HashMap<u16, TextureHandle>,
     by_q0v_frame: HashMap<(u16, u32), TextureHandle>,
     q0v_media: HashMap<u16, q0video::q0v::Q0vFile>,
+    fx_placement_textures: HashMap<FxPlacementKey, FxPlacementTexture>,
+    fx_serial: u64,
 }
 
 impl TextureCache {
@@ -45,6 +64,7 @@ impl TextureCache {
         self.by_asset_id.clear();
         self.by_q0v_frame.clear();
         self.q0v_media.clear();
+        self.fx_placement_textures.clear();
     }
 }
 
@@ -73,6 +93,31 @@ pub fn paint_v2_frame(
     cache: &mut TextureCache,
     white_stage_bg: bool,
 ) {
+    paint_v2_frame_with_rig_overrides(
+        painter,
+        ctx,
+        project,
+        q0rg_id,
+        frame,
+        target_rect,
+        cache,
+        white_stage_bg,
+        &q0s_format::rig::RigRuntimeOverrides::new(),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn paint_v2_frame_with_rig_overrides(
+    painter: &Painter,
+    ctx: &Context,
+    project: &ProjectV2,
+    q0rg_id: u16,
+    frame: u16,
+    target_rect: Rect,
+    cache: &mut TextureCache,
+    white_stage_bg: bool,
+    rig_overrides: &q0s_format::rig::RigRuntimeOverrides,
+) {
     let stage_w = project.meta.stage_width.max(1) as f32;
     let stage_h = project.meta.stage_height.max(1) as f32;
     let scale = (target_rect.width() / stage_w)
@@ -98,6 +143,119 @@ pub fn paint_v2_frame(
         &view,
         0,
         cache,
+        rig_overrides,
+    );
+}
+
+fn fx_raster_size(stage_rect: Rect, ctx: &Context) -> (u32, u32) {
+    let pixels_per_point = ctx.pixels_per_point().clamp(1.0, 2.0);
+    let mut width = (stage_rect.width().max(1.0) * pixels_per_point).ceil();
+    let mut height = (stage_rect.height().max(1.0) * pixels_per_point).ceil();
+    let dimension_scale = (3072.0 / width.max(height)).min(1.0);
+    width *= dimension_scale;
+    height *= dimension_scale;
+    let pixels = width * height;
+    if pixels > 6_000_000.0 {
+        let scale = (6_000_000.0 / pixels).sqrt();
+        width *= scale;
+        height *= scale;
+    }
+    (
+        width.max(1.0).round() as u32,
+        height.max(1.0).round() as u32,
+    )
+}
+
+fn affine_bits(affine: Affine) -> [u32; 6] {
+    [
+        affine.a11.to_bits(),
+        affine.a12.to_bits(),
+        affine.a21.to_bits(),
+        affine.a22.to_bits(),
+        affine.tx.to_bits(),
+        affine.ty.to_bits(),
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_fx_placement(
+    painter: &Painter,
+    ctx: &Context,
+    project: &ProjectV2,
+    host_q0rg_id: u16,
+    layer_id: u16,
+    placement_idx: usize,
+    placement: &Placement,
+    local_frame: u16,
+    composed: Affine,
+    fx: PlacementFx,
+    view: &StageView,
+    cache: &mut TextureCache,
+) {
+    let stage_w = project.meta.stage_width.max(1) as f32;
+    let stage_h = project.meta.stage_height.max(1) as f32;
+    let stage_rect = Rect::from_min_size(
+        view.origin,
+        egui::vec2(stage_w * view.scale, stage_h * view.scale),
+    );
+    let (width, height) = fx_raster_size(stage_rect, ctx);
+    let key = FxPlacementKey {
+        host_q0rg_id,
+        layer_id,
+        placement_idx,
+        local_frame,
+        width,
+        height,
+        affine_bits: affine_bits(composed),
+    };
+    if !cache.fx_placement_textures.contains_key(&key) {
+        if cache.fx_placement_textures.len() >= 64 {
+            cache.fx_placement_textures.clear();
+        }
+        let Some(crop) = q0s_format::raster::rasterize_placement_fx_scaled_cropped(
+            project,
+            host_q0rg_id,
+            placement,
+            local_frame,
+            composed,
+            fx,
+            width,
+            height,
+        ) else {
+            return;
+        };
+        let image = ColorImage::from_rgba_unmultiplied(
+            [crop.width as usize, crop.height as usize],
+            &crop.rgba,
+        );
+        cache.fx_serial = cache.fx_serial.wrapping_add(1);
+        let texture = ctx.load_texture(
+            format!("q0player_fx_placement_{}", cache.fx_serial),
+            image,
+            TextureOptions::LINEAR,
+        );
+        cache.fx_placement_textures.insert(
+            key,
+            FxPlacementTexture {
+                texture,
+                crop: [crop.x, crop.y, crop.width, crop.height],
+                blend_mode: fx.blend_mode,
+            },
+        );
+    }
+    let Some(cached) = cache.fx_placement_textures.get(&key) else {
+        return;
+    };
+    let [x, y, crop_width, crop_height] = cached.crop;
+    let x0 = stage_rect.left() + x as f32 / width as f32 * stage_rect.width();
+    let y0 = stage_rect.top() + y as f32 / height as f32 * stage_rect.height();
+    let x1 = stage_rect.left() + (x + crop_width) as f32 / width as f32 * stage_rect.width();
+    let y1 = stage_rect.top() + (y + crop_height) as f32 / height as f32 * stage_rect.height();
+    q0glblend::paint_texture(
+        painter,
+        Rect::from_min_max(pos2(x0, y0), pos2(x1, y1)),
+        cached.texture.id(),
+        cached.blend_mode,
     );
 }
 
@@ -112,6 +270,7 @@ fn paint_q0rg(
     view: &StageView,
     depth: u8,
     cache: &mut TextureCache,
+    rig_overrides: &q0s_format::rig::RigRuntimeOverrides,
 ) {
     if depth > Q0RG_RECURSION_LIMIT {
         return;
@@ -124,15 +283,46 @@ fn paint_q0rg(
     } else {
         0
     };
+    let rig_pose = q0s_format::rig::rig_for_q0rg(project, q0rg_id).map(|rig| {
+        let overrides = rig_overrides
+            .get(&q0rg_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        q0s_format::rig::evaluate_rig(rig, f32::from(local_frame), overrides)
+    });
     for layer in &q.layers {
-        for (idx, interp) in active_placements_at(layer, local_frame) {
-            let Some(placement) = layer.placements.get(idx) else {
+        if !project.layer_is_visible(q0rg_id, layer.layer_id) {
+            continue;
+        }
+        for active in active_placement_states_at(layer, local_frame) {
+            let Some(placement) = layer.placements.get(active.index) else {
                 continue;
             };
+            let local_affine = rig_pose
+                .as_ref()
+                .and_then(|pose| pose.binding_transform(placement.instance_id))
+                .unwrap_or_else(|| Affine::from_transform(active.transform));
             // Affine matrix composition: parent skew / non-uniform scale
             // propagate cleanly into children, unlike the old SRSk
             // decomposition which dropped them.
-            let composed = Affine::compose(parent, Affine::from_transform(interp));
+            let composed = Affine::compose(parent, local_affine);
+            if !active.fx.is_identity() {
+                paint_fx_placement(
+                    painter,
+                    ctx,
+                    project,
+                    q0rg_id,
+                    layer.layer_id,
+                    active.index,
+                    placement,
+                    local_frame,
+                    composed,
+                    active.fx,
+                    view,
+                    cache,
+                );
+                continue;
+            }
             match placement.target {
                 Target::Asset(asset_id) => {
                     if let Some(asset) = project.assets.iter().find(|a| a.id() == asset_id) {
@@ -159,6 +349,7 @@ fn paint_q0rg(
                         view,
                         depth + 1,
                         cache,
+                        rig_overrides,
                     );
                 }
                 _ => {}
@@ -289,6 +480,7 @@ fn paint_asset(
             mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
             painter.add(Shape::Mesh(mesh));
         }
+        Asset::Rig(_) => {}
         Asset::Vector(v) => {
             // Fill every closed contour in one tessellation pass. A vector asset
             // can contain an exterior plus oppositely-wound hole contours; filling
@@ -528,5 +720,87 @@ mod tests {
         drop_duplicate_closing_point_vec2(&mut points);
         assert_eq!(points.len(), 3);
         assert_ne!(points.first(), points.last());
+    }
+    #[test]
+    fn interactive_player_renderer_omits_hidden_layers() {
+        use q0s_format::v2::{
+            BitmapAsset, Layer, LayerKey, LayerMetadata, Placement, ProjectMeta, Q0rg, Transform2D,
+            Tween,
+        };
+
+        let mut project = ProjectV2 {
+            meta: ProjectMeta {
+                name: "hidden-player-layer".into(),
+                fps: 24,
+                stage_width: 16,
+                stage_height: 16,
+                entry_q0rg_id: 1,
+            },
+            assets: vec![Asset::Bitmap(BitmapAsset {
+                asset_id: 1,
+                width: 2,
+                height: 2,
+                rgba: [255, 0, 0, 255].repeat(4),
+            })],
+            asset_names: std::collections::HashMap::new(),
+            asset_appearances: std::collections::HashMap::new(),
+            layer_metadata: std::collections::HashMap::new(),
+            q0rgs: vec![Q0rg {
+                q0rg_id: 1,
+                name: "Stage".into(),
+                frame_count: 1,
+                script: String::new(),
+                layers: vec![Layer {
+                    layer_id: 1,
+                    name: "art".into(),
+                    explicit_keyframes: Vec::new(),
+                    placements: vec![Placement {
+                        instance_id: 0,
+                        frame: 0,
+                        target: Target::Asset(1),
+                        transform: Transform2D::IDENTITY,
+                        tween: Tween::None,
+                        fx: Default::default(),
+                    }],
+                }],
+            }],
+        };
+
+        let painted_shape_count = |project: &ProjectV2| {
+            let context = Context::default();
+            let target = Rect::from_min_size(Pos2::ZERO, egui::vec2(64.0, 64.0));
+            let mut cache = TextureCache::default();
+            let output = context.run(
+                egui::RawInput {
+                    screen_rect: Some(target),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let painter = ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Middle,
+                        egui::Id::new("hidden-layer-render-test"),
+                    ));
+                    paint_v2_frame(&painter, ctx, project, 1, 0, target, &mut cache, false);
+                },
+            );
+            output.shapes.len()
+        };
+
+        assert!(
+            painted_shape_count(&project) > 0,
+            "visible layer must paint"
+        );
+        project.layer_metadata.insert(
+            LayerKey::new(1, 1),
+            LayerMetadata {
+                hidden: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            painted_shape_count(&project),
+            0,
+            "hidden layer must emit no interactive player shapes"
+        );
     }
 }

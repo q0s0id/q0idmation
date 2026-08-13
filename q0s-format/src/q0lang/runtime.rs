@@ -84,6 +84,13 @@ impl Runtime {
                         args,
                     });
                 }
+                Statement::RigCommand { command, args } => {
+                    let args = args
+                        .iter()
+                        .map(|arg| self.resolve_runtime_value(arg, report))
+                        .collect::<Vec<_>>();
+                    self.emit_rig_command(command, &args, report);
+                }
                 Statement::Listen { event, handler } => {
                     let handlers = self.listeners.entry(event.clone()).or_default();
                     if !handlers.iter().any(|h| h == handler) {
@@ -136,6 +143,108 @@ impl Runtime {
                     ));
                 }
             }
+        }
+    }
+
+    fn emit_rig_command(&self, command: &str, args: &[RuntimeValue], report: &mut ExecutionReport) {
+        let control_name = |value: &RuntimeValue| match value {
+            RuntimeValue::String(name) | RuntimeValue::Ident(name) | RuntimeValue::Raw(name) => {
+                Some(name.clone())
+            }
+            RuntimeValue::Number(_) => None,
+        };
+        match (command, args) {
+            ("position", [name, RuntimeValue::Number(x), RuntimeValue::Number(y)]) => {
+                if let Some(control) = control_name(name) {
+                    report.actions.push(RuntimeAction::RigSetPosition {
+                        control,
+                        x: *x,
+                        y: *y,
+                    });
+                } else {
+                    report.diagnostics.push(RuntimeDiagnostic::at_line(
+                        0,
+                        "q0rig.position! expects a control name followed by x, y numbers",
+                    ));
+                }
+            }
+            ("value", [name, RuntimeValue::Number(value)]) => {
+                if let Some(control) = control_name(name) {
+                    report.actions.push(RuntimeAction::RigSetValue {
+                        control,
+                        value: *value,
+                    });
+                } else {
+                    report.diagnostics.push(RuntimeDiagnostic::at_line(
+                        0,
+                        "q0rig.value! expects a control name followed by a number",
+                    ));
+                }
+            }
+            ("reset", [name]) => {
+                if let Some(control) = control_name(name) {
+                    report.actions.push(RuntimeAction::RigReset { control });
+                } else {
+                    report.diagnostics.push(RuntimeDiagnostic::at_line(
+                        0,
+                        "q0rig.reset! expects a control name",
+                    ));
+                }
+            }
+            ("pose", [name, RuntimeValue::Number(weight)]) => {
+                if let Some(pose) = control_name(name) {
+                    if weight.is_finite() {
+                        report.actions.push(RuntimeAction::RigSetPose {
+                            pose,
+                            weight: weight.clamp(0.0, 1.0),
+                        });
+                    } else {
+                        report.diagnostics.push(RuntimeDiagnostic::at_line(
+                            0,
+                            "q0rig.pose! weight must be finite",
+                        ));
+                    }
+                } else {
+                    report.diagnostics.push(RuntimeDiagnostic::at_line(
+                        0,
+                        "q0rig.pose! expects a pose name followed by a weight",
+                    ));
+                }
+            }
+            ("pose_reset", [name]) => {
+                if let Some(pose) = control_name(name) {
+                    report.actions.push(RuntimeAction::RigResetPose { pose });
+                } else {
+                    report.diagnostics.push(RuntimeDiagnostic::at_line(
+                        0,
+                        "q0rig.pose_reset! expects a pose name",
+                    ));
+                }
+            }
+            ("position", _) => report.diagnostics.push(RuntimeDiagnostic::at_line(
+                0,
+                "q0rig.position! expects: q0rig.position! control, x, y",
+            )),
+            ("value", _) => report.diagnostics.push(RuntimeDiagnostic::at_line(
+                0,
+                "q0rig.value! expects: q0rig.value! control, value",
+            )),
+            ("reset", _) => report.diagnostics.push(RuntimeDiagnostic::at_line(
+                0,
+                "q0rig.reset! expects: q0rig.reset! control",
+            )),
+            ("pose", _) => report.diagnostics.push(RuntimeDiagnostic::at_line(
+                0,
+                "q0rig.pose! expects: q0rig.pose! pose, weight",
+            )),
+            ("pose_reset", _) => report.diagnostics.push(RuntimeDiagnostic::at_line(
+                0,
+                "q0rig.pose_reset! expects: q0rig.pose_reset! pose",
+            )),
+            _ => report.diagnostics.push(RuntimeDiagnostic::at_line(
+                0,
+                format!("unknown q0.rig command `q0rig.{command}!`"),
+            )),
         }
     }
 
@@ -329,6 +438,25 @@ pub enum RuntimeAction {
         command: String,
         args: Vec<RuntimeValue>,
     },
+    RigSetPosition {
+        control: String,
+        x: f64,
+        y: f64,
+    },
+    RigSetValue {
+        control: String,
+        value: f64,
+    },
+    RigReset {
+        control: String,
+    },
+    RigSetPose {
+        pose: String,
+        weight: f64,
+    },
+    RigResetPose {
+        pose: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -490,5 +618,56 @@ pr func cacheFrame frame
             runtime.private_functions["cacheFrame"].params,
             vec!["frame".to_string()]
         );
+    }
+
+    #[test]
+    fn emits_semantic_rig_runtime_actions() {
+        let mut runtime = Runtime::new();
+        let report = runtime.execute_source(
+            r#"import q0.rig
+base = 10
+q0rig.position! "look", base + 2, 7
+q0rig.value! "arm blend", 0.75
+q0rig.reset! "look"
+q0rig.pose! "wave", 0.6
+q0rig.pose_reset! "wave"
+"#,
+        );
+        assert_eq!(report.diagnostics, Vec::new());
+        assert_eq!(
+            report.actions,
+            vec![
+                RuntimeAction::RigSetPosition {
+                    control: "look".into(),
+                    x: 12.0,
+                    y: 7.0,
+                },
+                RuntimeAction::RigSetValue {
+                    control: "arm blend".into(),
+                    value: 0.75,
+                },
+                RuntimeAction::RigReset {
+                    control: "look".into(),
+                },
+                RuntimeAction::RigSetPose {
+                    pose: "wave".into(),
+                    weight: 0.6,
+                },
+                RuntimeAction::RigResetPose {
+                    pose: "wave".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reports_bad_rig_runtime_command_arguments_without_emitting_action() {
+        let mut runtime = Runtime::new();
+        let report = runtime.execute_source("q0rig.position! 12, 'bad'\n");
+        assert!(report.actions.is_empty());
+        assert_eq!(report.diagnostics.len(), 1);
+        assert!(report.diagnostics[0]
+            .message
+            .contains("q0rig.position! expects"));
     }
 }

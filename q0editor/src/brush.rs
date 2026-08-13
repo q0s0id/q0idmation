@@ -1540,11 +1540,41 @@ pub fn commit_brush_region_with_material(
 /// contours must end with the same topology or semi-transparent overlaps render
 /// darker and remain separately selectable. Disconnected regions are left
 /// alone, while touching or overlapping components are consolidated.
+#[cfg(test)]
 pub(crate) fn merge_touching_raw_fills_after_edit(
     project: &mut ProjectV2,
     q0rg_id: u16,
     layer_id: u16,
     frame: u16,
+) -> bool {
+    merge_touching_raw_fills_after_edit_impl(project, q0rg_id, layer_id, frame, None)
+}
+
+pub(crate) fn merge_touching_raw_fills_after_edit_focused(
+    project: &mut ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    frame: u16,
+    edited_asset_ids: &BTreeSet<u16>,
+) -> bool {
+    if edited_asset_ids.is_empty() {
+        return false;
+    }
+    merge_touching_raw_fills_after_edit_impl(
+        project,
+        q0rg_id,
+        layer_id,
+        frame,
+        Some(edited_asset_ids),
+    )
+}
+
+fn merge_touching_raw_fills_after_edit_impl(
+    project: &mut ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    frame: u16,
+    edited_asset_ids: Option<&BTreeSet<u16>>,
 ) -> bool {
     let candidates = collect_raw_fill_candidates(project, q0rg_id, layer_id, frame, true);
     let mut groups: Vec<(RawFillStyle, Vec<RawFillCandidate>)> = Vec::new();
@@ -1563,7 +1593,49 @@ pub(crate) fn merge_touching_raw_fills_after_edit(
     }
 
     let mut updates = Vec::new();
-    for (style, items) in groups {
+    for (style, mut items) in groups {
+        if let Some(edited_asset_ids) = edited_asset_ids {
+            let mut active = items
+                .iter()
+                .map(|item| edited_asset_ids.contains(&item.asset_id))
+                .collect::<Vec<_>>();
+            if !active.iter().any(|active| *active) {
+                continue;
+            }
+            loop {
+                let mut changed = false;
+                for candidate_index in 0..items.len() {
+                    if active[candidate_index] {
+                        continue;
+                    }
+                    if (0..items.len()).any(|active_index| {
+                        active[active_index]
+                            && raw_surface_sets_require_boundary_merge(
+                                &items[active_index].source_surfaces,
+                                &items[candidate_index].source_surfaces,
+                            )
+                    }) {
+                        active[candidate_index] = true;
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            items = items
+                .into_iter()
+                .zip(active)
+                .filter_map(|(item, active)| active.then_some(item))
+                .collect();
+        }
+
+        // One asset already renders all of its contours in one fill pass. Even if
+        // some of those contours overlap, rebuilding that asset cannot improve
+        // merge-drawing semantics and only risks destroying its Bezier boundary.
+        if items.len() < 2 {
+            continue;
+        }
         // A post-material fragment is a slice of one already-resolved filter
         // field. Geometry-merging those slices would make the filter evaluate
         // again from the merged contours and resurrect the split-edge glow.
@@ -1584,11 +1656,26 @@ pub(crate) fn merge_touching_raw_fills_after_edit(
 
         let mut merged = MultiPolygon(Vec::new());
         let mut asset_ids = BTreeSet::new();
+        let mut paths = Vec::new();
         for item in &items {
             asset_ids.insert(item.asset_id);
             merged = merged.union(&item.geometry);
+            let Some(Asset::Vector(vector)) = project
+                .assets
+                .iter()
+                .find(|asset| asset.id() == item.asset_id)
+            else {
+                paths.clear();
+                break;
+            };
+            paths.extend(vector.paths.iter().cloned());
         }
-        let paths = coverage_to_paths(&merged);
+        // Post-transform merge is a topology operation, not a geometry refit.
+        // Keep the exact source VPaths, including every cubic handle, and merely
+        // place the touching contours into one fill-only asset. The renderer
+        // tessellates all contours in one fill pass, so translucent overlap does
+        // not stack as separate objects and merge-drawing semantics are retained
+        // without turning smooth brush boundaries into anchor-only polygons.
         if paths.is_empty()
             || !merged_paths_preserve_every_source(color, &paths, &merged, &source_surfaces)
         {
@@ -1623,29 +1710,43 @@ pub(crate) fn merge_touching_raw_fills_after_edit(
     true
 }
 
+fn raw_surface_pair_requires_boundary_merge(a: &MultiPolygon<f64>, b: &MultiPolygon<f64>) -> bool {
+    let a_area = a.unsigned_area();
+    let b_area = b.unsigned_area();
+    if a_area <= 1.0e-8 || b_area <= 1.0e-8 {
+        return false;
+    }
+    let intersection_area = a.intersection(b).unsigned_area();
+    let min_area = a_area.min(b_area);
+    let tolerance = (min_area * 1.0e-7).max(1.0e-8);
+    // Partial overlap means both visible boundaries participate in the
+    // resulting planar surface. Full containment/identity does not.
+    if intersection_area > tolerance && intersection_area < min_area - tolerance {
+        return true;
+    }
+    if intersection_area <= tolerance {
+        let union = a.union(b);
+        return union.0.len() < a.0.len() + b.0.len();
+    }
+    false
+}
+
+fn raw_surface_sets_require_boundary_merge(
+    left: &[MultiPolygon<f64>],
+    right: &[MultiPolygon<f64>],
+) -> bool {
+    left.iter().any(|a| {
+        right
+            .iter()
+            .any(|b| raw_surface_pair_requires_boundary_merge(a, b))
+    })
+}
+
 fn raw_surfaces_require_boundary_merge(surfaces: &[MultiPolygon<f64>]) -> bool {
     for left in 0..surfaces.len() {
         for right in left + 1..surfaces.len() {
-            let a = &surfaces[left];
-            let b = &surfaces[right];
-            let a_area = a.unsigned_area();
-            let b_area = b.unsigned_area();
-            if a_area <= 1.0e-8 || b_area <= 1.0e-8 {
-                continue;
-            }
-            let intersection_area = a.intersection(b).unsigned_area();
-            let min_area = a_area.min(b_area);
-            let tolerance = (min_area * 1.0e-7).max(1.0e-8);
-            // Partial overlap means both visible boundaries participate in the
-            // resulting planar surface. Full containment/identity does not.
-            if intersection_area > tolerance && intersection_area < min_area - tolerance {
+            if raw_surface_pair_requires_boundary_merge(&surfaces[left], &surfaces[right]) {
                 return true;
-            }
-            if intersection_area <= tolerance {
-                let union = a.union(b);
-                if union.0.len() < a.0.len() + b.0.len() {
-                    return true;
-                }
             }
         }
     }
@@ -1991,10 +2092,12 @@ fn append_raw_fill(
         })
     {
         layer.placements.push(Placement {
+            instance_id: 0,
             frame,
             target: Target::Asset(asset_id),
             transform: Transform2D::IDENTITY,
             tween: Tween::None,
+            fx: Default::default(),
         });
     }
     asset_id
@@ -3507,16 +3610,20 @@ mod tests {
         ];
         app.state.project.q0rgs[0].layers[0].placements = vec![
             Placement {
+                instance_id: 0,
                 frame: 0,
                 target: Target::Asset(1),
                 transform: Transform2D::IDENTITY,
                 tween: Tween::None,
+                fx: Default::default(),
             },
             Placement {
+                instance_id: 0,
                 frame: 0,
                 target: Target::Asset(2),
                 transform: Transform2D::IDENTITY,
                 tween: Tween::None,
+                fx: Default::default(),
             },
         ];
 
@@ -3556,16 +3663,20 @@ mod tests {
         ];
         app.state.project.q0rgs[0].layers[0].placements = vec![
             Placement {
+                instance_id: 0,
                 frame: 0,
                 target: Target::Asset(1),
                 transform: Transform2D::IDENTITY,
                 tween: Tween::None,
+                fx: Default::default(),
             },
             Placement {
+                instance_id: 0,
                 frame: 0,
                 target: Target::Asset(2),
                 transform: Transform2D::IDENTITY,
                 tween: Tween::None,
+                fx: Default::default(),
             },
         ];
 
@@ -3581,12 +3692,101 @@ mod tests {
             panic!("merged raw fill must remain vector");
         };
         assert_eq!(vector.fill, Some(color));
-        assert_eq!(vector.paths.len(), 1);
+        assert_eq!(vector.paths.len(), 2);
         assert!((vector_fill_geometry(vector).unsigned_area() - 150.0).abs() < 0.1);
     }
-
     #[test]
-    fn moving_one_contour_into_its_raw_asset_neighbour_unions_them() {
+    fn post_drag_merge_preserves_bezier_boundaries_instead_of_polygonizing() {
+        let color = Rgba {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        let circle = |center_x: f32| {
+            let r = 10.0;
+            let k = r * 0.552_284_8;
+            VPath {
+                anchors: vec![
+                    Anchor {
+                        point: Vec2::new(center_x, -r),
+                        in_handle: Some(Vec2::new(center_x - k, -r)),
+                        out_handle: Some(Vec2::new(center_x + k, -r)),
+                    },
+                    Anchor {
+                        point: Vec2::new(center_x + r, 0.0),
+                        in_handle: Some(Vec2::new(center_x + r, -k)),
+                        out_handle: Some(Vec2::new(center_x + r, k)),
+                    },
+                    Anchor {
+                        point: Vec2::new(center_x, r),
+                        in_handle: Some(Vec2::new(center_x + k, r)),
+                        out_handle: Some(Vec2::new(center_x - k, r)),
+                    },
+                    Anchor {
+                        point: Vec2::new(center_x - r, 0.0),
+                        in_handle: Some(Vec2::new(center_x - r, k)),
+                        out_handle: Some(Vec2::new(center_x - r, -k)),
+                    },
+                ],
+                closed: true,
+            }
+        };
+        let left = circle(0.0);
+        let right = circle(12.0);
+        let mut app = EditorApp::default();
+        app.state.project.assets = vec![
+            raw_fill_asset(1, color, left.clone()),
+            raw_fill_asset(2, color, right.clone()),
+        ];
+        app.state.project.q0rgs[0].layers[0].placements = vec![
+            Placement {
+                instance_id: 0,
+                frame: 0,
+                target: Target::Asset(1),
+                transform: Transform2D::IDENTITY,
+                tween: Tween::None,
+                fx: Default::default(),
+            },
+            Placement {
+                instance_id: 0,
+                frame: 0,
+                target: Target::Asset(2),
+                transform: Transform2D::IDENTITY,
+                tween: Tween::None,
+                fx: Default::default(),
+            },
+        ];
+
+        let edited = BTreeSet::from([1]);
+        assert!(merge_touching_raw_fills_after_edit_focused(
+            &mut app.state.project,
+            1,
+            1,
+            0,
+            &edited,
+        ));
+        assert_eq!(app.state.project.q0rgs[0].layers[0].placements.len(), 1);
+        assert_eq!(app.state.project.assets.len(), 1);
+        let Asset::Vector(vector) = &app.state.project.assets[0] else {
+            panic!("merged raw fill must remain vector");
+        };
+        assert_eq!(vector.paths.len(), 2);
+        assert!(vector.paths.contains(&left));
+        assert!(vector.paths.contains(&right));
+        assert_eq!(
+            vector
+                .paths
+                .iter()
+                .flat_map(|path| &path.anchors)
+                .filter(|anchor| anchor.in_handle.is_some() || anchor.out_handle.is_some())
+                .count(),
+            8,
+            "post-drag merge dropped cubic handles and polygonized the visible boundary",
+        );
+    }
+    #[test]
+    fn already_merged_raw_asset_is_not_rebuilt_after_edit() {
         let mut app = EditorApp::default();
         let color = Rgba {
             r: 120,
@@ -3604,22 +3804,26 @@ mod tests {
             stroke: None,
         })];
         app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
             transform: Transform2D::IDENTITY,
             tween: Tween::None,
+            fx: Default::default(),
         }];
 
-        assert!(merge_touching_raw_fills_after_edit(
+        let before = app.state.project.assets[0].clone();
+        assert!(!merge_touching_raw_fills_after_edit(
             &mut app.state.project,
             1,
             1,
             0
         ));
+        assert_eq!(app.state.project.assets[0], before);
         let Asset::Vector(vector) = &app.state.project.assets[0] else {
             panic!("raw fill must remain vector");
         };
-        assert_eq!(vector.paths.len(), 1);
+        assert_eq!(vector.paths.len(), 2);
         assert!((vector_fill_geometry(vector).unsigned_area() - 150.0).abs() < 0.1);
     }
 
@@ -3638,16 +3842,20 @@ mod tests {
         ];
         app.state.project.q0rgs[0].layers[0].placements = vec![
             Placement {
+                instance_id: 0,
                 frame: 0,
                 target: Target::Asset(1),
                 transform: Transform2D::IDENTITY,
                 tween: Tween::None,
+                fx: Default::default(),
             },
             Placement {
+                instance_id: 0,
                 frame: 0,
                 target: Target::Asset(2),
                 transform: Transform2D::IDENTITY,
                 tween: Tween::None,
+                fx: Default::default(),
             },
         ];
 
@@ -3659,6 +3867,104 @@ mod tests {
         ));
         assert_eq!(app.state.project.q0rgs[0].layers[0].placements.len(), 2);
         assert_eq!(app.state.project.assets.len(), 2);
+    }
+
+    #[test]
+    fn post_edit_merge_does_not_rebuild_an_unchanged_rounded_brush_asset() {
+        let mut app = EditorApp::default();
+        let paint = settings(24.0, 65);
+        let gesture = stroke(
+            &[
+                Vec2::new(20.0, 40.0),
+                Vec2::new(55.0, 28.0),
+                Vec2::new(95.0, 52.0),
+                Vec2::new(140.0, 36.0),
+            ],
+            paint,
+        );
+        commit_brush_region(&mut app, brush_finish(gesture, paint), paint);
+        let before = app.state.project.assets[0].clone();
+
+        assert!(!merge_touching_raw_fills_after_edit(
+            &mut app.state.project,
+            1,
+            1,
+            0,
+        ));
+        assert_eq!(app.state.project.assets[0], before);
+    }
+
+    #[test]
+    fn focused_post_edit_merge_never_rebuilds_unrelated_touching_round_graphics() {
+        let color = Rgba {
+            r: 60,
+            g: 90,
+            b: 120,
+            a: 255,
+        };
+        let r = 18.0;
+        let k = r * 0.552_284_8;
+        let center = Vec2::new(120.0, 30.0);
+        let rounded = VPath {
+            anchors: vec![
+                Anchor {
+                    point: Vec2::new(center.x, center.y - r),
+                    in_handle: Some(Vec2::new(center.x - k, center.y - r)),
+                    out_handle: Some(Vec2::new(center.x + k, center.y - r)),
+                },
+                Anchor {
+                    point: Vec2::new(center.x + r, center.y),
+                    in_handle: Some(Vec2::new(center.x + r, center.y - k)),
+                    out_handle: Some(Vec2::new(center.x + r, center.y + k)),
+                },
+                Anchor {
+                    point: Vec2::new(center.x, center.y + r),
+                    in_handle: Some(Vec2::new(center.x + k, center.y + r)),
+                    out_handle: Some(Vec2::new(center.x - k, center.y + r)),
+                },
+                Anchor {
+                    point: Vec2::new(center.x - r, center.y),
+                    in_handle: Some(Vec2::new(center.x - r, center.y + k)),
+                    out_handle: Some(Vec2::new(center.x - r, center.y - k)),
+                },
+            ],
+            closed: true,
+        };
+        let mut app = EditorApp::default();
+        app.state.project.assets = vec![
+            raw_fill_asset(1, color, square_path(0.0, 0.0, 20.0, 20.0)),
+            raw_fill_asset(2, color, square_path(20.0, 0.0, 40.0, 20.0)),
+            raw_fill_asset(3, color, rounded),
+        ];
+        app.state.project.q0rgs[0].layers[0].placements = (1..=3)
+            .map(|asset_id| Placement {
+                instance_id: 0,
+                frame: 0,
+                target: Target::Asset(asset_id),
+                transform: Transform2D::IDENTITY,
+                tween: Tween::None,
+                fx: Default::default(),
+            })
+            .collect();
+
+        let mut old_global_behavior = app.state.project.clone();
+        assert!(merge_touching_raw_fills_after_edit(
+            &mut old_global_behavior,
+            1,
+            1,
+            0,
+        ));
+
+        let before = app.state.project.clone();
+        let edited = BTreeSet::from([3]);
+        assert!(!merge_touching_raw_fills_after_edit_focused(
+            &mut app.state.project,
+            1,
+            1,
+            0,
+            &edited,
+        ));
+        assert_eq!(app.state.project, before);
     }
 
     #[test]
@@ -3855,10 +4161,12 @@ mod tests {
             stroke: None,
         })];
         app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
             transform: Transform2D::IDENTITY,
             tween: Tween::None,
+            fx: Default::default(),
         }];
 
         let centers = [Vec2::new(60.0, 100.0), Vec2::new(140.0, 100.0)];
@@ -4042,10 +4350,12 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                instance_id: 0,
                 frame: 1,
                 target: Target::Asset(shared_asset_id),
                 transform: Transform2D::IDENTITY,
                 tween: Tween::None,
+                fx: Default::default(),
             });
 
         let vertical = stroke(&[Vec2::new(30.0, -20.0), Vec2::new(30.0, 60.0)], blue);
@@ -4232,6 +4542,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                instance_id: 0,
                 frame: 0,
                 target: Target::Asset(original_asset_id),
                 transform: Transform2D {
@@ -4239,6 +4550,7 @@ mod tests {
                     ..Transform2D::IDENTITY
                 },
                 tween: Tween::None,
+                fx: Default::default(),
             });
 
         let second = stroke(&[Vec2::new(20.0, 0.0), Vec2::new(20.0, 40.0)], paint);

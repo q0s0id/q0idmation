@@ -24,6 +24,10 @@ pub enum Statement {
         command: String,
         args: Vec<Value>,
     },
+    RigCommand {
+        command: String,
+        args: Vec<Value>,
+    },
     Listen {
         event: String,
         handler: String,
@@ -152,6 +156,16 @@ pub const BUILTIN_LIBRARIES: &[BuiltinLibrary] = &[
         ],
     },
     BuiltinLibrary {
+        name: "q0.rig",
+        symbols: &[
+            "q0rig.position!",
+            "q0rig.value!",
+            "q0rig.reset!",
+            "q0rig.pose!",
+            "q0rig.pose_reset!",
+        ],
+    },
+    BuiltinLibrary {
         name: "q0.core",
         symbols: &["do!", "listen", "xlisten", "pb", "pr", "func"],
     },
@@ -223,6 +237,9 @@ impl Parser<'_> {
             "pr" => self.parse_function(line_no, &parts, Visibility::Private),
             _ if first.starts_with("q0shell.") && first.ends_with('!') => {
                 self.parse_shell_command(line_no, line, first)
+            }
+            _ if first.starts_with("q0rig.") && first.ends_with('!') => {
+                self.parse_rig_command(line_no, line, first)
             }
             _ if line.contains('=') => self.parse_assignment(line_no, line),
             _ if first.ends_with('!') => self.statements.push(Statement::Unknown {
@@ -324,6 +341,24 @@ impl Parser<'_> {
         };
         self.statements
             .push(Statement::ShellCommand { command, args });
+    }
+
+    fn parse_rig_command(&mut self, line_no: usize, line: &str, first: &str) {
+        let command = first
+            .trim_start_matches("q0rig.")
+            .trim_end_matches('!')
+            .to_string();
+        let raw_args = line[first.len()..].trim();
+        let args = if raw_args.is_empty() {
+            Vec::new()
+        } else {
+            split_top_level_commas(raw_args)
+                .into_iter()
+                .map(|arg| parse_value(arg.trim(), line_no, &mut self.diagnostics))
+                .collect()
+        };
+        self.statements
+            .push(Statement::RigCommand { command, args });
     }
 
     fn parse_function(&mut self, line_no: usize, parts: &[&str], visibility: Visibility) {
@@ -937,6 +972,45 @@ q0shell.move! 'out.txt', 'done.txt'
                 value: Value::Raw(_),
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn parses_q0rig_runtime_control_commands() {
+        let program = parse(
+            r#"import q0.rig
+q0rig.position! "look", 12 + 3, 20
+q0rig.value! "arm fk ik", 0.75
+q0rig.reset! "look"
+q0rig.pose! "wave", 0.6
+q0rig.pose_reset! "wave"
+"#,
+        );
+        assert_eq!(program.diagnostics, Vec::new());
+        assert!(matches!(
+            program.statements[1],
+            Statement::RigCommand { ref command, ref args }
+                if command == "position" && args.len() == 3
+        ));
+        assert!(matches!(
+            program.statements[2],
+            Statement::RigCommand { ref command, ref args }
+                if command == "value" && args.len() == 2
+        ));
+        assert!(matches!(
+            program.statements[3],
+            Statement::RigCommand { ref command, ref args }
+                if command == "reset" && args.len() == 1
+        ));
+        assert!(matches!(
+            program.statements[4],
+            Statement::RigCommand { ref command, ref args }
+                if command == "pose" && args.len() == 2
+        ));
+        assert!(matches!(
+            program.statements[5],
+            Statement::RigCommand { ref command, ref args }
+                if command == "pose_reset" && args.len() == 1
         ));
     }
 }

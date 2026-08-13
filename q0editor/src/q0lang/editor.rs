@@ -604,6 +604,17 @@ fn runtime_action_label(action: &super::runtime::RuntimeAction) -> String {
                 .join(", ");
             format!("q0shell.{command}! {args}")
         }
+        RuntimeAction::RigSetPosition { control, x, y } => {
+            format!("q0rig.position! {:?}, {x}, {y}", control)
+        }
+        RuntimeAction::RigSetValue { control, value } => {
+            format!("q0rig.value! {:?}, {value}", control)
+        }
+        RuntimeAction::RigReset { control } => format!("q0rig.reset! {:?}", control),
+        RuntimeAction::RigSetPose { pose, weight } => {
+            format!("q0rig.pose! {:?}, {weight}", pose)
+        }
+        RuntimeAction::RigResetPose { pose } => format!("q0rig.pose_reset! {:?}", pose),
     }
 }
 

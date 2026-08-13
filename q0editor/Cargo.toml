@@ -14,6 +14,7 @@ appearance-mask-eraser = []
 
 [dependencies]
 q0credits = { path = "../q0credits" }
+q0glblend = { path = "../q0glblend" }
 eframe = "0.27"
 egui = "0.27"
 q0s-format = { path = "../q0s-format" }

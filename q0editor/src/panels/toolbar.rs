@@ -24,6 +24,7 @@ enum ToolIcon {
     Oval,
     Bucket,
     Eyedropper,
+    Rig,
 }
 
 impl ToolIcon {
@@ -41,6 +42,7 @@ impl ToolIcon {
             Tool::Oval => Self::Oval,
             Tool::Bucket => Self::Bucket,
             Tool::Eyedropper => Self::Eyedropper,
+            Tool::Rig => Self::Rig,
         }
     }
 }
@@ -218,6 +220,14 @@ fn draw_tool_icon(
         }
         ToolIcon::Bucket => draw_bucket(painter, c, primary, secondary),
         ToolIcon::Eyedropper => draw_eyedropper(painter, c, primary, secondary),
+        ToolIcon::Rig => {
+            painter.line_segment([c.point(0.22, 0.70), c.point(0.50, 0.42)], line);
+            painter.line_segment([c.point(0.50, 0.42), c.point(0.80, 0.20)], line);
+            for (x, y) in [(0.22, 0.70), (0.50, 0.42), (0.80, 0.20)] {
+                painter.circle_filled(c.point(x, y), 3.0, secondary);
+                painter.circle_stroke(c.point(x, y), 3.0, Stroke::new(1.0_f32, primary));
+            }
+        }
     }
 }
 

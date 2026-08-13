@@ -1459,10 +1459,12 @@ mod tests {
             rgba: vec![255, 0, 0, 255],
         }));
         project.q0rgs[0].layers[0].placements.push(Placement {
+            instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
             transform: Transform2D::IDENTITY,
             tween: Tween::None,
+            fx: Default::default(),
         });
         project
     }
@@ -1595,6 +1597,7 @@ mod tests {
         project.assets.swap(0, 1);
         let layer = &mut project.q0rgs[0].layers[0];
         layer.placements.push(Placement {
+            instance_id: 0,
             frame: 6,
             target: Target::Asset(1),
             transform: Transform2D {
@@ -1602,6 +1605,7 @@ mod tests {
                 ..Transform2D::IDENTITY
             },
             tween: Tween::None,
+            fx: Default::default(),
         });
         layer.placements.swap(0, 1);
         layer.explicit_keyframes = vec![5, 2];

@@ -1017,10 +1017,12 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                instance_id: 0,
                 frame: 0,
                 target: Target::Asset(1),
                 transform: Transform2D::IDENTITY,
                 tween: Tween::None,
+                fx: Default::default(),
             });
         app
     }

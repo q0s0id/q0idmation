@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use egui::{
     pos2, vec2, Align2, Color32, FontId, PointerButton, Rect, ScrollArea, Sense, Stroke, Ui,
 };
@@ -11,8 +13,8 @@ use crate::state::{
 
 const FRAME_W: f32 = 12.0;
 const ROW_H: f32 = 22.0;
-const LAYER_LABEL_W: f32 = 110.0;
-/// Gap above and below the cell fill — leaves room for thin row separators
+const LAYER_LABEL_W: f32 = 150.0;
+/// Gap above and below the cell fill вЂ” leaves room for thin row separators
 /// like the original Flash CS3 timeline.
 const CELL_PAD_Y: f32 = 1.0;
 /// How many "virtual" frame slots to render past `frame_count` so the user
@@ -91,23 +93,27 @@ pub(crate) fn visible_layer_indices(
     let Some(q0rg) = project.q0rgs.get(q0rg_idx) else {
         return Vec::new();
     };
-    let mut visible = Vec::new();
-    let mut collapsed_folder = None;
-    for index in (0..q0rg.layers.len()).rev() {
-        let layer = &q0rg.layers[index];
-        if let Some(folder_id) = collapsed_folder {
-            if project.layer_parent_folder(q0rg.q0rg_id, layer.layer_id) == Some(folder_id) {
-                continue;
+    q0rg.layers
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, layer)| {
+            let mut parent = project.layer_parent_folder(q0rg.q0rg_id, layer.layer_id);
+            let mut depth = 0usize;
+            while let Some(parent_id) = parent {
+                if project.layer_metadata(q0rg.q0rg_id, parent_id).collapsed {
+                    return false;
+                }
+                depth += 1;
+                if depth > q0s_format::v2::MAX_LAYER_FOLDER_NESTING_DEPTH {
+                    return false;
+                }
+                parent = project.layer_parent_folder(q0rg.q0rg_id, parent_id);
             }
-            collapsed_folder = None;
-        }
-        visible.push(index);
-        let metadata = project.layer_metadata(q0rg.q0rg_id, layer.layer_id);
-        if metadata.kind == q0s_format::v2::LayerKind::Folder && metadata.collapsed {
-            collapsed_folder = Some(layer.layer_id);
-        }
-    }
-    visible
+            true
+        })
+        .map(|(index, _)| index)
+        .collect()
 }
 
 pub(crate) fn visible_layer_ids(project: &q0s_format::v2::ProjectV2, q0rg_id: u16) -> Vec<u16> {
@@ -176,6 +182,33 @@ fn frame_selection_contains(
             ..=selection.anchor_frame.max(selection.focus_frame))
             .contains(&frame)
 }
+fn rig_key_frames(
+    project: &q0s_format::v2::ProjectV2,
+    q0rg_id: u16,
+    selected_control: Option<u16>,
+) -> BTreeSet<u16> {
+    let Some(rig) = q0s_format::rig::rig_for_q0rg(project, q0rg_id) else {
+        return BTreeSet::new();
+    };
+    rig.channels
+        .iter()
+        .filter(|channel| {
+            selected_control.is_none_or(|control_id| match channel.property {
+                q0s_format::v2::RigPropertyRef::ControlX(id)
+                | q0s_format::v2::RigPropertyRef::ControlY(id)
+                | q0s_format::v2::RigPropertyRef::ControlValue(id) => id == control_id,
+                q0s_format::v2::RigPropertyRef::NodeTx(_)
+                | q0s_format::v2::RigPropertyRef::NodeTy(_)
+                | q0s_format::v2::RigPropertyRef::NodeRotation(_)
+                | q0s_format::v2::RigPropertyRef::NodeScaleX(_)
+                | q0s_format::v2::RigPropertyRef::NodeScaleY(_)
+                | q0s_format::v2::RigPropertyRef::ConstraintWeight(_) => false,
+            })
+        })
+        .flat_map(|channel| channel.keys.iter().map(|key| key.frame))
+        .collect()
+}
+
 pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     let theme = app.settings.theme.clone();
     transport_bar(app, &theme, ui);
@@ -194,6 +227,11 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
 
     let q0rg_id = app.state.project.q0rgs[q0rg_idx].q0rg_id;
     let frame_count = app.state.project.q0rgs[q0rg_idx].frame_count;
+    let rig_key_frames = rig_key_frames(
+        &app.state.project,
+        q0rg_id,
+        app.session.rig_selected_control,
+    );
     // Model order is back-to-front for rendering. The timeline displays the
     // conventional front-to-back order, so rows are collected in reverse.
     // Folder children live immediately before their folder in model order;
@@ -225,7 +263,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             );
             let painter = ui.painter_at(rect);
 
-            // Timeline base panel — same as the editor's window colour
+            // Timeline base panel вЂ” same as the editor's window colour
             // so it visually merges with the surrounding chrome.
             painter.rect_filled(rect, 0.0, theme.window.to_color32());
 
@@ -245,7 +283,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 let x = rect.min.x + LAYER_LABEL_W + (f as f32) * FRAME_W;
                 let frame_one_based = f + 1;
                 let beyond = f >= frame_count;
-                // Tick lines — every 5th frame full-height, others only in
+                // Tick lines вЂ” every 5th frame full-height, others only in
                 // the layer area (below the header). Virtual cells past
                 // `frame_count` get fainter ticks.
                 if f % 5 == 0 {
@@ -264,7 +302,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         Stroke::new(1.0_f32, theme.timeline_grid.to_color32()),
                     );
                 }
-                // Frame number every 5th frame — but only inside the q0rg's
+                // Frame number every 5th frame вЂ” but only inside the q0rg's
                 // own range. Virtual cells past frame_count get no number.
                 if !beyond && (frame_one_based % 5 == 0 || f == 0) {
                     painter.text(
@@ -275,7 +313,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         theme.text_dim.to_color32(),
                     );
                 }
-                // Second marker (1s, 2s, …) at every fps-th frame above the number.
+                // Second marker (1s, 2s, вЂ¦) at every fps-th frame above the number.
                 if !beyond && fps > 0 && (frame_one_based as u32).is_multiple_of(fps) {
                     let secs = (frame_one_based as u32) / fps;
                     painter.text(
@@ -286,6 +324,30 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         theme.text.to_color32(),
                     );
                 }
+            }
+            // Rig keys live at q0rg scope rather than on one artwork layer. A
+            // compact diamond in the frame header makes their timing visible
+            // without inventing a fake layer row. When a rig control is selected,
+            // only that control's keys are shown.
+            for frame in &rig_key_frames {
+                if *frame >= frame_count {
+                    continue;
+                }
+                let center = pos2(
+                    rect.min.x + LAYER_LABEL_W + (*frame as f32 + 0.5) * FRAME_W,
+                    rect.min.y + ROW_H - 4.5,
+                );
+                let radius = 3.0_f32;
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        pos2(center.x, center.y - radius),
+                        pos2(center.x + radius, center.y),
+                        pos2(center.x, center.y + radius),
+                        pos2(center.x - radius, center.y),
+                    ],
+                    theme.accent.to_color32(),
+                    Stroke::new(0.8_f32, theme.stroke_dark.to_color32()),
+                ));
             }
             // End-of-q0rg marker: dashed amber bar at the right edge of the
             // last real frame so the user can see exactly where `frame_count`
@@ -311,6 +373,8 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 let layer = &app.state.project.q0rgs[q0rg_idx].layers[layer_index];
                 let metadata = app.state.project.layer_metadata(q0rg_id, layer.layer_id);
                 let is_folder = metadata.kind == q0s_format::v2::LayerKind::Folder;
+                let effective_visible = app.state.project.layer_is_visible(q0rg_id, layer.layer_id);
+                let effective_locked = app.state.project.layer_is_locked(q0rg_id, layer.layer_id);
                 let row_y = rect.min.y + ROW_H * (li as f32 + 1.0);
                 let row_rect =
                     Rect::from_min_size(pos2(rect.min.x, row_y), vec2(rect.width(), ROW_H));
@@ -337,7 +401,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     is_current_layer,
                 );
 
-                // Label (left-side fixed column) — pull tones from the
+                // Label (left-side fixed column) вЂ” pull tones from the
                 // panel/window pair so any theme reads as a coherent strip.
                 let label_rect =
                     Rect::from_min_size(pos2(rect.min.x, row_y), vec2(LAYER_LABEL_W, ROW_H));
@@ -361,8 +425,13 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         Stroke::new(1.0_f32, theme.accent.to_color32()),
                     );
                 }
+                let folder_depth =
+                    app.state
+                        .project
+                        .layer_folder_depth(q0rg_id, layer.layer_id) as f32;
+                let hierarchy_indent = folder_depth * 14.0;
                 let icon_rect = Rect::from_center_size(
-                    label_rect.left_center() + vec2(11.0, 0.0),
+                    label_rect.left_center() + vec2(11.0 + hierarchy_indent, 0.0),
                     vec2(13.0, 13.0),
                 );
                 draw_layer_icon(
@@ -373,17 +442,38 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     theme.text.to_color32(),
                     theme.accent.to_color32(),
                 );
-                let indent = if metadata.parent_folder_id.is_some() {
-                    14.0
+                let indent = hierarchy_indent;
+                let visibility_rect = Rect::from_center_size(
+                    label_rect.right_center() - vec2(31.0, 0.0),
+                    vec2(18.0, ROW_H),
+                );
+                let lock_rect = Rect::from_center_size(
+                    label_rect.right_center() - vec2(13.0, 0.0),
+                    vec2(18.0, ROW_H),
+                );
+                let layer_label = truncate_label(&layer.name, 13);
+                let label_color = if effective_visible {
+                    theme.text.to_color32()
                 } else {
-                    0.0
+                    theme.text.to_color32().gamma_multiply(0.45)
                 };
-                let layer_label = truncate_label(&layer.name, 14);
                 painter.text(
                     label_rect.left_center() + vec2(22.0 + indent, 0.0),
                     Align2::LEFT_CENTER,
                     layer_label,
                     FontId::proportional(11.0),
+                    label_color,
+                );
+                draw_visibility_icon(
+                    &painter,
+                    visibility_rect.shrink2(vec2(2.0, 4.0)),
+                    effective_visible,
+                    theme.text.to_color32(),
+                );
+                draw_lock_icon(
+                    &painter,
+                    lock_rect.shrink2(vec2(2.0, 3.0)),
+                    effective_locked,
                     theme.text.to_color32(),
                 );
                 painter.line_segment(
@@ -394,7 +484,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     Stroke::new(1.0_f32, theme.stroke_dark.to_color32()),
                 );
 
-                // Bottom row separator — hairline in the theme's stroke colour.
+                // Bottom row separator вЂ” hairline in the theme's stroke colour.
                 painter.line_segment(
                     [
                         pos2(rect.min.x, row_y + ROW_H),
@@ -432,15 +522,26 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 // Frame-strip drags keep their existing rectangular selection
                 // behaviour and never accidentally reorder a layer.
                 if let Some(pos) = response.interact_pointer_pos() {
-                    if label_rect.contains(pos) && response.drag_started_by(PointerButton::Primary)
+                    let state_control = visibility_rect.contains(pos) || lock_rect.contains(pos);
+                    if label_rect.contains(pos)
+                        && !state_control
+                        && response.drag_started_by(PointerButton::Primary)
                     {
                         started_layer_drag = Some(layer.layer_id);
                     }
                 }
 
-                // Click in row → set current_layer + current_frame
+                // Click in row в†’ set current_layer + current_frame
                 if let Some(pos) = response.interact_pointer_pos() {
                     if row_rect.contains(pos) && response.clicked() {
+                        if visibility_rect.contains(pos) {
+                            app.queue(Action::ToggleLayerVisibility(q0rg_id, layer.layer_id));
+                            continue;
+                        }
+                        if lock_rect.contains(pos) {
+                            app.queue(Action::ToggleLayerLock(q0rg_id, layer.layer_id));
+                            continue;
+                        }
                         if label_rect.contains(pos) {
                             click_label_layer = Some(layer.layer_id);
                         }
@@ -567,7 +668,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 Stroke::new(1.5_f32, theme.playhead.to_color32()),
             );
 
-            // Header click → set current frame
+            // Header click в†’ set current frame
             if let Some(pos) = response.interact_pointer_pos() {
                 if app.session.timeline_layer_drag.is_none()
                     && header_rect.contains(pos)
@@ -779,6 +880,54 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     render_layer_rename_dialog(app, ui.ctx());
 }
 
+fn layer_parent_for_drop_lane(
+    project: &q0s_format::v2::ProjectV2,
+    q0rg_id: u16,
+    target_layer_id: u16,
+    x: f32,
+    left: f32,
+) -> Option<u16> {
+    let target_depth = project.layer_folder_depth(q0rg_id, target_layer_id);
+    let requested_depth = if x < left + 32.0 {
+        0
+    } else {
+        let lane_depth = ((x - (left + 32.0)) / 14.0).floor() as usize + 1;
+        lane_depth.min(target_depth)
+    };
+    if requested_depth == 0 {
+        return None;
+    }
+    let ancestor_depth = requested_depth - 1;
+    let mut parent = project.layer_parent_folder(q0rg_id, target_layer_id);
+    while let Some(parent_id) = parent {
+        if project.layer_folder_depth(q0rg_id, parent_id) == ancestor_depth {
+            return Some(parent_id);
+        }
+        parent = project.layer_parent_folder(q0rg_id, parent_id);
+    }
+    None
+}
+
+fn layer_child_at_drop_parent(
+    project: &q0s_format::v2::ProjectV2,
+    q0rg_id: u16,
+    mut layer_id: u16,
+    requested_parent: Option<u16>,
+) -> Option<u16> {
+    let mut hops = 0usize;
+    loop {
+        let parent = project.layer_parent_folder(q0rg_id, layer_id);
+        if parent == requested_parent {
+            return Some(layer_id);
+        }
+        layer_id = parent?;
+        hops += 1;
+        if hops > q0s_format::v2::MAX_LAYER_FOLDER_NESTING_DEPTH {
+            return None;
+        }
+    }
+}
+
 fn layer_drop_target_at(
     project: &q0s_format::v2::ProjectV2,
     q0rg_id: u16,
@@ -800,40 +949,35 @@ fn layer_drop_target_at(
     let target_id = visible_layer_ids[row_index];
     let target_metadata = project.layer_metadata(q0rg_id, target_id);
     let dragged_metadata = project.layer_metadata(q0rg_id, dragged_layer_id);
-    let dragged_is_folder = dragged_metadata.kind == q0s_format::v2::LayerKind::Folder;
-    if dragged_is_folder && target_metadata.parent_folder_id == Some(dragged_layer_id) {
+    if project.layer_is_descendant_of(q0rg_id, target_id, dragged_layer_id) {
         return None;
     }
 
     let row_y = first_row_y + row_index as f32 * ROW_H;
     let row_fraction = ((pos.y - row_y) / ROW_H).clamp(0.0, 1.0);
-    let nested_lane = pos.x >= rect.min.x + 32.0;
+    let requested_parent =
+        layer_parent_for_drop_lane(project, q0rg_id, target_id, pos.x, rect.min.x);
 
     if target_metadata.kind == q0s_format::v2::LayerKind::Folder {
-        if target_id == dragged_layer_id {
+        if target_id == dragged_layer_id && (0.25..=0.75).contains(&row_fraction) {
             return None;
         }
-        if !dragged_is_folder && (0.25..=0.75).contains(&row_fraction) {
+        if (0.25..=0.75).contains(&row_fraction) {
             return Some(LayerDropTarget::IntoFolder(target_id));
         }
         return Some(if row_fraction < 0.5 {
             LayerDropTarget::Before {
                 layer_id: target_id,
-                parent_folder_id: None,
+                parent_folder_id: requested_parent,
             }
         } else {
             LayerDropTarget::After {
                 layer_id: target_id,
-                parent_folder_id: None,
+                parent_folder_id: requested_parent,
             }
         });
     }
 
-    let requested_parent = if nested_lane {
-        target_metadata.parent_folder_id
-    } else {
-        None
-    };
     if target_id == dragged_layer_id && requested_parent == dragged_metadata.parent_folder_id {
         return None;
     }
@@ -895,55 +1039,41 @@ fn draw_layer_drop_preview(
                     parent_folder_id: _
                 }
             );
-            let actual_parent = project.layer_parent_folder(q0rg_id, layer_id);
-            let (line_index, line_after) = if parent_folder_id.is_none() {
-                if let Some(folder_id) = actual_parent {
-                    let Some(folder_index) = visible_layer_ids
-                        .iter()
-                        .position(|candidate| *candidate == folder_id)
-                    else {
-                        return;
-                    };
-                    if before {
-                        (folder_index, false)
-                    } else {
-                        let last_child = visible_layer_ids
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, candidate)| {
-                                project.layer_parent_folder(q0rg_id, **candidate) == Some(folder_id)
-                            })
-                            .map(|(index, _)| index)
-                            .max()
-                            .unwrap_or(folder_index);
-                        (last_child, true)
-                    }
-                } else {
-                    let Some(index) = visible_layer_ids
-                        .iter()
-                        .position(|candidate| *candidate == layer_id)
-                    else {
-                        return;
-                    };
-                    (index, !before)
-                }
-            } else {
-                let Some(index) = visible_layer_ids
-                    .iter()
-                    .position(|candidate| *candidate == layer_id)
-                else {
-                    return;
-                };
-                (index, !before)
+            let Some(container_target_id) =
+                layer_child_at_drop_parent(project, q0rg_id, layer_id, parent_folder_id)
+            else {
+                return;
             };
+            let Some(target_index) = visible_layer_ids
+                .iter()
+                .position(|candidate| *candidate == container_target_id)
+            else {
+                return;
+            };
+            let line_index = if before {
+                target_index
+            } else if project.layer_is_folder(q0rg_id, container_target_id) {
+                visible_layer_ids
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, candidate)| {
+                        project.layer_is_descendant_of(q0rg_id, **candidate, container_target_id)
+                    })
+                    .map(|(index, _)| index)
+                    .max()
+                    .unwrap_or(target_index)
+            } else {
+                target_index
+            };
+            let line_after = !before;
             let y = rect.min.y
                 + ROW_H * (line_index as f32 + 1.0)
                 + if line_after { ROW_H } else { 0.0 };
-            let indent = if parent_folder_id.is_some() {
-                14.0
-            } else {
-                0.0
-            };
+            let indent = parent_folder_id
+                .map(|parent_id| {
+                    (project.layer_folder_depth(q0rg_id, parent_id) as f32 + 1.0) * 14.0
+                })
+                .unwrap_or(0.0);
             let x0 = rect.min.x + 4.0 + indent;
             let x1 = rect.min.x + LAYER_LABEL_W - 4.0;
             painter.line_segment([pos2(x0, y), pos2(x1, y)], Stroke::new(2.0_f32, accent));
@@ -1006,19 +1136,19 @@ fn timeline_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
         app.queue(Action::MoveLayer(q0rg_id, layer_id, 1));
         ui.close_menu();
     }
-    if metadata.kind == q0s_format::v2::LayerKind::Folder {
-        if ui
+    if metadata.kind == q0s_format::v2::LayerKind::Folder
+        && ui
             .button(if metadata.collapsed {
                 "Expand folder"
             } else {
                 "Collapse folder"
             })
             .clicked()
-        {
-            app.queue(Action::ToggleLayerFolder(q0rg_id, layer_id));
-            ui.close_menu();
-        }
-    } else if metadata.parent_folder_id.is_some() {
+    {
+        app.queue(Action::ToggleLayerFolder(q0rg_id, layer_id));
+        ui.close_menu();
+    }
+    if metadata.parent_folder_id.is_some() {
         if ui.button("Move out of folder").clicked() {
             app.queue(Action::OutdentLayer(q0rg_id, layer_id));
             ui.close_menu();
@@ -1319,6 +1449,93 @@ fn render_layer_rename_dialog(app: &mut EditorApp, ctx: &egui::Context) {
     }
 }
 
+fn draw_visibility_icon(painter: &egui::Painter, rect: Rect, visible: bool, color: Color32) {
+    let center = rect.center();
+    let half_w = (rect.width() * 0.47).min(6.0);
+    let half_h = (rect.height() * 0.30).min(3.0);
+    let left = pos2(center.x - half_w, center.y);
+    let right = pos2(center.x + half_w, center.y);
+    let active = color;
+    let dim = color.gamma_multiply(0.42);
+
+    if visible {
+        let upper = vec![
+            left,
+            pos2(center.x - half_w * 0.56, center.y - half_h * 0.82),
+            pos2(center.x, center.y - half_h),
+            pos2(center.x + half_w * 0.56, center.y - half_h * 0.82),
+            right,
+        ];
+        let lower = vec![
+            left,
+            pos2(center.x - half_w * 0.56, center.y + half_h * 0.82),
+            pos2(center.x, center.y + half_h),
+            pos2(center.x + half_w * 0.56, center.y + half_h * 0.82),
+            right,
+        ];
+        painter.add(egui::Shape::line(upper, Stroke::new(1.15_f32, active)));
+        painter.add(egui::Shape::line(lower, Stroke::new(1.15_f32, active)));
+        painter.circle_filled(center, 1.8, active);
+    } else {
+        let eyelid = vec![
+            left,
+            pos2(center.x - half_w * 0.52, center.y + half_h * 0.45),
+            pos2(center.x, center.y + half_h * 0.62),
+            pos2(center.x + half_w * 0.52, center.y + half_h * 0.45),
+            right,
+        ];
+        painter.add(egui::Shape::line(eyelid, Stroke::new(1.15_f32, dim)));
+        let lash_y = center.y + half_h * 0.5;
+        for x in [-0.50_f32, 0.0, 0.50] {
+            let px = center.x + half_w * x;
+            painter.line_segment(
+                [pos2(px, lash_y), pos2(px, lash_y + 1.6)],
+                Stroke::new(0.9_f32, dim),
+            );
+        }
+    }
+}
+
+fn draw_lock_icon(painter: &egui::Painter, rect: Rect, locked: bool, color: Color32) {
+    let center = rect.center();
+    let active = color;
+    let dim = color.gamma_multiply(0.42);
+    let stroke_color = if locked { active } else { dim };
+    let stroke = Stroke::new(1.1_f32, stroke_color);
+
+    let body_w = (rect.width() * 0.58).clamp(6.5, 8.0);
+    let body_h = (rect.height() * 0.42).clamp(4.5, 5.8);
+    let body = Rect::from_center_size(pos2(center.x, center.y + 2.2), vec2(body_w, body_h));
+    painter.rect_stroke(body, 1.3, stroke);
+
+    let shackle_half_w = body_w * 0.31;
+    let shackle_top = body.top() - 4.0;
+    let shackle_bottom = body.top() + 0.6;
+    if locked {
+        let shackle = vec![
+            pos2(center.x - shackle_half_w, shackle_bottom),
+            pos2(center.x - shackle_half_w, shackle_top + 1.6),
+            pos2(center.x - shackle_half_w * 0.55, shackle_top + 0.4),
+            pos2(center.x, shackle_top),
+            pos2(center.x + shackle_half_w * 0.55, shackle_top + 0.4),
+            pos2(center.x + shackle_half_w, shackle_top + 1.6),
+            pos2(center.x + shackle_half_w, shackle_bottom),
+        ];
+        painter.add(egui::Shape::line(shackle, stroke));
+        painter.circle_filled(pos2(center.x, body.center().y - 0.4), 1.0, active);
+    } else {
+        let open_center_x = center.x + 1.0;
+        let shackle = vec![
+            pos2(center.x - shackle_half_w + 0.3, shackle_bottom),
+            pos2(center.x - shackle_half_w + 0.3, shackle_top + 1.7),
+            pos2(open_center_x - shackle_half_w * 0.45, shackle_top + 0.5),
+            pos2(open_center_x + 0.2, shackle_top),
+            pos2(open_center_x + shackle_half_w * 0.72, shackle_top + 0.8),
+        ];
+        painter.add(egui::Shape::line(shackle, stroke));
+    }
+}
+
 fn draw_layer_icon(
     painter: &egui::Painter,
     rect: Rect,
@@ -1377,11 +1594,11 @@ fn draw_layer_icon(
 
 /// Paint per-frame base cells before any span/keyframe glyphs go on top.
 /// Three states:
-///   * inside `frame_count`, no placement covering this frame    → mid grey
+///   * inside `frame_count`, no placement covering this frame    в†’ mid grey
 ///     (active layer is a touch brighter so it's clear which row drawing
 ///     will land in).
-///   * beyond `frame_count`                                       → very dark
-///   * beyond + every-5th                                          → slightly
+///   * beyond `frame_count`                                       в†’ very dark
+///   * beyond + every-5th                                          в†’ slightly
 ///     brighter dark, producing a chequered "virtual frames" band.
 fn draw_empty_cells(
     painter: &egui::Painter,
@@ -1656,10 +1873,12 @@ mod tests {
 
     fn placement(frame: u16) -> Placement {
         Placement {
+            instance_id: 0,
             frame,
             target: Target::Asset(1),
             transform: Transform2D::IDENTITY,
             tween: Tween::None,
+            fx: Default::default(),
         }
     }
 
@@ -1767,6 +1986,8 @@ mod tests {
                     kind: q0s_format::v2::LayerKind::Normal,
                     parent_folder_id: Some(3),
                     collapsed: false,
+                    hidden: false,
+                    locked: false,
                 },
             );
         }
@@ -1776,6 +1997,8 @@ mod tests {
                 kind: q0s_format::v2::LayerKind::Folder,
                 parent_folder_id: None,
                 collapsed: false,
+                hidden: false,
+                locked: false,
             },
         );
         assert_eq!(visible_layer_indices(&project, 0), vec![3, 2, 1, 0]);
@@ -1786,6 +2009,132 @@ mod tests {
             .unwrap()
             .collapsed = true;
         assert_eq!(visible_layer_indices(&project, 0), vec![3, 2]);
+    }
+
+    #[test]
+    fn nested_folder_collapse_hides_the_complete_descendant_subtree() {
+        let mut project = crate::state::default_project();
+        project.q0rgs[0].layers = vec![
+            Layer {
+                layer_id: 1,
+                name: "leaf".into(),
+                explicit_keyframes: vec![0],
+                placements: Vec::new(),
+            },
+            Layer {
+                layer_id: 2,
+                name: "inner".into(),
+                explicit_keyframes: Vec::new(),
+                placements: Vec::new(),
+            },
+            Layer {
+                layer_id: 3,
+                name: "outer".into(),
+                explicit_keyframes: Vec::new(),
+                placements: Vec::new(),
+            },
+            Layer {
+                layer_id: 4,
+                name: "outside".into(),
+                explicit_keyframes: vec![0],
+                placements: Vec::new(),
+            },
+        ];
+        project.layer_metadata.insert(
+            q0s_format::v2::LayerKey::new(1, 1),
+            q0s_format::v2::LayerMetadata {
+                parent_folder_id: Some(2),
+                ..Default::default()
+            },
+        );
+        project.layer_metadata.insert(
+            q0s_format::v2::LayerKey::new(1, 2),
+            q0s_format::v2::LayerMetadata {
+                kind: q0s_format::v2::LayerKind::Folder,
+                parent_folder_id: Some(3),
+                collapsed: true,
+                ..Default::default()
+            },
+        );
+        project.layer_metadata.insert(
+            q0s_format::v2::LayerKey::new(1, 3),
+            q0s_format::v2::LayerMetadata {
+                kind: q0s_format::v2::LayerKind::Folder,
+                ..Default::default()
+            },
+        );
+        q0s_format::v2::validate(&project).expect("nested collapse fixture");
+
+        assert_eq!(visible_layer_indices(&project, 0), vec![3, 2, 1]);
+        project
+            .layer_metadata
+            .get_mut(&q0s_format::v2::LayerKey::new(1, 2))
+            .unwrap()
+            .collapsed = false;
+        project
+            .layer_metadata
+            .get_mut(&q0s_format::v2::LayerKey::new(1, 3))
+            .unwrap()
+            .collapsed = true;
+        assert_eq!(visible_layer_indices(&project, 0), vec![3, 2]);
+    }
+
+    #[test]
+    fn nested_drag_horizontal_lanes_can_outdent_one_level_or_to_root() {
+        let mut project = crate::state::default_project();
+        project.q0rgs[0].layers = vec![
+            Layer {
+                layer_id: 1,
+                name: "leaf".into(),
+                explicit_keyframes: vec![0],
+                placements: Vec::new(),
+            },
+            Layer {
+                layer_id: 2,
+                name: "inner".into(),
+                explicit_keyframes: Vec::new(),
+                placements: Vec::new(),
+            },
+            Layer {
+                layer_id: 3,
+                name: "outer".into(),
+                explicit_keyframes: Vec::new(),
+                placements: Vec::new(),
+            },
+        ];
+        project.layer_metadata.insert(
+            q0s_format::v2::LayerKey::new(1, 1),
+            q0s_format::v2::LayerMetadata {
+                parent_folder_id: Some(2),
+                ..Default::default()
+            },
+        );
+        project.layer_metadata.insert(
+            q0s_format::v2::LayerKey::new(1, 2),
+            q0s_format::v2::LayerMetadata {
+                kind: q0s_format::v2::LayerKind::Folder,
+                parent_folder_id: Some(3),
+                ..Default::default()
+            },
+        );
+        project.layer_metadata.insert(
+            q0s_format::v2::LayerKey::new(1, 3),
+            q0s_format::v2::LayerMetadata {
+                kind: q0s_format::v2::LayerKind::Folder,
+                ..Default::default()
+            },
+        );
+        q0s_format::v2::validate(&project).expect("nested drag lane fixture");
+
+        assert_eq!(layer_parent_for_drop_lane(&project, 1, 1, 8.0, 0.0), None);
+        assert_eq!(
+            layer_parent_for_drop_lane(&project, 1, 1, 35.0, 0.0),
+            Some(3)
+        );
+        assert_eq!(
+            layer_parent_for_drop_lane(&project, 1, 1, 50.0, 0.0),
+            Some(2)
+        );
     }
 
     #[test]
@@ -1817,6 +2166,8 @@ mod tests {
                 kind: q0s_format::v2::LayerKind::Normal,
                 parent_folder_id: Some(2),
                 collapsed: false,
+                hidden: false,
+                locked: false,
             },
         );
         project.layer_metadata.insert(
@@ -1825,6 +2176,8 @@ mod tests {
                 kind: q0s_format::v2::LayerKind::Folder,
                 parent_folder_id: None,
                 collapsed: false,
+                hidden: false,
+                locked: false,
             },
         );
         let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 120.0));
@@ -1886,6 +2239,65 @@ mod tests {
                 &[],
             ),
             None
+        );
+    }
+
+    #[test]
+    fn rig_header_markers_can_filter_to_selected_control() {
+        let mut project = crate::state::default_project();
+        project.q0rgs[0].frame_count = 12;
+        crate::rigging::ensure_rig(&mut project, 1).unwrap();
+        let rig = q0s_format::rig::rig_for_q0rg_mut(&mut project, 1).unwrap();
+        for id in [1, 2] {
+            rig.controls.push(q0s_format::v2::RigControl {
+                control_id: id,
+                name: format!("control {id}"),
+                kind: q0s_format::v2::RigControlKind::Slider,
+                target_node: None,
+                rest_x: 0.0,
+                rest_y: 0.0,
+                rest_value: 0.0,
+                min_value: -1.0,
+                max_value: 1.0,
+                public_in_simple: true,
+            });
+        }
+        rig.channels = vec![
+            q0s_format::v2::RigChannel {
+                property: q0s_format::v2::RigPropertyRef::ControlValue(1),
+                keys: vec![q0s_format::v2::RigKey {
+                    frame: 2,
+                    value: 0.4,
+                    easing: q0s_format::v2::Easing::Linear,
+                }],
+            },
+            q0s_format::v2::RigChannel {
+                property: q0s_format::v2::RigPropertyRef::ControlX(2),
+                keys: vec![q0s_format::v2::RigKey {
+                    frame: 7,
+                    value: 10.0,
+                    easing: q0s_format::v2::Easing::Linear,
+                }],
+            },
+        ];
+
+        assert_eq!(
+            rig_key_frames(&project, 1, None)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![2, 7]
+        );
+        assert_eq!(
+            rig_key_frames(&project, 1, Some(1))
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(
+            rig_key_frames(&project, 1, Some(2))
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![7]
         );
     }
 }

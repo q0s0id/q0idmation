@@ -1,0 +1,15 @@
+[package]
+name = "q0glblend"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Local OpenGL blend compositor for q0idmation UI renderers."
+
+[dependencies]
+egui = "0.27"
+egui_glow = "0.27"
+glow = "0.13"
+q0s-format = { path = "../q0s-format" }

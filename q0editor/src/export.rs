@@ -85,10 +85,12 @@ mod tests {
                     name: "L".to_string(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![Placement {
+                        instance_id: 0,
                         frame: 0,
                         target: Target::Asset(1),
                         transform: Transform2D::IDENTITY,
                         tween: Tween::None,
+                        fx: Default::default(),
                     }],
                 }],
             }],
@@ -118,5 +120,42 @@ mod tests {
             bytes.len(),
             bitmap_per_frame
         );
+    }
+
+    #[test]
+    fn export_preserves_rig_binding_channels_and_instance_identity() {
+        let mut project = one_red_square_project();
+        project.q0rgs[0].layers[0].placements[0].instance_id = 44;
+        crate::rigging::ensure_rig(&mut project, 1).expect("rig");
+        let bone = crate::rigging::add_bone(
+            &mut project,
+            1,
+            None,
+            Vec2::new(0.0, 0.0),
+            Vec2::new(20.0, 0.0),
+            0,
+        )
+        .expect("bone");
+        let selection = crate::state::Selection::Placement {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: 0,
+        };
+        crate::rigging::bind_selected_placement_to_node(&mut project, &selection, bone, 0)
+            .expect("bind");
+        crate::rigging::set_node_rotation(&mut project, 1, bone, 1, 0.35, true);
+
+        let bytes = export_to_q0s_bytes(&project).expect("export rigged q0s");
+        let parsed = q0s_format::parse_q0s_v2(&bytes).expect("parse rigged q0s");
+        assert!(q0s_format::v2::wire_equivalent(&parsed, &project));
+        assert_eq!(parsed.q0rgs[0].layers[0].placements[0].instance_id, 44);
+        let rig = q0s_format::rig::rig_for_q0rg(&parsed, 1).expect("exported rig");
+        assert_eq!(
+            rig.nodes[0].binding.expect("exported binding").instance_id,
+            44
+        );
+        assert!(rig.channels.iter().any(|channel| {
+            channel.property == q0s_format::v2::RigPropertyRef::NodeRotation(bone)
+        }));
     }
 }

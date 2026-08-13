@@ -177,6 +177,7 @@ impl FileStats {
                 Asset::Q0v(video) => {
                     total_bitmap_bytes += video.bytes.len() as u64;
                 }
+                Asset::Rig(_) => {}
             }
         }
 

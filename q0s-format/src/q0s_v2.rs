@@ -1,14 +1,15 @@
-//! `.q0s` v2 РІР‚вЂќ vector player format.
+//! `.q0s` v2 Р Р†Р вЂљРІР‚Сњ vector player format.
 //!
 //! Same on-disk shape as the corresponding `.q1s` project body, but with
 //! `Q0S\0` magic and independent player-format versions. Lets the editor ship
 //! that q0player can play frame-by-frame using the shared software
-//! rasteriser, with vector data and q0rg transforms intact РІР‚вЂќ no pre-baked
+//! rasteriser, with vector data and q0rg transforms intact Р Р†Р вЂљРІР‚Сњ no pre-baked
 //! bitmaps, dramatically smaller than the snapshot-style v1 output and
 //! resolution-independent on playback.
 //!
 //! v1 (legacy bitmap-only) is still parsed by `parse_q0s` so old movies
-//! keep playing.
+//! keep playing. Current v13 adds per-placement alpha, blend modes, blur,
+//! glow and drop-shadow data; v12 and earlier decode those properties as identity.
 
 use crate::error::Error;
 #[cfg(test)]
@@ -27,7 +28,14 @@ pub const Q0S_VERSION_EASING: u16 = 7;
 pub const Q0S_VERSION_APPEARANCE_MASKS: u16 = 8;
 pub const Q0S_VERSION_APPEARANCE_FRAGMENTS: u16 = 9;
 pub const Q0S_VERSION_APPEARANCE_AFFINE: u16 = 10;
-pub const Q0S_VERSION_CURRENT: u16 = Q0S_VERSION_APPEARANCE_AFFINE;
+pub const Q0S_VERSION_LAYER_STATE: u16 = 11;
+pub const Q0S_VERSION_NESTED_LAYER_FOLDERS: u16 = 12;
+pub const Q0S_VERSION_PLACEMENT_FX: u16 = 13;
+pub const Q0S_VERSION_RIGGING: u16 = 14;
+pub const Q0S_VERSION_RIG_PRO: u16 = 15;
+pub const Q0S_VERSION_RIG_DEFORMERS: u16 = 16;
+pub const Q0S_VERSION_RIG_POSE_VARIANTS: u16 = 17;
+pub const Q0S_VERSION_CURRENT: u16 = Q0S_VERSION_RIG_POSE_VARIANTS;
 
 /// Serialise a `ProjectV2` as the current vector `.q0s` bytes. Internally we
 /// reuse the current `.q1s` writer and patch the magic+version header in-place
@@ -70,6 +78,21 @@ pub fn parse_q0s_v2(bytes: &[u8]) -> Result<ProjectV2, Error> {
         Q0S_VERSION_APPEARANCE_FRAGMENTS => {
             v2::parse_body_after_header(bytes, v2::Q1S_VERSION_APPEARANCE_FRAGMENTS)
         }
+        Q0S_VERSION_APPEARANCE_AFFINE => {
+            v2::parse_body_after_header(bytes, v2::Q1S_VERSION_APPEARANCE_AFFINE)
+        }
+        Q0S_VERSION_LAYER_STATE => v2::parse_body_after_header(bytes, v2::Q1S_VERSION_LAYER_STATE),
+        Q0S_VERSION_NESTED_LAYER_FOLDERS => {
+            v2::parse_body_after_header(bytes, v2::Q1S_VERSION_NESTED_LAYER_FOLDERS)
+        }
+        Q0S_VERSION_PLACEMENT_FX => {
+            v2::parse_body_after_header(bytes, v2::Q1S_VERSION_PLACEMENT_FX)
+        }
+        Q0S_VERSION_RIGGING => v2::parse_body_after_header(bytes, v2::Q1S_VERSION_RIGGING),
+        Q0S_VERSION_RIG_PRO => v2::parse_body_after_header(bytes, v2::Q1S_VERSION_RIG_PRO),
+        Q0S_VERSION_RIG_DEFORMERS => {
+            v2::parse_body_after_header(bytes, v2::Q1S_VERSION_RIG_DEFORMERS)
+        }
         Q0S_VERSION_CURRENT => v2::parse_body_after_header(bytes, v2::Q1S_VERSION_CURRENT),
         _ => Err(Error::UnsupportedVersion(version)),
     }
@@ -94,6 +117,13 @@ pub fn is_q0s_v2(bytes: &[u8]) -> bool {
             | Q0S_VERSION_EASING
             | Q0S_VERSION_APPEARANCE_MASKS
             | Q0S_VERSION_APPEARANCE_FRAGMENTS
+            | Q0S_VERSION_APPEARANCE_AFFINE
+            | Q0S_VERSION_LAYER_STATE
+            | Q0S_VERSION_NESTED_LAYER_FOLDERS
+            | Q0S_VERSION_PLACEMENT_FX
+            | Q0S_VERSION_RIGGING
+            | Q0S_VERSION_RIG_PRO
+            | Q0S_VERSION_RIG_DEFORMERS
             | Q0S_VERSION_CURRENT
     )
 }
@@ -103,7 +133,8 @@ mod tests {
     use super::*;
     use crate::v2::{
         Anchor, Asset, Easing, EasingFamily, EasingMode, Layer, Path as VPath, Placement,
-        ProjectMeta, Q0rg, Rgba, Target, Transform2D, Tween, Vec2, VectorAsset,
+        ProjectMeta, Q0rg, Rgba, RigAsset, RigChannel, RigControl, RigControlKind, RigKey, RigNode,
+        RigPropertyRef, Target, Transform2D, Tween, Vec2, VectorAsset,
     };
 
     fn test_q0v_bytes() -> Vec<u8> {
@@ -175,10 +206,12 @@ mod tests {
                     name: "L".to_string(),
                     explicit_keyframes: vec![1],
                     placements: vec![Placement {
+                        instance_id: 0,
                         frame: 0,
                         target: Target::Asset(1),
                         transform: Transform2D::IDENTITY,
                         tween: Tween::None,
+                        fx: Default::default(),
                     }],
                 }],
             }],
@@ -190,7 +223,7 @@ mod tests {
         let mut project = small_project();
         project
             .asset_names
-            .insert(1, "player vector / герой".to_string());
+            .insert(1, "player vector / РіРµСЂРѕР№".to_string());
         let bytes = write_q0s_v2(&project).expect("write");
         assert_eq!(&bytes[0..4], &Q0S_V2_MAGIC);
         assert_eq!(
@@ -199,6 +232,59 @@ mod tests {
         );
         let parsed = parse_q0s_v2(&bytes).expect("parse");
         assert_eq!(parsed, project);
+    }
+
+    #[test]
+    fn current_q0s_roundtrip_preserves_placement_fx() {
+        let mut project = small_project();
+        project.q0rgs[0].layers[0].placements[0].fx = v2::PlacementFx {
+            opacity: 0.55,
+            blend_mode: v2::BlendMode::Multiply,
+            blur: Some(v2::BlurFx { radius: 4.0 }),
+            glow: Some(v2::GlowFx {
+                color: v2::Rgba {
+                    r: 250,
+                    g: 40,
+                    b: 20,
+                    a: 200,
+                },
+                radius: 8.0,
+                strength: 1.2,
+            }),
+            shadow: Some(v2::DropShadowFx {
+                color: v2::Rgba {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 150,
+                },
+                blur_radius: 6.0,
+                offset_x: 5.0,
+                offset_y: 3.0,
+                strength: 0.75,
+            }),
+        };
+        let bytes = write_q0s_v2(&project).expect("write placement fx q0s");
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            Q0S_VERSION_CURRENT
+        );
+        assert_eq!(
+            parse_q0s_v2(&bytes).expect("parse placement fx q0s"),
+            project
+        );
+    }
+
+    #[test]
+    fn q0s_v12_nested_folders_remain_readable_with_identity_fx() {
+        let project = small_project();
+        let mut bytes = v2::write_version(&project, v2::Q1S_VERSION_NESTED_LAYER_FOLDERS)
+            .expect("write q1s v13 body");
+        bytes[0..4].copy_from_slice(&Q0S_V2_MAGIC);
+        bytes[4..6].copy_from_slice(&Q0S_VERSION_NESTED_LAYER_FOLDERS.to_le_bytes());
+        let decoded = parse_q0s_v2(&bytes).expect("parse q0s v12");
+        assert_eq!(decoded, project);
+        assert!(decoded.q0rgs[0].layers[0].placements[0].fx.is_identity());
     }
 
     #[test]
@@ -214,10 +300,12 @@ mod tests {
         project.q0rgs[0].frame_count = 5;
         let layer = &mut project.q0rgs[0].layers[0];
         layer.placements.push(v2::Placement {
+            instance_id: 0,
             frame: 4,
             target: Target::Asset(1),
             transform: v2::Transform2D::IDENTITY,
             tween: Tween::None,
+            fx: Default::default(),
         });
         layer.placements.swap(0, 1);
         layer.explicit_keyframes = vec![3, 2];
@@ -522,6 +610,8 @@ mod tests {
                 kind: v2::LayerKind::Normal,
                 parent_folder_id: Some(9),
                 collapsed: false,
+                hidden: false,
+                locked: false,
             },
         );
         project.layer_metadata.insert(
@@ -530,6 +620,8 @@ mod tests {
                 kind: v2::LayerKind::Folder,
                 parent_folder_id: None,
                 collapsed: true,
+                hidden: false,
+                locked: false,
             },
         );
 
@@ -544,6 +636,72 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 9]
         );
+    }
+
+    #[test]
+    fn current_q0s_roundtrip_preserves_nested_layer_folders() {
+        let mut project = small_project();
+        project.q0rgs[0].layers.push(Layer {
+            layer_id: 8,
+            name: "inner".into(),
+            explicit_keyframes: Vec::new(),
+            placements: Vec::new(),
+        });
+        project.q0rgs[0].layers.push(Layer {
+            layer_id: 9,
+            name: "outer".into(),
+            explicit_keyframes: Vec::new(),
+            placements: Vec::new(),
+        });
+        project.layer_metadata.insert(
+            v2::LayerKey::new(1, 1),
+            v2::LayerMetadata {
+                parent_folder_id: Some(8),
+                ..Default::default()
+            },
+        );
+        project.layer_metadata.insert(
+            v2::LayerKey::new(1, 8),
+            v2::LayerMetadata {
+                kind: v2::LayerKind::Folder,
+                parent_folder_id: Some(9),
+                ..Default::default()
+            },
+        );
+        project.layer_metadata.insert(
+            v2::LayerKey::new(1, 9),
+            v2::LayerMetadata {
+                kind: v2::LayerKind::Folder,
+                ..Default::default()
+            },
+        );
+        v2::validate(&project).expect("nested q0s fixture");
+
+        let bytes = write_q0s_v2(&project).expect("write nested q0s");
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            Q0S_VERSION_CURRENT
+        );
+        assert_eq!(parse_q0s_v2(&bytes).expect("parse nested q0s"), project);
+    }
+
+    #[test]
+    fn q0s_v11_layer_state_remains_readable() {
+        let mut project = small_project();
+        project.layer_metadata.insert(
+            v2::LayerKey::new(1, 1),
+            v2::LayerMetadata {
+                hidden: true,
+                locked: true,
+                ..Default::default()
+            },
+        );
+        let mut bytes =
+            v2::write_version(&project, v2::Q1S_VERSION_LAYER_STATE).expect("write q1s v12 body");
+        bytes[0..4].copy_from_slice(&Q0S_V2_MAGIC);
+        bytes[4..6].copy_from_slice(&Q0S_VERSION_LAYER_STATE.to_le_bytes());
+        let parsed = parse_q0s_v2(&bytes).expect("parse q0s v11");
+        assert_eq!(parsed, project);
     }
 
     #[test]
@@ -570,7 +728,7 @@ mod tests {
         let project = small_project();
         let bytes = write_q0s_v2(&project).expect("write");
         assert!(is_q0s_v2(&bytes));
-        // Patch magic to legacy Q1S РІР‚вЂќ should no longer be flagged.
+        // Patch magic to legacy Q1S Р Р†Р вЂљРІР‚Сњ should no longer be flagged.
         let mut tampered = bytes.clone();
         tampered[0..4].copy_from_slice(&Q1S_V2_MAGIC);
         assert!(!is_q0s_v2(&tampered));
@@ -600,5 +758,240 @@ mod tests {
                 remaining: 4,
             }
         );
+    }
+    #[test]
+    fn current_q0s_roundtrip_preserves_layer_visibility_and_lock() {
+        let mut project = small_project();
+        project.layer_metadata.insert(
+            v2::LayerKey::new(1, 1),
+            v2::LayerMetadata {
+                hidden: true,
+                locked: true,
+                ..Default::default()
+            },
+        );
+
+        let bytes = write_q0s_v2(&project).expect("write layer-state q0s");
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            Q0S_VERSION_CURRENT
+        );
+        let parsed = parse_q0s_v2(&bytes).expect("parse layer-state q0s");
+        assert_eq!(parsed, project);
+        assert!(!parsed.layer_is_visible(1, 1));
+        assert!(parsed.layer_is_locked(1, 1));
+    }
+
+    #[test]
+    fn q0s_v10_remains_readable_with_visible_unlocked_defaults() {
+        let project = small_project();
+        let mut bytes = v2::write_version(&project, v2::Q1S_VERSION_APPEARANCE_AFFINE)
+            .expect("write q1s v11 body");
+        bytes[0..4].copy_from_slice(&Q0S_V2_MAGIC);
+        bytes[4..6].copy_from_slice(&Q0S_VERSION_APPEARANCE_AFFINE.to_le_bytes());
+
+        let parsed = parse_q0s_v2(&bytes).expect("parse q0s v10");
+        assert_eq!(parsed, project);
+        assert!(parsed.layer_is_visible(1, 1));
+        assert!(!parsed.layer_is_locked(1, 1));
+    }
+    fn add_player_test_rig(project: &mut ProjectV2) {
+        project.assets.push(Asset::Rig(RigAsset {
+            asset_id: 500,
+            owner_q0rg_id: 1,
+            nodes: vec![RigNode {
+                node_id: 1,
+                name: "root".into(),
+                parent: None,
+                rest: Transform2D::IDENTITY,
+                length: 12.0,
+                binding: None,
+            }],
+            controls: vec![RigControl {
+                control_id: 1,
+                name: "turn".into(),
+                kind: RigControlKind::Rotation,
+                target_node: Some(1),
+                rest_x: 0.0,
+                rest_y: 0.0,
+                rest_value: 0.0,
+                min_value: -3.0,
+                max_value: 3.0,
+                public_in_simple: true,
+            }],
+            constraints: Vec::new(),
+            channels: vec![RigChannel {
+                property: RigPropertyRef::ControlValue(1),
+                keys: vec![RigKey {
+                    frame: 0,
+                    value: 0.5,
+                    easing: Easing::Linear,
+                }],
+            }],
+            drivers: Vec::new(),
+            poses: Vec::new(),
+            deformers: Vec::new(),
+            pose_drivers: Vec::new(),
+            mirror_pairs: Vec::new(),
+            variants: Vec::new(),
+        }));
+        let rig = project
+            .assets
+            .iter_mut()
+            .find_map(|asset| match asset {
+                Asset::Rig(rig) => Some(rig),
+                _ => None,
+            })
+            .expect("player test rig");
+        rig.controls.push(RigControl {
+            control_id: 2,
+            name: "master".into(),
+            kind: RigControlKind::Slider,
+            target_node: None,
+            rest_x: 0.0,
+            rest_y: 0.0,
+            rest_value: 0.4,
+            min_value: 0.0,
+            max_value: 1.0,
+            public_in_simple: true,
+        });
+        rig.drivers.push(v2::RigDriver {
+            driver_id: 1,
+            source_control: 2,
+            source_min: 0.0,
+            source_max: 1.0,
+            target: RigPropertyRef::NodeRotation(1),
+            target_min: -0.25,
+            target_max: 0.5,
+        });
+        rig.poses.push(v2::RigPosePreset {
+            pose_id: 1,
+            name: "player pose".into(),
+            values: vec![v2::RigPoseValue {
+                property: RigPropertyRef::ControlValue(2),
+                value: 0.9,
+            }],
+        });
+    }
+
+    #[test]
+    fn current_q0s_roundtrip_preserves_rigging() {
+        let mut project = small_project();
+        add_player_test_rig(&mut project);
+        let bytes = write_q0s_v2(&project).expect("write rigged q0s");
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            Q0S_VERSION_CURRENT
+        );
+        assert_eq!(parse_q0s_v2(&bytes).expect("parse rigged q0s"), project);
+    }
+
+    #[test]
+    fn q0s_v13_placement_fx_body_remains_readable_without_rigs() {
+        let project = small_project();
+        let mut bytes =
+            v2::write_version(&project, v2::Q1S_VERSION_PLACEMENT_FX).expect("write q1s v14 body");
+        bytes[0..4].copy_from_slice(&Q0S_V2_MAGIC);
+        bytes[4..6].copy_from_slice(&Q0S_VERSION_PLACEMENT_FX.to_le_bytes());
+        assert_eq!(parse_q0s_v2(&bytes).expect("parse q0s v13"), project);
+    }
+
+    #[test]
+    fn current_q0s_roundtrip_preserves_nonempty_rig_deformer() {
+        let mut project = small_project();
+        project.q0rgs[0].layers[0].placements[0].instance_id = 2;
+        add_player_test_rig(&mut project);
+        let rig = project
+            .assets
+            .iter_mut()
+            .find_map(|asset| match asset {
+                Asset::Rig(rig) => Some(rig),
+                _ => None,
+            })
+            .expect("rig");
+        for (control_id, x, y) in [(3, 0.0, 0.0), (4, 5.0, 4.0), (5, 10.0, 0.0)] {
+            rig.controls.push(RigControl {
+                control_id,
+                name: format!("bend {control_id}"),
+                kind: RigControlKind::Position2D,
+                target_node: None,
+                rest_x: x,
+                rest_y: y,
+                rest_value: 0.0,
+                min_value: -1000.0,
+                max_value: 1000.0,
+                public_in_simple: true,
+            });
+        }
+        rig.deformers.push(v2::RigDeformer::Bend {
+            deformer_id: 1,
+            instance_id: 2,
+            asset_id: 1,
+            bind_transform: crate::transform::Affine::IDENTITY,
+            axis_start: Vec2::new(0.0, 0.0),
+            axis_end: Vec2::new(10.0, 0.0),
+            start_control: 3,
+            middle_control: 4,
+            end_control: 5,
+        });
+        let bytes = write_q0s_v2(&project).expect("write deformer q0s");
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            Q0S_VERSION_CURRENT
+        );
+        assert_eq!(parse_q0s_v2(&bytes).expect("parse deformer q0s"), project);
+    }
+
+    #[test]
+    fn current_q0s_roundtrip_preserves_pose_driver_and_variant() {
+        let mut project = small_project();
+        project.q0rgs[0].layers[0].placements[0].instance_id = 1;
+        add_player_test_rig(&mut project);
+        let rig = project
+            .assets
+            .iter_mut()
+            .find_map(|asset| match asset {
+                Asset::Rig(rig) => Some(rig),
+                _ => None,
+            })
+            .unwrap();
+        rig.controls.push(RigControl {
+            control_id: 3,
+            name: "pose source".into(),
+            kind: RigControlKind::Slider,
+            target_node: None,
+            rest_x: 0.0,
+            rest_y: 0.0,
+            rest_value: 0.0,
+            min_value: 0.0,
+            max_value: 1.0,
+            public_in_simple: true,
+        });
+        rig.pose_drivers.push(v2::RigPoseDriver {
+            driver_id: 1,
+            source_control: 3,
+            pose_id: 1,
+            source_min: 0.0,
+            source_max: 1.0,
+            weight_min: 0.0,
+            weight_max: 1.0,
+            mode: v2::RigPoseBlendMode::Override,
+        });
+        rig.variants.push(v2::RigVariantSet {
+            variant_id: 1,
+            name: "variant".into(),
+            instance_id: 1,
+            source_control: 3,
+            choices: vec![v2::RigVariantChoice {
+                name: "base".into(),
+                target: Target::Asset(1),
+            }],
+        });
+        let bytes = write_q0s_v2(&project).expect("write phase h q0s");
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            Q0S_VERSION_RIG_POSE_VARIANTS
+        );
+        assert_eq!(parse_q0s_v2(&bytes).expect("parse phase h q0s"), project);
     }
 }

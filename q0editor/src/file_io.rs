@@ -76,9 +76,15 @@ pub fn load_project(path: &Path) -> Result<ProjectV2, FileError> {
 
     if magic == Q1S_MAGIC && version == 1 {
         let v1 = parse_q1s(&bytes)?;
-        Ok(migrate_v1_to_v2(v1)?)
+        let mut project = migrate_v1_to_v2(v1)?;
+        q0s_format::v2::assign_missing_instance_ids(&mut project)?;
+        Ok(project)
     } else if magic == Q1S_V2_MAGIC {
-        Ok(parse_v2(&bytes)?)
+        let mut project = parse_v2(&bytes)?;
+        if version < q0s_format::v2::Q1S_VERSION_RIGGING {
+            q0s_format::v2::assign_missing_instance_ids(&mut project)?;
+        }
+        Ok(project)
     } else {
         Err(FileError::UnknownMagic(magic))
     }
@@ -383,16 +389,20 @@ mod tests {
         project.q0rgs[0].frame_count = 5;
         project.q0rgs[0].layers[0].placements = vec![
             q0s_format::v2::Placement {
+                instance_id: 0,
                 frame: 4,
                 target: q0s_format::v2::Target::Asset(1),
                 transform: q0s_format::v2::Transform2D::IDENTITY,
                 tween: q0s_format::v2::Tween::None,
+                fx: Default::default(),
             },
             q0s_format::v2::Placement {
+                instance_id: 0,
                 frame: 0,
                 target: q0s_format::v2::Target::Asset(2),
                 transform: q0s_format::v2::Transform2D::IDENTITY,
                 tween: q0s_format::v2::Tween::None,
+                fx: Default::default(),
             },
         ];
         project.q0rgs[0].layers[0].explicit_keyframes = vec![3, 2];
@@ -457,5 +467,157 @@ mod tests {
             load_project(&path),
             Err(FileError::TooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn protected_save_roundtrips_rig_binding_and_stable_identity() {
+        let dir = TestDir::new("rig-protected-save");
+        let path = dir.0.join("rigged.q1s");
+        let mut project = default_project();
+        project
+            .assets
+            .push(q0s_format::v2::Asset::Vector(q0s_format::v2::VectorAsset {
+                asset_id: 77,
+                paths: Vec::new(),
+                fill: None,
+                stroke: None,
+            }));
+        project.q0rgs[0].layers[0]
+            .placements
+            .push(q0s_format::v2::Placement {
+                instance_id: 123,
+                frame: 0,
+                target: q0s_format::v2::Target::Asset(77),
+                transform: q0s_format::v2::Transform2D::IDENTITY,
+                tween: q0s_format::v2::Tween::None,
+                fx: Default::default(),
+            });
+        crate::rigging::ensure_rig(&mut project, 1).expect("rig");
+        let bone = crate::rigging::add_bone(
+            &mut project,
+            1,
+            None,
+            q0s_format::v2::Vec2::new(0.0, 0.0),
+            q0s_format::v2::Vec2::new(20.0, 0.0),
+            0,
+        )
+        .expect("bone");
+        let selection = crate::state::Selection::Placement {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: 0,
+        };
+        crate::rigging::bind_selected_placement_to_node(&mut project, &selection, bone, 0)
+            .expect("bind");
+        crate::rigging::set_node_rotation(&mut project, 1, bone, 6, 0.4, true);
+        {
+            use q0s_format::v2::{
+                Asset, RigControl, RigControlKind, RigMirrorPair, RigPoseBlendMode, RigPoseDriver,
+                RigPosePreset, RigPoseValue, RigPropertyRef, RigVariantChoice, RigVariantSet,
+                Target,
+            };
+            let rig = project
+                .assets
+                .iter_mut()
+                .find_map(|asset| match asset {
+                    Asset::Rig(rig) if rig.owner_q0rg_id == 1 => Some(rig),
+                    _ => None,
+                })
+                .expect("rig metadata");
+            let source = rig
+                .controls
+                .iter()
+                .map(|control| control.control_id)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+            let partner = source.saturating_add(1);
+            rig.controls.extend([
+                RigControl {
+                    control_id: source,
+                    name: "protected save pose source".into(),
+                    kind: RigControlKind::Slider,
+                    target_node: None,
+                    rest_x: 0.0,
+                    rest_y: 0.0,
+                    rest_value: 0.0,
+                    min_value: 0.0,
+                    max_value: 1.0,
+                    public_in_simple: true,
+                },
+                RigControl {
+                    control_id: partner,
+                    name: "protected save pose target".into(),
+                    kind: RigControlKind::Slider,
+                    target_node: None,
+                    rest_x: 0.0,
+                    rest_y: 0.0,
+                    rest_value: 0.0,
+                    min_value: 0.0,
+                    max_value: 1.0,
+                    public_in_simple: true,
+                },
+            ]);
+            rig.poses.push(RigPosePreset {
+                pose_id: 1,
+                name: "protected save pose".into(),
+                values: vec![RigPoseValue {
+                    property: RigPropertyRef::ControlValue(partner),
+                    value: 1.0,
+                }],
+            });
+            rig.pose_drivers.push(RigPoseDriver {
+                driver_id: 1,
+                source_control: source,
+                pose_id: 1,
+                source_min: 0.0,
+                source_max: 1.0,
+                weight_min: 0.0,
+                weight_max: 1.0,
+                mode: RigPoseBlendMode::Override,
+            });
+            rig.mirror_pairs.push(RigMirrorPair {
+                left: RigPropertyRef::ControlValue(source),
+                right: RigPropertyRef::ControlValue(partner),
+                multiplier: 1.0,
+                offset: 0.0,
+            });
+            rig.variants.push(RigVariantSet {
+                variant_id: 1,
+                name: "protected save variant".into(),
+                instance_id: 123,
+                source_control: source,
+                choices: vec![RigVariantChoice {
+                    name: "default".into(),
+                    target: Target::Asset(77),
+                }],
+            });
+        }
+
+        save_project(&path, &project).expect("protected save rigged project");
+        let loaded = load_project(&path).expect("load protected rigged project");
+        assert!(wire_equivalent(&loaded, &project));
+        assert_eq!(loaded.q0rgs[0].layers[0].placements[0].instance_id, 123);
+        let rig = q0s_format::rig::rig_for_q0rg(&loaded, 1).expect("loaded rig");
+        assert_eq!(
+            rig.nodes[0].binding.expect("loaded binding").instance_id,
+            123
+        );
+        assert!(rig.channels.iter().any(|channel| {
+            channel.property == q0s_format::v2::RigPropertyRef::NodeRotation(bone)
+        }));
+        assert_eq!(rig.pose_drivers.len(), 1);
+        assert_eq!(rig.mirror_pairs.len(), 1);
+        assert_eq!(rig.variants.len(), 1);
+        assert_eq!(rig.variants[0].instance_id, 123);
+        assert_eq!(
+            rig.variants[0].choices[0].target,
+            q0s_format::v2::Target::Asset(77)
+        );
+        assert_eq!(
+            fs::read_dir(&dir.0).expect("read save dir").count(),
+            1,
+            "protected save must not leak a staging file"
+        );
     }
 }

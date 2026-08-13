@@ -40,6 +40,7 @@ impl LibraryIcon {
             Asset::Vector(_) => Self::Vector,
             Asset::Bitmap(_) => Self::Bitmap,
             Asset::Q0v(_) => Self::Video,
+            Asset::Rig(_) => Self::Symbol,
         }
     }
 }
@@ -102,7 +103,13 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             .iter()
             .filter(|q0rg| q0rg.q0rg_id != app.state.project.meta.entry_q0rg_id)
             .count()
-            + app.state.project.assets.len();
+            + app
+                .state
+                .project
+                .assets
+                .iter()
+                .filter(|asset| !matches!(asset, Asset::Rig(_)))
+                .count();
         ui.label(
             egui::RichText::new(format!("Items: {count}"))
                 .small()
@@ -580,6 +587,9 @@ fn collect_rows(app: &EditorApp) -> Vec<LibraryRow> {
         });
     }
     for asset in &project.assets {
+        if matches!(asset, Asset::Rig(_)) {
+            continue;
+        }
         let id = asset.id();
         let uses = project
             .q0rgs
@@ -627,6 +637,15 @@ fn collect_rows(app: &EditorApp) -> Vec<LibraryRow> {
                         .unwrap_or_else(|| "invalid q0v".to_string()),
                 )
             }
+            Asset::Rig(rig) => (
+                format!("Rig {}", rig.owner_q0rg_id),
+                "rig",
+                format!(
+                    "{} bones / {} controls",
+                    rig.nodes.len(),
+                    rig.controls.len()
+                ),
+            ),
         };
         rows.push(LibraryRow {
             key: LibraryKey::Asset(id),
@@ -692,6 +711,7 @@ fn draw_preview(app: &mut EditorApp, ui: &mut Ui) {
                     .get(&id)
                     .map(String::as_str)
                     .unwrap_or("Video asset"),
+                Asset::Rig(_) => "Rig metadata",
             })
             .unwrap_or("Missing asset"),
     };
@@ -721,10 +741,12 @@ fn draw_preview(app: &mut EditorApp, ui: &mut Ui) {
         LibraryKey::Asset(id) => placement_bbox(
             &app.state.project,
             &Placement {
+                instance_id: 0,
                 frame: 0,
                 target: Target::Asset(id),
                 transform: Transform2D::IDENTITY,
                 tween: Tween::None,
+                fx: Default::default(),
             },
         ),
     };
@@ -922,6 +944,7 @@ fn collect_asset_color_stats(project: &ProjectV2, asset_id: u16, stats: &mut Pre
                 );
             }
         }
+        Asset::Rig(_) => {}
     }
 }
 

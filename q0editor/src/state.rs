@@ -5,7 +5,7 @@ pub use q0s_format::geom::CapShape;
 use q0s_format::transform::Affine;
 use q0s_format::v2::{
     Anchor, Layer, LayerMetadata, Path as VPath, Placement, ProjectMeta, ProjectV2, Q0rg, Rgba,
-    Transform2D, Vec2, VectorAppearance, VectorAsset,
+    RigChannel, RigPoseBlendMode, Target, Transform2D, Vec2, VectorAppearance, VectorAsset,
 };
 
 use crate::advanced_brush::{AdvancedBrushSettings, AdvancedBrushStroke, BrushMode};
@@ -79,10 +79,11 @@ pub enum Tool {
     Oval,
     Bucket,
     Eyedropper,
+    Rig,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 12] = [
+    pub const ALL: [Tool; 13] = [
         Tool::Select,
         Tool::Hand,
         Tool::Subselect,
@@ -95,6 +96,7 @@ impl Tool {
         Tool::Oval,
         Tool::Bucket,
         Tool::Eyedropper,
+        Tool::Rig,
     ];
 
     pub fn label(self) -> &'static str {
@@ -111,6 +113,7 @@ impl Tool {
             Tool::Oval => "Oval",
             Tool::Bucket => "Recolor Fill",
             Tool::Eyedropper => "Eyedropper",
+            Tool::Rig => "Rig",
         }
     }
 
@@ -128,6 +131,7 @@ impl Tool {
             Tool::Oval => "O",
             Tool::Bucket => "K",
             Tool::Eyedropper => "I",
+            Tool::Rig => "G",
         }
     }
 }
@@ -223,6 +227,9 @@ impl TimelineSelection {
 
 #[derive(Debug, Clone)]
 pub struct TimelineFrameClipboardRow {
+    /// Original layer. Paste uses this only to distinguish a temporal copy on
+    /// the same track from a spatial copy into another layer.
+    pub source_layer_id: u16,
     pub explicit_keyframes: Vec<u16>,
     pub placements: Vec<Placement>,
 }
@@ -231,6 +238,10 @@ pub struct TimelineFrameClipboardRow {
 pub struct TimelineFrameClipboard {
     pub width: u16,
     pub rows: Vec<TimelineFrameClipboardRow>,
+    /// Rig keys are included only when the frame selection spans every drawable
+    /// layer in the q0rg. That makes whole-character time edits coherent without
+    /// making a one-layer copy unexpectedly rewrite the character rig.
+    pub rig_channels: Vec<RigChannel>,
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +282,56 @@ impl ClipboardPayload {
         self.placements.is_empty() && self.raw_vectors.is_empty() && self.timeline.is_none()
     }
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RigMode {
+    #[default]
+    Simple,
+    Pro,
+}
+
+impl RigMode {
+    pub const ALL: [Self; 2] = [Self::Simple, Self::Pro];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Simple => "Simple",
+            Self::Pro => "Pro",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RigEditMode {
+    #[default]
+    Pose,
+    AddBone,
+}
+
+impl RigEditMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Pose => "Pose",
+            Self::AddBone => "Add bone",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RigBoneDrag {
+    pub node_id: u16,
+    pub center_world: Vec2,
+    pub parent_world_angle: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RigControlDrag {
+    pub control_id: u16,
+    pub start_cursor: Vec2,
+    pub start_x: f32,
+    pub start_y: f32,
+    pub start_value: f32,
+}
+
 pub struct ProjectState {
     pub project: ProjectV2,
     pub file_path: Option<PathBuf>,
@@ -402,6 +463,7 @@ pub enum ToolState {
         q0rg_id: u16,
         layer_id: u16,
         placement_idx: usize,
+        start_cursor: Vec2,
         cursor_offset: Vec2,
         pivot_cursor_offset: Option<Vec2>,
     },
@@ -594,6 +656,12 @@ impl BrushLibraryFilter {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrushSizePreview {
+    Size,
+    MinimumSize,
+}
+
 pub struct Session {
     pub current_q0rg_id: u16,
     pub current_layer_id: u16,
@@ -626,6 +694,8 @@ pub struct Session {
     pub brush: BrushSettings,
     pub brush_mode: BrushMode,
     pub advanced_brush: AdvancedBrushSettings,
+    /// Temporary centre-stage nib preview while the user edits brush size controls.
+    pub brush_size_preview: Option<BrushSizePreview>,
     /// Keeps the last Classic raster draft alive for the release frame. Stage
     /// rendering happens before tool input, so without this handoff the newly
     /// committed vector cannot appear until the next frame and the stroke
@@ -647,6 +717,20 @@ pub struct Session {
     /// stroke-to-fill conversions in the right-click menu. Per-session, so
     /// the user picks once and forgets.
     pub brush_cap: CapShape,
+    /// Rigging uses one project/runtime model; this is only the editor presentation mode.
+    pub rig_mode: RigMode,
+    pub rig_edit_mode: RigEditMode,
+    pub rig_auto_key: bool,
+    pub rig_selected_node: Option<u16>,
+    pub rig_selected_control: Option<u16>,
+    pub rig_pose_blend_weight: f32,
+    pub rig_pose_blend_mode: RigPoseBlendMode,
+    pub rig_mirror_partner_node: Option<u16>,
+    pub rig_mirror_partner_control: Option<u16>,
+    pub rig_variant_add_target: Option<Target>,
+    pub rig_pending_bone_start: Option<Vec2>,
+    pub rig_bone_drag: Option<RigBoneDrag>,
+    pub rig_control_drag: Option<RigControlDrag>,
     pub show_credits: bool,
     pub credits_opened_at: Instant,
     pub show_settings: bool,
@@ -717,6 +801,7 @@ impl Session {
             brush: BrushSettings::default(),
             brush_mode: BrushMode::Classic,
             advanced_brush: AdvancedBrushSettings::default(),
+            brush_size_preview: None,
             classic_brush_preview_handoff: false,
             advanced_brush_preview_handoff: None,
             advanced_brush_preset_name: "My Brush".to_string(),
@@ -724,6 +809,19 @@ impl Session {
             advanced_brush_library_filter: BrushLibraryFilter::All,
             eraser_size: 18.0,
             brush_cap: CapShape::Round,
+            rig_mode: RigMode::Simple,
+            rig_edit_mode: RigEditMode::Pose,
+            rig_auto_key: true,
+            rig_selected_node: None,
+            rig_selected_control: None,
+            rig_pose_blend_weight: 0.5,
+            rig_pose_blend_mode: RigPoseBlendMode::Override,
+            rig_mirror_partner_node: None,
+            rig_mirror_partner_control: None,
+            rig_variant_add_target: None,
+            rig_pending_bone_start: None,
+            rig_bone_drag: None,
+            rig_control_drag: None,
             show_credits: false,
             credits_opened_at: Instant::now(),
             show_settings: false,
@@ -753,6 +851,19 @@ impl Session {
 
     /// Make sure cached selectors still point at valid model state. Called after
     /// undo/redo Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the project might have lost q0rgs, layers, placements etc.
+    /// Reconcile transient selection across a project-history boundary.
+    ///
+    /// History stores `ProjectV2`, not session/UI state. Path and placement
+    /// references are index-based, so blindly carrying them across undo/redo
+    /// can reinterpret an old selection as a different contour (notably a hole)
+    /// after topology or target changes. Preserve references when their structural
+    /// identity is still the same, even if editable geometry/transform properties
+    /// changed, and drop them when the backing model object is no longer compatible.
+    pub fn reconcile_after_history(&mut self, from: &ProjectV2, to: &ProjectV2) {
+        self.selection = history_stable_selection(from, to, self.selection.clone());
+        self.reconcile_with(to);
+    }
+
     pub fn reconcile_with(&mut self, project: &ProjectV2) {
         let previous_q0rg_id = self.current_q0rg_id;
         self.breadcrumb
@@ -907,7 +1018,9 @@ impl Session {
                     })
                     .and_then(|asset| match asset {
                         q0s_format::v2::Asset::Vector(vector) => vector.paths.get(path_idx),
-                        q0s_format::v2::Asset::Bitmap(_) | q0s_format::v2::Asset::Q0v(_) => None,
+                        q0s_format::v2::Asset::Bitmap(_)
+                        | q0s_format::v2::Asset::Q0v(_)
+                        | q0s_format::v2::Asset::Rig(_) => None,
                     })
                     .is_some();
                 if !exists {
@@ -991,6 +1104,26 @@ impl Session {
             Selection::None => {}
         }
         self.tool_state = ToolState::Idle;
+        self.rig_pending_bone_start = None;
+        self.rig_bone_drag = None;
+        self.rig_control_drag = None;
+        if let Some(rig) = q0s_format::rig::rig_for_q0rg(project, self.current_q0rg_id) {
+            if self
+                .rig_selected_node
+                .is_some_and(|id| !rig.nodes.iter().any(|node| node.node_id == id))
+            {
+                self.rig_selected_node = None;
+            }
+            if self
+                .rig_selected_control
+                .is_some_and(|id| !rig.controls.iter().any(|control| control.control_id == id))
+            {
+                self.rig_selected_control = None;
+            }
+        } else {
+            self.rig_selected_node = None;
+            self.rig_selected_control = None;
+        }
         self.playing = false;
         // If the script editor is bound to a now-gone q0rg, clear the
         // pin and let the next open snap to `current_q0rg_id`.
@@ -1155,6 +1288,237 @@ impl Session {
     }
 }
 
+fn placement_at(project: &ProjectV2, reference: PlacementRef) -> Option<&Placement> {
+    project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == reference.q0rg_id)
+        .and_then(|q0rg| {
+            q0rg.layers
+                .iter()
+                .find(|layer| layer.layer_id == reference.layer_id)
+        })
+        .and_then(|layer| layer.placements.get(reference.placement_idx))
+}
+
+fn path_at(project: &ProjectV2, reference: PathRef) -> Option<&VPath> {
+    let placement = placement_at(
+        project,
+        PlacementRef {
+            q0rg_id: reference.q0rg_id,
+            layer_id: reference.layer_id,
+            placement_idx: reference.placement_idx,
+        },
+    )?;
+    let q0s_format::v2::Target::Asset(asset_id) = placement.target else {
+        return None;
+    };
+    let asset = project.assets.iter().find(|asset| asset.id() == asset_id)?;
+    let q0s_format::v2::Asset::Vector(vector) = asset else {
+        return None;
+    };
+    vector.paths.get(reference.path_idx)
+}
+
+fn stable_placement_ref(from: &ProjectV2, to: &ProjectV2, reference: PlacementRef) -> bool {
+    let (Some(before), Some(after)) = (placement_at(from, reference), placement_at(to, reference))
+    else {
+        return false;
+    };
+    if before == after {
+        return true;
+    }
+    // Transform, tween and FX are mutable properties of one placement, not its
+    // identity. Undoing those edits should keep the object selected. A changed
+    // frame/target, however, means this index can now refer to a different model
+    // object (for example after Break Apart), so carrying selection would be unsafe.
+    before.frame == after.frame && before.target == after.target
+}
+
+fn stable_vector_path_structure(from: &ProjectV2, to: &ProjectV2, reference: PathRef) -> bool {
+    let placement = PlacementRef {
+        q0rg_id: reference.q0rg_id,
+        layer_id: reference.layer_id,
+        placement_idx: reference.placement_idx,
+    };
+    let (Some(before_placement), Some(after_placement)) =
+        (placement_at(from, placement), placement_at(to, placement))
+    else {
+        return false;
+    };
+    let (
+        q0s_format::v2::Target::Asset(before_asset_id),
+        q0s_format::v2::Target::Asset(after_asset_id),
+    ) = (before_placement.target, after_placement.target)
+    else {
+        return false;
+    };
+    if before_asset_id != after_asset_id {
+        return false;
+    }
+    let before = from.assets.iter().find_map(|asset| match asset {
+        q0s_format::v2::Asset::Vector(vector) if vector.asset_id == before_asset_id => Some(vector),
+        _ => None,
+    });
+    let after = to.assets.iter().find_map(|asset| match asset {
+        q0s_format::v2::Asset::Vector(vector) if vector.asset_id == after_asset_id => Some(vector),
+        _ => None,
+    });
+    let (Some(before), Some(after)) = (before, after) else {
+        return false;
+    };
+    if reference.path_idx >= before.paths.len() || before.paths.len() != after.paths.len() {
+        return false;
+    }
+    before.paths.iter().zip(&after.paths).all(|(left, right)| {
+        left.closed == right.closed
+            && left.anchors.len() == right.anchors.len()
+            && left.anchors.iter().zip(&right.anchors).all(|(a, b)| {
+                a.in_handle.is_some() == b.in_handle.is_some()
+                    && a.out_handle.is_some() == b.out_handle.is_some()
+            })
+    })
+}
+
+fn stable_path_ref(from: &ProjectV2, to: &ProjectV2, reference: PathRef) -> bool {
+    let placement = PlacementRef {
+        q0rg_id: reference.q0rg_id,
+        layer_id: reference.layer_id,
+        placement_idx: reference.placement_idx,
+    };
+    if !stable_placement_ref(from, to, placement) {
+        return false;
+    }
+    matches!(
+        (path_at(from, reference), path_at(to, reference)),
+        (Some(before), Some(after)) if before == after
+    ) || stable_vector_path_structure(from, to, reference)
+}
+
+fn history_stable_selection(from: &ProjectV2, to: &ProjectV2, selection: Selection) -> Selection {
+    match selection {
+        Selection::Placement {
+            q0rg_id,
+            layer_id,
+            placement_idx,
+        } => {
+            let reference = PlacementRef {
+                q0rg_id,
+                layer_id,
+                placement_idx,
+            };
+            if stable_placement_ref(from, to, reference) {
+                Selection::Placement {
+                    q0rg_id,
+                    layer_id,
+                    placement_idx,
+                }
+            } else {
+                Selection::None
+            }
+        }
+        Selection::Path {
+            q0rg_id,
+            layer_id,
+            placement_idx,
+            path_idx,
+        } => {
+            let reference = PathRef {
+                q0rg_id,
+                layer_id,
+                placement_idx,
+                path_idx,
+            };
+            if stable_path_ref(from, to, reference) {
+                Selection::Path {
+                    q0rg_id,
+                    layer_id,
+                    placement_idx,
+                    path_idx,
+                }
+            } else {
+                Selection::None
+            }
+        }
+        Selection::Paths(refs) => collapse_path_refs(
+            refs.into_iter()
+                .filter(|reference| stable_path_ref(from, to, *reference))
+                .collect(),
+        ),
+        Selection::PathPoints {
+            path,
+            anchor_indices,
+            bounds_min,
+            bounds_max,
+        } => {
+            if stable_path_ref(from, to, path) {
+                Selection::PathPoints {
+                    path,
+                    anchor_indices,
+                    bounds_min,
+                    bounds_max,
+                }
+            } else {
+                Selection::None
+            }
+        }
+        Selection::RawArea {
+            placements,
+            objects,
+            bounds_min,
+            bounds_max,
+        } => {
+            let stable_raw: Vec<PlacementRef> = placements
+                .iter()
+                .copied()
+                .filter(|reference| stable_placement_ref(from, to, *reference))
+                .collect();
+            let stable_objects: Vec<PlacementRef> = objects
+                .iter()
+                .copied()
+                .filter(|reference| stable_placement_ref(from, to, *reference))
+                .collect();
+            if stable_raw.len() == placements.len() && stable_objects.len() == objects.len() {
+                Selection::RawArea {
+                    placements: stable_raw,
+                    objects: stable_objects,
+                    bounds_min,
+                    bounds_max,
+                }
+            } else {
+                Selection::None
+            }
+        }
+        Selection::Mixed { paths, objects } => {
+            let stable_paths: Vec<PathRef> = paths
+                .into_iter()
+                .filter(|reference| stable_path_ref(from, to, *reference))
+                .collect();
+            let stable_objects: Vec<PlacementRef> = objects
+                .into_iter()
+                .filter(|reference| stable_placement_ref(from, to, *reference))
+                .collect();
+            collapse_mixed_selection(stable_paths, stable_objects)
+        }
+        Selection::Multi(refs) => {
+            let stable: Vec<PlacementRef> = refs
+                .into_iter()
+                .filter(|reference| stable_placement_ref(from, to, *reference))
+                .collect();
+            match stable.len() {
+                0 => Selection::None,
+                1 => Selection::Placement {
+                    q0rg_id: stable[0].q0rg_id,
+                    layer_id: stable[0].layer_id,
+                    placement_idx: stable[0].placement_idx,
+                },
+                _ => Selection::Multi(stable),
+            }
+        }
+        other => other,
+    }
+}
+
 fn path_ref_exists(project: &ProjectV2, r: PathRef) -> bool {
     project
         .q0rgs
@@ -1170,7 +1534,9 @@ fn path_ref_exists(project: &ProjectV2, r: PathRef) -> bool {
         })
         .and_then(|asset| match asset {
             q0s_format::v2::Asset::Vector(vector) => vector.paths.get(r.path_idx),
-            q0s_format::v2::Asset::Bitmap(_) | q0s_format::v2::Asset::Q0v(_) => None,
+            q0s_format::v2::Asset::Bitmap(_)
+            | q0s_format::v2::Asset::Q0v(_)
+            | q0s_format::v2::Asset::Rig(_) => None,
         })
         .is_some()
 }
@@ -1190,7 +1556,9 @@ fn path_anchor_count(project: &ProjectV2, r: PathRef) -> Option<usize> {
         })
         .and_then(|asset| match asset {
             q0s_format::v2::Asset::Vector(vector) => vector.paths.get(r.path_idx),
-            q0s_format::v2::Asset::Bitmap(_) | q0s_format::v2::Asset::Q0v(_) => None,
+            q0s_format::v2::Asset::Bitmap(_)
+            | q0s_format::v2::Asset::Q0v(_)
+            | q0s_format::v2::Asset::Rig(_) => None,
         })
         .map(|path| path.anchors.len())
 }
@@ -1336,7 +1704,8 @@ pub fn default_project() -> ProjectV2 {
 
 #[cfg(test)]
 mod default_project_tests {
-    use super::{default_project, DEFAULT_STAGE_HEIGHT, DEFAULT_STAGE_WIDTH};
+    use super::{default_project, History, DEFAULT_STAGE_HEIGHT, DEFAULT_STAGE_WIDTH};
+    use q0s_format::v2::{Asset, Placement, Target, Transform2D, Tween, VectorAsset};
 
     #[test]
     fn new_project_starts_with_a_real_blank_keyframe() {
@@ -1358,6 +1727,66 @@ mod default_project_tests {
             u32::from(project.meta.stage_width) * 3,
             u32::from(project.meta.stage_height) * 4,
             "the default stage must keep a true 4:3 aspect ratio"
+        );
+    }
+
+    #[test]
+    fn undo_redo_preserves_rig_structure_and_instance_identity() {
+        let mut before = default_project();
+        before.assets.push(Asset::Vector(VectorAsset {
+            asset_id: 7,
+            paths: Vec::new(),
+            fill: None,
+            stroke: None,
+        }));
+        before.q0rgs[0].layers[0].placements.push(Placement {
+            instance_id: 41,
+            frame: 0,
+            target: Target::Asset(7),
+            transform: Transform2D::IDENTITY,
+            tween: Tween::None,
+            fx: Default::default(),
+        });
+        crate::rigging::ensure_rig(&mut before, 1).expect("create rig");
+        let bone = crate::rigging::add_bone(
+            &mut before,
+            1,
+            None,
+            q0s_format::v2::Vec2::new(0.0, 0.0),
+            q0s_format::v2::Vec2::new(20.0, 0.0),
+            0,
+        )
+        .expect("bone");
+        let selection = super::Selection::Placement {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: 0,
+        };
+        crate::rigging::bind_selected_placement_to_node(&mut before, &selection, bone, 0)
+            .expect("bind");
+        let stable_id = before.q0rgs[0].layers[0].placements[0].instance_id;
+        assert_eq!(stable_id, 41);
+
+        let mut history = History::new();
+        history.snapshot(&before);
+        let mut after = before.clone();
+        crate::rigging::set_node_rotation(&mut after, 1, bone, 6, 0.75, true);
+        let undone = history.pop_undo(&after).expect("undo snapshot");
+        assert_eq!(undone, before);
+        assert_eq!(
+            undone.q0rgs[0].layers[0].placements[0].instance_id,
+            stable_id
+        );
+        let redone = history.pop_redo(&undone).expect("redo snapshot");
+        assert_eq!(redone, after);
+        assert_eq!(
+            redone.q0rgs[0].layers[0].placements[0].instance_id,
+            stable_id
+        );
+        let rig = q0s_format::rig::rig_for_q0rg(&redone, 1).expect("rig after redo");
+        assert_eq!(
+            rig.nodes[0].binding.expect("binding").instance_id,
+            stable_id
         );
     }
 }

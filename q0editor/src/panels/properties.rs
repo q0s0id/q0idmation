@@ -1,8 +1,10 @@
 use egui::{Color32, ScrollArea, Ui};
-use q0s_format::v2::{Asset, Rgba, Stroke as VStroke};
+use q0s_format::v2::{
+    Asset, BlendMode, BlurFx, DropShadowFx, GlowFx, PlacementFx, Rgba, Stroke as VStroke,
+};
 
 use crate::app::{Action, EditorApp};
-use crate::state::{BrushLibraryFilter, Selection, Tool};
+use crate::state::{BrushLibraryFilter, BrushSizePreview, Selection, Tool};
 
 pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     ui.heading("Properties");
@@ -132,7 +134,7 @@ fn raw_path_properties(
         })
         .and_then(|asset| match asset {
             Asset::Vector(vector) => vector.paths.get(path_idx),
-            Asset::Bitmap(_) | Asset::Q0v(_) => None,
+            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => None,
         });
     let Some(path) = path else {
         ui.label("Selection is no longer available");
@@ -229,6 +231,7 @@ enum ToolPropertyKind {
     ClosedShape,
     Fill,
     Eyedropper,
+    Rig,
 }
 
 fn tool_property_kind(tool: Tool) -> ToolPropertyKind {
@@ -244,6 +247,7 @@ fn tool_property_kind(tool: Tool) -> ToolPropertyKind {
         Tool::Rectangle | Tool::Oval => ToolPropertyKind::ClosedShape,
         Tool::Bucket => ToolPropertyKind::Fill,
         Tool::Eyedropper => ToolPropertyKind::Eyedropper,
+        Tool::Rig => ToolPropertyKind::Rig,
     }
 }
 
@@ -288,6 +292,7 @@ fn render_tool_properties(app: &mut EditorApp, ui: &mut Ui) {
             ui,
             "Click visible vector paint to copy its fill or stroke settings.",
         ),
+        ToolPropertyKind::Rig => crate::rigging::render_properties(app, ui),
     }
 }
 
@@ -516,6 +521,19 @@ fn paint_preview_dab(
     ));
 }
 
+fn update_brush_size_preview(
+    app: &mut EditorApp,
+    response: &egui::Response,
+    kind: BrushSizePreview,
+) {
+    let active = response.is_pointer_button_down_on() || response.changed();
+    if active {
+        app.session.brush_size_preview = Some(kind);
+    } else if app.session.brush_size_preview == Some(kind) {
+        app.session.brush_size_preview = None;
+    }
+}
+
 fn brush_properties(app: &mut EditorApp, ui: &mut Ui) {
     let mode_before = app.session.brush_mode;
     let classic_before = app.session.brush;
@@ -562,11 +580,12 @@ fn brush_properties(app: &mut EditorApp, ui: &mut Ui) {
                     ui.end_row();
 
                     ui.label("Size");
-                    ui.add(
+                    let size_response = ui.add(
                         egui::DragValue::new(&mut app.session.brush.size)
                             .speed(0.25)
                             .clamp_range(0.1..=512.0),
                     );
+                    update_brush_size_preview(app, &size_response, BrushSizePreview::Size);
                     ui.end_row();
 
                     ui.label("Smoothing");
@@ -591,10 +610,14 @@ fn brush_properties(app: &mut EditorApp, ui: &mut Ui) {
                     ui.end_row();
 
                     ui.label("Minimum size");
-                    ui.add_enabled(
+                    let min_size_response = ui.add_enabled(
                         dynamics_enabled,
-                        egui::Slider::new(&mut app.session.brush.dynamics_min_size, 0.01..=1.0)
-                            .suffix("×"),
+                        egui::Slider::new(&mut app.session.brush.dynamics_min_size, 0.01..=1.0),
+                    );
+                    update_brush_size_preview(
+                        app,
+                        &min_size_response,
+                        BrushSizePreview::MinimumSize,
                     );
                     ui.end_row();
 
@@ -636,11 +659,12 @@ fn brush_properties(app: &mut EditorApp, ui: &mut Ui) {
                     ui.end_row();
 
                     ui.label("Size");
-                    ui.add(
+                    let size_response = ui.add(
                         egui::DragValue::new(&mut app.session.advanced_brush.size)
                             .speed(0.25)
                             .clamp_range(0.1..=1024.0),
                     );
+                    update_brush_size_preview(app, &size_response, BrushSizePreview::Size);
                     ui.end_row();
 
                     ui.label("Smoothing");
@@ -696,12 +720,17 @@ fn brush_properties(app: &mut EditorApp, ui: &mut Ui) {
                     ui.end_row();
 
                     ui.label("Pressure min size");
-                    ui.add_enabled(
+                    let min_size_response = ui.add_enabled(
                         app.session.advanced_brush.pressure_size,
                         egui::Slider::new(
                             &mut app.session.advanced_brush.pressure_min_size,
                             0.01..=1.0,
                         ),
+                    );
+                    update_brush_size_preview(
+                        app,
+                        &min_size_response,
+                        BrushSizePreview::MinimumSize,
                     );
                     ui.end_row();
 
@@ -1052,6 +1081,15 @@ fn asset_properties(app: &mut EditorApp, ui: &mut Ui, id: u16) {
                 ui.label(format!("invalid q0v: {error}"));
             }
         },
+        Asset::Rig(rig) => {
+            ui.label(format!("Rig for q0rg {}", rig.owner_q0rg_id));
+            ui.label(format!(
+                "{} bones / {} controls / {} constraints",
+                rig.nodes.len(),
+                rig.controls.len(),
+                rig.constraints.len()
+            ));
+        }
         Asset::Vector(v) => {
             ui.label(format!("Vector: {} path(s)", v.paths.len()));
             let total_anchors: usize = v.paths.iter().map(|p| p.anchors.len()).sum();
@@ -1261,6 +1299,25 @@ fn q0rg_properties(app: &mut EditorApp, ui: &mut Ui, id: u16) {
     }
 }
 
+fn blend_mode_name(mode: BlendMode) -> &'static str {
+    match mode {
+        BlendMode::Normal => "Normal",
+        BlendMode::Multiply => "Multiply",
+        BlendMode::Screen => "Screen",
+        BlendMode::Add => "Add",
+        BlendMode::Overlay => "Overlay",
+    }
+}
+
+fn note_property_response(response: &egui::Response, dirty: &mut bool, wants_snapshot: &mut bool) {
+    if response.drag_started() || response.gained_focus() || response.changed() {
+        *wants_snapshot = true;
+    }
+    if response.changed() {
+        *dirty = true;
+    }
+}
+
 fn placement_properties(
     app: &mut EditorApp,
     ui: &mut Ui,
@@ -1270,7 +1327,7 @@ fn placement_properties(
 ) {
     let before = app.state.project.clone();
     let current_frame = app.session.current_frame;
-    let Some((source_frame, mut transform, tween)) = app
+    let Some((source_frame, mut transform, tween, mut fx)) = app
         .state
         .project
         .q0rgs
@@ -1279,9 +1336,10 @@ fn placement_properties(
         .and_then(|q| q.layers.iter().find(|layer| layer.layer_id == layer_id))
         .and_then(|layer| {
             let source = layer.placements.get(placement_idx)?;
-            let active =
-                crate::render::active_transform_for_placement(layer, placement_idx, current_frame)?;
-            Some((source.frame, active, source.tween))
+            let active = q0s_format::raster::active_placement_states_at(layer, current_frame)
+                .into_iter()
+                .find(|active| active.index == placement_idx)?;
+            Some((source.frame, active.transform, source.tween, active.fx))
         })
     else {
         ui.label("Selection is no longer available");
@@ -1290,6 +1348,7 @@ fn placement_properties(
 
     let mut wants_snapshot = false;
     let mut transform_dirty = false;
+    let mut fx_dirty = false;
     ui.label(egui::RichText::new("Placement").strong());
     if source_frame != current_frame {
         ui.label(
@@ -1352,29 +1411,231 @@ fn placement_properties(
     crate::easing::render_tween_properties(app, ui, q0rg_id, layer_id, placement_idx, tween);
 
     ui.separator();
-    if ui
-        .add_enabled(
-            app.can_break_apart_selection(),
-            egui::Button::new("Break Apart  (Ctrl+B)"),
-        )
-        .clicked()
-    {
-        app.queue(Action::BreakApartSelection);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("FX").strong());
+        let reset = ui.add_enabled(!fx.is_identity(), egui::Button::new("Reset"));
+        if reset.clicked() {
+            fx = PlacementFx::default();
+            fx_dirty = true;
+            wants_snapshot = true;
+        }
+    });
+
+    egui::Grid::new("placement_fx_global")
+        .num_columns(2)
+        .show(ui, |ui| {
+            ui.label("Alpha");
+            let mut percent = fx.opacity * 100.0;
+            let response = ui.add(
+                egui::Slider::new(&mut percent, 0.0..=100.0)
+                    .suffix("%")
+                    .show_value(true),
+            );
+            note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
+            if response.changed() {
+                fx.opacity = (percent / 100.0).clamp(0.0, 1.0);
+            }
+            ui.end_row();
+
+            ui.label("Blend");
+            let blend_before = fx.blend_mode;
+            egui::ComboBox::from_id_source("placement_fx_blend")
+                .selected_text(blend_mode_name(fx.blend_mode))
+                .show_ui(ui, |ui| {
+                    for mode in [
+                        BlendMode::Normal,
+                        BlendMode::Multiply,
+                        BlendMode::Screen,
+                        BlendMode::Add,
+                        BlendMode::Overlay,
+                    ] {
+                        ui.selectable_value(&mut fx.blend_mode, mode, blend_mode_name(mode));
+                    }
+                });
+            if fx.blend_mode != blend_before {
+                fx_dirty = true;
+                wants_snapshot = true;
+            }
+            ui.end_row();
+        });
+
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new("Filters").small().strong());
+
+    let mut glow_enabled = fx.glow.is_some();
+    let glow_toggle = ui.checkbox(&mut glow_enabled, "Glow");
+    if glow_toggle.changed() {
+        fx.glow = glow_enabled.then_some(GlowFx {
+            color: Rgba {
+                r: 255,
+                g: 32,
+                b: 24,
+                a: 255,
+            },
+            radius: 8.0,
+            strength: 1.0,
+        });
+        fx_dirty = true;
+        wants_snapshot = true;
+    }
+    if let Some(glow) = fx.glow.as_mut() {
+        ui.indent("placement_glow", |ui| {
+            egui::Grid::new("placement_glow_grid")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    ui.label("Color");
+                    let mut color = rgba_to_color32(glow.color);
+                    let response = ui.color_edit_button_srgba(&mut color);
+                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
+                    if response.changed() {
+                        glow.color = color32_to_rgba(color);
+                    }
+                    ui.end_row();
+
+                    ui.label("Radius");
+                    let response = ui.add(
+                        egui::DragValue::new(&mut glow.radius)
+                            .speed(0.25)
+                            .clamp_range(0.0..=256.0)
+                            .suffix(" px"),
+                    );
+                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
+                    ui.end_row();
+
+                    ui.label("Strength");
+                    let response = ui.add(
+                        egui::Slider::new(&mut glow.strength, 0.0..=4.0)
+                            .suffix("?")
+                            .show_value(true),
+                    );
+                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
+                    ui.end_row();
+                });
+        });
     }
 
-    if !transform_dirty {
+    let mut blur_enabled = fx.blur.is_some();
+    let blur_toggle = ui.checkbox(&mut blur_enabled, "Blur");
+    if blur_toggle.changed() {
+        fx.blur = blur_enabled.then_some(BlurFx { radius: 4.0 });
+        fx_dirty = true;
+        wants_snapshot = true;
+    }
+    if let Some(blur) = fx.blur.as_mut() {
+        ui.indent("placement_blur", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Radius");
+                let response = ui.add(
+                    egui::DragValue::new(&mut blur.radius)
+                        .speed(0.25)
+                        .clamp_range(0.0..=256.0)
+                        .suffix(" px"),
+                );
+                note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
+            });
+        });
+    }
+
+    let mut shadow_enabled = fx.shadow.is_some();
+    let shadow_toggle = ui.checkbox(&mut shadow_enabled, "Drop shadow");
+    if shadow_toggle.changed() {
+        fx.shadow = shadow_enabled.then_some(DropShadowFx {
+            color: Rgba {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 180,
+            },
+            blur_radius: 6.0,
+            offset_x: 4.0,
+            offset_y: 4.0,
+            strength: 1.0,
+        });
+        fx_dirty = true;
+        wants_snapshot = true;
+    }
+    if let Some(shadow) = fx.shadow.as_mut() {
+        ui.indent("placement_shadow", |ui| {
+            egui::Grid::new("placement_shadow_grid")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    ui.label("Color");
+                    let mut color = rgba_to_color32(shadow.color);
+                    let response = ui.color_edit_button_srgba(&mut color);
+                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
+                    if response.changed() {
+                        shadow.color = color32_to_rgba(color);
+                    }
+                    ui.end_row();
+
+                    ui.label("Blur");
+                    let response = ui.add(
+                        egui::DragValue::new(&mut shadow.blur_radius)
+                            .speed(0.25)
+                            .clamp_range(0.0..=256.0)
+                            .suffix(" px"),
+                    );
+                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
+                    ui.end_row();
+
+                    ui.label("Offset X");
+                    let response = ui.add(egui::DragValue::new(&mut shadow.offset_x).speed(0.25));
+                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
+                    ui.end_row();
+
+                    ui.label("Offset Y");
+                    let response = ui.add(egui::DragValue::new(&mut shadow.offset_y).speed(0.25));
+                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
+                    ui.end_row();
+
+                    ui.label("Strength");
+                    let response = ui.add(
+                        egui::Slider::new(&mut shadow.strength, 0.0..=4.0)
+                            .suffix("?")
+                            .show_value(true),
+                    );
+                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
+                    ui.end_row();
+                });
+        });
+    }
+
+    ui.separator();
+    let break_apart_fx_block = app.break_apart_fx_block_reason();
+    let break_apart = ui.add_enabled(
+        app.can_break_apart_selection(),
+        egui::Button::new("Break Apart  (Ctrl+B)"),
+    );
+    let break_apart = if let Some(reason) = break_apart_fx_block {
+        break_apart.on_hover_text(reason)
+    } else {
+        break_apart
+    };
+    if break_apart.clicked() {
+        app.queue(Action::BreakApartSelection);
+    }
+    if let Some(reason) = break_apart_fx_block {
+        ui.label(
+            egui::RichText::new(reason)
+                .small()
+                .color(app.settings.theme.text_dim.to_color32()),
+        );
+    }
+
+    if !transform_dirty && !fx_dirty {
         return;
     }
     if wants_snapshot {
         app.history.snapshot(&before);
     }
-    if let Some(new_idx) = apply_placement_transform_at_frame(
+    if let Some(new_idx) = apply_placement_edit_at_frame(
         app,
         q0rg_id,
         layer_id,
         placement_idx,
         current_frame,
         transform,
+        fx,
     ) {
         app.session.selection = Selection::Placement {
             q0rg_id,
@@ -1385,13 +1646,14 @@ fn placement_properties(
     }
 }
 
-fn apply_placement_transform_at_frame(
+fn apply_placement_edit_at_frame(
     app: &mut EditorApp,
     q0rg_id: u16,
     layer_id: u16,
     placement_idx: usize,
     frame: u16,
     transform: q0s_format::v2::Transform2D,
+    fx: PlacementFx,
 ) -> Option<usize> {
     let new_idx = crate::tools::materialize_placement_keyframe_for_edit(
         &mut app.state.project,
@@ -1412,6 +1674,7 @@ fn apply_placement_transform_at_frame(
         .placements
         .get_mut(new_idx)?;
     placement.transform = transform;
+    placement.fx = fx;
     Some(new_idx)
 }
 
@@ -1469,10 +1732,12 @@ mod tests {
         let mut app = EditorApp::default();
         app.state.project.q0rgs[0].frame_count = 12;
         app.state.project.q0rgs[0].layers[0].placements = vec![q0s_format::v2::Placement {
+            instance_id: 0,
             frame: 0,
             target: q0s_format::v2::Target::Asset(77),
             transform: q0s_format::v2::Transform2D::IDENTITY,
             tween: q0s_format::v2::Tween::None,
+            fx: Default::default(),
         }];
         let changed = q0s_format::v2::Transform2D {
             tx: 42.0,
@@ -1480,7 +1745,21 @@ mod tests {
             ..q0s_format::v2::Transform2D::IDENTITY
         };
 
-        let new_idx = apply_placement_transform_at_frame(&mut app, 1, 1, 0, 5, changed)
+        let changed_fx = PlacementFx {
+            opacity: 0.6,
+            glow: Some(GlowFx {
+                color: Rgba {
+                    r: 255,
+                    g: 0,
+                    b: 0,
+                    a: 255,
+                },
+                radius: 8.0,
+                strength: 1.0,
+            }),
+            ..Default::default()
+        };
+        let new_idx = apply_placement_edit_at_frame(&mut app, 1, 1, 0, 5, changed, changed_fx)
             .expect("properties edit must create keyframe");
 
         let layer = &app.state.project.q0rgs[0].layers[0];
@@ -1492,6 +1771,8 @@ mod tests {
         );
         assert_eq!(layer.placements[1].frame, 5);
         assert_eq!(layer.placements[1].transform, changed);
+        assert_eq!(layer.placements[1].fx, changed_fx);
+        assert!(layer.placements[0].fx.is_identity());
     }
 
     fn collect_painted_text(shape: &egui::epaint::Shape, text: &mut String) {
@@ -1580,6 +1861,7 @@ mod tests {
             tool_property_kind(Tool::Rectangle),
             tool_property_kind(Tool::Bucket),
             tool_property_kind(Tool::Eyedropper),
+            tool_property_kind(Tool::Rig),
         ];
         for first in 0..kinds.len() {
             for second in (first + 1)..kinds.len() {

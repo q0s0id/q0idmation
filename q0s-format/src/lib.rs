@@ -9,6 +9,7 @@ pub mod q0s_v2;
 pub mod q0s_writer;
 pub mod q1s;
 pub mod raster;
+pub mod rig;
 pub mod transform;
 pub mod v2;
 

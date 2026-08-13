@@ -23,7 +23,7 @@ use rodio::{buffer::SamplesBuffer, OutputStream, OutputStreamHandle, Sink, Sourc
 use super::analytics::FileStats;
 use super::credits;
 use super::recent;
-use super::render::{paint_v2_frame, TextureCache};
+use super::render::TextureCache;
 use super::settings::Settings;
 use super::theme::{ColorRgb, Theme};
 use crate::{Player, PlayerFormat};
@@ -711,7 +711,7 @@ impl PlayerApp {
                             if let Some(project) = player.project_v2() {
                                 let q0rg_id = project.meta.entry_q0rg_id;
                                 let frame = player.current_frame() as u16;
-                                paint_v2_frame(
+                                crate::ui::render::paint_v2_frame_with_rig_overrides(
                                     &painter,
                                     ctx,
                                     project,
@@ -720,6 +720,7 @@ impl PlayerApp {
                                     canvas_rect,
                                     &mut self.v2_textures,
                                     self.settings.white_stage_bg,
+                                    player.rig_runtime_overrides(),
                                 );
                             }
                         }

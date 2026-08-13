@@ -17,6 +17,16 @@ fn migrate_one_scene_v1_to_v2_preserves_data() {
         v2.asset_appearances.is_empty(),
         "v1 migration must not invent vector appearance state"
     );
+    assert!(
+        v2.layer_metadata.is_empty(),
+        "v1 migration must not invent hidden or locked layer state"
+    );
+    for q0rg in &v2.q0rgs {
+        for layer in &q0rg.layers {
+            assert!(v2.layer_is_visible(q0rg.q0rg_id, layer.layer_id));
+            assert!(!v2.layer_is_locked(q0rg.q0rg_id, layer.layer_id));
+        }
+    }
 
     assert_eq!(v2.assets.len(), v1.assets.len());
     for (a, expected) in v2.assets.iter().zip(v1.assets.iter()) {
@@ -27,7 +37,7 @@ fn migrate_one_scene_v1_to_v2_preserves_data() {
                 assert_eq!(b.height, expected.height);
                 assert_eq!(b.rgba, expected.rgba);
             }
-            Asset::Vector(_) | Asset::Q0v(_) => {
+            Asset::Vector(_) | Asset::Q0v(_) | Asset::Rig(_) => {
                 panic!("v1 assets must migrate as bitmap")
             }
         }

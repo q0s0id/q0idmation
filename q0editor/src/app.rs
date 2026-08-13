@@ -6,8 +6,8 @@ use eframe::App;
 use egui::Context;
 use q0s_format::transform::Affine;
 use q0s_format::v2::{
-    Anchor, Asset, Layer, LayerKey, LayerKind, LayerMetadata, Path as VPath, Placement, Q0rg,
-    Q0vAsset, Target, Transform2D, Tween, Vec2, VectorAsset,
+    Anchor, Asset, Layer, LayerKey, LayerKind, LayerMetadata, Path as VPath, Placement, ProjectV2,
+    Q0rg, Q0vAsset, Target, Transform2D, Tween, Vec2, VectorAsset,
 };
 
 use crate::file_io;
@@ -94,6 +94,21 @@ pub struct NewProjectSpec {
     pub frame_count: u16,
 }
 
+fn project_tab_title(project_name: &str, path: Option<&std::path::Path>) -> String {
+    if let Some(file_stem) = path
+        .and_then(std::path::Path::file_stem)
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+    {
+        return file_stem.to_string();
+    }
+
+    if project_name.trim().is_empty() {
+        "untitled".to_string()
+    } else {
+        project_name.to_string()
+    }
+}
 impl Default for NewProjectSpec {
     fn default() -> Self {
         Self {
@@ -146,6 +161,8 @@ pub enum Action {
     IndentLayer(u16, u16),
     OutdentLayer(u16, u16),
     ToggleLayerFolder(u16, u16),
+    ToggleLayerVisibility(u16, u16),
+    ToggleLayerLock(u16, u16),
     DeleteLayer(u16, u16),
     AddQ0rg,
     RenameLibraryItem(LibraryItem, String),
@@ -197,7 +214,149 @@ pub enum LayerDropTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LayerTreeNode {
     layer_id: u16,
-    children: Vec<u16>,
+    children: Vec<LayerTreeNode>,
+}
+
+fn build_layer_tree(project: &ProjectV2, q0rg_id: u16, layers: &[Layer]) -> Vec<LayerTreeNode> {
+    fn build_node(
+        project: &ProjectV2,
+        q0rg_id: u16,
+        layers: &[Layer],
+        layer_id: u16,
+    ) -> LayerTreeNode {
+        let children = if project.layer_is_folder(q0rg_id, layer_id) {
+            layers
+                .iter()
+                .rev()
+                .filter(|layer| {
+                    project.layer_parent_folder(q0rg_id, layer.layer_id) == Some(layer_id)
+                })
+                .map(|layer| build_node(project, q0rg_id, layers, layer.layer_id))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        LayerTreeNode { layer_id, children }
+    }
+
+    layers
+        .iter()
+        .rev()
+        .filter(|layer| {
+            project
+                .layer_parent_folder(q0rg_id, layer.layer_id)
+                .is_none()
+        })
+        .map(|layer| build_node(project, q0rg_id, layers, layer.layer_id))
+        .collect()
+}
+
+fn take_layer_tree_node(nodes: &mut Vec<LayerTreeNode>, layer_id: u16) -> Option<LayerTreeNode> {
+    if let Some(index) = nodes.iter().position(|node| node.layer_id == layer_id) {
+        return Some(nodes.remove(index));
+    }
+    for node in nodes {
+        if let Some(found) = take_layer_tree_node(&mut node.children, layer_id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn layer_tree_contains(node: &LayerTreeNode, layer_id: u16) -> bool {
+    node.layer_id == layer_id
+        || node
+            .children
+            .iter()
+            .any(|child| layer_tree_contains(child, layer_id))
+}
+
+fn layer_tree_children_mut(
+    nodes: &mut Vec<LayerTreeNode>,
+    parent_folder_id: Option<u16>,
+) -> Option<&mut Vec<LayerTreeNode>> {
+    let Some(parent_id) = parent_folder_id else {
+        return Some(nodes);
+    };
+    for node in nodes {
+        if node.layer_id == parent_id {
+            return Some(&mut node.children);
+        }
+        if let Some(children) = layer_tree_children_mut(&mut node.children, Some(parent_id)) {
+            return Some(children);
+        }
+    }
+    None
+}
+
+fn layer_child_at_parent(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    mut layer_id: u16,
+    requested_parent: Option<u16>,
+) -> Option<u16> {
+    let mut visited = std::collections::HashSet::new();
+    loop {
+        if !visited.insert(layer_id) {
+            return None;
+        }
+        let parent = project.layer_parent_folder(q0rg_id, layer_id);
+        if parent == requested_parent {
+            return Some(layer_id);
+        }
+        let parent_id = parent?;
+        layer_id = parent_id;
+    }
+}
+
+fn move_layer_tree_sibling(nodes: &mut [LayerTreeNode], layer_id: u16, direction: i8) -> bool {
+    if let Some(index) = nodes.iter().position(|node| node.layer_id == layer_id) {
+        let target = if direction < 0 {
+            index.checked_sub(1)
+        } else {
+            (index + 1 < nodes.len()).then_some(index + 1)
+        };
+        if let Some(target) = target {
+            nodes.swap(index, target);
+            return true;
+        }
+        return false;
+    }
+    nodes
+        .iter_mut()
+        .any(|node| move_layer_tree_sibling(&mut node.children, layer_id, direction))
+}
+
+fn layer_tree_depth_within_limit(nodes: &[LayerTreeNode], depth: usize) -> bool {
+    if nodes.is_empty() {
+        return true;
+    }
+    if depth > q0s_format::v2::MAX_LAYER_FOLDER_NESTING_DEPTH {
+        return false;
+    }
+    nodes
+        .iter()
+        .all(|node| layer_tree_depth_within_limit(&node.children, depth + 1))
+}
+
+fn flatten_layer_tree_model_order(
+    nodes: &[LayerTreeNode],
+    parent_folder_id: Option<u16>,
+    model_ids: &mut Vec<u16>,
+    parent_by_child: &mut std::collections::HashMap<u16, u16>,
+) {
+    for node in nodes.iter().rev() {
+        flatten_layer_tree_model_order(
+            &node.children,
+            Some(node.layer_id),
+            model_ids,
+            parent_by_child,
+        );
+        if let Some(parent_id) = parent_folder_id {
+            parent_by_child.insert(node.layer_id, parent_id);
+        }
+        model_ids.push(node.layer_id);
+    }
 }
 
 impl Default for EditorApp {
@@ -284,11 +443,7 @@ impl EditorApp {
                 };
                 Some(ProjectTabSummary {
                     id: tab.id,
-                    title: if title.trim().is_empty() {
-                        "untitled".to_string()
-                    } else {
-                        title
-                    },
+                    title: project_tab_title(&title, path.as_deref()),
                     path,
                     dirty,
                     active: self.active_project_tab == Some(tab.id),
@@ -725,8 +880,8 @@ impl EditorApp {
             Action::Undo => {
                 let current = self.state.project.clone();
                 if let Some(prior) = self.history.pop_undo(&current) {
+                    self.session.reconcile_after_history(&current, &prior);
                     self.state.project = prior;
-                    self.session.reconcile_with(&self.state.project);
                     self.textures.invalidate();
                     self.state.dirty = true;
                     self.session.status = "undo".to_string();
@@ -737,8 +892,8 @@ impl EditorApp {
             Action::Redo => {
                 let current = self.state.project.clone();
                 if let Some(next) = self.history.pop_redo(&current) {
+                    self.session.reconcile_after_history(&current, &next);
                     self.state.project = next;
-                    self.session.reconcile_with(&self.state.project);
                     self.textures.invalidate();
                     self.state.dirty = true;
                     self.session.status = "redo".to_string();
@@ -819,7 +974,7 @@ impl EditorApp {
                                 let (_, end) = self
                                     .layer_row_block_range(q0rg_id, selected_id)
                                     .unwrap_or((index, index + 1));
-                                (end, None)
+                                (end, metadata.parent_folder_id)
                             } else {
                                 (index + 1, metadata.parent_folder_id)
                             }
@@ -861,6 +1016,8 @@ impl EditorApp {
                             kind: LayerKind::Normal,
                             parent_folder_id: Some(parent_folder_id),
                             collapsed: false,
+                            hidden: false,
+                            locked: false,
                         },
                     );
                 }
@@ -871,7 +1028,14 @@ impl EditorApp {
             Action::AddLayerFolder => {
                 let q0rg_id = self.session.current_q0rg_id;
                 let selected_id = self.session.current_layer_id;
-                let insert_at = {
+                if self.state.project.layer_is_folder(q0rg_id, selected_id)
+                    && self.state.project.layer_folder_depth(q0rg_id, selected_id)
+                        >= q0s_format::v2::MAX_LAYER_FOLDER_NESTING_DEPTH
+                {
+                    self.session.status = "maximum layer folder nesting depth reached".to_string();
+                    return;
+                }
+                let (insert_at, parent_folder_id) = {
                     let Some(q0rg) = self
                         .state
                         .project
@@ -888,12 +1052,13 @@ impl EditorApp {
                     {
                         Some(index) => {
                             let metadata = self.state.project.layer_metadata(q0rg_id, selected_id);
-                            let block_id = metadata.parent_folder_id.unwrap_or(selected_id);
-                            self.layer_row_block_range(q0rg_id, block_id)
-                                .map(|(_, end)| end)
-                                .unwrap_or(index + 1)
+                            if metadata.kind == LayerKind::Folder {
+                                (index, Some(selected_id))
+                            } else {
+                                (index + 1, metadata.parent_folder_id)
+                            }
                         }
-                        None => q0rg.layers.len(),
+                        None => (q0rg.layers.len(), None),
                     }
                 };
                 self.history.snapshot(&self.state.project);
@@ -927,8 +1092,10 @@ impl EditorApp {
                     LayerKey::new(q0rg_id, next_id),
                     LayerMetadata {
                         kind: LayerKind::Folder,
-                        parent_folder_id: None,
+                        parent_folder_id,
                         collapsed: false,
+                        hidden: false,
+                        locked: false,
                     },
                 );
                 self.session.current_layer_id = next_id;
@@ -982,6 +1149,16 @@ impl EditorApp {
                 self.drop_layer(q0rg_id, layer_id, target);
             }
             Action::MoveTimelineFrames(selection, target_layer_id, target_frame) => {
+                if self.timeline_selection_touches_locked_layer(selection)
+                    || self
+                        .state
+                        .project
+                        .layer_is_locked(self.session.current_q0rg_id, target_layer_id)
+                {
+                    self.session.status =
+                        "locked layers cannot be moved or overwritten".to_string();
+                    return;
+                }
                 self.history.snapshot(&self.state.project);
                 if let Some(moved) = crate::timeline_edit::move_frames(
                     &mut self.state.project,
@@ -1026,6 +1203,64 @@ impl EditorApp {
                     "folder expanded"
                 } else {
                     "folder collapsed"
+                }
+                .to_string();
+            }
+            Action::ToggleLayerVisibility(q0rg_id, layer_id) => {
+                let exists = self
+                    .state
+                    .project
+                    .q0rgs
+                    .iter()
+                    .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+                    .is_some_and(|q0rg| q0rg.layers.iter().any(|layer| layer.layer_id == layer_id));
+                if !exists {
+                    return;
+                }
+                let metadata = self.state.project.layer_metadata(q0rg_id, layer_id);
+                self.history.snapshot(&self.state.project);
+                self.state.project.layer_metadata.insert(
+                    LayerKey::new(q0rg_id, layer_id),
+                    LayerMetadata {
+                        hidden: !metadata.hidden,
+                        ..metadata
+                    },
+                );
+                self.session.selection = Selection::None;
+                self.state.dirty = true;
+                self.session.status = if metadata.hidden {
+                    "layer shown"
+                } else {
+                    "layer hidden"
+                }
+                .to_string();
+            }
+            Action::ToggleLayerLock(q0rg_id, layer_id) => {
+                let exists = self
+                    .state
+                    .project
+                    .q0rgs
+                    .iter()
+                    .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+                    .is_some_and(|q0rg| q0rg.layers.iter().any(|layer| layer.layer_id == layer_id));
+                if !exists {
+                    return;
+                }
+                let metadata = self.state.project.layer_metadata(q0rg_id, layer_id);
+                self.history.snapshot(&self.state.project);
+                self.state.project.layer_metadata.insert(
+                    LayerKey::new(q0rg_id, layer_id),
+                    LayerMetadata {
+                        locked: !metadata.locked,
+                        ..metadata
+                    },
+                );
+                self.session.selection = Selection::None;
+                self.state.dirty = true;
+                self.session.status = if metadata.locked {
+                    "layer unlocked"
+                } else {
+                    "layer locked"
                 }
                 .to_string();
             }
@@ -1304,6 +1539,10 @@ impl EditorApp {
                     return;
                 }
                 if let Some(selection) = self.session.timeline_selection {
+                    if self.timeline_selection_touches_locked_layer(selection) {
+                        self.session.status = "locked timeline frames cannot be cut".to_string();
+                        return;
+                    }
                     let Some(frames) = crate::timeline_edit::capture_frames(
                         &self.state.project,
                         self.session.current_q0rg_id,
@@ -1369,6 +1608,12 @@ impl EditorApp {
                 };
                 match payload.timeline.clone() {
                     Some(TimelineClipboard::Frames(frames)) => {
+                        if self.current_layer_is_locked() || !self.current_layer_is_visible() {
+                            self.session.status =
+                                "show and unlock the target layer before pasting frames"
+                                    .to_string();
+                            return;
+                        }
                         if self.current_layer_is_folder() {
                             self.session.status = "paste frames onto a drawable layer".to_string();
                             return;
@@ -1414,6 +1659,12 @@ impl EditorApp {
                         }
                     }
                     None => {
+                        if self.current_layer_is_locked() || !self.current_layer_is_visible() {
+                            self.session.status =
+                                "show and unlock the target layer before pasting artwork"
+                                    .to_string();
+                            return;
+                        }
                         if self.session.pending_timeline_frame.is_some() {
                             self.session.status =
                                 "create the future frame with F5, F6, or F7 before pasting artwork"
@@ -1454,6 +1705,11 @@ impl EditorApp {
                     return;
                 }
                 if let Some(selection) = self.session.timeline_selection {
+                    if self.timeline_selection_touches_locked_layer(selection) {
+                        self.session.status =
+                            "locked timeline frames cannot be duplicated".to_string();
+                        return;
+                    }
                     let before = self.state.project.clone();
                     if let Some(duplicated) = crate::timeline_edit::duplicate_frames(
                         &mut self.state.project,
@@ -1560,6 +1816,10 @@ impl EditorApp {
     }
 
     fn reorder_selection(&mut self, to_front: bool) {
+        if self.selection_touches_locked_layer() {
+            self.session.status = "layer is locked".to_string();
+            return;
+        }
         if let Selection::Placement {
             q0rg_id,
             layer_id,
@@ -1601,6 +1861,96 @@ impl EditorApp {
         self.state
             .project
             .layer_is_folder(self.session.current_q0rg_id, self.session.current_layer_id)
+    }
+
+    fn current_layer_is_locked(&self) -> bool {
+        self.state
+            .project
+            .layer_is_locked(self.session.current_q0rg_id, self.session.current_layer_id)
+    }
+
+    fn current_layer_is_visible(&self) -> bool {
+        self.state
+            .project
+            .layer_is_visible(self.session.current_q0rg_id, self.session.current_layer_id)
+    }
+
+    fn timeline_selection_touches_locked_layer(&self, selection: TimelineSelection) -> bool {
+        let q0rg_id = self.session.current_q0rg_id;
+        let Some(q0rg) = self
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q| q.q0rg_id == q0rg_id)
+        else {
+            return false;
+        };
+        let Some(anchor) = q0rg
+            .layers
+            .iter()
+            .position(|layer| layer.layer_id == selection.anchor_layer_id)
+        else {
+            return false;
+        };
+        let Some(focus) = q0rg
+            .layers
+            .iter()
+            .position(|layer| layer.layer_id == selection.focus_layer_id)
+        else {
+            return false;
+        };
+        let first = anchor.min(focus);
+        let last = anchor.max(focus);
+        q0rg.layers[first..=last].iter().any(|layer| {
+            !self.state.project.layer_is_folder(q0rg_id, layer.layer_id)
+                && self.state.project.layer_is_locked(q0rg_id, layer.layer_id)
+        })
+    }
+
+    fn selection_touches_locked_layer(&self) -> bool {
+        let locked =
+            |q0rg_id: u16, layer_id: u16| self.state.project.layer_is_locked(q0rg_id, layer_id);
+        match &self.session.selection {
+            Selection::Placement {
+                q0rg_id, layer_id, ..
+            }
+            | Selection::Path {
+                q0rg_id, layer_id, ..
+            } => locked(*q0rg_id, *layer_id),
+            Selection::Paths(paths) => paths.iter().any(|path| locked(path.q0rg_id, path.layer_id)),
+            Selection::PathPoints { path, .. } => locked(path.q0rg_id, path.layer_id),
+            Selection::RawArea {
+                placements,
+                objects,
+                ..
+            } => placements
+                .iter()
+                .chain(objects)
+                .any(|item| locked(item.q0rg_id, item.layer_id)),
+            Selection::Mixed { paths, objects } => paths
+                .iter()
+                .map(|path| (path.q0rg_id, path.layer_id))
+                .chain(objects.iter().map(|item| (item.q0rg_id, item.layer_id)))
+                .any(|(q0rg_id, layer_id)| locked(q0rg_id, layer_id)),
+            Selection::Multi(items) => items.iter().any(|item| locked(item.q0rg_id, item.layer_id)),
+            Selection::None | Selection::Asset(_) | Selection::Q0rg(_) => false,
+        }
+    }
+
+    fn current_q0rg_has_locked_artwork_layer(&self) -> bool {
+        let q0rg_id = self.session.current_q0rg_id;
+        self.state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+            .is_some_and(|q0rg| {
+                q0rg.layers.iter().any(|layer| {
+                    !self.state.project.layer_is_folder(q0rg_id, layer.layer_id)
+                        && self.state.project.layer_is_locked(q0rg_id, layer.layer_id)
+                })
+            })
     }
 
     fn request_library_item_delete(&mut self, item: LibraryItem) {
@@ -1776,10 +2126,8 @@ impl EditorApp {
         .to_string();
     }
 
-    /// Return the model-order range occupied by a timeline row. Ordinary
-    /// layers occupy one slot. Folder rows own their contiguous children,
-    /// which are stored immediately before the folder so reverse UI order
-    /// shows the folder first while render order stays back-to-front.
+    /// Return the model-order range occupied by a timeline row. Folder rows own
+    /// their complete descendant subtree, stored contiguously before the folder.
     fn layer_row_block_range(&self, q0rg_id: u16, layer_id: u16) -> Option<(usize, usize)> {
         let q0rg = self
             .state
@@ -1796,34 +2144,18 @@ impl EditorApp {
         }
         let mut start = index;
         while start > 0
-            && self
-                .state
-                .project
-                .layer_parent_folder(q0rg_id, q0rg.layers[start - 1].layer_id)
-                == Some(layer_id)
+            && self.state.project.layer_is_descendant_of(
+                q0rg_id,
+                q0rg.layers[start - 1].layer_id,
+                layer_id,
+            )
         {
             start -= 1;
         }
         Some((start, index + 1))
     }
 
-    fn top_level_block_range_at_index(&self, q0rg_id: u16, index: usize) -> Option<(usize, usize)> {
-        let q0rg = self
-            .state
-            .project
-            .q0rgs
-            .iter()
-            .find(|q0rg| q0rg.q0rg_id == q0rg_id)?;
-        let layer = q0rg.layers.get(index)?;
-        let metadata = self.state.project.layer_metadata(q0rg_id, layer.layer_id);
-        let row_id = metadata.parent_folder_id.unwrap_or(layer.layer_id);
-        self.layer_row_block_range(q0rg_id, row_id)
-    }
-
-    fn move_layer_block(&mut self, q0rg_id: u16, layer_id: u16, direction: i8) {
-        if direction == 0 {
-            return;
-        }
+    fn apply_layer_tree(&mut self, q0rg_id: u16, nodes: &[LayerTreeNode]) -> bool {
         let Some(q0rg_index) = self
             .state
             .project
@@ -1831,87 +2163,81 @@ impl EditorApp {
             .iter()
             .position(|q0rg| q0rg.q0rg_id == q0rg_id)
         else {
-            return;
+            return false;
         };
-        let Some(index) = self.state.project.q0rgs[q0rg_index]
+        let current_layers = self.state.project.q0rgs[q0rg_index].layers.clone();
+        let mut model_ids = Vec::with_capacity(current_layers.len());
+        let mut parent_by_child = std::collections::HashMap::new();
+        flatten_layer_tree_model_order(nodes, None, &mut model_ids, &mut parent_by_child);
+        if model_ids.len() != current_layers.len() {
+            return false;
+        }
+
+        let current_ids = current_layers
+            .iter()
+            .map(|layer| layer.layer_id)
+            .collect::<Vec<_>>();
+        let parent_changed = current_layers.iter().any(|layer| {
+            self.state
+                .project
+                .layer_parent_folder(q0rg_id, layer.layer_id)
+                != parent_by_child.get(&layer.layer_id).copied()
+        });
+        if current_ids == model_ids && !parent_changed {
+            return false;
+        }
+
+        let mut layers_by_id = current_layers
+            .into_iter()
+            .map(|layer| (layer.layer_id, layer))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut reordered = Vec::with_capacity(model_ids.len());
+        for id in model_ids {
+            let Some(layer) = layers_by_id.remove(&id) else {
+                return false;
+            };
+            reordered.push(layer);
+        }
+        self.state.project.q0rgs[q0rg_index].layers = reordered;
+
+        let layer_ids = self.state.project.q0rgs[q0rg_index]
             .layers
             .iter()
-            .position(|layer| layer.layer_id == layer_id)
+            .map(|layer| layer.layer_id)
+            .collect::<Vec<_>>();
+        for layer_id in layer_ids {
+            let key = LayerKey::new(q0rg_id, layer_id);
+            let mut metadata = self.state.project.layer_metadata(q0rg_id, layer_id);
+            metadata.parent_folder_id = parent_by_child.get(&layer_id).copied();
+            if metadata == LayerMetadata::default() {
+                self.state.project.layer_metadata.remove(&key);
+            } else {
+                self.state.project.layer_metadata.insert(key, metadata);
+            }
+        }
+        true
+    }
+
+    fn move_layer_block(&mut self, q0rg_id: u16, layer_id: u16, direction: i8) {
+        if direction == 0 {
+            return;
+        }
+        let Some(q0rg) = self
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == q0rg_id)
         else {
             return;
         };
-        let metadata = self.state.project.layer_metadata(q0rg_id, layer_id);
-
-        if let Some(parent_id) = metadata.parent_folder_id {
-            let Some(folder_index) = self.state.project.q0rgs[q0rg_index]
-                .layers
-                .iter()
-                .position(|layer| layer.layer_id == parent_id)
-            else {
-                return;
-            };
-            let mut first_child = folder_index;
-            while first_child > 0
-                && self.state.project.layer_parent_folder(
-                    q0rg_id,
-                    self.state.project.q0rgs[q0rg_index].layers[first_child - 1].layer_id,
-                ) == Some(parent_id)
-            {
-                first_child -= 1;
-            }
-            let swap_with = if direction < 0 {
-                if index + 1 >= folder_index {
-                    return;
-                }
-                index + 1
-            } else {
-                if index <= first_child {
-                    return;
-                }
-                index - 1
-            };
-            self.history.snapshot(&self.state.project);
-            self.state.project.q0rgs[q0rg_index]
-                .layers
-                .swap(index, swap_with);
-        } else {
-            let Some((start, end)) = self.layer_row_block_range(q0rg_id, layer_id) else {
-                return;
-            };
-            let len = self.state.project.q0rgs[q0rg_index].layers.len();
-            if direction < 0 {
-                if end >= len {
-                    return;
-                }
-                let Some((next_start, next_end)) =
-                    self.top_level_block_range_at_index(q0rg_id, end)
-                else {
-                    return;
-                };
-                if next_start != end {
-                    return;
-                }
-                self.history.snapshot(&self.state.project);
-                let current_len = end - start;
-                self.state.project.q0rgs[q0rg_index].layers[start..next_end]
-                    .rotate_left(current_len);
-            } else {
-                if start == 0 {
-                    return;
-                }
-                let Some((previous_start, previous_end)) =
-                    self.top_level_block_range_at_index(q0rg_id, start - 1)
-                else {
-                    return;
-                };
-                if previous_end != start {
-                    return;
-                }
-                self.history.snapshot(&self.state.project);
-                let current_len = end - start;
-                self.state.project.q0rgs[q0rg_index].layers[previous_start..end]
-                    .rotate_right(current_len);
-            }
+        let mut nodes = build_layer_tree(&self.state.project, q0rg_id, &q0rg.layers);
+        if !move_layer_tree_sibling(&mut nodes, layer_id, direction) {
+            return;
+        }
+        self.history.snapshot(&self.state.project);
+        if !self.apply_layer_tree(q0rg_id, &nodes) {
+            return;
         }
         self.state.dirty = true;
         self.session.status = if direction < 0 {
@@ -1923,89 +2249,33 @@ impl EditorApp {
     }
 
     fn drop_layer(&mut self, q0rg_id: u16, layer_id: u16, target: LayerDropTarget) {
-        let Some(q0rg_index) = self
+        let Some(q0rg) = self
             .state
             .project
             .q0rgs
             .iter()
-            .position(|q0rg| q0rg.q0rg_id == q0rg_id)
+            .find(|q0rg| q0rg.q0rg_id == q0rg_id)
         else {
             return;
         };
-        let current_layers = self.state.project.q0rgs[q0rg_index].layers.clone();
-        if !current_layers
-            .iter()
-            .any(|layer| layer.layer_id == layer_id)
-        {
+        if !q0rg.layers.iter().any(|layer| layer.layer_id == layer_id) {
             return;
         }
-        let dragged_metadata = self.state.project.layer_metadata(q0rg_id, layer_id);
-        let dragged_is_folder = dragged_metadata.kind == LayerKind::Folder;
-
-        // Build the front-to-back tree used by the timeline. The file model is
-        // stored back-to-front, with each folder's children immediately before
-        // the folder row, so rebuilding through this tree keeps both contracts
-        // intact for arbitrary drag-and-drop moves.
-        let mut nodes: Vec<LayerTreeNode> = current_layers
-            .iter()
-            .rev()
-            .filter(|layer| {
-                self.state
-                    .project
-                    .layer_parent_folder(q0rg_id, layer.layer_id)
-                    .is_none()
-            })
-            .map(|layer| LayerTreeNode {
-                layer_id: layer.layer_id,
-                children: if self.state.project.layer_is_folder(q0rg_id, layer.layer_id) {
-                    current_layers
-                        .iter()
-                        .rev()
-                        .filter(|child| {
-                            self.state
-                                .project
-                                .layer_parent_folder(q0rg_id, child.layer_id)
-                                == Some(layer.layer_id)
-                        })
-                        .map(|child| child.layer_id)
-                        .collect()
-                } else {
-                    Vec::new()
-                },
-            })
-            .collect();
-
-        let mut dragged_node =
-            if let Some(index) = nodes.iter().position(|node| node.layer_id == layer_id) {
-                nodes.remove(index)
-            } else {
-                let mut removed = false;
-                for node in &mut nodes {
-                    if let Some(index) = node.children.iter().position(|child| *child == layer_id) {
-                        node.children.remove(index);
-                        removed = true;
-                        break;
-                    }
-                }
-                if !removed {
-                    return;
-                }
-                LayerTreeNode {
-                    layer_id,
-                    children: Vec::new(),
-                }
-            };
+        let mut nodes = build_layer_tree(&self.state.project, q0rg_id, &q0rg.layers);
+        let Some(dragged_node) = take_layer_tree_node(&mut nodes, layer_id) else {
+            return;
+        };
 
         let inserted = match target {
             LayerDropTarget::IntoFolder(folder_id) => {
-                if dragged_is_folder || folder_id == layer_id {
-                    false
-                } else if let Some(folder) = nodes
-                    .iter_mut()
-                    .find(|node| node.layer_id == folder_id)
-                    .filter(|node| self.state.project.layer_is_folder(q0rg_id, node.layer_id))
+                if folder_id == layer_id
+                    || layer_tree_contains(&dragged_node, folder_id)
+                    || !self.state.project.layer_is_folder(q0rg_id, folder_id)
                 {
-                    folder.children.insert(0, layer_id);
+                    false
+                } else if let Some(children) = layer_tree_children_mut(&mut nodes, Some(folder_id))
+                {
+                    children.insert(0, dragged_node);
                     true
                 } else {
                     false
@@ -2019,49 +2289,31 @@ impl EditorApp {
                 layer_id: target_id,
                 parent_folder_id,
             } => {
-                let before = matches!(
-                    target,
-                    LayerDropTarget::Before {
-                        layer_id: _,
-                        parent_folder_id: _
-                    }
-                );
-                if let Some(folder_id) = parent_folder_id {
-                    if dragged_is_folder || folder_id == layer_id {
-                        false
-                    } else if let Some(folder) =
-                        nodes.iter_mut().find(|node| node.layer_id == folder_id)
-                    {
-                        if let Some(target_index) =
-                            folder.children.iter().position(|child| *child == target_id)
+                let Some(container_target_id) = layer_child_at_parent(
+                    &self.state.project,
+                    q0rg_id,
+                    target_id,
+                    parent_folder_id,
+                ) else {
+                    return;
+                };
+                if container_target_id == layer_id
+                    || layer_tree_contains(&dragged_node, container_target_id)
+                {
+                    false
+                } else {
+                    let before = matches!(target, LayerDropTarget::Before { .. });
+                    if let Some(container) = layer_tree_children_mut(&mut nodes, parent_folder_id) {
+                        if let Some(target_index) = container
+                            .iter()
+                            .position(|node| node.layer_id == container_target_id)
                         {
                             let insert_at = target_index + usize::from(!before);
-                            folder.children.insert(insert_at, layer_id);
+                            container.insert(insert_at, dragged_node);
                             true
                         } else {
                             false
                         }
-                    } else {
-                        false
-                    }
-                } else {
-                    let target_block_id = self
-                        .state
-                        .project
-                        .layer_parent_folder(q0rg_id, target_id)
-                        .unwrap_or(target_id);
-                    if target_block_id == layer_id {
-                        false
-                    } else if let Some(target_index) = nodes
-                        .iter()
-                        .position(|node| node.layer_id == target_block_id)
-                    {
-                        let insert_at = target_index + usize::from(!before);
-                        if !dragged_is_folder {
-                            dragged_node.children.clear();
-                        }
-                        nodes.insert(insert_at, dragged_node);
-                        true
                     } else {
                         false
                     }
@@ -2071,60 +2323,14 @@ impl EditorApp {
         if !inserted {
             return;
         }
-
-        let mut parent_by_child = std::collections::HashMap::new();
-        let mut model_ids = Vec::with_capacity(current_layers.len());
-        for node in nodes.iter().rev() {
-            if self.state.project.layer_is_folder(q0rg_id, node.layer_id) {
-                for child_id in node.children.iter().rev() {
-                    parent_by_child.insert(*child_id, node.layer_id);
-                    model_ids.push(*child_id);
-                }
-            }
-            model_ids.push(node.layer_id);
-        }
-        if model_ids.len() != current_layers.len() {
-            return;
-        }
-
-        let current_ids: Vec<u16> = current_layers.iter().map(|layer| layer.layer_id).collect();
-        let parent_changed = current_layers.iter().any(|layer| {
-            self.state
-                .project
-                .layer_parent_folder(q0rg_id, layer.layer_id)
-                != parent_by_child.get(&layer.layer_id).copied()
-        });
-        if current_ids == model_ids && !parent_changed {
+        if !layer_tree_depth_within_limit(&nodes, 0) {
+            self.session.status = "maximum layer folder nesting depth reached".to_string();
             return;
         }
 
         self.history.snapshot(&self.state.project);
-        let mut layers_by_id: std::collections::HashMap<u16, Layer> = current_layers
-            .into_iter()
-            .map(|layer| (layer.layer_id, layer))
-            .collect();
-        let mut reordered = Vec::with_capacity(model_ids.len());
-        for id in model_ids {
-            let Some(layer) = layers_by_id.remove(&id) else {
-                return;
-            };
-            reordered.push(layer);
-        }
-        self.state.project.q0rgs[q0rg_index].layers = reordered;
-
-        self.state
-            .project
-            .layer_metadata
-            .retain(|key, metadata| key.q0rg_id != q0rg_id || metadata.kind == LayerKind::Folder);
-        for (child_id, folder_id) in parent_by_child {
-            self.state.project.layer_metadata.insert(
-                LayerKey::new(q0rg_id, child_id),
-                LayerMetadata {
-                    kind: LayerKind::Normal,
-                    parent_folder_id: Some(folder_id),
-                    collapsed: false,
-                },
-            );
+        if !self.apply_layer_tree(q0rg_id, &nodes) {
+            return;
         }
         self.session.current_layer_id = layer_id;
         self.session.timeline_selection = None;
@@ -2133,91 +2339,65 @@ impl EditorApp {
     }
 
     fn indent_layer(&mut self, q0rg_id: u16, layer_id: u16) {
-        let metadata = self.state.project.layer_metadata(q0rg_id, layer_id);
-        if metadata.kind == LayerKind::Folder || metadata.parent_folder_id.is_some() {
-            return;
-        }
-        let Some(q0rg_index) = self
+        let parent = self.state.project.layer_parent_folder(q0rg_id, layer_id);
+        let Some(q0rg) = self
             .state
             .project
             .q0rgs
             .iter()
-            .position(|q0rg| q0rg.q0rg_id == q0rg_id)
+            .find(|q0rg| q0rg.q0rg_id == q0rg_id)
         else {
             return;
         };
-        let Some(index) = self.state.project.q0rgs[q0rg_index]
+        let siblings = q0rg
             .layers
             .iter()
-            .position(|layer| layer.layer_id == layer_id)
-        else {
+            .rev()
+            .filter(|layer| {
+                self.state
+                    .project
+                    .layer_parent_folder(q0rg_id, layer.layer_id)
+                    == parent
+            })
+            .map(|layer| layer.layer_id)
+            .collect::<Vec<_>>();
+        let Some(index) = siblings.iter().position(|id| *id == layer_id) else {
             return;
         };
-        if index + 1 >= self.state.project.q0rgs[q0rg_index].layers.len() {
-            self.session.status = "put a folder directly above the layer first".to_string();
-            return;
-        }
-        let Some((next_start, next_end)) = self.top_level_block_range_at_index(q0rg_id, index + 1)
+        let Some(folder_id) = index
+            .checked_sub(1)
+            .and_then(|index| siblings.get(index))
+            .copied()
         else {
+            self.session.status = "put a folder directly above the layer first".to_string();
             return;
         };
-        if next_start != index + 1 {
-            self.session.status = "put a folder directly above the layer first".to_string();
-            return;
-        }
-        let folder_id = self.state.project.q0rgs[q0rg_index].layers[next_end - 1].layer_id;
         if !self.state.project.layer_is_folder(q0rg_id, folder_id) {
             self.session.status = "put a folder directly above the layer first".to_string();
             return;
         }
-        self.history.snapshot(&self.state.project);
-        self.state.project.layer_metadata.insert(
-            LayerKey::new(q0rg_id, layer_id),
-            LayerMetadata {
-                kind: LayerKind::Normal,
-                parent_folder_id: Some(folder_id),
-                collapsed: false,
-            },
-        );
-        self.state.dirty = true;
-        self.session.status = "layer moved into folder".to_string();
+        self.drop_layer(q0rg_id, layer_id, LayerDropTarget::IntoFolder(folder_id));
+        if self.state.project.layer_parent_folder(q0rg_id, layer_id) == Some(folder_id) {
+            self.session.status = "layer moved into folder".to_string();
+        }
     }
 
     fn outdent_layer(&mut self, q0rg_id: u16, layer_id: u16) {
         let Some(folder_id) = self.state.project.layer_parent_folder(q0rg_id, layer_id) else {
             return;
         };
-        let Some(q0rg_index) = self
-            .state
-            .project
-            .q0rgs
-            .iter()
-            .position(|q0rg| q0rg.q0rg_id == q0rg_id)
-        else {
-            return;
-        };
-        let Some(index) = self.state.project.q0rgs[q0rg_index]
-            .layers
-            .iter()
-            .position(|layer| layer.layer_id == layer_id)
-        else {
-            return;
-        };
-        let Some((block_start, _)) = self.layer_row_block_range(q0rg_id, folder_id) else {
-            return;
-        };
-        self.history.snapshot(&self.state.project);
-        let layer = self.state.project.q0rgs[q0rg_index].layers.remove(index);
-        let insert_at = block_start.min(self.state.project.q0rgs[q0rg_index].layers.len());
-        self.state.project.q0rgs[q0rg_index]
-            .layers
-            .insert(insert_at, layer);
-        self.state
-            .project
-            .layer_metadata
-            .remove(&LayerKey::new(q0rg_id, layer_id));
-        self.state.dirty = true;
-        self.session.status = "layer moved out of folder".to_string();
+        let grandparent = self.state.project.layer_parent_folder(q0rg_id, folder_id);
+        self.drop_layer(
+            q0rg_id,
+            layer_id,
+            LayerDropTarget::After {
+                layer_id: folder_id,
+                parent_folder_id: grandparent,
+            },
+        );
+        if self.state.project.layer_parent_folder(q0rg_id, layer_id) == grandparent {
+            self.session.status = "layer moved out of folder".to_string();
+        }
     }
 
     fn asset_reference_count(&self, asset_id: u16) -> usize {
@@ -2325,6 +2505,10 @@ impl EditorApp {
     /// before; the new outer placement uses IDENTITY transform and points
     /// at the new q0rg, so dragging it moves the whole group as one unit.
     fn convert_selection_to_q0rg(&mut self) {
+        if self.selection_touches_locked_layer() {
+            self.session.status = "locked artwork cannot be converted".to_string();
+            return;
+        }
         if let Selection::RawArea {
             placements,
             objects,
@@ -2399,10 +2583,12 @@ impl EditorApp {
             {
                 outer_idx = Some(layer.placements.len());
                 layer.placements.push(Placement {
+                    instance_id: 0,
                     frame,
                     target: Target::Q0rg(new_q0rg_id),
                     transform: Transform2D::IDENTITY,
                     tween: Tween::None,
+                    fx: Default::default(),
                 });
             }
             if let Some(placement_idx) = outer_idx {
@@ -2541,10 +2727,12 @@ impl EditorApp {
                         // Pinned to frame 0 inside the new q0rg Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р’В Р Р†Р вЂљР’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р РЋРІвЂћСћР В Р’В Р В Р вЂ№Р В Р вЂ Р Р†Р вЂљРЎвЂєР РЋРЎвЂєР В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†РІР‚С›РЎС›Р В Р’В Р вЂ™Р’В Р В Р’В Р В РІР‚в„–Р В Р’В Р В Р вЂ№Р В Р Р‹Р Р†РІР‚С›РЎС› single
                         // keyframe, no implicit time-shift. Rotation/scale/
                         // skew stay so the rendering is unchanged.
+                        instance_id: 0,
                         frame: 0,
                         target: p.target,
                         transform: p.transform,
                         tween: Tween::None,
+                        fx: Default::default(),
                     })
                     .collect();
                 if !mine.is_empty() {
@@ -2634,10 +2822,12 @@ impl EditorApp {
             if let Some(layer) = layer {
                 let idx = layer.placements.len();
                 layer.placements.push(Placement {
+                    instance_id: 0,
                     frame,
                     target: Target::Q0rg(new_q0rg_id),
                     transform: Transform2D::IDENTITY,
                     tween: Tween::None,
+                    fx: Default::default(),
                 });
                 new_outer_idx = Some(idx);
                 self.session.current_layer_id = layer.layer_id;
@@ -2666,6 +2856,10 @@ impl EditorApp {
     /// A new asset is created (the original is left intact in case other
     /// placements share it) and the placement is repointed at the new asset.
     fn convert_stroke_to_fill(&mut self) {
+        if self.selection_touches_locked_layer() {
+            self.session.status = "layer is locked".to_string();
+            return;
+        }
         let Selection::Placement {
             q0rg_id,
             layer_id,
@@ -2962,7 +3156,54 @@ impl EditorApp {
             media.spec.fps
         );
     }
+    pub(crate) fn break_apart_fx_block_reason(&self) -> Option<&'static str> {
+        let Selection::Placement {
+            q0rg_id,
+            layer_id,
+            placement_idx,
+        } = self.session.selection
+        else {
+            return None;
+        };
+        let layer = self
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == q0rg_id)?
+            .layers
+            .iter()
+            .find(|layer| layer.layer_id == layer_id)?;
+        let placement = layer.placements.get(placement_idx)?;
+        let active_fx =
+            q0s_format::raster::active_placement_states_at(layer, self.session.current_frame)
+                .into_iter()
+                .find(|active| active.index == placement_idx)
+                .map(|active| active.fx)
+                .unwrap_or(placement.fx);
+        if !active_fx.is_identity() {
+            return Some(
+                "Reset instance FX before Break Apart: group effects cannot be flattened losslessly.",
+            );
+        }
+        if let Target::Q0rg(child_id) = placement.target {
+            if q0s_format::raster::q0rg_frame_has_placement_fx(
+                &self.state.project,
+                child_id,
+                self.session.current_frame,
+            ) {
+                return Some(
+                    "Break Apart is disabled while the symbol contains active FX, so nested effects are never silently destroyed.",
+                );
+            }
+        }
+        None
+    }
+
     pub fn can_break_apart_selection(&self) -> bool {
+        if self.break_apart_fx_block_reason().is_some() {
+            return false;
+        }
         let Selection::Placement {
             q0rg_id,
             layer_id,
@@ -2995,6 +3236,14 @@ impl EditorApp {
     }
 
     fn break_apart_selection(&mut self) {
+        if self.selection_touches_locked_layer() {
+            self.session.status = "layer is locked".to_string();
+            return;
+        }
+        if let Some(reason) = self.break_apart_fx_block_reason() {
+            self.session.status = reason.to_string();
+            return;
+        }
         let Selection::Placement {
             q0rg_id,
             layer_id,
@@ -3076,11 +3325,11 @@ impl EditorApp {
             return;
         };
         let new_asset_id = crate::tools::next_asset_id_pub(&self.state.project);
-        let baked = bake_vector_asset(
-            &source,
-            new_asset_id,
-            Affine::from_transform(active_transform),
-        );
+        let bake_transform = Affine::from_transform(active_transform);
+        #[cfg(feature = "appearance-mask-eraser")]
+        let baked_appearance =
+            baked_vector_appearance(&self.state.project, &source, bake_transform);
+        let baked = bake_vector_asset(&source, new_asset_id, bake_transform);
         let frame = self.session.current_frame;
 
         self.history.snapshot(&self.state.project);
@@ -3094,6 +3343,13 @@ impl EditorApp {
             return;
         };
         self.state.project.assets.push(Asset::Vector(baked));
+        #[cfg(feature = "appearance-mask-eraser")]
+        if let Some(appearance) = baked_appearance {
+            self.state
+                .project
+                .asset_appearances
+                .insert(new_asset_id, appearance);
+        }
         let Some(placement) = self
             .state
             .project
@@ -3147,6 +3403,8 @@ impl EditorApp {
         let outer = Affine::from_transform(outer_transform);
         let mut next_asset_id = crate::tools::next_asset_id_pub(&self.state.project);
         let mut pending_assets = Vec::new();
+        #[cfg(feature = "appearance-mask-eraser")]
+        let mut pending_appearances = Vec::new();
         let mut pieces: Vec<BreakApartPiece> = Vec::new();
 
         for child_layer in &child.layers {
@@ -3171,15 +3429,23 @@ impl EditorApp {
                         };
                         match asset {
                             Asset::Vector(vector) => {
+                                #[cfg(feature = "appearance-mask-eraser")]
+                                if let Some(appearance) =
+                                    baked_vector_appearance(&self.state.project, &vector, composed)
+                                {
+                                    pending_appearances.push((next_asset_id, appearance));
+                                }
                                 let baked = bake_vector_asset(&vector, next_asset_id, composed);
                                 let path_count = baked.paths.len();
                                 pending_assets.push(Asset::Vector(baked));
                                 pieces.push(BreakApartPiece {
                                     placement: Placement {
+                                        instance_id: 0,
                                         frame: self.session.current_frame,
                                         target: Target::Asset(next_asset_id),
                                         transform: Transform2D::IDENTITY,
                                         tween: Tween::None,
+                                        fx: Default::default(),
                                     },
                                     raw_path_count: path_count,
                                 });
@@ -3190,7 +3456,7 @@ impl EditorApp {
                                 };
                                 next_asset_id = incremented;
                             }
-                            Asset::Bitmap(_) | Asset::Q0v(_) => {
+                            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => {
                                 let Some(transform) = affine_to_transform(composed) else {
                                     self.session.status =
                                         "Break Apart cannot represent a singular bitmap transform"
@@ -3199,10 +3465,12 @@ impl EditorApp {
                                 };
                                 pieces.push(BreakApartPiece {
                                     placement: Placement {
+                                        instance_id: 0,
                                         frame: self.session.current_frame,
                                         target: Target::Asset(asset_id),
                                         transform,
                                         tween: Tween::None,
+                                        fx: Default::default(),
                                     },
                                     raw_path_count: 0,
                                 });
@@ -3218,10 +3486,12 @@ impl EditorApp {
                         };
                         pieces.push(BreakApartPiece {
                             placement: Placement {
+                                instance_id: 0,
                                 frame: self.session.current_frame,
                                 target: Target::Q0rg(nested_id),
                                 transform,
                                 tween: Tween::None,
+                                fx: Default::default(),
                             },
                             raw_path_count: 0,
                         });
@@ -3241,6 +3511,11 @@ impl EditorApp {
             return;
         };
         self.state.project.assets.extend(pending_assets);
+        #[cfg(feature = "appearance-mask-eraser")]
+        self.state
+            .project
+            .asset_appearances
+            .extend(pending_appearances);
         let Some(parent_layer) = self
             .state
             .project
@@ -3281,6 +3556,16 @@ impl EditorApp {
         frame: u16,
     ) {
         let q0rg_id = self.session.current_q0rg_id;
+        if self.state.project.layer_is_locked(q0rg_id, target_layer_id)
+            || !self
+                .state
+                .project
+                .layer_is_visible(q0rg_id, target_layer_id)
+        {
+            self.session.status =
+                "show and unlock the target layer before placing media".to_string();
+            return;
+        }
         let Some(q0rg_index) = self
             .state
             .project
@@ -3384,10 +3669,12 @@ impl EditorApp {
                 name,
                 explicit_keyframes,
                 placements: vec![Placement {
+                    instance_id: 0,
                     frame,
                     target,
                     transform,
                     tween: Tween::None,
+                    fx: Default::default(),
                 }],
             },
         );
@@ -3398,6 +3685,8 @@ impl EditorApp {
                     kind: LayerKind::Normal,
                     parent_folder_id: Some(parent_folder_id),
                     collapsed: false,
+                    hidden: false,
+                    locked: false,
                 },
             );
         }
@@ -3422,6 +3711,11 @@ impl EditorApp {
     }
 
     fn place_library_item_at(&mut self, item: LibraryItem, position: q0s_format::v2::Vec2) {
+        if self.current_layer_is_locked() || !self.current_layer_is_visible() {
+            self.session.status =
+                "show and unlock the target layer before placing artwork".to_string();
+            return;
+        }
         if self.current_layer_is_folder() {
             self.session.status = "folders cannot contain artwork".to_string();
             return;
@@ -3501,10 +3795,12 @@ impl EditorApp {
         {
             let next_idx = layer.placements.len();
             layer.placements.push(Placement {
+                instance_id: 0,
                 frame,
                 target,
                 transform,
                 tween: Tween::None,
+                fx: Default::default(),
             });
             self.state.dirty = true;
             self.session.selection = Selection::Placement {
@@ -3576,10 +3872,12 @@ impl EditorApp {
         };
         let placement_idx = layer.placements.len();
         layer.placements.push(Placement {
+            instance_id: 0,
             frame,
             target: Target::Asset(new_asset_id),
             transform: Transform2D::IDENTITY,
             tween: Tween::None,
+            fx: Default::default(),
         });
         let path_count = source.paths.len();
         self.session.selection = raw_vector_selection(q0rg_id, layer_id, placement_idx, path_count);
@@ -3792,6 +4090,10 @@ impl EditorApp {
     /// frame also stops the previous keyframe from leaking through it.
     fn delete_timeline_selection(&mut self) -> Option<(usize, usize, bool)> {
         let selection = self.session.timeline_selection?;
+        if self.timeline_selection_touches_locked_layer(selection) {
+            self.session.status = "locked timeline frames cannot be cleared".to_string();
+            return None;
+        }
         let q0rg_id = self.session.current_q0rg_id;
         let q0rg = self
             .state
@@ -3895,6 +4197,10 @@ impl EditorApp {
     fn delete_selection(&mut self) -> bool {
         self.session
             .clear_inactive_frame_selection(&self.state.project);
+        if self.selection_touches_locked_layer() {
+            self.session.status = "layer is locked".to_string();
+            return false;
+        }
         let selection = self.session.selection.clone();
         match selection {
             Selection::Placement {
@@ -3981,7 +4287,7 @@ impl EditorApp {
                     })
                     .and_then(|asset| match asset {
                         Asset::Vector(vector) => vector.paths.get(path.path_idx),
-                        Asset::Bitmap(_) | Asset::Q0v(_) => None,
+                        Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => None,
                     })
                     .map(|raw_path| raw_path.anchors.len())
                     .unwrap_or(0);
@@ -4160,6 +4466,10 @@ impl EditorApp {
         let Some(selection) = self.session.timeline_selection else {
             return;
         };
+        if self.timeline_selection_touches_locked_layer(selection) {
+            self.session.status = "locked timeline frames cannot be changed".to_string();
+            return;
+        }
         let before = self.state.project.clone();
         match crate::timeline_edit::materialize_selected_keyframes(
             &mut self.state.project,
@@ -4410,6 +4720,10 @@ impl EditorApp {
     fn insert_blank_keyframe_at(&mut self, frame: u16) -> bool {
         let q0rg_id = self.session.current_q0rg_id;
         let layer_id = self.session.current_layer_id;
+        if self.state.project.layer_is_locked(q0rg_id, layer_id) {
+            self.session.status = "layer is locked".to_string();
+            return false;
+        }
         let has_keyframe = self
             .state
             .project
@@ -4459,6 +4773,10 @@ impl EditorApp {
     fn insert_keyframe_at(&mut self, frame: u16) -> usize {
         let q0rg_id = self.session.current_q0rg_id;
         let layer_id = self.session.current_layer_id;
+        if self.state.project.layer_is_locked(q0rg_id, layer_id) {
+            self.session.status = "layer is locked".to_string();
+            return 0;
+        }
         let active: Vec<(usize, q0s_format::v2::Transform2D)> = match self
             .state
             .project
@@ -4490,10 +4808,12 @@ impl EditorApp {
                     (src.frame != frame).then_some((
                         idx,
                         Placement {
+                            instance_id: 0,
                             frame,
                             target: src.target,
                             transform: interp,
                             tween: Tween::None,
+                            fx: Default::default(),
                         },
                     ))
                 })
@@ -4551,6 +4871,10 @@ impl EditorApp {
         let selection = self.session.timeline_selection.unwrap_or_else(|| {
             TimelineSelection::single(self.session.current_layer_id, self.session.current_frame)
         });
+        if self.timeline_selection_touches_locked_layer(selection) {
+            self.session.status = "locked keyframes cannot be cleared".to_string();
+            return;
+        }
         let before = self.state.project.clone();
         match crate::timeline_edit::remove_selected_keyframes(
             &mut self.state.project,
@@ -4577,6 +4901,10 @@ impl EditorApp {
     /// Remove the selected columns of time from the whole q0rg. Everything to
     /// the right shifts left, including blank keys and tween destinations.
     fn remove_frame(&mut self) {
+        if self.current_q0rg_has_locked_artwork_layer() {
+            self.session.status = "unlock layers before removing a global frame column".to_string();
+            return;
+        }
         if self.session.pending_timeline_frame.is_some() {
             self.session.status =
                 "future frame is not created; press F5, F6, or F7 first".to_string();
@@ -4640,6 +4968,12 @@ impl EditorApp {
         let selection = self.session.timeline_selection.unwrap_or_else(|| {
             TimelineSelection::single(self.session.current_layer_id, self.session.current_frame)
         });
+        if self.timeline_selection_touches_locked_layer(selection) {
+            self.session.tween_warning =
+                Some("Unlock the selected layer before editing its tween.".to_string());
+            self.session.status = "layer is locked".to_string();
+            return;
+        }
         let q0rg_id = self.session.current_q0rg_id;
         let visible_layer_ids =
             crate::panels::timeline::visible_layer_ids(&self.state.project, q0rg_id);
@@ -5550,14 +5884,14 @@ struct BreakApartPiece {
 pub(crate) fn affine_to_transform(affine: Affine) -> Option<Transform2D> {
     let sx = affine.a11.hypot(affine.a21);
     let determinant = affine.a11 * affine.a22 - affine.a12 * affine.a21;
-    if !sx.is_finite() || sx <= 1.0e-7 || !determinant.is_finite() || determinant <= 1.0e-9 {
+    if !sx.is_finite() || sx <= 1.0e-7 || !determinant.is_finite() || determinant.abs() <= 1.0e-9 {
         return None;
     }
     let rotation = affine.a21.atan2(affine.a11);
     let (sin, cos) = rotation.sin_cos();
     let sheared_x = cos * affine.a12 + sin * affine.a22;
     let sy = -sin * affine.a12 + cos * affine.a22;
-    if !sy.is_finite() || sy <= 1.0e-7 {
+    if !sy.is_finite() || sy.abs() <= 1.0e-7 {
         return None;
     }
     let transform = Transform2D {
@@ -5659,6 +5993,20 @@ fn break_apart_result_selection(
     }
 }
 
+#[cfg(feature = "appearance-mask-eraser")]
+fn baked_vector_appearance(
+    project: &ProjectV2,
+    source: &VectorAsset,
+    transform: Affine,
+) -> Option<q0s_format::v2::VectorAppearance> {
+    let mut appearance = project.asset_appearances.get(&source.asset_id)?.clone();
+    crate::appearance::freeze_material_source_from_current_body(source, &mut appearance);
+    Some(crate::appearance::transform_appearance(
+        &appearance,
+        transform,
+    ))
+}
+
 fn bake_vector_asset(source: &VectorAsset, asset_id: u16, transform: Affine) -> VectorAsset {
     let mut result = source.clone();
     result.asset_id = asset_id;
@@ -5708,6 +6056,8 @@ fn raw_vector_selection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "appearance-mask-eraser")]
+    use geo::{Area, BooleanOps};
     use image::ImageEncoder;
     use std::io::Cursor;
 
@@ -5744,6 +6094,20 @@ mod tests {
                 .expect("write q0v test frame");
         }
         writer.finish().expect("finish q0v fixture").into_inner()
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    fn test_glow_appearance() -> q0s_format::v2::VectorAppearance {
+        q0s_format::v2::VectorAppearance {
+            material: q0s_format::v2::VectorMaterial::SoftHalo {
+                radius: 12.0,
+                opacity: 0.65,
+            },
+            erase_mask: Vec::new(),
+            material_source: Vec::new(),
+            clip_mask: Vec::new(),
+            field_transform: Affine::IDENTITY,
+        }
     }
 
     fn test_square(min_x: f32, max_x: f32) -> q0s_format::v2::Path {
@@ -5799,16 +6163,20 @@ mod tests {
         app.state.project.q0rgs[0].frame_count = 12;
         app.state.project.q0rgs[0].layers[0].placements = vec![
             Placement {
+                instance_id: 0,
                 frame: 0,
                 target: Target::Asset(1),
                 transform: q0s_format::v2::Transform2D::IDENTITY,
                 tween: Tween::None,
+                fx: Default::default(),
             },
             Placement {
+                instance_id: 0,
                 frame: 0,
                 target: Target::Asset(2),
                 transform: q0s_format::v2::Transform2D::IDENTITY,
                 tween: Tween::None,
+                fx: Default::default(),
             },
         ];
         app.session.current_frame = 5;
@@ -5921,6 +6289,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                instance_id: 0,
                 frame: 5,
                 target: Target::Asset(77),
                 transform: Transform2D {
@@ -5928,6 +6297,7 @@ mod tests {
                     ..Transform2D::IDENTITY
                 },
                 tween: Tween::None,
+                fx: Default::default(),
             });
         app.session.current_frame = 5;
         app.session.selection = Selection::Placement {
@@ -5953,10 +6323,12 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                instance_id: 0,
                 frame: 0,
                 target: Target::Asset(78),
                 transform: Transform2D::IDENTITY,
                 tween: Tween::None,
+                fx: Default::default(),
             });
         app.session.current_frame = 5;
         app.session.selection = Selection::Multi(vec![
@@ -6185,6 +6557,28 @@ mod tests {
         assert_eq!(app.session.current_frame, 7);
     }
 
+    #[test]
+    fn saved_project_tabs_use_file_stems_instead_of_stale_meta_names() {
+        let mut app = EditorApp::default();
+        app.handle(
+            &Context::default(),
+            Action::CreateProject(NewProjectSpec::default()),
+        );
+        app.state.file_path = Some(PathBuf::from(r"F:\projects\APPROVED.q1s"));
+
+        app.handle(
+            &Context::default(),
+            Action::CreateProject(NewProjectSpec::default()),
+        );
+        app.state.file_path = Some(PathBuf::from(r"F:\projects\advanced smoke\smoke-lag.q1s"));
+
+        let summaries = app.project_tab_summaries();
+        let titles = summaries
+            .iter()
+            .map(|tab| tab.title.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(titles, vec!["APPROVED", "smoke-lag"]);
+    }
     #[test]
     fn home_and_project_tabs_preserve_independent_document_state() {
         let mut app = EditorApp::default();
@@ -6448,10 +6842,12 @@ mod tests {
         let mut app = EditorApp::default();
         app.state.project.q0rgs[0].frame_count = frame_count;
         app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            instance_id: 0,
             frame: 0,
             target: Target::Asset(77),
             transform: Transform2D::IDENTITY,
             tween: Tween::None,
+            fx: Default::default(),
         }];
         app.session.current_q0rg_id = app.state.project.q0rgs[0].q0rg_id;
         app.session.current_layer_id = app.state.project.q0rgs[0].layers[0].layer_id;
@@ -6466,6 +6862,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                instance_id: 0,
                 frame: 6,
                 target: Target::Asset(77),
                 transform: Transform2D {
@@ -6473,6 +6870,7 @@ mod tests {
                     ..Transform2D::IDENTITY
                 },
                 tween: Tween::None,
+                fx: Default::default(),
             });
         app.session.current_frame = 3;
         app.session.timeline_selection = Some(TimelineSelection::single(layer_id, 3));
@@ -6496,10 +6894,12 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                instance_id: 0,
                 frame: 6,
                 target: Target::Asset(77),
                 transform: Transform2D::IDENTITY,
                 tween: Tween::None,
+                fx: Default::default(),
             });
         app.session.current_frame = 0;
         app.session.timeline_selection = Some(TimelineSelection::single(layer_id, 0));
@@ -6649,10 +7049,12 @@ mod tests {
             name: "Layer 2".to_string(),
             explicit_keyframes: Vec::new(),
             placements: vec![Placement {
+                instance_id: 0,
                 frame: 0,
                 target: Target::Asset(88),
                 transform: Transform2D::IDENTITY,
                 tween: Tween::None,
+                fx: Default::default(),
             }],
         });
         let second_layer_id = first_layer_id + 1;
@@ -6682,6 +7084,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                instance_id: 0,
                 frame: 5,
                 target: Target::Asset(77),
                 transform: Transform2D {
@@ -6689,6 +7092,7 @@ mod tests {
                     ..Transform2D::IDENTITY
                 },
                 tween: Tween::None,
+                fx: Default::default(),
             });
         app.session.timeline_selection = Some(crate::state::TimelineSelection::single(layer_id, 5));
 
@@ -6733,6 +7137,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                instance_id: 0,
                 frame: 6,
                 target: Target::Asset(77),
                 transform: Transform2D {
@@ -6740,6 +7145,7 @@ mod tests {
                     ..Transform2D::IDENTITY
                 },
                 tween: Tween::None,
+                fx: Default::default(),
             });
         app.session.current_frame = 3;
 
@@ -6800,6 +7206,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                instance_id: 0,
                 frame: 3,
                 target: Target::Asset(77),
                 transform: Transform2D {
@@ -6807,6 +7214,7 @@ mod tests {
                     ..Transform2D::IDENTITY
                 },
                 tween: Tween::None,
+                fx: Default::default(),
             });
         app.session.current_frame = 4;
         app.session.timeline_selection = Some(TimelineSelection {
@@ -6832,6 +7240,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                instance_id: 0,
                 frame: 7,
                 target: Target::Asset(77),
                 transform: Transform2D {
@@ -6839,6 +7248,7 @@ mod tests {
                     ..Transform2D::IDENTITY
                 },
                 tween: Tween::None,
+                fx: Default::default(),
             });
         app.session.current_frame = 4;
         app.session.timeline_selection = Some(TimelineSelection {
@@ -6998,6 +7408,32 @@ mod tests {
     }
 
     #[test]
+    fn affine_decomposition_round_trips_reflection() {
+        let source = Transform2D {
+            tx: 18.0,
+            ty: -9.0,
+            sx: -1.4,
+            sy: 0.75,
+            rotation: 0.31,
+            skew_x: 0.16,
+            skew_y: 0.0,
+        };
+        let affine = Affine::from_transform(source);
+        let decomposed = affine_to_transform(affine).expect("reflection decomposition");
+        let rebuilt = Affine::from_transform(decomposed);
+        for point in [
+            Vec2::new(0.0, 0.0),
+            Vec2::new(20.0, -5.0),
+            Vec2::new(-3.0, 11.0),
+        ] {
+            let expected = affine.apply(point);
+            let actual = rebuilt.apply(point);
+            assert!((expected.x - actual.x).abs() < 0.001);
+            assert!((expected.y - actual.y).abs() < 0.001);
+        }
+    }
+
+    #[test]
     fn break_apart_transformed_vector_bakes_it_into_raw_graphics() {
         let mut app = EditorApp::default();
         app.state.project.assets.push(Asset::Vector(VectorAsset {
@@ -7014,6 +7450,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                instance_id: 0,
                 frame: 0,
                 target: Target::Asset(77),
                 transform: Transform2D {
@@ -7022,7 +7459,32 @@ mod tests {
                     ..Transform2D::IDENTITY
                 },
                 tween: Tween::None,
+                fx: Default::default(),
             });
+        #[cfg(feature = "appearance-mask-eraser")]
+        let expected_glow = {
+            app.state
+                .project
+                .asset_appearances
+                .insert(77, test_glow_appearance());
+            let Asset::Vector(source) = app
+                .state
+                .project
+                .assets
+                .iter()
+                .find(|asset| asset.id() == 77)
+                .unwrap()
+            else {
+                unreachable!()
+            };
+            let appearance = app.state.project.asset_appearances.get(&77).unwrap();
+            crate::appearance::transform_surface(
+                &crate::appearance::visible_material_surface_for_vector(source, Some(appearance)),
+                Affine::from_transform(
+                    app.state.project.q0rgs[0].layers[0].placements[0].transform,
+                ),
+            )
+        };
         app.session.selection = Selection::Placement {
             q0rg_id: 1,
             layer_id: 1,
@@ -7052,6 +7514,27 @@ mod tests {
             unreachable!()
         };
         assert_eq!(vector.paths[0].anchors[0].point, Vec2::new(50.0, 25.0));
+        #[cfg(feature = "appearance-mask-eraser")]
+        {
+            let appearance = app
+                .state
+                .project
+                .asset_appearances
+                .get(&new_id)
+                .expect("break apart must preserve vector glow metadata");
+            assert!(matches!(
+                appearance.material,
+                q0s_format::v2::VectorMaterial::SoftHalo { .. }
+            ));
+            let actual_glow =
+                crate::appearance::visible_material_surface_for_vector(vector, Some(appearance));
+            let mismatch = expected_glow.difference(&actual_glow).unsigned_area()
+                + actual_glow.difference(&expected_glow).unsigned_area();
+            assert!(
+                mismatch < 0.01,
+                "break apart changed the visible glow support: symmetric difference area={mismatch}"
+            );
+        }
         assert_eq!(
             app.state
                 .project
@@ -7062,6 +7545,307 @@ mod tests {
                 .id(),
             77
         );
+    }
+
+    #[test]
+    fn undoing_selected_placement_scale_keeps_the_object_selected() {
+        let mut app = EditorApp::default();
+        app.state.project.assets.push(Asset::Vector(VectorAsset {
+            asset_id: 77,
+            paths: vec![test_square(0.0, 20.0)],
+            fill: Some(q0s_format::v2::Rgba {
+                r: 10,
+                g: 20,
+                b: 30,
+                a: 255,
+            }),
+            stroke: None,
+        }));
+        app.state.project.q0rgs[0].layers[0]
+            .placements
+            .push(Placement {
+                instance_id: 0,
+                frame: 0,
+                target: Target::Asset(77),
+                transform: Transform2D::IDENTITY,
+                tween: Tween::None,
+                fx: Default::default(),
+            });
+        app.session.selection = Selection::Placement {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: 0,
+        };
+        app.history.snapshot(&app.state.project);
+        app.state.project.q0rgs[0].layers[0].placements[0]
+            .transform
+            .sx = 2.0;
+        app.state.project.q0rgs[0].layers[0].placements[0]
+            .transform
+            .sy = 1.5;
+
+        app.handle(&Context::default(), Action::Undo);
+
+        assert_eq!(
+            app.state.project.q0rgs[0].layers[0].placements[0].transform,
+            Transform2D::IDENTITY,
+        );
+        assert_eq!(
+            app.session.selection,
+            Selection::Placement {
+                q0rg_id: 1,
+                layer_id: 1,
+                placement_idx: 0,
+            },
+            "undoing a transform must not deselect the same display object",
+        );
+    }
+
+    #[test]
+    fn undoing_selected_raw_scale_keeps_the_path_selected() {
+        let mut app = EditorApp::default();
+        app.state.project.assets.push(Asset::Vector(VectorAsset {
+            asset_id: 77,
+            paths: vec![test_square(0.0, 20.0)],
+            fill: Some(q0s_format::v2::Rgba {
+                r: 10,
+                g: 20,
+                b: 30,
+                a: 255,
+            }),
+            stroke: None,
+        }));
+        app.state.project.q0rgs[0].layers[0]
+            .placements
+            .push(Placement {
+                instance_id: 0,
+                frame: 0,
+                target: Target::Asset(77),
+                transform: Transform2D::IDENTITY,
+                tween: Tween::None,
+                fx: Default::default(),
+            });
+        let selected = PathRef {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: 0,
+            path_idx: 0,
+        };
+        app.session.selection = Selection::Path {
+            q0rg_id: selected.q0rg_id,
+            layer_id: selected.layer_id,
+            placement_idx: selected.placement_idx,
+            path_idx: selected.path_idx,
+        };
+        app.history.snapshot(&app.state.project);
+        let Asset::Vector(vector) = app
+            .state
+            .project
+            .assets
+            .iter_mut()
+            .find(|asset| asset.id() == 77)
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        for anchor in &mut vector.paths[0].anchors {
+            anchor.point.x *= 2.0;
+            anchor.point.y *= 1.5;
+            if let Some(handle) = &mut anchor.in_handle {
+                handle.x *= 2.0;
+                handle.y *= 1.5;
+            }
+            if let Some(handle) = &mut anchor.out_handle {
+                handle.x *= 2.0;
+                handle.y *= 1.5;
+            }
+        }
+
+        app.handle(&Context::default(), Action::Undo);
+
+        assert_eq!(
+            app.session.selection,
+            Selection::Path {
+                q0rg_id: selected.q0rg_id,
+                layer_id: selected.layer_id,
+                placement_idx: selected.placement_idx,
+                path_idx: selected.path_idx,
+            },
+            "undoing a raw geometry transform must keep the same path selected",
+        );
+        let Asset::Vector(restored) = app
+            .state
+            .project
+            .assets
+            .iter()
+            .find(|asset| asset.id() == 77)
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(restored.paths[0], test_square(0.0, 20.0));
+    }
+    #[test]
+    fn undo_after_break_apart_does_not_reinterpret_path_selection_as_holes() {
+        let mut app = EditorApp::default();
+        let mut hole = test_square(5.0, 15.0);
+        hole.anchors.reverse();
+        app.state.project.assets.push(Asset::Vector(VectorAsset {
+            asset_id: 77,
+            paths: vec![test_square(0.0, 20.0), hole],
+            fill: Some(q0s_format::v2::Rgba {
+                r: 20,
+                g: 30,
+                b: 40,
+                a: 255,
+            }),
+            stroke: None,
+        }));
+        app.state.project.q0rgs[0].layers[0]
+            .placements
+            .push(Placement {
+                instance_id: 0,
+                frame: 0,
+                target: Target::Asset(77),
+                transform: Transform2D {
+                    tx: 50.0,
+                    ty: 25.0,
+                    ..Transform2D::IDENTITY
+                },
+                tween: Tween::None,
+                fx: Default::default(),
+            });
+        app.session.selection = Selection::Placement {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: 0,
+        };
+
+        app.handle(&Context::default(), Action::BreakApartSelection);
+        assert!(matches!(app.session.selection, Selection::Paths(_)));
+
+        app.handle(&Context::default(), Action::Undo);
+
+        assert!(
+            matches!(app.session.selection, Selection::None),
+            "undo must invalidate path indices whose backing placement/topology changed"
+        );
+        let restored = &app.state.project.q0rgs[0].layers[0].placements[0];
+        assert_eq!(restored.target, Target::Asset(77));
+        assert_eq!(restored.transform.tx, 50.0);
+        assert_eq!(restored.transform.ty, 25.0);
+    }
+
+    #[test]
+    fn break_apart_refuses_to_silently_destroy_instance_fx() {
+        let mut app = EditorApp::default();
+        app.state.project.assets.push(Asset::Vector(VectorAsset {
+            asset_id: 77,
+            paths: vec![test_square(0.0, 20.0)],
+            fill: Some(q0s_format::v2::Rgba {
+                r: 20,
+                g: 30,
+                b: 40,
+                a: 255,
+            }),
+            stroke: None,
+        }));
+        app.state.project.q0rgs[0].layers[0]
+            .placements
+            .push(Placement {
+                instance_id: 0,
+                frame: 0,
+                target: Target::Asset(77),
+                transform: Transform2D::IDENTITY,
+                tween: Tween::None,
+                fx: q0s_format::v2::PlacementFx {
+                    glow: Some(q0s_format::v2::GlowFx {
+                        color: q0s_format::v2::Rgba {
+                            r: 255,
+                            g: 30,
+                            b: 10,
+                            a: 255,
+                        },
+                        radius: 10.0,
+                        strength: 1.25,
+                    }),
+                    ..Default::default()
+                },
+            });
+        app.session.selection = Selection::Placement {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: 0,
+        };
+        let before = app.state.project.clone();
+
+        assert!(!app.can_break_apart_selection());
+        app.handle(&Context::default(), Action::BreakApartSelection);
+
+        assert_eq!(app.state.project, before);
+        assert!(app.session.status.contains("FX"));
+        assert!(app.session.status.contains("losslessly"));
+    }
+
+    #[test]
+    fn break_apart_refuses_when_child_symbol_contains_active_fx() {
+        let mut app = EditorApp::default();
+        app.state.project.assets.push(Asset::Vector(VectorAsset {
+            asset_id: 77,
+            paths: vec![test_square(0.0, 20.0)],
+            fill: Some(q0s_format::v2::Rgba {
+                r: 20,
+                g: 30,
+                b: 40,
+                a: 255,
+            }),
+            stroke: None,
+        }));
+        app.state.project.q0rgs.push(Q0rg {
+            q0rg_id: 2,
+            name: "FX child".to_string(),
+            frame_count: 1,
+            script: String::new(),
+            layers: vec![Layer {
+                layer_id: 1,
+                name: "Art".to_string(),
+                explicit_keyframes: Vec::new(),
+                placements: vec![Placement {
+                    instance_id: 0,
+                    frame: 0,
+                    target: Target::Asset(77),
+                    transform: Transform2D::IDENTITY,
+                    tween: Tween::None,
+                    fx: q0s_format::v2::PlacementFx {
+                        blur: Some(q0s_format::v2::BlurFx { radius: 6.0 }),
+                        ..Default::default()
+                    },
+                }],
+            }],
+        });
+        app.state.project.q0rgs[0].layers[0]
+            .placements
+            .push(Placement {
+                instance_id: 0,
+                frame: 0,
+                target: Target::Q0rg(2),
+                transform: Transform2D::IDENTITY,
+                tween: Tween::None,
+                fx: Default::default(),
+            });
+        app.session.selection = Selection::Placement {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: 0,
+        };
+        let before = app.state.project.clone();
+
+        assert!(!app.can_break_apart_selection());
+        app.handle(&Context::default(), Action::BreakApartSelection);
+
+        assert_eq!(app.state.project, before);
+        assert!(app.session.status.contains("active FX"));
+        assert!(app.session.status.contains("never silently destroyed"));
     }
 
     #[test]
@@ -7088,6 +7872,7 @@ mod tests {
                 name: "Art".to_string(),
                 explicit_keyframes: Vec::new(),
                 placements: vec![Placement {
+                    instance_id: 0,
                     frame: 0,
                     target: Target::Asset(77),
                     transform: Transform2D {
@@ -7096,12 +7881,14 @@ mod tests {
                         ..Transform2D::IDENTITY
                     },
                     tween: Tween::None,
+                    fx: Default::default(),
                 }],
             }],
         });
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                instance_id: 0,
                 frame: 0,
                 target: Target::Q0rg(2),
                 transform: Transform2D {
@@ -7110,7 +7897,38 @@ mod tests {
                     ..Transform2D::IDENTITY
                 },
                 tween: Tween::None,
+                fx: Default::default(),
             });
+        #[cfg(feature = "appearance-mask-eraser")]
+        let expected_glow = {
+            app.state
+                .project
+                .asset_appearances
+                .insert(77, test_glow_appearance());
+            let Asset::Vector(source) = app
+                .state
+                .project
+                .assets
+                .iter()
+                .find(|asset| asset.id() == 77)
+                .unwrap()
+            else {
+                unreachable!()
+            };
+            let appearance = app.state.project.asset_appearances.get(&77).unwrap();
+            let composed = Affine::compose(
+                Affine::from_transform(
+                    app.state.project.q0rgs[0].layers[0].placements[0].transform,
+                ),
+                Affine::from_transform(
+                    app.state.project.q0rgs[1].layers[0].placements[0].transform,
+                ),
+            );
+            crate::appearance::transform_surface(
+                &crate::appearance::visible_material_surface_for_vector(source, Some(appearance)),
+                composed,
+            )
+        };
         app.session.selection = Selection::Placement {
             q0rg_id: 1,
             layer_id: 1,
@@ -7137,6 +7955,23 @@ mod tests {
             unreachable!()
         };
         assert_eq!(vector.paths[0].anchors[0].point, Vec2::new(60.0, 25.0));
+        #[cfg(feature = "appearance-mask-eraser")]
+        {
+            let appearance = app
+                .state
+                .project
+                .asset_appearances
+                .get(&new_id)
+                .expect("symbol break apart must preserve child vector glow metadata");
+            let actual_glow =
+                crate::appearance::visible_material_surface_for_vector(vector, Some(appearance));
+            let mismatch = expected_glow.difference(&actual_glow).unsigned_area()
+                + actual_glow.difference(&expected_glow).unsigned_area();
+            assert!(
+                mismatch < 0.01,
+                "symbol break apart changed the visible glow support: symmetric difference area={mismatch}"
+            );
+        }
         assert!(matches!(
             app.session.selection,
             Selection::Path { .. } | Selection::Paths(_)
@@ -7244,10 +8079,12 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                instance_id: 0,
                 frame: 12,
                 target: Target::Asset(1),
                 transform: Transform2D::IDENTITY,
                 tween: Tween::None,
+                fx: Default::default(),
             });
 
         app.handle(&Context::default(), Action::SetQ0rgFrameCount(1, 8));
@@ -7264,10 +8101,12 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                instance_id: 0,
                 frame: 0,
                 target: Target::Q0rg(2),
                 transform: Transform2D::IDENTITY,
                 tween: Tween::None,
+                fx: Default::default(),
             });
 
         app.handle(
@@ -7462,6 +8301,8 @@ mod tests {
                     kind: LayerKind::Folder,
                     parent_folder_id: None,
                     collapsed: false,
+                    hidden: false,
+                    locked: false,
                 },
             );
         }
@@ -7472,6 +8313,8 @@ mod tests {
                     kind: LayerKind::Normal,
                     parent_folder_id: Some(folder_id),
                     collapsed: false,
+                    hidden: false,
+                    locked: false,
                 },
             );
         }
@@ -7514,6 +8357,69 @@ mod tests {
             vec![1, 10, 3, 2, 20, 5]
         );
         q0s_format::v2::validate(&app.state.project).expect("outdented drag project");
+    }
+
+    #[test]
+    fn nested_folders_can_be_created_moved_as_subtrees_and_cannot_form_cycles() {
+        let mut app = EditorApp::default();
+        app.handle(&Context::default(), Action::AddLayer);
+        let outside_layer = app.session.current_layer_id;
+
+        app.session.current_layer_id = 1;
+        app.handle(&Context::default(), Action::AddLayerFolder);
+        let outer_folder = app.session.current_layer_id;
+        app.handle(&Context::default(), Action::AddLayerFolder);
+        let inner_folder = app.session.current_layer_id;
+        app.handle(&Context::default(), Action::AddLayer);
+        let nested_leaf = app.session.current_layer_id;
+        app.handle(
+            &Context::default(),
+            Action::DropLayer(1, nested_leaf, LayerDropTarget::IntoFolder(inner_folder)),
+        );
+
+        assert_eq!(
+            app.state.project.layer_parent_folder(1, inner_folder),
+            Some(outer_folder)
+        );
+        assert_eq!(
+            app.state.project.layer_parent_folder(1, nested_leaf),
+            Some(inner_folder)
+        );
+        assert_eq!(app.state.project.layer_folder_depth(1, nested_leaf), 2);
+        q0s_format::v2::validate(&app.state.project).expect("created nested folder tree");
+
+        app.handle(
+            &Context::default(),
+            Action::DropLayer(
+                1,
+                outer_folder,
+                LayerDropTarget::Before {
+                    layer_id: outside_layer,
+                    parent_folder_id: None,
+                },
+            ),
+        );
+        assert_eq!(
+            app.state.project.layer_parent_folder(1, inner_folder),
+            Some(outer_folder)
+        );
+        assert_eq!(
+            app.state.project.layer_parent_folder(1, nested_leaf),
+            Some(inner_folder)
+        );
+        let outer_range = app
+            .layer_row_block_range(1, outer_folder)
+            .expect("outer subtree range");
+        assert_eq!(outer_range.1 - outer_range.0, 3);
+        q0s_format::v2::validate(&app.state.project).expect("moved nested folder subtree");
+
+        let before_cycle_attempt = app.state.project.clone();
+        app.handle(
+            &Context::default(),
+            Action::DropLayer(1, outer_folder, LayerDropTarget::IntoFolder(inner_folder)),
+        );
+        assert_eq!(app.state.project, before_cycle_attempt);
+        q0s_format::v2::validate(&app.state.project).expect("cycle attempt rejected");
     }
 
     #[test]
@@ -7743,5 +8649,46 @@ mod tests {
             .expect("video layer");
         assert!(video_layer.explicit_keyframes.is_empty());
         q0s_format::v2::validate(&app.state.project).expect("extended q0v scene");
+    }
+    #[test]
+    fn layer_visibility_and_lock_actions_persist_state_and_protect_frame_edits() {
+        let mut app = EditorApp::default();
+        let q0rg_id = app.session.current_q0rg_id;
+        let layer_id = app.session.current_layer_id;
+
+        assert!(app.state.project.layer_is_visible(q0rg_id, layer_id));
+        assert!(!app.state.project.layer_is_locked(q0rg_id, layer_id));
+
+        app.handle(
+            &Context::default(),
+            Action::ToggleLayerVisibility(q0rg_id, layer_id),
+        );
+        assert!(app.state.project.layer_metadata(q0rg_id, layer_id).hidden);
+        assert!(!app.state.project.layer_is_visible(q0rg_id, layer_id));
+
+        app.handle(
+            &Context::default(),
+            Action::ToggleLayerVisibility(q0rg_id, layer_id),
+        );
+        assert!(app.state.project.layer_is_visible(q0rg_id, layer_id));
+
+        app.handle(
+            &Context::default(),
+            Action::ToggleLayerLock(q0rg_id, layer_id),
+        );
+        assert!(app.state.project.layer_is_locked(q0rg_id, layer_id));
+        let before = app.state.project.clone();
+        app.handle(&Context::default(), Action::InsertBlankKeyframe);
+        assert_eq!(
+            app.state.project, before,
+            "locked layer must reject frame edits"
+        );
+        assert_eq!(app.session.status, "layer is locked");
+
+        app.handle(
+            &Context::default(),
+            Action::ToggleLayerLock(q0rg_id, layer_id),
+        );
+        assert!(!app.state.project.layer_is_locked(q0rg_id, layer_id));
     }
 }
