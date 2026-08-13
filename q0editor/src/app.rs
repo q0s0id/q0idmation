@@ -28,6 +28,7 @@ pub struct EditorApp {
     pub settings: crate::settings::Settings,
     /// Separate non-modal export workshop and immutable export queue.
     pub q0enc: crate::q0enc::Q0EncState,
+    pub(crate) release_feed: crate::release_feed::ReleaseFeedState,
     /// Set on the first `update()` so we apply the loaded theme once a
     /// real `Context` is available (the egui ctx isn't valid in
     /// `Default::default`).
@@ -385,6 +386,7 @@ impl Default for EditorApp {
             textures: TextureCache::default(),
             settings,
             q0enc,
+            release_feed: crate::release_feed::ReleaseFeedState::default(),
             theme_applied: false,
             q0lang_font_installed: false,
             pending: Vec::new(),

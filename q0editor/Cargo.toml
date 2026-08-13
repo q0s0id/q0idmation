@@ -29,6 +29,7 @@ lyon_path = "1"
 lyon_tessellation = "1"
 image = { version = "0.24.9", default-features = false, features = ["png", "jpeg", "webp"] }
 gif = "0.13"
+ureq = "2.12"
 
 [build-dependencies]
 q0icon = { path = "../q0icon" }

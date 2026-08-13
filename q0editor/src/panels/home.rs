@@ -1,8 +1,9 @@
 use std::path::Path;
 
-use egui::{Align, Button, Frame, Layout, Margin, RichText, Ui, Vec2};
+use egui::{Align, Button, Frame, Layout, Margin, RichText, ScrollArea, Ui, Vec2};
 
 use crate::app::{Action, EditorApp};
+use crate::release_feed::{short_date, ReleaseFeedStatus, ReleaseNote};
 
 pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     ui.add_space(24.0);
@@ -59,6 +60,8 @@ fn action_row(app: &mut EditorApp, ui: &mut Ui) {
 }
 
 fn content_columns(app: &mut EditorApp, ui: &mut Ui) {
+    app.release_feed.ensure_started(ui.ctx());
+    app.release_feed.poll();
     let recent = app.settings.recent_projects.clone();
     let mut open_recent = None;
     ui.columns(2, |columns| {
@@ -93,49 +96,102 @@ fn content_columns(app: &mut EditorApp, ui: &mut Ui) {
             .inner_margin(Margin::same(16.0))
             .show(&mut columns[1], |ui| {
                 ui.set_min_height(360.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Feed").size(18.0).strong());
-                    ui.label(
-                        RichText::new("reserved")
-                            .small()
-                            .color(app.settings.theme.accent.to_color32()),
-                    );
-                });
-                ui.add_space(16.0);
-                ui.label(
-                    RichText::new("Project news will live here.")
-                        .size(16.0)
-                        .color(app.settings.theme.text_dim.to_color32()),
-                );
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new(
-                        "Changelogs, release notes and repository updates will appear after GitHub integration and the first public commits.",
-                    )
-                    .color(app.settings.theme.text_dim.to_color32()),
-                );
-                ui.add_space(18.0);
-                ui.separator();
-                ui.add_space(12.0);
-                for label in ["changelog", "releases", "development updates"] {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new("○")
-                                .color(app.settings.theme.accent.to_color32()),
-                        );
-                        ui.label(
-                            RichText::new(label)
-                                .color(app.settings.theme.text_dim.to_color32()),
-                        );
-                    });
-                    ui.add_space(5.0);
-                }
+                release_feed(app, ui);
             });
     });
 
     if let Some(path) = open_recent {
         app.queue(Action::OpenProjectFromPath(path));
     }
+}
+
+fn release_feed(app: &mut EditorApp, ui: &mut Ui) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Feed").size(18.0).strong());
+        ui.label(
+            RichText::new("GitHub releases")
+                .small()
+                .color(app.settings.theme.accent.to_color32()),
+        );
+    });
+    ui.add_space(10.0);
+
+    let status = app.release_feed.status().clone();
+    match status {
+        ReleaseFeedStatus::Idle | ReleaseFeedStatus::Loading => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    RichText::new("Loading releases from GitHub...")
+                        .color(app.settings.theme.text_dim.to_color32()),
+                );
+            });
+        }
+        ReleaseFeedStatus::Ready(releases) if releases.is_empty() => {
+            ui.label(
+                RichText::new("No published GitHub releases yet.")
+                    .color(app.settings.theme.text_dim.to_color32()),
+            );
+        }
+        ReleaseFeedStatus::Ready(releases) => {
+            ScrollArea::vertical()
+                .id_source("home_release_feed")
+                .auto_shrink([false, false])
+                .max_height(310.0)
+                .show(ui, |ui| {
+                    for (index, release) in releases.iter().enumerate() {
+                        if index > 0 {
+                            ui.add_space(10.0);
+                            ui.separator();
+                            ui.add_space(10.0);
+                        }
+                        release_card(app, ui, release);
+                    }
+                });
+        }
+        ReleaseFeedStatus::Error(error) => {
+            ui.label(RichText::new("GitHub feed is temporarily unavailable.").strong());
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(error)
+                    .small()
+                    .color(app.settings.theme.text_dim.to_color32()),
+            );
+            ui.add_space(10.0);
+            if ui.button("Retry").clicked() {
+                app.release_feed.retry(ui.ctx());
+            }
+        }
+    }
+}
+
+fn release_card(app: &EditorApp, ui: &mut Ui, release: &ReleaseNote) {
+    ui.label(RichText::new(&release.title).size(15.0).strong());
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new(&release.tag)
+                .small()
+                .color(app.settings.theme.accent.to_color32()),
+        );
+        if let Some(date) = short_date(release.published_at.as_deref()) {
+            ui.label(
+                RichText::new(date)
+                    .small()
+                    .color(app.settings.theme.text_dim.to_color32()),
+            );
+        }
+        if release.prerelease {
+            ui.label(
+                RichText::new("prerelease")
+                    .small()
+                    .color(app.settings.theme.text_dim.to_color32()),
+            );
+        }
+    });
+    ui.add_space(6.0);
+    ui.label(RichText::new(&release.body).color(app.settings.theme.text_dim.to_color32()));
+    ui.add_space(8.0);
+    ui.hyperlink_to("View release on GitHub", &release.url);
 }
 
 fn recent_project_button(ui: &mut Ui, path: &Path) -> egui::Response {

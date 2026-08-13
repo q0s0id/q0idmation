@@ -13,6 +13,7 @@ pub mod l10n;
 pub mod panels;
 pub mod q0enc;
 pub mod q0lang;
+pub mod release_feed;
 pub mod render;
 pub mod rigging;
 pub mod selection_edit;
