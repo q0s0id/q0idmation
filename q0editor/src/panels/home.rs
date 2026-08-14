@@ -3,7 +3,10 @@ use std::path::Path;
 use egui::{Align, Button, Frame, Layout, Margin, RichText, ScrollArea, Ui, Vec2};
 
 use crate::app::{Action, EditorApp};
-use crate::release_feed::{short_date, ReleaseFeedStatus, ReleaseNote};
+use crate::release_feed::{
+    parse_release_markdown, short_date, MarkdownBlock, MarkdownSpan, MarkdownSpanKind,
+    ReleaseFeedStatus, ReleaseNote,
+};
 
 pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     ui.add_space(24.0);
@@ -189,9 +192,92 @@ fn release_card(app: &EditorApp, ui: &mut Ui, release: &ReleaseNote) {
         }
     });
     ui.add_space(6.0);
-    ui.label(RichText::new(&release.body).color(app.settings.theme.text_dim.to_color32()));
+    render_release_markdown(app, ui, &release.body);
     ui.add_space(8.0);
     ui.hyperlink_to("View release on GitHub", &release.url);
+}
+
+fn render_release_markdown(app: &EditorApp, ui: &mut Ui, body: &str) {
+    for block in parse_release_markdown(body) {
+        match block {
+            MarkdownBlock::Heading { level, spans } => {
+                if level <= 2 {
+                    ui.add_space(5.0);
+                }
+                let size = match level {
+                    1 => 16.0,
+                    2 => 14.5,
+                    _ => 13.5,
+                };
+                render_markdown_spans(app, ui, &spans, size, true, false);
+                ui.add_space(2.0);
+            }
+            MarkdownBlock::Bullet(spans) => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.label(RichText::new("? ").color(app.settings.theme.accent.to_color32()));
+                    render_markdown_spans_inline(app, ui, &spans, 13.0, false, true);
+                });
+                ui.add_space(2.0);
+            }
+            MarkdownBlock::Paragraph(spans) => {
+                render_markdown_spans(app, ui, &spans, 13.0, false, true);
+                ui.add_space(2.0);
+            }
+            MarkdownBlock::Spacer => ui.add_space(5.0),
+        }
+    }
+}
+
+fn render_markdown_spans(
+    app: &EditorApp,
+    ui: &mut Ui,
+    spans: &[MarkdownSpan],
+    size: f32,
+    strong_all: bool,
+    dim_plain: bool,
+) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        render_markdown_spans_inline(app, ui, spans, size, strong_all, dim_plain);
+    });
+}
+
+fn render_markdown_spans_inline(
+    app: &EditorApp,
+    ui: &mut Ui,
+    spans: &[MarkdownSpan],
+    size: f32,
+    strong_all: bool,
+    dim_plain: bool,
+) {
+    let accent = app.settings.theme.accent.to_color32();
+    let normal = if dim_plain {
+        app.settings.theme.text_dim.to_color32()
+    } else {
+        ui.visuals().text_color()
+    };
+
+    for span in spans {
+        let mut text = RichText::new(&span.text).size(size).color(normal);
+        if strong_all || matches!(span.kind, MarkdownSpanKind::Strong) {
+            text = text.strong();
+        }
+        match &span.kind {
+            MarkdownSpanKind::Code => {
+                ui.label(text.monospace().color(accent));
+            }
+            MarkdownSpanKind::Emphasis => {
+                ui.label(text.italics());
+            }
+            MarkdownSpanKind::Link(url) => {
+                ui.hyperlink_to(text.color(accent).underline(), url);
+            }
+            MarkdownSpanKind::Plain | MarkdownSpanKind::Strong => {
+                ui.label(text);
+            }
+        }
+    }
 }
 
 fn recent_project_button(ui: &mut Ui, path: &Path) -> egui::Response {

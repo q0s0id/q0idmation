@@ -19,6 +19,134 @@ pub struct ReleaseNote {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkdownSpanKind {
+    Plain,
+    Strong,
+    Code,
+    Emphasis,
+    Link(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkdownSpan {
+    pub text: String,
+    pub kind: MarkdownSpanKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkdownBlock {
+    Heading { level: u8, spans: Vec<MarkdownSpan> },
+    Bullet(Vec<MarkdownSpan>),
+    Paragraph(Vec<MarkdownSpan>),
+    Spacer,
+}
+
+pub fn parse_release_markdown(body: &str) -> Vec<MarkdownBlock> {
+    body.lines()
+        .map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return MarkdownBlock::Spacer;
+            }
+
+            if let Some((level, text)) = heading_line(trimmed) {
+                return MarkdownBlock::Heading {
+                    level,
+                    spans: parse_inline_markdown(text),
+                };
+            }
+            if let Some(text) = trimmed
+                .strip_prefix("- ")
+                .or_else(|| trimmed.strip_prefix("* "))
+            {
+                return MarkdownBlock::Bullet(parse_inline_markdown(text));
+            }
+            MarkdownBlock::Paragraph(parse_inline_markdown(trimmed))
+        })
+        .collect()
+}
+
+fn heading_line(line: &str) -> Option<(u8, &str)> {
+    let hashes = line.bytes().take_while(|byte| *byte == b'#').count();
+    if !(1..=6).contains(&hashes) || line.as_bytes().get(hashes) != Some(&b' ') {
+        return None;
+    }
+    Some((hashes as u8, line[hashes + 1..].trim()))
+}
+
+fn parse_inline_markdown(mut text: &str) -> Vec<MarkdownSpan> {
+    let mut spans = Vec::new();
+    while !text.is_empty() {
+        if let Some(rest) = text.strip_prefix("**") {
+            if let Some(end) = rest.find("**") {
+                push_span(&mut spans, &rest[..end], MarkdownSpanKind::Strong);
+                text = &rest[end + 2..];
+                continue;
+            }
+        }
+        if let Some(rest) = text.strip_prefix('`') {
+            if let Some(end) = rest.find('`') {
+                push_span(&mut spans, &rest[..end], MarkdownSpanKind::Code);
+                text = &rest[end + 1..];
+                continue;
+            }
+        }
+        if let Some(rest) = text.strip_prefix('[') {
+            if let Some(label_end) = rest.find("](") {
+                let after_label = &rest[label_end + 2..];
+                if let Some(url_end) = after_label.find(')') {
+                    let label = &rest[..label_end];
+                    let url = &after_label[..url_end];
+                    if !label.is_empty() && !url.is_empty() {
+                        push_span(&mut spans, label, MarkdownSpanKind::Link(url.to_string()));
+                        text = &after_label[url_end + 1..];
+                        continue;
+                    }
+                }
+            }
+        }
+        if let Some(rest) = text.strip_prefix('*') {
+            if !rest.starts_with('*') {
+                if let Some(end) = rest.find('*') {
+                    push_span(&mut spans, &rest[..end], MarkdownSpanKind::Emphasis);
+                    text = &rest[end + 1..];
+                    continue;
+                }
+            }
+        }
+
+        let next = [
+            text.find("**"),
+            text.find('`'),
+            text.find('['),
+            text.find('*'),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|index| *index > 0)
+        .min()
+        .unwrap_or(text.len());
+        if next == 0 || next == text.len() {
+            push_span(&mut spans, text, MarkdownSpanKind::Plain);
+            break;
+        }
+        push_span(&mut spans, &text[..next], MarkdownSpanKind::Plain);
+        text = &text[next..];
+    }
+    spans
+}
+
+fn push_span(spans: &mut Vec<MarkdownSpan>, text: &str, kind: MarkdownSpanKind) {
+    if text.is_empty() {
+        return;
+    }
+    spans.push(MarkdownSpan {
+        text: text.to_string(),
+        kind,
+    });
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReleaseFeedStatus {
     Idle,
     Loading,
@@ -231,6 +359,64 @@ mod tests {
         assert_eq!(
             releases[0].body,
             "No release notes were provided for this release."
+        );
+    }
+
+    #[test]
+    fn release_markdown_formats_real_release_notes_without_losing_text() {
+        let body = "# q0idmation\n\n## included\n\n- **q0editor** opens `.q1s` and [releases](https://example.invalid).\n\nplain *beta* note";
+        let blocks = parse_release_markdown(body);
+
+        assert!(matches!(
+            &blocks[0],
+            MarkdownBlock::Heading { level: 1, spans }
+                if spans == &vec![MarkdownSpan {
+                    text: "q0idmation".to_string(),
+                    kind: MarkdownSpanKind::Plain,
+                }]
+        ));
+        assert!(matches!(
+            &blocks[2],
+            MarkdownBlock::Heading { level: 2, .. }
+        ));
+
+        let MarkdownBlock::Bullet(spans) = &blocks[4] else {
+            panic!("release list item was not parsed as a bullet");
+        };
+        assert!(spans.iter().any(|span| {
+            span.text == "q0editor" && matches!(span.kind, MarkdownSpanKind::Strong)
+        }));
+        assert!(spans
+            .iter()
+            .any(|span| { span.text == ".q1s" && matches!(span.kind, MarkdownSpanKind::Code) }));
+        assert!(spans.iter().any(|span| {
+            span.text == "releases"
+                && matches!(
+                    &span.kind,
+                    MarkdownSpanKind::Link(url) if url == "https://example.invalid"
+                )
+        }));
+
+        let MarkdownBlock::Paragraph(spans) = &blocks[6] else {
+            panic!("plain release note was not parsed as a paragraph");
+        };
+        assert!(spans.iter().any(|span| {
+            span.text == "beta" && matches!(span.kind, MarkdownSpanKind::Emphasis)
+        }));
+    }
+
+    #[test]
+    fn malformed_inline_markdown_degrades_to_visible_plain_text() {
+        let blocks = parse_release_markdown("broken **bold and `code");
+        let MarkdownBlock::Paragraph(spans) = &blocks[0] else {
+            panic!("malformed markdown should remain a paragraph");
+        };
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>(),
+            "broken **bold and `code"
         );
     }
 
