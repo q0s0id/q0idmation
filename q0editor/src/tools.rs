@@ -9768,6 +9768,45 @@ fn bucket(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>) {
     }
 }
 
+fn bucket_visible_fill_geometry(vector: &VectorAsset) -> MultiPolygon<f64> {
+    if vector.fill.is_none() {
+        return MultiPolygon(Vec::new());
+    }
+
+    // Empty-space bucket faces are built from `flatten_path`, which is also the
+    // contour the stage renderer tessellates. Use that exact visible boundary
+    // when subtracting existing paint. Mixing it with the brush engine's
+    // anchor-only canonical merge geometry leaves angular bites wherever smooth
+    // Bezier handles bow away from their anchor polygon.
+    let paths: Vec<VPath> = vector
+        .paths
+        .iter()
+        .filter(|path| path.closed)
+        .filter_map(|path| {
+            let mut points = flatten_path(path);
+            if points.len() > 1
+                && points
+                    .first()
+                    .zip(points.last())
+                    .is_some_and(|(first, last)| bucket_distance_sq(*first, *last) <= 1.0e-8)
+            {
+                points.pop();
+            }
+            (points.len() >= 3).then(|| VPath {
+                anchors: points.into_iter().map(anchor).collect(),
+                closed: true,
+            })
+        })
+        .collect();
+
+    crate::brush::vector_fill_geometry(&VectorAsset {
+        asset_id: vector.asset_id,
+        paths,
+        fill: vector.fill,
+        stroke: None,
+    })
+}
+
 fn raw_fill_surface_on_layer(
     project: &ProjectV2,
     q0rg_id: u16,
@@ -9794,7 +9833,7 @@ fn raw_fill_surface_on_layer(
             else {
                 return None;
             };
-            vector.fill.map(|_| vector_fill_geometry(vector))
+            vector.fill.map(|_| bucket_visible_fill_geometry(vector))
         })
         .collect();
     geo::unary_union(surfaces.iter())
@@ -14401,6 +14440,94 @@ mod tests {
             .unwrap();
         assert_eq!(old_paths, 1);
         assert_eq!(new_paths, 1);
+    }
+
+    #[test]
+    fn bucket_curved_hole_has_no_angular_bites_against_visible_boundary() {
+        let outer = VPath {
+            anchors: vec![
+                anchor(Vec2::new(0.0, 0.0)),
+                anchor(Vec2::new(100.0, 0.0)),
+                anchor(Vec2::new(100.0, 100.0)),
+                anchor(Vec2::new(0.0, 100.0)),
+            ],
+            closed: true,
+        };
+
+        // The canonical raw anchors form a diamond, while the render handles
+        // make the visible hole circular. Bucket geometry must use one visual
+        // boundary consistently; mixing the two carves four angular bites out
+        // of the newly painted region next to the contour.
+        let k = 16.568_542_f32;
+        let mut top = anchor(Vec2::new(50.0, 20.0));
+        top.in_handle = Some(Vec2::new(50.0 + k, 20.0));
+        top.out_handle = Some(Vec2::new(50.0 - k, 20.0));
+        let mut left = anchor(Vec2::new(20.0, 50.0));
+        left.in_handle = Some(Vec2::new(20.0, 50.0 - k));
+        left.out_handle = Some(Vec2::new(20.0, 50.0 + k));
+        let mut bottom = anchor(Vec2::new(50.0, 80.0));
+        bottom.in_handle = Some(Vec2::new(50.0 - k, 80.0));
+        bottom.out_handle = Some(Vec2::new(50.0 + k, 80.0));
+        let mut right = anchor(Vec2::new(80.0, 50.0));
+        right.in_handle = Some(Vec2::new(80.0, 50.0 + k));
+        right.out_handle = Some(Vec2::new(80.0, 50.0 - k));
+        let curved_hole = VPath {
+            anchors: vec![top, left, bottom, right],
+            closed: true,
+        };
+
+        let old = Rgba {
+            r: 10,
+            g: 10,
+            b: 10,
+            a: 255,
+        };
+        let new = Rgba {
+            r: 230,
+            g: 45,
+            b: 70,
+            a: 255,
+        };
+        let mut app = EditorApp::default();
+        app.state.project.assets = vec![Asset::Vector(VectorAsset {
+            asset_id: 1,
+            paths: vec![outer, curved_hole],
+            fill: Some(old),
+            stroke: None,
+        })];
+        app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            instance_id: 0,
+            frame: 0,
+            target: Target::Asset(1),
+            transform: Transform2D::IDENTITY,
+            tween: Tween::None,
+            fx: Default::default(),
+        }];
+        app.session.fill_color = Some(new);
+
+        assert!(bucket_fill_at(&mut app, Vec2::new(50.0, 50.0)));
+        let filled = app
+            .state
+            .project
+            .assets
+            .iter()
+            .find_map(|asset| match asset {
+                Asset::Vector(vector) if vector.fill == Some(new) => Some(vector),
+                _ => None,
+            })
+            .expect("bucket-created fill");
+        let surface = vector_fill_geometry(filled);
+        for probe in [
+            Point::new(65.0, 30.0),
+            Point::new(70.0, 65.0),
+            Point::new(35.0, 70.0),
+            Point::new(30.0, 35.0),
+        ] {
+            assert!(
+                surface.contains(&probe),
+                "curved contour left an angular bucket bite at {probe:?}"
+            );
+        }
     }
 
     #[test]
