@@ -13,6 +13,9 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     ScrollArea::vertical()
         .auto_shrink([false, true])
         .show(ui, |ui| {
+            if render_audio_clip_properties(app, ui) {
+                return;
+            }
             let timeline_tweens = crate::easing::selected_tween_targets(app);
             if !timeline_tweens.is_empty() {
                 crate::easing::render_selected_tween_properties(app, ui, &timeline_tweens);
@@ -105,6 +108,138 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             // which hid the fill colour control behind selection-only properties.
             render_tool_properties(app, ui);
         });
+}
+
+fn render_audio_clip_properties(app: &mut EditorApp, ui: &mut Ui) -> bool {
+    let Some(selection) = app.session.timeline_selection else {
+        return false;
+    };
+    let q0rg_id = app.session.current_q0rg_id;
+    let layer_id = selection.focus_layer_id;
+    let frame = selection.focus_frame;
+    let Some(clip) =
+        crate::audio::audio_clip_at_frame(&app.state.project, q0rg_id, layer_id, frame)
+    else {
+        return false;
+    };
+    let Some(header) = app
+        .state
+        .project
+        .assets
+        .iter()
+        .find(|asset| asset.id() == clip.asset_id)
+        .and_then(|asset| match asset {
+            Asset::Q0v(media) => q0video::q0v::probe_header(&media.bytes).ok(),
+            _ => None,
+        })
+    else {
+        return false;
+    };
+    if !header.spec.audio || header.spec.video {
+        return false;
+    }
+    let name = app
+        .state
+        .project
+        .asset_names
+        .get(&clip.asset_id)
+        .cloned()
+        .unwrap_or_else(|| format!("Audio {}", clip.asset_id));
+    let before = app.state.project.clone();
+    let Some((mut gain, mut muted)) = app
+        .state
+        .project
+        .audio_clips
+        .get(clip.clip_idx)
+        .map(|clip| (clip.gain, clip.muted))
+    else {
+        return false;
+    };
+
+    ui.label(egui::RichText::new(format!("Audio clip: {name}")).strong());
+    let duration_seconds =
+        header.audio_samples_per_channel as f64 / f64::from(header.spec.audio_sample_rate.max(1));
+    ui.label(
+        egui::RichText::new(format!(
+            "{duration_seconds:.2}s | {} hz | {} channel(s)",
+            header.spec.audio_sample_rate, header.spec.audio_channels
+        ))
+        .small()
+        .color(app.settings.theme.text_dim.to_color32()),
+    );
+    ui.add_space(5.0);
+
+    let mut changed = false;
+    let mut wants_snapshot = false;
+    egui::Grid::new("audio_clip_properties")
+        .num_columns(2)
+        .show(ui, |ui| {
+            ui.label("Starts");
+            ui.label(format!("frame {}", clip.start_frame + 1));
+            ui.end_row();
+
+            ui.label("Ends");
+            ui.label(format!("frame {}", clip.end_frame_exclusive));
+            ui.end_row();
+
+            ui.label("Volume");
+            let mut percent = gain * 100.0;
+            let response = ui.add(
+                egui::Slider::new(&mut percent, 0.0..=200.0)
+                    .suffix("%")
+                    .show_value(true),
+            );
+            wants_snapshot |= response.drag_started() || response.gained_focus();
+            if response.changed() {
+                gain = (percent / 100.0).clamp(0.0, 2.0);
+                changed = true;
+            }
+            ui.end_row();
+
+            ui.label("Mute");
+            let response = ui.checkbox(&mut muted, "");
+            if response.changed() {
+                wants_snapshot = true;
+                changed = true;
+            }
+            ui.end_row();
+        });
+
+    ui.add_space(6.0);
+    if ui.button("Play from clip").clicked() {
+        app.session.current_layer_id = layer_id;
+        app.session.current_frame = clip.start_frame;
+        app.session.pending_timeline_frame = None;
+        app.session.timeline_selection = Some(crate::state::TimelineSelection::single(
+            layer_id,
+            clip.start_frame,
+        ));
+        app.session.selection = Selection::None;
+        if app.session.playing {
+            if let Err(error) = app.refresh_audio_playback() {
+                app.session.status = format!("audio preview failed: {error}");
+            }
+        } else {
+            app.queue(Action::TogglePlay);
+        }
+    }
+
+    if changed {
+        if wants_snapshot {
+            app.history.snapshot(&before);
+        }
+        if let Some(timeline_clip) = app.state.project.audio_clips.get_mut(clip.clip_idx) {
+            timeline_clip.gain = gain;
+            timeline_clip.muted = muted;
+            app.state.mark_dirty();
+        }
+        if app.session.playing {
+            if let Err(error) = app.refresh_audio_playback() {
+                app.session.status = format!("audio update failed: {error}");
+            }
+        }
+    }
+    true
 }
 
 fn raw_path_properties(
@@ -1000,7 +1135,7 @@ fn fill_tool_properties(app: &mut EditorApp, ui: &mut Ui) {
     tool_hint(
         app,
         ui,
-        "Changes the connected fill region under the cursor.",
+        "Fills enclosed raw regions on the active layer. Existing fills are recolored without changing their geometry.",
     );
     let mut fill = app.session.fill_color.unwrap_or_else(default_fill_color);
     egui::Grid::new("bucket_fill_settings")
@@ -1061,17 +1196,20 @@ fn asset_properties(app: &mut EditorApp, ui: &mut Ui, id: u16) {
         Asset::Bitmap(b) => {
             ui.label(format!("Bitmap {} x {}", b.width, b.height));
         }
-        Asset::Q0v(v) => match q0video::q0v::Q0vFile::parse(v.bytes.clone()) {
-            Ok(media) => {
-                ui.label(format!("q0v {} x {}", media.spec.width, media.spec.height));
+        Asset::Q0v(v) => match q0video::q0v::probe_header(&v.bytes) {
+            Ok(header) => {
+                ui.label(format!(
+                    "q0v {} x {}",
+                    header.spec.width, header.spec.height
+                ));
                 ui.label(format!(
                     "{} frame(s) at {} fps",
-                    media.spec.timeline_frames, media.spec.fps
+                    header.spec.timeline_frames, header.spec.fps
                 ));
-                ui.label(if media.spec.audio {
+                ui.label(if header.spec.audio {
                     format!(
                         "audio: {} hz / {} channel(s)",
-                        media.spec.audio_sample_rate, media.spec.audio_channels
+                        header.spec.audio_sample_rate, header.spec.audio_channels
                     )
                 } else {
                     "audio: none".to_string()

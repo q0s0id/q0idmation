@@ -883,6 +883,8 @@ mod tests {
             asset_names: std::collections::HashMap::new(),
             asset_appearances: appearances,
             layer_metadata: std::collections::HashMap::new(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
                 name: "Stage".into(),

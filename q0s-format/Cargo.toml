@@ -1,4 +1,4 @@
-[package]
+﻿[package]
 name = "q0s-format"
 version.workspace = true
 edition.workspace = true
@@ -8,5 +8,5 @@ repository.workspace = true
 homepage.workspace = true
 description = "Project and movie formats used by q0editor and q0player."
 [dependencies]
+q0vm = { path = "../q0vm" }
 q0video = { path = "../q0video" }
-

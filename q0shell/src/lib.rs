@@ -58,6 +58,9 @@ impl ShellHost {
                 RuntimeAction::GoRun(_) | RuntimeAction::GoStop(_) => {
                     log.push("timeline actions are unavailable in q0shell".to_string());
                 }
+                RuntimeAction::SceneSwitch { .. } => {
+                    log.push("scene actions are unavailable in q0shell".to_string());
+                }
                 RuntimeAction::RigSetPosition { .. }
                 | RuntimeAction::RigSetValue { .. }
                 | RuntimeAction::RigReset { .. }
@@ -301,6 +304,17 @@ q0shell.move! "box/a.txt", "box/b.txt"
         host.run_source(r#"q0shell.delete! "box""#)
             .expect("delete dir");
         assert!(!root.join("box").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scene_switch_is_reported_as_unavailable_in_shell_host() {
+        let root = unique_test_dir();
+        let mut host = ShellHost::new(root.clone()).expect("host");
+        let log = host
+            .run_source("q0scene.switch! \"room2\"\n")
+            .expect("scene action is a valid q0lang action, just not a shell capability");
+        assert_eq!(log, vec!["scene actions are unavailable in q0shell"]);
         let _ = fs::remove_dir_all(root);
     }
 

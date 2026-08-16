@@ -66,6 +66,8 @@ fn sample_v2_project() -> ProjectV2 {
         asset_names: std::collections::HashMap::new(),
         asset_appearances: std::collections::HashMap::new(),
         layer_metadata: std::collections::HashMap::new(),
+        audio_clips: Vec::new(),
+        runtime: Default::default(),
         q0rgs: vec![
             Q0rg {
                 q0rg_id: 1,
@@ -180,6 +182,8 @@ fn q0rg_chain(edge_count: usize) -> ProjectV2 {
         asset_names: std::collections::HashMap::new(),
         asset_appearances: std::collections::HashMap::new(),
         layer_metadata: std::collections::HashMap::new(),
+        audio_clips: Vec::new(),
+        runtime: Default::default(),
         q0rgs,
     }
 }
@@ -222,6 +226,8 @@ fn placement_fx_survive_q1s_roundtrip_without_touching_symbol_contents() {
             offset_y: -4.0,
             strength: 0.8,
         }),
+        audio_gain: 1.0,
+        audio_muted: false,
     };
 
     let decoded = parse(&write(&project).expect("write placement fx")).expect("parse placement fx");
@@ -235,8 +241,8 @@ fn custom_asset_names_survive_q1s_roundtrip() {
     let mut project = sample_v2_project();
     project
         .asset_names
-        .insert(2, "hero vector / лицо".to_string());
-    project.q0rgs[1].name = "hero symbol / герой".to_string();
+        .insert(2, "hero vector / Р»РёС†Рѕ".to_string());
+    project.q0rgs[1].name = "hero symbol / РіРµСЂРѕР№".to_string();
 
     let bytes = write(&project).expect("must serialize names");
     let parsed = parse(&bytes).expect("must parse names");
@@ -244,7 +250,7 @@ fn custom_asset_names_survive_q1s_roundtrip() {
     assert_eq!(parsed, project);
     assert_eq!(
         parsed.asset_names.get(&2).map(String::as_str),
-        Some("hero vector / лицо")
+        Some("hero vector / Р»РёС†Рѕ")
     );
 }
 
@@ -447,7 +453,7 @@ fn v2_rejects_q0rg_self_reference() {
 #[test]
 fn v2_detects_q0rg_cycle() {
     let mut project = sample_v2_project();
-    // q0rg 2 references q0rg 1, while q0rg 1 already references 2 в†’ cycle.
+    // q0rg 2 references q0rg 1, while q0rg 1 already references 2 РІвЂ вЂ™ cycle.
     project.q0rgs[1].layers[0].placements.push(Placement {
         instance_id: 0,
         frame: 0,

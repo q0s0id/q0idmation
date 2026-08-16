@@ -1,6 +1,6 @@
 # q0idmation
 
-q0idmation is a free and open-source 2D animation toolkit written in Rust. The first beta
+q0idmation is a free and open-source 2D animation toolkit written in Rust. The current beta
 ships two Windows applications:
 
 - `q0editor` creates and edits `.q1s` projects and exports `.q0s` movies.
@@ -71,8 +71,8 @@ Before sharing the beta, follow the compact [10-minute beta test](BETA_TEST.md).
 ## Beta notes
 
 - Keep `.q1s` source projects. `.q0s` is the playback export.
-- `Recolor Fill` changes an existing closed vector fill; it is not a
-  flood-fill tool for intersecting strokes.
+- `Paint Bucket` fills enclosed raw-vector regions and can use intersections
+  between open strokes as region boundaries.
 - Use the reproducible report template in [BETA_TEST.md](BETA_TEST.md), including
   the Build ID and installer SHA256.
 

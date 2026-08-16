@@ -2313,6 +2313,9 @@ where
     project
         .assets
         .retain(|asset| !removed.contains(&asset.id()));
+    project
+        .audio_clips
+        .retain(|clip| !removed.contains(&clip.asset_id));
     for asset_id in removed {
         project.asset_names.remove(&asset_id);
         project.asset_appearances.remove(&asset_id);
@@ -6573,7 +6576,9 @@ pub(crate) fn materialize_layer_keyframe_for_edit(
     layer_id: u16,
     frame: u16,
 ) -> Option<std::collections::BTreeMap<usize, usize>> {
-    if project.layer_is_folder(q0rg_id, layer_id) {
+    if project.layer_is_folder(q0rg_id, layer_id)
+        || crate::audio::audio_clip_at_frame(project, q0rg_id, layer_id, frame).is_some()
+    {
         return None;
     }
     let active = {
@@ -7966,7 +7971,8 @@ fn asset_visible_body_contains_point(
         Asset::Q0v(video) => q0video::q0v::Q0vFile::parse(video.bytes.clone())
             .ok()
             .is_some_and(|media| {
-                local.x >= 0.0
+                media.spec.video
+                    && local.x >= 0.0
                     && local.y >= 0.0
                     && local.x <= media.spec.width as f32
                     && local.y <= media.spec.height as f32
@@ -9736,19 +9742,18 @@ fn sample_vector_paint(
 
 // ---------------- Paint Bucket ----------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BucketTargetKind {
-    ExistingFill,
-    EmptyBoundary,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BucketTarget {
     layer_id: u16,
     placement_idx: usize,
     asset_id: u16,
     path_indices: Vec<usize>,
-    kind: BucketTargetKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BucketBoundarySegment {
+    a: Vec2,
+    b: Vec2,
 }
 
 fn bucket(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>) {
@@ -9801,10 +9806,8 @@ fn raw_fill_surface_on_layer(
 /// neighbouring contours must keep their old paint.
 fn bucket_fill_at(app: &mut EditorApp, point: Vec2) -> bool {
     let q0rg_id = app.session.current_q0rg_id;
-    let layer_frame = app.session.current_frame;
-    let Some(target) = find_bucket_target(&app.state.project, q0rg_id, layer_frame, point) else {
-        return false;
-    };
+    let layer_id = app.session.current_layer_id;
+    let frame = app.session.current_frame;
     let color = app.session.fill_color.unwrap_or(Rgba {
         r: 0,
         g: 0,
@@ -9812,12 +9815,28 @@ fn bucket_fill_at(app: &mut EditorApp, point: Vec2) -> bool {
         a: 255,
     });
 
+    if let Some(target) = find_bucket_target(&app.state.project, q0rg_id, layer_id, frame, point) {
+        return recolour_bucket_target(app, target, color);
+    }
+
+    let Some(region) =
+        find_empty_bucket_region(&app.state.project, q0rg_id, layer_id, frame, point)
+    else {
+        return false;
+    };
+    fill_empty_bucket_region(app, layer_id, region, color)
+}
+
+fn recolour_bucket_target(app: &mut EditorApp, target: BucketTarget, color: Rgba) -> bool {
+    let q0rg_id = app.session.current_q0rg_id;
+    let frame = app.session.current_frame;
+
     app.history.snapshot(&app.state.project);
     let Some(mapping) = materialize_layer_keyframe_for_edit(
         &mut app.state.project,
         q0rg_id,
         target.layer_id,
-        layer_frame,
+        frame,
     ) else {
         return false;
     };
@@ -9847,7 +9866,7 @@ fn bucket_fill_at(app: &mut EditorApp, point: Vec2) -> bool {
         &mut app.state.project,
         q0rg_id,
         target.layer_id,
-        layer_frame,
+        frame,
         &std::collections::BTreeSet::from([current_asset_id]),
     );
     let asset_id = writable
@@ -9868,73 +9887,39 @@ fn bucket_fill_at(app: &mut EditorApp, point: Vec2) -> bool {
     else {
         return false;
     };
+    if source.fill.is_none() {
+        return false;
+    }
 
-    let mut indices = target.path_indices.clone();
+    let mut indices = target.path_indices;
     indices.sort_unstable();
     indices.dedup();
     if indices.is_empty() || indices.iter().any(|index| *index >= source.paths.len()) {
         return false;
     }
+    let selected_indices: std::collections::BTreeSet<usize> = indices.iter().copied().collect();
     let selected_paths: Vec<VPath> = indices
         .iter()
         .map(|index| source.paths[*index].clone())
         .collect();
+    let remaining_paths: Vec<VPath> = source
+        .paths
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !selected_indices.contains(index))
+        .map(|(_, path)| path.clone())
+        .collect();
     let selected_surface = vector_fill_geometry(&VectorAsset {
         asset_id: 0,
         paths: selected_paths.clone(),
-        fill: Some(color),
+        fill: source.fill,
         stroke: None,
     });
     if selected_surface.0.is_empty() {
         return false;
     }
 
-    let open_paths: Vec<VPath> = source
-        .paths
-        .iter()
-        .filter(|path| !path.closed)
-        .cloned()
-        .collect();
-    let old_surface = source
-        .fill
-        .map(|_| vector_fill_geometry(&source))
-        .unwrap_or_else(|| MultiPolygon(Vec::new()));
-    let bucket_surface = match target.kind {
-        BucketTargetKind::ExistingFill => selected_surface.clone(),
-        BucketTargetKind::EmptyBoundary => {
-            // Filling an empty region must not erase or cover artwork that was
-            // already drawn inside it. Cut the new colour around every existing
-            // raw fill on this layer; stroke-only boundaries stay visible because
-            // the new placement is inserted underneath all raw graphics.
-            let occupied = raw_fill_surface_on_layer(
-                &app.state.project,
-                q0rg_id,
-                target.layer_id,
-                layer_frame,
-            );
-            selected_surface.difference(&occupied)
-        }
-    };
-    if bucket_surface.unsigned_area() <= 0.05 {
-        return false;
-    }
-    let remaining_surface = match target.kind {
-        BucketTargetKind::ExistingFill => old_surface.difference(&selected_surface),
-        BucketTargetKind::EmptyBoundary => old_surface.clone(),
-    };
-    let remaining_fill_paths = geo_multi_polygon_to_linear_paths(&remaining_surface);
-    let selected_fill_paths = geo_multi_polygon_to_linear_paths(&bucket_surface);
-    if selected_fill_paths.is_empty() {
-        return false;
-    }
-
-    // Recolouring an existing connected fill may reuse its source asset. Filling
-    // an empty boundary is non-destructive: the source artwork remains intact.
-    let reuse_source = target.kind == BucketTargetKind::ExistingFill
-        && source.fill.is_some()
-        && remaining_surface.unsigned_area() <= 0.05
-        && open_paths.is_empty();
-    if reuse_source {
+    if remaining_paths.is_empty() {
         if let Some(Asset::Vector(vector)) = app
             .state
             .project
@@ -9942,57 +9927,41 @@ fn bucket_fill_at(app: &mut EditorApp, point: Vec2) -> bool {
             .iter_mut()
             .find(|asset| asset.id() == asset_id)
         {
-            vector.paths = selected_fill_paths;
+            // Recolouring must be a style-only edit. Keep the exact source paths,
+            // including every cubic handle and the original outline.
             vector.fill = Some(color);
-            vector.stroke = source.stroke;
         }
     } else {
-        if target.kind == BucketTargetKind::ExistingFill && source.fill.is_some() {
-            if let Some(Asset::Vector(vector)) = app
-                .state
-                .project
-                .assets
-                .iter_mut()
-                .find(|asset| asset.id() == asset_id)
-            {
-                let mut paths = open_paths;
-                paths.extend(remaining_fill_paths);
-                vector.paths = paths;
-                vector.fill = source.fill;
-                vector.stroke = source.stroke;
-            }
+        if let Some(Asset::Vector(vector)) = app
+            .state
+            .project
+            .assets
+            .iter_mut()
+            .find(|asset| asset.id() == asset_id)
+        {
+            vector.paths = remaining_paths;
+            vector.fill = source.fill;
+            vector.stroke = source.stroke;
         }
 
         let new_asset_id = next_asset_id(&app.state.project);
         app.state.project.assets.push(Asset::Vector(VectorAsset {
             asset_id: new_asset_id,
-            paths: selected_fill_paths,
+            paths: selected_paths,
             fill: Some(color),
-            // Bucket fill never steals or duplicates the enclosing outline.
-            stroke: None,
+            // A split component owns its own copy of the shared outline. The
+            // paths are partitioned, so this does not double-draw any stroke.
+            stroke: source.stroke,
         }));
-        let insertion = app
-            .state
-            .project
-            .q0rgs
-            .iter()
-            .find(|q0rg| q0rg.q0rg_id == q0rg_id)
-            .and_then(|q0rg| {
-                q0rg.layers
-                    .iter()
-                    .find(|layer| layer.layer_id == target.layer_id)
-            })
-            .map(|layer| match target.kind {
-                BucketTargetKind::EmptyBoundary => {
-                    active_raw_placement_indices(&app.state.project, layer, layer_frame)
-                        .into_iter()
-                        .min()
-                        .unwrap_or(placement_idx)
-                }
-                BucketTargetKind::ExistingFill if source.fill.is_none() => placement_idx,
-                BucketTargetKind::ExistingFill => placement_idx + 1,
-            })
-            .unwrap_or(placement_idx);
+        crate::appearance::split_asset_appearance(
+            &mut app.state.project,
+            asset_id,
+            new_asset_id,
+            &source.paths,
+            &selected_surface,
+            false,
+        );
+
         if let Some(layer) = app
             .state
             .project
@@ -10005,14 +9974,11 @@ fn bucket_fill_at(app: &mut EditorApp, point: Vec2) -> bool {
                     .find(|layer| layer.layer_id == target.layer_id)
             })
         {
-            // Empty-region fills belong underneath all current raw graphics so
-            // enclosing contours and any artwork already inside remain visible.
-            // Recolouring an existing component can stay next to its remainder.
             layer.placements.insert(
-                insertion.min(layer.placements.len()),
+                (placement_idx + 1).min(layer.placements.len()),
                 Placement {
                     instance_id: 0,
-                    frame: layer_frame,
+                    frame,
                     target: Target::Asset(new_asset_id),
                     transform: Transform2D::IDENTITY,
                     tween: Tween::None,
@@ -10029,90 +9995,515 @@ fn bucket_fill_at(app: &mut EditorApp, point: Vec2) -> bool {
     true
 }
 
-/// Resolve the frontmost enclosed raw region. Existing filled geometry uses the
-/// same connected-component semantics as Select, including hole contours. A
-/// closed but currently unfilled path is also a valid bucket boundary.
-fn find_bucket_target(
+fn fill_empty_bucket_region(
+    app: &mut EditorApp,
+    layer_id: u16,
+    region: MultiPolygon<f64>,
+    color: Rgba,
+) -> bool {
+    let q0rg_id = app.session.current_q0rg_id;
+    let frame = app.session.current_frame;
+    // Empty-space paint is inserted under the raw drawing, but it must not
+    // cover existing fill islands living inside the newly enclosed face.
+    let occupied = raw_fill_surface_on_layer(&app.state.project, q0rg_id, layer_id, frame);
+    let bucket_surface = region.difference(&occupied);
+    if bucket_surface.unsigned_area() <= 0.05 {
+        return false;
+    }
+    let paths = geo_multi_polygon_to_linear_paths(&bucket_surface);
+    if paths.is_empty() {
+        return false;
+    }
+
+    app.history.snapshot(&app.state.project);
+    if materialize_layer_keyframe_for_edit(&mut app.state.project, q0rg_id, layer_id, frame)
+        .is_none()
+    {
+        return false;
+    }
+
+    let new_asset_id = next_asset_id(&app.state.project);
+    app.state.project.assets.push(Asset::Vector(VectorAsset {
+        asset_id: new_asset_id,
+        paths,
+        fill: Some(color),
+        stroke: None,
+    }));
+
+    let insertion = app
+        .state
+        .project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+        .and_then(|q0rg| q0rg.layers.iter().find(|layer| layer.layer_id == layer_id))
+        .map(|layer| {
+            active_raw_placement_indices(&app.state.project, layer, frame)
+                .into_iter()
+                .min()
+                .unwrap_or(layer.placements.len())
+        })
+        .unwrap_or(0);
+    if let Some(layer) = app
+        .state
+        .project
+        .q0rgs
+        .iter_mut()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+        .and_then(|q0rg| {
+            q0rg.layers
+                .iter_mut()
+                .find(|layer| layer.layer_id == layer_id)
+        })
+    {
+        layer.placements.insert(
+            insertion.min(layer.placements.len()),
+            Placement {
+                instance_id: 0,
+                frame,
+                target: Target::Asset(new_asset_id),
+                transform: Transform2D::IDENTITY,
+                tween: Tween::None,
+                fx: Default::default(),
+            },
+        );
+    } else {
+        return false;
+    }
+
+    app.state.dirty = true;
+    app.session.selection = Selection::None;
+    app.session.status = "Region filled".to_string();
+    app.textures.invalidate();
+    true
+}
+
+fn find_empty_bucket_region(
     project: &ProjectV2,
     q0rg_id: u16,
+    layer_id: u16,
     frame: u16,
     cursor: Vec2,
-) -> Option<BucketTarget> {
-    if let Some(RawSelectionHit::Fill(refs)) =
-        hit_test_raw_selection(project, q0rg_id, frame, cursor)
-    {
-        let first = *refs.first()?;
-        let placement = project
-            .q0rgs
-            .iter()
-            .find(|q0rg| q0rg.q0rg_id == first.q0rg_id)?
-            .layers
-            .iter()
-            .find(|layer| layer.layer_id == first.layer_id)?
-            .placements
-            .get(first.placement_idx)?;
-        let Target::Asset(asset_id) = placement.target else {
-            return None;
+) -> Option<MultiPolygon<f64>> {
+    if !project.layer_is_visible(q0rg_id, layer_id) || project.layer_is_locked(q0rg_id, layer_id) {
+        return None;
+    }
+    let segments = bucket_boundary_segments(project, q0rg_id, layer_id, frame);
+    let faces = bucket_planar_faces(&segments);
+    if faces.is_empty() {
+        return None;
+    }
+    let point = Point::new(cursor.x as f64, cursor.y as f64);
+    let selected = faces
+        .iter()
+        .filter(|face| face.contains(&point) || polygon_boundary_near_cursor(face, cursor, 0.5))
+        .min_by(|left, right| left.unsigned_area().total_cmp(&right.unsigned_area()))?
+        .clone();
+
+    let selected_area = selected.unsigned_area();
+    let mut region = MultiPolygon(vec![selected.clone()]);
+    // Disconnected inner loops are separate graph components. Subtract them
+    // from the chosen enclosing face so nested stroke loops produce a ring,
+    // not one giant fill that steamrolls everything inside.
+    for face in &faces {
+        let area = face.unsigned_area();
+        if area >= selected_area - 1e-6 || face.contains(&point) {
+            continue;
+        }
+        let Some(coord) = face.exterior().0.first() else {
+            continue;
         };
-        return Some(BucketTarget {
-            layer_id: first.layer_id,
-            placement_idx: first.placement_idx,
-            asset_id,
-            path_indices: refs
-                .into_iter()
-                .map(|reference| reference.path_idx)
-                .collect(),
-            kind: BucketTargetKind::ExistingFill,
+        if selected.contains(&Point::new(coord.x, coord.y)) {
+            region = region.difference(&MultiPolygon(vec![face.clone()]));
+        }
+    }
+    (region.unsigned_area() > 0.05).then_some(region)
+}
+
+fn bucket_boundary_segments(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    frame: u16,
+) -> Vec<BucketBoundarySegment> {
+    let Some(layer) = project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+        .and_then(|q0rg| q0rg.layers.iter().find(|layer| layer.layer_id == layer_id))
+    else {
+        return Vec::new();
+    };
+    let mut segments = Vec::new();
+    for placement_idx in active_raw_placement_indices(project, layer, frame) {
+        let placement = &layer.placements[placement_idx];
+        let Target::Asset(asset_id) = placement.target else {
+            continue;
+        };
+        let Some(Asset::Vector(vector)) =
+            project.assets.iter().find(|asset| asset.id() == asset_id)
+        else {
+            continue;
+        };
+        for path in &vector.paths {
+            let visible_boundary =
+                vector.stroke.is_some() || (path.closed && vector.fill.is_some());
+            if !visible_boundary {
+                continue;
+            }
+            let points = flatten_path(path);
+            for pair in points.windows(2) {
+                if bucket_distance_sq(pair[0], pair[1]) > 1e-8 {
+                    segments.push(BucketBoundarySegment {
+                        a: pair[0],
+                        b: pair[1],
+                    });
+                }
+            }
+        }
+    }
+    segments
+}
+
+fn bucket_planar_faces(segments: &[BucketBoundarySegment]) -> Vec<Polygon<f64>> {
+    let segments = bucket_split_segments_at_intersections(segments);
+    if segments.len() < 3 {
+        return Vec::new();
+    }
+
+    let mut nodes = Vec::<Vec2>::new();
+    let mut node_map = std::collections::HashMap::<(i64, i64), usize>::new();
+    let mut edges = std::collections::BTreeSet::<(usize, usize)>::new();
+    for segment in segments {
+        let a = bucket_graph_node(&mut nodes, &mut node_map, segment.a);
+        let b = bucket_graph_node(&mut nodes, &mut node_map, segment.b);
+        if a == b {
+            continue;
+        }
+        edges.insert(if a < b { (a, b) } else { (b, a) });
+    }
+    if edges.len() < 3 {
+        return Vec::new();
+    }
+
+    let mut adjacency = vec![Vec::<usize>::new(); nodes.len()];
+    for &(a, b) in &edges {
+        adjacency[a].push(b);
+        adjacency[b].push(a);
+    }
+    for (node, neighbours) in adjacency.iter_mut().enumerate() {
+        neighbours.sort_unstable();
+        neighbours.dedup();
+        neighbours.sort_by(|left, right| {
+            let l = nodes[*left];
+            let r = nodes[*right];
+            let origin = nodes[node];
+            let la = (l.y - origin.y).atan2(l.x - origin.x);
+            let ra = (r.y - origin.y).atan2(r.x - origin.x);
+            la.total_cmp(&ra)
         });
     }
 
-    let q0rg = project.q0rgs.iter().find(|q0rg| q0rg.q0rg_id == q0rg_id)?;
-    for layer in q0rg.layers.iter().rev() {
-        if !project.layer_is_visible(q0rg_id, layer.layer_id)
-            || project.layer_is_locked(q0rg_id, layer.layer_id)
-        {
+    let mut visited = std::collections::BTreeSet::<(usize, usize)>::new();
+    let mut faces = Vec::new();
+    for &(a, b) in &edges {
+        for (start_from, start_to) in [(a, b), (b, a)] {
+            if visited.contains(&(start_from, start_to)) {
+                continue;
+            }
+            let start = (start_from, start_to);
+            let mut from = start_from;
+            let mut to = start_to;
+            let mut ring = vec![from];
+            let mut closed = false;
+            let max_steps = edges.len().saturating_mul(2).saturating_add(4);
+            for _ in 0..max_steps {
+                if !visited.insert((from, to)) {
+                    break;
+                }
+                ring.push(to);
+                let neighbours = &adjacency[to];
+                let Some(reverse_index) =
+                    neighbours.iter().position(|candidate| *candidate == from)
+                else {
+                    break;
+                };
+                // Follow the face on the left side of the directed edge: at the
+                // next vertex take the immediately clockwise edge from reverse.
+                let next_index = if reverse_index == 0 {
+                    neighbours.len() - 1
+                } else {
+                    reverse_index - 1
+                };
+                let next = neighbours[next_index];
+                from = to;
+                to = next;
+                if (from, to) == start {
+                    closed = true;
+                    break;
+                }
+            }
+            if !closed || ring.len() < 4 {
+                continue;
+            }
+            let area = bucket_signed_ring_area(&ring, &nodes);
+            if area <= 0.05 {
+                continue;
+            }
+            let coords: Vec<Coord<f64>> = ring
+                .iter()
+                .map(|index| Coord {
+                    x: nodes[*index].x as f64,
+                    y: nodes[*index].y as f64,
+                })
+                .collect();
+            faces.push(Polygon::new(LineString(coords), Vec::new()));
+        }
+    }
+    faces
+}
+
+fn bucket_split_segments_at_intersections(
+    segments: &[BucketBoundarySegment],
+) -> Vec<BucketBoundarySegment> {
+    if segments.is_empty() {
+        return Vec::new();
+    }
+    let mut splits = vec![vec![0.0_f64, 1.0_f64]; segments.len()];
+    let mut cells = std::collections::HashMap::<(i32, i32), Vec<usize>>::new();
+    const CELL: f32 = 64.0;
+    for (index, segment) in segments.iter().enumerate() {
+        let min_x = segment.a.x.min(segment.b.x);
+        let max_x = segment.a.x.max(segment.b.x);
+        let min_y = segment.a.y.min(segment.b.y);
+        let max_y = segment.a.y.max(segment.b.y);
+        let x0 = (min_x / CELL).floor() as i32;
+        let x1 = (max_x / CELL).floor() as i32;
+        let y0 = (min_y / CELL).floor() as i32;
+        let y1 = (max_y / CELL).floor() as i32;
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                cells.entry((x, y)).or_default().push(index);
+            }
+        }
+    }
+    let mut pairs = std::collections::BTreeSet::<(usize, usize)>::new();
+    for bucket in cells.values() {
+        for left in 0..bucket.len() {
+            for right in (left + 1)..bucket.len() {
+                let a = bucket[left];
+                let b = bucket[right];
+                if a != b {
+                    pairs.insert(if a < b { (a, b) } else { (b, a) });
+                }
+            }
+        }
+    }
+    for (left, right) in pairs {
+        if !bucket_segment_bounds_overlap(segments[left], segments[right]) {
             continue;
         }
-        for placement_idx in active_raw_placement_indices(project, layer, frame)
-            .into_iter()
-            .rev()
-        {
-            let placement = &layer.placements[placement_idx];
-            let Target::Asset(asset_id) = placement.target else {
+        let (head, tail) = splits.split_at_mut(right);
+        bucket_add_segment_intersections(
+            segments[left],
+            segments[right],
+            &mut head[left],
+            &mut tail[0],
+        );
+    }
+
+    let mut out = Vec::new();
+    for (segment, mut params) in segments.iter().copied().zip(splits) {
+        params.sort_by(|a, b| a.total_cmp(b));
+        params.dedup_by(|a, b| (*a - *b).abs() <= 1e-7);
+        for pair in params.windows(2) {
+            if pair[1] - pair[0] <= 1e-7 {
                 continue;
-            };
-            let Some(Asset::Vector(vector)) =
-                project.assets.iter().find(|asset| asset.id() == asset_id)
-            else {
-                continue;
-            };
-            let best = vector
-                .paths
-                .iter()
-                .enumerate()
-                .filter(|(_, path)| path.closed)
-                .filter_map(|(path_idx, path)| {
-                    let points = flatten_path(path);
-                    (points.len() >= 3
-                        && (point_in_polygon(&points, cursor)
-                            || nearest_segment_distance(&points, cursor) <= 2.0))
-                        .then_some((path_idx, signed_path_area(path).abs()))
-                })
-                .min_by(|left, right| left.1.total_cmp(&right.1));
-            if let Some((path_idx, _)) = best {
-                return Some(BucketTarget {
-                    layer_id: layer.layer_id,
-                    placement_idx,
-                    asset_id,
-                    path_indices: vec![path_idx],
-                    kind: BucketTargetKind::EmptyBoundary,
-                });
             }
+            let a = bucket_lerp(segment, pair[0]);
+            let b = bucket_lerp(segment, pair[1]);
+            if bucket_distance_sq(a, b) > 1e-8 {
+                out.push(BucketBoundarySegment { a, b });
+            }
+        }
+    }
+    out
+}
+
+fn bucket_add_segment_intersections(
+    left: BucketBoundarySegment,
+    right: BucketBoundarySegment,
+    left_splits: &mut Vec<f64>,
+    right_splits: &mut Vec<f64>,
+) {
+    let px = left.a.x as f64;
+    let py = left.a.y as f64;
+    let rx = (left.b.x - left.a.x) as f64;
+    let ry = (left.b.y - left.a.y) as f64;
+    let qx = right.a.x as f64;
+    let qy = right.a.y as f64;
+    let sx = (right.b.x - right.a.x) as f64;
+    let sy = (right.b.y - right.a.y) as f64;
+    let cross = |ax: f64, ay: f64, bx: f64, by: f64| ax * by - ay * bx;
+    let dot = |ax: f64, ay: f64, bx: f64, by: f64| ax * bx + ay * by;
+    let rxs = cross(rx, ry, sx, sy);
+    let qpx = qx - px;
+    let qpy = qy - py;
+    let qpxr = cross(qpx, qpy, rx, ry);
+    const EPS: f64 = 1e-9;
+
+    if rxs.abs() > EPS {
+        let t = cross(qpx, qpy, sx, sy) / rxs;
+        let u = cross(qpx, qpy, rx, ry) / rxs;
+        if (-1e-7..=1.0 + 1e-7).contains(&t) && (-1e-7..=1.0 + 1e-7).contains(&u) {
+            left_splits.push(t.clamp(0.0, 1.0));
+            right_splits.push(u.clamp(0.0, 1.0));
+        }
+        return;
+    }
+    if qpxr.abs() > EPS {
+        return;
+    }
+
+    let rr = dot(rx, ry, rx, ry);
+    let ss = dot(sx, sy, sx, sy);
+    if rr <= EPS || ss <= EPS {
+        return;
+    }
+    for (x, y) in [(qx, qy), (qx + sx, qy + sy)] {
+        let t = dot(x - px, y - py, rx, ry) / rr;
+        if (-1e-7..=1.0 + 1e-7).contains(&t) {
+            left_splits.push(t.clamp(0.0, 1.0));
+        }
+    }
+    for (x, y) in [(px, py), (px + rx, py + ry)] {
+        let u = dot(x - qx, y - qy, sx, sy) / ss;
+        if (-1e-7..=1.0 + 1e-7).contains(&u) {
+            right_splits.push(u.clamp(0.0, 1.0));
+        }
+    }
+}
+
+fn bucket_segment_bounds_overlap(
+    left: BucketBoundarySegment,
+    right: BucketBoundarySegment,
+) -> bool {
+    const EPS: f32 = 1e-4;
+    left.a.x.min(left.b.x) <= right.a.x.max(right.b.x) + EPS
+        && left.a.x.max(left.b.x) + EPS >= right.a.x.min(right.b.x)
+        && left.a.y.min(left.b.y) <= right.a.y.max(right.b.y) + EPS
+        && left.a.y.max(left.b.y) + EPS >= right.a.y.min(right.b.y)
+}
+
+fn bucket_lerp(segment: BucketBoundarySegment, t: f64) -> Vec2 {
+    let t = t as f32;
+    Vec2::new(
+        segment.a.x + (segment.b.x - segment.a.x) * t,
+        segment.a.y + (segment.b.y - segment.a.y) * t,
+    )
+}
+
+fn bucket_distance_sq(a: Vec2, b: Vec2) -> f32 {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    dx * dx + dy * dy
+}
+
+fn bucket_graph_node(
+    nodes: &mut Vec<Vec2>,
+    node_map: &mut std::collections::HashMap<(i64, i64), usize>,
+    point: Vec2,
+) -> usize {
+    const QUANTIZE: f64 = 10_000.0;
+    let key = (
+        (point.x as f64 * QUANTIZE).round() as i64,
+        (point.y as f64 * QUANTIZE).round() as i64,
+    );
+    if let Some(index) = node_map.get(&key) {
+        return *index;
+    }
+    let index = nodes.len();
+    nodes.push(point);
+    node_map.insert(key, index);
+    index
+}
+
+fn bucket_signed_ring_area(ring: &[usize], nodes: &[Vec2]) -> f64 {
+    if ring.len() < 4 {
+        return 0.0;
+    }
+    let mut twice_area = 0.0_f64;
+    for pair in ring.windows(2) {
+        let a = nodes[pair[0]];
+        let b = nodes[pair[1]];
+        twice_area += a.x as f64 * b.y as f64 - b.x as f64 * a.y as f64;
+    }
+    twice_area * 0.5
+}
+/// Resolve the connected filled raw region on the active editable layer.
+/// Empty-space regions are handled separately by `find_empty_bucket_region`,
+/// which polygonizes the planar boundary graph rather than guessing one path.
+fn find_bucket_target(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    frame: u16,
+    cursor: Vec2,
+) -> Option<BucketTarget> {
+    if !project.layer_is_visible(q0rg_id, layer_id) || project.layer_is_locked(q0rg_id, layer_id) {
+        return None;
+    }
+    let layer = project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)?
+        .layers
+        .iter()
+        .find(|layer| layer.layer_id == layer_id)?;
+
+    for placement_idx in active_raw_placement_indices(project, layer, frame)
+        .into_iter()
+        .rev()
+    {
+        let placement = &layer.placements[placement_idx];
+        let Target::Asset(asset_id) = placement.target else {
+            continue;
+        };
+        let Some(Asset::Vector(vector)) =
+            project.assets.iter().find(|asset| asset.id() == asset_id)
+        else {
+            continue;
+        };
+        if vector.fill.is_none() {
+            continue;
+        }
+        let Some(component) = selectable_component_at_cursor(project, asset_id, vector, cursor)
+        else {
+            continue;
+        };
+        let path_indices: Vec<usize> = vector
+            .paths
+            .iter()
+            .enumerate()
+            .filter(|(_, path)| path.closed)
+            .filter_map(|(path_idx, path)| {
+                path.anchors
+                    .iter()
+                    .any(|anchor| polygon_boundary_near_cursor(&component, anchor.point, 0.5))
+                    .then_some(path_idx)
+            })
+            .collect();
+        if !path_indices.is_empty() {
+            return Some(BucketTarget {
+                layer_id,
+                placement_idx,
+                asset_id,
+                path_indices,
+            });
         }
     }
     None
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10415,6 +10806,8 @@ mod tests {
             asset_names: std::collections::HashMap::new(),
             asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
                 name: "Scene".into(),
@@ -10469,6 +10862,8 @@ mod tests {
             asset_names: std::collections::HashMap::new(),
             asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![
                 Q0rg {
                     q0rg_id: 1,
@@ -10566,6 +10961,8 @@ mod tests {
             asset_names: std::collections::HashMap::new(),
             asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
                 name: "Scene".into(),
@@ -11335,6 +11732,8 @@ mod tests {
             asset_names: std::collections::HashMap::new(),
             asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
                 name: "Scene".into(),
@@ -11486,6 +11885,8 @@ mod tests {
             asset_names: std::collections::HashMap::new(),
             asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
                 name: "Scene".into(),
@@ -11660,6 +12061,8 @@ mod tests {
             asset_names: std::collections::HashMap::new(),
             asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
                 name: "Scene".into(),
@@ -11783,6 +12186,8 @@ mod tests {
             asset_names: std::collections::HashMap::new(),
             asset_appearances: appearances,
             layer_metadata: std::collections::HashMap::new(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
                 name: "Scene".into(),
@@ -13001,6 +13406,8 @@ mod tests {
             asset_names: std::collections::HashMap::new(),
             asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
                 name: "Scene".into(),
@@ -13075,6 +13482,8 @@ mod tests {
             asset_names: std::collections::HashMap::new(),
             asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![
                 Q0rg {
                     q0rg_id: 1,
@@ -13792,6 +14201,8 @@ mod tests {
             asset_names: std::collections::HashMap::new(),
             asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
                 name: "S".into(),
@@ -13813,23 +14224,22 @@ mod tests {
             }],
         };
         assert_eq!(
-            find_bucket_target(&project, 1, 0, Vec2::new(10.0, 10.0)),
+            find_bucket_target(&project, 1, 1, 0, Vec2::new(10.0, 10.0)),
             Some(BucketTarget {
                 layer_id: 1,
                 placement_idx: 0,
                 asset_id: 7,
                 path_indices: vec![0],
-                kind: BucketTargetKind::ExistingFill,
             })
         );
         assert_eq!(
-            find_bucket_target(&project, 1, 0, Vec2::new(50.0, 50.0)),
+            find_bucket_target(&project, 1, 1, 0, Vec2::new(50.0, 50.0)),
             None
         );
 
         project.q0rgs[0].layers[0].placements[0].transform.tx = 40.0;
         assert_eq!(
-            find_bucket_target(&project, 1, 0, Vec2::new(50.0, 10.0)),
+            find_bucket_target(&project, 1, 1, 0, Vec2::new(50.0, 10.0)),
             None,
             "transformed vector instances are objects, not raw bucket surfaces"
         );
@@ -13991,6 +14401,322 @@ mod tests {
             .unwrap();
         assert_eq!(old_paths, 1);
         assert_eq!(new_paths, 1);
+    }
+
+    #[test]
+    fn bucket_fills_region_formed_by_multiple_open_strokes() {
+        let line = |a: Vec2, b: Vec2| VPath {
+            anchors: vec![anchor(a), anchor(b)],
+            closed: false,
+        };
+        let new = Rgba {
+            r: 230,
+            g: 35,
+            b: 55,
+            a: 255,
+        };
+        let mut app = EditorApp::default();
+        app.state.project.assets = vec![Asset::Vector(VectorAsset {
+            asset_id: 1,
+            paths: vec![
+                line(Vec2::new(20.0, 20.0), Vec2::new(80.0, 20.0)),
+                line(Vec2::new(80.0, 20.0), Vec2::new(80.0, 80.0)),
+                line(Vec2::new(80.0, 80.0), Vec2::new(20.0, 80.0)),
+                line(Vec2::new(20.0, 80.0), Vec2::new(20.0, 20.0)),
+            ],
+            fill: None,
+            stroke: Some(blue_stroke()),
+        })];
+        app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            instance_id: 0,
+            frame: 0,
+            target: Target::Asset(1),
+            transform: Transform2D::IDENTITY,
+            tween: Tween::None,
+            fx: Default::default(),
+        }];
+        app.session.fill_color = Some(new);
+
+        assert!(
+            bucket_fill_at(&mut app, Vec2::new(50.0, 50.0)),
+            "four ordinary open stroke paths must form a fillable planar region"
+        );
+        let filled = app
+            .state
+            .project
+            .assets
+            .iter()
+            .find_map(|asset| match asset {
+                Asset::Vector(vector) if vector.fill == Some(new) => Some(vector),
+                _ => None,
+            })
+            .expect("bucket-created fill");
+        let surface = vector_fill_geometry(filled);
+        assert!(surface.contains(&Point::new(50.0, 50.0)));
+        assert!(!surface.contains(&Point::new(10.0, 10.0)));
+    }
+
+    #[test]
+    fn bucket_fills_face_created_by_crossing_open_strokes() {
+        let line = |a: Vec2, b: Vec2| VPath {
+            anchors: vec![anchor(a), anchor(b)],
+            closed: false,
+        };
+        let new = Rgba {
+            r: 210,
+            g: 45,
+            b: 70,
+            a: 255,
+        };
+        let mut app = EditorApp::default();
+        app.state.project.assets = vec![Asset::Vector(VectorAsset {
+            asset_id: 1,
+            paths: vec![
+                line(Vec2::new(0.0, 20.0), Vec2::new(100.0, 20.0)),
+                line(Vec2::new(0.0, 80.0), Vec2::new(100.0, 80.0)),
+                line(Vec2::new(20.0, 0.0), Vec2::new(20.0, 100.0)),
+                line(Vec2::new(80.0, 0.0), Vec2::new(80.0, 100.0)),
+            ],
+            fill: None,
+            stroke: Some(blue_stroke()),
+        })];
+        app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            instance_id: 0,
+            frame: 0,
+            target: Target::Asset(1),
+            transform: Transform2D::IDENTITY,
+            tween: Tween::None,
+            fx: Default::default(),
+        }];
+        app.session.fill_color = Some(new);
+
+        assert!(bucket_fill_at(&mut app, Vec2::new(50.0, 50.0)));
+        let filled = app
+            .state
+            .project
+            .assets
+            .iter()
+            .find_map(|asset| match asset {
+                Asset::Vector(vector) if vector.fill == Some(new) => Some(vector),
+                _ => None,
+            })
+            .expect("central planar face");
+        let surface = vector_fill_geometry(filled);
+        assert!(surface.contains(&Point::new(50.0, 50.0)));
+        assert!(
+            !surface.contains(&Point::new(10.0, 50.0)),
+            "bucket must stop at the intersection-created left boundary"
+        );
+    }
+
+    #[test]
+    fn bucket_only_edits_the_active_layer() {
+        let square = |asset_id: u16, color: Rgba| {
+            Asset::Vector(VectorAsset {
+                asset_id,
+                paths: vec![VPath {
+                    anchors: vec![
+                        anchor(Vec2::new(0.0, 0.0)),
+                        anchor(Vec2::new(40.0, 0.0)),
+                        anchor(Vec2::new(40.0, 40.0)),
+                        anchor(Vec2::new(0.0, 40.0)),
+                    ],
+                    closed: true,
+                }],
+                fill: Some(color),
+                stroke: None,
+            })
+        };
+        let bottom = Rgba {
+            r: 20,
+            g: 30,
+            b: 40,
+            a: 255,
+        };
+        let top = Rgba {
+            r: 70,
+            g: 80,
+            b: 90,
+            a: 255,
+        };
+        let new = Rgba {
+            r: 220,
+            g: 50,
+            b: 70,
+            a: 255,
+        };
+        let mut app = EditorApp::default();
+        app.state.project.assets = vec![square(1, bottom), square(2, top)];
+        app.state.project.q0rgs[0].layers = vec![
+            Layer {
+                layer_id: 1,
+                name: "active".into(),
+                explicit_keyframes: Vec::new(),
+                placements: vec![Placement {
+                    instance_id: 0,
+                    frame: 0,
+                    target: Target::Asset(1),
+                    transform: Transform2D::IDENTITY,
+                    tween: Tween::None,
+                    fx: Default::default(),
+                }],
+            },
+            Layer {
+                layer_id: 2,
+                name: "other".into(),
+                explicit_keyframes: Vec::new(),
+                placements: vec![Placement {
+                    instance_id: 0,
+                    frame: 0,
+                    target: Target::Asset(2),
+                    transform: Transform2D::IDENTITY,
+                    tween: Tween::None,
+                    fx: Default::default(),
+                }],
+            },
+        ];
+        app.session.current_layer_id = 1;
+        app.session.fill_color = Some(new);
+
+        assert!(bucket_fill_at(&mut app, Vec2::new(20.0, 20.0)));
+        let fill_for = |asset_id| {
+            app.state
+                .project
+                .assets
+                .iter()
+                .find(|asset| asset.id() == asset_id)
+                .and_then(|asset| match asset {
+                    Asset::Vector(vector) => vector.fill,
+                    _ => None,
+                })
+        };
+        assert_eq!(fill_for(1), Some(new));
+        assert_eq!(
+            fill_for(2),
+            Some(top),
+            "a visually higher raw layer must not steal a paint-bucket click from the active layer"
+        );
+    }
+    #[test]
+    fn bucket_recolour_preserves_bezier_geometry_exactly() {
+        let old = Rgba {
+            r: 25,
+            g: 30,
+            b: 35,
+            a: 255,
+        };
+        let new = Rgba {
+            r: 225,
+            g: 45,
+            b: 65,
+            a: 255,
+        };
+        let mut a0 = anchor(Vec2::new(10.0, 20.0));
+        a0.out_handle = Some(Vec2::new(35.0, -5.0));
+        let mut a1 = anchor(Vec2::new(90.0, 20.0));
+        a1.in_handle = Some(Vec2::new(65.0, -5.0));
+        let curved = VPath {
+            anchors: vec![
+                a0,
+                a1,
+                anchor(Vec2::new(90.0, 90.0)),
+                anchor(Vec2::new(10.0, 90.0)),
+            ],
+            closed: true,
+        };
+        let original = curved.clone();
+        let mut app = EditorApp::default();
+        app.state.project.assets = vec![Asset::Vector(VectorAsset {
+            asset_id: 1,
+            paths: vec![curved],
+            fill: Some(old),
+            stroke: None,
+        })];
+        app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            instance_id: 0,
+            frame: 0,
+            target: Target::Asset(1),
+            transform: Transform2D::IDENTITY,
+            tween: Tween::None,
+            fx: Default::default(),
+        }];
+        app.session.fill_color = Some(new);
+
+        assert!(bucket_fill_at(&mut app, Vec2::new(50.0, 50.0)));
+        let recoloured = app
+            .state
+            .project
+            .assets
+            .iter()
+            .find_map(|asset| match asset {
+                Asset::Vector(vector) if vector.fill == Some(new) => Some(vector),
+                _ => None,
+            })
+            .expect("recoloured vector");
+        assert_eq!(
+            recoloured.paths,
+            vec![original],
+            "paint bucket must never polygonize an existing bezier fill just to change its colour"
+        );
+    }
+
+    #[test]
+    fn bucket_split_recolour_keeps_selected_outline() {
+        let square = |x: f32| VPath {
+            anchors: vec![
+                anchor(Vec2::new(x, 0.0)),
+                anchor(Vec2::new(x + 20.0, 0.0)),
+                anchor(Vec2::new(x + 20.0, 20.0)),
+                anchor(Vec2::new(x, 20.0)),
+            ],
+            closed: true,
+        };
+        let old = Rgba {
+            r: 30,
+            g: 40,
+            b: 50,
+            a: 255,
+        };
+        let new = Rgba {
+            r: 220,
+            g: 60,
+            b: 80,
+            a: 255,
+        };
+        let outline = blue_stroke();
+        let mut app = EditorApp::default();
+        app.state.project.assets = vec![Asset::Vector(VectorAsset {
+            asset_id: 1,
+            paths: vec![square(0.0), square(100.0)],
+            fill: Some(old),
+            stroke: Some(outline),
+        })];
+        app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            instance_id: 0,
+            frame: 0,
+            target: Target::Asset(1),
+            transform: Transform2D::IDENTITY,
+            tween: Tween::None,
+            fx: Default::default(),
+        }];
+        app.session.fill_color = Some(new);
+
+        assert!(bucket_fill_at(&mut app, Vec2::new(10.0, 10.0)));
+        let recoloured = app
+            .state
+            .project
+            .assets
+            .iter()
+            .find_map(|asset| match asset {
+                Asset::Vector(vector) if vector.fill == Some(new) => Some(vector),
+                _ => None,
+            })
+            .expect("split recoloured component");
+        assert_eq!(
+            recoloured.stroke.as_ref(),
+            Some(&outline),
+            "recolouring one component must not delete its original outline"
+        );
     }
 
     #[test]
@@ -14207,6 +14933,8 @@ mod tests {
             asset_names: std::collections::HashMap::new(),
             asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
                 name: "Scene".into(),
@@ -14297,6 +15025,8 @@ mod tests {
             asset_names: std::collections::HashMap::new(),
             asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
                 name: "Scene".into(),
@@ -14444,6 +15174,8 @@ mod tests {
             asset_names: std::collections::HashMap::new(),
             asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![
                 Q0rg {
                     q0rg_id: 1,
@@ -15448,6 +16180,8 @@ mod tests {
             asset_names: Default::default(),
             asset_appearances: Default::default(),
             layer_metadata: Default::default(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
                 name: "Stage".into(),

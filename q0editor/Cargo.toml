@@ -19,6 +19,7 @@ eframe = "0.27"
 egui = "0.27"
 q0s-format = { path = "../q0s-format" }
 q0video = { path = "../q0video" }
+rodio = "0.20"
 q0theme = { path = "../q0theme" }
 rfd = "0.14"
 serde = { version = "1", features = ["derive"] }

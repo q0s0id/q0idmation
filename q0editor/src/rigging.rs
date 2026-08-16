@@ -5338,6 +5338,8 @@ mod tests {
             asset_names: Default::default(),
             asset_appearances: Default::default(),
             layer_metadata: Default::default(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
                 name: "Stage".into(),

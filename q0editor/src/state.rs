@@ -111,7 +111,7 @@ impl Tool {
             Tool::Line => "Line",
             Tool::Rectangle => "Rectangle",
             Tool::Oval => "Oval",
-            Tool::Bucket => "Recolor Fill",
+            Tool::Bucket => "Paint Bucket",
             Tool::Eyedropper => "Eyedropper",
             Tool::Rig => "Rig",
         }
@@ -232,6 +232,9 @@ pub struct TimelineFrameClipboardRow {
     pub source_layer_id: u16,
     pub explicit_keyframes: Vec<u16>,
     pub placements: Vec<Placement>,
+    /// Frame scripts are timeline data, not display objects. Frames are stored
+    /// relative to the copied range, exactly like placements/keyframe markers.
+    pub frame_scripts: Vec<q0s_format::v2::FrameScript>,
 }
 
 #[derive(Debug, Clone)]
@@ -248,6 +251,7 @@ pub struct TimelineFrameClipboard {
 pub struct TimelineLayerClipboard {
     pub layers: Vec<Layer>,
     pub metadata: Vec<(u16, LayerMetadata)>,
+    pub frame_scripts: Vec<q0s_format::v2::FrameScript>,
 }
 
 #[derive(Debug, Clone)]
@@ -662,6 +666,14 @@ pub enum BrushSizePreview {
     MinimumSize,
 }
 
+#[derive(Debug, Clone)]
+pub struct FrameScriptEditor {
+    pub q0rg_id: u16,
+    pub layer_id: u16,
+    pub frame: u16,
+    pub source: String,
+}
+
 pub struct Session {
     pub current_q0rg_id: u16,
     pub current_layer_id: u16,
@@ -687,6 +699,13 @@ pub struct Session {
     pub timeline_frame_drag: Option<TimelineFrameDrag>,
     pub playing: bool,
     pub last_tick: Instant,
+    /// Persistent q0lang state for editor playback preview. Scrubbing does not
+    /// execute it; playback/frame-runtime transitions do.
+    pub preview_q0lang_runtime: q0s_format::q0lang::runtime::Runtime,
+    pub preview_q0lang_initialized: bool,
+    pub preview_script_diagnostics: Vec<q0s_format::q0lang::runtime::RuntimeDiagnostic>,
+    pub preview_frame_script_entries: u64,
+    pub preview_audio_resync_needed: bool,
     pub status: String,
     pub stroke_color: Rgba,
     pub stroke_width: f32,
@@ -752,9 +771,22 @@ pub struct Session {
     /// edit session) and back off after the first snapshot, so a long
     /// burst of typing collapses to a single undo entry.
     pub q0lang_edit_armed: bool,
+    /// Non-modal editor for code attached to one concrete timeline cell.
+    pub frame_script_editor: Option<FrameScriptEditor>,
+    /// Selection and inline rename state for the linked project graph panel.
+    pub project_graph_selected: Option<u16>,
+    pub project_graph_rename: Option<(u16, String)>,
 }
 
 impl Session {
+    pub fn reset_q0lang_preview(&mut self) {
+        self.preview_q0lang_runtime = q0s_format::q0lang::runtime::Runtime::new();
+        self.preview_q0lang_initialized = false;
+        self.preview_script_diagnostics.clear();
+        self.preview_frame_script_entries = 0;
+        self.preview_audio_resync_needed = false;
+    }
+
     pub fn for_project(project: &ProjectV2) -> Self {
         let entry = project.meta.entry_q0rg_id;
         let layer_id = project
@@ -789,6 +821,11 @@ impl Session {
             timeline_frame_drag: None,
             playing: false,
             last_tick: Instant::now(),
+            preview_q0lang_runtime: q0s_format::q0lang::runtime::Runtime::new(),
+            preview_q0lang_initialized: false,
+            preview_script_diagnostics: Vec::new(),
+            preview_frame_script_entries: 0,
+            preview_audio_resync_needed: false,
             status: "ready".to_string(),
             stroke_color: Rgba {
                 r: 0,
@@ -833,6 +870,9 @@ impl Session {
             show_q0lang_editor: false,
             q0lang_target: None,
             q0lang_edit_armed: true,
+            frame_script_editor: None,
+            project_graph_selected: None,
+            project_graph_rename: None,
         }
     }
 
@@ -900,6 +940,7 @@ impl Session {
                 self.timeline_selection = None;
                 self.timeline_layer_selection = None;
                 self.timeline_frame_drag = None;
+                self.reset_q0lang_preview();
             } else if let Some(selection) = self.timeline_selection {
                 let layers_exist = q
                     .layers
@@ -1687,6 +1728,8 @@ pub fn default_project() -> ProjectV2 {
         asset_names: std::collections::HashMap::new(),
         asset_appearances: std::collections::HashMap::new(),
         layer_metadata: std::collections::HashMap::new(),
+        audio_clips: Vec::new(),
+        runtime: Default::default(),
         q0rgs: vec![Q0rg {
             q0rg_id: 1,
             name: "Stage".to_string(),

@@ -1,0 +1,22 @@
+[package]
+name = "canripper"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "q0idmation container and Flash inspector/extractor."
+
+[dependencies]
+eframe = "0.27"
+egui = "0.27"
+flate2 = "1"
+image = { version = "0.24.9", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+lzma-rs = "0.3"
+lyon_path = "1"
+lyon_tessellation = "1"
+q0s-format = { path = "../q0s-format" }
+q0video = { path = "../q0video" }
+q0theme = { path = "../q0theme" }
+rfd = "0.14"

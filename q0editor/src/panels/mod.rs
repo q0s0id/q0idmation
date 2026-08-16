@@ -7,3 +7,5 @@ pub mod stage;
 pub mod tabs;
 pub mod timeline;
 pub mod toolbar;
+
+pub mod project_tree;

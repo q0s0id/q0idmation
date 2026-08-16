@@ -19,10 +19,11 @@
 //! exporter could use `2`.
 
 use crate::geom::{brush_outline, flatten_path};
+use crate::runtime_scene::RuntimeSceneState;
 use crate::transform::Affine;
 use crate::v2::{
-    Asset, BitmapAsset, BlendMode, Placement, PlacementFx, ProjectV2, Rgba, Target, Transform2D,
-    Vec2, VectorAppearance, VectorAsset, VectorMaterial, MAX_Q0RG_NESTING_DEPTH,
+    Asset, BitmapAsset, BlendMode, InstanceKey, Placement, PlacementFx, ProjectV2, Rgba, Target,
+    Transform2D, Vec2, VectorAppearance, VectorAsset, VectorMaterial, MAX_Q0RG_NESTING_DEPTH,
 };
 
 /// Render one frame of `q0rg_id` (resolved against `project`) into an
@@ -65,6 +66,31 @@ pub fn rasterize_q0rg_frame_with_rig_overrides(
     bg_rgba: [u8; 4],
     rig_overrides: &crate::rig::RigRuntimeOverrides,
 ) -> Vec<u8> {
+    rasterize_q0rg_frame_with_runtime_overrides(
+        project,
+        q0rg_id,
+        frame,
+        w,
+        h,
+        ss,
+        bg_rgba,
+        rig_overrides,
+        &RuntimeSceneState::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn rasterize_q0rg_frame_with_runtime_overrides(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    frame: u16,
+    w: u32,
+    h: u32,
+    ss: u32,
+    bg_rgba: [u8; 4],
+    rig_overrides: &crate::rig::RigRuntimeOverrides,
+    scene_state: &RuntimeSceneState,
+) -> Vec<u8> {
     rasterize_q0rg_frame_with_root_transform(
         project,
         q0rg_id,
@@ -75,6 +101,7 @@ pub fn rasterize_q0rg_frame_with_rig_overrides(
         bg_rgba,
         Affine::IDENTITY,
         rig_overrides,
+        scene_state,
     )
 }
 
@@ -251,6 +278,7 @@ fn placement_target_stage_bounds(
     local_frame: u16,
     composed: Affine,
     depth: u8,
+    scene_state: &RuntimeSceneState,
 ) -> Option<StageBounds> {
     if depth > MAX_Q0RG_NESTING_DEPTH {
         return None;
@@ -276,9 +304,14 @@ fn placement_target_stage_bounds(
             asset_stage_bounds(project, deformed.as_ref().unwrap_or(asset), composed)
         }
 
-        Target::Q0rg(child_id) if child_id != host_q0rg_id => {
-            q0rg_stage_bounds(project, child_id, local_frame, composed, depth + 1)
-        }
+        Target::Q0rg(child_id) if child_id != host_q0rg_id => q0rg_stage_bounds(
+            project,
+            child_id,
+            local_frame,
+            composed,
+            depth + 1,
+            scene_state,
+        ),
         Target::Q0rg(_) => None,
     }
 }
@@ -289,6 +322,7 @@ fn q0rg_stage_bounds(
     frame: u16,
     parent: Affine,
     depth: u8,
+    scene_state: &RuntimeSceneState,
 ) -> Option<StageBounds> {
     if depth > MAX_Q0RG_NESTING_DEPTH {
         return None;
@@ -310,10 +344,12 @@ fn q0rg_stage_bounds(
             let Some(placement) = layer.placements.get(active.index) else {
                 continue;
             };
-            let local_affine = rig_pose
+            let authored_affine = rig_pose
                 .as_ref()
                 .and_then(|pose| pose.binding_transform(placement.instance_id))
                 .unwrap_or_else(|| Affine::from_transform(active.transform));
+            let key = InstanceKey::new(q0rg_id, placement.instance_id);
+            let local_affine = scene_state.effective_affine(key, authored_affine);
             let composed = Affine::compose(parent, local_affine);
             let Some(target_bounds) = placement_target_stage_bounds(
                 project,
@@ -322,6 +358,7 @@ fn q0rg_stage_bounds(
                 local_frame,
                 composed,
                 depth,
+                scene_state,
             ) else {
                 continue;
             };
@@ -334,6 +371,88 @@ fn q0rg_stage_bounds(
         }
     }
     bounds
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RuntimeInstanceMetrics {
+    pub x: f32,
+    pub y: f32,
+    pub left: f32,
+    pub right: f32,
+    pub top: f32,
+    pub bottom: f32,
+}
+
+impl RuntimeInstanceMetrics {
+    pub fn width(self) -> f32 {
+        self.right - self.left
+    }
+
+    pub fn height(self) -> f32 {
+        self.bottom - self.top
+    }
+}
+
+/// Resolve one stable display-object instance at a host q0rg frame using the
+/// same visual bounds path as the shared renderer. Runtime position overrides
+/// are ephemeral and do not mutate `ProjectV2`.
+pub fn runtime_instance_metrics(
+    project: &ProjectV2,
+    host_q0rg_id: u16,
+    frame: u16,
+    instance_id: u32,
+    scene_state: &RuntimeSceneState,
+) -> Option<RuntimeInstanceMetrics> {
+    if instance_id == 0 {
+        return None;
+    }
+    let q0rg = project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == host_q0rg_id)?;
+    let local_frame = if q0rg.frame_count > 0 {
+        frame % q0rg.frame_count
+    } else {
+        0
+    };
+    let rig_pose = crate::rig::rig_for_q0rg(project, host_q0rg_id)
+        .map(|rig| crate::rig::evaluate_rig(rig, f32::from(local_frame), &[]));
+    for layer in &q0rg.layers {
+        if !project.layer_is_visible(host_q0rg_id, layer.layer_id) {
+            continue;
+        }
+        for active in active_placement_states_at(layer, local_frame) {
+            let placement = layer.placements.get(active.index)?;
+            if placement.instance_id != instance_id {
+                continue;
+            }
+            let authored_affine = rig_pose
+                .as_ref()
+                .and_then(|pose| pose.binding_transform(instance_id))
+                .unwrap_or_else(|| Affine::from_transform(active.transform));
+            let key = InstanceKey::new(host_q0rg_id, instance_id);
+            let effective = scene_state.effective_affine(key, authored_affine);
+            let target = placement_target_stage_bounds(
+                project,
+                host_q0rg_id,
+                placement,
+                local_frame,
+                effective,
+                0,
+                scene_state,
+            )?;
+            let visible = bounds_with_placement_fx(target, active.fx, effective.uniform_scale());
+            return Some(RuntimeInstanceMetrics {
+                x: effective.tx,
+                y: effective.ty,
+                left: visible.min_x,
+                right: visible.max_x,
+                top: visible.min_y,
+                bottom: visible.max_y,
+            });
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -371,6 +490,7 @@ pub fn rasterize_placement_fx_scaled_cropped(
         local_frame,
         composed_stage_transform,
         0,
+        &RuntimeSceneState::new(),
     )?;
     let fx_bounds =
         bounds_with_placement_fx(target_bounds, fx, composed_stage_transform.uniform_scale());
@@ -417,6 +537,7 @@ pub fn rasterize_placement_fx_scaled_cropped(
         local_height,
         0,
         &crate::rig::RigRuntimeOverrides::new(),
+        &RuntimeSceneState::new(),
         rig,
         rig_pose.as_ref(),
     );
@@ -480,6 +601,7 @@ pub fn rasterize_placement_outer_fx_scaled_cropped(
         local_frame,
         composed_stage_transform,
         0,
+        &RuntimeSceneState::new(),
     )?;
     let outer_fx = PlacementFx {
         opacity: fx.opacity,
@@ -487,6 +609,8 @@ pub fn rasterize_placement_outer_fx_scaled_cropped(
         blur: None,
         glow: fx.glow,
         shadow: fx.shadow,
+        audio_gain: fx.audio_gain,
+        audio_muted: fx.audio_muted,
     };
     let fx_bounds = bounds_with_placement_fx(
         target_bounds,
@@ -535,6 +659,7 @@ pub fn rasterize_placement_outer_fx_scaled_cropped(
         local_height,
         0,
         &crate::rig::RigRuntimeOverrides::new(),
+        &RuntimeSceneState::new(),
         rig,
         rig_pose.as_ref(),
     );
@@ -644,6 +769,7 @@ pub fn rasterize_q0rg_frame_scaled_with_rig_overrides(
         bg_rgba,
         root,
         rig_overrides,
+        &RuntimeSceneState::new(),
     )
 }
 
@@ -658,6 +784,7 @@ fn rasterize_q0rg_frame_with_root_transform(
     bg_rgba: [u8; 4],
     root: Affine,
     rig_overrides: &crate::rig::RigRuntimeOverrides,
+    scene_state: &RuntimeSceneState,
 ) -> Vec<u8> {
     let ss = ss.max(1);
     let sw = w.saturating_mul(ss);
@@ -676,6 +803,7 @@ fn rasterize_q0rg_frame_with_root_transform(
         sh,
         0,
         rig_overrides,
+        scene_state,
     );
     if ss == 1 {
         return hi;
@@ -732,6 +860,7 @@ fn render_to_buffer(
     h: u32,
     depth: u8,
     rig_overrides: &crate::rig::RigRuntimeOverrides,
+    scene_state: &RuntimeSceneState,
 ) {
     if depth > MAX_Q0RG_NESTING_DEPTH {
         return;
@@ -759,10 +888,12 @@ fn render_to_buffer(
             let Some(placement) = layer.placements.get(active.index) else {
                 continue;
             };
-            let local_affine = rig_pose
+            let authored_affine = rig_pose
                 .as_ref()
                 .and_then(|pose| pose.binding_transform(placement.instance_id))
                 .unwrap_or_else(|| Affine::from_transform(active.transform));
+            let key = InstanceKey::new(q0rg_id, placement.instance_id);
+            let local_affine = scene_state.effective_affine(key, authored_affine);
             let composed = Affine::compose(parent, local_affine);
             if active.fx.is_identity() {
                 render_placement_target(
@@ -776,6 +907,7 @@ fn render_to_buffer(
                     h,
                     depth,
                     rig_overrides,
+                    scene_state,
                     crate::rig::rig_for_q0rg(project, q0rg_id),
                     rig_pose.as_ref(),
                 );
@@ -792,6 +924,7 @@ fn render_to_buffer(
                     h,
                     depth,
                     rig_overrides,
+                    scene_state,
                     crate::rig::rig_for_q0rg(project, q0rg_id),
                     rig_pose.as_ref(),
                 );
@@ -813,6 +946,7 @@ fn render_placement_target(
     h: u32,
     depth: u8,
     rig_overrides: &crate::rig::RigRuntimeOverrides,
+    scene_state: &RuntimeSceneState,
     rig: Option<&crate::v2::RigAsset>,
     rig_pose: Option<&crate::rig::RigPose>,
 ) {
@@ -860,6 +994,7 @@ fn render_placement_target(
                 h,
                 depth + 1,
                 rig_overrides,
+                scene_state,
             );
         }
         _ => {}
@@ -1088,6 +1223,8 @@ fn placement_fx_in_pixels(fx: PlacementFx, scale: f32) -> PlacementFx {
             offset_y: shadow.offset_y * scale,
             ..shadow
         }),
+        audio_gain: fx.audio_gain,
+        audio_muted: fx.audio_muted,
     }
 }
 
@@ -2278,6 +2415,8 @@ mod resolver_tests {
             asset_names: Default::default(),
             asset_appearances: Default::default(),
             layer_metadata: Default::default(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
                 name: "Stage".to_string(),
@@ -2390,6 +2529,8 @@ mod resolver_tests {
             asset_names: Default::default(),
             asset_appearances: Default::default(),
             layer_metadata: Default::default(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
                 name: "Stage".to_string(),
@@ -2483,6 +2624,8 @@ mod resolver_tests {
             asset_names: Default::default(),
             asset_appearances: Default::default(),
             layer_metadata: Default::default(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
                 name: "Stage".to_string(),
@@ -3247,6 +3390,8 @@ mod resolver_tests {
             asset_names: std::collections::HashMap::new(),
             asset_appearances: appearances,
             layer_metadata: std::collections::HashMap::new(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![
                 Q0rg {
                     q0rg_id: 1,
@@ -3330,6 +3475,8 @@ mod resolver_tests {
             asset_names: std::collections::HashMap::new(),
             asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
                 name: "stage".into(),
@@ -3369,6 +3516,8 @@ mod resolver_tests {
             asset_names: std::collections::HashMap::new(),
             asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
                 name: "stage".into(),
@@ -3505,6 +3654,8 @@ mod resolver_tests {
             asset_names: Default::default(),
             asset_appearances: Default::default(),
             layer_metadata: Default::default(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
                 name: "Stage".into(),

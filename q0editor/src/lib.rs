@@ -4,6 +4,7 @@ pub mod app;
 pub mod appearance;
 #[cfg(windows)]
 pub mod assoc;
+pub mod audio;
 mod bitmap_import;
 pub mod brush;
 pub mod easing;
@@ -18,6 +19,7 @@ pub mod render;
 pub mod rigging;
 pub mod selection_edit;
 pub mod settings;
+pub mod single_instance;
 pub mod state;
 pub mod theme;
 pub mod timeline_edit;

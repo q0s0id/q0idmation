@@ -25,8 +25,11 @@ use lyon_tessellation::geometry_builder::{BuffersBuilder, Positions, VertexBuffe
 use lyon_tessellation::{FillOptions, FillRule as LyonFillRule, FillTessellator};
 use q0s_format::geom::flatten_path;
 use q0s_format::raster::active_placement_states_at;
+use q0s_format::runtime_scene::RuntimeSceneState;
 use q0s_format::transform::Affine;
-use q0s_format::v2::{Asset, BlendMode, Placement, PlacementFx, ProjectV2, Rgba, Target, Vec2};
+use q0s_format::v2::{
+    Asset, BlendMode, InstanceKey, Placement, PlacementFx, ProjectV2, Rgba, Target, Vec2,
+};
 
 const Q0RG_RECURSION_LIMIT: u8 = 8;
 const BEZIER_SAMPLES: usize = 16;
@@ -118,6 +121,33 @@ pub fn paint_v2_frame_with_rig_overrides(
     white_stage_bg: bool,
     rig_overrides: &q0s_format::rig::RigRuntimeOverrides,
 ) {
+    paint_v2_frame_with_runtime_overrides(
+        painter,
+        ctx,
+        project,
+        q0rg_id,
+        frame,
+        target_rect,
+        cache,
+        white_stage_bg,
+        rig_overrides,
+        &RuntimeSceneState::new(),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn paint_v2_frame_with_runtime_overrides(
+    painter: &Painter,
+    ctx: &Context,
+    project: &ProjectV2,
+    q0rg_id: u16,
+    frame: u16,
+    target_rect: Rect,
+    cache: &mut TextureCache,
+    white_stage_bg: bool,
+    rig_overrides: &q0s_format::rig::RigRuntimeOverrides,
+    scene_state: &RuntimeSceneState,
+) {
     let stage_w = project.meta.stage_width.max(1) as f32;
     let stage_h = project.meta.stage_height.max(1) as f32;
     let scale = (target_rect.width() / stage_w)
@@ -144,6 +174,7 @@ pub fn paint_v2_frame_with_rig_overrides(
         0,
         cache,
         rig_overrides,
+        scene_state,
     );
 }
 
@@ -271,6 +302,7 @@ fn paint_q0rg(
     depth: u8,
     cache: &mut TextureCache,
     rig_overrides: &q0s_format::rig::RigRuntimeOverrides,
+    scene_state: &RuntimeSceneState,
 ) {
     if depth > Q0RG_RECURSION_LIMIT {
         return;
@@ -298,13 +330,15 @@ fn paint_q0rg(
             let Some(placement) = layer.placements.get(active.index) else {
                 continue;
             };
-            let local_affine = rig_pose
+            let authored_affine = rig_pose
                 .as_ref()
                 .and_then(|pose| pose.binding_transform(placement.instance_id))
                 .unwrap_or_else(|| Affine::from_transform(active.transform));
-            // Affine matrix composition: parent skew / non-uniform scale
-            // propagate cleanly into children, unlike the old SRSk
-            // decomposition which dropped them.
+            let key = InstanceKey::new(q0rg_id, placement.instance_id);
+            let local_affine = scene_state.effective_affine(key, authored_affine);
+            // Runtime scene state participates in the same affine composition
+            // as authored/rig transforms, so the crisp GUI renderer and the
+            // shared raster renderer cannot disagree about where an instance is.
             let composed = Affine::compose(parent, local_affine);
             if !active.fx.is_identity() {
                 paint_fx_placement(
@@ -350,6 +384,7 @@ fn paint_q0rg(
                         depth + 1,
                         cache,
                         rig_overrides,
+                        scene_state,
                     );
                 }
                 _ => {}
@@ -722,6 +757,132 @@ mod tests {
         assert_ne!(points.first(), points.last());
     }
     #[test]
+    fn interactive_player_renderer_applies_runtime_scene_overlay_to_nested_q0rg() {
+        use q0s_format::runtime_scene::RuntimeSceneState;
+        use q0s_format::v2::{
+            BitmapAsset, InstanceKey, Layer, Placement, ProjectMeta, Q0rg, Transform2D, Tween,
+        };
+
+        let project = ProjectV2 {
+            meta: ProjectMeta {
+                name: "runtime-gui-overlay".into(),
+                fps: 24,
+                stage_width: 16,
+                stage_height: 16,
+                entry_q0rg_id: 1,
+            },
+            assets: vec![Asset::Bitmap(BitmapAsset {
+                asset_id: 1,
+                width: 2,
+                height: 2,
+                rgba: [255, 0, 0, 255].repeat(4),
+            })],
+            asset_names: Default::default(),
+            asset_appearances: Default::default(),
+            layer_metadata: Default::default(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
+            q0rgs: vec![
+                Q0rg {
+                    q0rg_id: 1,
+                    name: "Stage".into(),
+                    frame_count: 1,
+                    script: String::new(),
+                    layers: vec![Layer {
+                        layer_id: 1,
+                        name: "player".into(),
+                        explicit_keyframes: vec![0],
+                        placements: vec![Placement {
+                            instance_id: 7,
+                            frame: 0,
+                            target: Target::Q0rg(2),
+                            transform: Transform2D {
+                                tx: 2.0,
+                                ty: 3.0,
+                                ..Transform2D::IDENTITY
+                            },
+                            tween: Tween::None,
+                            fx: Default::default(),
+                        }],
+                    }],
+                },
+                Q0rg {
+                    q0rg_id: 2,
+                    name: "PlayerSymbol".into(),
+                    frame_count: 1,
+                    script: String::new(),
+                    layers: vec![Layer {
+                        layer_id: 2,
+                        name: "body".into(),
+                        explicit_keyframes: vec![0],
+                        placements: vec![Placement {
+                            instance_id: 8,
+                            frame: 0,
+                            target: Target::Asset(1),
+                            transform: Transform2D::IDENTITY,
+                            tween: Tween::None,
+                            fx: Default::default(),
+                        }],
+                    }],
+                },
+            ],
+        };
+
+        let render_min_mesh_x = |scene: &RuntimeSceneState| {
+            let context = Context::default();
+            let target = Rect::from_min_size(Pos2::ZERO, egui::vec2(64.0, 64.0));
+            let mut cache = TextureCache::default();
+            let output = context.run(
+                egui::RawInput {
+                    screen_rect: Some(target),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let painter = ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Middle,
+                        egui::Id::new("runtime-overlay-render-test"),
+                    ));
+                    paint_v2_frame_with_runtime_overrides(
+                        &painter,
+                        ctx,
+                        &project,
+                        1,
+                        0,
+                        target,
+                        &mut cache,
+                        false,
+                        &q0s_format::rig::RigRuntimeOverrides::new(),
+                        scene,
+                    );
+                },
+            );
+            output
+                .shapes
+                .iter()
+                .flat_map(|clipped| match &clipped.shape {
+                    Shape::Mesh(mesh) => mesh.vertices.iter().map(|vertex| vertex.pos.x).collect(),
+                    _ => Vec::new(),
+                })
+                .fold(f32::INFINITY, f32::min)
+        };
+
+        let authored = RuntimeSceneState::new();
+        let authored_x = render_min_mesh_x(&authored);
+        assert!(authored_x.is_finite());
+
+        let mut moved = RuntimeSceneState::new();
+        moved.set_position(InstanceKey::new(1, 7), 8.0, 3.0);
+        let moved_x = render_min_mesh_x(&moved);
+
+        // 16 stage units fit into 64 screen points, so the +6 stage-unit
+        // runtime move must become exactly +24 screen points in the GUI mesh.
+        assert!(
+            ((moved_x - authored_x) - 24.0).abs() < 0.01,
+            "authored_x={authored_x}, moved_x={moved_x}"
+        );
+    }
+
+    #[test]
     fn interactive_player_renderer_omits_hidden_layers() {
         use q0s_format::v2::{
             BitmapAsset, Layer, LayerKey, LayerMetadata, Placement, ProjectMeta, Q0rg, Transform2D,
@@ -745,6 +906,8 @@ mod tests {
             asset_names: std::collections::HashMap::new(),
             asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
                 name: "Stage".into(),

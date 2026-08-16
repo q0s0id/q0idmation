@@ -10,6 +10,8 @@ use q0s_format::v2::{
 use q0s_format::{migrate_v1_to_v2, parse_q1s, Q1S_MAGIC};
 
 pub const Q1S_EXTENSION: &str = "q1s";
+pub const Q0LANG_EXTENSIONS: &[&str] = &["q0l", "q0lang"];
+pub const MAX_Q0LANG_BYTES: u64 = 8 * 1024 * 1024;
 /// Refuse unexpectedly large projects before allocating a matching buffer.
 /// Normal beta projects are far smaller; 256 MiB still leaves ample room for
 /// embedded raster assets while preventing accidental multi-gigabyte loads.
@@ -83,6 +85,10 @@ pub fn load_project(path: &Path) -> Result<ProjectV2, FileError> {
         let mut project = parse_v2(&bytes)?;
         if version < q0s_format::v2::Q1S_VERSION_RIGGING {
             q0s_format::v2::assign_missing_instance_ids(&mut project)?;
+        }
+        if version == q0s_format::v2::Q1S_VERSION_AUDIO_CLIP_FX {
+            crate::audio::migrate_legacy_audio_placements(&mut project);
+            q0s_format::v2::validate(&project)?;
         }
         Ok(project)
     } else {
@@ -247,11 +253,70 @@ pub(crate) fn replace_staged_file(staging_path: &Path, path: &Path) -> io::Resul
     }
 }
 
+pub fn is_q0lang_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            Q0LANG_EXTENSIONS
+                .iter()
+                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+        })
+}
+
+pub fn load_q0lang_document(path: &Path) -> io::Result<String> {
+    let size = fs::metadata(path)?.len();
+    if size > MAX_Q0LANG_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("q0lang source is too large ({size} bytes; limit is {MAX_Q0LANG_BYTES})"),
+        ));
+    }
+    let bytes = fs::read(path)?;
+    if bytes.len() as u64 > MAX_Q0LANG_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "q0lang source exceeded the size limit while reading",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("q0lang source must be utf-8: {error}"),
+        )
+    })
+}
+
+pub fn save_q0lang_document(path: &Path, text: &str) -> io::Result<()> {
+    if text.len() as u64 > MAX_Q0LANG_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("q0lang source is too large (limit is {MAX_Q0LANG_BYTES} bytes)"),
+        ));
+    }
+    write_bytes_atomic(path, text.as_bytes())
+}
+
 pub fn pick_open_path() -> Option<PathBuf> {
     rfd::FileDialog::new()
+        .add_filter("q0editor documents", &["q1s", "q0l", "q0lang"])
         .add_filter("q0s project (.q1s)", &[Q1S_EXTENSION])
+        .add_filter("q0lang source (.q0l, .q0lang)", Q0LANG_EXTENSIONS)
         .add_filter("any", &["*"])
         .pick_file()
+}
+
+pub fn pick_q0lang_save_path(suggested: Option<&Path>) -> Option<PathBuf> {
+    let default_name = suggested
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .unwrap_or("script.q0l");
+    let mut dialog = rfd::FileDialog::new()
+        .add_filter("q0lang source (.q0l, .q0lang)", Q0LANG_EXTENSIONS)
+        .set_file_name(default_name);
+    if let Some(parent) = suggested.and_then(Path::parent) {
+        dialog = dialog.set_directory(parent);
+    }
+    dialog.save_file()
 }
 
 pub fn pick_bitmap_import_path() -> Option<PathBuf> {
@@ -264,9 +329,12 @@ pub fn pick_media_import_path() -> Option<PathBuf> {
     rfd::FileDialog::new()
         .add_filter(
             "q0editor media",
-            &["png", "jpg", "jpeg", "webp", "mp4", "q0v"],
+            &[
+                "png", "jpg", "jpeg", "webp", "wav", "mp3", "ogg", "flac", "mp4", "q0v",
+            ],
         )
         .add_filter("video", &["mp4", "q0v"])
+        .add_filter("audio", &["wav", "mp3", "ogg", "flac"])
         .add_filter("bitmap image", &["png", "jpg", "jpeg", "webp"])
         .pick_file()
 }
@@ -467,6 +535,40 @@ mod tests {
             load_project(&path),
             Err(FileError::TooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn q0l_and_q0lang_are_the_same_utf8_source_format() {
+        let dir = TestDir::new("q0lang-source");
+        let q0l = dir
+            .0
+            .join("\u{441}\u{43a}\u{440}\u{438}\u{43f}\u{442} one.q0l");
+        let q0lang = dir
+            .0
+            .join("\u{441}\u{43a}\u{440}\u{438}\u{43f}\u{442} two.q0lang");
+        let source =
+            "import q0.math\nname = \"\u{433}\u{435}\u{440}\u{43e}\u{439}\"\nx = sin(pi / 2)\n";
+
+        save_q0lang_document(&q0l, source).expect("save .q0l");
+        save_q0lang_document(&q0lang, source).expect("save .q0lang");
+
+        assert!(is_q0lang_path(&q0l));
+        assert!(is_q0lang_path(&q0lang));
+        assert_eq!(load_q0lang_document(&q0l).expect("load .q0l"), source);
+        assert_eq!(load_q0lang_document(&q0lang).expect("load .q0lang"), source);
+    }
+
+    #[test]
+    fn q0lang_save_atomically_replaces_existing_source() {
+        let dir = TestDir::new("q0lang-atomic");
+        let path = dir.0.join("logic.q0l");
+        fs::write(&path, "old").expect("seed q0lang source");
+        save_q0lang_document(&path, "new\nsource\n").expect("replace q0lang source");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read replacement"),
+            "new\nsource\n"
+        );
+        assert_eq!(fs::read_dir(&dir.0).expect("read source dir").count(), 1);
     }
 
     #[test]

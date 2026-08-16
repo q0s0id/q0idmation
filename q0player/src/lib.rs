@@ -1,12 +1,17 @@
 pub mod ui;
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 
-use q0s_format::q0lang::runtime::{Runtime, RuntimeAction, RuntimeDiagnostic, TimelineTarget};
+use q0s_format::q0lang::runtime::{
+    Runtime, RuntimeAction, RuntimeDiagnostic, RuntimeValue, TimelineTarget,
+};
 use q0s_format::rig::{RigControlOverride, RigRuntimeOverrides};
-use q0s_format::v2::ProjectV2;
+use q0s_format::runtime_scene::RuntimeSceneState;
+use q0s_format::v2::{Asset, ProjectDependencyKind, ProjectDependencySource, ProjectV2};
 use q0s_format::{is_q0s_v2, parse_q0s, parse_q0s_v2, Bitmap, Error, Movie, Placement};
 use q0video::q0v::{Q0vFile, Q0vSpec, MAGIC as Q0V_MAGIC};
 
@@ -54,29 +59,64 @@ enum Inner {
         frame_index: usize,
     },
     V2 {
-        project: ProjectV2,
+        project: Arc<ProjectV2>,
         entry_q0rg_id: u16,
         frame_count: u16,
         fps: u16,
         frame_index: u16,
     },
     Q0v {
-        media: Q0vFile,
+        media: Arc<Q0vFile>,
         frame_index: u32,
     },
 }
 
 /// Refuse unexpectedly large movies before allocating a matching buffer.
 pub const MAX_Q0S_FILE_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const PLAYER_AUDIO_SAMPLE_RATE: u32 = 48_000;
+pub(crate) const PLAYER_AUDIO_CHANNELS: u16 = 2;
+const MAX_FRAME_SCRIPT_TRANSITIONS: usize = 64;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PlayerInputState {
+    left: bool,
+    right: bool,
+    jump: bool,
+    jump_pressed: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct PlayerAudioClip {
+    pub(crate) start_sample_frame: u64,
+    pub(crate) end_sample_frame: u64,
+    pub(crate) media: Arc<Q0vFile>,
+    pub(crate) gain: f32,
+}
+
+#[derive(Clone)]
+pub(crate) struct PlayerAudioTimeline {
+    pub(crate) clips: Vec<PlayerAudioClip>,
+    pub(crate) total_sample_frames: u64,
+    pub(crate) start_sample_frame: u64,
+}
 
 pub struct Player {
     inner: Inner,
     q0lang: Option<Runtime>,
     initial_script_diagnostics: Vec<RuntimeDiagnostic>,
     rig_runtime_overrides: RigRuntimeOverrides,
+    scene_runtime: RuntimeSceneState,
+    scene_library: HashMap<String, Arc<ProjectV2>>,
+    active_scene_alias: Option<String>,
+    scene_generation: u64,
+    input: PlayerInputState,
+    audio_timeline: Option<PlayerAudioTimeline>,
     playing: bool,
     loop_enabled: bool,
     accumulator_sec: f32,
+    /// Number of dispatched frame-entry events. Used during runtime init to
+    /// avoid firing the destination frame twice after an entry-script goto.
+    frame_script_entries: u64,
 }
 
 /// Which player-format kind a `Player` was loaded from. Public so the UI
@@ -94,6 +134,173 @@ pub struct Q0vAudioData {
     pub sample_rate: u32,
     pub samples: Vec<f32>,
     pub start_interleaved: usize,
+}
+
+fn source_duration_at_player_rate(media: &Q0vFile) -> u64 {
+    media
+        .audio_samples_per_channel
+        .saturating_mul(u64::from(PLAYER_AUDIO_SAMPLE_RATE))
+        .div_ceil(u64::from(media.spec.audio_sample_rate.max(1)))
+}
+
+fn build_q0v_audio_timeline(media: Arc<Q0vFile>) -> Option<PlayerAudioTimeline> {
+    if !media.spec.audio || media.spec.audio_channels == 0 || media.spec.audio_sample_rate == 0 {
+        return None;
+    }
+    let total_sample_frames = u64::from(media.spec.timeline_frames.max(1))
+        .saturating_mul(u64::from(PLAYER_AUDIO_SAMPLE_RATE))
+        .div_ceil(u64::from(media.spec.fps.max(1)))
+        .max(1);
+    let end_sample_frame = source_duration_at_player_rate(&media).min(total_sample_frames);
+    (end_sample_frame > 0).then(|| PlayerAudioTimeline {
+        clips: vec![PlayerAudioClip {
+            start_sample_frame: 0,
+            end_sample_frame,
+            media,
+            gain: 1.0,
+        }],
+        total_sample_frames,
+        start_sample_frame: 0,
+    })
+}
+
+fn build_project_audio_timeline(project: &ProjectV2) -> Option<PlayerAudioTimeline> {
+    let q0rg_id = project.meta.entry_q0rg_id;
+    let q0rg = project.q0rgs.iter().find(|q0rg| q0rg.q0rg_id == q0rg_id)?;
+    let host_fps = u64::from(project.meta.fps.max(1));
+    let total_sample_frames = u64::from(q0rg.frame_count.max(1))
+        .saturating_mul(u64::from(PLAYER_AUDIO_SAMPLE_RATE))
+        .div_ceil(host_fps)
+        .max(1);
+    let mut parsed_by_asset: HashMap<u16, Arc<Q0vFile>> = HashMap::new();
+    let mut clips = Vec::new();
+
+    for clip in project
+        .audio_clips
+        .iter()
+        .filter(|clip| clip.q0rg_id == q0rg_id && !clip.muted && clip.gain > 0.0)
+    {
+        let media = if let Some(media) = parsed_by_asset.get(&clip.asset_id) {
+            Arc::clone(media)
+        } else {
+            let asset = project
+                .assets
+                .iter()
+                .find(|asset| asset.id() == clip.asset_id)?;
+            let Asset::Q0v(asset) = asset else {
+                continue;
+            };
+            let parsed = Arc::new(Q0vFile::parse(asset.bytes.clone()).ok()?);
+            parsed_by_asset.insert(clip.asset_id, Arc::clone(&parsed));
+            parsed
+        };
+        if !media.spec.audio || media.spec.video {
+            continue;
+        }
+        let start_sample_frame = u64::from(clip.start_frame)
+            .saturating_mul(u64::from(PLAYER_AUDIO_SAMPLE_RATE))
+            / host_fps;
+        let boundary_frame = q0s_format::v2::audio_clip_end_frame(project, *clip)?;
+        let boundary_sample_frame = u64::from(boundary_frame)
+            .saturating_mul(u64::from(PLAYER_AUDIO_SAMPLE_RATE))
+            / host_fps;
+        let end_sample_frame = start_sample_frame
+            .saturating_add(source_duration_at_player_rate(&media))
+            .min(boundary_sample_frame)
+            .min(total_sample_frames);
+        if end_sample_frame > start_sample_frame {
+            clips.push(PlayerAudioClip {
+                start_sample_frame,
+                end_sample_frame,
+                media,
+                gain: clip.gain.clamp(0.0, 4.0),
+            });
+        }
+    }
+
+    (!clips.is_empty()).then_some(PlayerAudioTimeline {
+        clips,
+        total_sample_frames,
+        start_sample_frame: 0,
+    })
+}
+
+pub(crate) fn sample_audio_timeline(
+    timeline: &PlayerAudioTimeline,
+    sample_frame: u64,
+    output_channel: u16,
+) -> f32 {
+    let mut mixed = 0.0_f32;
+    for clip in &timeline.clips {
+        if sample_frame < clip.start_sample_frame || sample_frame >= clip.end_sample_frame {
+            continue;
+        }
+        let media = &clip.media;
+        let channels = usize::from(media.spec.audio_channels);
+        let source_rate = u64::from(media.spec.audio_sample_rate.max(1));
+        if channels == 0 {
+            continue;
+        }
+        let pcm = media.audio_pcm_le_bytes();
+        let source_frames = pcm.len() / 2 / channels;
+        if source_frames == 0 {
+            continue;
+        }
+        let local_output_frame = sample_frame - clip.start_sample_frame;
+        let source_numerator = local_output_frame.saturating_mul(source_rate);
+        let source_index = (source_numerator / u64::from(PLAYER_AUDIO_SAMPLE_RATE)) as usize;
+        let next_index = source_index.saturating_add(1).min(source_frames - 1);
+        let fraction = (source_numerator % u64::from(PLAYER_AUDIO_SAMPLE_RATE)) as f32
+            / PLAYER_AUDIO_SAMPLE_RATE as f32;
+        let source_channel = if channels == 1 {
+            0
+        } else {
+            usize::from(output_channel).min(channels - 1)
+        };
+        let read = |frame: usize| {
+            let index = (frame.min(source_frames - 1) * channels + source_channel) * 2;
+            i16::from_le_bytes([pcm[index], pcm[index + 1]]) as f32 / 32768.0
+        };
+        let a = read(source_index);
+        let b = read(next_index);
+        mixed += (a + (b - a) * fraction) * clip.gain;
+    }
+    mixed.clamp(-1.0, 1.0)
+}
+
+fn build_bundled_scene_library(
+    project: &ProjectV2,
+    diagnostics: &mut Vec<RuntimeDiagnostic>,
+) -> HashMap<String, Arc<ProjectV2>> {
+    let mut scenes = HashMap::new();
+    for node in
+        project.runtime.project_graph.nodes.iter().filter(|node| {
+            node.parent_node_id.is_none() && node.kind == ProjectDependencyKind::Movie
+        })
+    {
+        match &node.source {
+            ProjectDependencySource::Embedded(bytes) => match parse_q0s_v2(bytes) {
+                Ok(scene) => {
+                    scenes.insert(node.alias.clone(), Arc::new(scene));
+                }
+                Err(error) => diagnostics.push(RuntimeDiagnostic {
+                    line: 0,
+                    message: format!(
+                        "bundled movie dependency `{}` cannot be loaded as a scene: {error}",
+                        node.alias
+                    ),
+                }),
+            },
+            ProjectDependencySource::External(path) => diagnostics.push(RuntimeDiagnostic {
+                line: 0,
+                message: format!(
+                    "external movie dependency `{}` ({path}) cannot be scene-switched by q0player; export a bundled q0s",
+                    node.alias
+                ),
+            }),
+        }
+    }
+    scenes
 }
 
 impl Player {
@@ -125,7 +332,8 @@ impl Player {
     }
 
     pub fn from_q0v_bytes(bytes: Vec<u8>) -> Result<Self, PlayerLoadError> {
-        let media = Q0vFile::parse(bytes).map_err(PlayerLoadError::Media)?;
+        let media = Arc::new(Q0vFile::parse(bytes).map_err(PlayerLoadError::Media)?);
+        let audio_timeline = build_q0v_audio_timeline(Arc::clone(&media));
         Ok(Self {
             inner: Inner::Q0v {
                 media,
@@ -134,9 +342,16 @@ impl Player {
             q0lang: None,
             initial_script_diagnostics: Vec::new(),
             rig_runtime_overrides: RigRuntimeOverrides::new(),
+            scene_runtime: RuntimeSceneState::new(),
+            scene_library: HashMap::new(),
+            active_scene_alias: None,
+            scene_generation: 0,
+            input: PlayerInputState::default(),
+            audio_timeline,
             playing: true,
             loop_enabled: true,
             accumulator_sec: 0.0,
+            frame_script_entries: 0,
         })
     }
 
@@ -155,8 +370,22 @@ impl Player {
             let frame_count = q.frame_count.max(1);
             let entry_script = q.script.clone();
             let fps = project.meta.fps.max(1);
+            let startup_q0lang = project
+                .runtime
+                .project_graph
+                .nodes
+                .iter()
+                .filter(|node| {
+                    node.parent_node_id.is_none() && node.kind == ProjectDependencyKind::Q0lang
+                })
+                .map(|node| (node.node_id, node.alias.clone(), node.source.clone()))
+                .collect::<Vec<_>>();
+            let audio_timeline = build_project_audio_timeline(&project);
+            let mut initial_script_diagnostics = Vec::new();
+            let scene_library =
+                build_bundled_scene_library(&project, &mut initial_script_diagnostics);
             let inner = Inner::V2 {
-                project,
+                project: Arc::new(project),
                 entry_q0rg_id,
                 frame_count,
                 fps,
@@ -165,13 +394,51 @@ impl Player {
             let mut player = Self {
                 inner,
                 q0lang: Some(Runtime::new()),
-                initial_script_diagnostics: Vec::new(),
+                initial_script_diagnostics,
                 rig_runtime_overrides: RigRuntimeOverrides::new(),
+                scene_runtime: RuntimeSceneState::new(),
+                scene_library,
+                active_scene_alias: None,
+                scene_generation: 0,
+                input: PlayerInputState::default(),
+                audio_timeline,
                 playing: true,
                 loop_enabled: true,
                 accumulator_sec: 0.0,
+                frame_script_entries: 0,
             };
-            player.run_q0lang_source(&entry_script);
+            let mut transition_budget = MAX_FRAME_SCRIPT_TRANSITIONS;
+            player.sync_q0lang_host_globals();
+            let mut startup_q0lang = startup_q0lang;
+            startup_q0lang.sort_by_key(|(node_id, _, _)| *node_id);
+            for (_, alias, source) in startup_q0lang {
+                match source {
+                    ProjectDependencySource::Embedded(bytes) => match String::from_utf8(bytes) {
+                        Ok(source) => {
+                            player.run_q0lang_source_with_budget(&source, &mut transition_budget)
+                        }
+                        Err(_) => player.initial_script_diagnostics.push(RuntimeDiagnostic {
+                            line: 0,
+                            message: format!(
+                                "embedded q0lang dependency `{alias}` is not valid utf-8"
+                            ),
+                        }),
+                    },
+                    ProjectDependencySource::External(path) => {
+                        player.initial_script_diagnostics.push(RuntimeDiagnostic {
+                            line: 0,
+                            message: format!(
+                                "external q0lang dependency `{alias}` ({path}) is not executed by q0player; export a bundled q0s"
+                            ),
+                        });
+                    }
+                }
+            }
+            let entries_before_init = player.frame_script_entries;
+            player.run_q0lang_source_with_budget(&entry_script, &mut transition_budget);
+            if player.frame_script_entries == entries_before_init {
+                player.run_current_frame_scripts(&mut transition_budget);
+            }
             Ok(player)
         } else {
             let movie = parse_q0s(bytes)?;
@@ -183,9 +450,16 @@ impl Player {
                 q0lang: None,
                 initial_script_diagnostics: Vec::new(),
                 rig_runtime_overrides: RigRuntimeOverrides::new(),
+                scene_runtime: RuntimeSceneState::new(),
+                scene_library: HashMap::new(),
+                active_scene_alias: None,
+                scene_generation: 0,
+                input: PlayerInputState::default(),
+                audio_timeline: None,
                 playing: true,
                 loop_enabled: true,
                 accumulator_sec: 0.0,
+                frame_script_entries: 0,
             })
         }
     }
@@ -202,13 +476,69 @@ impl Player {
     /// player, `None` for v1. UI uses this for vector-aware file info.
     pub fn project_v2(&self) -> Option<&ProjectV2> {
         match &self.inner {
-            Inner::V2 { project, .. } => Some(project),
+            Inner::V2 { project, .. } => Some(project.as_ref()),
             _ => None,
         }
     }
 
+    pub fn active_scene_alias(&self) -> Option<&str> {
+        self.active_scene_alias.as_deref()
+    }
+
+    pub fn scene_generation(&self) -> u64 {
+        self.scene_generation
+    }
+
     pub fn rig_runtime_overrides(&self) -> &RigRuntimeOverrides {
         &self.rig_runtime_overrides
+    }
+
+    pub fn scene_runtime(&self) -> &RuntimeSceneState {
+        &self.scene_runtime
+    }
+
+    pub fn set_input_state(&mut self, left: bool, right: bool, jump: bool) {
+        if jump && !self.input.jump {
+            self.input.jump_pressed = true;
+        }
+        self.input.left = left;
+        self.input.right = right;
+        self.input.jump = jump;
+    }
+
+    pub fn uses_game_input(&self) -> bool {
+        self.q0lang
+            .as_ref()
+            .is_some_and(|runtime| runtime.imported_libraries.contains("q0.input"))
+    }
+
+    pub fn runtime_instance_metrics(
+        &self,
+        runtime_name: &str,
+    ) -> Option<q0s_format::raster::RuntimeInstanceMetrics> {
+        let (project, owner, frame) = match &self.inner {
+            Inner::V2 {
+                project,
+                entry_q0rg_id,
+                frame_index,
+                ..
+            } => (project.as_ref(), *entry_q0rg_id, *frame_index),
+            _ => return None,
+        };
+        let key = project
+            .runtime
+            .instance_names
+            .iter()
+            .find_map(|(key, name)| {
+                (name == runtime_name && key.q0rg_id == owner).then_some(*key)
+            })?;
+        q0s_format::raster::runtime_instance_metrics(
+            project,
+            owner,
+            frame,
+            key.instance_id,
+            &self.scene_runtime,
+        )
     }
 
     /// Diagnostics produced while executing the entry q0lang script.
@@ -292,6 +622,21 @@ impl Player {
         })
     }
 
+    pub(crate) fn has_audio_timeline(&self) -> bool {
+        self.audio_timeline.is_some()
+    }
+
+    pub(crate) fn audio_timeline(&self) -> Option<PlayerAudioTimeline> {
+        let mut timeline = self.audio_timeline.clone()?;
+        timeline.start_sample_frame = (self.current_frame() as u64)
+            .saturating_mul(u64::from(PLAYER_AUDIO_SAMPLE_RATE))
+            / u64::from(self.fps().max(1));
+        timeline.start_sample_frame = timeline
+            .start_sample_frame
+            .min(timeline.total_sample_frames);
+        Some(timeline)
+    }
+
     pub fn is_playing(&self) -> bool {
         self.playing
     }
@@ -322,18 +667,20 @@ impl Player {
 
     pub fn seek_to_frame(&mut self, target_frame: usize) {
         let target = target_frame.min(self.total_frames().saturating_sub(1));
-        match &mut self.inner {
-            Inner::V1 { frame_index, .. } => {
-                *frame_index = target;
-            }
-            Inner::V2 { frame_index, .. } => {
-                *frame_index = target as u16;
-            }
-            Inner::Q0v { frame_index, .. } => {
-                *frame_index = target as u32;
-            }
-        }
+        self.set_frame_raw(target);
         self.accumulator_sec = 0.0;
+        if matches!(self.inner, Inner::V2 { .. }) {
+            let mut transition_budget = MAX_FRAME_SCRIPT_TRANSITIONS;
+            self.run_current_frame_scripts(&mut transition_budget);
+        }
+    }
+
+    fn set_frame_raw(&mut self, target: usize) {
+        match &mut self.inner {
+            Inner::V1 { frame_index, .. } => *frame_index = target,
+            Inner::V2 { frame_index, .. } => *frame_index = target as u16,
+            Inner::Q0v { frame_index, .. } => *frame_index = target as u32,
+        }
     }
 
     pub fn total_frames(&self) -> usize {
@@ -353,117 +700,375 @@ impl Player {
     }
 
     pub fn tick(&mut self, delta_sec: f32) {
-        if !self.playing {
+        let interactive_runtime = self.uses_game_input();
+        if !self.playing && !interactive_runtime {
             return;
         }
         self.accumulator_sec += delta_sec.max(0.0);
         let frame_time = 1.0_f32 / self.fps() as f32;
+        let mut transition_budget = MAX_FRAME_SCRIPT_TRANSITIONS;
         while self.accumulator_sec >= frame_time {
             self.accumulator_sec -= frame_time;
-            let total = self.total_frames();
-            let mut hit_end = false;
-            match &mut self.inner {
-                Inner::V1 { frame_index, .. } => {
-                    *frame_index += 1;
-                    if *frame_index >= total {
-                        if self.loop_enabled {
-                            *frame_index = 0;
-                        } else {
-                            *frame_index = total.saturating_sub(1);
-                            hit_end = true;
-                        }
-                    }
+
+            // q0.input marks an interactive runtime. Its fixed-step game clock
+            // is independent from timeline transport: pausing/end-of-timeline
+            // freezes authored animation, not input/physics. The current frame's
+            // script is therefore the game-tick script while that frame is held.
+            if interactive_runtime {
+                if self.playing && self.total_frames() > 1 {
+                    self.advance_timeline_one_frame();
                 }
-                Inner::V2 { frame_index, .. } => {
-                    let next = frame_index.saturating_add(1);
-                    if usize::from(next) >= total {
-                        if self.loop_enabled {
-                            *frame_index = 0;
-                        } else {
-                            *frame_index = total.saturating_sub(1) as u16;
-                            hit_end = true;
-                        }
-                    } else {
-                        *frame_index = next;
-                    }
-                }
-                Inner::Q0v { frame_index, .. } => {
-                    let next = frame_index.saturating_add(1);
-                    if next as usize >= total {
-                        if self.loop_enabled {
-                            *frame_index = 0;
-                        } else {
-                            *frame_index = total.saturating_sub(1) as u32;
-                            hit_end = true;
-                        }
-                    } else {
-                        *frame_index = next;
-                    }
-                }
+                self.run_current_frame_scripts(&mut transition_budget);
+                continue;
             }
-            if hit_end {
-                self.playing = false;
+
+            if self.advance_timeline_one_frame() {
+                self.run_current_frame_scripts(&mut transition_budget);
+                if !self.playing {
+                    self.accumulator_sec = 0.0;
+                    break;
+                }
+            } else if !self.playing {
                 self.accumulator_sec = 0.0;
                 break;
             }
         }
     }
 
-    fn run_q0lang_source(&mut self, source: &str) {
+    /// Advance authored timeline transport by one fixed frame. Returns true
+    /// when a v2 frame was entered and its frame script should run.
+    fn advance_timeline_one_frame(&mut self) -> bool {
+        let total = self.total_frames();
+        let mut hit_end = false;
+        let mut entered_v2_frame = false;
+        match &mut self.inner {
+            Inner::V1 { frame_index, .. } => {
+                *frame_index += 1;
+                if *frame_index >= total {
+                    if self.loop_enabled {
+                        *frame_index = 0;
+                    } else {
+                        *frame_index = total.saturating_sub(1);
+                        hit_end = true;
+                    }
+                }
+            }
+            Inner::V2 { frame_index, .. } => {
+                let next = frame_index.saturating_add(1);
+                if usize::from(next) >= total {
+                    if self.loop_enabled {
+                        *frame_index = 0;
+                        entered_v2_frame = true;
+                    } else {
+                        *frame_index = total.saturating_sub(1) as u16;
+                        hit_end = true;
+                    }
+                } else {
+                    *frame_index = next;
+                    entered_v2_frame = true;
+                }
+            }
+            Inner::Q0v { frame_index, .. } => {
+                let next = frame_index.saturating_add(1);
+                if next as usize >= total {
+                    if self.loop_enabled {
+                        *frame_index = 0;
+                    } else {
+                        *frame_index = total.saturating_sub(1) as u32;
+                        hit_end = true;
+                    }
+                } else {
+                    *frame_index = next;
+                }
+            }
+        }
+        if hit_end {
+            self.playing = false;
+        }
+        entered_v2_frame
+    }
+
+    fn run_q0lang_source_with_budget(&mut self, source: &str, transition_budget: &mut usize) {
+        self.sync_q0lang_host_globals();
         let report = match self.q0lang.as_mut() {
             Some(runtime) => runtime.execute_source(source),
             None => return,
         };
-        self.initial_script_diagnostics = report.diagnostics;
-        self.apply_q0lang_actions(&report.actions);
+        self.initial_script_diagnostics.extend(report.diagnostics);
+        self.apply_q0lang_scene_writes();
+        self.sync_q0lang_host_globals();
+        self.apply_q0lang_actions_with_budget(&report.actions, transition_budget);
     }
 
-    fn apply_q0lang_actions(&mut self, actions: &[RuntimeAction]) {
-        let owner_q0rg_id = match &self.inner {
-            Inner::V2 { entry_q0rg_id, .. } => Some(*entry_q0rg_id),
-            _ => None,
+    fn run_current_frame_scripts(&mut self, transition_budget: &mut usize) {
+        let (entry_q0rg_id, frame) = match &self.inner {
+            Inner::V2 {
+                entry_q0rg_id,
+                frame_index,
+                ..
+            } => (*entry_q0rg_id, *frame_index),
+            _ => return,
         };
+        self.frame_script_entries = self.frame_script_entries.saturating_add(1);
+        let mut scripts = self
+            .project_v2()
+            .into_iter()
+            .flat_map(|project| project.runtime.frame_scripts.iter().enumerate())
+            .filter(|(_, script)| script.q0rg_id == entry_q0rg_id && script.frame == frame)
+            .map(|(insertion_order, script)| {
+                (script.layer_id, insertion_order, script.source.clone())
+            })
+            .collect::<Vec<_>>();
+        scripts.sort_by_key(|(layer_id, insertion_order, _)| (*layer_id, *insertion_order));
+        for (_, _, source) in scripts {
+            self.run_q0lang_source_with_budget(&source, transition_budget);
+        }
+        self.input.jump_pressed = false;
+    }
+
+    fn sync_q0lang_host_globals(&mut self) {
+        let (stage_width, stage_height, owner, frame, names) = match &self.inner {
+            Inner::V2 {
+                project,
+                entry_q0rg_id,
+                frame_index,
+                ..
+            } => (
+                f64::from(project.meta.stage_width),
+                f64::from(project.meta.stage_height),
+                *entry_q0rg_id,
+                *frame_index,
+                project
+                    .runtime
+                    .instance_names
+                    .iter()
+                    .filter(|(key, _)| key.q0rg_id == *entry_q0rg_id)
+                    .map(|(key, name)| (*key, name.clone()))
+                    .collect::<Vec<_>>(),
+            ),
+            _ => return,
+        };
+        let metrics = names
+            .iter()
+            .filter_map(|(key, name)| {
+                self.project_v2().and_then(|project| {
+                    q0s_format::raster::runtime_instance_metrics(
+                        project,
+                        owner,
+                        frame,
+                        key.instance_id,
+                        &self.scene_runtime,
+                    )
+                    .map(|metrics| (name.clone(), metrics))
+                })
+            })
+            .collect::<Vec<_>>();
+        let fixed_dt = 1.0 / f64::from(self.fps().max(1));
+        let Some(runtime) = self.q0lang.as_mut() else {
+            return;
+        };
+        runtime
+            .vars
+            .insert("stage.width".into(), RuntimeValue::Number(stage_width));
+        runtime
+            .vars
+            .insert("stage.height".into(), RuntimeValue::Number(stage_height));
+        runtime
+            .vars
+            .insert("time.dt".into(), RuntimeValue::Number(fixed_dt));
+        runtime
+            .vars
+            .insert("input.left".into(), RuntimeValue::Bool(self.input.left));
+        runtime
+            .vars
+            .insert("input.right".into(), RuntimeValue::Bool(self.input.right));
+        runtime
+            .vars
+            .insert("input.jump".into(), RuntimeValue::Bool(self.input.jump));
+        runtime.vars.insert(
+            "input.jump_pressed".into(),
+            RuntimeValue::Bool(self.input.jump_pressed),
+        );
+        for (name, metrics) in metrics {
+            for (suffix, value) in [
+                ("x", metrics.x),
+                ("y", metrics.y),
+                ("left", metrics.left),
+                ("right", metrics.right),
+                ("top", metrics.top),
+                ("bottom", metrics.bottom),
+                ("width", metrics.width()),
+                ("height", metrics.height()),
+            ] {
+                runtime.vars.insert(
+                    format!("{name}.{suffix}"),
+                    RuntimeValue::Number(f64::from(value)),
+                );
+            }
+        }
+    }
+
+    fn apply_q0lang_scene_writes(&mut self) {
+        let names = match &self.inner {
+            Inner::V2 {
+                project,
+                entry_q0rg_id,
+                ..
+            } => project
+                .runtime
+                .instance_names
+                .iter()
+                .filter(|(key, _)| key.q0rg_id == *entry_q0rg_id)
+                .map(|(key, name)| (*key, name.clone()))
+                .collect::<Vec<_>>(),
+            _ => return,
+        };
+        let Some(runtime) = self.q0lang.as_ref() else {
+            return;
+        };
+        let writes = names
+            .into_iter()
+            .filter_map(|(key, name)| {
+                let x = match runtime.vars.get(&format!("{name}.x")) {
+                    Some(RuntimeValue::Number(value)) if value.is_finite() => *value as f32,
+                    _ => return None,
+                };
+                let y = match runtime.vars.get(&format!("{name}.y")) {
+                    Some(RuntimeValue::Number(value)) if value.is_finite() => *value as f32,
+                    _ => return None,
+                };
+                Some((key, x, y))
+            })
+            .collect::<Vec<_>>();
+        for (key, x, y) in writes {
+            self.scene_runtime.set_position(key, x, y);
+        }
+    }
+
+    fn runtime_transition_to_frame(&mut self, target_frame: usize, transition_budget: &mut usize) {
+        if *transition_budget == 0 {
+            self.initial_script_diagnostics.push(RuntimeDiagnostic {
+                line: 0,
+                message: format!(
+                    "frame-script transition budget exceeded ({MAX_FRAME_SCRIPT_TRANSITIONS})"
+                ),
+            });
+            return;
+        }
+        *transition_budget -= 1;
+        let target = target_frame.min(self.total_frames().saturating_sub(1));
+        self.set_frame_raw(target);
+        self.accumulator_sec = 0.0;
+        self.run_current_frame_scripts(transition_budget);
+    }
+
+    fn apply_q0lang_actions_with_budget(
+        &mut self,
+        actions: &[RuntimeAction],
+        transition_budget: &mut usize,
+    ) {
         for action in actions {
             match action {
                 RuntimeAction::GoRun(target) => {
-                    if let Some(frame) = self.resolve_timeline_target(target) {
-                        self.seek_to_frame(frame);
-                    }
                     self.playing = true;
+                    if let Some(frame) = self.resolve_timeline_target(target) {
+                        self.runtime_transition_to_frame(frame, transition_budget);
+                    }
                 }
                 RuntimeAction::GoStop(target) => {
-                    if let Some(frame) = self.resolve_timeline_target(target) {
-                        self.seek_to_frame(frame);
-                    }
                     self.playing = false;
+                    if let Some(frame) = self.resolve_timeline_target(target) {
+                        self.runtime_transition_to_frame(frame, transition_budget);
+                    }
                 }
                 RuntimeAction::ShellCommand { .. } => {}
+                RuntimeAction::SceneSwitch { alias } => {
+                    self.switch_to_bundled_scene(alias, transition_budget);
+                }
                 RuntimeAction::RigSetPosition { control, x, y } => {
-                    if let Some(owner) = owner_q0rg_id {
+                    if let Some(owner) = self.current_entry_q0rg_id() {
                         self.apply_rig_position(owner, control, *x as f32, *y as f32);
                     }
                 }
                 RuntimeAction::RigSetValue { control, value } => {
-                    if let Some(owner) = owner_q0rg_id {
+                    if let Some(owner) = self.current_entry_q0rg_id() {
                         self.apply_rig_value(owner, control, *value as f32);
                     }
                 }
                 RuntimeAction::RigReset { control } => {
-                    if let Some(owner) = owner_q0rg_id {
+                    if let Some(owner) = self.current_entry_q0rg_id() {
                         self.reset_rig_control(owner, control);
                     }
                 }
                 RuntimeAction::RigSetPose { pose, weight } => {
-                    if let Some(owner) = owner_q0rg_id {
+                    if let Some(owner) = self.current_entry_q0rg_id() {
                         self.apply_rig_pose(owner, pose, *weight as f32);
                     }
                 }
                 RuntimeAction::RigResetPose { pose } => {
-                    if let Some(owner) = owner_q0rg_id {
+                    if let Some(owner) = self.current_entry_q0rg_id() {
                         self.reset_rig_pose(owner, pose);
                     }
                 }
             }
+        }
+    }
+
+    fn current_entry_q0rg_id(&self) -> Option<u16> {
+        match &self.inner {
+            Inner::V2 { entry_q0rg_id, .. } => Some(*entry_q0rg_id),
+            _ => None,
+        }
+    }
+
+    fn switch_to_bundled_scene(&mut self, alias: &str, transition_budget: &mut usize) {
+        let Some(project) = self.scene_library.get(alias).cloned() else {
+            self.initial_script_diagnostics.push(RuntimeDiagnostic {
+                line: 0,
+                message: format!("q0scene.switch! could not find bundled movie alias `{alias}`"),
+            });
+            return;
+        };
+        let entry_q0rg_id = project.meta.entry_q0rg_id;
+        let Some(entry) = project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == entry_q0rg_id)
+        else {
+            self.initial_script_diagnostics.push(RuntimeDiagnostic {
+                line: 0,
+                message: format!("scene `{alias}` has no entry q0rg {entry_q0rg_id}"),
+            });
+            return;
+        };
+        let frame_count = entry.frame_count.max(1);
+        let entry_script = entry.script.clone();
+        let fps = project.meta.fps.max(1);
+        let audio_timeline = build_project_audio_timeline(project.as_ref());
+
+        self.inner = Inner::V2 {
+            project,
+            entry_q0rg_id,
+            frame_count,
+            fps,
+            frame_index: 0,
+        };
+        self.scene_runtime = RuntimeSceneState::new();
+        self.rig_runtime_overrides.clear();
+        self.audio_timeline = audio_timeline;
+        self.accumulator_sec = 0.0;
+        self.active_scene_alias = Some(alias.to_string());
+        self.scene_generation = self.scene_generation.wrapping_add(1);
+
+        // Deliberately keep the root Runtime alive. In particular, do not
+        // execute this scene's project-graph q0lang dependencies: bundled
+        // movies are scene data, while the root q0lang runtime is the game
+        // kernel shared across all scenes.
+        self.sync_q0lang_host_globals();
+        let entries_before_init = self.frame_script_entries;
+        self.run_q0lang_source_with_budget(&entry_script, transition_budget);
+        if self.frame_script_entries == entries_before_init {
+            self.run_current_frame_scripts(transition_budget);
         }
     }
 
@@ -621,7 +1226,7 @@ impl Player {
                 frame_index,
                 ..
             } => {
-                let buf = q0s_format::raster::rasterize_q0rg_frame_with_rig_overrides(
+                let buf = q0s_format::raster::rasterize_q0rg_frame_with_runtime_overrides(
                     project,
                     *entry_q0rg_id,
                     *frame_index,
@@ -630,6 +1235,7 @@ impl Player {
                     ss.max(1) as u32,
                     [0xFF, 0xFF, 0xFF, 0xFF],
                     &self.rig_runtime_overrides,
+                    &self.scene_runtime,
                 );
                 let n = (viewport_width as usize)
                     .saturating_mul(viewport_height as usize)
@@ -768,7 +1374,10 @@ fn blit_bitmap(
 
 #[cfg(test)]
 mod tests {
-    use super::{Player, PlayerFormat, PlayerLoadError, MAX_Q0S_FILE_BYTES};
+    use super::{
+        sample_audio_timeline, Player, PlayerFormat, PlayerLoadError, MAX_Q0S_FILE_BYTES,
+        PLAYER_AUDIO_SAMPLE_RATE,
+    };
     use image::ImageEncoder;
     use q0video::q0v::{Q0vSpec, Q0vWriter, MEDIA_TICKS_PER_SECOND};
     use std::io::Cursor;
@@ -826,6 +1435,8 @@ mod tests {
             asset_names: std::collections::HashMap::new(),
             asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
                 name: "Stage".to_string(),
@@ -835,6 +1446,300 @@ mod tests {
             }],
         };
         q0s_format::write_q0s_v2(&project).expect("write q0s v2")
+    }
+
+    fn q0s_v2_with_frame_scripts(frame_count: u16, scripts: &[(u16, u16, &str)]) -> Vec<u8> {
+        q0s_v2_with_entry_and_frame_scripts("", frame_count, scripts)
+    }
+
+    fn q0s_v2_with_entry_and_frame_scripts(
+        entry_script: &str,
+        frame_count: u16,
+        scripts: &[(u16, u16, &str)],
+    ) -> Vec<u8> {
+        use q0s_format::v2::{FrameScript, Layer, ProjectMeta, ProjectV2, Q0rg};
+
+        let max_layer = scripts
+            .iter()
+            .map(|(_, layer, _)| *layer)
+            .max()
+            .unwrap_or(1);
+        let layers = (1..=max_layer)
+            .map(|layer_id| Layer {
+                layer_id,
+                name: format!("layer {layer_id}"),
+                explicit_keyframes: Vec::new(),
+                placements: Vec::new(),
+            })
+            .collect();
+        let mut project = ProjectV2 {
+            meta: ProjectMeta {
+                name: "frame-script-test".to_string(),
+                fps: 24,
+                stage_width: 64,
+                stage_height: 64,
+                entry_q0rg_id: 1,
+            },
+            assets: Vec::new(),
+            asset_names: Default::default(),
+            asset_appearances: Default::default(),
+            layer_metadata: Default::default(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
+            q0rgs: vec![Q0rg {
+                q0rg_id: 1,
+                name: "Stage".to_string(),
+                frame_count,
+                script: entry_script.to_string(),
+                layers,
+            }],
+        };
+        project.runtime.frame_scripts = scripts
+            .iter()
+            .map(|(frame, layer_id, source)| FrameScript {
+                q0rg_id: 1,
+                layer_id: *layer_id,
+                frame: *frame,
+                source: (*source).to_string(),
+            })
+            .collect();
+        q0s_format::write_q0s_v2(&project).expect("write frame-script q0s")
+    }
+
+    fn runtime_var(player: &Player, name: &str) -> Option<String> {
+        player
+            .q0lang
+            .as_ref()
+            .and_then(|runtime| runtime.vars.get(name))
+            .map(|value| value.display_lossy())
+    }
+
+    fn q0s_v2_game_fixture(module_source: &str) -> Vec<u8> {
+        use q0s_format::v2::{
+            Anchor, Asset, FrameScript, InstanceKey, Layer, Path, Placement, ProjectDependencyKind,
+            ProjectDependencyNode, ProjectDependencySource, ProjectMeta, ProjectV2, Q0rg, Rgba,
+            Target, Transform2D, Tween, Vec2, VectorAsset,
+        };
+        let square = Asset::Vector(VectorAsset {
+            asset_id: 1,
+            paths: vec![Path {
+                closed: true,
+                anchors: vec![
+                    Anchor {
+                        point: Vec2::new(0.0, 0.0),
+                        in_handle: None,
+                        out_handle: None,
+                    },
+                    Anchor {
+                        point: Vec2::new(10.0, 0.0),
+                        in_handle: None,
+                        out_handle: None,
+                    },
+                    Anchor {
+                        point: Vec2::new(10.0, 10.0),
+                        in_handle: None,
+                        out_handle: None,
+                    },
+                    Anchor {
+                        point: Vec2::new(0.0, 10.0),
+                        in_handle: None,
+                        out_handle: None,
+                    },
+                ],
+            }],
+            fill: Some(Rgba {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255,
+            }),
+            stroke: None,
+        });
+        let mut project = ProjectV2 {
+            meta: ProjectMeta {
+                name: "embedded-game".into(),
+                fps: 24,
+                stage_width: 100,
+                stage_height: 100,
+                entry_q0rg_id: 1,
+            },
+            assets: vec![square],
+            asset_names: Default::default(),
+            asset_appearances: Default::default(),
+            layer_metadata: Default::default(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
+            q0rgs: vec![
+                Q0rg {
+                    q0rg_id: 1,
+                    name: "Stage".into(),
+                    frame_count: 1,
+                    script: String::new(),
+                    layers: vec![Layer {
+                        layer_id: 1,
+                        name: "player".into(),
+                        explicit_keyframes: vec![0],
+                        placements: vec![Placement {
+                            instance_id: 11,
+                            frame: 0,
+                            target: Target::Q0rg(2),
+                            transform: Transform2D {
+                                tx: 20.0,
+                                ty: 70.0,
+                                ..Transform2D::IDENTITY
+                            },
+                            tween: Tween::None,
+                            fx: Default::default(),
+                        }],
+                    }],
+                },
+                Q0rg {
+                    q0rg_id: 2,
+                    name: "PlayerSymbol".into(),
+                    frame_count: 1,
+                    script: String::new(),
+                    layers: vec![Layer {
+                        layer_id: 2,
+                        name: "body".into(),
+                        explicit_keyframes: vec![0],
+                        placements: vec![Placement {
+                            instance_id: 22,
+                            frame: 0,
+                            target: Target::Asset(1),
+                            transform: Transform2D::IDENTITY,
+                            tween: Tween::None,
+                            fx: Default::default(),
+                        }],
+                    }],
+                },
+            ],
+        };
+        project
+            .runtime
+            .instance_names
+            .insert(InstanceKey::new(1, 11), "player".to_string());
+        project
+            .runtime
+            .project_graph
+            .nodes
+            .push(ProjectDependencyNode {
+                node_id: 1,
+                parent_node_id: None,
+                alias: "game".into(),
+                kind: ProjectDependencyKind::Q0lang,
+                source: ProjectDependencySource::Embedded(module_source.as_bytes().to_vec()),
+            });
+        project.runtime.frame_scripts.push(FrameScript {
+            q0rg_id: 1,
+            layer_id: 1,
+            frame: 0,
+            source: "vy = update(vy)\n".into(),
+        });
+        q0s_format::write_q0s_v2(&project).expect("write embedded game fixture")
+    }
+
+    const GAME_CONTROLLER: &str = r#"import q0.input
+import q0.scene
+import q0.time
+speed = 240
+gravity = 1440
+jump_speed = -480
+vy = 0
+pb func update current_vy {
+  dt = time.dt
+  dx = 0
+  if input.left and not input.right {
+    dx = -speed * dt
+  }
+  if input.right and not input.left {
+    dx = speed * dt
+  }
+  grounded = player.bottom >= stage.height - 0.5
+  if input.jump_pressed and grounded {
+    current_vy = jump_speed
+  }
+  current_vy = current_vy + gravity * dt
+  dy = current_vy * dt
+  if player.left + dx < 0 {
+    dx = -player.left
+  }
+  if player.right + dx > stage.width {
+    dx = stage.width - player.right
+  }
+  if player.top + dy < 0 {
+    dy = -player.top
+    if current_vy < 0 {
+      current_vy = 0
+    }
+  }
+  if player.bottom + dy >= stage.height {
+    dy = stage.height - player.bottom
+    if current_vy > 0 {
+      current_vy = 0
+    }
+  }
+  player.x = player.x + dx
+  player.y = player.y + dy
+  return current_vy
+}
+"#;
+
+    fn q0s_v2_with_timeline_audio(muted: bool) -> Vec<u8> {
+        use q0s_format::v2::{Asset, AudioClip, Layer, ProjectMeta, ProjectV2, Q0rg, Q0vAsset};
+
+        let spec = Q0vSpec {
+            width: 0,
+            height: 0,
+            fps: 48_000,
+            timeline_frames: 2,
+            video: false,
+            audio: true,
+            audio_sample_rate: 48_000,
+            audio_channels: 2,
+        };
+        let mut writer = Q0vWriter::new(Cursor::new(Vec::new()), spec).expect("audio q0v writer");
+        writer
+            .write_audio_pcm_i16(&[16_384, -16_384, 8192, -8192])
+            .expect("audio q0v pcm");
+        let audio_bytes = writer.finish().expect("finish audio q0v").into_inner();
+        let project = ProjectV2 {
+            meta: ProjectMeta {
+                name: "timeline-audio".to_string(),
+                fps: 24,
+                stage_width: 64,
+                stage_height: 64,
+                entry_q0rg_id: 1,
+            },
+            assets: vec![Asset::Q0v(Q0vAsset {
+                asset_id: 77,
+                bytes: audio_bytes,
+            })],
+            asset_names: std::collections::HashMap::new(),
+            asset_appearances: std::collections::HashMap::new(),
+            layer_metadata: std::collections::HashMap::new(),
+            audio_clips: vec![AudioClip {
+                q0rg_id: 1,
+                layer_id: 1,
+                start_frame: 1,
+                asset_id: 77,
+                gain: 0.5,
+                muted,
+            }],
+            runtime: Default::default(),
+            q0rgs: vec![Q0rg {
+                q0rg_id: 1,
+                name: "Stage".to_string(),
+                frame_count: 4,
+                script: String::new(),
+                layers: vec![Layer {
+                    layer_id: 1,
+                    name: "audio".to_string(),
+                    explicit_keyframes: Vec::new(),
+                    placements: Vec::new(),
+                }],
+            }],
+        };
+        q0s_format::write_q0s_v2(&project).expect("write timeline audio q0s")
     }
 
     #[test]
@@ -895,6 +1800,37 @@ mod tests {
             0,
             "video and audio loop at the same duration"
         );
+    }
+
+    #[test]
+    fn q0s_timeline_audio_respects_clip_start_gain_and_seek() {
+        let bytes = q0s_v2_with_timeline_audio(false);
+        let mut player = Player::from_bytes(&bytes).expect("load q0s timeline audio");
+        assert_eq!(player.format(), PlayerFormat::VectorV2);
+        assert!(player.has_audio_timeline());
+
+        let timeline = player.audio_timeline().expect("q0s audio timeline");
+        let clip_start = u64::from(PLAYER_AUDIO_SAMPLE_RATE) / 24;
+        assert_eq!(timeline.start_sample_frame, 0);
+        assert_eq!(sample_audio_timeline(&timeline, clip_start - 1, 0), 0.0);
+        assert!((sample_audio_timeline(&timeline, clip_start, 0) - 0.25).abs() < 0.001);
+        assert!((sample_audio_timeline(&timeline, clip_start, 1) + 0.25).abs() < 0.001);
+        assert!((sample_audio_timeline(&timeline, clip_start + 1, 0) - 0.125).abs() < 0.001);
+
+        player.seek_to_frame(1);
+        let seeked = player.audio_timeline().expect("seeked q0s audio timeline");
+        assert_eq!(seeked.start_sample_frame, clip_start);
+        assert!(
+            (sample_audio_timeline(&seeked, seeked.start_sample_frame, 0) - 0.25).abs() < 0.001
+        );
+    }
+
+    #[test]
+    fn muted_q0s_timeline_audio_does_not_create_playback_source() {
+        let bytes = q0s_v2_with_timeline_audio(true);
+        let player = Player::from_bytes(&bytes).expect("load muted q0s timeline audio");
+        assert!(!player.has_audio_timeline());
+        assert!(player.audio_timeline().is_none());
     }
 
     #[test]
@@ -1013,6 +1949,8 @@ mod tests {
             asset_names: Default::default(),
             asset_appearances: Default::default(),
             layer_metadata: Default::default(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
                 name: "Stage".into(),
@@ -1124,6 +2062,361 @@ mod tests {
             .initial_script_diagnostics()
             .iter()
             .any(|diagnostic| diagnostic.message.contains("private")));
+    }
+
+    #[test]
+    fn frame_zero_script_runs_once_after_runtime_init() {
+        let bytes = q0s_v2_with_frame_scripts(3, &[(0, 1, "init = 7\n")]);
+        let player = Player::from_bytes(&bytes).expect("load frame-script player");
+        assert_eq!(player.current_frame(), 0);
+        assert_eq!(runtime_var(&player, "init").as_deref(), Some("7"));
+        assert_eq!(player.frame_script_entries, 1);
+    }
+
+    #[test]
+    fn bundled_scene_switch_preserves_one_game_kernel_across_projects() {
+        use q0s_format::v2::{
+            FrameScript, Layer, ProjectDependencyKind, ProjectDependencyNode,
+            ProjectDependencySource, ProjectMeta, ProjectV2, Q0rg,
+        };
+
+        let scene_layer = || Layer {
+            layer_id: 1,
+            name: "logic".into(),
+            explicit_keyframes: vec![0],
+            placements: Vec::new(),
+        };
+        let mut child = ProjectV2 {
+            meta: ProjectMeta {
+                name: "room two".into(),
+                fps: 24,
+                stage_width: 80,
+                stage_height: 64,
+                entry_q0rg_id: 1,
+            },
+            assets: Vec::new(),
+            asset_names: Default::default(),
+            asset_appearances: Default::default(),
+            layer_metadata: Default::default(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
+            q0rgs: vec![Q0rg {
+                q0rg_id: 1,
+                name: "Stage".into(),
+                frame_count: 1,
+                script: String::new(),
+                layers: vec![scene_layer()],
+            }],
+        };
+        child.runtime.frame_scripts.push(FrameScript {
+            q0rg_id: 1,
+            layer_id: 1,
+            frame: 0,
+            source: "kernel = update(kernel)\n".into(),
+        });
+        // This would destroy the persistent state if a scene switch restarted
+        // the child movie's q0lang graph as a second game kernel.
+        child
+            .runtime
+            .project_graph
+            .nodes
+            .push(ProjectDependencyNode {
+                node_id: 1,
+                parent_node_id: None,
+                alias: "wrong_kernel".into(),
+                kind: ProjectDependencyKind::Q0lang,
+                source: ProjectDependencySource::Embedded(b"kernel = 0\n".to_vec()),
+            });
+        let child_bytes = q0s_format::write_q0s_v2(&child).expect("serialize child scene");
+
+        let mut root = ProjectV2 {
+            meta: ProjectMeta {
+                name: "root game".into(),
+                fps: 24,
+                stage_width: 64,
+                stage_height: 64,
+                entry_q0rg_id: 1,
+            },
+            assets: Vec::new(),
+            asset_names: Default::default(),
+            asset_appearances: Default::default(),
+            layer_metadata: Default::default(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
+            q0rgs: vec![Q0rg {
+                q0rg_id: 1,
+                name: "Stage".into(),
+                frame_count: 1,
+                script: String::new(),
+                layers: vec![scene_layer()],
+            }],
+        };
+        root.runtime.project_graph.nodes.extend([
+            ProjectDependencyNode {
+                node_id: 1,
+                parent_node_id: None,
+                alias: "game".into(),
+                kind: ProjectDependencyKind::Q0lang,
+                source: ProjectDependencySource::Embedded(
+                    b"import q0.scene\nkernel = 40\npb func update x {\n  return x + 1\n}\n"
+                        .to_vec(),
+                ),
+            },
+            ProjectDependencyNode {
+                node_id: 2,
+                parent_node_id: None,
+                alias: "room2".into(),
+                kind: ProjectDependencyKind::Movie,
+                source: ProjectDependencySource::Embedded(child_bytes),
+            },
+        ]);
+        root.runtime.frame_scripts.push(FrameScript {
+            q0rg_id: 1,
+            layer_id: 1,
+            frame: 0,
+            source: "kernel = update(kernel)\nq0scene.switch! \"room2\"\n".into(),
+        });
+
+        let bytes = q0s_format::write_q0s_v2(&root).expect("serialize root game");
+        let mut player = Player::from_bytes(&bytes).expect("load bundled game");
+        assert_eq!(player.active_scene_alias(), Some("room2"));
+        assert_eq!(player.scene_generation(), 1);
+        assert_eq!(
+            player.project_v2().expect("active v2").meta.name,
+            "room two"
+        );
+        assert_eq!(
+            player.q0lang.as_ref().expect("game kernel").vars["kernel"],
+            q0s_format::q0lang::runtime::RuntimeValue::Number(42.0),
+            "root frame increments to 41, child frame increments the SAME runtime to 42; child kernel=0 must not run"
+        );
+
+        player.tick(1.0 / 24.0);
+        assert_eq!(
+            player.q0lang.as_ref().expect("game kernel").vars["kernel"],
+            q0s_format::q0lang::runtime::RuntimeValue::Number(43.0),
+            "the child scene keeps calling the function defined only by the root kernel"
+        );
+    }
+
+    #[test]
+    fn entry_function_bytecode_is_callable_from_later_frame_script() {
+        let bytes = q0s_v2_with_entry_and_frame_scripts(
+            "pb func plus_one x {\n  return x + 1\n}\n",
+            3,
+            &[(1, 1, "result = plus_one(9)\n")],
+        );
+        let mut player = Player::from_bytes(&bytes).expect("load qvm function player");
+        assert!(runtime_var(&player, "result").is_none());
+        player.tick(1.0 / 24.0);
+        assert_eq!(player.current_frame(), 1);
+        assert_eq!(runtime_var(&player, "result").as_deref(), Some("10"));
+        assert!(player.initial_script_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn interactive_one_frame_runtime_ticks_without_play_or_loop() {
+        let bytes = q0s_v2_game_fixture(GAME_CONTROLLER);
+        let mut player = Player::from_bytes(&bytes).expect("load embedded game");
+        player.set_loop_enabled(false);
+        player.set_playing(false);
+        let before = player
+            .runtime_instance_metrics("player")
+            .expect("before metrics");
+
+        player.set_input_state(false, true, false);
+        player.tick(1.0 / 24.0);
+        let after = player
+            .runtime_instance_metrics("player")
+            .expect("after metrics");
+
+        assert_eq!(
+            player.current_frame(),
+            0,
+            "game clock must not invent timeline frames"
+        );
+        assert!(!player.is_playing(), "timeline transport stays paused");
+        assert!(
+            after.x > before.x + 1.0,
+            "input must run while transport is paused: before={before:?} after={after:?}"
+        );
+    }
+
+    #[test]
+    fn interactive_one_frame_runtime_does_not_stop_at_timeline_end() {
+        let bytes = q0s_v2_game_fixture(GAME_CONTROLLER);
+        let mut player = Player::from_bytes(&bytes).expect("load embedded game");
+        player.set_loop_enabled(false);
+        player.set_playing(true);
+        player.set_input_state(false, true, false);
+
+        player.tick(3.0 / 24.0);
+
+        assert!(
+            player.is_playing(),
+            "one-frame game has no authored frame to advance past"
+        );
+        assert_eq!(player.current_frame(), 0);
+        assert!(
+            player
+                .runtime_instance_metrics("player")
+                .expect("metrics")
+                .x
+                > 20.0,
+            "game runtime must keep ticking on frame zero"
+        );
+    }
+
+    #[test]
+    fn embedded_q0lang_game_moves_jumps_and_clamps_named_instance_to_stage() {
+        let bytes = q0s_v2_game_fixture(GAME_CONTROLLER);
+        let mut player = Player::from_bytes(&bytes).expect("load embedded game");
+        assert!(player.uses_game_input());
+        assert!(
+            player.initial_script_diagnostics().is_empty(),
+            "{:?}",
+            player.initial_script_diagnostics()
+        );
+        let authored_x = player.project_v2().unwrap().q0rgs[0].layers[0].placements[0]
+            .transform
+            .tx;
+        assert_eq!(authored_x, 20.0);
+
+        // Gravity settles the symbol exactly on the stage floor.
+        player.set_input_state(false, false, false);
+        player.tick(20.0 / 24.0);
+        let floor = player
+            .runtime_instance_metrics("player")
+            .expect("floor metrics");
+        assert!((floor.bottom - 100.0).abs() < 0.01, "{floor:?}");
+
+        // Right and left movement clamp the visible body, not merely its transform origin.
+        player.set_input_state(false, true, false);
+        player.tick(40.0 / 24.0);
+        let right = player
+            .runtime_instance_metrics("player")
+            .expect("right wall metrics");
+        assert!((right.right - 100.0).abs() < 0.01, "{right:?}");
+        assert!(right.left >= -0.01, "{right:?}");
+
+        let mut right_pixels = vec![0; 100 * 100 * 4];
+        player.render_with_quality(&mut right_pixels, 100, 100, 1);
+
+        player.set_input_state(true, false, false);
+        player.tick(40.0 / 24.0);
+        let left = player
+            .runtime_instance_metrics("player")
+            .expect("left wall metrics");
+        assert!(left.left.abs() < 0.01, "{left:?}");
+        assert!(left.right <= 100.01, "{left:?}");
+
+        let mut left_pixels = vec![0; 100 * 100 * 4];
+        player.render_with_quality(&mut left_pixels, 100, 100, 1);
+        assert_ne!(
+            right_pixels, left_pixels,
+            "runtime transform must reach raster output"
+        );
+
+        // One rising jump edge launches upward; holding jump does not retrigger in mid-air.
+        player.set_input_state(false, false, false);
+        player.tick(1.0 / 24.0);
+        let grounded = player
+            .runtime_instance_metrics("player")
+            .expect("grounded metrics");
+        assert!((grounded.bottom - 100.0).abs() < 0.01);
+        player.set_input_state(false, false, true);
+        player.tick(1.0 / 24.0);
+        let airborne = player
+            .runtime_instance_metrics("player")
+            .expect("airborne metrics");
+        assert!(airborne.bottom < grounded.bottom - 1.0, "{airborne:?}");
+        player.tick(30.0 / 24.0);
+        let landed = player
+            .runtime_instance_metrics("player")
+            .expect("landed metrics");
+        assert!((landed.bottom - 100.0).abs() < 0.01, "{landed:?}");
+
+        // Runtime motion is an overlay: the authored movie is untouched.
+        assert_eq!(
+            player.project_v2().unwrap().q0rgs[0].layers[0].placements[0]
+                .transform
+                .tx,
+            authored_x
+        );
+    }
+
+    #[test]
+    fn frame_script_fires_when_playback_enters_frame() {
+        let bytes = q0s_v2_with_frame_scripts(3, &[(1, 1, "entered = 1\n")]);
+        let mut player = Player::from_bytes(&bytes).expect("load frame-script player");
+        assert!(runtime_var(&player, "entered").is_none());
+        player.tick(1.0 / 24.0);
+        assert_eq!(player.current_frame(), 1);
+        assert_eq!(runtime_var(&player, "entered").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn loop_reenters_frame_zero_and_refires_its_script() {
+        let bytes = q0s_v2_with_frame_scripts(2, &[(0, 1, "broken signal\n")]);
+        let mut player = Player::from_bytes(&bytes).expect("load frame-script player");
+        let initial = player.initial_script_diagnostics().len();
+        assert!(
+            initial > 0,
+            "frame zero diagnostic proves initial execution"
+        );
+        player.tick(2.0 / 24.0);
+        assert_eq!(player.current_frame(), 0);
+        assert!(
+            player.initial_script_diagnostics().len() > initial,
+            "loop entry must execute frame zero again"
+        );
+    }
+
+    #[test]
+    fn runtime_goto_runs_destination_but_skips_intermediate_frame_scripts() {
+        let bytes = q0s_v2_with_frame_scripts(
+            5,
+            &[
+                (1, 1, "gorun! 3\n"),
+                (2, 1, "middle = 1\n"),
+                (3, 1, "destination = 1\n"),
+            ],
+        );
+        let mut player = Player::from_bytes(&bytes).expect("load frame-script player");
+        player.seek_to_frame(1);
+        assert_eq!(player.current_frame(), 3);
+        assert!(runtime_var(&player, "middle").is_none());
+        assert_eq!(runtime_var(&player, "destination").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn backward_runtime_goto_runs_destination_frame_script() {
+        let bytes = q0s_v2_with_frame_scripts(5, &[(1, 1, "back = 1\n"), (3, 1, "gostop! 1\n")]);
+        let mut player = Player::from_bytes(&bytes).expect("load frame-script player");
+        player.seek_to_frame(3);
+        assert_eq!(player.current_frame(), 1);
+        assert_eq!(runtime_var(&player, "back").as_deref(), Some("1"));
+        assert!(!player.is_playing());
+    }
+
+    #[test]
+    fn same_frame_scripts_run_in_deterministic_layer_order() {
+        let bytes = q0s_v2_with_frame_scripts(3, &[(1, 2, "order = 2\n"), (1, 1, "order = 1\n")]);
+        let mut player = Player::from_bytes(&bytes).expect("load frame-script player");
+        player.seek_to_frame(1);
+        assert_eq!(runtime_var(&player, "order").as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn self_jump_is_stopped_by_frame_transition_budget() {
+        let bytes = q0s_v2_with_frame_scripts(3, &[(1, 1, "gorun! 1\n")]);
+        let mut player = Player::from_bytes(&bytes).expect("load frame-script player");
+        player.seek_to_frame(1);
+        assert_eq!(player.current_frame(), 1);
+        assert!(player
+            .initial_script_diagnostics()
+            .iter()
+            .any(|diagnostic| { diagnostic.message.contains("transition budget exceeded") }));
     }
 
     #[test]
@@ -1377,6 +2670,8 @@ mod tests {
             asset_names: Default::default(),
             asset_appearances: Default::default(),
             layer_metadata: Default::default(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
                 name: "Stage".into(),
@@ -1566,6 +2861,8 @@ mod tests {
             asset_names: Default::default(),
             asset_appearances: Default::default(),
             layer_metadata: Default::default(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
                 name: "Stage".into(),

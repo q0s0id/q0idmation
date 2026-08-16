@@ -10,6 +10,7 @@ pub mod q0s_writer;
 pub mod q1s;
 pub mod raster;
 pub mod rig;
+pub mod runtime_scene;
 pub mod transform;
 pub mod v2;
 

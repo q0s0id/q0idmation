@@ -295,6 +295,7 @@ pub struct ExportJob {
     pub total_units: u32,
     pub phase: String,
     snapshot: ProjectV2,
+    source_project_path: Option<PathBuf>,
 }
 
 impl ExportJob {
@@ -350,6 +351,7 @@ pub struct Q0EncState {
     pub q0v_streams: Q0vStreams,
     pub output_text: String,
     pub last_export_directory: Option<PathBuf>,
+    source_project_path: Option<PathBuf>,
     pub queue: Vec<ExportJob>,
     pub queue_running: bool,
     next_job_id: u64,
@@ -384,6 +386,7 @@ impl Default for Q0EncState {
             q0v_streams: Q0vStreams::default(),
             output_text: "movie.q0s".to_string(),
             last_export_directory: None,
+            source_project_path: None,
             queue: Vec::new(),
             queue_running: false,
             next_job_id: 1,
@@ -411,6 +414,7 @@ impl Q0EncState {
 
     pub fn open_for_project(&mut self, project: &ProjectV2, file_path: Option<&Path>) {
         self.open = true;
+        self.source_project_path = file_path.map(Path::to_path_buf);
         self.source_q0rg_id = project.meta.entry_q0rg_id;
         self.width = u32::from(project.meta.stage_width);
         self.height = u32::from(project.meta.stage_height);
@@ -568,6 +572,7 @@ impl Q0EncState {
             total_units,
             phase: "waiting".to_string(),
             snapshot: project.clone(),
+            source_project_path: self.source_project_path.clone(),
         });
         Ok(id)
     }
@@ -744,13 +749,16 @@ fn export_q0s(
     if cancel.load(Ordering::Acquire) {
         return Ok(WorkerOutcome::Cancelled);
     }
-    progress(0, 1, "validating runtime build");
-    let bytes = crate::export::export_to_q0s_bytes(job.snapshot())
-        .map_err(|error| format!("serialize: {error}"))?;
+    progress(0, 1, "bundling runtime project dependencies");
+    let bundled = crate::export::export_with_embedded_dependencies(
+        job.snapshot(),
+        job.source_project_path.as_deref(),
+    )?;
+    let bytes = bundled.bytes;
     let parsed = q0s_format::parse_q0s_v2(&bytes)
         .map_err(|error| format!("parse-back before write: {error}"))?;
-    if !q0s_format::v2::wire_equivalent(&parsed, job.snapshot()) {
-        return Err("parse-back before write changed the canonical project".to_string());
+    if !q0s_format::v2::wire_equivalent(&parsed, &bundled.project) {
+        return Err("parse-back before write changed the bundled canonical project".to_string());
     }
     if cancel.load(Ordering::Acquire) {
         return Ok(WorkerOutcome::Cancelled);
@@ -760,8 +768,8 @@ fn export_q0s(
     let reread = std::fs::read(&job.output_path).map_err(|error| format!("reread: {error}"))?;
     let reparsed = q0s_format::parse_q0s_v2(&reread)
         .map_err(|error| format!("parse-back after write: {error}"))?;
-    if !q0s_format::v2::wire_equivalent(&reparsed, job.snapshot()) {
-        return Err("written q0s does not match the canonical export snapshot".to_string());
+    if !q0s_format::v2::wire_equivalent(&reparsed, &bundled.project) {
+        return Err("written q0s does not match the bundled canonical export snapshot".to_string());
     }
     progress(1, 1, "runtime build verified");
     Ok(WorkerOutcome::Completed)
@@ -1437,7 +1445,10 @@ pub fn suggested_output_path(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use q0s_format::v2::{Asset, BitmapAsset, Placement, Target, Transform2D, Tween};
+    use q0s_format::v2::{
+        Asset, BitmapAsset, Placement, ProjectDependencyKind, ProjectDependencyNode,
+        ProjectDependencySource, Target, Transform2D, Tween,
+    };
 
     fn unique_output(label: &str) -> PathBuf {
         let nonce = std::time::SystemTime::now()
@@ -1566,7 +1577,7 @@ mod tests {
     fn q0s_job_uses_an_immutable_snapshot_and_round_trips() {
         let mut project = crate::state::default_project();
         project.meta.name = "snapshot before edits".to_string();
-        let output = unique_output("снимок").with_extension("q0s");
+        let output = unique_output("СЃРЅРёРјРѕРє").with_extension("q0s");
         let mut state = Q0EncState::default();
         state.open_for_project(&project, None);
         state.output_text = output.display().to_string();
@@ -1639,6 +1650,50 @@ mod tests {
         );
         assert_eq!(parsed.q0rgs[0].layers[0].explicit_keyframes, vec![2, 5]);
         std::fs::remove_file(output).expect("cleanup q0s");
+    }
+
+    #[test]
+    fn q0s_queue_embeds_external_q0lang_relative_to_source_project() {
+        let mut project = visual_project(1);
+        project
+            .runtime
+            .project_graph
+            .nodes
+            .push(ProjectDependencyNode {
+                node_id: 1,
+                parent_node_id: None,
+                alias: "game".into(),
+                kind: ProjectDependencyKind::Q0lang,
+                source: ProjectDependencySource::External("game.q0l".into()),
+            });
+        let dir = unique_output("q0lang-bundle-dir");
+        std::fs::create_dir_all(&dir).expect("create q0lang bundle dir");
+        let project_path = dir.join("movie.q1s");
+        let source_path = dir.join("game.q0l");
+        let output = dir.join("movie.q0s");
+        let source = "import q0.time\npb func tick x {\n  return x + 1\n}\n";
+        std::fs::write(&source_path, source).expect("write external q0l");
+
+        let mut state = Q0EncState::default();
+        state.open_for_project(&project, Some(&project_path));
+        state.output_text = output.display().to_string();
+        state.enqueue(&project).expect("enqueue bundled q0s");
+        state.start_queue();
+        let statuses = wait_for_queue(&mut state);
+        assert!(
+            matches!(state.queue[0].state, JobState::Completed),
+            "queue state: {:?}; statuses: {statuses:?}",
+            state.queue[0].state
+        );
+
+        std::fs::remove_file(&source_path).expect("remove q0l after queue export");
+        let parsed = q0s_format::parse_q0s_v2(&std::fs::read(&output).expect("read bundled q0s"))
+            .expect("parse bundled q0s");
+        assert!(matches!(
+            &parsed.runtime.project_graph.nodes[0].source,
+            ProjectDependencySource::Embedded(bytes) if bytes == source.as_bytes()
+        ));
+        std::fs::remove_dir_all(&dir).expect("cleanup bundle dir");
     }
 
     #[test]
@@ -1781,6 +1836,7 @@ mod tests {
             total_units: 3,
             phase: "testing".into(),
             snapshot: project,
+            source_project_path: None,
         };
         let cancel = AtomicBool::new(true);
         let outcome = execute_job(&job, &cancel, |_, _, _| {}).expect("cancel outcome");
@@ -1916,18 +1972,18 @@ mod tests {
 
     #[test]
     fn suggested_path_keeps_the_project_directory_and_name() {
-        let path = Path::new("folder with spaces/герой.q1s");
+        let path = Path::new("folder with spaces/РіРµСЂРѕР№.q1s");
         assert_eq!(
             suggested_output_path(Some(path), ExportFormat::Q0s, ImageCodec::Png),
-            PathBuf::from("folder with spaces/герой.q0s")
+            PathBuf::from("folder with spaces/РіРµСЂРѕР№.q0s")
         );
         assert_eq!(
             suggested_output_path(Some(path), ExportFormat::Mp4, ImageCodec::Png),
-            PathBuf::from("folder with spaces/герой.mp4")
+            PathBuf::from("folder with spaces/РіРµСЂРѕР№.mp4")
         );
         assert_eq!(
             suggested_output_path(Some(path), ExportFormat::PngSequence, ImageCodec::Png),
-            PathBuf::from("folder with spaces/герой-frames")
+            PathBuf::from("folder with spaces/РіРµСЂРѕР№-frames")
         );
     }
 }

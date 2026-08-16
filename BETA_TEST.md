@@ -1,4 +1,4 @@
-# q0idmation first beta: 10-minute test
+# q0idmation beta release: 10-minute test
 
 Keep the original `.q1s` project while testing. A `.q0s` file is a playback
 export, not a replacement for the source project.

@@ -1,19 +1,28 @@
-//! q0lang v0 parser shared by editor and player.
+//! q0lang parser shared by editor, compiler and player.
 //!
-//! This is intentionally small and line-oriented: enough structure for the
-//! editor to validate the language shape and for the future runtime/compiler
-//! to grow from stable AST names instead of raw strings.
+//! Blocks are parsed into a real recursive AST. Runtime never reparses block
+//! source text: source parsing ends here, before qvm bytecode compilation.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {
     pub statements: Vec<Statement>,
+    pub statement_lines: Vec<usize>,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Block {
+    pub statements: Vec<Statement>,
+    pub statement_lines: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Statement {
     Assignment {
         name: String,
+        value: Value,
+    },
+    Expression {
         value: Value,
     },
     TimelineSignal {
@@ -25,6 +34,10 @@ pub enum Statement {
         args: Vec<Value>,
     },
     RigCommand {
+        command: String,
+        args: Vec<Value>,
+    },
+    SceneCommand {
         command: String,
         args: Vec<Value>,
     },
@@ -40,9 +53,22 @@ pub enum Statement {
         visibility: Visibility,
         name: String,
         params: Vec<String>,
+        body: Option<Block>,
     },
     DoBlock {
-        body: String,
+        body: Block,
+    },
+    If {
+        condition: Value,
+        then_body: Block,
+        else_body: Option<Block>,
+    },
+    While {
+        condition: Value,
+        body: Block,
+    },
+    Return {
+        value: Option<Value>,
     },
     Import {
         library: String,
@@ -58,7 +84,7 @@ pub enum TimelineSignal {
     GoStop,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Visibility {
     Public,
     Private,
@@ -69,6 +95,8 @@ pub enum Value {
     Ident(String),
     Number(String),
     String(String),
+    Bool(bool),
+    Null,
     Unary {
         op: UnaryOp,
         value: Box<Value>,
@@ -88,6 +116,7 @@ pub enum Value {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {
     Neg,
+    Not,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +127,14 @@ pub enum BinaryOp {
     Div,
     Rem,
     Pow,
+    Equal,
+    NotEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+    And,
+    Or,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,10 +143,8 @@ pub struct Diagnostic {
     pub message: String,
 }
 
-/// Maximum number of recursive Pratt-parser calls allowed for one expression.
-/// This bounds parentheses, unary operators, nested calls, and right-associative
-/// operators parsed from untrusted scripts embedded in movie files.
 pub const MAX_EXPRESSION_NESTING_DEPTH: usize = 64;
+pub const MAX_BLOCK_NESTING_DEPTH: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuiltinLibrary {
@@ -134,6 +169,35 @@ pub const BUILTIN_LIBRARIES: &[BuiltinLibrary] = &[
     BuiltinLibrary {
         name: "q0.timeline",
         symbols: &["gorun!", "gostop!", "frame", "label"],
+    },
+    BuiltinLibrary {
+        name: "q0.input",
+        symbols: &[
+            "input.left",
+            "input.right",
+            "input.jump",
+            "input.jump_pressed",
+        ],
+    },
+    BuiltinLibrary {
+        name: "q0.scene",
+        symbols: &[
+            "stage.width",
+            "stage.height",
+            "player.x",
+            "player.y",
+            "player.left",
+            "player.right",
+            "player.top",
+            "player.bottom",
+            "player.width",
+            "player.height",
+            "q0scene.switch!",
+        ],
+    },
+    BuiltinLibrary {
+        name: "q0.time",
+        symbols: &["time.dt"],
     },
     BuiltinLibrary {
         name: "q0.math",
@@ -167,132 +231,210 @@ pub const BUILTIN_LIBRARIES: &[BuiltinLibrary] = &[
     },
     BuiltinLibrary {
         name: "q0.core",
-        symbols: &["do!", "listen", "xlisten", "pb", "pr", "func"],
+        symbols: &[
+            "do!", "listen", "xlisten", "pb", "pr", "func", "if", "else", "while", "return",
+            "true", "false", "null", "and", "or", "not",
+        ],
     },
 ];
 
 pub fn parse(src: &str) -> Program {
-    let mut p = Parser {
-        lines: src.lines().enumerate().peekable(),
-        statements: Vec::new(),
-        diagnostics: Vec::new(),
-    };
-    p.parse_all();
-    Program {
-        statements: p.statements,
-        diagnostics: p.diagnostics,
-    }
+    Parser::new(src).parse_program()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostCommandKind {
+    Shell,
+    Rig,
+    Scene,
 }
 
 struct Parser<'a> {
-    lines: std::iter::Peekable<std::iter::Enumerate<std::str::Lines<'a>>>,
-    statements: Vec<Statement>,
+    lines: Vec<&'a str>,
+    pos: usize,
     diagnostics: Vec<Diagnostic>,
 }
 
-impl Parser<'_> {
-    fn parse_all(&mut self) {
-        while let Some((idx, raw)) = self.lines.next() {
-            let line_no = idx + 1;
-            let line = strip_comment(raw).trim();
+impl<'a> Parser<'a> {
+    fn new(src: &'a str) -> Self {
+        Self {
+            lines: src.lines().collect(),
+            pos: 0,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn parse_program(mut self) -> Program {
+        let mut statements = Vec::new();
+        let mut statement_lines = Vec::new();
+        while self.pos < self.lines.len() {
+            let line_no = self.pos + 1;
+            let line = strip_comment(self.lines[self.pos]).trim().to_string();
             if line.is_empty() {
+                self.pos += 1;
                 continue;
             }
-            if line == "}" {
+            if line.starts_with('}') {
                 self.diagnostics.push(Diagnostic {
                     line: line_no,
                     message: "unexpected closing brace".to_string(),
                 });
+                self.pos += 1;
                 continue;
             }
-            if line.starts_with("do") {
-                self.parse_do(line_no, line);
+            if line.starts_with("else") {
+                self.diagnostics.push(Diagnostic {
+                    line: line_no,
+                    message: "unexpected else without matching if".to_string(),
+                });
+                self.pos += 1;
                 continue;
             }
-            self.parse_line(line_no, line);
+            if let Some(statement) = self.parse_statement(0) {
+                statements.push(statement);
+                statement_lines.push(line_no);
+            }
+        }
+        Program {
+            statements,
+            statement_lines,
+            diagnostics: self.diagnostics,
         }
     }
 
-    fn parse_line(&mut self, line_no: usize, line: &str) {
-        let parts = split_words(line);
-        let Some(first) = parts.first().copied() else {
-            return;
-        };
+    fn parse_statement(&mut self, depth: usize) -> Option<Statement> {
+        if depth >= MAX_BLOCK_NESTING_DEPTH {
+            let line_no = self.pos + 1;
+            self.diagnostics.push(Diagnostic {
+                line: line_no,
+                message: format!(
+                    "q0lang block nesting is too deep (maximum {MAX_BLOCK_NESTING_DEPTH})"
+                ),
+            });
+            self.pos += 1;
+            return None;
+        }
+
+        let line_no = self.pos + 1;
+        let line = strip_comment(self.lines[self.pos]).trim().to_string();
+        self.pos += 1;
+        if line.is_empty() {
+            return None;
+        }
+        let parts = split_words(&line);
+        let first = parts.first().copied()?;
+
         match first {
             "import" => self.parse_import(line_no, &parts),
-            "gorun!" => self.parse_timeline(line_no, TimelineSignal::GoRun, line, &parts),
-            "gostop!" => self.parse_timeline(line_no, TimelineSignal::GoStop, line, &parts),
+            "gorun!" => self.parse_timeline(line_no, TimelineSignal::GoRun, &line, &parts),
+            "gostop!" => self.parse_timeline(line_no, TimelineSignal::GoStop, &line, &parts),
             "gorun" | "gostop" => {
                 self.diagnostics.push(Diagnostic {
                     line: line_no,
                     message: format!("execution signal `{first}` must end with !"),
                 });
-                self.statements.push(Statement::Unknown {
-                    text: line.to_string(),
-                });
+                Some(Statement::Unknown { text: line })
             }
             "listen" => self.parse_listen(line_no, &parts, false),
             "xlisten" => self.parse_listen(line_no, &parts, true),
-            "pb" => self.parse_function(line_no, &parts, Visibility::Public),
-            "pr" => self.parse_function(line_no, &parts, Visibility::Private),
+            "pb" => self.parse_function(line_no, &line, Visibility::Public, depth),
+            "pr" => self.parse_function(line_no, &line, Visibility::Private, depth),
+            "do!" => self.parse_do(line_no, &line, depth),
+            "do" => {
+                self.diagnostics.push(Diagnostic {
+                    line: line_no,
+                    message: "execution block `do` must be written as do!".to_string(),
+                });
+                if line.contains('{') {
+                    let _ = self.parse_block(line_no, "do", depth + 1);
+                }
+                None
+            }
+            "if" => self.parse_if(line_no, &line, depth),
+            "while" => self.parse_while(line_no, &line, depth),
+            "return" => self.parse_return(line_no, &line),
+            "else" => {
+                self.diagnostics.push(Diagnostic {
+                    line: line_no,
+                    message: "unexpected else without matching if".to_string(),
+                });
+                None
+            }
             _ if first.starts_with("q0shell.") && first.ends_with('!') => {
-                self.parse_shell_command(line_no, line, first)
+                self.parse_host_command(line_no, &line, first, HostCommandKind::Shell)
             }
             _ if first.starts_with("q0rig.") && first.ends_with('!') => {
-                self.parse_rig_command(line_no, line, first)
+                self.parse_host_command(line_no, &line, first, HostCommandKind::Rig)
             }
-            _ if line.contains('=') => self.parse_assignment(line_no, line),
-            _ if first.ends_with('!') => self.statements.push(Statement::Unknown {
-                text: line.to_string(),
-            }),
+            _ if first.starts_with("q0scene.") && first.ends_with('!') => {
+                self.parse_host_command(line_no, &line, first, HostCommandKind::Scene)
+            }
+            _ if find_assignment_operator(&line).is_some() => self.parse_assignment(line_no, &line),
+            _ if first.ends_with('!') => Some(Statement::Unknown { text: line }),
+            _ => {
+                let before = self.diagnostics.len();
+                let value = parse_value(&line, line_no, &mut self.diagnostics);
+                if self.diagnostics.len() == before && matches!(value, Value::Call { .. }) {
+                    Some(Statement::Expression { value })
+                } else {
+                    if self.diagnostics.len() == before {
+                        self.diagnostics.push(Diagnostic {
+                            line: line_no,
+                            message: "unknown q0lang statement".to_string(),
+                        });
+                    }
+                    Some(Statement::Unknown { text: line })
+                }
+            }
+        }
+    }
+
+    fn parse_import(&mut self, line_no: usize, parts: &[&str]) -> Option<Statement> {
+        match parts {
+            ["import", library] => {
+                if !BUILTIN_LIBRARIES
+                    .iter()
+                    .any(|builtin| builtin.name == *library)
+                {
+                    self.diagnostics.push(Diagnostic {
+                        line: line_no,
+                        message: format!("unknown library `{library}`"),
+                    });
+                }
+                Some(Statement::Import {
+                    library: (*library).to_string(),
+                })
+            }
             _ => {
                 self.diagnostics.push(Diagnostic {
                     line: line_no,
-                    message: "unknown q0lang statement".to_string(),
+                    message: "import expects one library name".to_string(),
                 });
-                self.statements.push(Statement::Unknown {
-                    text: line.to_string(),
-                });
+                None
             }
         }
     }
 
-    fn parse_import(&mut self, line_no: usize, parts: &[&str]) {
-        match parts {
-            ["import", lib] => {
-                if !BUILTIN_LIBRARIES.iter().any(|b| b.name == *lib) {
-                    self.diagnostics.push(Diagnostic {
-                        line: line_no,
-                        message: format!("unknown library `{lib}`"),
-                    });
-                }
-                self.statements.push(Statement::Import {
-                    library: (*lib).to_string(),
-                });
-            }
-            _ => self.diagnostics.push(Diagnostic {
-                line: line_no,
-                message: "import expects one library name".to_string(),
-            }),
-        }
-    }
-
-    fn parse_timeline(&mut self, line_no: usize, kind: TimelineSignal, line: &str, parts: &[&str]) {
+    fn parse_timeline(
+        &mut self,
+        line_no: usize,
+        kind: TimelineSignal,
+        line: &str,
+        parts: &[&str],
+    ) -> Option<Statement> {
         if parts.len() < 2 {
             self.diagnostics.push(Diagnostic {
                 line: line_no,
                 message: "timeline signal expects a target".to_string(),
             });
-            return;
+            return None;
         }
         let target_src = line[parts[0].len()..].trim();
-        self.statements.push(Statement::TimelineSignal {
-            kind,
-            target: parse_value(target_src, line_no, &mut self.diagnostics),
-        });
+        let target = parse_value(target_src, line_no, &mut self.diagnostics);
+        Some(Statement::TimelineSignal { kind, target })
     }
 
-    fn parse_listen(&mut self, line_no: usize, parts: &[&str], remove: bool) {
+    fn parse_listen(&mut self, line_no: usize, parts: &[&str], remove: bool) -> Option<Statement> {
         if parts.len() != 3 {
             self.diagnostics.push(Diagnostic {
                 line: line_no,
@@ -303,7 +445,7 @@ impl Parser<'_> {
                 }
                 .to_string(),
             });
-            return;
+            return None;
         }
         let event = parts[1].to_string();
         if !is_mouse_event(&event) {
@@ -312,22 +454,33 @@ impl Parser<'_> {
                 message: format!("event `{event}` is not in q0.mouse built-ins yet"),
             });
         }
-        if remove {
-            self.statements.push(Statement::Unlisten {
+        Some(if remove {
+            Statement::Unlisten {
                 event,
                 handler: parts[2].to_string(),
-            });
+            }
         } else {
-            self.statements.push(Statement::Listen {
+            Statement::Listen {
                 event,
                 handler: parts[2].to_string(),
-            });
-        }
+            }
+        })
     }
 
-    fn parse_shell_command(&mut self, line_no: usize, line: &str, first: &str) {
+    fn parse_host_command(
+        &mut self,
+        line_no: usize,
+        line: &str,
+        first: &str,
+        kind: HostCommandKind,
+    ) -> Option<Statement> {
+        let prefix = match kind {
+            HostCommandKind::Shell => "q0shell.",
+            HostCommandKind::Rig => "q0rig.",
+            HostCommandKind::Scene => "q0scene.",
+        };
         let command = first
-            .trim_start_matches("q0shell.")
+            .trim_start_matches(prefix)
             .trim_end_matches('!')
             .to_string();
         let raw_args = line[first.len()..].trim();
@@ -339,124 +492,250 @@ impl Parser<'_> {
                 .map(|arg| parse_value(arg.trim(), line_no, &mut self.diagnostics))
                 .collect()
         };
-        self.statements
-            .push(Statement::ShellCommand { command, args });
+        Some(match kind {
+            HostCommandKind::Shell => Statement::ShellCommand { command, args },
+            HostCommandKind::Rig => Statement::RigCommand { command, args },
+            HostCommandKind::Scene => Statement::SceneCommand { command, args },
+        })
     }
 
-    fn parse_rig_command(&mut self, line_no: usize, line: &str, first: &str) {
-        let command = first
-            .trim_start_matches("q0rig.")
-            .trim_end_matches('!')
-            .to_string();
-        let raw_args = line[first.len()..].trim();
-        let args = if raw_args.is_empty() {
-            Vec::new()
+    fn parse_function(
+        &mut self,
+        line_no: usize,
+        line: &str,
+        visibility: Visibility,
+        depth: usize,
+    ) -> Option<Statement> {
+        let has_body = line.ends_with('{');
+        let header = if has_body {
+            line[..line.len() - 1].trim_end()
         } else {
-            split_top_level_commas(raw_args)
-                .into_iter()
-                .map(|arg| parse_value(arg.trim(), line_no, &mut self.diagnostics))
-                .collect()
+            line
         };
-        self.statements
-            .push(Statement::RigCommand { command, args });
-    }
-
-    fn parse_function(&mut self, line_no: usize, parts: &[&str], visibility: Visibility) {
+        let parts = split_words(header);
         if parts.len() < 3 || parts[1] != "func" {
             self.diagnostics.push(Diagnostic {
                 line: line_no,
-                message: "function expects: pb func name [params...] or pr func name [params...]"
-                    .to_string(),
+                message:
+                    "function expects: pb func name [params...] { ... } or signature-only form"
+                        .to_string(),
             });
-            return;
+            return None;
         }
-        self.statements.push(Statement::Function {
-            visibility,
-            name: parts[2].to_string(),
-            params: parts[3..].iter().map(|s| (*s).to_string()).collect(),
-        });
-    }
-
-    fn parse_assignment(&mut self, line_no: usize, line: &str) {
-        let Some((name, value)) = line.split_once('=') else {
-            return;
-        };
-        let name = name.trim();
-        let value = value.trim();
-        if name.is_empty() || !is_ident(name) {
+        let name = parts[2];
+        if !is_plain_ident(name) {
             self.diagnostics.push(Diagnostic {
                 line: line_no,
-                message: "left side of assignment must be an identifier".to_string(),
+                message: "function name must be an identifier".to_string(),
             });
-            return;
+            return None;
+        }
+        let params = parts[3..]
+            .iter()
+            .map(|param| (*param).to_string())
+            .collect::<Vec<_>>();
+        if let Some(bad) = params.iter().find(|param| !is_plain_ident(param)) {
+            self.diagnostics.push(Diagnostic {
+                line: line_no,
+                message: format!("function parameter `{bad}` must be an identifier"),
+            });
+        }
+        let body = if has_body {
+            Some(self.parse_block(line_no, "function", depth + 1).0)
+        } else {
+            None
+        };
+        Some(Statement::Function {
+            visibility,
+            name: name.to_string(),
+            params,
+            body,
+        })
+    }
+
+    fn parse_do(&mut self, line_no: usize, line: &str, depth: usize) -> Option<Statement> {
+        if !line.ends_with('{') {
+            self.diagnostics.push(Diagnostic {
+                line: line_no,
+                message: "do! expects an opening { at the end of the line".to_string(),
+            });
+            return None;
+        }
+        let (body, _, _) = self.parse_block(line_no, "do!", depth + 1);
+        Some(Statement::DoBlock { body })
+    }
+
+    fn parse_if(&mut self, line_no: usize, line: &str, depth: usize) -> Option<Statement> {
+        let Some(condition_src) = block_header_expression(line, "if") else {
+            self.diagnostics.push(Diagnostic {
+                line: line_no,
+                message: "if expects: if condition {".to_string(),
+            });
+            return None;
+        };
+        let condition = parse_value(condition_src, line_no, &mut self.diagnostics);
+        let (then_body, suffix, close_line) = self.parse_block(line_no, "if", depth + 1);
+        let else_body = if suffix.as_deref() == Some("else {") {
+            Some(self.parse_block(close_line, "else", depth + 1).0)
+        } else if suffix.is_some() {
+            self.diagnostics.push(Diagnostic {
+                line: close_line,
+                message: "only `} else {` may follow an if closing brace".to_string(),
+            });
+            None
+        } else if self.consume_separate_else_header() {
+            let else_line = self.pos;
+            Some(self.parse_block(else_line, "else", depth + 1).0)
+        } else {
+            None
+        };
+        Some(Statement::If {
+            condition,
+            then_body,
+            else_body,
+        })
+    }
+
+    fn parse_while(&mut self, line_no: usize, line: &str, depth: usize) -> Option<Statement> {
+        let Some(condition_src) = block_header_expression(line, "while") else {
+            self.diagnostics.push(Diagnostic {
+                line: line_no,
+                message: "while expects: while condition {".to_string(),
+            });
+            return None;
+        };
+        let condition = parse_value(condition_src, line_no, &mut self.diagnostics);
+        let (body, suffix, close_line) = self.parse_block(line_no, "while", depth + 1);
+        if let Some(suffix) = suffix {
+            self.diagnostics.push(Diagnostic {
+                line: close_line,
+                message: format!("unexpected text after while closing brace: `{suffix}`"),
+            });
+        }
+        Some(Statement::While { condition, body })
+    }
+
+    fn parse_return(&mut self, line_no: usize, line: &str) -> Option<Statement> {
+        let rest = line["return".len()..].trim();
+        let value = if rest.is_empty() {
+            None
+        } else {
+            Some(parse_value(rest, line_no, &mut self.diagnostics))
+        };
+        Some(Statement::Return { value })
+    }
+
+    fn parse_assignment(&mut self, line_no: usize, line: &str) -> Option<Statement> {
+        let index = find_assignment_operator(line)?;
+        let name = line[..index].trim();
+        let value = line[index + 1..].trim();
+        if !is_member_ident(name) {
+            self.diagnostics.push(Diagnostic {
+                line: line_no,
+                message: "left side of assignment must be an identifier or member path".to_string(),
+            });
+            return None;
         }
         if value.is_empty() {
             self.diagnostics.push(Diagnostic {
                 line: line_no,
                 message: "assignment needs a value".to_string(),
             });
-            return;
+            return None;
         }
-        self.statements.push(Statement::Assignment {
+        Some(Statement::Assignment {
             name: name.to_string(),
             value: parse_value(value, line_no, &mut self.diagnostics),
-        });
+        })
     }
 
-    fn parse_do(&mut self, line_no: usize, line: &str) {
-        if !line.starts_with("do!") {
+    fn parse_block(
+        &mut self,
+        opening_line: usize,
+        kind: &str,
+        depth: usize,
+    ) -> (Block, Option<String>, usize) {
+        let mut block = Block::default();
+        if depth >= MAX_BLOCK_NESTING_DEPTH {
             self.diagnostics.push(Diagnostic {
-                line: line_no,
-                message: "execution block `do` must be written as do!".to_string(),
+                line: opening_line,
+                message: format!(
+                    "q0lang block nesting is too deep (maximum {MAX_BLOCK_NESTING_DEPTH})"
+                ),
             });
-            if line.contains('{') {
-                for (_idx, raw) in self.lines.by_ref() {
-                    if strip_comment(raw).trim() == "}" {
-                        break;
-                    }
-                }
-            }
-            return;
+            return (block, None, opening_line);
         }
-        if !line.contains('{') {
-            self.diagnostics.push(Diagnostic {
-                line: line_no,
-                message: "do! expects an opening {".to_string(),
-            });
-            return;
-        }
-        let mut body = String::new();
-        let mut closed = false;
-        for (idx, raw) in self.lines.by_ref() {
-            let trimmed = strip_comment(raw).trim();
-            if trimmed == "}" {
-                closed = true;
-                break;
+        while self.pos < self.lines.len() {
+            let line_no = self.pos + 1;
+            let line = strip_comment(self.lines[self.pos]).trim().to_string();
+            if line.is_empty() {
+                self.pos += 1;
+                continue;
             }
-            body.push_str(raw);
-            body.push('\n');
-            if trimmed.contains('}') {
-                self.diagnostics.push(Diagnostic {
-                    line: idx + 1,
-                    message: "closing brace must be alone on its line".to_string(),
-                });
+            if let Some(rest) = line.strip_prefix('}') {
+                self.pos += 1;
+                let suffix = rest.trim();
+                return (
+                    block,
+                    (!suffix.is_empty()).then(|| suffix.to_string()),
+                    line_no,
+                );
+            }
+            if let Some(statement) = self.parse_statement(depth) {
+                block.statements.push(statement);
+                block.statement_lines.push(line_no);
             }
         }
-        if !closed {
-            self.diagnostics.push(Diagnostic {
-                line: line_no,
-                message: "do! block is missing closing }".to_string(),
-            });
+        self.diagnostics.push(Diagnostic {
+            line: opening_line,
+            message: format!("{kind} block is missing closing }}"),
+        });
+        (block, None, self.lines.len().max(opening_line))
+    }
+
+    fn consume_separate_else_header(&mut self) -> bool {
+        let mut scan = self.pos;
+        while scan < self.lines.len() && strip_comment(self.lines[scan]).trim().is_empty() {
+            scan += 1;
         }
-        self.statements.push(Statement::DoBlock { body });
+        if scan < self.lines.len() && strip_comment(self.lines[scan]).trim() == "else {" {
+            self.pos = scan + 1;
+            true
+        } else {
+            false
+        }
     }
 }
 
+fn block_header_expression<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
+    let rest = line.strip_prefix(keyword)?.trim_start();
+    let condition = rest.strip_suffix('{')?.trim_end();
+    (!condition.is_empty()).then_some(condition)
+}
+
 fn strip_comment(line: &str) -> &str {
-    match line.find('#') {
-        Some(i) => &line[..i],
-        None => line,
+    let bytes = line.as_bytes();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == active {
+                quote = None;
+            }
+        } else if b == b'"' || b == b'\'' {
+            quote = Some(b);
+        } else if b == b'#' {
+            return &line[..i];
+        }
+        i += 1;
     }
+    line
 }
 
 fn split_words(line: &str) -> Vec<&str> {
@@ -471,21 +750,21 @@ fn split_top_level_commas(src: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut start = 0;
     let mut depth = 0_i32;
-    let mut in_string = false;
+    let mut quote = None;
     let mut escaped = false;
     for (idx, ch) in src.char_indices() {
-        if in_string {
+        if let Some(active) = quote {
             if escaped {
                 escaped = false;
             } else if ch == '\\' {
                 escaped = true;
-            } else if ch == '"' {
-                in_string = false;
+            } else if ch == active {
+                quote = None;
             }
             continue;
         }
         match ch {
-            '"' => in_string = true,
+            '"' | '\'' => quote = Some(ch),
             '(' => depth += 1,
             ')' => depth -= 1,
             ',' if depth == 0 => {
@@ -499,10 +778,56 @@ fn split_top_level_commas(src: &str) -> Vec<&str> {
     out
 }
 
-fn is_ident(src: &str) -> bool {
+fn find_assignment_operator(src: &str) -> Option<usize> {
+    let bytes = src.as_bytes();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut depth = 0_i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == active {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' | b'\'' => quote = Some(b),
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'=' if depth == 0 => {
+                let prev = i.checked_sub(1).and_then(|index| bytes.get(index)).copied();
+                let next = bytes.get(i + 1).copied();
+                if prev != Some(b'=')
+                    && prev != Some(b'!')
+                    && prev != Some(b'<')
+                    && prev != Some(b'>')
+                    && next != Some(b'=')
+                {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn is_plain_ident(src: &str) -> bool {
     let mut chars = src.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn is_member_ident(src: &str) -> bool {
+    !src.is_empty() && src.split('.').all(is_plain_ident)
 }
 
 fn is_ident_start(b: u8) -> bool {
@@ -516,8 +841,8 @@ fn is_ident_continue(b: u8) -> bool {
 fn is_mouse_event(src: &str) -> bool {
     BUILTIN_LIBRARIES
         .iter()
-        .find(|b| b.name == "q0.mouse")
-        .map(|b| b.symbols.contains(&src))
+        .find(|library| library.name == "q0.mouse")
+        .map(|library| library.symbols.contains(&src))
         .unwrap_or(false)
 }
 
@@ -526,12 +851,24 @@ enum ExprToken {
     Ident(String),
     Number(String),
     String(String),
+    True,
+    False,
+    Null,
     Plus,
     Minus,
     Star,
     Slash,
     Percent,
     Caret,
+    EqualEqual,
+    BangEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+    And,
+    Or,
+    Not,
     LParen,
     RParen,
     Comma,
@@ -581,7 +918,9 @@ impl<'a, 'd> ExprParser<'a, 'd> {
             if !self.depth_exceeded {
                 self.diagnostics.push(Diagnostic {
                     line: self.line,
-                    message: "expression nesting is too deep (maximum 64)".to_string(),
+                    message: format!(
+                        "expression nesting is too deep (maximum {MAX_EXPRESSION_NESTING_DEPTH})"
+                    ),
                 });
             }
             self.depth_exceeded = true;
@@ -592,17 +931,19 @@ impl<'a, 'd> ExprParser<'a, 'd> {
         let mut lhs = match self.next() {
             ExprToken::Number(raw) => Value::Number(raw),
             ExprToken::String(text) => Value::String(text),
+            ExprToken::True => Value::Bool(true),
+            ExprToken::False => Value::Bool(false),
+            ExprToken::Null => Value::Null,
             ExprToken::Ident(name) => {
                 if matches!(self.peek(), ExprToken::LParen) {
                     self.next();
                     let mut args = Vec::new();
                     if !matches!(self.peek(), ExprToken::RParen) {
                         loop {
-                            let argument = self.parse_bp(0, depth + 1);
+                            args.push(self.parse_bp(0, depth + 1));
                             if self.depth_exceeded {
                                 return Value::Raw(self.src.to_string());
                             }
-                            args.push(argument);
                             if matches!(self.peek(), ExprToken::Comma) {
                                 self.next();
                                 continue;
@@ -624,20 +965,21 @@ impl<'a, 'd> ExprParser<'a, 'd> {
                 }
             }
             ExprToken::Minus => {
-                let rhs = self.parse_bp(9, depth + 1);
-                if self.depth_exceeded {
-                    return Value::Raw(self.src.to_string());
-                }
+                let value = self.parse_bp(17, depth + 1);
                 Value::Unary {
                     op: UnaryOp::Neg,
-                    value: Box::new(rhs),
+                    value: Box::new(value),
+                }
+            }
+            ExprToken::Not => {
+                let value = self.parse_bp(17, depth + 1);
+                Value::Unary {
+                    op: UnaryOp::Not,
+                    value: Box::new(value),
                 }
             }
             ExprToken::LParen => {
                 let inner = self.parse_bp(0, depth + 1);
-                if self.depth_exceeded {
-                    return Value::Raw(self.src.to_string());
-                }
                 if matches!(self.peek(), ExprToken::RParen) {
                     self.next();
                 } else {
@@ -664,12 +1006,12 @@ impl<'a, 'd> ExprParser<'a, 'd> {
             }
         };
 
-        while let Some((l_bp, r_bp, op)) = infix_binding_power(self.peek()) {
-            if l_bp < min_bp {
+        while let Some((left_bp, right_bp, op)) = infix_binding_power(self.peek()) {
+            if left_bp < min_bp {
                 break;
             }
             self.next();
-            let rhs = self.parse_bp(r_bp, depth + 1);
+            let rhs = self.parse_bp(right_bp, depth + 1);
             if self.depth_exceeded {
                 return Value::Raw(self.src.to_string());
             }
@@ -679,7 +1021,6 @@ impl<'a, 'd> ExprParser<'a, 'd> {
                 right: Box::new(rhs),
             };
         }
-
         lhs
     }
 
@@ -689,7 +1030,7 @@ impl<'a, 'd> ExprParser<'a, 'd> {
         let mut i = 0;
         while i < bytes.len() {
             match bytes[i] {
-                b' ' | b'\t' => i += 1,
+                b' ' | b'\t' | b'\r' | b'\n' => i += 1,
                 b'+' => {
                     tokens.push(ExprToken::Plus);
                     i += 1;
@@ -714,6 +1055,30 @@ impl<'a, 'd> ExprParser<'a, 'd> {
                     tokens.push(ExprToken::Caret);
                     i += 1;
                 }
+                b'=' if bytes.get(i + 1) == Some(&b'=') => {
+                    tokens.push(ExprToken::EqualEqual);
+                    i += 2;
+                }
+                b'!' if bytes.get(i + 1) == Some(&b'=') => {
+                    tokens.push(ExprToken::BangEqual);
+                    i += 2;
+                }
+                b'<' if bytes.get(i + 1) == Some(&b'=') => {
+                    tokens.push(ExprToken::LessEqual);
+                    i += 2;
+                }
+                b'>' if bytes.get(i + 1) == Some(&b'=') => {
+                    tokens.push(ExprToken::GreaterEqual);
+                    i += 2;
+                }
+                b'<' => {
+                    tokens.push(ExprToken::Less);
+                    i += 1;
+                }
+                b'>' => {
+                    tokens.push(ExprToken::Greater);
+                    i += 1;
+                }
                 b'(' => {
                     tokens.push(ExprToken::LParen);
                     i += 1;
@@ -726,13 +1091,9 @@ impl<'a, 'd> ExprParser<'a, 'd> {
                     tokens.push(ExprToken::Comma);
                     i += 1;
                 }
-                b'"' => {
-                    let (text, end) = self.lex_string(i + 1, b'"');
-                    tokens.push(ExprToken::String(text));
-                    i = end;
-                }
-                b'\'' => {
-                    let (text, end) = self.lex_string(i + 1, b'\'');
+                b'"' | b'\'' => {
+                    let quote = bytes[i];
+                    let (text, end) = self.lex_string(i + 1, quote);
                     tokens.push(ExprToken::String(text));
                     i = end;
                 }
@@ -765,23 +1126,30 @@ impl<'a, 'd> ExprParser<'a, 'd> {
                     }
                     tokens.push(ExprToken::Number(self.src[start..i].to_string()));
                 }
-                b if is_ident_start(b) => {
+                byte if is_ident_start(byte) => {
                     let start = i;
                     i += 1;
                     while i < bytes.len() && is_ident_continue(bytes[i]) {
                         i += 1;
                     }
-                    tokens.push(ExprToken::Ident(self.src[start..i].to_string()));
+                    let word = &self.src[start..i];
+                    tokens.push(match word {
+                        "true" => ExprToken::True,
+                        "false" => ExprToken::False,
+                        "null" => ExprToken::Null,
+                        "and" => ExprToken::And,
+                        "or" => ExprToken::Or,
+                        "not" => ExprToken::Not,
+                        _ => ExprToken::Ident(word.to_string()),
+                    });
                 }
                 _ => {
+                    let ch = self.src[i..].chars().next().unwrap_or('?');
                     self.diagnostics.push(Diagnostic {
                         line: self.line,
-                        message: format!(
-                            "unknown expression byte `{}`",
-                            self.src[i..].chars().next().unwrap_or('?')
-                        ),
+                        message: format!("unknown expression character `{ch}`"),
                     });
-                    i += 1;
+                    i += ch.len_utf8();
                 }
             }
         }
@@ -794,35 +1162,37 @@ impl<'a, 'd> ExprParser<'a, 'd> {
         let mut out = String::new();
         let mut closed = false;
         while i < bytes.len() {
-            match bytes[i] {
-                b'\\' if i + 1 < bytes.len() => {
-                    let escaped = match bytes[i + 1] {
-                        b'n' => '\n',
-                        b'r' => '\r',
-                        b't' => '\t',
-                        b'"' => '"',
-                        b'\'' => '\'',
-                        b'\\' => '\\',
-                        other => other as char,
-                    };
-                    out.push(escaped);
-                    i += 2;
-                }
-                b if b == quote => {
-                    closed = true;
-                    i += 1;
+            if bytes[i] == quote {
+                i += 1;
+                closed = true;
+                break;
+            }
+            if bytes[i] == b'\\' {
+                i += 1;
+                if i >= bytes.len() {
                     break;
                 }
-                b => {
-                    out.push(b as char);
-                    i += 1;
-                }
+                let escaped = match bytes[i] {
+                    b'n' => '\n',
+                    b'r' => '\r',
+                    b't' => '\t',
+                    b'\\' => '\\',
+                    b'"' => '"',
+                    b'\'' => '\'',
+                    other => other as char,
+                };
+                out.push(escaped);
+                i += 1;
+                continue;
             }
+            let ch = self.src[i..].chars().next().unwrap_or('?');
+            out.push(ch);
+            i += ch.len_utf8();
         }
         if !closed {
             self.diagnostics.push(Diagnostic {
                 line: self.line,
-                message: "string literal is missing closing quote".to_string(),
+                message: "string is missing closing quote".to_string(),
             });
         }
         (out, i)
@@ -841,12 +1211,20 @@ impl<'a, 'd> ExprParser<'a, 'd> {
 
 fn infix_binding_power(token: &ExprToken) -> Option<(u8, u8, BinaryOp)> {
     match token {
-        ExprToken::Plus => Some((1, 2, BinaryOp::Add)),
-        ExprToken::Minus => Some((1, 2, BinaryOp::Sub)),
-        ExprToken::Star => Some((3, 4, BinaryOp::Mul)),
-        ExprToken::Slash => Some((3, 4, BinaryOp::Div)),
-        ExprToken::Percent => Some((3, 4, BinaryOp::Rem)),
-        ExprToken::Caret => Some((8, 7, BinaryOp::Pow)),
+        ExprToken::Or => Some((1, 2, BinaryOp::Or)),
+        ExprToken::And => Some((3, 4, BinaryOp::And)),
+        ExprToken::EqualEqual => Some((5, 6, BinaryOp::Equal)),
+        ExprToken::BangEqual => Some((5, 6, BinaryOp::NotEqual)),
+        ExprToken::Less => Some((7, 8, BinaryOp::Less)),
+        ExprToken::LessEqual => Some((7, 8, BinaryOp::LessEqual)),
+        ExprToken::Greater => Some((7, 8, BinaryOp::Greater)),
+        ExprToken::GreaterEqual => Some((7, 8, BinaryOp::GreaterEqual)),
+        ExprToken::Plus => Some((9, 10, BinaryOp::Add)),
+        ExprToken::Minus => Some((9, 10, BinaryOp::Sub)),
+        ExprToken::Star => Some((11, 12, BinaryOp::Mul)),
+        ExprToken::Slash => Some((11, 12, BinaryOp::Div)),
+        ExprToken::Percent => Some((11, 12, BinaryOp::Rem)),
+        ExprToken::Caret => Some((15, 14, BinaryOp::Pow)),
         _ => None,
     }
 }
@@ -856,7 +1234,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_q0lang_base_shape() {
+    fn parses_language_shape() {
         let program = parse(
             r#"import q0.mouse
 X = "hello"
@@ -879,6 +1257,10 @@ do! {
                 value: Value::String(_),
                 ..
             }
+        ));
+        assert!(matches!(
+            program.statements[8],
+            Statement::DoBlock { ref body } if body.statements.len() == 1
         ));
     }
 
@@ -945,7 +1327,6 @@ q0shell.move! 'out.txt', 'done.txt'
     fn accepts_expression_just_below_nesting_budget() {
         let nesting = MAX_EXPRESSION_NESTING_DEPTH - 1;
         let source = format!("x = {}1{}", "(".repeat(nesting), ")".repeat(nesting));
-
         let program = parse(&source);
         assert_eq!(program.diagnostics, Vec::new());
     }
@@ -954,7 +1335,6 @@ q0shell.move! 'out.txt', 'done.txt'
     fn reports_expression_nesting_budget_instead_of_recursing_unbounded() {
         let nesting = MAX_EXPRESSION_NESTING_DEPTH + 1024;
         let source = format!("x = {}1{}", "(".repeat(nesting), ")".repeat(nesting));
-
         let program = parse(&source);
         let depth_diagnostics = program
             .diagnostics
@@ -976,6 +1356,17 @@ q0shell.move! 'out.txt', 'done.txt'
     }
 
     #[test]
+    fn parses_q0scene_switch_command() {
+        let program = parse("import q0.scene\nq0scene.switch! \"room_2\"\n");
+        assert_eq!(program.diagnostics, Vec::new());
+        assert!(matches!(
+            program.statements[1],
+            Statement::SceneCommand { ref command, ref args }
+                if command == "switch" && args == &[Value::String("room_2".into())]
+        ));
+    }
+
+    #[test]
     fn parses_q0rig_runtime_control_commands() {
         let program = parse(
             r#"import q0.rig
@@ -993,24 +1384,68 @@ q0rig.pose_reset! "wave"
                 if command == "position" && args.len() == 3
         ));
         assert!(matches!(
-            program.statements[2],
-            Statement::RigCommand { ref command, ref args }
-                if command == "value" && args.len() == 2
-        ));
-        assert!(matches!(
-            program.statements[3],
-            Statement::RigCommand { ref command, ref args }
-                if command == "reset" && args.len() == 1
-        ));
-        assert!(matches!(
-            program.statements[4],
-            Statement::RigCommand { ref command, ref args }
-                if command == "pose" && args.len() == 2
-        ));
-        assert!(matches!(
             program.statements[5],
             Statement::RigCommand { ref command, ref args }
                 if command == "pose_reset" && args.len() == 1
+        ));
+    }
+
+    #[test]
+    fn parses_real_nested_blocks_bool_logic_and_function_body() {
+        let program = parse(
+            r#"pb func choose x limit {
+  if x >= limit and not false {
+    return x
+  } else {
+    while x < limit {
+      x = x + 1
+    }
+    return x
+  }
+}
+result = choose(1, 3)
+"#,
+        );
+        assert_eq!(program.diagnostics, Vec::new(), "{:?}", program.diagnostics);
+        assert!(matches!(
+            program.statements[0],
+            Statement::Function {
+                body: Some(ref body),
+                ..
+            } if matches!(body.statements.first(), Some(Statement::If { .. }))
+        ));
+        assert!(matches!(
+            program.statements[1],
+            Statement::Assignment {
+                value: Value::Call { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn hash_inside_string_is_not_a_comment() {
+        let program = parse("x = \"#still text\" # comment\n");
+        assert_eq!(program.diagnostics, Vec::new());
+        assert!(matches!(
+            &program.statements[0],
+            Statement::Assignment {
+                value: Value::String(value),
+                ..
+            } if value == "#still text"
+        ));
+    }
+
+    #[test]
+    fn separate_else_line_is_supported() {
+        let program = parse("if true {\n  x = 1\n}\nelse {\n  x = 2\n}\n");
+        assert_eq!(program.diagnostics, Vec::new());
+        assert!(matches!(
+            &program.statements[0],
+            Statement::If {
+                else_body: Some(body),
+                ..
+            } if body.statements.len() == 1
         ));
     }
 }

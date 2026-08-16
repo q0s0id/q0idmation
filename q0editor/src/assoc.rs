@@ -10,10 +10,40 @@ use std::ffi::c_void;
 use winreg::enums::*;
 use winreg::RegKey;
 
-const PROG_ID: &str = "q0editor.Project";
-const FRIENDLY: &str = "q0s Project";
-const EXTENSION: &str = ".q1s";
+const PROJECT_PROG_ID: &str = "q0editor.Project";
+const PROJECT_FRIENDLY: &str = "q0s Project";
+const Q0LANG_PROG_ID: &str = "q0editor.Q0langSource";
+const Q0LANG_FRIENDLY: &str = "q0lang source";
 const PREVIOUS_PROG_ID_VALUE: &str = "PreviousDefaultProgId";
+const PREVIOUS_Q0L_PROG_ID_VALUE: &str = "PreviousDefaultProgId.q0l";
+const PREVIOUS_Q0LANG_PROG_ID_VALUE: &str = "PreviousDefaultProgId.q0lang";
+
+#[derive(Clone, Copy)]
+struct AssociationSpec {
+    extension: &'static str,
+    prog_id: &'static str,
+    friendly: &'static str,
+    previous_value: &'static str,
+}
+
+const PROJECT_ASSOCIATION: AssociationSpec = AssociationSpec {
+    extension: ".q1s",
+    prog_id: PROJECT_PROG_ID,
+    friendly: PROJECT_FRIENDLY,
+    previous_value: PREVIOUS_PROG_ID_VALUE,
+};
+const Q0L_ASSOCIATION: AssociationSpec = AssociationSpec {
+    extension: ".q0l",
+    prog_id: Q0LANG_PROG_ID,
+    friendly: Q0LANG_FRIENDLY,
+    previous_value: PREVIOUS_Q0L_PROG_ID_VALUE,
+};
+const Q0LANG_ASSOCIATION: AssociationSpec = AssociationSpec {
+    extension: ".q0lang",
+    prog_id: Q0LANG_PROG_ID,
+    friendly: Q0LANG_FRIENDLY,
+    previous_value: PREVIOUS_Q0LANG_PROG_ID_VALUE,
+};
 const SHCNE_ASSOCCHANGED: i32 = 0x0800_0000;
 const SHCNF_IDLIST: u32 = 0;
 
@@ -36,20 +66,20 @@ enum UnregisterAction<'a> {
     RemoveEditorDefault,
 }
 
-fn extension_default_belongs_to_editor(current: Option<&str>) -> bool {
-    current.is_some_and(|value| value.eq_ignore_ascii_case(PROG_ID))
+fn extension_default_belongs_to(current: Option<&str>, prog_id: &str) -> bool {
+    current.is_some_and(|value| value.eq_ignore_ascii_case(prog_id))
 }
 
-fn restorable_foreign_prog_id(value: Option<&str>) -> Option<&str> {
+fn restorable_foreign_prog_id<'a>(value: Option<&'a str>, prog_id: &str) -> Option<&'a str> {
     value.filter(|value| {
-        !value.is_empty() && *value == value.trim() && !value.eq_ignore_ascii_case(PROG_ID)
+        !value.is_empty() && *value == value.trim() && !value.eq_ignore_ascii_case(prog_id)
     })
 }
 
-fn backup_action_for_registration(current: Option<&str>) -> BackupAction<'_> {
-    if extension_default_belongs_to_editor(current) {
+fn backup_action_for_registration<'a>(current: Option<&'a str>, prog_id: &str) -> BackupAction<'a> {
+    if extension_default_belongs_to(current, prog_id) {
         BackupAction::KeepExisting
-    } else if let Some(previous) = restorable_foreign_prog_id(current) {
+    } else if let Some(previous) = restorable_foreign_prog_id(current, prog_id) {
         BackupAction::ReplaceWith(previous)
     } else {
         BackupAction::Clear
@@ -59,10 +89,11 @@ fn backup_action_for_registration(current: Option<&str>) -> BackupAction<'_> {
 fn action_for_unregistration<'a>(
     current: Option<&str>,
     previous: Option<&'a str>,
+    prog_id: &str,
 ) -> UnregisterAction<'a> {
-    if !extension_default_belongs_to_editor(current) {
+    if !extension_default_belongs_to(current, prog_id) {
         UnregisterAction::PreserveForeign
-    } else if let Some(previous) = restorable_foreign_prog_id(previous) {
+    } else if let Some(previous) = restorable_foreign_prog_id(previous, prog_id) {
         UnregisterAction::Restore(previous)
     } else {
         UnregisterAction::RemoveEditorDefault
@@ -97,17 +128,21 @@ fn open_classes(access: u32) -> std::io::Result<RegKey> {
     }
 }
 
-fn read_extension_default(classes: &RegKey) -> std::io::Result<Option<String>> {
-    match classes.open_subkey_with_flags(EXTENSION, KEY_READ) {
+fn read_extension_default(classes: &RegKey, extension: &str) -> std::io::Result<Option<String>> {
+    match classes.open_subkey_with_flags(extension, KEY_READ) {
         Ok(ext_key) => read_optional_string(&ext_key, ""),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
 }
 
-fn read_saved_previous_prog_id(classes: &RegKey) -> std::io::Result<Option<String>> {
-    match classes.open_subkey_with_flags(PROG_ID, KEY_READ) {
-        Ok(prog_key) => read_optional_string(&prog_key, PREVIOUS_PROG_ID_VALUE),
+fn read_saved_previous_prog_id(
+    classes: &RegKey,
+    prog_id: &str,
+    previous_value: &str,
+) -> std::io::Result<Option<String>> {
+    match classes.open_subkey_with_flags(prog_id, KEY_READ) {
+        Ok(prog_key) => read_optional_string(&prog_key, previous_value),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
@@ -118,8 +153,8 @@ fn expected_open_command() -> std::io::Result<String> {
     Ok(format!("\"{}\" \"%1\"", exe.to_string_lossy()))
 }
 
-fn read_open_command(classes: &RegKey) -> std::io::Result<Option<String>> {
-    match classes.open_subkey_with_flags(format!("{PROG_ID}\\shell\\open\\command"), KEY_READ) {
+fn read_open_command(classes: &RegKey, prog_id: &str) -> std::io::Result<Option<String>> {
+    match classes.open_subkey_with_flags(format!("{prog_id}\\shell\\open\\command"), KEY_READ) {
         Ok(command_key) => read_optional_string(&command_key, ""),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
@@ -139,88 +174,121 @@ fn notify_association_changed() {
 }
 
 pub fn is_registered_for_current_user() -> std::io::Result<bool> {
+    is_spec_registered(PROJECT_ASSOCIATION)
+}
+
+pub fn register_for_current_user() -> std::io::Result<()> {
+    register_spec(PROJECT_ASSOCIATION)?;
+    notify_association_changed();
+    Ok(())
+}
+
+pub fn unregister_for_current_user() -> std::io::Result<()> {
+    unregister_spec(PROJECT_ASSOCIATION, true)?;
+    notify_association_changed();
+    Ok(())
+}
+
+pub fn is_q0lang_registered_for_current_user() -> std::io::Result<bool> {
+    Ok(is_spec_registered(Q0L_ASSOCIATION)? && is_spec_registered(Q0LANG_ASSOCIATION)?)
+}
+
+pub fn register_q0lang_for_current_user() -> std::io::Result<()> {
+    register_spec(Q0L_ASSOCIATION)?;
+    register_spec(Q0LANG_ASSOCIATION)?;
+    notify_association_changed();
+    Ok(())
+}
+
+pub fn unregister_q0lang_for_current_user() -> std::io::Result<()> {
+    unregister_spec(Q0L_ASSOCIATION, false)?;
+    unregister_spec(Q0LANG_ASSOCIATION, true)?;
+    notify_association_changed();
+    Ok(())
+}
+
+fn is_spec_registered(spec: AssociationSpec) -> std::io::Result<bool> {
     let classes = match open_classes(KEY_READ) {
         Ok(classes) => classes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
-    let current = read_extension_default(&classes)?;
-    if !extension_default_belongs_to_editor(current.as_deref()) {
+    let current = read_extension_default(&classes, spec.extension)?;
+    if !extension_default_belongs_to(current.as_deref(), spec.prog_id) {
         return Ok(false);
     }
-    let actual_command = read_open_command(&classes)?;
+    let actual_command = read_open_command(&classes, spec.prog_id)?;
     let expected_command = expected_open_command()?;
     Ok(actual_command
         .as_deref()
         .is_some_and(|command| command.eq_ignore_ascii_case(&expected_command)))
 }
 
-pub fn register_for_current_user() -> std::io::Result<()> {
+fn register_spec(spec: AssociationSpec) -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
     let exe_str = exe.to_string_lossy().to_string();
     let classes = open_classes(KEY_READ | KEY_WRITE)?;
-    let current = read_extension_default(&classes)?;
-    let backup_action = backup_action_for_registration(current.as_deref());
+    let current = read_extension_default(&classes, spec.extension)?;
+    let backup_action = backup_action_for_registration(current.as_deref(), spec.prog_id);
 
-    // Build the private ProgID before publishing the shared extension default.
-    let (prog_key, _) = classes.create_subkey(PROG_ID)?;
+    let (prog_key, _) = classes.create_subkey(spec.prog_id)?;
     match backup_action {
         BackupAction::KeepExisting => {
-            let saved = read_optional_string(&prog_key, PREVIOUS_PROG_ID_VALUE)?;
-            if restorable_foreign_prog_id(saved.as_deref()).is_none() {
-                delete_value_if_present(&prog_key, PREVIOUS_PROG_ID_VALUE)?;
+            let saved = read_optional_string(&prog_key, spec.previous_value)?;
+            if restorable_foreign_prog_id(saved.as_deref(), spec.prog_id).is_none() {
+                delete_value_if_present(&prog_key, spec.previous_value)?;
             }
         }
         BackupAction::ReplaceWith(previous) => {
-            prog_key.set_value(PREVIOUS_PROG_ID_VALUE, &previous)?;
+            prog_key.set_value(spec.previous_value, &previous)?;
         }
         BackupAction::Clear => {
-            delete_value_if_present(&prog_key, PREVIOUS_PROG_ID_VALUE)?;
+            delete_value_if_present(&prog_key, spec.previous_value)?;
         }
     }
 
-    prog_key.set_value("", &FRIENDLY)?;
+    prog_key.set_value("", &spec.friendly)?;
     let (icon_key, _) = prog_key.create_subkey("DefaultIcon")?;
     icon_key.set_value("", &format!("\"{}\",0", exe_str))?;
     let (command_key, _) = prog_key.create_subkey("shell\\open\\command")?;
     command_key.set_value("", &format!("\"{}\" \"%1\"", exe_str))?;
 
-    let (ext_key, _) = classes.create_subkey(EXTENSION)?;
-    ext_key.set_value("", &PROG_ID)?;
-    notify_association_changed();
+    let (ext_key, _) = classes.create_subkey(spec.extension)?;
+    ext_key.set_value("", &spec.prog_id)?;
     Ok(())
 }
 
-pub fn unregister_for_current_user() -> std::io::Result<()> {
+fn unregister_spec(spec: AssociationSpec, remove_prog_id: bool) -> std::io::Result<()> {
     let classes = match open_classes(KEY_READ | KEY_WRITE) {
         Ok(classes) => classes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
 
-    let previous = read_saved_previous_prog_id(&classes)?;
-    match classes.open_subkey_with_flags(EXTENSION, KEY_READ | KEY_WRITE) {
+    let previous = read_saved_previous_prog_id(&classes, spec.prog_id, spec.previous_value)?;
+    match classes.open_subkey_with_flags(spec.extension, KEY_READ | KEY_WRITE) {
         Ok(ext_key) => {
             let current = read_optional_string(&ext_key, "")?;
-            match action_for_unregistration(current.as_deref(), previous.as_deref()) {
+            match action_for_unregistration(current.as_deref(), previous.as_deref(), spec.prog_id) {
                 UnregisterAction::PreserveForeign => {}
                 UnregisterAction::Restore(previous) => ext_key.set_value("", &previous)?,
-                UnregisterAction::RemoveEditorDefault => {
-                    delete_value_if_present(&ext_key, "")?;
-                }
+                UnregisterAction::RemoveEditorDefault => delete_value_if_present(&ext_key, "")?,
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
 
-    match classes.delete_subkey_all(PROG_ID) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+    if remove_prog_id {
+        match classes.delete_subkey_all(spec.prog_id) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    } else if let Ok(prog_key) = classes.open_subkey_with_flags(spec.prog_id, KEY_READ | KEY_WRITE)
+    {
+        delete_value_if_present(&prog_key, spec.previous_value)?;
     }
-
-    notify_association_changed();
     Ok(())
 }
 
@@ -230,16 +298,20 @@ mod tests {
 
     #[test]
     fn editor_prog_id_comparison_is_case_insensitive() {
-        assert!(extension_default_belongs_to_editor(Some(PROG_ID)));
-        assert!(extension_default_belongs_to_editor(Some(
-            "Q0EDITOR.PROJECT"
-        )));
+        assert!(extension_default_belongs_to(
+            Some(PROJECT_PROG_ID),
+            PROJECT_PROG_ID
+        ));
+        assert!(extension_default_belongs_to(
+            Some("Q0EDITOR.PROJECT"),
+            PROJECT_PROG_ID
+        ));
     }
 
     #[test]
     fn registration_preserves_a_foreign_default() {
         assert_eq!(
-            backup_action_for_registration(Some("another-editor.Project")),
+            backup_action_for_registration(Some("another-editor.Project"), PROJECT_PROG_ID),
             BackupAction::ReplaceWith("another-editor.Project")
         );
     }
@@ -247,7 +319,7 @@ mod tests {
     #[test]
     fn registration_keeps_the_original_backup_on_upgrade() {
         assert_eq!(
-            backup_action_for_registration(Some(PROG_ID)),
+            backup_action_for_registration(Some(PROJECT_PROG_ID), PROJECT_PROG_ID),
             BackupAction::KeepExisting
         );
     }
@@ -255,13 +327,18 @@ mod tests {
     #[test]
     fn unregister_restores_only_while_editor_is_current() {
         assert_eq!(
-            action_for_unregistration(Some(PROG_ID), Some("another-editor.Project")),
+            action_for_unregistration(
+                Some(PROJECT_PROG_ID),
+                Some("another-editor.Project"),
+                PROJECT_PROG_ID
+            ),
             UnregisterAction::Restore("another-editor.Project")
         );
         assert_eq!(
             action_for_unregistration(
                 Some("users-new-choice.Project"),
-                Some("another-editor.Project")
+                Some("another-editor.Project"),
+                PROJECT_PROG_ID
             ),
             UnregisterAction::PreserveForeign
         );
@@ -270,8 +347,22 @@ mod tests {
     #[test]
     fn invalid_backup_removes_only_our_default() {
         assert_eq!(
-            action_for_unregistration(Some(PROG_ID), Some(PROG_ID)),
+            action_for_unregistration(
+                Some(PROJECT_PROG_ID),
+                Some(PROJECT_PROG_ID),
+                PROJECT_PROG_ID
+            ),
             UnregisterAction::RemoveEditorDefault
+        );
+    }
+
+    #[test]
+    fn q0l_and_q0lang_share_a_prog_id_but_keep_independent_backups() {
+        assert_eq!(Q0L_ASSOCIATION.prog_id, Q0LANG_ASSOCIATION.prog_id);
+        assert_ne!(Q0L_ASSOCIATION.extension, Q0LANG_ASSOCIATION.extension);
+        assert_ne!(
+            Q0L_ASSOCIATION.previous_value,
+            Q0LANG_ASSOCIATION.previous_value
         );
     }
 }

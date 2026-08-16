@@ -150,53 +150,61 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     if let (Some(item), Some(pointer)) =
         (library_payload.as_deref(), ui.ctx().pointer_interact_pos())
     {
-        let stage_position = q0s_format::v2::Vec2::new(
-            (pointer.x - view.origin.x) / view.scale,
-            (pointer.y - view.origin.y) / view.scale,
-        );
-        if let Some(target) = library_item_target(&app.state.project, *item) {
-            let transform = centered_target_transform(&app.state.project, target, stage_position);
-            render_target_preview(
-                &painter,
-                &app.state.project,
-                target,
-                frame,
-                transform,
-                &view,
-                &mut app.textures,
-                ui.ctx(),
-                Color32::from_white_alpha(176),
+        if crate::audio::library_item_is_audio_only(&app.state.project, *item) {
+            // Audio is timeline media, never a display object. Deliberately draw
+            // no stage ghost, bbox, handle or other visual-object affordance.
+        } else {
+            let stage_position = q0s_format::v2::Vec2::new(
+                (pointer.x - view.origin.x) / view.scale,
+                (pointer.y - view.origin.y) / view.scale,
             );
-            let preview = q0s_format::v2::Placement {
-                instance_id: 0,
-                frame,
-                target,
-                transform,
-                tween: q0s_format::v2::Tween::None,
-                fx: Default::default(),
-            };
-            if let Some((min_x, min_y, max_x, max_y)) =
-                crate::render::placement_bbox(&app.state.project, &preview)
-            {
-                painter.rect_stroke(
-                    Rect::from_min_max(
-                        pos2(
-                            view.origin.x + min_x * view.scale,
-                            view.origin.y + min_y * view.scale,
-                        ),
-                        pos2(
-                            view.origin.x + max_x * view.scale,
-                            view.origin.y + max_y * view.scale,
-                        ),
-                    ),
-                    0.0,
-                    Stroke::new(1.5_f32, app.settings.theme.accent.to_color32()),
+            if let Some(target) = library_item_target(&app.state.project, *item) {
+                let transform =
+                    centered_target_transform(&app.state.project, target, stage_position);
+                render_target_preview(
+                    &painter,
+                    &app.state.project,
+                    target,
+                    frame,
+                    transform,
+                    &view,
+                    &mut app.textures,
+                    ui.ctx(),
+                    Color32::from_white_alpha(176),
                 );
+                let preview = q0s_format::v2::Placement {
+                    instance_id: 0,
+                    frame,
+                    target,
+                    transform,
+                    tween: q0s_format::v2::Tween::None,
+                    fx: Default::default(),
+                };
+                if let Some((min_x, min_y, max_x, max_y)) =
+                    crate::render::placement_bbox(&app.state.project, &preview)
+                {
+                    painter.rect_stroke(
+                        Rect::from_min_max(
+                            pos2(
+                                view.origin.x + min_x * view.scale,
+                                view.origin.y + min_y * view.scale,
+                            ),
+                            pos2(
+                                view.origin.x + max_x * view.scale,
+                                view.origin.y + max_y * view.scale,
+                            ),
+                        ),
+                        0.0,
+                        Stroke::new(1.5_f32, app.settings.theme.accent.to_color32()),
+                    );
+                }
             }
         }
     }
     if let Some(item) = response.dnd_release_payload::<LibraryItem>() {
-        if let Some(pointer) = ui.ctx().pointer_interact_pos() {
+        if crate::audio::library_item_is_audio_only(&app.state.project, *item) {
+            app.session.status = "drop audio onto a timeline frame".to_string();
+        } else if let Some(pointer) = ui.ctx().pointer_interact_pos() {
             let stage_position = q0s_format::v2::Vec2::new(
                 (pointer.x - view.origin.x) / view.scale,
                 (pointer.y - view.origin.y) / view.scale,

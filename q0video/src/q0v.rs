@@ -67,6 +67,60 @@ impl Q0vSpec {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Q0vHeader {
+    pub spec: Q0vSpec,
+    pub audio_samples_per_channel: u64,
+}
+
+/// Read only the fixed q0v header. This deliberately avoids cloning or scanning
+/// media payloads and is intended for editor hot paths such as library labels
+/// and timeline layout. Full file validation still belongs to `Q0vFile::parse`.
+pub fn probe_header(bytes: &[u8]) -> Result<Q0vHeader, String> {
+    if bytes.len() < HEADER_SIZE as usize {
+        return Err("q0v is truncated before its header".to_string());
+    }
+    if bytes[0..4] != MAGIC {
+        return Err("q0v magic is invalid".to_string());
+    }
+    let version = read_u16(bytes, 4)?;
+    if version != VERSION {
+        return Err(format!("unsupported q0v version {version}"));
+    }
+    let flags = read_u16(bytes, 6)?;
+    if flags & !(FLAG_VIDEO | FLAG_AUDIO) != 0 {
+        return Err("q0v contains unknown stream flags".to_string());
+    }
+    let video = flags & FLAG_VIDEO != 0;
+    let audio = flags & FLAG_AUDIO != 0;
+    let spec = Q0vSpec {
+        width: read_u32(bytes, 8)?,
+        height: read_u32(bytes, 12)?,
+        fps: read_u32(bytes, 16)?,
+        timeline_frames: read_u32(bytes, 20)?,
+        video,
+        audio,
+        audio_sample_rate: read_u32(bytes, 28)?,
+        audio_channels: read_u16(bytes, 32)?,
+    };
+    spec.validate()?;
+    let audio_bits = read_u16(bytes, 34)?;
+    if audio && audio_bits != 16 {
+        return Err("q0v audio must be signed 16-bit PCM".to_string());
+    }
+    if !audio && audio_bits != 0 {
+        return Err("q0v has audio sample bits without audio".to_string());
+    }
+    let header_size = read_u32(bytes, 68)?;
+    if header_size != HEADER_SIZE as u32 {
+        return Err("q0v header size is invalid".to_string());
+    }
+    Ok(Q0vHeader {
+        spec,
+        audio_samples_per_channel: read_u64(bytes, 40)?,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameIndex {
     pub pts_ticks: u64,
     pub offset: u64,
@@ -259,6 +313,159 @@ impl<W: Write + Seek> Q0vWriter<W> {
     }
 }
 
+#[derive(Debug)]
+struct ParsedQ0vLayout {
+    spec: Q0vSpec,
+    frames: Vec<FrameIndex>,
+    audio_samples_per_channel: u64,
+    audio_offset: usize,
+    audio_length: usize,
+}
+
+fn parse_layout(bytes: &[u8]) -> Result<ParsedQ0vLayout, String> {
+    if bytes.len() < HEADER_SIZE as usize {
+        return Err("q0v is truncated before its header".to_string());
+    }
+    if bytes[0..4] != MAGIC {
+        return Err("q0v magic is invalid".to_string());
+    }
+    let version = read_u16(bytes, 4)?;
+    if version != VERSION {
+        return Err(format!("unsupported q0v version {version}"));
+    }
+    let flags = read_u16(bytes, 6)?;
+    if flags & !(FLAG_VIDEO | FLAG_AUDIO) != 0 {
+        return Err("q0v contains unknown stream flags".to_string());
+    }
+    let video = flags & FLAG_VIDEO != 0;
+    let audio = flags & FLAG_AUDIO != 0;
+    let spec = Q0vSpec {
+        width: read_u32(bytes, 8)?,
+        height: read_u32(bytes, 12)?,
+        fps: read_u32(bytes, 16)?,
+        timeline_frames: read_u32(bytes, 20)?,
+        video,
+        audio,
+        audio_sample_rate: read_u32(bytes, 28)?,
+        audio_channels: read_u16(bytes, 32)?,
+    };
+    spec.validate()?;
+    let video_frames = read_u32(bytes, 24)?;
+    let audio_bits = read_u16(bytes, 34)?;
+    if audio && audio_bits != 16 {
+        return Err("q0v audio must be signed 16-bit pcm".to_string());
+    }
+    if !audio && (spec.audio_sample_rate != 0 || spec.audio_channels != 0 || audio_bits != 0) {
+        return Err("q0v has audio metadata without an audio stream".to_string());
+    }
+    let audio_samples_per_channel = read_u64(bytes, 40)?;
+    let audio_offset = read_u64(bytes, 48)?;
+    let index_offset = read_u64(bytes, 56)?;
+    let index_entries = read_u32(bytes, 64)?;
+    let header_size = read_u32(bytes, 68)?;
+    if header_size != HEADER_SIZE as u32 {
+        return Err("q0v header size is invalid".to_string());
+    }
+    if index_entries != video_frames {
+        return Err("q0v video frame count and index count disagree".to_string());
+    }
+    if video && video_frames != spec.timeline_frames {
+        return Err("q0v video stream does not cover the full timeline".to_string());
+    }
+    if !video && video_frames != 0 {
+        return Err("q0v has indexed frames without a video stream".to_string());
+    }
+    let index_end = index_offset
+        .checked_add(u64::from(index_entries).saturating_mul(INDEX_ENTRY_SIZE))
+        .ok_or_else(|| "q0v index overflows the file".to_string())?;
+    if index_offset < HEADER_SIZE || index_end != bytes.len() as u64 {
+        return Err("q0v index bounds or trailing bytes are invalid".to_string());
+    }
+    let audio_length = if audio {
+        let length = audio_samples_per_channel
+            .checked_mul(u64::from(spec.audio_channels))
+            .and_then(|samples| samples.checked_mul(2))
+            .ok_or_else(|| "q0v audio length overflows".to_string())?;
+        if audio_offset < HEADER_SIZE || audio_offset.saturating_add(length) != index_offset {
+            return Err("q0v audio payload bounds are invalid".to_string());
+        }
+        length
+    } else {
+        if audio_offset != 0 || audio_samples_per_channel != 0 {
+            return Err("q0v has audio payload metadata without audio".to_string());
+        }
+        0
+    };
+
+    let mut frames: Vec<FrameIndex> = Vec::with_capacity(index_entries as usize);
+    for index in 0..index_entries {
+        let base = index_offset as usize + index as usize * INDEX_ENTRY_SIZE as usize;
+        let frame = FrameIndex {
+            pts_ticks: read_u64(bytes, base)?,
+            offset: read_u64(bytes, base + 8)?,
+            length: read_u32(bytes, base + 16)?,
+        };
+        let end = frame
+            .offset
+            .checked_add(u64::from(frame.length))
+            .ok_or_else(|| "q0v frame payload overflows".to_string())?;
+        let payload_limit = if audio { audio_offset } else { index_offset };
+        if frame.offset < HEADER_SIZE || end > payload_limit {
+            return Err("q0v frame payload bounds are invalid".to_string());
+        }
+        if let Some(previous) = frames.last() {
+            if frame.pts_ticks < previous.pts_ticks {
+                return Err("q0v frame timestamps are not monotonic".to_string());
+            }
+        }
+        frames.push(frame);
+    }
+    Ok(ParsedQ0vLayout {
+        spec,
+        frames,
+        audio_samples_per_channel,
+        audio_offset: audio_offset as usize,
+        audio_length: audio_length as usize,
+    })
+}
+
+/// Validate the complete q0v container without taking ownership of or copying
+/// its media payload. This is intentionally as strict as `Q0vFile::parse`.
+pub fn validate_bytes(bytes: &[u8]) -> Result<(), String> {
+    parse_layout(bytes).map(|_| ())
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Q0vAudioView<'a> {
+    pub spec: Q0vSpec,
+    pub samples_per_channel: u64,
+    pcm_le_bytes: &'a [u8],
+}
+
+impl<'a> Q0vAudioView<'a> {
+    pub fn pcm_le_bytes(self) -> &'a [u8] {
+        self.pcm_le_bytes
+    }
+}
+
+/// Borrow the validated PCM payload directly from an existing q0v byte slice.
+/// Audio-only projects use this for waveform work without duplicating the song.
+pub fn audio_view(bytes: &[u8]) -> Result<Q0vAudioView<'_>, String> {
+    let layout = parse_layout(bytes)?;
+    if !layout.spec.audio {
+        return Err("q0v has no audio stream".to_string());
+    }
+    let end = layout
+        .audio_offset
+        .checked_add(layout.audio_length)
+        .ok_or_else(|| "q0v audio payload overflows usize".to_string())?;
+    Ok(Q0vAudioView {
+        spec: layout.spec,
+        samples_per_channel: layout.audio_samples_per_channel,
+        pcm_le_bytes: &bytes[layout.audio_offset..end],
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct Q0vFile {
     bytes: Vec<u8>,
@@ -271,110 +478,14 @@ pub struct Q0vFile {
 
 impl Q0vFile {
     pub fn parse(bytes: Vec<u8>) -> Result<Self, String> {
-        if bytes.len() < HEADER_SIZE as usize {
-            return Err("q0v is truncated before its header".to_string());
-        }
-        if bytes[0..4] != MAGIC {
-            return Err("q0v magic is invalid".to_string());
-        }
-        let version = read_u16(&bytes, 4)?;
-        if version != VERSION {
-            return Err(format!("unsupported q0v version {version}"));
-        }
-        let flags = read_u16(&bytes, 6)?;
-        if flags & !(FLAG_VIDEO | FLAG_AUDIO) != 0 {
-            return Err("q0v contains unknown stream flags".to_string());
-        }
-        let video = flags & FLAG_VIDEO != 0;
-        let audio = flags & FLAG_AUDIO != 0;
-        let spec = Q0vSpec {
-            width: read_u32(&bytes, 8)?,
-            height: read_u32(&bytes, 12)?,
-            fps: read_u32(&bytes, 16)?,
-            timeline_frames: read_u32(&bytes, 20)?,
-            video,
-            audio,
-            audio_sample_rate: read_u32(&bytes, 28)?,
-            audio_channels: read_u16(&bytes, 32)?,
-        };
-        spec.validate()?;
-        let video_frames = read_u32(&bytes, 24)?;
-        let audio_bits = read_u16(&bytes, 34)?;
-        if audio && audio_bits != 16 {
-            return Err("q0v audio must be signed 16-bit pcm".to_string());
-        }
-        if !audio && (spec.audio_sample_rate != 0 || spec.audio_channels != 0 || audio_bits != 0) {
-            return Err("q0v has audio metadata without an audio stream".to_string());
-        }
-        let audio_samples_per_channel = read_u64(&bytes, 40)?;
-        let audio_offset = read_u64(&bytes, 48)?;
-        let index_offset = read_u64(&bytes, 56)?;
-        let index_entries = read_u32(&bytes, 64)?;
-        let header_size = read_u32(&bytes, 68)?;
-        if header_size != HEADER_SIZE as u32 {
-            return Err("q0v header size is invalid".to_string());
-        }
-        if index_entries != video_frames {
-            return Err("q0v video frame count and index count disagree".to_string());
-        }
-        if video && video_frames != spec.timeline_frames {
-            return Err("q0v video stream does not cover the full timeline".to_string());
-        }
-        if !video && video_frames != 0 {
-            return Err("q0v has indexed frames without a video stream".to_string());
-        }
-        let index_end = index_offset
-            .checked_add(u64::from(index_entries).saturating_mul(INDEX_ENTRY_SIZE))
-            .ok_or_else(|| "q0v index overflows the file".to_string())?;
-        if index_offset < HEADER_SIZE || index_end != bytes.len() as u64 {
-            return Err("q0v index bounds or trailing bytes are invalid".to_string());
-        }
-        let audio_length = if audio {
-            let length = audio_samples_per_channel
-                .checked_mul(u64::from(spec.audio_channels))
-                .and_then(|samples| samples.checked_mul(2))
-                .ok_or_else(|| "q0v audio length overflows".to_string())?;
-            if audio_offset < HEADER_SIZE || audio_offset.saturating_add(length) != index_offset {
-                return Err("q0v audio payload bounds are invalid".to_string());
-            }
-            length
-        } else {
-            if audio_offset != 0 || audio_samples_per_channel != 0 {
-                return Err("q0v has audio payload metadata without audio".to_string());
-            }
-            0
-        };
-
-        let mut frames: Vec<FrameIndex> = Vec::with_capacity(index_entries as usize);
-        for index in 0..index_entries {
-            let base = index_offset as usize + index as usize * INDEX_ENTRY_SIZE as usize;
-            let frame = FrameIndex {
-                pts_ticks: read_u64(&bytes, base)?,
-                offset: read_u64(&bytes, base + 8)?,
-                length: read_u32(&bytes, base + 16)?,
-            };
-            let end = frame
-                .offset
-                .checked_add(u64::from(frame.length))
-                .ok_or_else(|| "q0v frame payload overflows".to_string())?;
-            let payload_limit = if audio { audio_offset } else { index_offset };
-            if frame.offset < HEADER_SIZE || end > payload_limit {
-                return Err("q0v frame payload bounds are invalid".to_string());
-            }
-            if let Some(previous) = frames.last() {
-                if frame.pts_ticks < previous.pts_ticks {
-                    return Err("q0v frame timestamps are not monotonic".to_string());
-                }
-            }
-            frames.push(frame);
-        }
+        let layout = parse_layout(&bytes)?;
         Ok(Self {
             bytes,
-            spec,
-            frames,
-            audio_samples_per_channel,
-            audio_offset: audio_offset as usize,
-            audio_length: audio_length as usize,
+            spec: layout.spec,
+            frames: layout.frames,
+            audio_samples_per_channel: layout.audio_samples_per_channel,
+            audio_offset: layout.audio_offset,
+            audio_length: layout.audio_length,
         })
     }
 
@@ -475,7 +586,13 @@ mod tests {
             .unwrap();
         writer.write_audio_pcm_i16(&[1, -1, 2, -2]).unwrap();
         let cursor = writer.finish().expect("finish");
-        let parsed = Q0vFile::parse(cursor.into_inner()).expect("parse");
+        let bytes = cursor.into_inner();
+        validate_bytes(&bytes).expect("borrowed validation");
+        let audio = audio_view(&bytes).expect("borrowed audio view");
+        assert_eq!(audio.spec, spec);
+        assert_eq!(audio.samples_per_channel, 2);
+        assert_eq!(audio.pcm_le_bytes(), &[1, 0, 255, 255, 2, 0, 254, 255]);
+        let parsed = Q0vFile::parse(bytes).expect("parse");
         assert_eq!(parsed.spec, spec);
         assert_eq!(parsed.frames.len(), 2);
         assert_eq!(parsed.decode_frame_rgba(1).unwrap(), vec![0, 255, 0, 255]);
@@ -508,6 +625,7 @@ mod tests {
         writer.write_video_frame(0, &png([0, 0, 0, 255])).unwrap();
         let mut bytes = writer.finish().unwrap().into_inner();
         bytes.push(9);
+        assert!(validate_bytes(&bytes).is_err());
         assert!(Q0vFile::parse(bytes).is_err());
     }
 
@@ -528,6 +646,28 @@ mod tests {
         assert_eq!(spec.video_frame_for_host_frame(2, 60), Some(1));
         assert_eq!(spec.video_frame_for_host_frame(5, 60), Some(2));
         assert_eq!(spec.video_frame_for_host_frame(600, 60), Some(2));
+    }
+
+    #[test]
+    fn header_probe_reads_stream_metadata_without_owning_payload() {
+        let spec = Q0vSpec {
+            width: 0,
+            height: 0,
+            fps: 48_000,
+            timeline_frames: 4,
+            video: false,
+            audio: true,
+            audio_sample_rate: 48_000,
+            audio_channels: 2,
+        };
+        let mut writer = Q0vWriter::new(std::io::Cursor::new(Vec::new()), spec).unwrap();
+        writer
+            .write_audio_pcm_i16(&[1, -1, 2, -2, 3, -3, 4, -4])
+            .unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let header = probe_header(&bytes).unwrap();
+        assert_eq!(header.spec, spec);
+        assert_eq!(header.audio_samples_per_channel, 4);
     }
 
     #[test]

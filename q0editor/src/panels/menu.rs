@@ -6,7 +6,7 @@ use crate::app::{Action, EditorApp};
 pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     egui::menu::bar(ui, |ui| {
         ui.menu_button("File", |ui| {
-            if app.has_active_project() && !app.home_visible() {
+            if app.has_active_document() && !app.home_visible() {
                 if ui.button("Home").clicked() {
                     app.queue(Action::ShowHome);
                     ui.close_menu();
@@ -51,7 +51,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             ui.separator();
             if ui
                 .add_enabled(
-                    app.has_active_project() && !app.home_visible(),
+                    app.has_active_document() && !app.home_visible(),
                     shortcut_button_widget("Save", "Ctrl+S"),
                 )
                 .clicked()
@@ -61,7 +61,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             }
             if ui
                 .add_enabled(
-                    app.has_active_project() && !app.home_visible(),
+                    app.has_active_document() && !app.home_visible(),
                     shortcut_button_widget("Save As...", "Ctrl+Shift+S"),
                 )
                 .clicked()
@@ -87,7 +87,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             }
         });
 
-        if !app.home_visible() {
+        if !app.home_visible() && app.has_active_project() {
             ui.menu_button("Edit", |ui| {
                 let can_undo = app.history.can_undo();
                 let can_redo = app.history.can_redo();
@@ -192,6 +192,13 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     app.queue(Action::OpenQ0langEditor(None));
                     ui.close_menu();
                 }
+                if ui
+                    .selectable_label(app.project_tree_open(), "Project...")
+                    .clicked()
+                {
+                    app.queue(Action::ToggleProjectTree);
+                    ui.close_menu();
+                }
                 ui.separator();
                 ui.label(
                     egui::RichText::new("Mouse wheel: zoom, MMB or hold H/Space + drag: pan")
@@ -253,6 +260,12 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 app.queue(Action::ToggleCredits);
             }
             if app.has_active_project() && !app.home_visible() {
+                let project_resp = ui
+                    .selectable_label(app.project_tree_open(), "Project")
+                    .on_hover_text("Open or close the project dependency tree");
+                if project_resp.clicked() {
+                    app.queue(Action::ToggleProjectTree);
+                }
                 let q0enc_resp = ui
                     .selectable_label(app.q0enc.open, "q0enc")
                     .on_hover_text("Open or close the export workshop");
@@ -390,6 +403,7 @@ pub fn handle_home_shortcuts(app: &mut EditorApp, ctx: &egui::Context) {
 
 pub fn handle_global_shortcuts(app: &mut EditorApp, ctx: &egui::Context) {
     let typing = ctx.wants_keyboard_input();
+    let code_document = app.active_document_is_q0lang();
     ctx.input_mut(|i| {
         if i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Tab) {
             app.queue(Action::CycleDocumentTab(-1));
@@ -406,6 +420,9 @@ pub fn handle_global_shortcuts(app: &mut EditorApp, ctx: &egui::Context) {
             app.queue(Action::SaveProjectAs);
         } else if i.consume_key(Modifiers::COMMAND, Key::S) {
             app.queue(Action::SaveProject);
+        }
+        if code_document {
+            return;
         }
         if !typing {
             if i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z)

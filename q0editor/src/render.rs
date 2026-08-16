@@ -348,6 +348,7 @@ pub struct TextureCache {
     vector_render_by_asset: HashMap<u16, CachedVectorRenderGeometry>,
     by_q0v_frame: HashMap<(u16, u32), TextureHandle>,
     q0v_media: HashMap<u16, q0video::q0v::Q0vFile>,
+    audio_waveforms: HashMap<u16, crate::audio::AudioWaveformBuilder>,
     fx_project_snapshot: Option<ProjectV2>,
     fx_placement_textures: HashMap<FxPlacementKey, FxPlacementTexture>,
     fx_serial: u64,
@@ -540,6 +541,7 @@ impl TextureCache {
         self.vector_render_by_asset.clear();
         self.by_q0v_frame.clear();
         self.q0v_media.clear();
+        self.audio_waveforms.clear();
         self.fx_project_snapshot = None;
         self.fx_placement_textures.clear();
         self.classic_brush_preview = None;
@@ -574,6 +576,7 @@ impl TextureCache {
         self.vector_render_by_asset.remove(&asset_id);
         self.by_q0v_frame.retain(|(id, _), _| *id != asset_id);
         self.q0v_media.remove(&asset_id);
+        self.audio_waveforms.remove(&asset_id);
         // Placement FX can contain this asset through an arbitrarily nested q0rg.
         // Asset edits are comparatively cold; clear the soft-effect cache here so
         // the hot placement-translation path never has to deep-compare vector/
@@ -608,6 +611,30 @@ impl TextureCache {
         for asset_id in asset_ids {
             self.invalidate_asset(asset_id);
         }
+    }
+
+    pub(crate) fn audio_waveform(
+        &mut self,
+        project: &ProjectV2,
+        asset_id: u16,
+    ) -> Option<(&crate::audio::AudioWaveform, bool)> {
+        const BINS_PER_REPAINT: usize = 8;
+        let bytes = project
+            .assets
+            .iter()
+            .find(|asset| asset.id() == asset_id)
+            .and_then(|asset| match asset {
+                Asset::Q0v(media) => Some(media.bytes.as_slice()),
+                _ => None,
+            })?;
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            self.audio_waveforms.entry(asset_id)
+        {
+            entry.insert(crate::audio::AudioWaveformBuilder::new(bytes)?);
+        }
+        let builder = self.audio_waveforms.get_mut(&asset_id)?;
+        let complete = builder.advance(bytes, BINS_PER_REPAINT);
+        Some((builder.waveform(), complete))
     }
 
     fn vector_render_geometry(&mut self, vector: &VectorAsset) -> &CachedVectorRenderGeometry {
@@ -3770,6 +3797,9 @@ fn asset_local_outline(asset: &Asset) -> Vec<Vec2> {
         Asset::Q0v(v) => q0video::q0v::Q0vFile::parse(v.bytes.clone())
             .ok()
             .map(|media| {
+                if !media.spec.video {
+                    return Vec::new();
+                }
                 let width = media.spec.width as f32;
                 let height = media.spec.height as f32;
                 vec![

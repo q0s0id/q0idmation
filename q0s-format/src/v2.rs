@@ -70,7 +70,13 @@ pub const Q1S_VERSION_RIG_PRO: u16 = 16;
 pub const Q1S_VERSION_RIG_DEFORMERS: u16 = 17;
 /// Pose drivers, explicit mirror metadata and drawing substitutions.
 pub const Q1S_VERSION_RIG_POSE_VARIANTS: u16 = 18;
-pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_RIG_POSE_VARIANTS;
+/// Legacy audio gain/mute stored on media placements.
+pub const Q1S_VERSION_AUDIO_CLIP_FX: u16 = 19;
+/// Audio leaves display-object placements and becomes independent timeline data.
+pub const Q1S_VERSION_AUDIO_TIMELINE_CLIPS: u16 = 20;
+/// Linked project graph, frame scripts and stable runtime object names.
+pub const Q1S_VERSION_PROJECT_RUNTIME: u16 = 21;
+pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_PROJECT_RUNTIME;
 /// Kept as an alias so external code that imported the v2-era constant keeps
 /// compiling. It now means "the current write-out version".
 pub const Q1S_V2_VERSION: u16 = Q1S_VERSION_CURRENT;
@@ -105,6 +111,8 @@ const PLACEMENT_FX_BLEND: u8 = 1 << 1;
 const PLACEMENT_FX_BLUR: u8 = 1 << 2;
 const PLACEMENT_FX_GLOW: u8 = 1 << 3;
 const PLACEMENT_FX_SHADOW: u8 = 1 << 4;
+const PLACEMENT_FX_AUDIO_GAIN: u8 = 1 << 5;
+const PLACEMENT_FX_AUDIO_MUTED: u8 = 1 << 6;
 const BLEND_MODE_NORMAL: u8 = 0;
 const BLEND_MODE_MULTIPLY: u8 = 1;
 const BLEND_MODE_SCREEN: u8 = 2;
@@ -844,6 +852,8 @@ pub struct PlacementFx {
     pub blur: Option<BlurFx>,
     pub glow: Option<GlowFx>,
     pub shadow: Option<DropShadowFx>,
+    pub audio_gain: f32,
+    pub audio_muted: bool,
 }
 
 impl Default for PlacementFx {
@@ -854,6 +864,8 @@ impl Default for PlacementFx {
             blur: None,
             glow: None,
             shadow: None,
+            audio_gain: 1.0,
+            audio_muted: false,
         }
     }
 }
@@ -886,6 +898,12 @@ impl PlacementFx {
             blur: lerp_blur(self.blur, target.blur, t),
             glow: lerp_glow(self.glow, target.glow, t),
             shadow: lerp_shadow(self.shadow, target.shadow, t),
+            audio_gain: lerp_f32(self.audio_gain, target.audio_gain, t),
+            audio_muted: if t >= 1.0 {
+                target.audio_muted
+            } else {
+                self.audio_muted
+            },
         }
     }
 }
@@ -1062,6 +1080,72 @@ pub struct LayerMetadata {
     pub locked: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AudioClip {
+    pub q0rg_id: u16,
+    pub layer_id: u16,
+    pub start_frame: u16,
+    pub asset_id: u16,
+    pub gain: f32,
+    pub muted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectDependencyKind {
+    Movie,
+    Q0lang,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectDependencySource {
+    External(String),
+    Embedded(Vec<u8>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectDependencyNode {
+    pub node_id: u16,
+    pub parent_node_id: Option<u16>,
+    pub alias: String,
+    pub kind: ProjectDependencyKind,
+    pub source: ProjectDependencySource,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectGraph {
+    pub nodes: Vec<ProjectDependencyNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameScript {
+    pub q0rg_id: u16,
+    pub layer_id: u16,
+    pub frame: u16,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InstanceKey {
+    pub q0rg_id: u16,
+    pub instance_id: u32,
+}
+
+impl InstanceKey {
+    pub const fn new(q0rg_id: u16, instance_id: u32) -> Self {
+        Self {
+            q0rg_id,
+            instance_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectRuntimeData {
+    pub project_graph: ProjectGraph,
+    pub frame_scripts: Vec<FrameScript>,
+    pub instance_names: HashMap<InstanceKey, String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Q0rg {
     pub q0rg_id: u16,
@@ -1084,7 +1168,32 @@ pub struct ProjectV2 {
     /// Sparse structural metadata for timeline layers. Missing entries are
     /// ordinary top-level layers, preserving legacy project behaviour.
     pub layer_metadata: HashMap<LayerKey, LayerMetadata>,
+    /// Audio clips live beside the visual timeline rather than inside display
+    /// placements, so they can never become stage objects or visual keyframes.
+    pub audio_clips: Vec<AudioClip>,
+    /// Runtime/project-link metadata introduced after the visual/audio core.
+    /// Old files decode this as an empty/default block.
+    pub runtime: ProjectRuntimeData,
     pub q0rgs: Vec<Q0rg>,
+}
+
+pub fn audio_clip_end_frame(project: &ProjectV2, clip: AudioClip) -> Option<u16> {
+    let media = project.assets.iter().find_map(|asset| match asset {
+        Asset::Q0v(media) if media.asset_id == clip.asset_id => Some(media),
+        _ => None,
+    })?;
+    let header = q0video::q0v::probe_header(&media.bytes).ok()?;
+    if !header.spec.audio || header.spec.video {
+        return None;
+    }
+    let duration_frames = header
+        .audio_samples_per_channel
+        .saturating_mul(u64::from(project.meta.fps.max(1)))
+        .div_ceil(u64::from(header.spec.audio_sample_rate.max(1)))
+        .max(1);
+    u64::from(clip.start_frame)
+        .checked_add(duration_frames)
+        .and_then(|end| u16::try_from(end).ok())
 }
 
 /// Return the exact deterministic ordering used by the current q1s/q0s writer.
@@ -1097,6 +1206,18 @@ pub struct ProjectV2 {
 pub(crate) fn canonicalized_for_wire(project: &ProjectV2) -> ProjectV2 {
     let mut canonical = project.clone();
     canonical.assets.sort_by_key(Asset::id);
+    canonical
+        .audio_clips
+        .sort_by_key(|clip| (clip.q0rg_id, clip.layer_id, clip.start_frame, clip.asset_id));
+    canonical
+        .runtime
+        .project_graph
+        .nodes
+        .sort_by_key(|node| node.node_id);
+    canonical
+        .runtime
+        .frame_scripts
+        .sort_by_key(|script| (script.q0rg_id, script.frame, script.layer_id));
     canonical.q0rgs.sort_by_key(|q0rg| q0rg.q0rg_id);
     for q0rg in &mut canonical.q0rgs {
         for layer in &mut q0rg.layers {
@@ -1203,6 +1324,25 @@ pub fn wire_equivalent(left: &ProjectV2, right: &ProjectV2) -> bool {
         || left.asset_names != right.asset_names
         || left.asset_appearances != right.asset_appearances
         || left.layer_metadata != right.layer_metadata
+        || {
+            let mut left_runtime = left.runtime.clone();
+            let mut right_runtime = right.runtime.clone();
+            left_runtime
+                .project_graph
+                .nodes
+                .sort_by_key(|node| node.node_id);
+            right_runtime
+                .project_graph
+                .nodes
+                .sort_by_key(|node| node.node_id);
+            left_runtime
+                .frame_scripts
+                .sort_by_key(|script| (script.q0rg_id, script.frame, script.layer_id));
+            right_runtime
+                .frame_scripts
+                .sort_by_key(|script| (script.q0rg_id, script.frame, script.layer_id));
+            left_runtime != right_runtime
+        }
         || left.assets.len() != right.assets.len()
         || left.q0rgs.len() != right.q0rgs.len()
     {
@@ -2122,6 +2262,143 @@ fn validate_rig_asset(rig: &RigAsset) -> Result<(), Error> {
     Ok(())
 }
 
+const MAX_PROJECT_GRAPH_DEPTH: usize = 64;
+const MAX_EMBEDDED_DEPENDENCY_BYTES: usize = 256 * 1024 * 1024;
+
+fn runtime_alias_is_valid(alias: &str) -> bool {
+    let mut chars = alias.chars();
+    matches!(chars.next(), Some(ch) if ch.is_ascii_alphabetic() || ch == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn validate_project_runtime(project: &ProjectV2) -> Result<(), Error> {
+    let nodes = &project.runtime.project_graph.nodes;
+    let mut node_ids = HashSet::new();
+    let mut parent_by_id = HashMap::new();
+    let mut sibling_aliases = HashSet::new();
+    for node in nodes {
+        if node.node_id == 0 || !node_ids.insert(node.node_id) {
+            return Err(Error::Validation(
+                "project dependency node ids must be unique and non-zero",
+            ));
+        }
+        if !runtime_alias_is_valid(&node.alias) {
+            return Err(Error::Validation(
+                "project dependency alias must be an identifier",
+            ));
+        }
+        if !sibling_aliases.insert((node.parent_node_id, node.alias.clone())) {
+            return Err(Error::Validation(
+                "project dependency aliases must be unique among siblings",
+            ));
+        }
+        match &node.source {
+            ProjectDependencySource::External(path) if path.trim().is_empty() => {
+                return Err(Error::Validation(
+                    "external project dependency path cannot be empty",
+                ));
+            }
+            ProjectDependencySource::Embedded(bytes)
+                if bytes.len() > MAX_EMBEDDED_DEPENDENCY_BYTES =>
+            {
+                return Err(Error::Validation(
+                    "embedded project dependency is too large",
+                ));
+            }
+            _ => {}
+        }
+        parent_by_id.insert(node.node_id, node.parent_node_id);
+    }
+    for node in nodes {
+        if let Some(parent) = node.parent_node_id {
+            if parent == node.node_id || !node_ids.contains(&parent) {
+                return Err(Error::Validation(
+                    "project dependency parent references a missing/self node",
+                ));
+            }
+        }
+        let mut seen = HashSet::new();
+        let mut cursor = Some(node.node_id);
+        let mut depth = 0usize;
+        while let Some(id) = cursor {
+            if !seen.insert(id) {
+                return Err(Error::Validation("project dependency cycle detected"));
+            }
+            depth += 1;
+            if depth > MAX_PROJECT_GRAPH_DEPTH {
+                return Err(Error::Validation("project dependency nesting is too deep"));
+            }
+            cursor = parent_by_id.get(&id).copied().flatten();
+        }
+    }
+
+    let mut frame_script_keys = HashSet::new();
+    for script in &project.runtime.frame_scripts {
+        let q0rg = project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == script.q0rg_id)
+            .ok_or(Error::Validation("frame script references a missing q0rg"))?;
+        if script.frame >= q0rg.frame_count {
+            return Err(Error::Validation(
+                "frame script is outside the q0rg timeline",
+            ));
+        }
+        if !q0rg
+            .layers
+            .iter()
+            .any(|layer| layer.layer_id == script.layer_id)
+        {
+            return Err(Error::Validation("frame script references a missing layer"));
+        }
+        if project.layer_is_folder(script.q0rg_id, script.layer_id) {
+            return Err(Error::Validation(
+                "frame script cannot live on a folder row",
+            ));
+        }
+        if !frame_script_keys.insert((script.q0rg_id, script.layer_id, script.frame)) {
+            return Err(Error::Validation(
+                "only one frame script is allowed per timeline cell",
+            ));
+        }
+        if script.source.len() > usize::from(u16::MAX) {
+            return Err(Error::Overflow("frame script exceeds u16 source length"));
+        }
+    }
+
+    let mut names_by_q0rg = HashSet::new();
+    for (key, name) in &project.runtime.instance_names {
+        if key.instance_id == 0 || name.trim().is_empty() {
+            return Err(Error::Validation(
+                "runtime instance names require a non-zero instance id and non-empty name",
+            ));
+        }
+        let q0rg = project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == key.q0rg_id)
+            .ok_or(Error::Validation(
+                "runtime instance name references a missing q0rg",
+            ))?;
+        if !q0rg
+            .layers
+            .iter()
+            .flat_map(|layer| &layer.placements)
+            .any(|placement| placement.instance_id == key.instance_id)
+        {
+            return Err(Error::Validation(
+                "runtime instance name references a missing placement identity",
+            ));
+        }
+        if !names_by_q0rg.insert((key.q0rg_id, name.clone())) {
+            return Err(Error::Validation(
+                "runtime instance names must be unique within a q0rg",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn validate(project: &ProjectV2) -> Result<(), Error> {
     if project.meta.fps == 0 {
         return Err(Error::Validation("fps must be > 0"));
@@ -2132,6 +2409,8 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
     if project.q0rgs.is_empty() {
         return Err(Error::Validation("at least one q0rg is required"));
     }
+
+    validate_project_runtime(project)?;
 
     let mut asset_ids = HashSet::new();
     for asset in &project.assets {
@@ -2178,7 +2457,7 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
                 }
             }
             Asset::Q0v(v) => {
-                q0video::q0v::Q0vFile::parse(v.bytes.clone())
+                q0video::q0v::validate_bytes(&v.bytes)
                     .map_err(|_| Error::Validation("q0v asset payload is invalid"))?;
             }
             Asset::Rig(rig) => validate_rig_asset(rig)?,
@@ -2388,6 +2667,11 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
                         "placement opacity must be finite and between 0 and 1",
                     ));
                 }
+                if !p.fx.audio_gain.is_finite() || !(0.0..=4.0).contains(&p.fx.audio_gain) {
+                    return Err(Error::Validation(
+                        "placement audio gain must be finite and between 0 and 4",
+                    ));
+                }
                 if let Some(blur) = p.fx.blur {
                     if !blur.radius.is_finite() || !(0.0..=512.0).contains(&blur.radius) {
                         return Err(Error::Validation(
@@ -2459,6 +2743,78 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
             }
         }
         layer_ids_by_q0rg.insert(q0rg.q0rg_id, layer_ids);
+    }
+
+    let mut audio_ranges = HashMap::<(u16, u16), Vec<(u16, u16)>>::new();
+    for &clip in &project.audio_clips {
+        if !clip.gain.is_finite() || !(0.0..=4.0).contains(&clip.gain) {
+            return Err(Error::Validation(
+                "audio clip gain must be finite and between 0 and 4",
+            ));
+        }
+        let q0rg = project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == clip.q0rg_id)
+            .ok_or(Error::Validation("audio clip references a missing q0rg"))?;
+        let layer = q0rg
+            .layers
+            .iter()
+            .find(|layer| layer.layer_id == clip.layer_id)
+            .ok_or(Error::Validation("audio clip references a missing layer"))?;
+        if project.layer_is_folder(clip.q0rg_id, clip.layer_id) {
+            return Err(Error::Validation("audio clip cannot live on a folder row"));
+        }
+        if clip.start_frame >= q0rg.frame_count {
+            return Err(Error::Validation(
+                "audio clip start is outside the timeline",
+            ));
+        }
+        let Some(end_frame) = audio_clip_end_frame(project, clip) else {
+            return Err(Error::Validation(
+                "audio clip must reference an audio-only q0v asset",
+            ));
+        };
+        if end_frame > q0rg.frame_count {
+            return Err(Error::Validation("audio clip extends past the timeline"));
+        }
+        if layer
+            .keyframe_frames()
+            .into_iter()
+            .any(|frame| (clip.start_frame..end_frame).contains(&frame))
+        {
+            return Err(Error::Validation(
+                "audio clip frames cannot contain visual keyframes",
+            ));
+        }
+        if let Some(previous_key) = layer
+            .keyframe_frames()
+            .into_iter()
+            .filter(|frame| *frame < clip.start_frame)
+            .max()
+        {
+            if layer
+                .placements
+                .iter()
+                .any(|placement| placement.frame == previous_key)
+            {
+                return Err(Error::Validation(
+                    "audio clip frames cannot contain held visual content",
+                ));
+            }
+        }
+        let ranges = audio_ranges
+            .entry((clip.q0rg_id, clip.layer_id))
+            .or_default();
+        if ranges
+            .iter()
+            .any(|&(start, end)| start < end_frame && clip.start_frame < end)
+        {
+            return Err(Error::Validation(
+                "audio clips on one layer must not overlap",
+            ));
+        }
+        ranges.push((clip.start_frame, end_frame));
     }
 
     for (&key, &metadata) in &project.layer_metadata {
@@ -2761,6 +3117,9 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
         && version != Q1S_VERSION_RIGGING
         && version != Q1S_VERSION_RIG_PRO
         && version != Q1S_VERSION_RIG_DEFORMERS
+        && version != Q1S_VERSION_RIG_POSE_VARIANTS
+        && version != Q1S_VERSION_AUDIO_CLIP_FX
+        && version != Q1S_VERSION_AUDIO_TIMELINE_CLIPS
         && version != Q1S_VERSION_CURRENT
     {
         return Err(Error::UnsupportedVersion(version));
@@ -2799,6 +3158,30 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
     {
         return Err(Error::Validation(
             "legacy q1s versions cannot store placement effects",
+        ));
+    }
+    if version < Q1S_VERSION_AUDIO_CLIP_FX
+        && project
+            .q0rgs
+            .iter()
+            .flat_map(|q0rg| &q0rg.layers)
+            .flat_map(|layer| &layer.placements)
+            .any(|placement| {
+                (placement.fx.audio_gain - 1.0).abs() > 1.0e-6 || placement.fx.audio_muted
+            })
+    {
+        return Err(Error::Validation(
+            "q1s v18 cannot store audio clip gain or mute",
+        ));
+    }
+    if version < Q1S_VERSION_AUDIO_TIMELINE_CLIPS && !project.audio_clips.is_empty() {
+        return Err(Error::Validation(
+            "q1s v19 cannot store timeline audio clips",
+        ));
+    }
+    if version < Q1S_VERSION_PROJECT_RUNTIME && project.runtime != ProjectRuntimeData::default() {
+        return Err(Error::Validation(
+            "q1s v20 cannot store project runtime metadata",
         ));
     }
     if version < Q1S_VERSION_RIGGING
@@ -3030,6 +3413,86 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
                     out.extend_from_slice(&value.to_le_bytes());
                 }
             }
+        }
+    }
+
+    if version >= Q1S_VERSION_AUDIO_TIMELINE_CLIPS {
+        let clip_count = u16::try_from(project.audio_clips.len())
+            .map_err(|_| Error::Overflow("audio clip count exceeds u16"))?;
+        out.extend_from_slice(&clip_count.to_le_bytes());
+        let mut clips = project.audio_clips.clone();
+        clips.sort_by_key(|clip| (clip.q0rg_id, clip.layer_id, clip.start_frame, clip.asset_id));
+        for clip in clips {
+            out.extend_from_slice(&clip.q0rg_id.to_le_bytes());
+            out.extend_from_slice(&clip.layer_id.to_le_bytes());
+            out.extend_from_slice(&clip.start_frame.to_le_bytes());
+            out.extend_from_slice(&clip.asset_id.to_le_bytes());
+            out.extend_from_slice(&clip.gain.to_le_bytes());
+            out.push(u8::from(clip.muted));
+        }
+    }
+
+    if version >= Q1S_VERSION_PROJECT_RUNTIME {
+        let node_count = u16::try_from(project.runtime.project_graph.nodes.len())
+            .map_err(|_| Error::Overflow("project dependency node count exceeds u16"))?;
+        out.extend_from_slice(&node_count.to_le_bytes());
+        let mut nodes = project
+            .runtime
+            .project_graph
+            .nodes
+            .iter()
+            .collect::<Vec<_>>();
+        nodes.sort_by_key(|node| node.node_id);
+        for node in nodes {
+            out.extend_from_slice(&node.node_id.to_le_bytes());
+            match node.parent_node_id {
+                Some(parent) => {
+                    out.push(1);
+                    out.extend_from_slice(&parent.to_le_bytes());
+                }
+                None => out.push(0),
+            }
+            write_string_u16(&mut out, &node.alias)?;
+            out.push(match node.kind {
+                ProjectDependencyKind::Movie => 0,
+                ProjectDependencyKind::Q0lang => 1,
+            });
+            match &node.source {
+                ProjectDependencySource::External(path) => {
+                    out.push(0);
+                    write_string_u16(&mut out, path)?;
+                }
+                ProjectDependencySource::Embedded(bytes) => {
+                    out.push(1);
+                    let len = u32::try_from(bytes.len())
+                        .map_err(|_| Error::Overflow("embedded dependency exceeds u32"))?;
+                    out.extend_from_slice(&len.to_le_bytes());
+                    out.extend_from_slice(bytes);
+                }
+            }
+        }
+
+        let script_count = u16::try_from(project.runtime.frame_scripts.len())
+            .map_err(|_| Error::Overflow("frame script count exceeds u16"))?;
+        out.extend_from_slice(&script_count.to_le_bytes());
+        let mut scripts = project.runtime.frame_scripts.iter().collect::<Vec<_>>();
+        scripts.sort_by_key(|script| (script.q0rg_id, script.frame, script.layer_id));
+        for script in scripts {
+            out.extend_from_slice(&script.q0rg_id.to_le_bytes());
+            out.extend_from_slice(&script.layer_id.to_le_bytes());
+            out.extend_from_slice(&script.frame.to_le_bytes());
+            write_string_u16(&mut out, &script.source)?;
+        }
+
+        let name_count = u16::try_from(project.runtime.instance_names.len())
+            .map_err(|_| Error::Overflow("runtime instance name count exceeds u16"))?;
+        out.extend_from_slice(&name_count.to_le_bytes());
+        let mut names = project.runtime.instance_names.iter().collect::<Vec<_>>();
+        names.sort_by_key(|(key, _)| (key.q0rg_id, key.instance_id));
+        for (key, name) in names {
+            out.extend_from_slice(&key.q0rg_id.to_le_bytes());
+            out.extend_from_slice(&key.instance_id.to_le_bytes());
+            write_string_u16(&mut out, name)?;
         }
     }
 
@@ -3560,7 +4023,7 @@ fn write_easing(out: &mut Vec<u8>, easing: Easing) {
     }
 }
 
-fn write_placement_fx(out: &mut Vec<u8>, fx: PlacementFx) {
+fn write_placement_fx(out: &mut Vec<u8>, fx: PlacementFx, version: u16) {
     let mut flags = 0u8;
     if (fx.opacity - 1.0).abs() > 1.0e-6 {
         flags |= PLACEMENT_FX_OPACITY;
@@ -3576,6 +4039,14 @@ fn write_placement_fx(out: &mut Vec<u8>, fx: PlacementFx) {
     }
     if fx.shadow.is_some() {
         flags |= PLACEMENT_FX_SHADOW;
+    }
+    if version >= Q1S_VERSION_AUDIO_CLIP_FX {
+        if (fx.audio_gain - 1.0).abs() > 1.0e-6 {
+            flags |= PLACEMENT_FX_AUDIO_GAIN;
+        }
+        if fx.audio_muted {
+            flags |= PLACEMENT_FX_AUDIO_MUTED;
+        }
     }
     out.push(flags);
     if flags & PLACEMENT_FX_OPACITY != 0 {
@@ -3598,6 +4069,9 @@ fn write_placement_fx(out: &mut Vec<u8>, fx: PlacementFx) {
         out.extend_from_slice(&glow.radius.to_le_bytes());
         out.extend_from_slice(&glow.strength.to_le_bytes());
     }
+    if flags & PLACEMENT_FX_AUDIO_GAIN != 0 {
+        out.extend_from_slice(&fx.audio_gain.to_le_bytes());
+    }
     if let Some(shadow) = fx.shadow {
         out.extend_from_slice(&[
             shadow.color.r,
@@ -3612,16 +4086,17 @@ fn write_placement_fx(out: &mut Vec<u8>, fx: PlacementFx) {
     }
 }
 
-fn read_placement_fx(c: &mut Cursor<'_>) -> Result<PlacementFx, Error> {
+fn read_placement_fx(c: &mut Cursor<'_>, version: u16) -> Result<PlacementFx, Error> {
     let flags = c.read_u8()?;
-    if flags
-        & !(PLACEMENT_FX_OPACITY
-            | PLACEMENT_FX_BLEND
-            | PLACEMENT_FX_BLUR
-            | PLACEMENT_FX_GLOW
-            | PLACEMENT_FX_SHADOW)
-        != 0
-    {
+    let mut allowed_flags = PLACEMENT_FX_OPACITY
+        | PLACEMENT_FX_BLEND
+        | PLACEMENT_FX_BLUR
+        | PLACEMENT_FX_GLOW
+        | PLACEMENT_FX_SHADOW;
+    if version >= Q1S_VERSION_AUDIO_CLIP_FX {
+        allowed_flags |= PLACEMENT_FX_AUDIO_GAIN | PLACEMENT_FX_AUDIO_MUTED;
+    }
+    if flags & !allowed_flags != 0 {
         return Err(Error::Validation("invalid placement fx flags"));
     }
     let opacity = if flags & PLACEMENT_FX_OPACITY != 0 {
@@ -3662,6 +4137,12 @@ fn read_placement_fx(c: &mut Cursor<'_>) -> Result<PlacementFx, Error> {
     } else {
         None
     };
+    let audio_gain = if flags & PLACEMENT_FX_AUDIO_GAIN != 0 {
+        c.read_f32()?
+    } else {
+        1.0
+    };
+    let audio_muted = flags & PLACEMENT_FX_AUDIO_MUTED != 0;
     let shadow = if flags & PLACEMENT_FX_SHADOW != 0 {
         Some(DropShadowFx {
             color: Rgba {
@@ -3684,6 +4165,8 @@ fn read_placement_fx(c: &mut Cursor<'_>) -> Result<PlacementFx, Error> {
         blur,
         glow,
         shadow,
+        audio_gain,
+        audio_muted,
     })
 }
 
@@ -3748,7 +4231,7 @@ fn write_q0rg(out: &mut Vec<u8>, q0rg: &Q0rg, version: u16) -> Result<(), Error>
                 }
             }
             if version >= Q1S_VERSION_PLACEMENT_FX {
-                write_placement_fx(out, p.fx);
+                write_placement_fx(out, p.fx, version);
             }
         }
 
@@ -3793,6 +4276,9 @@ pub fn parse(bytes: &[u8]) -> Result<ProjectV2, Error> {
         && version != Q1S_VERSION_RIGGING
         && version != Q1S_VERSION_RIG_PRO
         && version != Q1S_VERSION_RIG_DEFORMERS
+        && version != Q1S_VERSION_RIG_POSE_VARIANTS
+        && version != Q1S_VERSION_AUDIO_CLIP_FX
+        && version != Q1S_VERSION_AUDIO_TIMELINE_CLIPS
         && version != Q1S_VERSION_CURRENT
     {
         return Err(Error::UnsupportedVersion(version));
@@ -3956,6 +4442,89 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
         }
     }
 
+    let mut audio_clips = Vec::new();
+    if version >= Q1S_VERSION_AUDIO_TIMELINE_CLIPS {
+        let count = c.read_u16()?;
+        audio_clips.reserve(usize::from(count));
+        for _ in 0..count {
+            let q0rg_id = c.read_u16()?;
+            let layer_id = c.read_u16()?;
+            let start_frame = c.read_u16()?;
+            let asset_id = c.read_u16()?;
+            let gain = c.read_f32()?;
+            let muted = match c.read_u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(Error::Validation("invalid audio clip mute flag")),
+            };
+            audio_clips.push(AudioClip {
+                q0rg_id,
+                layer_id,
+                start_frame,
+                asset_id,
+                gain,
+                muted,
+            });
+        }
+    }
+
+    let mut runtime = ProjectRuntimeData::default();
+    if version >= Q1S_VERSION_PROJECT_RUNTIME {
+        let node_count = c.read_u16()?;
+        runtime.project_graph.nodes.reserve(usize::from(node_count));
+        for _ in 0..node_count {
+            let node_id = c.read_u16()?;
+            let parent_node_id = match c.read_u8()? {
+                0 => None,
+                1 => Some(c.read_u16()?),
+                _ => return Err(Error::Validation("invalid project dependency parent flag")),
+            };
+            let alias = c.read_string_u16()?;
+            let kind = match c.read_u8()? {
+                0 => ProjectDependencyKind::Movie,
+                1 => ProjectDependencyKind::Q0lang,
+                _ => return Err(Error::Validation("invalid project dependency kind")),
+            };
+            let source = match c.read_u8()? {
+                0 => ProjectDependencySource::External(c.read_string_u16()?),
+                1 => {
+                    let len = usize::try_from(c.read_u32()?)
+                        .map_err(|_| Error::Validation("embedded dependency length is invalid"))?;
+                    ProjectDependencySource::Embedded(c.read_exact(len)?.to_vec())
+                }
+                _ => return Err(Error::Validation("invalid project dependency source kind")),
+            };
+            runtime.project_graph.nodes.push(ProjectDependencyNode {
+                node_id,
+                parent_node_id,
+                alias,
+                kind,
+                source,
+            });
+        }
+
+        let script_count = c.read_u16()?;
+        runtime.frame_scripts.reserve(usize::from(script_count));
+        for _ in 0..script_count {
+            runtime.frame_scripts.push(FrameScript {
+                q0rg_id: c.read_u16()?,
+                layer_id: c.read_u16()?,
+                frame: c.read_u16()?,
+                source: c.read_string_u16()?,
+            });
+        }
+
+        let name_count = c.read_u16()?;
+        runtime.instance_names.reserve(usize::from(name_count));
+        for _ in 0..name_count {
+            let key = InstanceKey::new(c.read_u16()?, c.read_u32()?);
+            let name = c.read_string_u16()?;
+            if runtime.instance_names.insert(key, name).is_some() {
+                return Err(Error::Validation("duplicate runtime instance name entry"));
+            }
+        }
+    }
+
     c.finish()?;
 
     let project = ProjectV2 {
@@ -3970,6 +4539,8 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
         asset_names,
         asset_appearances,
         layer_metadata,
+        audio_clips,
+        runtime,
         q0rgs,
     };
     if version < Q1S_VERSION_NESTED_LAYER_FOLDERS
@@ -4586,7 +5157,7 @@ fn parse_q0rg(c: &mut Cursor, version: u16) -> Result<Q0rg, Error> {
                 _ => return Err(Error::Validation("invalid tween kind")),
             };
             let fx = if version >= Q1S_VERSION_PLACEMENT_FX {
-                read_placement_fx(c)?
+                read_placement_fx(c, version)?
             } else {
                 PlacementFx::default()
             };
@@ -4649,6 +5220,26 @@ mod compatibility_tests {
         writer.finish().expect("finish q0v").into_inner()
     }
 
+    fn test_audio_q0v_bytes() -> Vec<u8> {
+        const SAMPLE_FRAMES: usize = 4_800;
+        let spec = q0video::q0v::Q0vSpec {
+            width: 0,
+            height: 0,
+            fps: 48_000,
+            timeline_frames: SAMPLE_FRAMES as u32,
+            video: false,
+            audio: true,
+            audio_sample_rate: 48_000,
+            audio_channels: 2,
+        };
+        let mut writer = q0video::q0v::Q0vWriter::new(std::io::Cursor::new(Vec::new()), spec)
+            .expect("audio q0v writer");
+        writer
+            .write_audio_pcm_i16(&vec![0; SAMPLE_FRAMES * 2])
+            .expect("audio q0v pcm");
+        writer.finish().expect("finish audio q0v").into_inner()
+    }
+
     fn legacy_project() -> ProjectV2 {
         ProjectV2 {
             meta: ProjectMeta {
@@ -4667,6 +5258,8 @@ mod compatibility_tests {
             asset_names: std::collections::HashMap::new(),
             asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
                 name: "Stage".to_string(),
@@ -6066,9 +6659,108 @@ mod compatibility_tests {
         let bytes = write(&project).expect("write v18 rig extensions");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q1S_VERSION_RIG_POSE_VARIANTS
+            Q1S_VERSION_CURRENT
         );
-        assert_eq!(parse(&bytes).expect("parse v18 rig extensions"), project);
+        assert_eq!(
+            parse(&bytes).expect("parse current rig extensions"),
+            project
+        );
+    }
+
+    #[test]
+    fn current_q1s_roundtrip_preserves_audio_clip_gain_and_mute() {
+        let mut project = legacy_project();
+        project.q0rgs[0].layers[0].placements[0].fx.audio_gain = 0.375;
+        project.q0rgs[0].layers[0].placements[0].fx.audio_muted = true;
+        let bytes = write(&project).expect("write audio clip fx");
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            Q1S_VERSION_CURRENT
+        );
+        assert_eq!(parse(&bytes).expect("parse audio clip fx"), project);
+    }
+
+    #[test]
+    fn current_q1s_roundtrip_preserves_timeline_audio_clip() {
+        let mut project = legacy_project();
+        project.meta.fps = 24;
+        project.assets = vec![Asset::Q0v(Q0vAsset {
+            asset_id: 77,
+            bytes: test_audio_q0v_bytes(),
+        })];
+        project.q0rgs[0].frame_count = 20;
+        project.q0rgs[0].layers[0].placements.clear();
+        project.q0rgs[0].layers[0].explicit_keyframes.clear();
+        project.audio_clips.push(AudioClip {
+            q0rg_id: 1,
+            layer_id: 1,
+            start_frame: 3,
+            asset_id: 77,
+            gain: 0.375,
+            muted: true,
+        });
+
+        let bytes = write(&project).expect("write timeline audio q1s");
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            Q1S_VERSION_CURRENT
+        );
+        let parsed = parse(&bytes).expect("parse timeline audio q1s");
+        assert_eq!(parsed, project);
+        assert_eq!(parsed.audio_clips, project.audio_clips);
+    }
+
+    #[test]
+    fn q1s_v19_remains_readable_without_timeline_audio_section() {
+        let mut project = legacy_project();
+        let bytes =
+            write_version(&project, Q1S_VERSION_AUDIO_CLIP_FX).expect("write q1s v19 fixture");
+        let parsed = parse(&bytes).expect("parse q1s v19 fixture");
+        assert_eq!(parsed, project);
+        assert!(parsed.audio_clips.is_empty());
+
+        project.assets = vec![Asset::Q0v(Q0vAsset {
+            asset_id: 77,
+            bytes: test_audio_q0v_bytes(),
+        })];
+        project.q0rgs[0].frame_count = 20;
+        project.q0rgs[0].layers[0].placements.clear();
+        project.q0rgs[0].layers[0].explicit_keyframes.clear();
+        project.audio_clips.push(AudioClip {
+            q0rg_id: 1,
+            layer_id: 1,
+            start_frame: 0,
+            asset_id: 77,
+            gain: 1.0,
+            muted: false,
+        });
+        assert_eq!(
+            write_version(&project, Q1S_VERSION_AUDIO_CLIP_FX)
+                .expect_err("q1s v19 must reject timeline audio clips"),
+            Error::Validation("q1s v19 cannot store timeline audio clips")
+        );
+    }
+
+    #[test]
+    fn q1s_v18_rejects_audio_clip_fx_instead_of_dropping_them() {
+        let mut project = legacy_project();
+        project.q0rgs[0].layers[0].placements[0].fx.audio_gain = 0.5;
+        assert_eq!(
+            write_version(&project, Q1S_VERSION_RIG_POSE_VARIANTS)
+                .expect_err("v18 must reject audio clip fx"),
+            Error::Validation("q1s v18 cannot store audio clip gain or mute")
+        );
+    }
+
+    #[test]
+    fn q1s_v18_remains_readable_with_default_audio_clip_fx() {
+        let project = legacy_project();
+        let bytes = write_version(&project, Q1S_VERSION_RIG_POSE_VARIANTS).expect("write q1s v18");
+        let parsed = parse(&bytes).expect("parse q1s v18");
+        assert_eq!(parsed, project);
+        let fx = parsed.q0rgs[0].layers[0].placements[0].fx;
+        assert_eq!(fx.audio_gain, 1.0);
+        assert!(!fx.audio_muted);
     }
 
     #[test]
@@ -6128,6 +6820,101 @@ mod compatibility_tests {
         assert_eq!(
             validate(&project).expect_err("variant cycle must reject"),
             Error::Validation("q0rg cycle detected")
+        );
+    }
+
+    #[test]
+    fn current_q1s_roundtrip_preserves_project_runtime_metadata() {
+        let mut project = legacy_project();
+        project.q0rgs[0].layers[0].placements[0].instance_id = 42;
+        project.runtime.project_graph.nodes = vec![
+            ProjectDependencyNode {
+                node_id: 1,
+                parent_node_id: None,
+                alias: "logic".into(),
+                kind: ProjectDependencyKind::Q0lang,
+                source: ProjectDependencySource::External("scripts/logic.q0l".into()),
+            },
+            ProjectDependencyNode {
+                node_id: 2,
+                parent_node_id: Some(1),
+                alias: "ui".into(),
+                kind: ProjectDependencyKind::Movie,
+                source: ProjectDependencySource::Embedded(vec![1, 2, 3, 4]),
+            },
+        ];
+        project.runtime.frame_scripts.push(FrameScript {
+            q0rg_id: 1,
+            layer_id: 1,
+            frame: 0,
+            source: "gostop! 0\n".into(),
+        });
+        project
+            .runtime
+            .instance_names
+            .insert(InstanceKey::new(1, 42), "hero".into());
+
+        let bytes = write(&project).expect("write project runtime q1s");
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            Q1S_VERSION_PROJECT_RUNTIME
+        );
+        assert_eq!(parse(&bytes).expect("parse project runtime q1s"), project);
+    }
+
+    #[test]
+    fn q1s_v20_remains_readable_with_empty_project_runtime_metadata() {
+        let project = legacy_project();
+        let bytes = write_version(&project, Q1S_VERSION_AUDIO_TIMELINE_CLIPS)
+            .expect("write q1s v20 fixture");
+        let parsed = parse(&bytes).expect("parse q1s v20 fixture");
+        assert_eq!(parsed, project);
+        assert_eq!(parsed.runtime, ProjectRuntimeData::default());
+    }
+
+    #[test]
+    fn project_runtime_validation_rejects_dependency_cycles_and_duplicate_aliases() {
+        let mut project = legacy_project();
+        project.runtime.project_graph.nodes = vec![
+            ProjectDependencyNode {
+                node_id: 1,
+                parent_node_id: Some(2),
+                alias: "a".into(),
+                kind: ProjectDependencyKind::Q0lang,
+                source: ProjectDependencySource::External("a.q0l".into()),
+            },
+            ProjectDependencyNode {
+                node_id: 2,
+                parent_node_id: Some(1),
+                alias: "b".into(),
+                kind: ProjectDependencyKind::Movie,
+                source: ProjectDependencySource::External("b.q0s".into()),
+            },
+        ];
+        assert_eq!(
+            validate(&project).expect_err("dependency cycle must fail"),
+            Error::Validation("project dependency cycle detected")
+        );
+
+        project.runtime.project_graph.nodes = vec![
+            ProjectDependencyNode {
+                node_id: 1,
+                parent_node_id: None,
+                alias: "same".into(),
+                kind: ProjectDependencyKind::Q0lang,
+                source: ProjectDependencySource::External("a.q0l".into()),
+            },
+            ProjectDependencyNode {
+                node_id: 2,
+                parent_node_id: None,
+                alias: "same".into(),
+                kind: ProjectDependencyKind::Movie,
+                source: ProjectDependencySource::External("b.q0s".into()),
+            },
+        ];
+        assert_eq!(
+            validate(&project).expect_err("duplicate sibling alias must fail"),
+            Error::Validation("project dependency aliases must be unique among siblings")
         );
     }
 }

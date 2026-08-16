@@ -1,0 +1,12 @@
+﻿[package]
+name = "q0vm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Sandboxed bytecode virtual machine for q0lang."
+
+[lib]
+path = "src/lib.rs"

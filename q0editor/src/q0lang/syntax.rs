@@ -11,8 +11,11 @@
 //!   pb func openDoor actor speed
 //!   pr func cacheFrame frame
 //!   do! { ... }
+//!   if x >= 2 and not false { ... } else { ... }
+//!   while x < 10 { ... }
+//!   return x
 //!
-//! The tokenizer is tiny and intentionally forgiving — it never panics on
+//! The tokenizer is tiny and intentionally forgiving вЂ” it never panics on
 //! malformed input, it just falls back to `Identifier` for whatever it
 //! can't classify. That matters because the editor live-relexes every
 //! keystroke; a broken intermediate state must still render.
@@ -36,7 +39,7 @@ pub enum TokenKind {
     Number,
     Comment,
     Operator,
-    /// `Q0Signal UP!` and similar — uppercase identifiers ending in `!`.
+    /// `Q0Signal UP!` and similar вЂ” uppercase identifiers ending in `!`.
     Signal,
     Identifier,
     Whitespace,
@@ -54,7 +57,7 @@ pub struct Token {
 /// Top-level keywords. Case-sensitive.
 const KEYWORDS: &[&str] = &[
     "import", "listen", "xlisten", "pb", "pr", "func", "if", "else", "return", "true", "false",
-    "null", "for", "while", "in", "as", "self",
+    "null", "while", "and", "or", "not",
 ];
 
 /// Built-in libraries / module names known from the q0lang notes. Highlighted
@@ -115,7 +118,7 @@ pub fn tokenize(src: &str) -> Vec<Token> {
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
-        // Newline first — keep separate so the layouter can pass through line breaks.
+        // Newline first вЂ” keep separate so the layouter can pass through line breaks.
         if b == b'\n' {
             out.push(Token {
                 kind: TokenKind::Newline,
@@ -152,17 +155,11 @@ pub fn tokenize(src: &str) -> Vec<Token> {
             });
             continue;
         }
-        // Comment: ! ... ! on a single line. Closing ! is optional at EOL —
-        // treat unterminated as a comment to end of line so the editor
-        // colours partial typing nicely.
-        if b == b'!' {
+        // q0lang comments start with # and run to the end of the line.
+        // `!` belongs to execution signals and `!=`, so it must never start a comment.
+        if b == b'#' {
             let s = i;
-            i += 1;
             while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
-                if bytes[i] == b'!' {
-                    i += 1;
-                    break;
-                }
                 i += 1;
             }
             out.push(Token {
@@ -172,7 +169,7 @@ pub fn tokenize(src: &str) -> Vec<Token> {
             });
             continue;
         }
-        // String: "..." — backslash escapes are not part of q0lang per the
+        // String: "..." вЂ” backslash escapes are not part of q0lang per the
         // examples, but we tolerate them by skipping the next byte.
         if b == b'"' {
             let s = i;
@@ -252,7 +249,7 @@ pub fn tokenize(src: &str) -> Vec<Token> {
                 });
                 continue;
             }
-            // Dotted path (qos.lib.X) — only if the next byte is `.` followed by another identifier.
+            // Dotted path (qos.lib.X) вЂ” only if the next byte is `.` followed by another identifier.
             if i < bytes.len()
                 && bytes[i] == b'.'
                 && i + 1 < bytes.len()
@@ -292,7 +289,7 @@ pub fn tokenize(src: &str) -> Vec<Token> {
             });
             continue;
         }
-        // Operator / punctuation — single byte at a time.
+        // Operator / punctuation вЂ” single byte at a time.
         if matches!(
             b,
             b'(' | b')'
@@ -317,7 +314,7 @@ pub fn tokenize(src: &str) -> Vec<Token> {
                 | b'&'
                 | b'|'
                 | b'^'
-                | b'#'
+                | b'!'
         ) {
             out.push(Token {
                 kind: TokenKind::Operator,
@@ -327,7 +324,7 @@ pub fn tokenize(src: &str) -> Vec<Token> {
             i += 1;
             continue;
         }
-        // Unknown byte — emit one Other and keep going so we never loop.
+        // Unknown byte вЂ” emit one Other and keep going so we never loop.
         let s = i;
         // Walk forward bytewise but try to stop at the next "interesting"
         // boundary so we don't shrink tokens to size-1 over multi-byte UTF-8
@@ -342,6 +339,7 @@ pub fn tokenize(src: &str) -> Vec<Token> {
             && bytes[i] != b' '
             && bytes[i] != b'\t'
             && bytes[i] != b'!'
+            && bytes[i] != b'#'
             && bytes[i] != b'"'
             && bytes[i] != b'\''
             && !matches!(
@@ -368,7 +366,7 @@ pub fn tokenize(src: &str) -> Vec<Token> {
                     | b'&'
                     | b'|'
                     | b'^'
-                    | b'#'
+                    | b'!'
             )
         {
             i += 1;
@@ -409,7 +407,7 @@ fn token_color(kind: TokenKind, theme: &Theme) -> Color32 {
 
 /// Build a `LayoutJob` for a single line of source. The script editor
 /// uses egui's per-line layouter callback (one call per visible row), so
-/// this runs hot — keep it allocation-light. We retokenise the line each
+/// this runs hot вЂ” keep it allocation-light. We retokenise the line each
 /// time rather than caching, because lines are short and the cost is
 /// dwarfed by glyph layout anyway.
 pub fn layout_line(src: &str, theme: &Theme, font: FontId, wrap_width: f32) -> LayoutJob {
@@ -445,4 +443,38 @@ pub fn layout_line(src: &str, theme: &Theme, font: FontId, wrap_width: f32) -> L
         job.append(slice, 0.0, format);
     }
     job
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn slices_of_kind(src: &str, kind: TokenKind) -> Vec<&str> {
+        tokenize(src)
+            .into_iter()
+            .filter(|token| token.kind == kind)
+            .map(|token| &src[token.start..token.end])
+            .collect()
+    }
+
+    #[test]
+    fn q0lang_hash_comment_does_not_eat_signal_bang_or_not_equal() {
+        let src = "if x != 2 { gorun! 3 } # comment";
+        assert_eq!(slices_of_kind(src, TokenKind::Comment), vec!["# comment"]);
+        assert!(slices_of_kind(src, TokenKind::Signal).contains(&"gorun!"));
+        let operators = slices_of_kind(src, TokenKind::Operator);
+        assert!(operators.contains(&"!"));
+        assert!(operators.contains(&"="));
+    }
+
+    #[test]
+    fn real_control_flow_words_are_keywords() {
+        let src = "if true and not false { while x < 3 { return null } } else { x = 1 }";
+        let keywords = slices_of_kind(src, TokenKind::Keyword);
+        for expected in [
+            "if", "true", "and", "not", "false", "while", "return", "null", "else",
+        ] {
+            assert!(keywords.contains(&expected), "missing keyword {expected}");
+        }
+    }
 }

@@ -368,6 +368,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             let mut click_layer: Option<u16> = None;
             let mut click_frame: Option<u16> = None;
             let mut click_label_layer: Option<u16> = None;
+            let mut open_frame_script: Option<(u16, u16, u16)> = None;
             let mut started_layer_drag: Option<u16> = None;
             for (li, layer_index) in visible_layer_indices.iter().copied().enumerate() {
                 let layer = &app.state.project.q0rgs[q0rg_idx].layers[layer_index];
@@ -506,6 +507,31 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         frame_count,
                         is_current_layer,
                     );
+                    draw_audio_waveforms(
+                        &app.state.project,
+                        &mut app.textures,
+                        &painter,
+                        &theme,
+                        q0rg_id,
+                        layer,
+                        AudioWaveformLayout {
+                            base_x: rect.min.x + LAYER_LABEL_W,
+                            row_y,
+                            frame_count,
+                        },
+                    );
+                    draw_frame_script_markers(
+                        &app.state.project,
+                        &painter,
+                        &theme,
+                        q0rg_id,
+                        layer.layer_id,
+                        AudioWaveformLayout {
+                            base_x: rect.min.x + LAYER_LABEL_W,
+                            row_y,
+                            frame_count,
+                        },
+                    );
                 } else {
                     let folder_strip = Rect::from_min_size(
                         pos2(rect.min.x + LAYER_LABEL_W, row_y + CELL_PAD_Y),
@@ -516,6 +542,28 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         0.0,
                         blend(theme.panel.to_color32(), theme.window.to_color32(), 0.35),
                     );
+                }
+
+                if !is_folder && response.double_clicked() {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        if row_rect.contains(pos) && !label_rect.contains(pos) {
+                            let rel_x = pos.x - (rect.min.x + LAYER_LABEL_W);
+                            if rel_x >= 0.0 {
+                                let frame = (rel_x / FRAME_W).floor() as u16;
+                                if frame < frame_count
+                                    && app.state.project.runtime.frame_scripts.iter().any(
+                                        |script| {
+                                            script.q0rg_id == q0rg_id
+                                                && script.layer_id == layer.layer_id
+                                                && script.frame == frame
+                                        },
+                                    )
+                                {
+                                    open_frame_script = Some((q0rg_id, layer.layer_id, frame));
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Dragging starts only from the fixed layer-label column.
@@ -565,6 +613,10 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         }
                     }
                 }
+            }
+
+            if let Some((q0rg_id, layer_id, frame)) = open_frame_script {
+                app.queue(Action::OpenFrameScriptEditor(q0rg_id, layer_id, frame));
             }
 
             if let Some(layer_id) = started_layer_drag {
@@ -1179,6 +1231,32 @@ fn timeline_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
             .strong()
             .small(),
     );
+    let zero_frame = frame - 1;
+    let has_frame_code = app
+        .state
+        .project
+        .runtime
+        .frame_scripts
+        .iter()
+        .any(|script| {
+            script.q0rg_id == q0rg_id && script.layer_id == layer_id && script.frame == zero_frame
+        });
+    if ui
+        .button(if has_frame_code {
+            "Edit Frame Code..."
+        } else {
+            "Add Frame Code..."
+        })
+        .clicked()
+    {
+        app.queue(Action::OpenFrameScriptEditor(q0rg_id, layer_id, zero_frame));
+        ui.close_menu();
+    }
+    if has_frame_code && ui.button("Delete Frame Code").clicked() {
+        app.queue(Action::DeleteFrameScript(q0rg_id, layer_id, zero_frame));
+        ui.close_menu();
+    }
+    ui.separator();
     if ui.button("Insert Frame  (F5)").clicked() {
         app.queue(Action::InsertFrame);
         ui.close_menu();
@@ -1630,6 +1708,115 @@ fn draw_empty_cells(
             beyond
         };
         painter.rect_filled(cell, 0.0, fill);
+    }
+}
+
+fn draw_frame_script_markers(
+    project: &q0s_format::v2::ProjectV2,
+    painter: &egui::Painter,
+    theme: &Theme,
+    q0rg_id: u16,
+    layer_id: u16,
+    layout: AudioWaveformLayout,
+) {
+    let color = theme.accent.to_color32();
+    for script in &project.runtime.frame_scripts {
+        if script.q0rg_id != q0rg_id
+            || script.layer_id != layer_id
+            || script.frame >= layout.frame_count
+        {
+            continue;
+        }
+        let x = layout.base_x + f32::from(script.frame) * FRAME_W + FRAME_W * 0.5;
+        painter.text(
+            pos2(x, layout.row_y + 3.0),
+            Align2::CENTER_TOP,
+            "{}",
+            FontId::monospace(7.0),
+            color,
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AudioWaveformLayout {
+    base_x: f32,
+    row_y: f32,
+    frame_count: u16,
+}
+
+fn draw_audio_waveforms(
+    project: &q0s_format::v2::ProjectV2,
+    textures: &mut crate::render::TextureCache,
+    painter: &egui::Painter,
+    theme: &Theme,
+    q0rg_id: u16,
+    layer: &q0s_format::v2::Layer,
+    layout: AudioWaveformLayout,
+) {
+    let AudioWaveformLayout {
+        base_x,
+        row_y,
+        frame_count,
+    } = layout;
+    let center_y = row_y + ROW_H * 0.5;
+    let amplitude = (ROW_H - CELL_PAD_Y * 2.0 - 7.0).max(2.0) * 0.5;
+    let clip_rect = painter.clip_rect();
+    for (clip_idx, timeline_clip) in project.audio_clips.iter().enumerate() {
+        if timeline_clip.q0rg_id != q0rg_id || timeline_clip.layer_id != layer.layer_id {
+            continue;
+        }
+        let Some(clip) = crate::audio::audio_clip_ref(project, clip_idx) else {
+            continue;
+        };
+        let end = clip.end_frame_exclusive.min(frame_count);
+        if end <= clip.start_frame {
+            continue;
+        }
+        let clip_left = base_x + f32::from(clip.start_frame) * FRAME_W;
+        let clip_right = base_x + f32::from(end) * FRAME_W;
+        let visible_left = clip_left.max(clip_rect.left());
+        let visible_right = clip_right.min(clip_rect.right());
+        if visible_right <= visible_left {
+            continue;
+        }
+        let Some((waveform, waveform_complete)) = textures.audio_waveform(project, clip.asset_id)
+        else {
+            continue;
+        };
+        if !waveform_complete {
+            painter.ctx().request_repaint();
+        }
+        if waveform.bins.is_empty() {
+            continue;
+        }
+        let color = if timeline_clip.muted {
+            theme.text_dim.to_color32().gamma_multiply(0.45)
+        } else {
+            theme.accent.to_color32().gamma_multiply(0.82)
+        };
+        let visible_width = visible_right - visible_left;
+        let sample_columns = ((visible_width / 2.0).ceil() as usize).clamp(1, 4096);
+        let clip_width = (clip_right - clip_left).max(1.0);
+        for column in 0..sample_columns {
+            let x = visible_left + (column as f32 + 0.5) * visible_width / sample_columns as f32;
+            let clip_fraction = ((x - clip_left) / clip_width).clamp(0.0, 0.999_999);
+            let bin = (clip_fraction * waveform.bins.len() as f32) as usize;
+            let (min, max) = waveform.bins[bin.min(waveform.bins.len() - 1)];
+            let y_top = center_y - max.clamp(-1.0, 1.0) * amplitude;
+            let y_bottom = center_y - min.clamp(-1.0, 1.0) * amplitude;
+            painter.line_segment(
+                [pos2(x, y_top), pos2(x, y_bottom)],
+                Stroke::new(1.0_f32, color),
+            );
+        }
+        painter.line_segment(
+            [
+                pos2(visible_left, center_y),
+                pos2(visible_right.max(visible_left), center_y),
+            ],
+            Stroke::new(0.65_f32, color.gamma_multiply(0.7)),
+        );
     }
 }
 

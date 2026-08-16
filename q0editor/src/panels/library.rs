@@ -24,6 +24,7 @@ enum LibraryIcon {
     Vector,
     Bitmap,
     Video,
+    Audio,
 }
 
 impl LibraryIcon {
@@ -39,7 +40,13 @@ impl LibraryIcon {
         match asset {
             Asset::Vector(_) => Self::Vector,
             Asset::Bitmap(_) => Self::Bitmap,
-            Asset::Q0v(_) => Self::Video,
+            Asset::Q0v(media) => {
+                if crate::audio::q0v_is_audio_only_bytes(&media.bytes) {
+                    Self::Audio
+                } else {
+                    Self::Video
+                }
+            }
             Asset::Rig(_) => Self::Symbol,
         }
     }
@@ -68,7 +75,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             }
             if ui
                 .small_button("Import")
-                .on_hover_text("Import PNG, JPEG, WebP, MP4 or q0v")
+                .on_hover_text("Import PNG, JPEG, WebP, WAV, MP3, OGG, FLAC, MP4 or q0v")
                 .clicked()
             {
                 app.queue(Action::ImportMedia);
@@ -122,8 +129,8 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 _ => None,
             };
             if let Some(item) = selected_item {
-                let can_place =
-                    !matches!(item, LibraryItem::Q0rg(id) if id == app.session.current_q0rg_id);
+                let can_place = !matches!(item, LibraryItem::Q0rg(id) if id == app.session.current_q0rg_id)
+                    && !crate::audio::library_item_is_audio_only(&app.state.project, item);
                 if ui
                     .add_enabled(can_place, egui::Button::new("Place").small())
                     .clicked()
@@ -243,9 +250,17 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                                 )
                             },
                         );
+                        let drag_hint = if crate::audio::library_item_is_audio_only(
+                            &app.state.project,
+                            payload,
+                        ) {
+                            "Drag onto timeline to place"
+                        } else {
+                            "Drag onto stage to place"
+                        };
                         let response = drag
                             .response
-                            .on_hover_text(format!("{}\n{}\nDrag onto stage to place", row.name, row.detail));
+                            .on_hover_text(format!("{}\n{}\n{drag_hint}", row.name, row.detail));
                         response.clone().context_menu(|ui| {
                             if can_rename_item(app, payload) && ui.button("Rename").clicked() {
                                 rename = Some(payload);
@@ -364,6 +379,11 @@ fn library_item_name(app: &EditorApp, item: LibraryItem) -> Option<String> {
                     .get(&id)
                     .cloned()
                     .unwrap_or_else(|| match asset {
+                        Asset::Q0v(media)
+                            if crate::audio::q0v_is_audio_only_bytes(&media.bytes) =>
+                        {
+                            format!("Audio {id}")
+                        }
                         Asset::Q0v(_) => format!("Video {id}"),
                         _ => format!("Vector {id}"),
                     })
@@ -549,6 +569,43 @@ fn draw_library_icon(
                 Stroke::NONE,
             ));
         }
+        LibraryIcon::Audio => {
+            let mid = rect.center().y;
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    pos2(rect.left() + 1.0, mid - 2.0),
+                    pos2(rect.left() + 4.0, mid - 2.0),
+                    pos2(rect.left() + 7.0, mid - 5.0),
+                    pos2(rect.left() + 7.0, mid + 5.0),
+                    pos2(rect.left() + 4.0, mid + 2.0),
+                    pos2(rect.left() + 1.0, mid + 2.0),
+                ],
+                accent,
+                Stroke::NONE,
+            ));
+            painter.line_segment(
+                [
+                    pos2(rect.left() + 9.0, mid - 3.5),
+                    pos2(rect.left() + 11.0, mid),
+                ],
+                quiet,
+            );
+            painter.line_segment(
+                [
+                    pos2(rect.left() + 11.0, mid),
+                    pos2(rect.left() + 9.0, mid + 3.5),
+                ],
+                quiet,
+            );
+            painter.line_segment(
+                [pos2(rect.left() + 11.0, mid - 5.0), pos2(rect.right(), mid)],
+                strong,
+            );
+            painter.line_segment(
+                [pos2(rect.right(), mid), pos2(rect.left() + 11.0, mid + 5.0)],
+                strong,
+            );
+        }
         LibraryIcon::Bitmap => {
             painter.rect_stroke(rect, 1.5, quiet);
             painter.circle_filled(pos2(rect.right() - 3.0, rect.top() + 3.0), 1.4, accent);
@@ -616,26 +673,46 @@ fn collect_rows(app: &EditorApp) -> Vec<LibraryRow> {
                 format!("{} contours", vector.paths.len()),
             ),
             Asset::Q0v(video) => {
-                let media = q0video::q0v::Q0vFile::parse(video.bytes.clone()).ok();
-                (
-                    project
-                        .asset_names
-                        .get(&id)
-                        .cloned()
-                        .unwrap_or_else(|| format!("Video {id}")),
-                    "q0v",
-                    media
-                        .map(|media| {
-                            format!(
-                                "{} x {} px / {} frames / {} fps",
-                                media.spec.width,
-                                media.spec.height,
-                                media.spec.timeline_frames,
-                                media.spec.fps
-                            )
-                        })
-                        .unwrap_or_else(|| "invalid q0v".to_string()),
-                )
+                let header = q0video::q0v::probe_header(&video.bytes).ok();
+                if let Some(header) = header
+                    .as_ref()
+                    .filter(|header| header.spec.audio && !header.spec.video)
+                {
+                    let seconds = header.audio_samples_per_channel as f64
+                        / f64::from(header.spec.audio_sample_rate.max(1));
+                    (
+                        project
+                            .asset_names
+                            .get(&id)
+                            .cloned()
+                            .unwrap_or_else(|| format!("Audio {id}")),
+                        "audio",
+                        format!(
+                            "{seconds:.2}s / {} hz / {} ch",
+                            header.spec.audio_sample_rate, header.spec.audio_channels
+                        ),
+                    )
+                } else {
+                    (
+                        project
+                            .asset_names
+                            .get(&id)
+                            .cloned()
+                            .unwrap_or_else(|| format!("Video {id}")),
+                        "q0v",
+                        header
+                            .map(|header| {
+                                format!(
+                                    "{} x {} px / {} frames / {} fps",
+                                    header.spec.width,
+                                    header.spec.height,
+                                    header.spec.timeline_frames,
+                                    header.spec.fps
+                                )
+                            })
+                            .unwrap_or_else(|| "invalid q0v".to_string()),
+                    )
+                }
             }
             Asset::Rig(rig) => (
                 format!("Rig {}", rig.owner_q0rg_id),
@@ -924,6 +1001,12 @@ fn collect_asset_color_stats(project: &ProjectV2, asset_id: u16, stats: &mut Pre
             }
         }
         Asset::Q0v(video) => {
+            let Ok(header) = q0video::q0v::probe_header(&video.bytes) else {
+                return;
+            };
+            if !header.spec.video {
+                return;
+            }
             let Ok(media) = q0video::q0v::Q0vFile::parse(video.bytes.clone()) else {
                 return;
             };

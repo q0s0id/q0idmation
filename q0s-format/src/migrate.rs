@@ -68,6 +68,8 @@ pub fn migrate_v1_to_v2(v1: Q1Project) -> Result<ProjectV2, Error> {
         asset_names: std::collections::HashMap::new(),
         asset_appearances: std::collections::HashMap::new(),
         layer_metadata: std::collections::HashMap::new(),
+        audio_clips: Vec::new(),
+        runtime: Default::default(),
         q0rgs,
     };
     crate::v2::validate(&project)?;

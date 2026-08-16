@@ -21,12 +21,22 @@ fn native_options() -> eframe::NativeOptions {
 
 fn main() -> eframe::Result<()> {
     let initial_path = std::env::args_os().nth(1).map(std::path::PathBuf::from);
+    let external_open_inbox =
+        match q0editor::single_instance::claim_or_forward(initial_path.clone()) {
+            q0editor::single_instance::LaunchDisposition::Primary(primary) => Some(primary.start()),
+            q0editor::single_instance::LaunchDisposition::Forwarded => return Ok(()),
+            q0editor::single_instance::LaunchDisposition::Secondary => None,
+        };
+
     eframe::run_native(
         "q0editor",
         native_options(),
         Box::new(move |cc| {
             q0editor::theme::install(&cc.egui_ctx);
             let mut app = EditorApp::default();
+            if let Some(inbox) = external_open_inbox {
+                app.set_external_open_inbox(inbox);
+            }
             if let Some(path) = initial_path {
                 app.queue(Action::OpenProjectFromPath(path));
             }

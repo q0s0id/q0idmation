@@ -35,7 +35,10 @@ pub const Q0S_VERSION_RIGGING: u16 = 14;
 pub const Q0S_VERSION_RIG_PRO: u16 = 15;
 pub const Q0S_VERSION_RIG_DEFORMERS: u16 = 16;
 pub const Q0S_VERSION_RIG_POSE_VARIANTS: u16 = 17;
-pub const Q0S_VERSION_CURRENT: u16 = Q0S_VERSION_RIG_POSE_VARIANTS;
+pub const Q0S_VERSION_AUDIO_CLIP_FX: u16 = 18;
+pub const Q0S_VERSION_AUDIO_TIMELINE_CLIPS: u16 = 19;
+pub const Q0S_VERSION_PROJECT_RUNTIME: u16 = 20;
+pub const Q0S_VERSION_CURRENT: u16 = Q0S_VERSION_PROJECT_RUNTIME;
 
 /// Serialise a `ProjectV2` as the current vector `.q0s` bytes. Internally we
 /// reuse the current `.q1s` writer and patch the magic+version header in-place
@@ -93,6 +96,15 @@ pub fn parse_q0s_v2(bytes: &[u8]) -> Result<ProjectV2, Error> {
         Q0S_VERSION_RIG_DEFORMERS => {
             v2::parse_body_after_header(bytes, v2::Q1S_VERSION_RIG_DEFORMERS)
         }
+        Q0S_VERSION_RIG_POSE_VARIANTS => {
+            v2::parse_body_after_header(bytes, v2::Q1S_VERSION_RIG_POSE_VARIANTS)
+        }
+        Q0S_VERSION_AUDIO_CLIP_FX => {
+            v2::parse_body_after_header(bytes, v2::Q1S_VERSION_AUDIO_CLIP_FX)
+        }
+        Q0S_VERSION_AUDIO_TIMELINE_CLIPS => {
+            v2::parse_body_after_header(bytes, v2::Q1S_VERSION_AUDIO_TIMELINE_CLIPS)
+        }
         Q0S_VERSION_CURRENT => v2::parse_body_after_header(bytes, v2::Q1S_VERSION_CURRENT),
         _ => Err(Error::UnsupportedVersion(version)),
     }
@@ -124,6 +136,9 @@ pub fn is_q0s_v2(bytes: &[u8]) -> bool {
             | Q0S_VERSION_RIGGING
             | Q0S_VERSION_RIG_PRO
             | Q0S_VERSION_RIG_DEFORMERS
+            | Q0S_VERSION_RIG_POSE_VARIANTS
+            | Q0S_VERSION_AUDIO_CLIP_FX
+            | Q0S_VERSION_AUDIO_TIMELINE_CLIPS
             | Q0S_VERSION_CURRENT
     )
 }
@@ -152,6 +167,26 @@ mod tests {
             .expect("q0v writer");
         writer.write_video_frame(0, b"frame").expect("q0v frame");
         writer.finish().expect("finish q0v").into_inner()
+    }
+
+    fn test_audio_q0v_bytes() -> Vec<u8> {
+        const SAMPLE_FRAMES: usize = 4_800;
+        let spec = q0video::q0v::Q0vSpec {
+            width: 0,
+            height: 0,
+            fps: 48_000,
+            timeline_frames: SAMPLE_FRAMES as u32,
+            video: false,
+            audio: true,
+            audio_sample_rate: 48_000,
+            audio_channels: 2,
+        };
+        let mut writer = q0video::q0v::Q0vWriter::new(std::io::Cursor::new(Vec::new()), spec)
+            .expect("audio q0v writer");
+        writer
+            .write_audio_pcm_i16(&vec![0; SAMPLE_FRAMES * 2])
+            .expect("audio q0v pcm");
+        writer.finish().expect("finish audio q0v").into_inner()
     }
 
     fn small_project() -> ProjectV2 {
@@ -196,6 +231,8 @@ mod tests {
             asset_names: std::collections::HashMap::new(),
             asset_appearances: std::collections::HashMap::new(),
             layer_metadata: std::collections::HashMap::new(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
             q0rgs: vec![Q0rg {
                 q0rg_id: 1,
                 name: "Stage".to_string(),
@@ -263,6 +300,8 @@ mod tests {
                 offset_y: 3.0,
                 strength: 0.75,
             }),
+            audio_gain: 1.0,
+            audio_muted: false,
         };
         let bytes = write_q0s_v2(&project).expect("write placement fx q0s");
         assert_eq!(
@@ -273,6 +312,62 @@ mod tests {
             parse_q0s_v2(&bytes).expect("parse placement fx q0s"),
             project
         );
+    }
+
+    #[test]
+    fn current_q0s_roundtrip_preserves_audio_clip_gain_and_mute() {
+        let mut project = small_project();
+        project.q0rgs[0].layers[0].placements[0].fx.audio_gain = 0.625;
+        project.q0rgs[0].layers[0].placements[0].fx.audio_muted = true;
+        let bytes = write_q0s_v2(&project).expect("write audio clip q0s");
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            Q0S_VERSION_CURRENT
+        );
+        assert_eq!(parse_q0s_v2(&bytes).expect("parse audio clip q0s"), project);
+    }
+
+    #[test]
+    fn current_q0s_roundtrip_preserves_timeline_audio_clip() {
+        let mut project = small_project();
+        project.assets = vec![Asset::Q0v(v2::Q0vAsset {
+            asset_id: 77,
+            bytes: test_audio_q0v_bytes(),
+        })];
+        project.q0rgs[0].frame_count = 20;
+        project.q0rgs[0].layers[0].placements.clear();
+        project.q0rgs[0].layers[0].explicit_keyframes.clear();
+        project.audio_clips.push(v2::AudioClip {
+            q0rg_id: 1,
+            layer_id: 1,
+            start_frame: 4,
+            asset_id: 77,
+            gain: 0.625,
+            muted: true,
+        });
+
+        let bytes = write_q0s_v2(&project).expect("write timeline audio q0s");
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            Q0S_VERSION_CURRENT
+        );
+        let parsed = parse_q0s_v2(&bytes).expect("parse timeline audio q0s");
+        assert_eq!(parsed, project);
+        assert_eq!(parsed.audio_clips, project.audio_clips);
+    }
+
+    #[test]
+    fn q0s_v17_remains_readable_with_default_audio_clip_fx() {
+        let project = small_project();
+        let mut bytes = v2::write_version(&project, v2::Q1S_VERSION_RIG_POSE_VARIANTS)
+            .expect("write q1s v18 body");
+        bytes[0..4].copy_from_slice(&Q0S_V2_MAGIC);
+        bytes[4..6].copy_from_slice(&Q0S_VERSION_RIG_POSE_VARIANTS.to_le_bytes());
+        let parsed = parse_q0s_v2(&bytes).expect("parse q0s v17");
+        assert_eq!(parsed, project);
+        let fx = parsed.q0rgs[0].layers[0].placements[0].fx;
+        assert_eq!(fx.audio_gain, 1.0);
+        assert!(!fx.audio_muted);
     }
 
     #[test]
@@ -990,8 +1085,45 @@ mod tests {
         let bytes = write_q0s_v2(&project).expect("write phase h q0s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_RIG_POSE_VARIANTS
+            Q0S_VERSION_CURRENT
         );
         assert_eq!(parse_q0s_v2(&bytes).expect("parse phase h q0s"), project);
+    }
+
+    #[test]
+    fn current_q0s_roundtrip_preserves_project_runtime_metadata() {
+        let mut project = small_project();
+        project.q0rgs[0].layers[0].placements[0].instance_id = 77;
+        project
+            .runtime
+            .project_graph
+            .nodes
+            .push(v2::ProjectDependencyNode {
+                node_id: 1,
+                parent_node_id: None,
+                alias: "logic".into(),
+                kind: v2::ProjectDependencyKind::Q0lang,
+                source: v2::ProjectDependencySource::Embedded(b"gostop! 0\n".to_vec()),
+            });
+        project.runtime.frame_scripts.push(v2::FrameScript {
+            q0rg_id: 1,
+            layer_id: 1,
+            frame: 1,
+            source: "gorun! 2\n".into(),
+        });
+        project
+            .runtime
+            .instance_names
+            .insert(v2::InstanceKey::new(1, 77), "actor".into());
+
+        let bytes = write_q0s_v2(&project).expect("write project runtime q0s");
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            Q0S_VERSION_PROJECT_RUNTIME
+        );
+        assert_eq!(
+            parse_q0s_v2(&bytes).expect("parse project runtime q0s"),
+            project
+        );
     }
 }

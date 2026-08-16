@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use q0s_format::v2::{Layer, LayerKey, LayerMetadata, ProjectV2, RigChannel, Tween};
+use q0s_format::v2::{FrameScript, Layer, LayerKey, LayerMetadata, ProjectV2, RigChannel, Tween};
 
 use crate::state::{
     TimelineFrameClipboard, TimelineFrameClipboardRow, TimelineLayerClipboard,
@@ -245,10 +245,26 @@ pub fn capture_frames(
         );
         explicit_keyframes.sort_unstable();
         explicit_keyframes.dedup();
+        let frame_scripts = project
+            .runtime
+            .frame_scripts
+            .iter()
+            .filter(|script| {
+                script.q0rg_id == q0rg_id
+                    && script.layer_id == layer_id
+                    && (first_frame..=last_frame).contains(&script.frame)
+            })
+            .cloned()
+            .map(|mut script| {
+                script.frame -= first_frame;
+                script
+            })
+            .collect();
         rows.push(TimelineFrameClipboardRow {
             source_layer_id: layer_id,
             explicit_keyframes,
             placements,
+            frame_scripts,
         });
     }
 
@@ -295,6 +311,12 @@ pub fn clear_frames(
 ) -> Option<usize> {
     let (layer_ids, first_frame, last_frame) = selected_frame_bounds(project, q0rg_id, selection)?;
     let clear_rig = selection_spans_all_drawable_layers(project, q0rg_id, &layer_ids);
+    let selected_layers = layer_ids.iter().copied().collect::<HashSet<_>>();
+    project.runtime.frame_scripts.retain(|script| {
+        script.q0rg_id != q0rg_id
+            || !selected_layers.contains(&script.layer_id)
+            || !(first_frame..=last_frame).contains(&script.frame)
+    });
     let q0rg_index = q0rg_index(project, q0rg_id)?;
     let q0rg = &mut project.q0rgs[q0rg_index];
     let mut removed = 0;
@@ -440,11 +462,54 @@ pub fn remove_selected_frame_columns(
     }
     let width = last_frame - first_frame + 1;
 
+    // Audio clips are timeline entities, not placements. Removing global frame
+    // columns must therefore shift them explicitly. If the cut intersects a
+    // clip, remove the whole clip: AudioClip currently has no source-offset or
+    // crop fields, so keeping a remainder would silently restart the source.
+    let mut shifted_audio = Vec::with_capacity(project.audio_clips.len());
+    for mut clip in project.audio_clips.iter().copied() {
+        if clip.q0rg_id != q0rg_id {
+            shifted_audio.push(clip);
+            continue;
+        }
+        let Some(end_frame) = q0s_format::v2::audio_clip_end_frame(project, clip) else {
+            shifted_audio.push(clip);
+            continue;
+        };
+        if clip.start_frame <= last_frame && first_frame < end_frame {
+            continue;
+        }
+        if clip.start_frame > last_frame {
+            clip.start_frame -= width;
+        }
+        shifted_audio.push(clip);
+    }
+    project.audio_clips = shifted_audio;
+    let audio_at_zero_layers = project
+        .audio_clips
+        .iter()
+        .filter(|clip| clip.q0rg_id == q0rg_id && clip.start_frame == 0)
+        .map(|clip| clip.layer_id)
+        .collect::<HashSet<_>>();
+
     if first_frame == 0 && last_frame == old_count - 1 {
         clear_rig_frame_range(project, q0rg_id, 0, old_count - 1);
     } else {
         shift_rig_keys_after_removed_columns(project, q0rg_id, first_frame, last_frame, width);
     }
+
+    project.runtime.frame_scripts.retain_mut(|script| {
+        if script.q0rg_id != q0rg_id {
+            return true;
+        }
+        if (first_frame..=last_frame).contains(&script.frame) {
+            return false;
+        }
+        if script.frame > last_frame {
+            script.frame -= width;
+        }
+        true
+    });
 
     let q0rg = &mut project.q0rgs[q0rg_index];
     if first_frame == 0 && last_frame == old_count - 1 {
@@ -452,7 +517,9 @@ pub fn remove_selected_frame_columns(
         for layer in &mut q0rg.layers {
             layer.explicit_keyframes.clear();
             layer.placements.clear();
-            if drawable_layer_ids.contains(&layer.layer_id) {
+            if drawable_layer_ids.contains(&layer.layer_id)
+                && !audio_at_zero_layers.contains(&layer.layer_id)
+            {
                 layer.ensure_explicit_keyframe(0);
             }
         }
@@ -490,7 +557,10 @@ pub fn remove_selected_frame_columns(
         }
         layer.explicit_keyframes.sort_unstable();
         layer.explicit_keyframes.dedup();
-        if drawable_layer_ids.contains(&layer.layer_id) && !layer.has_keyframe(0) {
+        if drawable_layer_ids.contains(&layer.layer_id)
+            && !audio_at_zero_layers.contains(&layer.layer_id)
+            && !layer.has_keyframe(0)
+        {
             layer.ensure_explicit_keyframe(0);
         }
     }
@@ -508,6 +578,12 @@ fn remove_frames_for_move(
 ) -> Option<usize> {
     let (layer_ids, first_frame, last_frame) = selected_frame_bounds(project, q0rg_id, selection)?;
     let clear_rig = selection_spans_all_drawable_layers(project, q0rg_id, &layer_ids);
+    let selected_layers = layer_ids.iter().copied().collect::<HashSet<_>>();
+    project.runtime.frame_scripts.retain(|script| {
+        script.q0rg_id != q0rg_id
+            || !selected_layers.contains(&script.layer_id)
+            || !(first_frame..=last_frame).contains(&script.frame)
+    });
     let q0rg_index = q0rg_index(project, q0rg_id)?;
     let q0rg = &mut project.q0rgs[q0rg_index];
     let mut removed = 0;
@@ -641,6 +717,21 @@ pub fn paste_frames(
         }
         prepared_rows.push(prepared);
     }
+    let target_layer_set = target_layer_ids.iter().copied().collect::<HashSet<_>>();
+    project.runtime.frame_scripts.retain(|script| {
+        script.q0rg_id != q0rg_id
+            || !target_layer_set.contains(&script.layer_id)
+            || !(target_frame..=last_frame).contains(&script.frame)
+    });
+    let mut pasted_scripts = Vec::<FrameScript>::new();
+    for (layer_id, row) in target_layer_ids.iter().copied().zip(&clipboard.rows) {
+        pasted_scripts.extend(row.frame_scripts.iter().cloned().map(|mut script| {
+            script.q0rg_id = q0rg_id;
+            script.layer_id = layer_id;
+            script.frame = target_frame.saturating_add(script.frame);
+            script
+        }));
+    }
     {
         let q0rg = &mut project.q0rgs[q0rg_index];
         q0rg.frame_count = q0rg.frame_count.max(last_frame.saturating_add(1));
@@ -682,6 +773,11 @@ pub fn paste_frames(
         clipboard.width,
         &clipboard.rig_channels,
     );
+    project.runtime.frame_scripts.extend(pasted_scripts);
+    project
+        .runtime
+        .frame_scripts
+        .sort_by_key(|script| (script.q0rg_id, script.frame, script.layer_id));
 
     Some(TimelineSelection {
         anchor_layer_id: target_layer_ids[0],
@@ -793,7 +889,18 @@ pub fn capture_layers(
             (layer.layer_id, metadata)
         })
         .collect();
-    Some(TimelineLayerClipboard { layers, metadata })
+    let frame_scripts = project
+        .runtime
+        .frame_scripts
+        .iter()
+        .filter(|script| script.q0rg_id == q0rg_id && selected.contains(&script.layer_id))
+        .cloned()
+        .collect();
+    Some(TimelineLayerClipboard {
+        layers,
+        metadata,
+        frame_scripts,
+    })
 }
 
 pub fn remove_layers(
@@ -806,6 +913,10 @@ pub fn remove_layers(
         return None;
     }
     let removed = ids.iter().copied().collect::<HashSet<_>>();
+    project
+        .runtime
+        .frame_scripts
+        .retain(|script| script.q0rg_id != q0rg_id || !removed.contains(&script.layer_id));
     let q0rg_index = q0rg_index(project, q0rg_id)?;
     let removed_instance_ids = project.q0rgs[q0rg_index]
         .layers
@@ -963,6 +1074,19 @@ pub fn paste_layers(
             .frame_count
             .max(max_frame.saturating_add(1));
     }
+    for script in &clipboard.frame_scripts {
+        let Some(layer_id) = id_map.get(&script.layer_id).copied() else {
+            continue;
+        };
+        let mut script = script.clone();
+        script.q0rg_id = q0rg_id;
+        script.layer_id = layer_id;
+        project.runtime.frame_scripts.push(script);
+    }
+    project
+        .runtime
+        .frame_scripts
+        .sort_by_key(|script| (script.q0rg_id, script.frame, script.layer_id));
 
     Some(TimelineLayerSelection {
         anchor_layer_id: pasted_ui_top,
@@ -1794,5 +1918,121 @@ mod tests {
                 .instance_id,
             91
         );
+    }
+
+    #[test]
+    fn frame_scripts_follow_copy_move_and_removed_frame_columns() {
+        let mut project = crate::state::default_project();
+        project.q0rgs[0].frame_count = 10;
+        project.runtime.frame_scripts = vec![
+            FrameScript {
+                q0rg_id: 1,
+                layer_id: 1,
+                frame: 2,
+                source: "a = 1".into(),
+            },
+            FrameScript {
+                q0rg_id: 1,
+                layer_id: 1,
+                frame: 7,
+                source: "b = 2".into(),
+            },
+        ];
+
+        let clipboard = capture_frames(&project, 1, TimelineSelection::single(1, 2))
+            .expect("capture scripted frame");
+        assert_eq!(clipboard.rows[0].frame_scripts.len(), 1);
+        assert_eq!(clipboard.rows[0].frame_scripts[0].frame, 0);
+        paste_frames(&mut project, 1, 1, 4, &clipboard).expect("paste scripted frame");
+        assert!(project.runtime.frame_scripts.iter().any(|script| {
+            script.q0rg_id == 1
+                && script.layer_id == 1
+                && script.frame == 4
+                && script.source == "a = 1"
+        }));
+
+        move_frames(&mut project, 1, TimelineSelection::single(1, 4), 1, 5)
+            .expect("move scripted frame");
+        assert!(!project
+            .runtime
+            .frame_scripts
+            .iter()
+            .any(|script| script.q0rg_id == 1 && script.layer_id == 1 && script.frame == 4));
+        assert!(project.runtime.frame_scripts.iter().any(|script| {
+            script.q0rg_id == 1
+                && script.layer_id == 1
+                && script.frame == 5
+                && script.source == "a = 1"
+        }));
+
+        remove_selected_frame_columns(
+            &mut project,
+            1,
+            TimelineSelection {
+                anchor_layer_id: 1,
+                anchor_frame: 1,
+                focus_layer_id: 1,
+                focus_frame: 2,
+            },
+        )
+        .expect("remove columns");
+        assert!(!project
+            .runtime
+            .frame_scripts
+            .iter()
+            .any(|script| script.q0rg_id == 1 && script.frame == 2));
+        assert!(project.runtime.frame_scripts.iter().any(|script| {
+            script.q0rg_id == 1
+                && script.layer_id == 1
+                && script.frame == 3
+                && script.source == "a = 1"
+        }));
+        assert!(project.runtime.frame_scripts.iter().any(|script| {
+            script.q0rg_id == 1
+                && script.layer_id == 1
+                && script.frame == 5
+                && script.source == "b = 2"
+        }));
+    }
+
+    #[test]
+    fn layer_copy_preserves_frame_scripts_and_remaps_layer_identity() {
+        let mut project = crate::state::default_project();
+        project.q0rgs[0].frame_count = 6;
+        project.runtime.frame_scripts.push(FrameScript {
+            q0rg_id: 1,
+            layer_id: 1,
+            frame: 3,
+            source: "pr \"copied\"".into(),
+        });
+
+        let clipboard = capture_layers(&project, 1, TimelineLayerSelection::single(1))
+            .expect("capture scripted layer");
+        assert_eq!(clipboard.frame_scripts.len(), 1);
+        let pasted = paste_layers(&mut project, 1, 1, &clipboard).expect("paste scripted layer");
+        assert_ne!(pasted.anchor_layer_id, 1);
+        assert!(project.runtime.frame_scripts.iter().any(|script| {
+            script.q0rg_id == 1
+                && script.layer_id == pasted.anchor_layer_id
+                && script.frame == 3
+                && script.source == "pr \"copied\""
+        }));
+
+        remove_layers(
+            &mut project,
+            1,
+            TimelineLayerSelection::single(pasted.anchor_layer_id),
+        )
+        .expect("remove copied layer");
+        assert!(!project
+            .runtime
+            .frame_scripts
+            .iter()
+            .any(|script| script.layer_id == pasted.anchor_layer_id));
+        assert!(project
+            .runtime
+            .frame_scripts
+            .iter()
+            .any(|script| script.layer_id == 1 && script.frame == 3));
     }
 }

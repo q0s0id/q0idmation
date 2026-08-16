@@ -3,7 +3,7 @@ use egui::{Context, RichText};
 use crate::app::{Action, EditorApp};
 
 pub fn render(app: &mut EditorApp, ctx: &Context) {
-    let summaries = app.project_tab_summaries();
+    let summaries = app.document_tab_summaries();
     let mut switch_to = None;
     let mut close = None;
     let mut show_home = false;
@@ -71,10 +71,10 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
         app.queue(Action::ShowHome);
     }
     if let Some(tab_id) = switch_to {
-        app.queue(Action::SwitchProjectTab(tab_id));
+        app.queue(Action::SwitchDocumentTab(tab_id));
     }
     if let Some(tab_id) = close {
-        app.queue(Action::CloseProjectTab(tab_id));
+        app.queue(Action::CloseDocumentTab(tab_id));
     }
     if create {
         app.queue(Action::NewProject);

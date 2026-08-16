@@ -4,19 +4,23 @@ use std::time::{Duration, Instant};
 
 use eframe::App;
 use egui::Context;
+use q0s_format::q0lang::runtime::{RuntimeAction, RuntimeDiagnostic, TimelineTarget};
 use q0s_format::transform::Affine;
 use q0s_format::v2::{
-    Anchor, Asset, Layer, LayerKey, LayerKind, LayerMetadata, Path as VPath, Placement, ProjectV2,
-    Q0rg, Q0vAsset, Target, Transform2D, Tween, Vec2, VectorAsset,
+    Anchor, Asset, AudioClip, Layer, LayerKey, LayerKind, LayerMetadata, Path as VPath, Placement,
+    ProjectDependencyKind, ProjectDependencyNode, ProjectDependencySource, ProjectV2, Q0rg,
+    Q0vAsset, Target, Transform2D, Tween, Vec2, VectorAsset,
 };
 
 use crate::file_io;
 use crate::panels;
 use crate::render::TextureCache;
 use crate::state::{
-    default_project, History, LibraryItem, PathRef, PlacementRef, ProjectState, Selection, Session,
-    TimelineClipboard, TimelineSelection, Tool, ToolState,
+    default_project, FrameScriptEditor, History, LibraryItem, PathRef, PlacementRef, ProjectState,
+    Selection, Session, TimelineClipboard, TimelineSelection, Tool, ToolState,
 };
+
+const MAX_PREVIEW_FRAME_SCRIPT_TRANSITIONS: usize = 64;
 
 pub struct EditorApp {
     pub state: ProjectState,
@@ -42,12 +46,15 @@ pub struct EditorApp {
     pending_asset_delete: Option<(u16, usize)>,
     pending_q0rg_delete: Option<(u16, usize)>,
     pending_layer_delete: Option<(u16, u16, usize, usize)>,
-    pending_frame_truncate: Option<(u16, u16, usize, usize)>,
+    pending_frame_truncate: Option<(u16, u16, usize, usize, usize, usize)>,
     media_import_job: Option<MediaImportJob>,
-    project_tabs: Vec<ProjectTab>,
-    active_project_tab: Option<u64>,
-    last_project_tab: Option<u64>,
-    next_project_tab_id: u64,
+    audio_playback: Option<crate::audio::EditorAudioPlayback>,
+    external_open_inbox: Option<crate::single_instance::ExternalOpenInbox>,
+    show_project_tree: bool,
+    document_tabs: Vec<DocumentTab>,
+    active_document_tab: Option<u64>,
+    last_document_tab: Option<u64>,
+    next_document_tab_id: u64,
     show_home: bool,
     project_active: bool,
     new_project_dialog: Option<NewProjectSpec>,
@@ -68,22 +75,46 @@ struct ProjectWorkspace {
     pending_asset_delete: Option<(u16, usize)>,
     pending_q0rg_delete: Option<(u16, usize)>,
     pending_layer_delete: Option<(u16, u16, usize, usize)>,
-    pending_frame_truncate: Option<(u16, u16, usize, usize)>,
+    pending_frame_truncate: Option<(u16, u16, usize, usize, usize, usize)>,
     media_import_job: Option<MediaImportJob>,
 }
 
-struct ProjectTab {
+pub(crate) struct Q0langDocument {
+    pub(crate) path: PathBuf,
+    pub(crate) text: String,
+    pub(crate) dirty: bool,
+    pub(crate) search: String,
+    pub(crate) replace: String,
+    pub(crate) show_find: bool,
+    pub(crate) show_replace: bool,
+}
+
+enum DocumentKind {
+    Project {
+        workspace: Option<Box<ProjectWorkspace>>,
+    },
+    Q0lang(Q0langDocument),
+}
+
+struct DocumentTab {
     id: u64,
-    workspace: Option<ProjectWorkspace>,
+    kind: DocumentKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentKindSummary {
+    Project,
+    Q0lang,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectTabSummary {
+pub struct DocumentTabSummary {
     pub id: u64,
     pub title: String,
     pub path: Option<PathBuf>,
     pub dirty: bool,
     pub active: bool,
+    pub kind: DocumentKindSummary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,8 +160,8 @@ pub enum Action {
     ShowHome,
     ResumeProject,
     CycleDocumentTab(i8),
-    SwitchProjectTab(u64),
-    CloseProjectTab(u64),
+    SwitchDocumentTab(u64),
+    CloseDocumentTab(u64),
     OpenProject,
     OpenProjectFromPath(PathBuf),
     ImportBitmap,
@@ -181,6 +212,7 @@ pub enum Action {
     ExitQ0rg,
     ToggleCredits,
     ToggleSettings,
+    ToggleProjectTree,
     ZoomIn,
     ZoomOut,
     ZoomReset,
@@ -197,6 +229,15 @@ pub enum Action {
     /// currently-selected one when `None`.
     OpenQ0langEditor(Option<u16>),
     CloseQ0langEditor,
+    OpenFrameScriptEditor(u16, u16, u16),
+    DeleteFrameScript(u16, u16, u16),
+    AddProjectDependency(PathBuf, Option<u16>),
+    RenameProjectDependency(u16, String),
+    ReparentProjectDependency(u16, Option<u16>),
+    RemoveProjectDependency(u16),
+    RelinkProjectDependency(u16, PathBuf),
+    EmbedProjectDependency(u16),
+    OpenProjectDependency(u16),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -396,10 +437,13 @@ impl Default for EditorApp {
             pending_layer_delete: None,
             pending_frame_truncate: None,
             media_import_job: None,
-            project_tabs: Vec::new(),
-            active_project_tab: None,
-            last_project_tab: None,
-            next_project_tab_id: 1,
+            audio_playback: None,
+            external_open_inbox: None,
+            show_project_tree: false,
+            document_tabs: Vec::new(),
+            active_document_tab: None,
+            last_document_tab: None,
+            next_document_tab_id: 1,
             show_home: true,
             project_active: false,
             new_project_dialog: None,
@@ -413,6 +457,31 @@ impl EditorApp {
         self.pending.push(action);
     }
 
+    pub fn set_external_open_inbox(&mut self, inbox: crate::single_instance::ExternalOpenInbox) {
+        self.external_open_inbox = Some(inbox);
+    }
+
+    fn poll_external_open_requests(&mut self, ctx: &Context) {
+        let Some(inbox) = self.external_open_inbox.clone() else {
+            return;
+        };
+        inbox.attach_context(ctx);
+        let requests = inbox.drain();
+        if requests.is_empty() {
+            return;
+        }
+
+        // A file association launch should feel like opening another tab in
+        // the already-running editor, including when that window is minimized.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        for request in requests {
+            if let Some(path) = request.path {
+                self.handle(ctx, Action::OpenProjectFromPath(path));
+            }
+        }
+    }
+
     pub fn home_visible(&self) -> bool {
         self.show_home
     }
@@ -421,37 +490,102 @@ impl EditorApp {
         self.project_active
     }
 
-    pub fn has_open_projects(&self) -> bool {
-        !self.project_tabs.is_empty()
+    pub fn project_tree_open(&self) -> bool {
+        self.show_project_tree
     }
 
-    pub fn project_tab_summaries(&self) -> Vec<ProjectTabSummary> {
-        self.project_tabs
+    pub fn has_active_document(&self) -> bool {
+        !self.show_home && self.active_document_tab.is_some()
+    }
+
+    pub fn active_document_is_q0lang(&self) -> bool {
+        let Some(active_id) = self.active_document_tab else {
+            return false;
+        };
+        self.document_tabs
+            .iter()
+            .any(|tab| tab.id == active_id && matches!(tab.kind, DocumentKind::Q0lang(_)))
+    }
+
+    pub fn has_open_projects(&self) -> bool {
+        self.document_tabs
+            .iter()
+            .any(|tab| matches!(tab.kind, DocumentKind::Project { .. }))
+    }
+
+    pub fn document_tab_summaries(&self) -> Vec<DocumentTabSummary> {
+        self.document_tabs
             .iter()
             .filter_map(|tab| {
-                let (title, path, dirty) = if self.active_project_tab == Some(tab.id) {
-                    (
-                        self.state.project.meta.name.clone(),
-                        self.state.file_path.clone(),
-                        self.state.dirty,
-                    )
-                } else {
-                    let workspace = tab.workspace.as_ref()?;
-                    (
-                        workspace.state.project.meta.name.clone(),
-                        workspace.state.file_path.clone(),
-                        workspace.state.dirty,
-                    )
-                };
-                Some(ProjectTabSummary {
-                    id: tab.id,
-                    title: project_tab_title(&title, path.as_deref()),
-                    path,
-                    dirty,
-                    active: self.active_project_tab == Some(tab.id),
-                })
+                let active = self.active_document_tab == Some(tab.id);
+                match &tab.kind {
+                    DocumentKind::Project { workspace } => {
+                        let (title, path, dirty) = if active && self.project_active {
+                            (
+                                project_tab_title(
+                                    &self.state.project.meta.name,
+                                    self.state.file_path.as_deref(),
+                                ),
+                                self.state.file_path.clone(),
+                                self.state.dirty,
+                            )
+                        } else {
+                            let workspace = workspace.as_ref()?;
+                            (
+                                project_tab_title(
+                                    &workspace.state.project.meta.name,
+                                    workspace.state.file_path.as_deref(),
+                                ),
+                                workspace.state.file_path.clone(),
+                                workspace.state.dirty,
+                            )
+                        };
+                        Some(DocumentTabSummary {
+                            id: tab.id,
+                            title,
+                            path,
+                            dirty,
+                            active,
+                            kind: DocumentKindSummary::Project,
+                        })
+                    }
+                    DocumentKind::Q0lang(document) => Some(DocumentTabSummary {
+                        id: tab.id,
+                        title: document
+                            .path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("script.q0l")
+                            .to_string(),
+                        path: Some(document.path.clone()),
+                        dirty: document.dirty,
+                        active,
+                        kind: DocumentKindSummary::Q0lang,
+                    }),
+                }
             })
             .collect()
+    }
+
+    pub(crate) fn active_q0lang_document_mut(&mut self) -> Option<&mut Q0langDocument> {
+        let active_id = self.active_document_tab?;
+        let tab = self
+            .document_tabs
+            .iter_mut()
+            .find(|tab| tab.id == active_id)?;
+        match &mut tab.kind {
+            DocumentKind::Q0lang(document) => Some(document),
+            DocumentKind::Project { .. } => None,
+        }
+    }
+
+    pub(crate) fn active_q0lang_document(&self) -> Option<&Q0langDocument> {
+        let active_id = self.active_document_tab?;
+        let tab = self.document_tabs.iter().find(|tab| tab.id == active_id)?;
+        match &tab.kind {
+            DocumentKind::Q0lang(document) => Some(document),
+            DocumentKind::Project { .. } => None,
+        }
     }
 
     fn workspace_for_project(
@@ -525,24 +659,40 @@ impl EditorApp {
     }
 
     fn active_workspace_busy(&self) -> bool {
-        self.media_import_job.is_some()
-            || self.q0enc.has_active_job()
-            || self.unsaved_action.is_some()
+        self.project_active
+            && (self.media_import_job.is_some()
+                || self.q0enc.has_active_job()
+                || self.unsaved_action.is_some())
     }
 
     fn store_active_workspace(&mut self) {
-        let Some(active_id) = self.active_project_tab else {
+        if !self.project_active {
+            return;
+        }
+        let Some(active_id) = self.active_document_tab else {
             return;
         };
         let workspace = self.take_active_workspace();
-        if let Some(tab) = self.project_tabs.iter_mut().find(|tab| tab.id == active_id) {
-            tab.workspace = Some(workspace);
+        if let Some(tab) = self
+            .document_tabs
+            .iter_mut()
+            .find(|tab| tab.id == active_id)
+        {
+            if let DocumentKind::Project { workspace: slot } = &mut tab.kind {
+                *slot = Some(Box::new(workspace));
+            }
         }
-        self.active_project_tab = None;
         self.project_active = false;
     }
 
+    fn deactivate_active_document(&mut self) {
+        if self.project_active {
+            self.store_active_workspace();
+        }
+    }
+
     fn switch_to_home(&mut self) -> bool {
+        self.stop_audio_playback();
         if self.show_home {
             return true;
         }
@@ -551,8 +701,9 @@ impl EditorApp {
                 "finish or cancel the active import/export before switching tabs".to_string();
             return false;
         }
-        self.last_project_tab = self.active_project_tab;
-        self.store_active_workspace();
+        self.last_document_tab = self.active_document_tab;
+        self.deactivate_active_document();
+        self.active_document_tab = None;
         self.show_home = true;
         self.session.playing = false;
         self.session.status = "home".to_string();
@@ -560,9 +711,9 @@ impl EditorApp {
     }
 
     fn cycle_document_tab(&mut self, direction: i8) {
-        let mut documents = Vec::with_capacity(self.project_tabs.len() + 1);
+        let mut documents = Vec::with_capacity(self.document_tabs.len() + 1);
         documents.push(None);
-        documents.extend(self.project_tabs.iter().map(|tab| Some(tab.id)));
+        documents.extend(self.document_tabs.iter().map(|tab| Some(tab.id)));
         if documents.len() <= 1 {
             return;
         }
@@ -571,7 +722,7 @@ impl EditorApp {
         } else {
             documents
                 .iter()
-                .position(|tab| *tab == self.active_project_tab)
+                .position(|tab| *tab == self.active_document_tab)
                 .unwrap_or(0)
         };
         let next = if direction < 0 {
@@ -581,7 +732,7 @@ impl EditorApp {
         };
         match documents[next] {
             Some(tab_id) => {
-                self.switch_to_project_tab(tab_id);
+                self.switch_to_document_tab(tab_id);
             }
             None => {
                 self.switch_to_home();
@@ -589,13 +740,12 @@ impl EditorApp {
         }
     }
 
-    fn switch_to_project_tab(&mut self, tab_id: u64) -> bool {
-        if self.active_project_tab == Some(tab_id) {
-            self.show_home = false;
-            self.project_active = true;
+    fn switch_to_document_tab(&mut self, tab_id: u64) -> bool {
+        self.stop_audio_playback();
+        if self.active_document_tab == Some(tab_id) && !self.show_home {
             return true;
         }
-        let Some(target_index) = self.project_tabs.iter().position(|tab| tab.id == tab_id) else {
+        let Some(target_index) = self.document_tabs.iter().position(|tab| tab.id == tab_id) else {
             return false;
         };
         if self.active_workspace_busy() {
@@ -603,16 +753,29 @@ impl EditorApp {
                 "finish or cancel the active import/export before switching tabs".to_string();
             return false;
         }
-        if self.active_project_tab.is_some() {
-            self.store_active_workspace();
+        self.deactivate_active_document();
+
+        let is_project = matches!(
+            self.document_tabs[target_index].kind,
+            DocumentKind::Project { .. }
+        );
+        if is_project {
+            let workspace = match &mut self.document_tabs[target_index].kind {
+                DocumentKind::Project { workspace } => workspace.take(),
+                DocumentKind::Q0lang(_) => None,
+            };
+            let Some(workspace) = workspace else {
+                return false;
+            };
+            self.install_workspace(*workspace);
+            self.project_active = true;
+        } else {
+            self.project_active = false;
+            self.session.playing = false;
+            self.session.status = "q0lang source".to_string();
         }
-        let Some(workspace) = self.project_tabs[target_index].workspace.take() else {
-            return false;
-        };
-        self.install_workspace(workspace);
-        self.active_project_tab = Some(tab_id);
-        self.last_project_tab = Some(tab_id);
-        self.project_active = true;
+        self.active_document_tab = Some(tab_id);
+        self.last_document_tab = Some(tab_id);
         self.show_home = false;
         true
     }
@@ -624,25 +787,62 @@ impl EditorApp {
                     .to_string();
             return false;
         }
-        if self.active_project_tab.is_some() {
-            self.store_active_workspace();
-        }
-        let tab_id = self.next_project_tab_id;
-        self.next_project_tab_id = self.next_project_tab_id.saturating_add(1);
-        self.project_tabs.push(ProjectTab {
+        self.deactivate_active_document();
+        let tab_id = self.next_document_tab_id;
+        self.next_document_tab_id = self.next_document_tab_id.saturating_add(1);
+        self.document_tabs.push(DocumentTab {
             id: tab_id,
-            workspace: None,
+            kind: DocumentKind::Project { workspace: None },
         });
         self.install_workspace(workspace);
-        self.active_project_tab = Some(tab_id);
-        self.last_project_tab = Some(tab_id);
+        self.active_document_tab = Some(tab_id);
+        self.last_document_tab = Some(tab_id);
         self.project_active = true;
         self.show_home = false;
         true
     }
 
-    fn close_project_tab(&mut self, tab_id: u64) {
-        if self.active_project_tab != Some(tab_id) && !self.switch_to_project_tab(tab_id) {
+    fn activate_q0lang_document(&mut self, document: Q0langDocument) -> bool {
+        if self.active_workspace_busy() {
+            self.session.status =
+                "finish or cancel the active import/export before opening another document"
+                    .to_string();
+            return false;
+        }
+        self.deactivate_active_document();
+        let tab_id = self.next_document_tab_id;
+        self.next_document_tab_id = self.next_document_tab_id.saturating_add(1);
+        self.document_tabs.push(DocumentTab {
+            id: tab_id,
+            kind: DocumentKind::Q0lang(document),
+        });
+        self.active_document_tab = Some(tab_id);
+        self.last_document_tab = Some(tab_id);
+        self.project_active = false;
+        self.show_home = false;
+        true
+    }
+
+    fn document_tab_dirty(&self, tab_id: u64) -> bool {
+        let Some(tab) = self.document_tabs.iter().find(|tab| tab.id == tab_id) else {
+            return false;
+        };
+        match &tab.kind {
+            DocumentKind::Project { workspace } => {
+                if self.active_document_tab == Some(tab_id) && self.project_active {
+                    self.state.dirty
+                } else {
+                    workspace
+                        .as_ref()
+                        .is_some_and(|workspace| workspace.state.dirty)
+                }
+            }
+            DocumentKind::Q0lang(document) => document.dirty,
+        }
+    }
+
+    fn close_document_tab(&mut self, tab_id: u64) {
+        if self.active_document_tab != Some(tab_id) && !self.switch_to_document_tab(tab_id) {
             return;
         }
         if self.active_workspace_busy() {
@@ -650,72 +850,78 @@ impl EditorApp {
                 "finish or cancel the active import/export before closing this tab".to_string();
             return;
         }
-        if self.state.dirty {
-            self.unsaved_action = Some(Action::CloseProjectTab(tab_id));
+        if self.document_tab_dirty(tab_id) {
+            self.unsaved_action = Some(Action::CloseDocumentTab(tab_id));
             return;
         }
-        let Some(index) = self.project_tabs.iter().position(|tab| tab.id == tab_id) else {
+        let Some(index) = self.document_tabs.iter().position(|tab| tab.id == tab_id) else {
             return;
         };
-        self.project_tabs.remove(index);
-        let _discarded = self.take_active_workspace();
-        self.active_project_tab = None;
-        self.project_active = false;
+        if self.project_active {
+            let _discarded = self.take_active_workspace();
+            self.project_active = false;
+        }
+        self.document_tabs.remove(index);
+        self.active_document_tab = None;
         let replacement = self
-            .project_tabs
+            .document_tabs
             .get(index)
-            .or_else(|| index.checked_sub(1).and_then(|i| self.project_tabs.get(i)))
+            .or_else(|| index.checked_sub(1).and_then(|i| self.document_tabs.get(i)))
             .map(|tab| tab.id);
         if let Some(replacement) = replacement {
-            self.switch_to_project_tab(replacement);
+            self.switch_to_document_tab(replacement);
         } else {
             self.show_home = true;
-            self.last_project_tab = None;
+            self.last_document_tab = None;
             self.session.status = "home".to_string();
         }
     }
 
-    fn first_dirty_project_tab(&self) -> Option<u64> {
-        self.project_tabs.iter().find_map(|tab| {
-            let dirty = if self.active_project_tab == Some(tab.id) {
-                self.state.dirty
-            } else {
-                tab.workspace
-                    .as_ref()
-                    .is_some_and(|workspace| workspace.state.dirty)
-            };
-            dirty.then_some(tab.id)
-        })
+    fn first_dirty_document_tab(&self) -> Option<u64> {
+        self.document_tabs
+            .iter()
+            .find_map(|tab| self.document_tab_dirty(tab.id).then_some(tab.id))
     }
 
-    fn has_dirty_projects(&self) -> bool {
-        self.first_dirty_project_tab().is_some()
+    fn has_dirty_documents(&self) -> bool {
+        self.first_dirty_document_tab().is_some()
     }
 
-    fn find_project_tab_by_path(&self, path: &std::path::Path) -> Option<u64> {
+    fn document_tab_path(&self, tab: &DocumentTab) -> Option<PathBuf> {
+        match &tab.kind {
+            DocumentKind::Project { workspace } => {
+                if self.active_document_tab == Some(tab.id) && self.project_active {
+                    self.state.file_path.clone()
+                } else {
+                    workspace
+                        .as_ref()
+                        .and_then(|workspace| workspace.state.file_path.clone())
+                }
+            }
+            DocumentKind::Q0lang(document) => Some(document.path.clone()),
+        }
+    }
+
+    fn find_document_tab_by_path(&self, path: &std::path::Path) -> Option<u64> {
         let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        self.project_tabs.iter().find_map(|tab| {
-            let candidate = if self.active_project_tab == Some(tab.id) {
-                self.state.file_path.as_ref()
-            } else {
-                tab.workspace
-                    .as_ref()
-                    .and_then(|workspace| workspace.state.file_path.as_ref())
-            }?;
+        self.document_tabs.iter().find_map(|tab| {
+            let candidate = self.document_tab_path(tab)?;
             let candidate =
-                std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_path_buf());
+                std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.to_path_buf());
             (candidate == canonical).then_some(tab.id)
         })
     }
 
     fn another_project_tab_uses_path(&self, path: &std::path::Path) -> bool {
         let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        self.project_tabs.iter().any(|tab| {
-            if self.active_project_tab == Some(tab.id) {
+        self.document_tabs.iter().any(|tab| {
+            if self.active_document_tab == Some(tab.id) {
                 return false;
             }
-            let Some(candidate) = tab
-                .workspace
+            let DocumentKind::Project { workspace } = &tab.kind else {
+                return false;
+            };
+            let Some(candidate) = workspace
                 .as_ref()
                 .and_then(|workspace| workspace.state.file_path.as_ref())
             else {
@@ -725,6 +931,568 @@ impl EditorApp {
                 std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_path_buf());
             candidate == canonical
         })
+    }
+
+    fn another_document_tab_uses_path(&self, path: &std::path::Path) -> bool {
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.document_tabs.iter().any(|tab| {
+            if self.active_document_tab == Some(tab.id) {
+                return false;
+            }
+            let Some(candidate) = self.document_tab_path(tab) else {
+                return false;
+            };
+            let candidate =
+                std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.to_path_buf());
+            candidate == canonical
+        })
+    }
+
+    pub(crate) fn resolve_project_dependency_path(&self, node_id: u16) -> Option<PathBuf> {
+        let node = self
+            .state
+            .project
+            .runtime
+            .project_graph
+            .nodes
+            .iter()
+            .find(|node| node.node_id == node_id)?;
+        let ProjectDependencySource::External(path) = &node.source else {
+            return None;
+        };
+        let path = PathBuf::from(path);
+        if path.is_absolute() {
+            Some(path)
+        } else {
+            self.state
+                .file_path
+                .as_deref()
+                .and_then(std::path::Path::parent)
+                .map(|base| base.join(path))
+        }
+    }
+
+    fn relative_path_between(base: &std::path::Path, target: &std::path::Path) -> Option<PathBuf> {
+        use std::path::Component;
+
+        let base = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+        let target = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+        let base_components = base.components().collect::<Vec<_>>();
+        let target_components = target.components().collect::<Vec<_>>();
+
+        let base_prefix = base_components
+            .iter()
+            .find_map(|component| match component {
+                Component::Prefix(prefix) => Some(prefix.as_os_str()),
+                _ => None,
+            });
+        let target_prefix = target_components
+            .iter()
+            .find_map(|component| match component {
+                Component::Prefix(prefix) => Some(prefix.as_os_str()),
+                _ => None,
+            });
+        if base_prefix != target_prefix || base.has_root() != target.has_root() {
+            return None;
+        }
+
+        let mut common = 0usize;
+        while common < base_components.len()
+            && common < target_components.len()
+            && base_components[common] == target_components[common]
+        {
+            common += 1;
+        }
+        let mut relative = PathBuf::new();
+        for component in &base_components[common..] {
+            if matches!(component, Component::Normal(_)) {
+                relative.push("..");
+            }
+        }
+        for component in &target_components[common..] {
+            match component {
+                Component::Normal(value) => relative.push(value),
+                Component::ParentDir => relative.push(".."),
+                Component::CurDir => {}
+                Component::RootDir | Component::Prefix(_) => return None,
+            }
+        }
+        Some(if relative.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            relative
+        })
+    }
+
+    fn rebase_project_dependencies_for_save(
+        &self,
+        project: &mut ProjectV2,
+        destination: &std::path::Path,
+    ) {
+        let old_base = self
+            .state
+            .file_path
+            .as_deref()
+            .and_then(std::path::Path::parent)
+            .map(std::path::Path::to_path_buf);
+        let Some(new_base) = destination.parent() else {
+            return;
+        };
+        for node in &mut project.runtime.project_graph.nodes {
+            let ProjectDependencySource::External(stored) = &node.source else {
+                continue;
+            };
+            let stored_path = PathBuf::from(stored);
+            let absolute = if stored_path.is_absolute() {
+                stored_path
+            } else if let Some(old_base) = old_base.as_deref() {
+                old_base.join(stored_path)
+            } else {
+                stored_path
+            };
+            let absolute = std::fs::canonicalize(&absolute).unwrap_or(absolute);
+            let rebased = Self::relative_path_between(new_base, &absolute)
+                .unwrap_or_else(|| absolute.clone());
+            node.source =
+                ProjectDependencySource::External(rebased.to_string_lossy().replace('\\', "/"));
+        }
+    }
+
+    fn project_dependency_storage_path(&self, path: &std::path::Path) -> String {
+        let normalized = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if let Some(base) = self
+            .state
+            .file_path
+            .as_deref()
+            .and_then(std::path::Path::parent)
+        {
+            if let Some(relative) = Self::relative_path_between(base, &normalized) {
+                return relative.to_string_lossy().replace('\\', "/");
+            }
+        }
+        normalized.to_string_lossy().to_string()
+    }
+
+    fn project_dependency_kind(path: &std::path::Path) -> Option<ProjectDependencyKind> {
+        match path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("q0s") => Some(ProjectDependencyKind::Movie),
+            Some("q0l" | "q0lang") => Some(ProjectDependencyKind::Q0lang),
+            _ => None,
+        }
+    }
+
+    fn project_dependency_alias_base(path: &std::path::Path) -> String {
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("dependency");
+        let mut alias = String::new();
+        for (index, ch) in stem.chars().enumerate() {
+            let valid = if index == 0 {
+                ch.is_ascii_alphabetic() || ch == '_'
+            } else {
+                ch.is_ascii_alphanumeric() || ch == '_'
+            };
+            if valid {
+                alias.push(ch);
+            } else if index == 0 && ch.is_ascii_digit() {
+                alias.push('_');
+                alias.push(ch);
+            } else {
+                alias.push('_');
+            }
+        }
+        if alias.is_empty() {
+            "dependency".to_string()
+        } else {
+            alias
+        }
+    }
+
+    fn project_dependency_alias_valid(alias: &str) -> bool {
+        let mut chars = alias.chars();
+        matches!(chars.next(), Some(ch) if ch.is_ascii_alphabetic() || ch == '_')
+            && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    }
+
+    fn unique_project_dependency_alias(&self, parent: Option<u16>, base: &str) -> String {
+        let used = self
+            .state
+            .project
+            .runtime
+            .project_graph
+            .nodes
+            .iter()
+            .filter(|node| node.parent_node_id == parent)
+            .map(|node| node.alias.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        if !used.contains(base) {
+            return base.to_string();
+        }
+        for suffix in 2_u32.. {
+            let candidate = format!("{base}_{suffix}");
+            if !used.contains(candidate.as_str()) {
+                return candidate;
+            }
+        }
+        unreachable!()
+    }
+
+    fn project_dependency_reparent_would_cycle(&self, node_id: u16, parent: Option<u16>) -> bool {
+        let Some(mut cursor) = parent else {
+            return false;
+        };
+        let nodes = &self.state.project.runtime.project_graph.nodes;
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            if cursor == node_id || !seen.insert(cursor) {
+                return true;
+            }
+            let Some(node) = nodes.iter().find(|node| node.node_id == cursor) else {
+                return false;
+            };
+            let Some(parent) = node.parent_node_id else {
+                return false;
+            };
+            cursor = parent;
+        }
+    }
+
+    fn add_project_dependency(&mut self, path: &std::path::Path, parent: Option<u16>) {
+        let Some(kind) = Self::project_dependency_kind(path) else {
+            self.session.status = "project tree accepts .q0s, .q0l and .q0lang".to_string();
+            return;
+        };
+        if !path.is_file() {
+            self.session.status = format!("dependency does not exist: {}", path.display());
+            return;
+        }
+        if parent.is_some_and(|parent| {
+            !self
+                .state
+                .project
+                .runtime
+                .project_graph
+                .nodes
+                .iter()
+                .any(|node| node.node_id == parent)
+        }) {
+            self.session.status = "dependency parent no longer exists".to_string();
+            return;
+        }
+        let node_id = self
+            .state
+            .project
+            .runtime
+            .project_graph
+            .nodes
+            .iter()
+            .map(|node| node.node_id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+            .max(1);
+        let base = Self::project_dependency_alias_base(path);
+        let alias = self.unique_project_dependency_alias(parent, &base);
+        let source = ProjectDependencySource::External(self.project_dependency_storage_path(path));
+        self.history.snapshot(&self.state.project);
+        self.state
+            .project
+            .runtime
+            .project_graph
+            .nodes
+            .push(ProjectDependencyNode {
+                node_id,
+                parent_node_id: parent,
+                alias: alias.clone(),
+                kind,
+                source,
+            });
+        self.state.dirty = true;
+        self.session.project_graph_selected = Some(node_id);
+        self.session.status = format!("linked {alias}");
+    }
+
+    fn rename_project_dependency(&mut self, node_id: u16, alias: String) {
+        let alias = alias.trim().to_string();
+        if !Self::project_dependency_alias_valid(&alias) {
+            self.session.status = "dependency alias must be a q0lang identifier".to_string();
+            return;
+        }
+        let Some(parent) = self
+            .state
+            .project
+            .runtime
+            .project_graph
+            .nodes
+            .iter()
+            .find(|node| node.node_id == node_id)
+            .map(|node| node.parent_node_id)
+        else {
+            return;
+        };
+        if self
+            .state
+            .project
+            .runtime
+            .project_graph
+            .nodes
+            .iter()
+            .any(|node| {
+                node.node_id != node_id && node.parent_node_id == parent && node.alias == alias
+            })
+        {
+            self.session.status = "a sibling dependency already uses that alias".to_string();
+            return;
+        }
+        self.history.snapshot(&self.state.project);
+        if let Some(node) = self
+            .state
+            .project
+            .runtime
+            .project_graph
+            .nodes
+            .iter_mut()
+            .find(|node| node.node_id == node_id)
+        {
+            node.alias = alias.clone();
+            self.state.dirty = true;
+            self.session.status = format!("renamed dependency to {alias}");
+        }
+    }
+
+    fn reparent_project_dependency(&mut self, node_id: u16, parent: Option<u16>) {
+        if parent == Some(node_id) || self.project_dependency_reparent_would_cycle(node_id, parent)
+        {
+            self.session.status = "dependency reparent would create a cycle".to_string();
+            return;
+        }
+        if parent.is_some_and(|parent| {
+            !self
+                .state
+                .project
+                .runtime
+                .project_graph
+                .nodes
+                .iter()
+                .any(|node| node.node_id == parent)
+        }) {
+            self.session.status = "dependency parent no longer exists".to_string();
+            return;
+        }
+        let Some(current) = self
+            .state
+            .project
+            .runtime
+            .project_graph
+            .nodes
+            .iter()
+            .find(|node| node.node_id == node_id)
+            .cloned()
+        else {
+            return;
+        };
+        if self
+            .state
+            .project
+            .runtime
+            .project_graph
+            .nodes
+            .iter()
+            .any(|node| {
+                node.node_id != node_id
+                    && node.parent_node_id == parent
+                    && node.alias == current.alias
+            })
+        {
+            self.session.status = "target parent already has a child with this alias".to_string();
+            return;
+        }
+        if current.parent_node_id == parent {
+            return;
+        }
+        self.history.snapshot(&self.state.project);
+        if let Some(node) = self
+            .state
+            .project
+            .runtime
+            .project_graph
+            .nodes
+            .iter_mut()
+            .find(|node| node.node_id == node_id)
+        {
+            node.parent_node_id = parent;
+            self.state.dirty = true;
+            self.session.status = "dependency moved".to_string();
+        }
+    }
+
+    fn remove_project_dependency(&mut self, node_id: u16) {
+        let nodes = &self.state.project.runtime.project_graph.nodes;
+        if !nodes.iter().any(|node| node.node_id == node_id) {
+            return;
+        }
+        let mut removed = std::collections::HashSet::from([node_id]);
+        loop {
+            let before = removed.len();
+            for node in nodes {
+                if node
+                    .parent_node_id
+                    .is_some_and(|parent| removed.contains(&parent))
+                {
+                    removed.insert(node.node_id);
+                }
+            }
+            if removed.len() == before {
+                break;
+            }
+        }
+        self.history.snapshot(&self.state.project);
+        self.state
+            .project
+            .runtime
+            .project_graph
+            .nodes
+            .retain(|node| !removed.contains(&node.node_id));
+        if self
+            .session
+            .project_graph_selected
+            .is_some_and(|selected| removed.contains(&selected))
+        {
+            self.session.project_graph_selected = None;
+            self.session.project_graph_rename = None;
+        }
+        self.state.dirty = true;
+        self.session.status = format!("removed {} dependency node(s)", removed.len());
+    }
+
+    fn relink_project_dependency(&mut self, node_id: u16, path: &std::path::Path) {
+        let Some(kind) = Self::project_dependency_kind(path) else {
+            self.session.status = "relink expects .q0s, .q0l or .q0lang".to_string();
+            return;
+        };
+        let Some(expected_kind) = self
+            .state
+            .project
+            .runtime
+            .project_graph
+            .nodes
+            .iter()
+            .find(|node| node.node_id == node_id)
+            .map(|node| node.kind)
+        else {
+            return;
+        };
+        if kind != expected_kind {
+            self.session.status = "relink file type does not match dependency kind".to_string();
+            return;
+        }
+        if !path.is_file() {
+            self.session.status = "relink target does not exist".to_string();
+            return;
+        }
+        let stored = self.project_dependency_storage_path(path);
+        self.history.snapshot(&self.state.project);
+        if let Some(node) = self
+            .state
+            .project
+            .runtime
+            .project_graph
+            .nodes
+            .iter_mut()
+            .find(|node| node.node_id == node_id)
+        {
+            node.source = ProjectDependencySource::External(stored);
+            self.state.dirty = true;
+            self.session.status = "dependency relinked".to_string();
+        }
+    }
+
+    fn embed_project_dependency(&mut self, node_id: u16) {
+        let Some(path) = self.resolve_project_dependency_path(node_id) else {
+            self.session.status = "dependency is already embedded".to_string();
+            return;
+        };
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            self.session.status = format!("dependency is missing: {}", path.display());
+            return;
+        };
+        if metadata.len() > 256 * 1024 * 1024 {
+            self.session.status = "dependency is too large to embed".to_string();
+            return;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            self.session.status = format!("failed to read dependency: {}", path.display());
+            return;
+        };
+        self.history.snapshot(&self.state.project);
+        if let Some(node) = self
+            .state
+            .project
+            .runtime
+            .project_graph
+            .nodes
+            .iter_mut()
+            .find(|node| node.node_id == node_id)
+        {
+            node.source = ProjectDependencySource::Embedded(bytes);
+            self.state.dirty = true;
+            self.session.status = "dependency embedded into project".to_string();
+        }
+    }
+
+    fn open_project_dependency(&mut self, node_id: u16) {
+        let Some(node) = self
+            .state
+            .project
+            .runtime
+            .project_graph
+            .nodes
+            .iter()
+            .find(|node| node.node_id == node_id)
+            .cloned()
+        else {
+            return;
+        };
+        match (node.kind, node.source) {
+            (ProjectDependencyKind::Q0lang, ProjectDependencySource::External(_)) => {
+                if let Some(path) = self.resolve_project_dependency_path(node_id) {
+                    self.open_from_path(&path);
+                }
+            }
+            (ProjectDependencyKind::Movie, ProjectDependencySource::External(_)) => {
+                let Some(path) = self.resolve_project_dependency_path(node_id) else {
+                    return;
+                };
+                if !path.is_file() {
+                    self.session.status = format!("dependency is missing: {}", path.display());
+                    return;
+                }
+                let player = std::env::current_exe()
+                    .ok()
+                    .map(|exe| exe.with_file_name("q0player.exe"));
+                if let Some(player) = player.filter(|player| player.is_file()) {
+                    match std::process::Command::new(player).arg(&path).spawn() {
+                        Ok(_) => self.session.status = format!("opened {}", path.display()),
+                        Err(error) => {
+                            self.session.status = format!("could not open movie: {error}")
+                        }
+                    }
+                } else {
+                    self.session.status =
+                        format!("q0player is unavailable; linked movie: {}", path.display());
+                }
+            }
+            (_, ProjectDependencySource::Embedded(_)) => {
+                self.session.status =
+                    "embedded dependencies are read-only in the project tree".to_string()
+            }
+        }
     }
 
     fn create_project(&mut self, mut spec: NewProjectSpec) {
@@ -797,18 +1565,18 @@ impl EditorApp {
                 self.switch_to_home();
             }
             Action::ResumeProject => {
-                if let Some(tab_id) = self.last_project_tab {
-                    self.switch_to_project_tab(tab_id);
+                if let Some(tab_id) = self.last_document_tab {
+                    self.switch_to_document_tab(tab_id);
                 }
             }
             Action::CycleDocumentTab(direction) => {
                 self.cycle_document_tab(direction);
             }
-            Action::SwitchProjectTab(tab_id) => {
-                self.switch_to_project_tab(tab_id);
+            Action::SwitchDocumentTab(tab_id) => {
+                self.switch_to_document_tab(tab_id);
             }
-            Action::CloseProjectTab(tab_id) => {
-                self.close_project_tab(tab_id);
+            Action::CloseDocumentTab(tab_id) => {
+                self.close_document_tab(tab_id);
             }
             Action::OpenProject => {
                 if let Some(path) = file_io::pick_open_path() {
@@ -835,18 +1603,31 @@ impl EditorApp {
                 self.import_media_from_path(ctx, &path);
             }
             Action::SaveProject => {
-                let path = self.state.file_path.clone();
-                match path {
-                    Some(p) => {
-                        self.save_to(&p);
+                if self.active_document_is_q0lang() {
+                    self.save_current_q0lang();
+                } else if self.project_active {
+                    let path = self.state.file_path.clone();
+                    match path {
+                        Some(p) => {
+                            self.save_to(&p);
+                        }
+                        None => self.handle(ctx, Action::SaveProjectAs),
                     }
-                    None => self.handle(ctx, Action::SaveProjectAs),
                 }
             }
             Action::SaveProjectAs => {
-                let suggested = self.state.file_path.clone();
-                if let Some(path) = file_io::pick_save_path(suggested.as_deref()) {
-                    self.save_to(&path);
+                if self.active_document_is_q0lang() {
+                    let suggested = self
+                        .active_q0lang_document()
+                        .map(|document| document.path.clone());
+                    if let Some(path) = file_io::pick_q0lang_save_path(suggested.as_deref()) {
+                        self.save_q0lang_to(&path);
+                    }
+                } else if self.project_active {
+                    let suggested = self.state.file_path.clone();
+                    if let Some(path) = file_io::pick_save_path(suggested.as_deref()) {
+                        self.save_to(&path);
+                    }
                 }
             }
             Action::OpenQ0Enc => {
@@ -869,9 +1650,9 @@ impl EditorApp {
                     self.session.status =
                         "finish or cancel the active import/export before closing q0editor"
                             .to_string();
-                } else if let Some(dirty_tab) = self.first_dirty_project_tab() {
-                    if self.active_project_tab != Some(dirty_tab) {
-                        self.switch_to_project_tab(dirty_tab);
+                } else if let Some(dirty_tab) = self.first_dirty_document_tab() {
+                    if self.active_document_tab != Some(dirty_tab) {
+                        self.switch_to_document_tab(dirty_tab);
                     }
                     self.unsaved_action = Some(Action::Exit);
                 } else {
@@ -910,14 +1691,29 @@ impl EditorApp {
             }
             Action::TogglePlay => {
                 self.session.pending_timeline_frame = None;
-                self.session.playing = !self.session.playing;
+                let wants_play = !self.session.playing;
+                self.session.playing = wants_play;
                 self.session.last_tick = Instant::now();
-                self.session.status = if self.session.playing {
-                    "playing"
+                if wants_play {
+                    self.initialize_preview_q0lang_if_needed();
+                    self.session.preview_audio_resync_needed = false;
+                    if self.session.playing {
+                        self.session.status = "playing".to_string();
+                        if let Err(error) = self.refresh_audio_playback() {
+                            self.session.status = format!("playing; audio warning: {error}");
+                        }
+                    } else {
+                        if let Some(audio) = self.audio_playback.as_ref() {
+                            audio.set_playing(false);
+                        }
+                        self.session.status = "stopped by frame code".to_string();
+                    }
                 } else {
-                    "paused"
+                    if let Some(audio) = self.audio_playback.as_ref() {
+                        audio.set_playing(false);
+                    }
+                    self.session.status = "paused".to_string();
                 }
-                .to_string();
             }
             Action::FirstFrame => self.go_to_frame(0),
             Action::PreviousFrame => {
@@ -1476,6 +2272,9 @@ impl EditorApp {
             Action::ToggleSettings => {
                 self.session.show_settings = !self.session.show_settings;
             }
+            Action::ToggleProjectTree => {
+                self.show_project_tree = !self.show_project_tree;
+            }
             Action::ZoomIn => {
                 let z = (self.session.viewport.zoom * 1.25).clamp(0.05, 32.0);
                 self.session.viewport.zoom = z;
@@ -1621,14 +2420,37 @@ impl EditorApp {
                             return;
                         }
                         let target_frame = self.session.timeline_frame();
-                        self.history.snapshot(&self.state.project);
+                        let before = self.state.project.clone();
+                        let mut candidate = before.clone();
                         if let Some(selection) = crate::timeline_edit::paste_frames(
-                            &mut self.state.project,
+                            &mut candidate,
                             self.session.current_q0rg_id,
                             self.session.current_layer_id,
                             target_frame,
                             &frames,
                         ) {
+                            let audio_conflict = candidate.audio_clips.iter().enumerate().any(
+                                |(clip_idx, clip)| {
+                                    crate::audio::audio_clip_ref(&candidate, clip_idx).is_some_and(
+                                        |resolved| {
+                                            crate::audio::visual_content_conflicts_with_audio_range(
+                                                &candidate,
+                                                clip.q0rg_id,
+                                                clip.layer_id,
+                                                resolved.start_frame,
+                                                resolved.end_frame_exclusive,
+                                            )
+                                        },
+                                    )
+                                },
+                            );
+                            if audio_conflict {
+                                self.session.status =
+                                    "cannot paste visual frames into an audio range".to_string();
+                                return;
+                            }
+                            self.history.snapshot(&before);
+                            self.state.project = candidate;
                             self.session.timeline_selection = Some(selection);
                             self.session.timeline_layer_selection = None;
                             self.session.selection = Selection::None;
@@ -1675,6 +2497,17 @@ impl EditorApp {
                         }
                         if self.current_layer_is_folder() {
                             self.session.status = "folders cannot contain artwork".to_string();
+                            return;
+                        }
+                        if crate::audio::audio_clip_at_frame(
+                            &self.state.project,
+                            self.session.current_q0rg_id,
+                            self.session.current_layer_id,
+                            self.session.current_frame,
+                        )
+                        .is_some()
+                        {
+                            self.session.status = "audio frames cannot contain artwork".to_string();
                             return;
                         }
                         if payload.is_empty() {
@@ -1814,6 +2647,98 @@ impl EditorApp {
             Action::CloseQ0langEditor => {
                 self.session.show_q0lang_editor = false;
             }
+            Action::OpenFrameScriptEditor(q0rg_id, layer_id, frame) => {
+                if self.state.project.layer_is_folder(q0rg_id, layer_id) {
+                    self.session.status = "folders cannot contain frame code".to_string();
+                } else if self
+                    .state
+                    .project
+                    .q0rgs
+                    .iter()
+                    .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+                    .is_some_and(|q0rg| frame < q0rg.frame_count)
+                {
+                    let source = self
+                        .state
+                        .project
+                        .runtime
+                        .frame_scripts
+                        .iter()
+                        .find(|script| {
+                            script.q0rg_id == q0rg_id
+                                && script.layer_id == layer_id
+                                && script.frame == frame
+                        })
+                        .map(|script| script.source.clone())
+                        .unwrap_or_default();
+                    self.session.frame_script_editor = Some(FrameScriptEditor {
+                        q0rg_id,
+                        layer_id,
+                        frame,
+                        source,
+                    });
+                    self.session.status = format!("frame code: frame {}", frame + 1);
+                }
+            }
+            Action::DeleteFrameScript(q0rg_id, layer_id, frame) => {
+                if self
+                    .state
+                    .project
+                    .runtime
+                    .frame_scripts
+                    .iter()
+                    .any(|script| {
+                        script.q0rg_id == q0rg_id
+                            && script.layer_id == layer_id
+                            && script.frame == frame
+                    })
+                {
+                    self.history.snapshot(&self.state.project);
+                    self.state.project.runtime.frame_scripts.retain(|script| {
+                        script.q0rg_id != q0rg_id
+                            || script.layer_id != layer_id
+                            || script.frame != frame
+                    });
+                    self.state.dirty = true;
+                    self.session.reset_q0lang_preview();
+                    if self
+                        .session
+                        .frame_script_editor
+                        .as_ref()
+                        .is_some_and(|editor| {
+                            editor.q0rg_id == q0rg_id
+                                && editor.layer_id == layer_id
+                                && editor.frame == frame
+                        })
+                    {
+                        self.session.frame_script_editor = None;
+                    }
+                    self.session.status = "frame code removed".to_string();
+                } else {
+                    self.session.status = "frame has no code".to_string();
+                }
+            }
+            Action::AddProjectDependency(path, parent) => {
+                self.add_project_dependency(&path, parent);
+            }
+            Action::RenameProjectDependency(node_id, alias) => {
+                self.rename_project_dependency(node_id, alias);
+            }
+            Action::ReparentProjectDependency(node_id, parent) => {
+                self.reparent_project_dependency(node_id, parent);
+            }
+            Action::RemoveProjectDependency(node_id) => {
+                self.remove_project_dependency(node_id);
+            }
+            Action::RelinkProjectDependency(node_id, path) => {
+                self.relink_project_dependency(node_id, &path);
+            }
+            Action::EmbedProjectDependency(node_id) => {
+                self.embed_project_dependency(node_id);
+            }
+            Action::OpenProjectDependency(node_id) => {
+                self.open_project_dependency(node_id);
+            }
         }
     }
 
@@ -1907,6 +2832,57 @@ impl EditorApp {
         q0rg.layers[first..=last].iter().any(|layer| {
             !self.state.project.layer_is_folder(q0rg_id, layer.layer_id)
                 && self.state.project.layer_is_locked(q0rg_id, layer.layer_id)
+        })
+    }
+
+    fn timeline_selection_touches_audio(&self, selection: TimelineSelection) -> bool {
+        let q0rg_id = self.session.current_q0rg_id;
+        let Some(q0rg) = self
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+        else {
+            return false;
+        };
+        let Some(anchor_layer) = q0rg
+            .layers
+            .iter()
+            .position(|layer| layer.layer_id == selection.anchor_layer_id)
+        else {
+            return false;
+        };
+        let Some(focus_layer) = q0rg
+            .layers
+            .iter()
+            .position(|layer| layer.layer_id == selection.focus_layer_id)
+        else {
+            return false;
+        };
+        let first_layer = anchor_layer.min(focus_layer);
+        let last_layer = anchor_layer.max(focus_layer);
+        let first_frame = selection.anchor_frame.min(selection.focus_frame);
+        let end_frame = selection
+            .anchor_frame
+            .max(selection.focus_frame)
+            .saturating_add(1);
+        self.state.project.audio_clips.iter().any(|clip| {
+            if clip.q0rg_id != q0rg_id {
+                return false;
+            }
+            let Some(layer_index) = q0rg
+                .layers
+                .iter()
+                .position(|layer| layer.layer_id == clip.layer_id)
+            else {
+                return false;
+            };
+            if !(first_layer..=last_layer).contains(&layer_index) {
+                return false;
+            }
+            q0s_format::v2::audio_clip_end_frame(&self.state.project, *clip)
+                .is_some_and(|clip_end| first_frame < clip_end && clip.start_frame < end_frame)
         })
     }
 
@@ -2026,6 +3002,20 @@ impl EditorApp {
         }
         self.history.snapshot(&self.state.project);
         self.state.project.q0rgs.retain(|q| q.q0rg_id != q0rg_id);
+        self.state
+            .project
+            .audio_clips
+            .retain(|clip| clip.q0rg_id != q0rg_id);
+        self.state
+            .project
+            .runtime
+            .frame_scripts
+            .retain(|script| script.q0rg_id != q0rg_id);
+        self.state
+            .project
+            .runtime
+            .instance_names
+            .retain(|key, _| key.q0rg_id != q0rg_id);
         for q0rg in &mut self.state.project.q0rgs {
             for layer in &mut q0rg.layers {
                 layer.placements.retain(
@@ -2057,10 +3047,33 @@ impl EditorApp {
             return;
         };
         let layer_count = end - start;
+        let removed_layer_ids: std::collections::HashSet<u16> = q0rg.layers[start..end]
+            .iter()
+            .map(|layer| layer.layer_id)
+            .collect();
         let item_count = q0rg.layers[start..end]
             .iter()
             .map(|layer| layer.placements.len() + layer.explicit_keyframes.len())
-            .sum();
+            .sum::<usize>()
+            + self
+                .state
+                .project
+                .audio_clips
+                .iter()
+                .filter(|clip| {
+                    clip.q0rg_id == q0rg_id && removed_layer_ids.contains(&clip.layer_id)
+                })
+                .count()
+            + self
+                .state
+                .project
+                .runtime
+                .frame_scripts
+                .iter()
+                .filter(|script| {
+                    script.q0rg_id == q0rg_id && removed_layer_ids.contains(&script.layer_id)
+                })
+                .count();
         if item_count > 0 || layer_count > 1 {
             self.pending_layer_delete = Some((q0rg_id, layer_id, layer_count, item_count));
             self.session.status = "layer deletion requires confirmation".to_string();
@@ -2088,9 +3101,26 @@ impl EditorApp {
             .iter()
             .map(|layer| layer.layer_id)
             .collect();
+        let removed_instance_ids = self.state.project.q0rgs[q0rg_index].layers[start..end]
+            .iter()
+            .flat_map(|layer| &layer.placements)
+            .filter_map(|placement| (placement.instance_id != 0).then_some(placement.instance_id))
+            .collect::<std::collections::HashSet<_>>();
         self.state.project.q0rgs[q0rg_index]
             .layers
             .drain(start..end);
+        self.state
+            .project
+            .audio_clips
+            .retain(|clip| clip.q0rg_id != q0rg_id || !removed_ids.contains(&clip.layer_id));
+        self.state
+            .project
+            .runtime
+            .frame_scripts
+            .retain(|script| script.q0rg_id != q0rg_id || !removed_ids.contains(&script.layer_id));
+        self.state.project.runtime.instance_names.retain(|key, _| {
+            key.q0rg_id != q0rg_id || !removed_instance_ids.contains(&key.instance_id)
+        });
         self.state
             .project
             .layer_metadata
@@ -2403,14 +3433,23 @@ impl EditorApp {
     }
 
     fn asset_reference_count(&self, asset_id: u16) -> usize {
-        self.state
+        let placement_refs = self
+            .state
             .project
             .q0rgs
             .iter()
             .flat_map(|q0rg| &q0rg.layers)
             .flat_map(|layer| &layer.placements)
             .filter(|placement| matches!(placement.target, Target::Asset(id) if id == asset_id))
-            .count()
+            .count();
+        placement_refs
+            + self
+                .state
+                .project
+                .audio_clips
+                .iter()
+                .filter(|clip| clip.asset_id == asset_id)
+                .count()
     }
 
     fn request_frame_count_change(&mut self, q0rg_id: u16, requested: u16) {
@@ -2451,10 +3490,41 @@ impl EditorApp {
                     .is_some_and(|to_frame| to_frame >= requested)
             })
             .count();
+        let removed_audio = self
+            .state
+            .project
+            .audio_clips
+            .iter()
+            .filter(|clip| clip.q0rg_id == q0rg_id)
+            .filter(|clip| {
+                clip.start_frame >= requested
+                    || q0s_format::v2::audio_clip_end_frame(&self.state.project, **clip)
+                        .is_some_and(|end| end > requested)
+            })
+            .count();
+        let removed_frame_scripts = self
+            .state
+            .project
+            .runtime
+            .frame_scripts
+            .iter()
+            .filter(|script| script.q0rg_id == q0rg_id && script.frame >= requested)
+            .count();
 
-        if requested < q0rg.frame_count && (removed_keyframes > 0 || removed_tweens > 0) {
-            self.pending_frame_truncate =
-                Some((q0rg_id, requested, removed_keyframes, removed_tweens));
+        if requested < q0rg.frame_count
+            && (removed_keyframes > 0
+                || removed_tweens > 0
+                || removed_audio > 0
+                || removed_frame_scripts > 0)
+        {
+            self.pending_frame_truncate = Some((
+                q0rg_id,
+                requested,
+                removed_keyframes,
+                removed_tweens,
+                removed_audio,
+                removed_frame_scripts,
+            ));
             self.session.status = "reducing frames requires confirmation".to_string();
             return;
         }
@@ -2463,6 +3533,41 @@ impl EditorApp {
 
     fn apply_frame_count(&mut self, q0rg_id: u16, frame_count: u16) {
         self.history.snapshot(&self.state.project);
+        let frame_count = frame_count.max(1);
+        let audio_to_remove: std::collections::HashSet<(u16, u16, u16, u16)> = self
+            .state
+            .project
+            .audio_clips
+            .iter()
+            .filter(|clip| clip.q0rg_id == q0rg_id)
+            .filter(|clip| {
+                clip.start_frame >= frame_count
+                    || q0s_format::v2::audio_clip_end_frame(&self.state.project, **clip)
+                        .is_some_and(|end| end > frame_count)
+            })
+            .map(|clip| (clip.q0rg_id, clip.layer_id, clip.start_frame, clip.asset_id))
+            .collect();
+        self.state.project.audio_clips.retain(|clip| {
+            !audio_to_remove.contains(&(
+                clip.q0rg_id,
+                clip.layer_id,
+                clip.start_frame,
+                clip.asset_id,
+            ))
+        });
+        self.state
+            .project
+            .runtime
+            .frame_scripts
+            .retain(|script| script.q0rg_id != q0rg_id || script.frame < frame_count);
+        if self
+            .session
+            .frame_script_editor
+            .as_ref()
+            .is_some_and(|editor| editor.q0rg_id == q0rg_id && editor.frame >= frame_count)
+        {
+            self.session.frame_script_editor = None;
+        }
         let Some(q0rg) = self
             .state
             .project
@@ -2472,7 +3577,7 @@ impl EditorApp {
         else {
             return;
         };
-        q0rg.frame_count = frame_count.max(1);
+        q0rg.frame_count = frame_count;
         for layer in &mut q0rg.layers {
             layer
                 .explicit_keyframes
@@ -3042,9 +4147,23 @@ impl EditorApp {
                     return;
                 }
             }
+        } else if crate::audio::is_supported_audio_path(path) {
+            let (sender, receiver) = mpsc::channel();
+            let worker_path = source_path.clone();
+            if let Err(error) = std::thread::Builder::new()
+                .name("q0editor-audio-import".to_string())
+                .spawn(move || {
+                    let result = crate::audio::transcode_audio_to_q0v(&worker_path);
+                    let _ = sender.send(result);
+                })
+            {
+                self.session.status = format!("start audio import worker failed: {error}");
+                return;
+            }
+            receiver
         } else {
             self.session.status = format!(
-                "unsupported media file: {} (expected png, jpg, webp, mp4 or q0v)",
+                "unsupported media file: {} (expected png, jpg, webp, wav, mp3, ogg, flac, mp4 or q0v)",
                 path.display()
             );
             return;
@@ -3056,6 +4175,8 @@ impl EditorApp {
         });
         self.session.status = if extension.eq_ignore_ascii_case("mp4") {
             format!("converting {} to q0v...", path.display())
+        } else if crate::audio::is_supported_audio_path(path) {
+            format!("decoding audio {}...", path.display())
         } else {
             format!("reading {}...", path.display())
         };
@@ -3088,8 +4209,11 @@ impl EditorApp {
                     .extension()
                     .and_then(|extension| extension.to_str())
                     .is_some_and(|extension| extension.eq_ignore_ascii_case("mp4"));
+                let is_audio = crate::audio::is_supported_audio_path(&job.path);
                 let prefix = if is_mp4 {
                     "mp4 import failed"
+                } else if is_audio {
+                    "audio import failed"
                 } else {
                     "q0v import failed"
                 };
@@ -3131,11 +4255,16 @@ impl EditorApp {
             self.session.status = "video import failed: asset id space exhausted".to_string();
             return;
         };
+        let default_name = if media.spec.audio && !media.spec.video {
+            "Audio"
+        } else {
+            "Video"
+        };
         let name = path
             .file_stem()
             .and_then(|name| name.to_str())
             .filter(|name| !name.trim().is_empty())
-            .unwrap_or("Video")
+            .unwrap_or(default_name)
             .to_string();
 
         self.history.snapshot(&self.state.project);
@@ -3150,13 +4279,23 @@ impl EditorApp {
         self.state.dirty = true;
         self.session.selection = Selection::Asset(asset_id);
         self.textures.invalidate();
-        self.session.status = format!(
-            "imported {name} as q0v asset {asset_id} ({}x{}, {} frames at {} fps; audio import pending)",
-            media.spec.width,
-            media.spec.height,
-            media.spec.timeline_frames,
-            media.spec.fps
-        );
+        self.session.status = if media.spec.audio && !media.spec.video {
+            let seconds = media.audio_samples_per_channel as f64
+                / f64::from(media.spec.audio_sample_rate.max(1));
+            format!(
+                "imported {name} as audio asset {asset_id} ({seconds:.2}s, {} hz, {} channel(s))",
+                media.spec.audio_sample_rate, media.spec.audio_channels
+            )
+        } else {
+            format!(
+                "imported {name} as q0v asset {asset_id} ({}x{}, {} frames at {} fps{})",
+                media.spec.width,
+                media.spec.height,
+                media.spec.timeline_frames,
+                media.spec.fps,
+                if media.spec.audio { "; audio" } else { "" }
+            )
+        };
     }
     pub(crate) fn break_apart_fx_block_reason(&self) -> Option<&'static str> {
         let Selection::Placement {
@@ -3592,15 +4731,15 @@ impl EditorApp {
                 .iter()
                 .find(|asset| asset.id() == asset_id)
                 .and_then(|asset| match asset {
-                    Asset::Q0v(video) => q0video::q0v::Q0vFile::parse(video.bytes.clone())
+                    Asset::Q0v(video) => q0video::q0v::probe_header(&video.bytes)
                         .ok()
-                        .map(|media| (asset_id, media.spec)),
+                        .map(|header| (asset_id, header.spec, header.audio_samples_per_channel)),
                     _ => None,
                 }),
             LibraryItem::Q0rg(_) => None,
         };
 
-        let Some((asset_id, media_spec)) = q0v else {
+        let Some((asset_id, media_spec, audio_samples_per_channel)) = q0v else {
             self.session.current_layer_id = target_layer_id;
             self.session.current_frame = frame;
             let center = Vec2::new(
@@ -3612,18 +4751,89 @@ impl EditorApp {
         };
 
         let project_fps = u32::from(self.state.project.meta.fps.max(1));
-        let duration_frames = u64::from(media_spec.timeline_frames)
-            .saturating_mul(u64::from(project_fps))
-            .div_ceil(u64::from(media_spec.fps.max(1)))
-            .max(1);
+        let audio_only = media_spec.audio && !media_spec.video;
+        let duration_frames = if audio_only {
+            audio_samples_per_channel
+                .saturating_mul(u64::from(project_fps))
+                .div_ceil(u64::from(media_spec.audio_sample_rate.max(1)))
+                .max(1)
+        } else {
+            u64::from(media_spec.timeline_frames)
+                .saturating_mul(u64::from(project_fps))
+                .div_ceil(u64::from(media_spec.fps.max(1)))
+                .max(1)
+        };
         let end_exclusive = u64::from(frame).saturating_add(duration_frames);
         if end_exclusive > u64::from(u16::MAX) {
-            self.session.status = "video is too long for this timeline".to_string();
+            self.session.status = if audio_only {
+                "audio is too long for this timeline".to_string()
+            } else {
+                "video is too long for this timeline".to_string()
+            };
             return;
         }
         let end_exclusive = end_exclusive as u16;
         let old_frame_count = self.state.project.q0rgs[q0rg_index].frame_count;
         let new_frame_count = old_frame_count.max(end_exclusive);
+        if audio_only {
+            if crate::audio::audio_range_intersects(
+                &self.state.project,
+                q0rg_id,
+                target_layer_id,
+                frame,
+                end_exclusive,
+            ) {
+                self.session.status = "audio clips cannot overlap on the same layer".to_string();
+                return;
+            }
+            if crate::audio::visual_content_conflicts_with_audio_range(
+                &self.state.project,
+                q0rg_id,
+                target_layer_id,
+                frame,
+                end_exclusive,
+            ) {
+                self.session.status =
+                    "audio frames must be empty; choose an empty timeline range".to_string();
+                return;
+            }
+            self.history.snapshot(&self.state.project);
+            let q0rg = &mut self.state.project.q0rgs[q0rg_index];
+            q0rg.frame_count = new_frame_count;
+            let Some(layer) = q0rg
+                .layers
+                .iter_mut()
+                .find(|layer| layer.layer_id == target_layer_id)
+            else {
+                return;
+            };
+            layer
+                .explicit_keyframes
+                .retain(|key| !(frame..end_exclusive).contains(key));
+            self.state.project.audio_clips.push(AudioClip {
+                q0rg_id,
+                layer_id: target_layer_id,
+                start_frame: frame,
+                asset_id,
+                gain: 1.0,
+                muted: false,
+            });
+            self.session.current_layer_id = target_layer_id;
+            self.session.current_frame = frame;
+            self.session.timeline_selection = Some(crate::state::TimelineSelection::single(
+                target_layer_id,
+                frame,
+            ));
+            self.session.selection = Selection::None;
+            self.state.dirty = true;
+            self.session.status = format!(
+                "placed audio on layer {} at frame {} ({} project frames)",
+                target_layer_id,
+                frame + 1,
+                duration_frames
+            );
+            return;
+        }
         let target_index = self.state.project.q0rgs[q0rg_index]
             .layers
             .iter()
@@ -3647,14 +4857,23 @@ impl EditorApp {
             .asset_names
             .get(&asset_id)
             .cloned()
-            .unwrap_or_else(|| format!("Video {asset_id}"));
+            .unwrap_or_else(|| {
+                if audio_only {
+                    format!("Audio {asset_id}")
+                } else {
+                    format!("Video {asset_id}")
+                }
+            });
         let target = Target::Asset(asset_id);
-        let center = Vec2::new(
-            self.state.project.meta.stage_width as f32 * 0.5,
-            self.state.project.meta.stage_height as f32 * 0.5,
-        );
-        let transform =
-            crate::render::centered_target_transform(&self.state.project, target, center);
+        let transform = if audio_only {
+            Transform2D::IDENTITY
+        } else {
+            let center = Vec2::new(
+                self.state.project.meta.stage_width as f32 * 0.5,
+                self.state.project.meta.stage_height as f32 * 0.5,
+            );
+            crate::render::centered_target_transform(&self.state.project, target, center)
+        };
         let explicit_keyframes = if end_exclusive < new_frame_count {
             vec![end_exclusive]
         } else {
@@ -3698,21 +4917,38 @@ impl EditorApp {
             next_layer_id,
             frame,
         ));
-        self.session.selection = Selection::Placement {
-            q0rg_id,
-            layer_id: next_layer_id,
-            placement_idx: 0,
+        self.session.selection = if audio_only {
+            Selection::None
+        } else {
+            Selection::Placement {
+                q0rg_id,
+                layer_id: next_layer_id,
+                placement_idx: 0,
+            }
         };
         self.state.dirty = true;
         self.textures.invalidate();
-        self.session.status = format!(
-            "placed q0v on timeline at frame {} ({} project frames)",
-            frame + 1,
-            duration_frames
-        );
+        self.session.status = if audio_only {
+            format!(
+                "placed audio on timeline at frame {} ({} project frames)",
+                frame + 1,
+                duration_frames
+            )
+        } else {
+            format!(
+                "placed q0v on timeline at frame {} ({} project frames)",
+                frame + 1,
+                duration_frames
+            )
+        };
     }
 
     fn place_library_item_at(&mut self, item: LibraryItem, position: q0s_format::v2::Vec2) {
+        if crate::audio::library_item_is_audio_only(&self.state.project, item) {
+            self.session.status =
+                "audio lives on the timeline; drag it onto a timeline frame".to_string();
+            return;
+        }
         if self.current_layer_is_locked() || !self.current_layer_is_visible() {
             self.session.status =
                 "show and unlock the target layer before placing artwork".to_string();
@@ -3720,6 +4956,17 @@ impl EditorApp {
         }
         if self.current_layer_is_folder() {
             self.session.status = "folders cannot contain artwork".to_string();
+            return;
+        }
+        if crate::audio::audio_clip_at_frame(
+            &self.state.project,
+            self.session.current_q0rg_id,
+            self.session.current_layer_id,
+            self.session.current_frame,
+        )
+        .is_some()
+        {
+            self.session.status = "audio frames cannot contain artwork".to_string();
             return;
         }
         if let LibraryItem::Asset(asset_id) = item {
@@ -4131,32 +5378,68 @@ impl EditorApp {
             .map(|layer| layer.layer_id)
             .collect();
         let cell_count = editable_layer_ids.len() * usize::from(last_frame - first_frame + 1);
+        let mut audio_cells = std::collections::HashSet::new();
+        let mut audio_clips_to_remove = std::collections::HashSet::new();
+        for clip in &self.state.project.audio_clips {
+            if clip.q0rg_id != q0rg_id || !editable_layer_ids.contains(&clip.layer_id) {
+                continue;
+            }
+            let Some(clip_end) = q0s_format::v2::audio_clip_end_frame(&self.state.project, *clip)
+            else {
+                continue;
+            };
+            let overlap_start = clip.start_frame.max(first_frame);
+            let overlap_end = clip_end.min(last_frame.saturating_add(1));
+            if overlap_start < overlap_end {
+                audio_clips_to_remove.insert((
+                    clip.q0rg_id,
+                    clip.layer_id,
+                    clip.start_frame,
+                    clip.asset_id,
+                ));
+            }
+            for frame in overlap_start..overlap_end {
+                audio_cells.insert((clip.layer_id, frame));
+            }
+        }
+        let audio_selection = !audio_cells.is_empty();
         if editable_layer_ids.is_empty() {
             self.session.selection = Selection::None;
             self.session.timeline_selection = None;
             return Some((0, 0, false));
         }
 
-        let needs_change = editable_layer_ids.iter().any(|layer_id| {
-            let layer = q0rg
-                .layers
-                .iter()
-                .find(|layer| layer.layer_id == *layer_id)
-                .expect("selected editable layer still exists");
-            (first_frame..=last_frame).any(|frame| !layer.is_blank_keyframe(frame))
-                || layer.placements.iter().any(|placement| {
-                    placement
-                        .tween
-                        .to_frame()
-                        .is_some_and(|to_frame| (first_frame..=last_frame).contains(&to_frame))
-                })
-        });
+        let needs_change = audio_selection
+            || editable_layer_ids.iter().any(|layer_id| {
+                let layer = q0rg
+                    .layers
+                    .iter()
+                    .find(|layer| layer.layer_id == *layer_id)
+                    .expect("selected editable layer still exists");
+                (first_frame..=last_frame).any(|frame| !layer.is_blank_keyframe(frame))
+                    || layer.placements.iter().any(|placement| {
+                        placement
+                            .tween
+                            .to_frame()
+                            .is_some_and(|to_frame| (first_frame..=last_frame).contains(&to_frame))
+                    })
+            });
         if !needs_change {
             self.session.selection = Selection::None;
             return Some((cell_count, 0, false));
         }
 
         self.history.snapshot(&self.state.project);
+        let before_audio = self.state.project.audio_clips.len();
+        self.state.project.audio_clips.retain(|clip| {
+            !audio_clips_to_remove.contains(&(
+                clip.q0rg_id,
+                clip.layer_id,
+                clip.start_frame,
+                clip.asset_id,
+            ))
+        });
+        let removed_audio = before_audio - self.state.project.audio_clips.len();
         let q0rg = self
             .state
             .project
@@ -4164,7 +5447,7 @@ impl EditorApp {
             .iter_mut()
             .find(|q0rg| q0rg.q0rg_id == q0rg_id)
             .expect("selected q0rg disappeared during timeline delete");
-        let mut removed_items = 0usize;
+        let mut removed_items = removed_audio;
         for layer_id in editable_layer_ids {
             let layer = q0rg
                 .layers
@@ -4187,7 +5470,9 @@ impl EditorApp {
                 }
             }
             for frame in first_frame..=last_frame {
-                layer.ensure_explicit_keyframe(frame);
+                if !audio_cells.contains(&(layer_id, frame)) {
+                    layer.ensure_explicit_keyframe(frame);
+                }
             }
         }
 
@@ -4472,6 +5757,10 @@ impl EditorApp {
             self.session.status = "locked timeline frames cannot be changed".to_string();
             return;
         }
+        if self.timeline_selection_touches_audio(selection) {
+            self.session.status = "audio frames cannot contain visual keyframes".to_string();
+            return;
+        }
         let before = self.state.project.clone();
         match crate::timeline_edit::materialize_selected_keyframes(
             &mut self.state.project,
@@ -4495,6 +5784,14 @@ impl EditorApp {
     }
 
     fn blank_timeline_selection(&mut self) {
+        if self
+            .session
+            .timeline_selection
+            .is_some_and(|selection| self.timeline_selection_touches_audio(selection))
+        {
+            self.session.status = "audio frames cannot contain blank keyframes".to_string();
+            return;
+        }
         match self.delete_timeline_selection() {
             Some((cell_count, _, false)) => {
                 self.session.status =
@@ -4598,6 +5895,37 @@ impl EditorApp {
             self.state.dirty = true;
         }
         extended
+    }
+
+    pub(crate) fn refresh_audio_playback(&mut self) -> Result<(), String> {
+        let has_audio = crate::audio::has_audible_timeline_audio(
+            &self.state.project,
+            self.session.current_q0rg_id,
+        );
+        if !has_audio {
+            if let Some(audio) = self.audio_playback.as_mut() {
+                audio.stop();
+            }
+            return Ok(());
+        }
+        if self.audio_playback.is_none() {
+            self.audio_playback = Some(crate::audio::EditorAudioPlayback::new()?);
+        }
+        self.audio_playback
+            .as_mut()
+            .expect("editor audio initialized")
+            .sync(
+                &self.state.project,
+                self.session.current_q0rg_id,
+                self.session.current_frame,
+                self.session.playing,
+            )
+    }
+
+    pub(crate) fn stop_audio_playback(&mut self) {
+        if let Some(audio) = self.audio_playback.as_mut() {
+            audio.stop();
+        }
     }
 
     fn go_to_frame(&mut self, requested: u16) {
@@ -4726,6 +6054,12 @@ impl EditorApp {
             self.session.status = "layer is locked".to_string();
             return false;
         }
+        if crate::audio::audio_clip_at_frame(&self.state.project, q0rg_id, layer_id, frame)
+            .is_some()
+        {
+            self.session.status = "audio frames cannot contain blank keyframes".to_string();
+            return false;
+        }
         let has_keyframe = self
             .state
             .project
@@ -4777,6 +6111,12 @@ impl EditorApp {
         let layer_id = self.session.current_layer_id;
         if self.state.project.layer_is_locked(q0rg_id, layer_id) {
             self.session.status = "layer is locked".to_string();
+            return 0;
+        }
+        if crate::audio::audio_clip_at_frame(&self.state.project, q0rg_id, layer_id, frame)
+            .is_some()
+        {
+            self.session.status = "audio frames cannot contain visual keyframes".to_string();
             return 0;
         }
         let active: Vec<(usize, q0s_format::v2::Transform2D)> = match self
@@ -4976,6 +6316,12 @@ impl EditorApp {
             self.session.status = "layer is locked".to_string();
             return;
         }
+        if self.timeline_selection_touches_audio(selection) {
+            let message = "audio frames cannot contain motion tweens".to_string();
+            self.session.tween_warning = Some(message.clone());
+            self.session.status = message;
+            return;
+        }
         let q0rg_id = self.session.current_q0rg_id;
         let visible_layer_ids =
             crate::panels::timeline::visible_layer_ids(&self.state.project, q0rg_id);
@@ -5002,6 +6348,24 @@ impl EditorApp {
                 self.session.status = error.message().to_string();
             }
         }
+    }
+
+    fn render_project_tree_dialog(&mut self, ctx: &Context) {
+        if !self.project_active || self.show_home || self.active_document_is_q0lang() {
+            return;
+        }
+        let mut open = self.show_project_tree;
+        egui::Window::new("Project")
+            .id(egui::Id::new("q0editor_project_tree_window"))
+            .open(&mut open)
+            .default_size([560.0, 600.0])
+            .min_size([420.0, 360.0])
+            .collapsible(false)
+            .resizable(true)
+            .show(ctx, |ui| {
+                panels::project_tree::render(self, ui);
+            });
+        self.show_project_tree = open;
     }
 
     fn render_credits_dialog(&mut self, ctx: &Context) {
@@ -5245,6 +6609,19 @@ impl EditorApp {
                         .small()
                         .color(self.settings.theme.text_dim.to_color32()),
                     );
+                    let q0lang_association_state =
+                        match crate::assoc::is_q0lang_registered_for_current_user() {
+                            Ok(true) => "active for this q0editor",
+                            Ok(false) => "not active",
+                            Err(_) => "status unavailable",
+                        };
+                    ui.label(
+                        egui::RichText::new(format!(
+                            ".q0l / .q0lang source files: {q0lang_association_state}. Both extensions are the same q0lang source format."
+                        ))
+                        .small()
+                        .color(self.settings.theme.text_dim.to_color32()),
+                    );
                     ui.horizontal(|ui| {
                         if ui.button("Register .q1s").clicked() {
                             match crate::assoc::register_for_current_user() {
@@ -5263,6 +6640,31 @@ impl EditorApp {
                                 Ok(()) => {
                                     self.session.status =
                                         ".q1s association removed".to_string()
+                                }
+                                Err(error) => {
+                                    self.session.status = format!("removal failed: {error}")
+                                }
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Register .q0l + .q0lang").clicked() {
+                            match crate::assoc::register_q0lang_for_current_user() {
+                                Ok(()) => {
+                                    self.session.status =
+                                        ".q0l and .q0lang files now open with q0editor".to_string()
+                                }
+                                Err(error) => {
+                                    self.session.status =
+                                        format!("q0lang association failed: {error}")
+                                }
+                            }
+                        }
+                        if ui.button("Remove q0lang associations").clicked() {
+                            match crate::assoc::unregister_q0lang_for_current_user() {
+                                Ok(()) => {
+                                    self.session.status =
+                                        ".q0l and .q0lang associations removed".to_string()
                                 }
                                 Err(error) => {
                                     self.session.status = format!("removal failed: {error}")
@@ -5298,8 +6700,11 @@ impl EditorApp {
                 "save failed: this q1s file is already open in another tab".to_string();
             return false;
         }
-        match file_io::save_project(path, &self.state.project) {
+        let mut project_to_save = self.state.project.clone();
+        self.rebase_project_dependencies_for_save(&mut project_to_save, path);
+        match file_io::save_project(path, &project_to_save) {
             Ok(_) => {
+                self.state.project = project_to_save;
                 self.state.dirty = false;
                 self.state.file_path = Some(path.to_path_buf());
                 self.settings.push_recent(path);
@@ -5320,11 +6725,56 @@ impl EditorApp {
     }
 
     fn open_from_path(&mut self, path: &std::path::Path) -> bool {
-        if let Some(tab_id) = self.find_project_tab_by_path(path) {
-            self.switch_to_project_tab(tab_id);
+        if let Some(tab_id) = self.find_document_tab_by_path(path) {
+            self.switch_to_document_tab(tab_id);
             self.session.status = format!("already open: {}", path.display());
             return true;
         }
+
+        if file_io::is_q0lang_path(path) {
+            match file_io::load_q0lang_document(path) {
+                Ok(text) => {
+                    let document = Q0langDocument {
+                        path: path.to_path_buf(),
+                        text,
+                        dirty: false,
+                        search: String::new(),
+                        replace: String::new(),
+                        show_find: false,
+                        show_replace: false,
+                    };
+                    if !self.activate_q0lang_document(document) {
+                        return false;
+                    }
+                    self.settings.push_recent(path);
+                    self.session.status = match self.settings.try_save() {
+                        Ok(()) => format!("opened {}", path.display()),
+                        Err(error) => format!(
+                            "opened {}; recent list was not saved: {error}",
+                            path.display()
+                        ),
+                    };
+                    return true;
+                }
+                Err(error) => {
+                    self.session.status = format!("open failed: {error}");
+                    return false;
+                }
+            }
+        }
+
+        let is_project = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case(file_io::Q1S_EXTENSION));
+        if !is_project {
+            self.session.status = format!(
+                "open failed: unsupported document type {} (expected .q1s, .q0l or .q0lang)",
+                path.display()
+            );
+            return false;
+        }
+
         match file_io::load_project(path) {
             Ok(project) => {
                 let workspace = self.workspace_for_project(project, Some(path.to_path_buf()));
@@ -5353,24 +6803,25 @@ impl EditorApp {
         let dropped = ctx.input(|input| input.raw.dropped_files.clone());
         let Some(file) = dropped.first() else { return };
         let Some(path) = file.path.as_ref() else {
-            self.session.status = "drop a .q1s project file from Explorer".to_string();
+            self.session.status = "drop a .q1s, .q0l or .q0lang document from Explorer".to_string();
             return;
         };
         let is_project = path
             .extension()
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| extension.eq_ignore_ascii_case(file_io::Q1S_EXTENSION));
-        if is_project {
+        if is_project || file_io::is_q0lang_path(path) {
             self.queue(Action::OpenProjectFromPath(path.clone()));
-        } else if self.show_home {
+        } else if self.show_home || !self.project_active {
             self.session.status = "open or create a project before importing media".to_string();
         } else if crate::bitmap_import::is_supported_bitmap_path(path)
             || file_io::is_supported_video_import_path(path)
+            || crate::audio::is_supported_audio_path(path)
         {
             self.queue(Action::ImportMediaFromPath(path.clone()));
         } else {
             self.session.status = format!(
-                "unsupported dropped file: {} (expected .q1s, png, jpg, webp, mp4 or q0v)",
+                "unsupported dropped file: {} (expected .q1s, .q0l, .q0lang, png, jpg, webp, wav, mp3, ogg, flac, mp4 or q0v)",
                 path.display()
             );
         }
@@ -5385,6 +6836,65 @@ impl EditorApp {
             return false;
         };
         self.save_to(&path)
+    }
+
+    fn save_q0lang_to(&mut self, path: &std::path::Path) -> bool {
+        if !file_io::is_q0lang_path(path) {
+            self.session.status = "save failed: q0lang source must use .q0l or .q0lang".to_string();
+            return false;
+        }
+        if self.another_document_tab_uses_path(path) {
+            self.session.status =
+                "save failed: this file is already open in another tab".to_string();
+            return false;
+        }
+        let Some(text) = self
+            .active_q0lang_document()
+            .map(|document| document.text.clone())
+        else {
+            return false;
+        };
+        match file_io::save_q0lang_document(path, &text) {
+            Ok(()) => {
+                if let Some(document) = self.active_q0lang_document_mut() {
+                    document.path = path.to_path_buf();
+                    document.dirty = false;
+                }
+                self.settings.push_recent(path);
+                self.session.status = match self.settings.try_save() {
+                    Ok(()) => format!("saved {}", path.display()),
+                    Err(error) => format!(
+                        "saved {}; recent list was not saved: {error}",
+                        path.display()
+                    ),
+                };
+                true
+            }
+            Err(error) => {
+                self.session.status = format!("save failed: {error}");
+                false
+            }
+        }
+    }
+
+    fn save_current_q0lang(&mut self) -> bool {
+        let Some(path) = self
+            .active_q0lang_document()
+            .map(|document| document.path.clone())
+        else {
+            return false;
+        };
+        self.save_q0lang_to(&path)
+    }
+
+    fn save_current_document(&mut self) -> bool {
+        if self.active_document_is_q0lang() {
+            self.save_current_q0lang()
+        } else if self.project_active {
+            self.save_current_project()
+        } else {
+            false
+        }
     }
 
     fn render_new_project_dialog(&mut self, ctx: &Context) {
@@ -5518,7 +7028,7 @@ impl EditorApp {
         };
 
         let destination = match action {
-            Action::CloseProjectTab(_) => "close this project tab",
+            Action::CloseDocumentTab(_) => "close this document tab",
             Action::Exit => "close q0editor",
             _ => "continue",
         };
@@ -5547,7 +7057,7 @@ impl EditorApp {
             });
 
         if save {
-            if self.save_current_project() {
+            if self.save_current_document() {
                 if let Some(action) = self.unsaved_action.take() {
                     self.handle(ctx, action);
                 }
@@ -5555,8 +7065,12 @@ impl EditorApp {
         } else if discard {
             if let Some(action) = self.unsaved_action.take() {
                 match action {
-                    Action::CloseProjectTab(_) | Action::Exit => {
-                        self.state.dirty = false;
+                    Action::CloseDocumentTab(_) | Action::Exit => {
+                        if self.project_active {
+                            self.state.dirty = false;
+                        } else if let Some(document) = self.active_q0lang_document_mut() {
+                            document.dirty = false;
+                        }
                         self.handle(ctx, action);
                     }
                     _ => {}
@@ -5664,7 +7178,9 @@ impl EditorApp {
             }
         }
 
-        if let Some((q0rg_id, frames, keyframes, tweens)) = self.pending_frame_truncate {
+        if let Some((q0rg_id, frames, keyframes, tweens, audio_clips, frame_scripts)) =
+            self.pending_frame_truncate
+        {
             let mut confirm = false;
             let mut cancel = false;
             egui::Window::new("Shorten symbol?")
@@ -5674,7 +7190,7 @@ impl EditorApp {
                 .show(ctx, |ui| {
                     ui.label(format!("Reduce the symbol to {frames} frame(s)?"));
                     ui.label(format!(
-                        "This removes {keyframes} keyframe(s) and {tweens} tween(s)."
+                        "This removes {keyframes} keyframe(s), {tweens} tween(s), {audio_clips} audio clip(s), and {frame_scripts} frame script(s)."
                     ));
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -5696,21 +7212,147 @@ impl EditorApp {
         }
     }
 
+    fn initialize_preview_q0lang_if_needed(&mut self) {
+        if self.session.preview_q0lang_initialized {
+            return;
+        }
+        self.session.preview_q0lang_initialized = true;
+        let source = self
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == self.session.current_q0rg_id)
+            .map(|q0rg| q0rg.script.clone())
+            .unwrap_or_default();
+        let mut transition_budget = MAX_PREVIEW_FRAME_SCRIPT_TRANSITIONS;
+        let entries_before = self.session.preview_frame_script_entries;
+        self.run_preview_q0lang_source_with_budget(&source, &mut transition_budget);
+        if self.session.preview_frame_script_entries == entries_before {
+            self.run_current_preview_frame_scripts(&mut transition_budget);
+        }
+    }
+
+    fn run_preview_q0lang_source_with_budget(
+        &mut self,
+        source: &str,
+        transition_budget: &mut usize,
+    ) {
+        let report = self.session.preview_q0lang_runtime.execute_source(source);
+        self.session
+            .preview_script_diagnostics
+            .extend(report.diagnostics);
+        self.apply_preview_q0lang_actions(&report.actions, transition_budget);
+    }
+
+    fn run_current_preview_frame_scripts(&mut self, transition_budget: &mut usize) {
+        let q0rg_id = self.session.current_q0rg_id;
+        let frame = self.session.current_frame;
+        self.session.preview_frame_script_entries =
+            self.session.preview_frame_script_entries.saturating_add(1);
+        let mut scripts = self
+            .state
+            .project
+            .runtime
+            .frame_scripts
+            .iter()
+            .enumerate()
+            .filter(|(_, script)| script.q0rg_id == q0rg_id && script.frame == frame)
+            .map(|(insertion_order, script)| {
+                (script.layer_id, insertion_order, script.source.clone())
+            })
+            .collect::<Vec<_>>();
+        scripts.sort_by_key(|(layer_id, insertion_order, _)| (*layer_id, *insertion_order));
+        for (_, _, source) in scripts {
+            self.run_preview_q0lang_source_with_budget(&source, transition_budget);
+        }
+    }
+
+    fn resolve_preview_timeline_target(&self, target: &TimelineTarget) -> Option<u16> {
+        match target {
+            TimelineTarget::Frame(frame) => Some(*frame),
+            TimelineTarget::Label(label) => label.parse::<u16>().ok(),
+        }
+    }
+
+    fn preview_runtime_transition_to_frame(
+        &mut self,
+        requested: u16,
+        transition_budget: &mut usize,
+    ) {
+        if *transition_budget == 0 {
+            self.session.preview_script_diagnostics.push(RuntimeDiagnostic {
+                line: 0,
+                message: format!(
+                    "frame-script transition budget exceeded ({MAX_PREVIEW_FRAME_SCRIPT_TRANSITIONS})"
+                ),
+            });
+            return;
+        }
+        *transition_budget -= 1;
+        let last_frame = self
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == self.session.current_q0rg_id)
+            .map(|q0rg| q0rg.frame_count.saturating_sub(1))
+            .unwrap_or(0);
+        self.session.current_frame = requested.min(last_frame);
+        self.session.pending_timeline_frame = None;
+        self.session.preview_audio_resync_needed = true;
+        self.run_current_preview_frame_scripts(transition_budget);
+    }
+
+    fn apply_preview_q0lang_actions(
+        &mut self,
+        actions: &[RuntimeAction],
+        transition_budget: &mut usize,
+    ) {
+        for action in actions {
+            match action {
+                RuntimeAction::GoRun(target) => {
+                    self.session.playing = true;
+                    if let Some(frame) = self.resolve_preview_timeline_target(target) {
+                        self.preview_runtime_transition_to_frame(frame, transition_budget);
+                    }
+                }
+                RuntimeAction::GoStop(target) => {
+                    self.session.playing = false;
+                    if let Some(frame) = self.resolve_preview_timeline_target(target) {
+                        self.preview_runtime_transition_to_frame(frame, transition_budget);
+                    }
+                }
+                RuntimeAction::ShellCommand { .. }
+                | RuntimeAction::SceneSwitch { .. }
+                | RuntimeAction::RigSetPosition { .. }
+                | RuntimeAction::RigSetValue { .. }
+                | RuntimeAction::RigReset { .. }
+                | RuntimeAction::RigSetPose { .. }
+                | RuntimeAction::RigResetPose { .. } => {
+                    // Preview intentionally exposes no shell/filesystem capability and
+                    // does not mutate authored rig data. Runtime scene overrides are
+                    // introduced by the host-api phase rather than by writing the project.
+                }
+            }
+        }
+    }
+
     fn tick_playback(&mut self) {
         if !self.session.playing {
             self.session.last_tick = Instant::now();
             return;
         }
+        if let Some(audio) = self.audio_playback.as_mut() {
+            audio.pump(&self.state.project, self.session.current_q0rg_id);
+        }
         let now = Instant::now();
         let dt = (now - self.session.last_tick).as_secs_f32();
         let fps = self.state.project.meta.fps.max(1) as f32;
-        let frames = (dt * fps) as i32;
+        let frames = (dt * fps) as u32;
         if frames < 1 {
             return;
         }
-        // Keep the sub-frame remainder instead of resetting to `now`.
-        // Otherwise frequent repaints systematically lose time and make
-        // playback run slower than the project's FPS.
         self.session.last_tick += Duration::from_secs_f32(frames as f32 / fps);
         let total = self
             .state
@@ -5720,12 +7362,21 @@ impl EditorApp {
             .find(|q| q.q0rg_id == self.session.current_q0rg_id)
             .map(|q| q.frame_count.max(1))
             .unwrap_or(1);
-        let mut next = self.session.current_frame as i32 + frames;
-        next %= total as i32;
-        if next < 0 {
-            next += total as i32;
+        let mut transition_budget = MAX_PREVIEW_FRAME_SCRIPT_TRANSITIONS;
+        for _ in 0..frames {
+            let next = self.session.current_frame.saturating_add(1);
+            self.session.current_frame = if next >= total { 0 } else { next };
+            self.run_current_preview_frame_scripts(&mut transition_budget);
+            if !self.session.playing {
+                break;
+            }
         }
-        self.session.current_frame = next as u16;
+        if self.session.preview_audio_resync_needed {
+            self.session.preview_audio_resync_needed = false;
+            if let Err(error) = self.refresh_audio_playback() {
+                self.session.status = format!("frame-code audio warning: {error}");
+            }
+        }
     }
 }
 
@@ -5757,6 +7408,7 @@ impl App for EditorApp {
             let _ = crate::q0lang::fonts::install(ctx, &self.settings.q0lang_font_name);
             self.q0lang_font_installed = true;
         }
+        self.poll_external_open_requests(ctx);
         self.poll_media_import();
         if ctx.input(|input| input.viewport().close_requested()) && !self.close_requested {
             if self.media_import_job.is_some() {
@@ -5768,7 +7420,7 @@ impl App for EditorApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.session.status =
                     "q0enc export is active; cancel it before closing q0editor".to_string();
-            } else if self.has_dirty_projects() {
+            } else if self.has_dirty_documents() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 if self.unsaved_action.is_none() {
                     self.handle(ctx, Action::Exit);
@@ -5783,9 +7435,11 @@ impl App for EditorApp {
         } else {
             panels::menu::handle_global_shortcuts(self, ctx);
         }
-        self.tick_playback();
-        self.session
-            .clear_inactive_frame_selection(&self.state.project);
+        if self.project_active {
+            self.tick_playback();
+            self.session
+                .clear_inactive_frame_selection(&self.state.project);
+        }
 
         egui::TopBottomPanel::top("menu_bar")
             .resizable(false)
@@ -5797,6 +7451,10 @@ impl App for EditorApp {
         if self.show_home {
             egui::CentralPanel::default().show(ctx, |ui| {
                 panels::home::render(self, ui);
+            });
+        } else if self.active_document_is_q0lang() {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                crate::q0lang::editor::render_standalone(self, ui);
             });
         } else {
             egui::TopBottomPanel::bottom("timeline")
@@ -5839,10 +7497,14 @@ impl App for EditorApp {
 
             panels::q0enc::render(self, ctx);
             crate::q0lang::render(self, ctx);
+            crate::q0lang::frame_editor::render(self, ctx);
             crate::easing::render_editor(self, ctx);
             crate::easing::render_warning(self, ctx);
         }
 
+        if self.show_project_tree {
+            self.render_project_tree_dialog(ctx);
+        }
         if self.session.show_credits {
             self.render_credits_dialog(ctx);
         }
@@ -5856,6 +7518,16 @@ impl App for EditorApp {
         // Update window title
         let title = if self.show_home {
             "q0editor - home".to_string()
+        } else if let Some(document) = self.active_q0lang_document() {
+            let name = document
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("script.q0l");
+            format!(
+                "q0editor - {name}{}",
+                if document.dirty { " *" } else { "" }
+            )
         } else {
             self.state.title()
         };
@@ -5865,8 +7537,10 @@ impl App for EditorApp {
         for status in self.q0enc.poll_events() {
             self.session.status = status;
         }
-        self.session
-            .clear_inactive_frame_selection(&self.state.project);
+        if self.project_active {
+            self.session
+                .clear_inactive_frame_selection(&self.state.project);
+        }
 
         if self.media_import_job.is_some() {
             ctx.request_repaint_after(Duration::from_millis(50));
@@ -6068,6 +7742,33 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_nanos()
+    }
+
+    fn test_audio_q0v_bytes(sample_rate: u32, sample_frames: u32) -> Vec<u8> {
+        let spec = q0video::q0v::Q0vSpec {
+            width: 0,
+            height: 0,
+            fps: sample_rate,
+            timeline_frames: sample_frames,
+            video: false,
+            audio: true,
+            audio_sample_rate: sample_rate,
+            audio_channels: 2,
+        };
+        let mut writer = q0video::q0v::Q0vWriter::new(Cursor::new(Vec::new()), spec)
+            .expect("create audio q0v fixture");
+        let mut pcm = Vec::with_capacity(sample_frames as usize * 2);
+        for sample in 0..sample_frames {
+            let value = if sample % 2 == 0 { 12_000 } else { -12_000 };
+            pcm.extend_from_slice(&[value, -value]);
+        }
+        writer
+            .write_audio_pcm_i16(&pcm)
+            .expect("write audio q0v fixture");
+        writer
+            .finish()
+            .expect("finish audio q0v fixture")
+            .into_inner()
     }
 
     fn test_q0v_bytes(fps: u32, frames: u32) -> Vec<u8> {
@@ -6503,7 +8204,7 @@ mod tests {
 
         assert_eq!(app.state.project.meta.name, "Current work");
         assert_eq!(app.new_project_dialog, Some(NewProjectSpec::default()));
-        assert_eq!(app.project_tabs.len(), 1);
+        assert_eq!(app.document_tabs.len(), 1);
     }
 
     #[test]
@@ -6539,7 +8240,7 @@ mod tests {
                 ..NewProjectSpec::default()
             }),
         );
-        let first_tab = app.active_project_tab.expect("first project tab");
+        let first_tab = app.active_document_tab.expect("first project tab");
         app.state.dirty = true;
         app.session.current_frame = 7;
 
@@ -6551,16 +8252,16 @@ mod tests {
             }),
         );
 
-        assert_eq!(app.project_tabs.len(), 2);
+        assert_eq!(app.document_tabs.len(), 2);
         assert_eq!(app.state.project.meta.name, "Next");
-        assert!(app.switch_to_project_tab(first_tab));
+        assert!(app.switch_to_document_tab(first_tab));
         assert_eq!(app.state.project.meta.name, "Unsaved work");
         assert!(app.state.dirty);
         assert_eq!(app.session.current_frame, 7);
     }
 
     #[test]
-    fn saved_project_tabs_use_file_stems_instead_of_stale_meta_names() {
+    fn saved_document_tabs_use_file_stems_instead_of_stale_meta_names() {
         let mut app = EditorApp::default();
         app.handle(
             &Context::default(),
@@ -6574,7 +8275,7 @@ mod tests {
         );
         app.state.file_path = Some(PathBuf::from(r"F:\projects\advanced smoke\smoke-lag.q1s"));
 
-        let summaries = app.project_tab_summaries();
+        let summaries = app.document_tab_summaries();
         let titles = summaries
             .iter()
             .map(|tab| tab.title.as_str())
@@ -6582,7 +8283,7 @@ mod tests {
         assert_eq!(titles, vec!["APPROVED", "smoke-lag"]);
     }
     #[test]
-    fn home_and_project_tabs_preserve_independent_document_state() {
+    fn home_and_document_tabs_preserve_independent_document_state() {
         let mut app = EditorApp::default();
         app.handle(
             &Context::default(),
@@ -6592,7 +8293,7 @@ mod tests {
                 ..NewProjectSpec::default()
             }),
         );
-        let alpha = app.active_project_tab.expect("alpha tab");
+        let alpha = app.active_document_tab.expect("alpha tab");
         app.session.current_frame = 12;
         app.state.dirty = true;
 
@@ -6604,17 +8305,17 @@ mod tests {
                 ..NewProjectSpec::default()
             }),
         );
-        let beta = app.active_project_tab.expect("beta tab");
+        let beta = app.active_document_tab.expect("beta tab");
         app.session.current_frame = 3;
 
         assert!(app.switch_to_home());
         assert!(app.home_visible());
-        assert_eq!(app.project_tab_summaries().len(), 2);
-        assert!(app.switch_to_project_tab(alpha));
+        assert_eq!(app.document_tab_summaries().len(), 2);
+        assert!(app.switch_to_document_tab(alpha));
         assert_eq!(app.state.project.meta.name, "Alpha");
         assert_eq!(app.session.current_frame, 12);
         assert!(app.state.dirty);
-        assert!(app.switch_to_project_tab(beta));
+        assert!(app.switch_to_document_tab(beta));
         assert_eq!(app.state.project.meta.name, "Beta");
         assert_eq!(app.session.current_frame, 3);
         assert!(!app.state.dirty);
@@ -6630,7 +8331,7 @@ mod tests {
                 ..NewProjectSpec::default()
             }),
         );
-        let alpha = app.active_project_tab.expect("alpha tab");
+        let alpha = app.active_document_tab.expect("alpha tab");
         app.handle(
             &Context::default(),
             Action::CreateProject(NewProjectSpec {
@@ -6638,16 +8339,16 @@ mod tests {
                 ..NewProjectSpec::default()
             }),
         );
-        let beta = app.active_project_tab.expect("beta tab");
+        let beta = app.active_document_tab.expect("beta tab");
 
         app.cycle_document_tab(1);
         assert!(app.home_visible());
         app.cycle_document_tab(1);
-        assert_eq!(app.active_project_tab, Some(alpha));
+        assert_eq!(app.active_document_tab, Some(alpha));
         app.cycle_document_tab(1);
-        assert_eq!(app.active_project_tab, Some(beta));
+        assert_eq!(app.active_document_tab, Some(beta));
         app.cycle_document_tab(-1);
-        assert_eq!(app.active_project_tab, Some(alpha));
+        assert_eq!(app.active_document_tab, Some(alpha));
     }
 
     #[test]
@@ -6657,15 +8358,15 @@ mod tests {
             &Context::default(),
             Action::CreateProject(NewProjectSpec::default()),
         );
-        let tab_id = app.active_project_tab.expect("project tab");
+        let tab_id = app.active_document_tab.expect("project tab");
         app.state.dirty = true;
 
-        app.handle(&Context::default(), Action::CloseProjectTab(tab_id));
+        app.handle(&Context::default(), Action::CloseDocumentTab(tab_id));
 
-        assert_eq!(app.project_tabs.len(), 1);
+        assert_eq!(app.document_tabs.len(), 1);
         assert!(matches!(
             app.unsaved_action,
-            Some(Action::CloseProjectTab(id)) if id == tab_id
+            Some(Action::CloseDocumentTab(id)) if id == tab_id
         ));
     }
 
@@ -6679,7 +8380,7 @@ mod tests {
                 ..NewProjectSpec::default()
             }),
         );
-        let alpha = app.active_project_tab.expect("alpha tab");
+        let alpha = app.active_document_tab.expect("alpha tab");
         app.state.dirty = true;
         app.handle(
             &Context::default(),
@@ -6688,17 +8389,17 @@ mod tests {
                 ..NewProjectSpec::default()
             }),
         );
-        let beta = app.active_project_tab.expect("beta tab");
+        let beta = app.active_document_tab.expect("beta tab");
         app.state.dirty = true;
 
         app.handle(&Context::default(), Action::Exit);
-        assert_eq!(app.active_project_tab, Some(alpha));
+        assert_eq!(app.active_document_tab, Some(alpha));
         assert!(matches!(app.unsaved_action, Some(Action::Exit)));
 
         app.unsaved_action = None;
         app.state.dirty = false;
         app.handle(&Context::default(), Action::Exit);
-        assert_eq!(app.active_project_tab, Some(beta));
+        assert_eq!(app.active_document_tab, Some(beta));
         assert!(matches!(app.unsaved_action, Some(Action::Exit)));
 
         app.unsaved_action = None;
@@ -7323,6 +9024,24 @@ mod tests {
         assert_eq!(bitmap.rgba, vec![255, 0, 0, 255, 0, 255, 0, 128]);
         assert!(matches!(app.session.selection, Selection::Asset(id) if id == bitmap.asset_id));
         assert!(app.state.dirty);
+    }
+
+    #[test]
+    fn project_tree_window_is_independent_from_settings_and_credits() {
+        let mut app = EditorApp::default();
+        app.session.show_settings = true;
+        app.session.show_credits = true;
+        assert!(!app.project_tree_open());
+
+        app.handle(&Context::default(), Action::ToggleProjectTree);
+        assert!(app.project_tree_open());
+        assert!(app.session.show_settings);
+        assert!(app.session.show_credits);
+
+        app.handle(&Context::default(), Action::ToggleProjectTree);
+        assert!(!app.project_tree_open());
+        assert!(app.session.show_settings);
+        assert!(app.session.show_credits);
     }
 
     #[test]
@@ -8092,7 +9811,10 @@ mod tests {
         app.handle(&Context::default(), Action::SetQ0rgFrameCount(1, 8));
 
         assert_eq!(app.state.project.q0rgs[0].frame_count, 24);
-        assert!(matches!(app.pending_frame_truncate, Some((1, 8, 1, 0))));
+        assert!(matches!(
+            app.pending_frame_truncate,
+            Some((1, 8, 1, 0, 0, 0))
+        ));
         assert!(!app.state.dirty);
     }
     #[test]
@@ -8585,6 +10307,192 @@ mod tests {
     }
 
     #[test]
+    fn audio_only_library_item_cannot_be_placed_on_stage() {
+        let mut app = EditorApp::default();
+        app.state.project.assets.push(Asset::Q0v(Q0vAsset {
+            asset_id: 77,
+            bytes: test_audio_q0v_bytes(48_000, 4_800),
+        }));
+        let before: usize = app.state.project.q0rgs[0]
+            .layers
+            .iter()
+            .map(|layer| layer.placements.len())
+            .sum();
+        app.handle(
+            &Context::default(),
+            Action::PlaceLibraryItemAt(LibraryItem::Asset(77), Vec2::new(120.0, 80.0)),
+        );
+        let after: usize = app.state.project.q0rgs[0]
+            .layers
+            .iter()
+            .map(|layer| layer.placements.len())
+            .sum();
+        assert_eq!(after, before, "audio must never become a stage object");
+        assert!(matches!(app.session.selection, Selection::None));
+        assert!(app.session.status.contains("timeline"));
+    }
+
+    #[test]
+    fn audio_timeline_drop_stays_on_target_layer_without_creating_keyframes() {
+        let mut app = EditorApp::default();
+        app.state.project.meta.fps = 24;
+        app.state.project.q0rgs[0].frame_count = 4;
+        app.state.project.q0rgs[0].layers[0]
+            .explicit_keyframes
+            .clear();
+        app.state.project.assets.push(Asset::Q0v(Q0vAsset {
+            asset_id: 77,
+            bytes: test_audio_q0v_bytes(48_000, 48_000),
+        }));
+        let layer_count_before = app.state.project.q0rgs[0].layers.len();
+
+        app.handle(
+            &Context::default(),
+            Action::PlaceLibraryItemOnTimeline(LibraryItem::Asset(77), 1, 2),
+        );
+
+        assert_eq!(app.state.project.q0rgs[0].layers.len(), layer_count_before);
+        let layer = &app.state.project.q0rgs[0].layers[0];
+        assert_eq!(layer.layer_id, 1);
+        assert!(layer.placements.is_empty());
+        assert!(layer.explicit_keyframes.is_empty());
+        assert_eq!(app.state.project.audio_clips.len(), 1);
+        let clip = app.state.project.audio_clips[0];
+        assert_eq!(clip.q0rg_id, 1);
+        assert_eq!(clip.layer_id, 1);
+        assert_eq!(clip.start_frame, 2);
+        assert_eq!(clip.asset_id, 77);
+        assert!(matches!(app.session.selection, Selection::None));
+        assert_eq!(
+            app.session.timeline_selection,
+            Some(crate::state::TimelineSelection::single(1, 2))
+        );
+        assert_eq!(app.state.project.q0rgs[0].frame_count, 26);
+        q0s_format::v2::validate(&app.state.project).expect("audio timeline project");
+    }
+
+    #[test]
+    fn audio_timeline_range_rejects_visual_and_blank_keyframes() {
+        let mut app = EditorApp::default();
+        app.state.project.meta.fps = 24;
+        app.state.project.q0rgs[0].frame_count = 30;
+        app.state.project.q0rgs[0].layers[0]
+            .explicit_keyframes
+            .clear();
+        app.state.project.assets.push(Asset::Q0v(Q0vAsset {
+            asset_id: 77,
+            bytes: test_audio_q0v_bytes(48_000, 48_000),
+        }));
+        app.handle(
+            &Context::default(),
+            Action::PlaceLibraryItemOnTimeline(LibraryItem::Asset(77), 1, 2),
+        );
+
+        app.session.current_layer_id = 1;
+        app.session.current_frame = 8;
+        app.session.timeline_selection = Some(crate::state::TimelineSelection::single(1, 8));
+        app.handle(&Context::default(), Action::InsertKeyframe);
+        app.handle(&Context::default(), Action::InsertBlankKeyframe);
+
+        let layer = &app.state.project.q0rgs[0].layers[0];
+        assert!(!layer.has_keyframe(8));
+        assert!(layer
+            .placements
+            .iter()
+            .all(|placement| placement.frame != 8));
+        assert!(app.session.status.contains("audio frames"));
+        q0s_format::v2::validate(&app.state.project).expect("audio keyframe guard project");
+    }
+
+    #[test]
+    fn frame_clipboard_cannot_paste_visual_content_into_audio_range() {
+        let mut app = app_with_one_timeline_object(30);
+        app.state.project.q0rgs[0].layers.push(Layer {
+            layer_id: 2,
+            name: "audio row".to_string(),
+            explicit_keyframes: Vec::new(),
+            placements: Vec::new(),
+        });
+        app.state.project.assets.push(Asset::Vector(VectorAsset {
+            asset_id: 77,
+            paths: vec![test_square(0.0, 20.0)],
+            fill: None,
+            stroke: None,
+        }));
+        app.state.project.assets.push(Asset::Q0v(Q0vAsset {
+            asset_id: 78,
+            bytes: test_audio_q0v_bytes(48_000, 48_000),
+        }));
+        app.handle(
+            &Context::default(),
+            Action::PlaceLibraryItemOnTimeline(LibraryItem::Asset(78), 2, 2),
+        );
+
+        app.session.current_layer_id = 1;
+        app.session.current_frame = 0;
+        app.session.timeline_selection = Some(TimelineSelection::single(1, 0));
+        app.handle(&Context::default(), Action::CopySelection);
+
+        app.session.current_layer_id = 2;
+        app.session.current_frame = 8;
+        app.session.timeline_selection = Some(TimelineSelection::single(2, 8));
+        app.handle(&Context::default(), Action::Paste);
+
+        let audio_layer = app.state.project.q0rgs[0]
+            .layers
+            .iter()
+            .find(|layer| layer.layer_id == 2)
+            .expect("audio layer");
+        assert!(audio_layer.placements.is_empty());
+        assert!(!audio_layer.has_keyframe(8));
+        assert!(app.session.status.contains("audio range"));
+        assert_eq!(app.state.project.audio_clips.len(), 1);
+        q0s_format::v2::validate(&app.state.project).expect("audio clipboard guard project");
+    }
+
+    #[test]
+    fn remove_frame_columns_shift_or_remove_timeline_audio_clips_safely() {
+        let mut app = EditorApp::default();
+        app.state.project.meta.fps = 24;
+        app.state.project.q0rgs[0].frame_count = 60;
+        app.state.project.q0rgs[0].layers[0]
+            .explicit_keyframes
+            .clear();
+        app.state.project.assets.push(Asset::Q0v(Q0vAsset {
+            asset_id: 77,
+            bytes: test_audio_q0v_bytes(48_000, 48_000),
+        }));
+        app.handle(
+            &Context::default(),
+            Action::PlaceLibraryItemOnTimeline(LibraryItem::Asset(77), 1, 20),
+        );
+        assert_eq!(app.state.project.audio_clips[0].start_frame, 20);
+
+        app.session.timeline_selection = Some(TimelineSelection {
+            anchor_layer_id: 1,
+            anchor_frame: 2,
+            focus_layer_id: 1,
+            focus_frame: 4,
+        });
+        app.session.current_frame = 4;
+        app.handle(&Context::default(), Action::RemoveFrame);
+        assert_eq!(app.state.project.audio_clips.len(), 1);
+        assert_eq!(app.state.project.audio_clips[0].start_frame, 17);
+        q0s_format::v2::validate(&app.state.project).expect("shifted audio clip project");
+
+        app.session.timeline_selection = Some(TimelineSelection {
+            anchor_layer_id: 1,
+            anchor_frame: 18,
+            focus_layer_id: 1,
+            focus_frame: 19,
+        });
+        app.session.current_frame = 19;
+        app.handle(&Context::default(), Action::RemoveFrame);
+        assert!(app.state.project.audio_clips.is_empty());
+        q0s_format::v2::validate(&app.state.project).expect("cut audio clip project");
+    }
+
+    #[test]
     fn q0v_timeline_drop_creates_an_independent_finite_video_layer() {
         let mut app = EditorApp::default();
         app.state.project.meta.fps = 20;
@@ -8692,5 +10600,155 @@ mod tests {
             Action::ToggleLayerLock(q0rg_id, layer_id),
         );
         assert!(!app.state.project.layer_is_locked(q0rg_id, layer_id));
+    }
+
+    fn preview_runtime_var(app: &EditorApp, name: &str) -> Option<String> {
+        app.session
+            .preview_q0lang_runtime
+            .vars
+            .get(name)
+            .map(|value| value.display_lossy())
+    }
+
+    #[test]
+    fn editor_preview_runs_frame_zero_after_runtime_init() {
+        let mut app = EditorApp::default();
+        app.state
+            .project
+            .runtime
+            .frame_scripts
+            .push(q0s_format::v2::FrameScript {
+                q0rg_id: 1,
+                layer_id: 1,
+                frame: 0,
+                source: "init = 7\n".into(),
+            });
+        app.initialize_preview_q0lang_if_needed();
+        assert_eq!(preview_runtime_var(&app, "init").as_deref(), Some("7"));
+        assert_eq!(app.session.preview_frame_script_entries, 1);
+    }
+
+    #[test]
+    fn editor_scrub_does_not_execute_frame_code() {
+        let mut app = EditorApp::default();
+        app.state
+            .project
+            .runtime
+            .frame_scripts
+            .push(q0s_format::v2::FrameScript {
+                q0rg_id: 1,
+                layer_id: 1,
+                frame: 5,
+                source: "scrubbed = 1\n".into(),
+            });
+        app.initialize_preview_q0lang_if_needed();
+        app.go_to_frame(5);
+        assert_eq!(app.session.current_frame, 5);
+        assert!(preview_runtime_var(&app, "scrubbed").is_none());
+    }
+
+    #[test]
+    fn editor_playback_executes_each_entered_frame_script() {
+        let mut app = EditorApp::default();
+        app.state
+            .project
+            .runtime
+            .frame_scripts
+            .push(q0s_format::v2::FrameScript {
+                q0rg_id: 1,
+                layer_id: 1,
+                frame: 1,
+                source: "entered = 1\n".into(),
+            });
+        app.session.playing = true;
+        app.initialize_preview_q0lang_if_needed();
+        app.session.last_tick = Instant::now() - Duration::from_secs_f32(1.1 / 24.0);
+        app.tick_playback();
+        assert_eq!(app.session.current_frame, 1);
+        assert_eq!(preview_runtime_var(&app, "entered").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn editor_runtime_goto_executes_destination_and_skips_intermediate_scripts() {
+        let mut app = EditorApp::default();
+        app.state.project.runtime.frame_scripts.extend([
+            q0s_format::v2::FrameScript {
+                q0rg_id: 1,
+                layer_id: 1,
+                frame: 1,
+                source: "gorun! 3\n".into(),
+            },
+            q0s_format::v2::FrameScript {
+                q0rg_id: 1,
+                layer_id: 1,
+                frame: 2,
+                source: "middle = 1\n".into(),
+            },
+            q0s_format::v2::FrameScript {
+                q0rg_id: 1,
+                layer_id: 1,
+                frame: 3,
+                source: "destination = 1\n".into(),
+            },
+        ]);
+        let mut budget = MAX_PREVIEW_FRAME_SCRIPT_TRANSITIONS;
+        app.preview_runtime_transition_to_frame(1, &mut budget);
+        assert_eq!(app.session.current_frame, 3);
+        assert!(preview_runtime_var(&app, "middle").is_none());
+        assert_eq!(
+            preview_runtime_var(&app, "destination").as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn editor_preview_self_jump_stops_at_transition_budget() {
+        let mut app = EditorApp::default();
+        app.state
+            .project
+            .runtime
+            .frame_scripts
+            .push(q0s_format::v2::FrameScript {
+                q0rg_id: 1,
+                layer_id: 1,
+                frame: 1,
+                source: "gorun! 1\n".into(),
+            });
+        let mut budget = MAX_PREVIEW_FRAME_SCRIPT_TRANSITIONS;
+        app.preview_runtime_transition_to_frame(1, &mut budget);
+        assert_eq!(app.session.current_frame, 1);
+        assert!(app
+            .session
+            .preview_script_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("transition budget exceeded")));
+    }
+
+    #[test]
+    fn editor_preview_orders_same_frame_scripts_by_layer() {
+        let mut app = EditorApp::default();
+        app.state.project.q0rgs[0].layers.push(Layer {
+            layer_id: 2,
+            name: "second".into(),
+            explicit_keyframes: Vec::new(),
+            placements: Vec::new(),
+        });
+        app.state.project.runtime.frame_scripts.extend([
+            q0s_format::v2::FrameScript {
+                q0rg_id: 1,
+                layer_id: 2,
+                frame: 1,
+                source: "order = 2\n".into(),
+            },
+            q0s_format::v2::FrameScript {
+                q0rg_id: 1,
+                layer_id: 1,
+                frame: 1,
+                source: "order = 1\n".into(),
+            },
+        ]);
+        let mut budget = MAX_PREVIEW_FRAME_SCRIPT_TRANSITIONS;
+        app.preview_runtime_transition_to_frame(1, &mut budget);
+        assert_eq!(preview_runtime_var(&app, "order").as_deref(), Some("2"));
     }
 }
