@@ -6370,10 +6370,17 @@ impl EditorApp {
 
     fn render_credits_dialog(&mut self, ctx: &Context) {
         let mut open = self.session.show_credits;
+        let screen = ctx.screen_rect();
+        let initial_pos = egui::pos2(
+            (screen.center().x - 380.0).max(16.0),
+            (screen.center().y - 335.0).max(40.0),
+        );
         egui::Window::new("Credits")
             .open(&mut open)
-            .default_size([720.0, 620.0])
+            .default_pos(initial_pos)
+            .default_size([760.0, 590.0])
             .min_size([500.0, 440.0])
+            .max_height((screen.height() - 90.0).max(360.0))
             .collapsible(false)
             .resizable(true)
             .show(ctx, |ui| {

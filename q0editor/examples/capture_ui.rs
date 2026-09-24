@@ -1,13 +1,13 @@
 //! Capture real egui frames without changing the user's projects or settings.
 //! cargo run -p q0editor --example capture_ui -- out/ui home dark 1280 800
-//! Screens: home, new, workspace, settings, export. Themes: any built-in id.
+//! Screens: home, new, workspace, settings, export, credits. Themes: any built-in id.
 //! Optional final argument: milliseconds to settle before capture (default 1000).
 
 use eframe::App;
 use q0editor::{
+    EditorApp,
     app::{Action, NewProjectSpec},
     settings::{Settings, Theme},
-    EditorApp,
 };
 use std::path::PathBuf;
 
@@ -70,7 +70,7 @@ fn main() -> eframe::Result<()> {
     let dir = PathBuf::from(args.get(1).map(String::as_str).unwrap_or("out/ui"));
     let screen = args.get(2).map(String::as_str).unwrap_or("home");
     assert!(
-        ["home", "new", "workspace", "settings", "export"].contains(&screen),
+        ["home", "new", "workspace", "settings", "export", "credits"].contains(&screen),
         "unknown screen"
     );
     let theme_id = args.get(3).map(String::as_str).unwrap_or("dark");
@@ -101,7 +101,7 @@ fn main() -> eframe::Result<()> {
         theme: Theme::from_builtin(preset),
         ..Settings::default()
     };
-    if ["workspace", "export"].contains(&screen) {
+    if ["workspace", "export", "credits"].contains(&screen) {
         editor.queue(Action::CreateProject(NewProjectSpec {
             name: "Motion study".into(),
             ..NewProjectSpec::default()
@@ -112,6 +112,7 @@ fn main() -> eframe::Result<()> {
         "new" => editor.queue(Action::NewProject),
         "settings" => editor.session.show_settings = true,
         "export" => editor.queue(Action::OpenQ0Enc),
+        "credits" => editor.queue(Action::ToggleCredits),
         _ => {}
     }
     eframe::run_native(
