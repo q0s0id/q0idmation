@@ -156,17 +156,16 @@ fn selected_raw_vectors(project: &ProjectV2, selection: &Selection) -> Vec<RawVe
         placements,
         bounds_min,
         bounds_max,
+        clip_polygon,
         ..
     } = selection
     else {
         return Vec::new();
     };
-    let clip = MultiPolygon(vec![crate::tools::rect_polygon((
-        bounds_min.x,
-        bounds_min.y,
-        bounds_max.x,
-        bounds_max.y,
-    ))]);
+    let clip = MultiPolygon(vec![crate::tools::selection_clip_polygon(
+        (bounds_min.x, bounds_min.y, bounds_max.x, bounds_max.y),
+        clip_polygon.as_deref(),
+    )]);
     let mut vectors = Vec::new();
     for reference in placements {
         let Some(placement) = placement_clone(project, *reference) else {
@@ -180,6 +179,21 @@ fn selected_raw_vectors(project: &ProjectV2, selection: &Selection) -> Vec<RawVe
         else {
             continue;
         };
+        if vector.fill.is_none() && vector.stroke.is_some() && clip_polygon.is_some() {
+            let (paths, _) = crate::tools::clip_stroked_paths(vector, &clip.0[0]);
+            if !paths.is_empty() {
+                vectors.push(RawVectorClipboard {
+                    vector: VectorAsset {
+                        asset_id: 0,
+                        paths,
+                        fill: None,
+                        stroke: vector.stroke,
+                    },
+                    appearance: None,
+                });
+            }
+            continue;
+        }
         let source = crate::tools::vector_fill_geometry(vector);
 
         #[cfg(feature = "appearance-mask-eraser")]
@@ -532,14 +546,13 @@ pub fn remove_raw_area_and_objects(
     objects: &[PlacementRef],
     bounds_min: Vec2,
     bounds_max: Vec2,
+    clip_polygon: Option<&[Vec2]>,
     frame: u16,
 ) -> bool {
-    let clip = MultiPolygon(vec![crate::tools::rect_polygon((
-        bounds_min.x,
-        bounds_min.y,
-        bounds_max.x,
-        bounds_max.y,
-    ))]);
+    let clip = MultiPolygon(vec![crate::tools::selection_clip_polygon(
+        (bounds_min.x, bounds_min.y, bounds_max.x, bounds_max.y),
+        clip_polygon,
+    )]);
     let affected_layers: BTreeSet<(u16, u16)> = raw_placements
         .iter()
         .chain(objects.iter())
@@ -606,6 +619,23 @@ pub fn remove_raw_area_and_objects(
         else {
             continue;
         };
+        if snapshot.fill.is_none() && snapshot.stroke.is_some() && clip_polygon.is_some() {
+            let (selected, remainder) = crate::tools::clip_stroked_paths(&snapshot, &clip.0[0]);
+            if selected.is_empty() {
+                continue;
+            }
+            changed = true;
+            if remainder.is_empty() {
+                remove_refs.push(*reference);
+            } else if let Some(Asset::Vector(vector)) = project
+                .assets
+                .iter_mut()
+                .find(|asset| asset.id() == asset_id)
+            {
+                vector.paths = remainder;
+            }
+            continue;
+        }
         let surface = crate::tools::vector_fill_geometry(&snapshot);
         let selected = surface.intersection(&clip);
         #[cfg(feature = "appearance-mask-eraser")]
@@ -722,6 +752,7 @@ pub fn selection_from_paste(result: PasteResult) -> Selection {
             objects: result.objects,
             bounds_min,
             bounds_max,
+            clip_polygon: None,
         };
     }
     if !result.raw_paths.is_empty() {

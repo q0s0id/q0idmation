@@ -3621,6 +3621,7 @@ impl EditorApp {
             objects,
             bounds_min,
             bounds_max,
+            clip_polygon,
         } = self.session.selection.clone()
         {
             let payload = crate::selection_edit::capture_clipboard(
@@ -3638,6 +3639,7 @@ impl EditorApp {
                 &objects,
                 bounds_min,
                 bounds_max,
+                clip_polygon.as_deref(),
                 self.session.current_frame,
             );
 
@@ -5651,6 +5653,7 @@ impl EditorApp {
                 objects,
                 bounds_min,
                 bounds_max,
+                clip_polygon,
             } => {
                 self.history.snapshot(&self.state.project);
                 let changed = crate::selection_edit::remove_raw_area_and_objects(
@@ -5659,6 +5662,7 @@ impl EditorApp {
                     &objects,
                     bounds_min,
                     bounds_max,
+                    clip_polygon.as_deref(),
                     self.session.current_frame,
                 );
                 if changed {
@@ -7685,6 +7689,7 @@ fn break_apart_result_selection(
         objects,
         bounds_min: Vec2::new(min_x, min_y),
         bounds_max: Vec2::new(max_x, max_y),
+        clip_polygon: None,
     }
 }
 
@@ -8166,6 +8171,7 @@ mod tests {
             objects: Vec::new(),
             bounds_min: Vec2::new(-1.0, -1.0),
             bounds_max: Vec2::new(21.0, 21.0),
+            clip_polygon: None,
         };
 
         assert!(app.delete_selection());

@@ -191,15 +191,17 @@ pub enum Selection {
         bounds_min: Vec2,
         bounds_max: Vec2,
     },
-    /// Non-destructive V marquee over one or more raw drawing surfaces.
+    /// Non-destructive V marquee or lasso over raw drawing surfaces.
     /// Geometry is not split until the user actually drags the selection.
     RawArea {
-        /// Identity raw drawing surfaces intersected by the marquee.
+        /// Identity raw drawing surfaces intersected by the selection region.
         placements: Vec<PlacementRef>,
-        /// Display objects intersected by the same marquee.
+        /// Display objects intersected by the same region.
         objects: Vec<PlacementRef>,
         bounds_min: Vec2,
         bounds_max: Vec2,
+        /// Freehand clip for a lasso selection; None uses the rectangular bounds.
+        clip_polygon: Option<Vec<Vec2>>,
     },
     /// Materialized mixed free-transform selection. Raw marquee fragments are
     /// cut into path-granular geometry only when the user starts moving or
@@ -1288,6 +1290,7 @@ impl Session {
                 objects,
                 bounds_min,
                 bounds_max,
+                clip_polygon,
             } => {
                 let kept_raw: Vec<PlacementRef> = placements
                     .into_iter()
@@ -1314,6 +1317,7 @@ impl Session {
                         objects: kept_objects,
                         bounds_min,
                         bounds_max,
+                        clip_polygon,
                     }
                 }
             }
@@ -1521,6 +1525,7 @@ fn history_stable_selection(from: &ProjectV2, to: &ProjectV2, selection: Selecti
             objects,
             bounds_min,
             bounds_max,
+            clip_polygon,
         } => {
             let stable_raw: Vec<PlacementRef> = placements
                 .iter()
@@ -1538,6 +1543,7 @@ fn history_stable_selection(from: &ProjectV2, to: &ProjectV2, selection: Selecti
                     objects: stable_objects,
                     bounds_min,
                     bounds_max,
+                    clip_polygon,
                 }
             } else {
                 Selection::None
