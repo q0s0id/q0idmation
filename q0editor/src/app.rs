@@ -7749,6 +7749,27 @@ mod tests {
     use image::ImageEncoder;
     use std::io::Cursor;
 
+    #[test]
+    fn switching_from_lasso_to_select_keeps_stage_selection() {
+        let mut app = EditorApp::default();
+        let selection = Selection::Placement {
+            q0rg_id: app.session.current_q0rg_id,
+            layer_id: app.session.current_layer_id,
+            placement_idx: 0,
+        };
+        app.session.current_tool = Tool::Lasso;
+        app.session.selection = selection.clone();
+        app.session.tool_state = ToolState::LassoDrawing {
+            points: vec![Vec2::new(10.0, 10.0)],
+        };
+
+        app.handle(&Context::default(), Action::SelectTool(Tool::Select));
+
+        assert_eq!(app.session.current_tool, Tool::Select);
+        assert_eq!(app.session.selection, selection);
+        assert!(matches!(app.session.tool_state, ToolState::Idle));
+    }
+
     fn app_test_nonce() -> u128 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

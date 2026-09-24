@@ -10800,6 +10800,83 @@ mod tests {
     }
 
     #[test]
+    fn lasso_selected_text_has_ordinary_transform_bounds_and_can_move() {
+        let mut app = EditorApp::default();
+        let q0rg_id = app.session.current_q0rg_id;
+        let layer_id = app.session.current_layer_id;
+        let asset_id = 77;
+        app.state.project.assets.push(Asset::Vector(VectorAsset {
+            asset_id,
+            paths: vec![VPath {
+                anchors: vec![
+                    anchor(Vec2::new(0.0, 0.0)),
+                    anchor(Vec2::new(20.0, 0.0)),
+                    anchor(Vec2::new(20.0, 20.0)),
+                    anchor(Vec2::new(0.0, 20.0)),
+                ],
+                closed: true,
+            }],
+            fill: Some(Rgba {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255,
+            }),
+            stroke: None,
+        }));
+        app.state
+            .project
+            .asset_names
+            .insert(asset_id, crate::text_tool::encode_source("Text", 48.0));
+        app.state.project.q0rgs[0].layers[0]
+            .placements
+            .push(Placement {
+                instance_id: 0,
+                frame: 0,
+                target: Target::Asset(asset_id),
+                transform: Transform2D {
+                    tx: 24.0,
+                    ty: 42.0,
+                    ..Transform2D::IDENTITY
+                },
+                tween: Tween::None,
+                fx: Default::default(),
+            });
+        let loop_points = [
+            Vec2::new(20.0, 38.0),
+            Vec2::new(50.0, 38.0),
+            Vec2::new(50.0, 68.0),
+            Vec2::new(20.0, 68.0),
+        ];
+        app.session.selection = lasso_selection(&app.state.project, q0rg_id, 0, &loop_points);
+        assert!(matches!(
+            app.session.selection,
+            Selection::Placement {
+                placement_idx: 0,
+                ..
+            }
+        ));
+        app.session.current_tool = Tool::Select;
+        assert_eq!(
+            selection_transform_bounds(&app),
+            Some((24.0, 42.0, 44.0, 62.0))
+        );
+        assert!(drag_start_data(&app.state.project, q0rg_id, layer_id, 0, 0).is_some());
+        assert!(begin_dragging_placement(
+            &mut app,
+            q0rg_id,
+            layer_id,
+            0,
+            Vec2::new(30.0, 48.0),
+            "Moving text",
+        ));
+        assert!(matches!(
+            app.session.tool_state,
+            ToolState::DraggingPlacement { .. }
+        ));
+    }
+
+    #[test]
     fn full_marquee_drag_preserves_real_curve_fixture() {
         let mut project =
             q0s_format::v2::parse(include_bytes!("../testdata/marquee_curve_regression.q1s"))
