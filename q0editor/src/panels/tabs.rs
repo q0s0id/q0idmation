@@ -11,8 +11,9 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
 
     egui::TopBottomPanel::top("document_tabs")
         .resizable(false)
-        .exact_height(32.0)
+        .exact_height(42.0)
         .show(ctx, |ui| {
+            ui.add_space(3.0);
             ui.horizontal(|ui| {
                 if ui
                     .selectable_label(app.home_visible(), RichText::new("Home").strong())
@@ -30,37 +31,45 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             for tab in &summaries {
-                                ui.group(|ui| {
-                                    ui.horizontal(|ui| {
-                                        let label = if tab.dirty {
-                                            format!("{} *", tab.title)
-                                        } else {
-                                            tab.title.clone()
-                                        };
-                                        let mut hover = tab
-                                            .path
-                                            .as_ref()
-                                            .map(|path| path.display().to_string())
-                                            .unwrap_or_else(|| "Unsaved project".to_string());
-                                        if tab.dirty {
-                                            hover.push_str("\nUnsaved changes");
-                                        }
-                                        if ui
-                                            .selectable_label(tab.active, label)
-                                            .on_hover_text(hover)
-                                            .clicked()
-                                        {
-                                            switch_to = Some(tab.id);
-                                        }
-                                        if ui
-                                            .small_button("x")
-                                            .on_hover_text("Close project tab")
-                                            .clicked()
-                                        {
-                                            close = Some(tab.id);
-                                        }
+                                egui::Frame::none()
+                                    .fill(if tab.active {
+                                        ui.visuals().selection.bg_fill
+                                    } else {
+                                        ui.visuals().panel_fill
+                                    })
+                                    .rounding(6.0)
+                                    .inner_margin(egui::Margin::symmetric(8.0, 2.0))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            let label = if tab.dirty {
+                                                format!("{} *", tab.title)
+                                            } else {
+                                                tab.title.clone()
+                                            };
+                                            let mut hover = tab
+                                                .path
+                                                .as_ref()
+                                                .map(|path| path.display().to_string())
+                                                .unwrap_or_else(|| "Unsaved project".to_string());
+                                            if tab.dirty {
+                                                hover.push_str("\nUnsaved changes");
+                                            }
+                                            if ui
+                                                .selectable_label(tab.active, label)
+                                                .on_hover_text(hover)
+                                                .clicked()
+                                            {
+                                                switch_to = Some(tab.id);
+                                            }
+                                            if ui
+                                                .small_button("x")
+                                                .on_hover_text("Close project tab")
+                                                .clicked()
+                                            {
+                                                close = Some(tab.id);
+                                            }
+                                        });
                                     });
-                                });
                             }
                         });
                     });

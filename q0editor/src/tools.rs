@@ -1,11 +1,11 @@
 use egui::epaint::PathShape;
 use egui::{
-    pos2, Color32, ColorImage, Context, Key, Mesh, Painter, PointerButton, Pos2, Response, Shape,
-    Stroke, TextureHandle, TextureOptions,
+    Color32, ColorImage, Context, Key, Mesh, Painter, PointerButton, Pos2, Response, Shape, Stroke,
+    TextureHandle, TextureOptions, pos2,
 };
 use geo::{
-    Area, BooleanOps, BoundingRect, Contains, ConvexHull, Coord, LineString, MultiPoint,
-    MultiPolygon, Point, Polygon,
+    Area, BooleanOps, BoundingRect, Contains, ConvexHull, Coord, Intersects, LineString,
+    MultiPoint, MultiPolygon, Point, Polygon,
 };
 use q0s_format::transform::Affine;
 use q0s_format::v2::{
@@ -14,12 +14,12 @@ use q0s_format::v2::{
 };
 
 use crate::app::EditorApp;
-use crate::render::{
-    flatten_path, flatten_path_for_stroke, paint_complex_fill, paint_round_stroke_preview,
-    placement_bbox, placement_local_bbox, StageView, TextureCache,
-};
 #[cfg(feature = "appearance-mask-eraser")]
 use crate::render::{CachedInteractivePath, CachedSelectionPaint, SelectionPaintKey};
+use crate::render::{
+    StageView, TextureCache, flatten_path, flatten_path_for_stroke, paint_complex_fill,
+    paint_round_stroke_preview, placement_bbox, placement_local_bbox,
+};
 
 use crate::state::{
     AppearanceTransformSnapshot, BrushSizePreview, GroupTransformOperation, Handle, PathRef,
@@ -74,7 +74,7 @@ pub fn handle(
     if current_layer_is_folder
         && !matches!(
             app.session.current_tool,
-            Tool::Select | Tool::Subselect | Tool::Hand
+            Tool::Select | Tool::Lasso | Tool::Subselect | Tool::Hand
         )
     {
         if response.clicked() || response.drag_started() {
@@ -84,7 +84,7 @@ pub fn handle(
     }
     let edits_current_layer = !matches!(
         app.session.current_tool,
-        Tool::Select | Tool::Subselect | Tool::Hand | Tool::Eyedropper | Tool::Rig
+        Tool::Select | Tool::Lasso | Tool::Subselect | Tool::Hand | Tool::Eyedropper | Tool::Rig
     );
     if edits_current_layer && (!current_layer_is_visible || current_layer_is_locked) {
         if response.clicked() || response.drag_started() {
@@ -113,12 +113,14 @@ pub fn handle(
         Tool::Brush => brush_tool(app, response, view, ctx),
         Tool::Eraser => eraser(app, response, view, ctx),
         Tool::Select => select(app, response, cursor_stage, view),
+        Tool::Lasso => lasso(app, response, cursor_stage, view),
         Tool::Subselect => subselect(app, response, cursor_stage),
         Tool::Line => line(app, response, cursor_stage, painter, view),
         Tool::Rectangle => primitive_rect(app, response, cursor_stage, painter, view, false),
         Tool::Oval => primitive_rect(app, response, cursor_stage, painter, view, true),
         Tool::Bucket => bucket(app, response, cursor_stage),
         Tool::Eyedropper => eyedropper(app, response, cursor_stage, view),
+        Tool::Text => crate::text_tool::handle_stage(app, response, cursor_stage),
         Tool::Rig => crate::rigging::handle_stage(app, response, painter, view, ctx),
     }
 
@@ -227,7 +229,10 @@ fn pick_cursor(
 
     Some(match app.session.current_tool {
         Tool::Hand => CursorIcon::Grab,
-        Tool::Pen | Tool::Line | Tool::Rectangle | Tool::Oval => CursorIcon::Crosshair,
+        Tool::Pen | Tool::Line | Tool::Rectangle | Tool::Oval | Tool::Lasso => {
+            CursorIcon::Crosshair
+        }
+        Tool::Text => CursorIcon::Text,
         Tool::Pencil => CursorIcon::Crosshair,
         // The brush paints its own exact nib-size ring.
         Tool::Brush => CursorIcon::None,
@@ -1394,6 +1399,183 @@ fn marquee_selection(
             placement_idx: objects[0].placement_idx,
         },
         _ => Selection::Multi(objects),
+    }
+}
+
+/// Select whole editable contours and display objects whose visible geometry
+/// intersects the freehand region. The lasso never mutates source artwork.
+fn lasso_selection(project: &ProjectV2, q0rg_id: u16, frame: u16, points: &[Vec2]) -> Selection {
+    if points.len() < 3 {
+        return Selection::None;
+    }
+    let ring: Vec<_> = points
+        .iter()
+        .map(|p| Coord {
+            x: f64::from(p.x),
+            y: f64::from(p.y),
+        })
+        .collect();
+    let region = Polygon::new(LineString::from(ring), vec![]);
+    if region.unsigned_area() < 1.0 {
+        return Selection::None;
+    }
+    let Some(bounds) = region.bounding_rect() else {
+        return Selection::None;
+    };
+    let rect = (
+        bounds.min().x as f32,
+        bounds.min().y as f32,
+        bounds.max().x as f32,
+        bounds.max().y as f32,
+    );
+    let objects: Vec<_> = collect_placements_in_rect(project, q0rg_id, frame, rect)
+        .into_iter()
+        .filter(|reference| {
+            let Some(layer) = project
+                .q0rgs
+                .iter()
+                .find(|q| q.q0rg_id == reference.q0rg_id)
+                .and_then(|q| q.layers.iter().find(|l| l.layer_id == reference.layer_id))
+            else {
+                return false;
+            };
+            let Some(placement) = layer.placements.get(reference.placement_idx) else {
+                return false;
+            };
+            let Some((_, transform)) = crate::render::active_placements_at(layer, frame)
+                .into_iter()
+                .find(|(idx, _)| *idx == reference.placement_idx)
+            else {
+                return false;
+            };
+            let mut visual = placement.clone();
+            visual.transform = transform;
+            placement_bbox(project, &visual)
+                .is_some_and(|bbox| region.intersects(&rect_polygon(bbox)))
+        })
+        .collect();
+    let mut paths = Vec::new();
+    if let Some(q0rg) = project.q0rgs.iter().find(|q| q.q0rg_id == q0rg_id) {
+        for layer in q0rg.layers.iter().rev() {
+            if !project.layer_is_visible(q0rg_id, layer.layer_id)
+                || project.layer_is_locked(q0rg_id, layer.layer_id)
+            {
+                continue;
+            }
+            for placement_idx in active_raw_placement_indices(project, layer, frame) {
+                let Target::Asset(asset_id) = layer.placements[placement_idx].target else {
+                    continue;
+                };
+                let Some(Asset::Vector(vector)) =
+                    project.assets.iter().find(|a| a.id() == asset_id)
+                else {
+                    continue;
+                };
+                let fill_touches = vector.fill.is_some()
+                    && raw_selectable_fill_surface(project, asset_id, vector).intersects(&region);
+                for (path_idx, path) in vector.paths.iter().enumerate() {
+                    let flattened = flatten_path(path);
+                    if flattened.len() < 2 {
+                        continue;
+                    }
+                    let line = LineString::from(
+                        flattened
+                            .iter()
+                            .map(|p| Coord {
+                                x: f64::from(p.x),
+                                y: f64::from(p.y),
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                    let touches = if path.closed && fill_touches {
+                        region.intersects(&Polygon::new(line, vec![]))
+                    } else if path.closed && vector.fill.is_some() {
+                        false
+                    } else {
+                        region.intersects(&line)
+                    };
+                    if touches {
+                        paths.push(PathRef {
+                            q0rg_id,
+                            layer_id: layer.layer_id,
+                            placement_idx,
+                            path_idx,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    match (paths.len(), objects.len()) {
+        (0, 0) => Selection::None,
+        (1, 0) => {
+            let p = paths[0];
+            Selection::Path {
+                q0rg_id: p.q0rg_id,
+                layer_id: p.layer_id,
+                placement_idx: p.placement_idx,
+                path_idx: p.path_idx,
+            }
+        }
+        (_, 0) => Selection::Paths(paths),
+        (0, 1) => {
+            let p = objects[0];
+            Selection::Placement {
+                q0rg_id: p.q0rg_id,
+                layer_id: p.layer_id,
+                placement_idx: p.placement_idx,
+            }
+        }
+        (0, _) => Selection::Multi(objects),
+        _ => Selection::Mixed { paths, objects },
+    }
+}
+
+fn lasso(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: &StageView) {
+    let pointer = response
+        .interact_pointer_pos()
+        .map(|p| screen_to_stage(p, view))
+        .or(cursor);
+    if response.drag_started_by(PointerButton::Primary) {
+        if let Some(point) = pointer.filter(|p| primitive_point_is_on_stage(app, *p)) {
+            app.session.tool_state = ToolState::LassoDrawing {
+                points: vec![point],
+            };
+        }
+    }
+    if response.dragged_by(PointerButton::Primary) {
+        if let (ToolState::LassoDrawing { points }, Some(point)) =
+            (&mut app.session.tool_state, pointer)
+        {
+            if points
+                .last()
+                .is_none_or(|last| (last.x - point.x).hypot(last.y - point.y) >= 2.0)
+            {
+                points.push(point);
+            }
+        }
+    }
+    if response.drag_stopped_by(PointerButton::Primary) {
+        if let ToolState::LassoDrawing { mut points } =
+            std::mem::replace(&mut app.session.tool_state, ToolState::Idle)
+        {
+            if let Some(point) = pointer {
+                points.push(point);
+            }
+            let selected = lasso_selection(
+                &app.state.project,
+                app.session.current_q0rg_id,
+                app.session.current_frame,
+                &points,
+            );
+            app.session.status = if matches!(selected, Selection::None) {
+                "Lasso: nothing selected"
+            } else {
+                "Lasso selection ready"
+            }
+            .to_owned();
+            app.session.selection = selected;
+        }
     }
 }
 
@@ -7904,6 +8086,15 @@ fn is_raw_graphics_placement(project: &ProjectV2, placement: &Placement) -> bool
     if placement.transform != Transform2D::IDENTITY || !matches!(placement.tween, Tween::None) {
         return false;
     }
+    if let Target::Asset(asset_id) = placement.target {
+        if project
+            .asset_names
+            .get(&asset_id)
+            .is_some_and(|name| crate::text_tool::decode_source(name).is_some())
+        {
+            return false;
+        }
+    }
     matches!(
         placement.target,
         Target::Asset(asset_id)
@@ -8391,6 +8582,16 @@ fn draw_in_progress_overlay(app: &EditorApp, painter: &Painter, view: &StageView
     }
 
     match &app.session.tool_state {
+        ToolState::LassoDrawing { points } => {
+            if points.len() >= 2 {
+                let outline: Vec<_> = points.iter().map(|p| stage_to_screen(*p, view)).collect();
+                painter.add(Shape::line(
+                    outline,
+                    Stroke::new(1.5_f32, selection_color(app)),
+                ));
+                painter.circle_filled(stage_to_screen(points[0], view), 3.0, selection_color(app));
+            }
+        }
         ToolState::PenDrawing { anchors } => {
             if anchors.len() >= 2 {
                 let pts: Vec<Pos2> = anchors
@@ -10549,6 +10750,56 @@ mod tests {
     use q0s_format::v2::{Layer, ProjectMeta, Q0rg};
 
     #[test]
+    fn lasso_selects_only_objects_inside_its_freehand_region() {
+        let mut project = crate::state::default_project();
+        project
+            .assets
+            .push(Asset::Bitmap(q0s_format::v2::BitmapAsset {
+                asset_id: 1,
+                width: 10,
+                height: 10,
+                rgba: vec![255; 400],
+            }));
+        for (x, y) in [(10.0, 10.0), (100.0, 100.0)] {
+            project.q0rgs[0].layers[0].placements.push(Placement {
+                instance_id: 0,
+                frame: 0,
+                target: Target::Asset(1),
+                transform: Transform2D {
+                    tx: x,
+                    ty: y,
+                    ..Transform2D::IDENTITY
+                },
+                tween: Tween::None,
+                fx: Default::default(),
+            });
+        }
+        let loop_points = [
+            Vec2::new(5.0, 5.0),
+            Vec2::new(35.0, 5.0),
+            Vec2::new(35.0, 35.0),
+            Vec2::new(5.0, 35.0),
+        ];
+        assert!(matches!(
+            lasso_selection(&project, 1, 0, &loop_points),
+            Selection::Placement {
+                placement_idx: 0,
+                ..
+            }
+        ));
+        let miss = [
+            Vec2::new(40.0, 40.0),
+            Vec2::new(60.0, 40.0),
+            Vec2::new(60.0, 60.0),
+            Vec2::new(40.0, 60.0),
+        ];
+        assert!(matches!(
+            lasso_selection(&project, 1, 0, &miss),
+            Selection::None
+        ));
+    }
+
+    #[test]
     fn full_marquee_drag_preserves_real_curve_fixture() {
         let mut project =
             q0s_format::v2::parse(include_bytes!("../testdata/marquee_curve_regression.q1s"))
@@ -10737,10 +10988,11 @@ mod tests {
         )
         .expect("oval");
         assert_eq!(path.anchors.len(), 4);
-        assert!(path
-            .anchors
-            .iter()
-            .all(|anchor| anchor.in_handle.is_some() && anchor.out_handle.is_some()));
+        assert!(
+            path.anchors
+                .iter()
+                .all(|anchor| anchor.in_handle.is_some() && anchor.out_handle.is_some())
+        );
         let bounds = path_bbox(&path).expect("bounds");
         assert!((bounds.0 - 20.0).abs() < 1.0e-3);
         assert!((bounds.1 - 10.0).abs() < 1.0e-3);
@@ -12558,9 +12810,11 @@ mod tests {
             .get_mut(&1)
             .unwrap()
             .field_transform = old_field;
-        assert!(app.state.project.asset_appearances[&1]
-            .material_source
-            .is_empty());
+        assert!(
+            app.state.project.asset_appearances[&1]
+                .material_source
+                .is_empty()
+        );
 
         assert!(begin_dragging_raw_paths(
             &mut app,

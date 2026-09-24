@@ -519,18 +519,19 @@ impl Theme {
         let window = self.window.to_color32();
         let deep = self.deep_bg.to_color32();
         let text = self.text.to_color32();
-        let stroke_dark = self.stroke_dark.to_color32();
 
-        visuals.panel_fill = panel;
+        visuals.panel_fill = window;
         visuals.window_fill = window;
-        visuals.window_stroke = Stroke::new(1.0_f32, stroke_dark);
-        visuals.menu_rounding = Rounding::same(2.0);
-        visuals.window_rounding = Rounding::same(3.0);
+        let border = blend(self.window, self.text, 0.16).to_color32();
+        let hover = blend(self.panel, self.accent, 0.16).to_color32();
+        visuals.window_stroke = Stroke::new(1.0_f32, border);
+        visuals.menu_rounding = Rounding::same(8.0);
+        visuals.window_rounding = Rounding::same(12.0);
         visuals.extreme_bg_color = deep;
         visuals.faint_bg_color = mid_blend(panel, window);
         visuals.code_bg_color = deep;
-        visuals.hyperlink_color = accent;
-        visuals.selection.bg_fill = accent;
+        visuals.hyperlink_color = blend(self.accent, self.text, 0.35).to_color32();
+        visuals.selection.bg_fill = blend(self.window, self.accent, 0.24).to_color32();
         visuals.selection.stroke = Stroke::new(1.0_f32, text);
 
         for w in [
@@ -539,20 +540,22 @@ impl Theme {
         ] {
             w.bg_fill = panel;
             w.weak_bg_fill = panel;
-            w.bg_stroke = Stroke::new(1.0_f32, stroke_dark);
+            w.bg_stroke = Stroke::new(1.0_f32, border);
             w.fg_stroke = Stroke::new(1.0_f32, text);
-            w.rounding = Rounding::same(2.0);
+            w.rounding = Rounding::same(5.0);
         }
-        visuals.widgets.hovered.bg_fill = mid_blend(panel, accent);
-        visuals.widgets.hovered.weak_bg_fill = mid_blend(panel, accent);
+        visuals.widgets.noninteractive.bg_fill = window;
+        visuals.widgets.noninteractive.weak_bg_fill = window;
+        visuals.widgets.hovered.bg_fill = hover;
+        visuals.widgets.hovered.weak_bg_fill = hover;
         visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, text);
         visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, accent);
-        visuals.widgets.hovered.rounding = Rounding::same(2.0);
-        visuals.widgets.active.bg_fill = accent;
-        visuals.widgets.active.weak_bg_fill = accent;
+        visuals.widgets.hovered.rounding = Rounding::same(5.0);
+        visuals.widgets.active.bg_fill = hover;
+        visuals.widgets.active.weak_bg_fill = hover;
         visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, text);
         visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, accent);
-        visuals.widgets.active.rounding = Rounding::same(2.0);
+        visuals.widgets.active.rounding = Rounding::same(5.0);
         visuals.widgets.open = visuals.widgets.active;
 
         style.visuals = visuals;

@@ -24,18 +24,22 @@ pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
 
     egui::Window::new("q0enc")
         .open(&mut open)
-        .default_size([780.0, 660.0])
-        .min_size([640.0, 500.0])
+        .default_size([780.0, 610.0])
+        .default_pos(ctx.screen_rect().center() - egui::vec2(410.0, 340.0))
+        .min_size([640.0, 400.0])
+        .max_height((ctx.screen_rect().height() - 110.0).max(400.0))
+        .vscroll(true)
         .max_width(860.0)
         .collapsible(false)
         .resizable(true)
         .show(ctx, |ui| {
+            ui.style_mut().wrap = Some(true);
             let project = &app.state.project;
             let state = &mut app.q0enc;
             let theme = &app.settings.theme;
 
             ui.horizontal(|ui| {
-                ui.heading("q0enc");
+                ui.label(RichText::new("Export studio").size(24.0).strong());
                 ui.separator();
                 ui.label(
                     RichText::new(format!(
@@ -58,14 +62,18 @@ pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         ui.label(
-                            RichText::new("format")
+                            RichText::new("FORMAT")
                                 .strong()
                                 .color(theme.text.to_color32()),
                         );
                         ui.add_space(3.0);
                         for format in ExportFormat::ALL {
-                            let response = ui
-                                .selectable_label(state.selected_format == format, format.label());
+                            let response = ui.add_sized(
+                                [140.0, 36.0],
+                                egui::Button::new(format.label())
+                                    .selected(state.selected_format == format)
+                                    .rounding(6.0),
+                            );
                             if response.clicked() {
                                 state.select_format(format, file_path.as_deref());
                             }
@@ -105,7 +113,9 @@ pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
                                 ui.horizontal(|ui| {
                                     ui.add(
                                         egui::TextEdit::singleline(&mut state.output_text)
-                                            .desired_width(f32::INFINITY),
+                                            .desired_width(
+                                                (ui.available_width() - 90.0).max(120.0),
+                                            ),
                                     );
                                     if ui
                                         .add_enabled(true, egui::Button::new("browse..."))
@@ -139,7 +149,15 @@ pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
                                     if ui
                                         .add_enabled(
                                             validation.is_ok(),
-                                            egui::Button::new("export now"),
+                                            egui::Button::new(
+                                                RichText::new("Export now").strong().color(
+                                                    crate::theme::on_accent(
+                                                        theme.accent.to_color32(),
+                                                    ),
+                                                ),
+                                            )
+                                            .fill(theme.accent.to_color32())
+                                            .min_size(egui::vec2(128.0, 34.0)),
                                         )
                                         .clicked()
                                     {
@@ -153,7 +171,7 @@ pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
 
             ui.separator();
             ui.horizontal(|ui| {
-                ui.label(RichText::new("export queue").strong());
+                ui.label(RichText::new("Export queue").size(15.0).strong());
                 let pending = state
                     .queue
                     .iter()
@@ -193,9 +211,11 @@ pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
                 .show(ui, |ui| {
                     if state.queue.is_empty() {
                         ui.label(
-                            RichText::new("the queue is empty")
-                                .small()
-                                .color(theme.text_dim.to_color32()),
+                            RichText::new(
+                                "No exports queued. Choose a format and add your first job.",
+                            )
+                            .small()
+                            .color(theme.text_dim.to_color32()),
                         );
                     }
                     for job in &state.queue {
@@ -319,6 +339,7 @@ fn render_format_settings(
             );
             ui.add_space(8.0);
             egui::Grid::new("q0enc_q0s_summary")
+                .min_col_width(96.0)
                 .num_columns(2)
                 .spacing([16.0, 5.0])
                 .show(ui, |ui| {
@@ -332,7 +353,7 @@ fn render_format_settings(
                     ui.label(project.q0rgs.len().to_string());
                     ui.end_row();
                     ui.label("verification");
-                    ui.label("serialize → parse-back → atomic write → reread");
+                    ui.label("Serialize / validate / write / verify");
                     ui.end_row();
                 });
         }

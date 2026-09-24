@@ -64,7 +64,7 @@ struct LibraryRow {
 
 pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     ui.horizontal(|ui| {
-        ui.heading("Library");
+        ui.label(egui::RichText::new("Library").size(15.0).strong());
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if ui
                 .small_button("+")
@@ -211,6 +211,18 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         });
     ui.separator();
 
+    if rows.is_empty() {
+        ui.label(
+            egui::RichText::new(if needle.is_empty() {
+                "Import media or create a symbol to get started."
+            } else {
+                "No matching library items"
+            })
+            .small()
+            .color(app.settings.theme.text_dim.to_color32()),
+        );
+    }
+
     let mut selected = None;
     let mut enter = None;
     let mut rename = None;
@@ -296,14 +308,6 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 });
         });
 
-    if rows.is_empty() {
-        ui.label(
-            egui::RichText::new("No matching library items")
-                .small()
-                .color(app.settings.theme.text_dim.to_color32()),
-        );
-    }
-
     if let Some(key) = selected {
         app.session.selection = match key {
             LibraryKey::Q0rg(id) => Selection::Q0rg(id),
@@ -348,12 +352,19 @@ fn can_rename_item(app: &EditorApp, item: LibraryItem) -> bool {
             .q0rgs
             .iter()
             .any(|q0rg| q0rg.q0rg_id == id),
-        LibraryItem::Asset(id) => app
-            .state
-            .project
-            .assets
-            .iter()
-            .any(|asset| asset.id() == id && matches!(asset, Asset::Vector(_) | Asset::Q0v(_))),
+        LibraryItem::Asset(id) => {
+            app.state
+                .project
+                .assets
+                .iter()
+                .any(|asset| asset.id() == id && matches!(asset, Asset::Vector(_) | Asset::Q0v(_)))
+                && !app
+                    .state
+                    .project
+                    .asset_names
+                    .get(&id)
+                    .is_some_and(|name| crate::text_tool::decode_source(name).is_some())
+        }
     }
 }
 
@@ -663,15 +674,32 @@ fn collect_rows(app: &EditorApp) -> Vec<LibraryRow> {
                 "bitmap",
                 format!("{} x {} px", bitmap.width, bitmap.height),
             ),
-            Asset::Vector(vector) => (
-                project
-                    .asset_names
-                    .get(&id)
-                    .cloned()
-                    .unwrap_or_else(|| format!("Vector {id}")),
-                "vector",
-                format!("{} contours", vector.paths.len()),
-            ),
+            Asset::Vector(vector) => {
+                if let Some((name, size)) = project.asset_names.get(&id).and_then(|name| {
+                    crate::text_tool::decode_source(name).map(|(_, size)| {
+                        (
+                            crate::text_tool::display_name(name).unwrap_or_default(),
+                            size,
+                        )
+                    })
+                }) {
+                    (
+                        name,
+                        "text",
+                        format!("{} px / {} contours", size as u16, vector.paths.len()),
+                    )
+                } else {
+                    (
+                        project
+                            .asset_names
+                            .get(&id)
+                            .cloned()
+                            .unwrap_or_else(|| format!("Vector {id}")),
+                        "vector",
+                        format!("{} contours", vector.paths.len()),
+                    )
+                }
+            }
             Asset::Q0v(video) => {
                 let header = q0video::q0v::probe_header(&video.bytes).ok();
                 if let Some(header) = header
@@ -737,7 +765,7 @@ fn collect_rows(app: &EditorApp) -> Vec<LibraryRow> {
 }
 
 fn draw_preview(app: &mut EditorApp, ui: &mut Ui) {
-    let height = 142.0_f32.min(ui.available_height().max(70.0));
+    let height = (ui.clip_rect().bottom() - ui.cursor().top() - 145.0).clamp(64.0, 142.0);
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
     let border = app.settings.theme.stroke_dark.to_color32();
     let painter = ui.painter_at(rect).with_clip_rect(rect);
@@ -829,17 +857,13 @@ fn draw_preview(app: &mut EditorApp, ui: &mut Ui) {
     };
 
     let Some(bounds) = bbox else {
-        let empty_color = match background {
-            PreviewBackground::Light => preview_dark,
-            PreviewBackground::Dark => preview_light,
-            PreviewBackground::Checker => app.settings.theme.accent.to_color32(),
-        };
+        painter.rect_filled(content_rect, 4.0, ui.visuals().window_fill());
         painter.text(
             content_rect.center(),
             egui::Align2::CENTER_CENTER,
-            "empty",
+            "No artwork yet",
             FontId::proportional(12.0),
-            empty_color,
+            app.settings.theme.text_dim.to_color32(),
         );
         return;
     };

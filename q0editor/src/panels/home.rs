@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use egui::{Align, Button, Frame, Layout, Margin, RichText, ScrollArea, Ui, Vec2};
+use egui::{Align, Button, Layout, RichText, ScrollArea, Ui, Vec2};
 
 use crate::app::{Action, EditorApp};
 use crate::release_feed::{
@@ -9,56 +9,117 @@ use crate::release_feed::{
 };
 
 pub fn render(app: &mut EditorApp, ui: &mut Ui) {
-    ui.add_space(24.0);
-    let page_width = ui.available_width().min(1120.0);
-    let side_space = ((ui.available_width() - page_width) * 0.5).max(0.0);
-    ui.horizontal(|ui| {
-        ui.add_space(side_space);
-        ui.allocate_ui_with_layout(
-            Vec2::new(page_width, ui.available_height()),
-            Layout::top_down(Align::Min),
-            |ui| {
-                header(app, ui);
-                ui.add_space(22.0);
-                action_row(app, ui);
-                ui.add_space(24.0);
-                content_columns(app, ui);
-            },
-        );
-    });
+    ScrollArea::vertical()
+        .id_source("home_page")
+        .show(ui, |ui| {
+            let page_width = (ui.available_width() - 48.0).clamp(300.0, 1080.0);
+            let side_space = ((ui.available_width() - page_width) * 0.5).max(0.0);
+            ui.add_space(32.0);
+            ui.horizontal(|ui| {
+                ui.add_space(side_space);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(page_width, 0.0),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = 16.0;
+                        header(app, ui);
+                        ui.add_space(24.0);
+                        action_row(app, ui);
+                        ui.add_space(28.0);
+                        content_columns(app, ui);
+                        ui.add_space(24.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("q0editor").strong());
+                            ui.label(RichText::new(env!("CARGO_PKG_VERSION")).small());
+                            ui.separator();
+                            ui.label(
+                                RichText::new("Vector animation, frame by frame.")
+                                    .color(app.settings.theme.text_dim.to_color32()),
+                            );
+                        });
+                        ui.add_space(24.0);
+                    },
+                );
+            });
+        });
 }
 
 fn header(app: &EditorApp, ui: &mut Ui) {
-    ui.label(RichText::new("q0editor").size(38.0).strong());
-    ui.label(
-        RichText::new("home")
-            .size(16.0)
-            .color(app.settings.theme.accent.to_color32()),
-    );
+    let accent = ui.visuals().hyperlink_color;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("q0e").size(22.0).strong().color(accent));
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new("YOUR ANIMATION WORKSPACE")
+                .size(11.0)
+                .color(app.settings.theme.text_dim.to_color32()),
+        );
+    });
+    ui.add_space(16.0);
+    ui.label(RichText::new("Make your next move.").size(38.0).strong());
     ui.add_space(6.0);
     ui.label(
-        RichText::new("Create a project or continue from a recent q1s file.")
+        RichText::new("A new idea, a blank stage. Or pick up right where you left off.")
+            .size(15.0)
             .color(app.settings.theme.text_dim.to_color32()),
     );
 }
 
 fn action_row(app: &mut EditorApp, ui: &mut Ui) {
-    ui.horizontal_wrapped(|ui| {
-        if ui
-            .add_sized(
-                [164.0, 42.0],
-                Button::new(RichText::new("New project").strong()),
-            )
-            .clicked()
-        {
-            app.queue(Action::NewProject);
-        }
-        if ui
-            .add_sized([164.0, 42.0], Button::new("Open project..."))
-            .clicked()
-        {
-            app.queue(Action::OpenProject);
-        }
+    ui.columns(2, |columns| {
+        crate::theme::surface(&columns[0])
+            .fill(app.settings.theme.panel.to_color32())
+            .stroke(egui::Stroke::new(
+                1.0_f32,
+                app.settings.theme.accent.to_color32(),
+            ))
+            .show(&mut columns[0], |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new("Start something new").size(19.0).strong());
+                ui.label(
+                    RichText::new("Set your stage. Bring an idea to life.")
+                        .color(app.settings.theme.text_dim.to_color32()),
+                );
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    if crate::theme::primary_button(
+                        ui,
+                        "New project",
+                        app.settings.theme.accent.to_color32(),
+                    )
+                    .clicked()
+                    {
+                        app.queue(Action::NewProject);
+                    }
+                    ui.label(
+                        RichText::new("Ctrl + N")
+                            .small()
+                            .color(app.settings.theme.text_dim.to_color32()),
+                    );
+                });
+            });
+        crate::theme::surface(&columns[1]).show(&mut columns[1], |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new("Back to your craft").size(19.0).strong());
+            ui.label(
+                RichText::new("Open a project and keep the story moving.")
+                    .color(app.settings.theme.text_dim.to_color32()),
+            );
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_sized([144.0, 36.0], Button::new("Open project..."))
+                    .clicked()
+                {
+                    app.queue(Action::OpenProject);
+                }
+                ui.label(
+                    RichText::new("Ctrl + O")
+                        .small()
+                        .color(app.settings.theme.text_dim.to_color32()),
+                );
+            });
+        });
     });
 }
 
@@ -68,41 +129,57 @@ fn content_columns(app: &mut EditorApp, ui: &mut Ui) {
     let recent = app.settings.recent_projects.clone();
     let mut open_recent = None;
     ui.columns(2, |columns| {
-        columns[0].set_max_width(columns[0].available_width());
-        Frame::group(columns[0].style())
-            .inner_margin(Margin::same(16.0))
-            .show(&mut columns[0], |ui| {
-                ui.set_min_height(360.0);
-                ui.label(RichText::new("Recent projects").size(18.0).strong());
-                ui.add_space(8.0);
-                if recent.is_empty() {
-                    ui.label(
-                        RichText::new("No recent projects yet.")
-                            .color(app.settings.theme.text_dim.to_color32()),
-                    );
-                    ui.label(
-                        RichText::new("Saved and opened q1s files will appear here.")
-                            .small()
-                            .color(app.settings.theme.text_dim.to_color32()),
-                    );
-                } else {
-                    for path in &recent {
-                        if recent_project_button(ui, path).clicked() {
-                            open_recent = Some(path.clone());
-                        }
-                        ui.add_space(4.0);
-                    }
+        crate::theme::surface(&columns[0]).show(&mut columns[0], |ui| {
+            ui.set_width(ui.available_width());
+            ui.set_min_height(230.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Recent projects").size(17.0).strong());
+                ui.label(
+                    RichText::new(format!("{:02}", recent.len()))
+                        .small()
+                        .color(app.settings.theme.text_dim.to_color32()),
+                );
+            });
+            ui.add_space(12.0);
+            if recent.is_empty() {
+                ui.add_space(24.0);
+                ui.label(
+                    RichText::new("Your next story starts here.")
+                        .size(16.0)
+                        .strong(),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "Projects you open or save will appear here, ready for your next session.",
+                    )
+                    .color(app.settings.theme.text_dim.to_color32()),
+                );
+                ui.add_space(16.0);
+                if ui.button("Create your first project").clicked() {
+                    app.queue(Action::NewProject);
                 }
-            });
-
-        Frame::group(columns[1].style())
-            .inner_margin(Margin::same(16.0))
-            .show(&mut columns[1], |ui| {
-                ui.set_min_height(360.0);
-                release_feed(app, ui);
-            });
+            } else {
+                ScrollArea::vertical()
+                    .id_source("home_recent_projects")
+                    .max_height(240.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for path in &recent {
+                            if recent_project_button(ui, path).clicked() {
+                                open_recent = Some(path.clone());
+                            }
+                            ui.add_space(4.0);
+                        }
+                    });
+            }
+        });
+        crate::theme::surface(&columns[1]).show(&mut columns[1], |ui| {
+            ui.set_width(ui.available_width());
+            ui.set_min_height(230.0);
+            release_feed(app, ui);
+        });
     });
-
     if let Some(path) = open_recent {
         app.queue(Action::OpenProjectFromPath(path));
     }
@@ -110,11 +187,11 @@ fn content_columns(app: &mut EditorApp, ui: &mut Ui) {
 
 fn release_feed(app: &mut EditorApp, ui: &mut Ui) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Feed").size(18.0).strong());
+        ui.label(RichText::new("What’s new").size(17.0).strong());
         ui.label(
             RichText::new("GitHub releases")
                 .small()
-                .color(app.settings.theme.accent.to_color32()),
+                .color(ui.visuals().hyperlink_color),
         );
     });
     ui.add_space(10.0);
@@ -140,7 +217,7 @@ fn release_feed(app: &mut EditorApp, ui: &mut Ui) {
             ScrollArea::vertical()
                 .id_source("home_release_feed")
                 .auto_shrink([false, false])
-                .max_height(310.0)
+                .max_height(240.0)
                 .show(ui, |ui| {
                     for (index, release) in releases.iter().enumerate() {
                         if index > 0 {
@@ -174,7 +251,7 @@ fn release_card(app: &EditorApp, ui: &mut Ui, release: &ReleaseNote) {
         ui.label(
             RichText::new(&release.tag)
                 .small()
-                .color(app.settings.theme.accent.to_color32()),
+                .color(ui.visuals().hyperlink_color),
         );
         if let Some(date) = short_date(release.published_at.as_deref()) {
             ui.label(
@@ -215,7 +292,7 @@ fn render_release_markdown(app: &EditorApp, ui: &mut Ui, body: &str) {
             MarkdownBlock::Bullet(spans) => {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
-                    ui.label(RichText::new("? ").color(app.settings.theme.accent.to_color32()));
+                    ui.label(RichText::new("? ").color(ui.visuals().hyperlink_color));
                     render_markdown_spans_inline(app, ui, &spans, 13.0, false, true);
                 });
                 ui.add_space(2.0);
@@ -251,7 +328,7 @@ fn render_markdown_spans_inline(
     strong_all: bool,
     dim_plain: bool,
 ) {
-    let accent = app.settings.theme.accent.to_color32();
+    let accent = ui.visuals().hyperlink_color;
     let normal = if dim_plain {
         app.settings.theme.text_dim.to_color32()
     } else {
@@ -290,9 +367,29 @@ fn recent_project_button(ui: &mut Ui, path: &Path) -> egui::Response {
         .map(Path::display)
         .map(|display| display.to_string())
         .unwrap_or_default();
-    ui.add_sized(
-        [ui.available_width(), 48.0],
-        Button::new(format!("{file_name}\n{parent}")),
-    )
-    .on_hover_text(path.display().to_string())
+    let width = ui.available_width();
+    let (row, response) = ui.allocate_exact_size(egui::vec2(width, 56.0), egui::Sense::click());
+    let visuals = ui.style().interact(&response);
+    ui.painter()
+        .rect(row, visuals.rounding, visuals.bg_fill, visuals.bg_stroke);
+    let rect = response.rect.shrink2(egui::vec2(14.0, 9.0));
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.text(
+        rect.left_top(),
+        egui::Align2::LEFT_TOP,
+        file_name,
+        egui::FontId::proportional(14.0),
+        ui.visuals().text_color(),
+    );
+    painter.text(
+        rect.left_bottom(),
+        egui::Align2::LEFT_BOTTOM,
+        parent,
+        egui::FontId::proportional(11.0),
+        ui.visuals().weak_text_color(),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, path.display().to_string())
+    });
+    response.on_hover_text(path.display().to_string())
 }

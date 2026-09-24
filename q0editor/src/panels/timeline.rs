@@ -12,8 +12,8 @@ use crate::state::{
 };
 
 const FRAME_W: f32 = 12.0;
-const ROW_H: f32 = 22.0;
-const LAYER_LABEL_W: f32 = 150.0;
+const ROW_H: f32 = 26.0;
+const LAYER_LABEL_W: f32 = 174.0;
 /// Gap above and below the cell fill вЂ” leaves room for thin row separators
 /// like the original Flash CS3 timeline.
 const CELL_PAD_Y: f32 = 1.0;
@@ -1285,7 +1285,9 @@ fn timeline_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
 }
 
 fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new("Timeline").strong());
+        ui.separator();
         let play_label = if app.session.playing { "Pause" } else { "Play" };
         if ui.button(play_label).clicked() {
             app.queue(Action::TogglePlay);
@@ -1366,92 +1368,92 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
             egui::RichText::new(format!("{} fps", app.state.project.meta.fps))
                 .color(theme.text_dim.to_color32()),
         );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let can_delete = app.session.timeline_selection.is_some()
-                || super::menu::selection_can_be_deleted(&app.session.selection);
-            if ui
-                .add_enabled(can_delete, egui::Button::new("Delete"))
-                .on_hover_text("Delete selection (Del)")
-                .clicked()
-            {
-                app.queue(Action::DeleteSelection);
-            }
-            if ui.button("+ Layer").clicked() {
-                app.queue(Action::AddLayer);
-            }
-            if ui
-                .button("+ Folder")
-                .on_hover_text("Create layer folder")
-                .clicked()
-            {
-                app.queue(Action::AddLayerFolder);
-            }
-            let q0rg_id = app.session.current_q0rg_id;
-            let layer_id = app.session.current_layer_id;
-            if layer_move_icon_button(ui, LayerMoveIcon::Up, "Move layer up").clicked() {
-                app.queue(Action::MoveLayer(q0rg_id, layer_id, -1));
-            }
-            if layer_move_icon_button(ui, LayerMoveIcon::Down, "Move layer down").clicked() {
-                app.queue(Action::MoveLayer(q0rg_id, layer_id, 1));
-            }
-            if layer_move_icon_button(ui, LayerMoveIcon::Indent, "Move layer into folder above")
-                .clicked()
-            {
-                app.queue(Action::IndentLayer(q0rg_id, layer_id));
-            }
-            if layer_move_icon_button(ui, LayerMoveIcon::Outdent, "Move layer out of folder")
-                .clicked()
-            {
-                app.queue(Action::OutdentLayer(q0rg_id, layer_id));
-            }
-            if ui.button("+ q0rg").clicked() {
-                app.queue(Action::AddQ0rg);
-            }
-            if ui
-                .button("+ Frame")
-                .on_hover_text("Insert frame (F5)")
-                .clicked()
-            {
-                app.queue(Action::InsertFrame);
-            }
-            let keyframes_enabled = app.session.timeline_selection.is_some()
-                || !app
-                    .state
-                    .project
-                    .layer_is_folder(app.session.current_q0rg_id, app.session.current_layer_id);
-            if ui
-                .add_enabled(keyframes_enabled, egui::Button::new("+ Keyframe"))
-                .on_hover_text("Insert keyframe (F6)")
-                .clicked()
-            {
-                app.queue(Action::InsertKeyframe);
-            }
-            if ui
-                .add_enabled(keyframes_enabled, egui::Button::new("+ Blank Key"))
-                .on_hover_text("Insert blank keyframe (F7)")
-                .clicked()
-            {
-                app.queue(Action::InsertBlankKeyframe);
-            }
-            if ui
-                .button("- Frame")
-                .on_hover_text("Remove selected frame(s) and close the time gap (Shift+F5)")
-                .clicked()
-            {
-                app.queue(Action::RemoveFrame);
-            }
-            let can_tween = app.session.timeline_selection.is_some()
-                && app.session.pending_timeline_frame.is_none();
-            if ui
-                .add_enabled(can_tween, egui::Button::new("Tween"))
-                .on_hover_text(
-                    "Create a motion tween from a non-keyframe cell between two keyframes (Ctrl+Alt+T)",
-                )
-                .clicked()
-            {
-                app.queue(Action::CreateMotionTween);
-            }
-        });
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().button_padding = vec2(8.0, 4.0);
+        let can_delete = app.session.timeline_selection.is_some()
+            || super::menu::selection_can_be_deleted(&app.session.selection);
+        if ui
+            .add_enabled(can_delete, egui::Button::new("Delete"))
+            .on_hover_text("Delete selection (Del)")
+            .clicked()
+        {
+            app.queue(Action::DeleteSelection);
+        }
+        if ui.button("+ Layer").clicked() {
+            app.queue(Action::AddLayer);
+        }
+        if ui
+            .button("+ Folder")
+            .on_hover_text("Create layer folder")
+            .clicked()
+        {
+            app.queue(Action::AddLayerFolder);
+        }
+        let q0rg_id = app.session.current_q0rg_id;
+        let layer_id = app.session.current_layer_id;
+        if layer_move_icon_button(ui, LayerMoveIcon::Up, "Move layer up").clicked() {
+            app.queue(Action::MoveLayer(q0rg_id, layer_id, -1));
+        }
+        if layer_move_icon_button(ui, LayerMoveIcon::Down, "Move layer down").clicked() {
+            app.queue(Action::MoveLayer(q0rg_id, layer_id, 1));
+        }
+        if layer_move_icon_button(ui, LayerMoveIcon::Indent, "Move layer into folder above")
+            .clicked()
+        {
+            app.queue(Action::IndentLayer(q0rg_id, layer_id));
+        }
+        if layer_move_icon_button(ui, LayerMoveIcon::Outdent, "Move layer out of folder").clicked()
+        {
+            app.queue(Action::OutdentLayer(q0rg_id, layer_id));
+        }
+        if ui.button("+ q0rg").clicked() {
+            app.queue(Action::AddQ0rg);
+        }
+        if ui
+            .button("+ Frame")
+            .on_hover_text("Insert frame (F5)")
+            .clicked()
+        {
+            app.queue(Action::InsertFrame);
+        }
+        let keyframes_enabled = app.session.timeline_selection.is_some()
+            || !app
+                .state
+                .project
+                .layer_is_folder(app.session.current_q0rg_id, app.session.current_layer_id);
+        if ui
+            .add_enabled(keyframes_enabled, egui::Button::new("+ Keyframe"))
+            .on_hover_text("Insert keyframe (F6)")
+            .clicked()
+        {
+            app.queue(Action::InsertKeyframe);
+        }
+        if ui
+            .add_enabled(keyframes_enabled, egui::Button::new("+ Blank Key"))
+            .on_hover_text("Insert blank keyframe (F7)")
+            .clicked()
+        {
+            app.queue(Action::InsertBlankKeyframe);
+        }
+        if ui
+            .button("- Frame")
+            .on_hover_text("Remove selected frame(s) and close the time gap (Shift+F5)")
+            .clicked()
+        {
+            app.queue(Action::RemoveFrame);
+        }
+        let can_tween = app.session.timeline_selection.is_some()
+            && app.session.pending_timeline_frame.is_none();
+        if ui
+            .add_enabled(can_tween, egui::Button::new("Tween"))
+            .on_hover_text(
+                "Create a motion tween from a non-keyframe cell between two keyframes (Ctrl+Alt+T)",
+            )
+            .clicked()
+        {
+            app.queue(Action::CreateMotionTween);
+        }
     });
 }
 

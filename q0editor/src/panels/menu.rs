@@ -526,6 +526,7 @@ pub fn handle_global_shortcuts(app: &mut EditorApp, ctx: &egui::Context) {
             for tool in crate::state::Tool::ALL {
                 let key = match tool.glyph() {
                     "V" => Key::V,
+                    "Q" => Key::Q,
                     "H" => Key::H,
                     "A" => Key::A,
                     "P" => Key::P,
@@ -537,6 +538,7 @@ pub fn handle_global_shortcuts(app: &mut EditorApp, ctx: &egui::Context) {
                     "O" => Key::O,
                     "K" => Key::K,
                     "I" => Key::I,
+                    "T" => Key::T,
                     _ => continue,
                 };
                 if i.consume_key(Modifiers::NONE, key) {

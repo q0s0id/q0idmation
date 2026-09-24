@@ -103,17 +103,124 @@ pub fn install(ctx: &Context) {
     visuals.error_fg_color = Color32::from_rgb(0xFF, 0x60, 0x60);
 
     style.visuals = visuals;
-    style.spacing.item_spacing = vec2(4.0, 3.0);
-    style.spacing.button_padding = vec2(6.0, 3.0);
-    style.spacing.menu_margin = egui::Margin::same(4.0);
-    style.spacing.window_margin = egui::Margin::same(2.0);
-    style.spacing.indent = 14.0;
-    style.spacing.scroll.bar_width = 10.0;
-    style.spacing.scroll.bar_inner_margin = 1.0;
+    style.spacing.item_spacing = vec2(6.0, 5.0);
+    style.spacing.button_padding = vec2(10.0, 5.0);
+    style.spacing.interact_size = vec2(40.0, 26.0);
+    style.spacing.menu_margin = egui::Margin::same(8.0);
+    style.spacing.window_margin = egui::Margin::same(16.0);
+    style.spacing.indent = 16.0;
+    style.spacing.scroll.bar_width = 6.0;
+    style.spacing.scroll.bar_inner_margin = 3.0;
+    style
+        .text_styles
+        .insert(egui::TextStyle::Heading, egui::FontId::proportional(18.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Body, egui::FontId::proportional(13.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Small, egui::FontId::proportional(11.0));
 
     ctx.set_style(style);
 }
 
 pub fn text_dim() -> Color32 {
     TEXT_DIM
+}
+
+/// Shared surface treatment: derive chrome from the active theme, including
+/// custom and light palettes, instead of baking dark colours into each panel.
+pub fn surface(ui: &egui::Ui) -> egui::Frame {
+    egui::Frame::none()
+        .fill(ui.visuals().window_fill())
+        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+        .rounding(10.0)
+        .inner_margin(egui::Margin::same(20.0))
+}
+
+pub fn section_heading(ui: &mut egui::Ui, title: &str, detail: &str) {
+    ui.label(egui::RichText::new(title).strong().size(15.0));
+    if !detail.is_empty() {
+        ui.label(
+            egui::RichText::new(detail)
+                .small()
+                .color(ui.visuals().weak_text_color()),
+        );
+    }
+    ui.add_space(5.0);
+}
+
+pub fn primary_button(ui: &mut egui::Ui, label: &str, accent: Color32) -> egui::Response {
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).strong().color(on_accent(accent)))
+            .fill(accent)
+            .min_size(vec2(144.0, 36.0)),
+    )
+}
+
+pub fn on_accent(color: Color32) -> Color32 {
+    let luminance = |v: u8| {
+        let v = f32::from(v) / 255.0;
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let l = 0.2126 * luminance(color.r())
+        + 0.7152 * luminance(color.g())
+        + 0.0722 * luminance(color.b());
+    if l > 0.179 {
+        Color32::BLACK
+    } else {
+        Color32::WHITE
+    }
+}
+
+pub fn preset_button(
+    ui: &mut egui::Ui,
+    preset: &q0theme::BuiltinTheme,
+    selected: bool,
+) -> egui::Response {
+    let color = |c: q0theme::Rgb| Color32::from_rgb(c.r, c.g, c.b);
+    let (rect, response) = ui.allocate_exact_size(vec2(140.0, 65.0), egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, selected, preset.name)
+    });
+    if ui.is_rect_visible(rect) {
+        let border = if selected || response.hovered() || response.has_focus() {
+            Stroke::new(2.0_f32, ui.visuals().hyperlink_color)
+        } else {
+            ui.visuals().widgets.noninteractive.bg_stroke
+        };
+        ui.painter()
+            .rect(rect.shrink(1.0), 7.0, color(preset.window), border);
+        for (index, swatch) in [preset.deep_bg, preset.panel, preset.text, preset.accent]
+            .into_iter()
+            .enumerate()
+        {
+            let position = rect.left_top() + vec2(14.0 + index as f32 * 18.0, 18.0);
+            ui.painter().circle_filled(position, 5.0, color(swatch));
+        }
+        ui.painter().text(
+            rect.left_bottom() + vec2(10.0, -12.0),
+            egui::Align2::LEFT_BOTTOM,
+            preset.name,
+            egui::FontId::proportional(12.0),
+            color(preset.text),
+        );
+        if selected {
+            ui.painter().text(
+                rect.right_top() + vec2(-10.0, 10.0),
+                egui::Align2::RIGHT_TOP,
+                "ON",
+                egui::FontId::monospace(9.0),
+                color(preset.text),
+            );
+        }
+    }
+    response.on_hover_text(preset.name)
 }

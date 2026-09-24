@@ -3084,6 +3084,7 @@ dependencies = [
  "rodio",
  "serde",
  "serde_json",
+ "ttf-parser",
  "ureq",
  "winreg",
  "winres",

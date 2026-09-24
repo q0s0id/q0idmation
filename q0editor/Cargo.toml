@@ -28,6 +28,7 @@ dirs = "5"
 geo = "0.33"
 lyon_path = "1"
 lyon_tessellation = "1"
+ttf-parser = "0.25"
 image = { version = "0.24.9", default-features = false, features = ["png", "jpeg", "webp"] }
 gif = "0.13"
 ureq = "2.12"

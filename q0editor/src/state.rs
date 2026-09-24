@@ -68,6 +68,7 @@ impl TimelineLayerSelection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
     Select,
+    Lasso,
     Hand,
     Subselect,
     Pen,
@@ -79,12 +80,14 @@ pub enum Tool {
     Oval,
     Bucket,
     Eyedropper,
+    Text,
     Rig,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 13] = [
+    pub const ALL: [Tool; 15] = [
         Tool::Select,
+        Tool::Lasso,
         Tool::Hand,
         Tool::Subselect,
         Tool::Pen,
@@ -96,12 +99,14 @@ impl Tool {
         Tool::Oval,
         Tool::Bucket,
         Tool::Eyedropper,
+        Tool::Text,
         Tool::Rig,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
             Tool::Select => "Select",
+            Tool::Lasso => "Lasso",
             Tool::Hand => "Hand",
             Tool::Subselect => "Subselect",
             Tool::Pen => "Pen",
@@ -113,6 +118,7 @@ impl Tool {
             Tool::Oval => "Oval",
             Tool::Bucket => "Paint Bucket",
             Tool::Eyedropper => "Eyedropper",
+            Tool::Text => "Text",
             Tool::Rig => "Rig",
         }
     }
@@ -120,6 +126,7 @@ impl Tool {
     pub fn glyph(self) -> &'static str {
         match self {
             Tool::Select => "V",
+            Tool::Lasso => "Q",
             Tool::Hand => "H",
             Tool::Subselect => "A",
             Tool::Pen => "P",
@@ -131,6 +138,7 @@ impl Tool {
             Tool::Oval => "O",
             Tool::Bucket => "K",
             Tool::Eyedropper => "I",
+            Tool::Text => "T",
             Tool::Rig => "G",
         }
     }
@@ -444,6 +452,9 @@ pub enum GroupTransformOperation {
 #[derive(Debug, Clone)]
 pub enum ToolState {
     Idle,
+    LassoDrawing {
+        points: Vec<Vec2>,
+    },
     PenDrawing {
         anchors: Vec<Anchor>,
     },
@@ -694,6 +705,7 @@ pub struct Session {
     pub library_search: String,
     pub library_sort_ascending: bool,
     pub library_rename: Option<LibraryRename>,
+    pub text_editor: Option<crate::text_tool::TextDraft>,
     pub layer_rename: Option<LayerRename>,
     pub timeline_layer_drag: Option<TimelineLayerDrag>,
     pub timeline_frame_drag: Option<TimelineFrameDrag>,
@@ -815,6 +827,7 @@ impl Session {
             breadcrumb: Vec::new(),
             library_search: String::new(),
             library_sort_ascending: true,
+            text_editor: None,
             library_rename: None,
             layer_rename: None,
             timeline_layer_drag: None,

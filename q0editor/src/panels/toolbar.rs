@@ -7,12 +7,13 @@ use egui::{
 use crate::app::{Action, EditorApp};
 use crate::state::Tool;
 
-const TOOL_BUTTON_SIZE: f32 = 30.0;
+const TOOL_BUTTON_SIZE: f32 = 32.0;
 const TOOL_ICON_SIZE: f32 = 19.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ToolIcon {
     SelectPointer,
+    Lasso,
     Hand,
     SubselectPointer,
     Pen,
@@ -24,6 +25,7 @@ enum ToolIcon {
     Oval,
     Bucket,
     Eyedropper,
+    Text,
     Rig,
 }
 
@@ -31,6 +33,7 @@ impl ToolIcon {
     const fn for_tool(tool: Tool) -> Self {
         match tool {
             Tool::Select => Self::SelectPointer,
+            Tool::Lasso => Self::Lasso,
             Tool::Hand => Self::Hand,
             Tool::Subselect => Self::SubselectPointer,
             Tool::Pen => Self::Pen,
@@ -42,6 +45,7 @@ impl ToolIcon {
             Tool::Oval => Self::Oval,
             Tool::Bucket => Self::Bucket,
             Tool::Eyedropper => Self::Eyedropper,
+            Tool::Text => Self::Text,
             Tool::Rig => Self::Rig,
         }
     }
@@ -49,8 +53,13 @@ impl ToolIcon {
 
 pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     ui.vertical_centered(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
         ui.add_space(4.0);
         for tool in Tool::ALL {
+            if matches!(tool, Tool::Pen | Tool::Line | Tool::Bucket | Tool::Text) {
+                ui.add_space(3.0);
+                ui.separator();
+            }
             let selected = app.session.current_tool == tool;
             let response = tool_button(
                 ui,
@@ -94,7 +103,7 @@ fn tool_button(
             let background = blend_rgb(panel, accent, 0.30);
             ui.painter().rect(
                 rect.shrink(1.0),
-                3.0,
+                6.0,
                 background,
                 Stroke::new(1.5_f32, accent),
             );
@@ -193,6 +202,17 @@ fn draw_tool_icon(
 
     match icon {
         ToolIcon::SelectPointer => draw_select_pointer(painter, c, primary, secondary),
+        ToolIcon::Lasso => {
+            let loop_points: Vec<_> = (0..=22)
+                .map(|step| {
+                    let angle = std::f32::consts::TAU * step as f32 / 22.0;
+                    c.point(0.48 + angle.cos() * 0.34, 0.43 + angle.sin() * 0.29)
+                })
+                .collect();
+            painter.add(Shape::line(loop_points, line));
+            painter.line_segment([c.point(0.76, 0.62), c.point(0.89, 0.9)], fine);
+            painter.circle_filled(c.point(0.89, 0.9), 1.7, secondary);
+        }
         ToolIcon::Hand => draw_hand(painter, c, primary, secondary),
         ToolIcon::SubselectPointer => draw_subselect_pointer(painter, c, primary, secondary),
         ToolIcon::Pen => draw_pen(painter, c, primary, secondary),
@@ -220,6 +240,13 @@ fn draw_tool_icon(
         }
         ToolIcon::Bucket => draw_bucket(painter, c, primary, secondary),
         ToolIcon::Eyedropper => draw_eyedropper(painter, c, primary, secondary),
+        ToolIcon::Text => {
+            painter.line_segment([c.point(0.14, 0.2), c.point(0.86, 0.2)], line);
+            painter.line_segment([c.point(0.5, 0.2), c.point(0.5, 0.82)], line);
+            painter.line_segment([c.point(0.3, 0.82), c.point(0.7, 0.82)], line);
+            painter.line_segment([c.point(0.14, 0.2), c.point(0.14, 0.37)], fine);
+            painter.line_segment([c.point(0.86, 0.2), c.point(0.86, 0.37)], fine);
+        }
         ToolIcon::Rig => {
             painter.line_segment([c.point(0.22, 0.70), c.point(0.50, 0.42)], line);
             painter.line_segment([c.point(0.50, 0.42), c.point(0.80, 0.20)], line);

@@ -21,6 +21,7 @@ pub mod selection_edit;
 pub mod settings;
 pub mod single_instance;
 pub mod state;
+pub mod text_tool;
 pub mod theme;
 pub mod timeline_edit;
 

@@ -6408,17 +6408,26 @@ impl EditorApp {
         let mut close_requested = false;
         egui::Window::new("Settings")
             .open(&mut open)
-            .default_size([460.0, 540.0])
+            .default_size([640.0, 580.0])
+            .max_height((ctx.screen_rect().height() - 110.0).max(320.0))
+            .default_pos(ctx.screen_rect().center() - egui::vec2(336.0, 330.0))
             .collapsible(false)
             .resizable(true)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                ui.heading("Theme presets");
+                ui.label(egui::RichText::new("Make it yours.").size(27.0).strong());
+                ui.label(egui::RichText::new("Appearance, canvas and editor preferences")
+                    .color(self.settings.theme.text_dim.to_color32()));
+                ui.add_space(18.0);
+                crate::theme::section_heading(ui, "Appearance", "Choose a palette. Every panel follows your theme.");
                 ui.horizontal_wrapped(|ui| {
                     for preset in Theme::PRESETS {
-                        if ui.button(preset.name).clicked() {
+                        let selected = self.settings.theme.accent == preset.accent.into()
+                            && self.settings.theme.window == preset.window.into()
+                            && self.settings.theme.panel == preset.panel.into();
+                        if crate::theme::preset_button(ui, preset, selected).clicked() {
                             self.settings.theme = Theme::from_builtin(preset);
                             self.settings.theme.apply(ctx);
                             self.settings.save();
@@ -6426,6 +6435,7 @@ impl EditorApp {
                         }
                     }
                 });
+                ui.add_space(12.0);
                 ui.horizontal_wrapped(|ui| {
                     if ui
                         .button("Save as... (.q7s)")
@@ -6910,12 +6920,14 @@ impl EditorApp {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_width(430.0)
+            .default_width(510.0)
+            .max_height((ctx.screen_rect().height() - 110.0).max(320.0))
+            .vscroll(true)
             .show(ctx, |ui| {
                 ui.label(
-                    egui::RichText::new("Project settings")
+                    egui::RichText::new("Every story starts with a stage.")
                         .strong()
-                        .size(18.0),
+                        .size(24.0),
                 );
                 ui.label(
                     egui::RichText::new(
@@ -6928,35 +6940,30 @@ impl EditorApp {
                 ui.horizontal(|ui| {
                     ui.label("Name");
                     ui.add_sized(
-                        [330.0, 24.0],
+                        [410.0, 32.0],
                         egui::TextEdit::singleline(&mut draft.name).hint_text("untitled"),
                     );
                 });
 
                 ui.add_space(8.0);
-                ui.label("Stage preset");
+                crate::theme::section_heading(ui, "Stage preset", "Pick a format, then fine-tune the dimensions below.");
                 ui.horizontal_wrapped(|ui| {
-                    if ui.button("Classic 640x480").clicked() {
-                        draft.width = 640;
-                        draft.height = 480;
-                    }
-                    if ui.button("HD 1280x720").clicked() {
-                        draft.width = 1280;
-                        draft.height = 720;
-                    }
-                    if ui.button("Full HD 1920x1080").clicked() {
-                        draft.width = 1920;
-                        draft.height = 1080;
-                    }
-                    if ui.button("Portrait 1080x1920").clicked() {
-                        draft.width = 1080;
-                        draft.height = 1920;
+                    for (name, width, height) in [
+                        ("Classic", 640, 480), ("HD", 1280, 720),
+                        ("Full HD", 1920, 1080), ("Portrait", 1080, 1920),
+                    ] {
+                        let selected = draft.width == width && draft.height == height;
+                        if ui.add_sized([117.0, 54.0], egui::Button::new(
+                            format!("{name}\n{width} × {height}")).selected(selected).rounding(6.0)).clicked() {
+                            draft.width = width;
+                            draft.height = height;
+                        }
                     }
                 });
-
+                ui.add_space(12.0);
                 ui.add_space(6.0);
                 egui::Grid::new("new_project_settings_grid")
-                    .num_columns(2)
+                    .num_columns(4)
                     .spacing([18.0, 8.0])
                     .show(ui, |ui| {
                         ui.label("Width");
@@ -6965,7 +6972,6 @@ impl EditorApp {
                                 .clamp_range(1..=8192)
                                 .suffix(" px"),
                         );
-                        ui.end_row();
 
                         ui.label("Height");
                         ui.add(
@@ -6981,7 +6987,6 @@ impl EditorApp {
                                 .clamp_range(1..=240)
                                 .suffix(" fps"),
                         );
-                        ui.end_row();
 
                         ui.label("Initial timeline");
                         ui.add(
@@ -7004,7 +7009,7 @@ impl EditorApp {
                 ui.add_space(12.0);
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("Create project").clicked() {
+                    if crate::theme::primary_button(ui, "Create project", self.settings.theme.accent.to_color32()).clicked() {
                         create = true;
                     }
                     if ui.button("Cancel").clicked() {
@@ -7449,9 +7454,11 @@ impl App for EditorApp {
         panels::tabs::render(self, ctx);
 
         if self.show_home {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                panels::home::render(self, ui);
-            });
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().fill(self.settings.theme.deep_bg.to_color32()))
+                .show(ctx, |ui| {
+                    panels::home::render(self, ui);
+                });
         } else if self.active_document_is_q0lang() {
             egui::CentralPanel::default().show(ctx, |ui| {
                 crate::q0lang::editor::render_standalone(self, ui);
@@ -7459,8 +7466,8 @@ impl App for EditorApp {
         } else {
             egui::TopBottomPanel::bottom("timeline")
                 .resizable(true)
-                .default_height(170.0)
-                .min_height(80.0)
+                .default_height(192.0)
+                .min_height(120.0)
                 .show(ctx, |ui| {
                     panels::timeline::render(self, ui);
                 });
@@ -7469,14 +7476,16 @@ impl App for EditorApp {
 
             egui::SidePanel::left("toolbar")
                 .resizable(false)
-                .exact_width(40.0)
+                .exact_width(48.0)
                 .show(ctx, |ui| {
-                    panels::toolbar::render(self, ui);
+                    egui::ScrollArea::vertical()
+                        .id_source("tools_scroll")
+                        .show(ui, |ui| panels::toolbar::render(self, ui));
                 });
 
             egui::SidePanel::right("right_dock")
                 .resizable(true)
-                .default_width(260.0)
+                .default_width(290.0)
                 .min_width(200.0)
                 .show(ctx, |ui| {
                     let half = ui.available_height() * 0.5;
@@ -7484,7 +7493,9 @@ impl App for EditorApp {
                         .resizable(true)
                         .default_height(half)
                         .show_inside(ui, |ui| {
-                            panels::library::render(self, ui);
+                            egui::ScrollArea::vertical()
+                                .id_source("library_panel_scroll")
+                                .show(ui, |ui| panels::library::render(self, ui));
                         });
                     egui::CentralPanel::default().show_inside(ui, |ui| {
                         panels::properties::render(self, ui);
@@ -7512,6 +7523,7 @@ impl App for EditorApp {
             self.render_settings_dialog(ctx);
         }
         self.render_new_project_dialog(ctx);
+        crate::text_tool::render_dialog(self, ctx);
         self.render_destructive_change_dialogs(ctx);
         self.render_unsaved_changes_dialog(ctx);
 

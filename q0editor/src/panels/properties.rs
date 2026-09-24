@@ -7,7 +7,7 @@ use crate::app::{Action, EditorApp};
 use crate::state::{BrushLibraryFilter, BrushSizePreview, Selection, Tool};
 
 pub fn render(app: &mut EditorApp, ui: &mut Ui) {
-    ui.heading("Properties");
+    crate::theme::section_heading(ui, "Properties", "Selection & tool controls");
     ui.separator();
 
     ScrollArea::vertical()
@@ -356,6 +356,7 @@ fn stage_properties(app: &mut EditorApp, ui: &mut Ui) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolPropertyKind {
     Select,
+    Lasso,
     Hand,
     Subselect,
     Pen,
@@ -366,12 +367,14 @@ enum ToolPropertyKind {
     ClosedShape,
     Fill,
     Eyedropper,
+    Text,
     Rig,
 }
 
 fn tool_property_kind(tool: Tool) -> ToolPropertyKind {
     match tool {
         Tool::Select => ToolPropertyKind::Select,
+        Tool::Lasso => ToolPropertyKind::Lasso,
         Tool::Hand => ToolPropertyKind::Hand,
         Tool::Subselect => ToolPropertyKind::Subselect,
         Tool::Pen => ToolPropertyKind::Pen,
@@ -382,6 +385,7 @@ fn tool_property_kind(tool: Tool) -> ToolPropertyKind {
         Tool::Rectangle | Tool::Oval => ToolPropertyKind::ClosedShape,
         Tool::Bucket => ToolPropertyKind::Fill,
         Tool::Eyedropper => ToolPropertyKind::Eyedropper,
+        Tool::Text => ToolPropertyKind::Text,
         Tool::Rig => ToolPropertyKind::Rig,
     }
 }
@@ -401,6 +405,10 @@ fn render_tool_properties(app: &mut EditorApp, ui: &mut Ui) {
             ui,
             "Select connected raw fills, partial areas, or display objects. Drag the selection to move it.",
         ),
+        ToolPropertyKind::Lasso => tool_hint(app, ui,
+            "Draw a loop to select contours and objects inside or touching it."),
+        ToolPropertyKind::Text => tool_hint(app, ui,
+            "Click the stage to add text. Click existing text to edit it."),
         ToolPropertyKind::Hand => tool_hint(
             app,
             ui,
@@ -1184,6 +1192,7 @@ fn color32_to_rgba(c: Color32) -> Rgba {
 }
 
 fn asset_properties(app: &mut EditorApp, ui: &mut Ui, id: u16) {
+    text_properties(app, ui, id);
     let Some(asset_idx) = app.state.project.assets.iter().position(|a| a.id() == id) else {
         ui.label("Selection is no longer available");
         return;
@@ -1463,6 +1472,17 @@ fn placement_properties(
     layer_id: u16,
     placement_idx: usize,
 ) {
+    if let Some(asset_id) = crate::text_tool::selected_asset_id(
+        app,
+        &Selection::Placement {
+            q0rg_id,
+            layer_id,
+            placement_idx,
+        },
+    ) {
+        text_properties(app, ui, asset_id);
+        ui.separator();
+    }
     let before = app.state.project.clone();
     let current_frame = app.session.current_frame;
     let Some((source_frame, mut transform, tween, mut fx)) = app
@@ -1784,6 +1804,24 @@ fn placement_properties(
     }
 }
 
+fn text_properties(app: &mut EditorApp, ui: &mut Ui, asset_id: u16) {
+    let Some((content, size)) = app
+        .state
+        .project
+        .asset_names
+        .get(&asset_id)
+        .and_then(|name| crate::text_tool::decode_source(name))
+    else {
+        return;
+    };
+    ui.label(egui::RichText::new("Text").strong());
+    ui.label(egui::RichText::new(content).color(app.settings.theme.text_dim.to_color32()));
+    ui.label(format!("{} px · vector outlines", size as u16));
+    if ui.button("Edit text...").clicked() {
+        crate::text_tool::begin_edit(app, asset_id);
+    }
+}
+
 fn apply_placement_edit_at_frame(
     app: &mut EditorApp,
     q0rg_id: u16,
@@ -1990,6 +2028,7 @@ mod tests {
     fn every_tool_gets_a_specific_properties_kind() {
         let kinds = [
             tool_property_kind(Tool::Select),
+            tool_property_kind(Tool::Lasso),
             tool_property_kind(Tool::Subselect),
             tool_property_kind(Tool::Pen),
             tool_property_kind(Tool::Pencil),
@@ -1999,6 +2038,7 @@ mod tests {
             tool_property_kind(Tool::Rectangle),
             tool_property_kind(Tool::Bucket),
             tool_property_kind(Tool::Eyedropper),
+            tool_property_kind(Tool::Text),
             tool_property_kind(Tool::Rig),
         ];
         for first in 0..kinds.len() {
