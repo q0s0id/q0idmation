@@ -5351,34 +5351,31 @@ pub(crate) fn materialize_raw_paths_as_placements(
         let _ = &original_paths;
         #[cfg(feature = "appearance-mask-eraser")]
         {
-            let selected_geometry = app
-                .state
-                .project
-                .assets
-                .iter()
-                .find(|asset| asset.id() == selected_asset_id)
-                .and_then(|asset| match asset {
-                    Asset::Vector(vector) => Some(vector_fill_geometry(vector)),
-                    _ => None,
-                })
-                .unwrap_or_else(|| MultiPolygon(Vec::new()));
-            let partition = app
-                .state
-                .project
-                .asset_appearances
-                .get(&writable_asset_id)
-                .map(|appearance| {
-                    crate::appearance::material_support(&selected_geometry, appearance.material)
-                })
-                .unwrap_or(selected_geometry);
-            crate::appearance::split_asset_appearance(
-                &mut app.state.project,
-                writable_asset_id,
-                selected_asset_id,
-                &original_paths,
-                &partition,
-                source_empty,
-            );
+            if let Some(appearance) = app.state.project.asset_appearances.get(&writable_asset_id) {
+                let selected_geometry = app
+                    .state
+                    .project
+                    .assets
+                    .iter()
+                    .find(|asset| asset.id() == selected_asset_id)
+                    .and_then(|asset| match asset {
+                        Asset::Vector(vector) => Some(
+                            crate::appearance::visible_source_surface_for_vector(vector, None),
+                        ),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| MultiPolygon(Vec::new()));
+                let partition =
+                    crate::appearance::material_support(&selected_geometry, appearance.material);
+                crate::appearance::split_asset_appearance(
+                    &mut app.state.project,
+                    writable_asset_id,
+                    selected_asset_id,
+                    &original_paths,
+                    &partition,
+                    source_empty,
+                );
+            }
         }
         let layer = app
             .state
@@ -11741,6 +11738,137 @@ mod tests {
         );
         assert!(selected_after_move.difference(&expected).unsigned_area() < 0.05);
         assert!(expected.difference(&selected_after_move).unsigned_area() < 0.05);
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn v_drag_of_whole_curve_in_multi_component_fill_keeps_smooth_outline() {
+        let mut project =
+            q0s_format::v2::parse(include_bytes!("../testdata/marquee_curve_regression.q1s"))
+                .expect("parse curved artwork fixture");
+        project.assets.retain(|asset| asset.id() == 1);
+        project.q0rgs[0].layers[0]
+            .placements
+            .retain(|placement| placement.target == Target::Asset(1));
+        let Asset::Vector(vector) = &mut project.assets[0] else {
+            unreachable!()
+        };
+        let original_path = vector.paths[0].clone();
+        let mut distant_path = original_path.clone();
+        for anchor in &mut distant_path.anchors {
+            anchor.point.x += 700.0;
+            if let Some(handle) = &mut anchor.in_handle {
+                handle.x += 700.0;
+            }
+            if let Some(handle) = &mut anchor.out_handle {
+                handle.x += 700.0;
+            }
+        }
+        vector.paths = vec![original_path.clone(), distant_path];
+        let expected = crate::appearance::visible_source_surface_for_vector(
+            &VectorAsset {
+                asset_id: 1,
+                paths: vec![original_path.clone()],
+                fill: vector.fill,
+                stroke: None,
+            },
+            None,
+        );
+        for material in [
+            q0s_format::v2::VectorMaterial::Solid,
+            q0s_format::v2::VectorMaterial::SoftHalo {
+                radius: 10.0,
+                opacity: 0.5,
+            },
+        ] {
+            let mut app = EditorApp::default();
+            app.state.project = project.clone();
+            app.state.project.asset_appearances.insert(
+                1,
+                q0s_format::v2::VectorAppearance {
+                    material,
+                    erase_mask: Vec::new(),
+                    material_source: Vec::new(),
+                    clip_mask: Vec::new(),
+                    field_transform: Affine::IDENTITY,
+                },
+            );
+            let reference = PathRef {
+                q0rg_id: 1,
+                layer_id: app.state.project.q0rgs[0].layers[0].layer_id,
+                placement_idx: 0,
+                path_idx: 0,
+            };
+            assert!(begin_dragging_raw_paths(
+                &mut app,
+                vec![reference],
+                Vec2::new(300.0, 100.0),
+                "Moving selected raw graphics",
+            ));
+            let ToolState::DraggingPaths { refs, .. } = app.session.tool_state.clone() else {
+                panic!("V must start dragging the selected fill");
+            };
+            let selected_id = raw_placement_asset_id(
+                &app.state.project,
+                refs[0].q0rg_id,
+                refs[0].layer_id,
+                refs[0].placement_idx,
+            )
+            .expect("selected vector placement");
+            let Asset::Vector(selected) = app
+                .state
+                .project
+                .assets
+                .iter()
+                .find(|asset| asset.id() == selected_id)
+                .expect("selected vector")
+            else {
+                unreachable!()
+            };
+            assert_eq!(selected.paths[0], original_path);
+            let visible = crate::appearance::visible_source_surface_for_vector(
+                selected,
+                app.state.project.asset_appearances.get(&selected_id),
+            );
+            assert!(
+                surface_mismatch_area(&visible, &expected) < 0.05,
+                "V selection must not clip a curved fill to its angular anchor hull"
+            );
+            let delta = Vec2::new(34.0, 18.0);
+            assert!(set_raw_refs_live_transform(
+                &mut app.state.project,
+                &refs,
+                Affine {
+                    tx: delta.x,
+                    ty: delta.y,
+                    ..Affine::IDENTITY
+                },
+            ));
+            assert!(bake_raw_refs_live_transform(&mut app, &refs));
+            let Asset::Vector(selected_after) = app
+                .state
+                .project
+                .assets
+                .iter()
+                .find(|asset| asset.id() == selected_id)
+                .expect("moved vector")
+            else {
+                unreachable!()
+            };
+            let moved_visible = crate::appearance::visible_source_surface_for_vector(
+                selected_after,
+                app.state.project.asset_appearances.get(&selected_id),
+            );
+            let expected_moved = crate::appearance::transform_surface(
+                &expected,
+                Affine {
+                    tx: delta.x,
+                    ty: delta.y,
+                    ..Affine::IDENTITY
+                },
+            );
+            assert!(surface_mismatch_area(&moved_visible, &expected_moved) < 0.05);
+        }
     }
 
     #[test]

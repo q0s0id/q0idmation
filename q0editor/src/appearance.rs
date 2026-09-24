@@ -76,17 +76,7 @@ pub(crate) fn partition_appearance(
     } else {
         original.material_source.clone()
     };
-    let material_geometry = rendered_curve_surface(&VectorAsset {
-        asset_id: 0,
-        paths: material_source.clone(),
-        fill: Some(Rgba {
-            r: 255,
-            g: 255,
-            b: 255,
-            a: 255,
-        }),
-        stroke: None,
-    });
+    let material_geometry = rendered_curve_paths_surface(&material_source);
     if material_geometry.0.is_empty() {
         return None;
     }
@@ -105,7 +95,7 @@ pub(crate) fn partition_appearance(
         material: original.material,
         erase_mask: original.erase_mask.clone(),
         material_source: material_source.clone(),
-        clip_mask: crate::brush::coverage_to_paths(&clip),
+        clip_mask: crate::brush::coverage_to_linear_paths(&clip),
         field_transform: original.field_transform,
     };
     Some((make(source_clip), make(selected_clip)))
@@ -128,7 +118,7 @@ pub(crate) fn partition_unclipped_appearance_by_source_subset(
         return None;
     }
     let inverse_field = original.field_transform.inverse()?;
-    let selected_source = paths_to_coverage(selected_paths);
+    let selected_source = rendered_curve_paths_surface(selected_paths);
     if selected_source.0.is_empty() {
         return None;
     }
@@ -146,7 +136,7 @@ pub(crate) fn partition_unclipped_appearance_by_source_subset(
     };
 
     let mut remainder = original.clone();
-    remainder.erase_mask = crate::brush::coverage_to_paths(&remainder_erase);
+    remainder.erase_mask = crate::brush::coverage_to_linear_paths(&remainder_erase);
 
     let material_source = if original.material_source.is_empty() {
         original_paths.to_vec()
@@ -157,7 +147,7 @@ pub(crate) fn partition_unclipped_appearance_by_source_subset(
         material: original.material,
         erase_mask: original.erase_mask.clone(),
         material_source,
-        clip_mask: crate::brush::coverage_to_paths(&selected_support),
+        clip_mask: crate::brush::coverage_to_linear_paths(&selected_support),
         field_transform: original.field_transform,
     };
     Some((remainder, selected))
@@ -316,6 +306,20 @@ fn rendered_curve_surface(vector: &VectorAsset) -> MultiPolygon<f64> {
         stroke: None,
     };
     crate::brush::vector_fill_geometry(&flattened)
+}
+
+fn rendered_curve_paths_surface(paths: &[VPath]) -> MultiPolygon<f64> {
+    rendered_curve_surface(&VectorAsset {
+        asset_id: 0,
+        paths: paths.to_vec(),
+        fill: Some(Rgba {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 255,
+        }),
+        stroke: None,
+    })
 }
 
 pub(crate) fn mask_paths_to_coverage(paths: &[VPath]) -> MultiPolygon<f64> {
@@ -701,12 +705,7 @@ pub(crate) fn material_source_surface(
     let source = if appearance.material_source.is_empty() {
         vector
     } else {
-        return rendered_curve_surface(&VectorAsset {
-            asset_id: vector.asset_id,
-            paths: appearance.material_source.clone(),
-            fill: vector.fill,
-            stroke: None,
-        });
+        return rendered_curve_paths_surface(&appearance.material_source);
     };
     rendered_curve_surface(source)
 }
@@ -814,7 +813,7 @@ pub(crate) fn visible_material_surface_for_paths(
         fill: vector.fill,
         stroke: None,
     };
-    let subset_source = crate::brush::vector_fill_geometry(&subset);
+    let subset_source = rendered_curve_surface(&subset);
     let Some(appearance) = appearance else {
         return subset_source;
     };
