@@ -1984,6 +1984,8 @@ fn cut_raw_areas_for_drag_prepared(
         }
     }
     for (r, asset_id, selected, remainder, appearance_enabled, whole_visual) in jobs {
+        #[cfg(not(feature = "appearance-mask-eraser"))]
+        let _ = appearance_enabled;
         if whole_visual {
             let Some(Asset::Vector(original)) = app
                 .state
@@ -2014,7 +2016,7 @@ fn cut_raw_areas_for_drag_prepared(
             continue;
         }
 
-        if appearance_enabled {
+        if cfg!(feature = "appearance-mask-eraser") {
             let Some(Asset::Vector(original)) = app
                 .state
                 .project
@@ -2026,8 +2028,6 @@ fn cut_raw_areas_for_drag_prepared(
                 continue;
             };
 
-            let selected_has_body = selected.unsigned_area() > 0.05;
-            let remainder_has_body = remainder.unsigned_area() > 0.05;
             let carrier_paths: Vec<VPath> = original
                 .paths
                 .iter()
@@ -2037,56 +2037,48 @@ fn cut_raw_areas_for_drag_prepared(
             if carrier_paths.is_empty() {
                 continue;
             }
-
-            // When the marquee cuts real fill we keep the compact physical body
-            // split. If it catches halo only (or all body but not all halo), the
-            // frozen source is duplicated only as an internal carrier; the
-            // post-material clip is authoritative for rendering/hit-testing.
-            let selected_paths = if selected_has_body {
-                let paths = geo_multi_polygon_to_linear_paths(&selected);
-                if paths.is_empty() {
-                    carrier_paths.clone()
-                } else {
-                    paths
-                }
-            } else {
-                carrier_paths.clone()
-            };
-            if selected_has_body && remainder_has_body {
-                if let Some(Asset::Vector(vector)) = app
-                    .state
-                    .project
-                    .assets
-                    .iter_mut()
-                    .find(|asset| asset.id() == asset_id)
-                {
-                    let mut paths: Vec<VPath> = vector
-                        .paths
-                        .iter()
-                        .filter(|path| !path.closed)
-                        .cloned()
-                        .collect();
-                    paths.extend(geo_multi_polygon_to_linear_paths(&remainder));
-                    vector.paths = paths;
-                }
-            }
-
             let selected_asset_id = next_asset_id(&app.state.project);
             app.state.project.assets.push(Asset::Vector(VectorAsset {
                 asset_id: selected_asset_id,
-                paths: selected_paths,
+                // Keep the authored curves on both sides of the cut. Only the
+                // clip/erase masks partition their visible pixels.
+                paths: carrier_paths.clone(),
                 fill: original.fill,
                 stroke: original.stroke,
             }));
             #[cfg(feature = "appearance-mask-eraser")]
-            crate::appearance::split_asset_appearance(
-                &mut app.state.project,
-                asset_id,
-                selected_asset_id,
-                &original.paths,
-                &clip,
-                false,
-            );
+            if appearance_enabled {
+                crate::appearance::split_asset_appearance(
+                    &mut app.state.project,
+                    asset_id,
+                    selected_asset_id,
+                    &original.paths,
+                    &clip,
+                    false,
+                );
+            } else {
+                let mask_paths = geo_multi_polygon_to_linear_paths(&clip);
+                let source_appearance = q0s_format::v2::VectorAppearance {
+                    material: q0s_format::v2::VectorMaterial::Solid,
+                    erase_mask: mask_paths.clone(),
+                    material_source: carrier_paths.clone(),
+                    clip_mask: Vec::new(),
+                    field_transform: Affine::IDENTITY,
+                };
+                let selected_appearance = q0s_format::v2::VectorAppearance {
+                    erase_mask: Vec::new(),
+                    clip_mask: mask_paths,
+                    ..source_appearance.clone()
+                };
+                app.state
+                    .project
+                    .asset_appearances
+                    .insert(asset_id, source_appearance);
+                app.state
+                    .project
+                    .asset_appearances
+                    .insert(selected_asset_id, selected_appearance);
+            }
 
             let Some(layer) = app
                 .state
@@ -2118,17 +2110,7 @@ fn cut_raw_areas_for_drag_prepared(
                     fx: Default::default(),
                 },
             );
-            let selected_len = app
-                .state
-                .project
-                .assets
-                .iter()
-                .find(|asset| asset.id() == selected_asset_id)
-                .and_then(|asset| match asset {
-                    Asset::Vector(vector) => Some(vector.paths.len()),
-                    _ => None,
-                })
-                .unwrap_or(0);
+            let selected_len = carrier_paths.len();
             refs.extend((0..selected_len).map(|path_idx| PathRef {
                 q0rg_id: r.q0rg_id,
                 layer_id: r.layer_id,
@@ -11253,20 +11235,39 @@ mod tests {
             Some(&loop_points),
         );
         assert!(!refs.is_empty());
-        let Asset::Vector(cut_vector) = &app.state.project.assets[0] else {
-            panic!("cut raw fill");
-        };
-        let selected_paths = refs
+        let selected_id = raw_placement_asset_id(
+            &app.state.project,
+            refs[0].q0rg_id,
+            refs[0].layer_id,
+            refs[0].placement_idx,
+        )
+        .expect("selected raw fragment");
+        let Asset::Vector(selected_fragment) = app
+            .state
+            .project
+            .assets
             .iter()
-            .map(|reference| cut_vector.paths[reference.path_idx].clone())
-            .collect();
-        let selected_fragment = VectorAsset {
-            asset_id: 2,
-            paths: selected_paths,
-            fill: cut_vector.fill,
-            stroke: None,
+            .find(|asset| asset.id() == selected_id)
+            .expect("selected asset")
+        else {
+            panic!("selected raw fragment must be vector");
         };
-        assert!((vector_fill_geometry(&selected_fragment).unsigned_area() - 1250.0).abs() < 0.1);
+        #[cfg(feature = "appearance-mask-eraser")]
+        let selected_surface = crate::appearance::visible_source_surface_for_vector(
+            selected_fragment,
+            app.state.project.asset_appearances.get(&selected_id),
+        );
+        #[cfg(not(feature = "appearance-mask-eraser"))]
+        let selected_surface = vector_fill_geometry(&VectorAsset {
+            asset_id: selected_id,
+            paths: refs
+                .iter()
+                .map(|reference| selected_fragment.paths[reference.path_idx].clone())
+                .collect(),
+            fill: selected_fragment.fill,
+            stroke: None,
+        });
+        assert!((selected_surface.unsigned_area() - 1250.0).abs() < 0.1);
         let mut after_delete = project;
         assert!(crate::selection_edit::remove_raw_area_and_objects(
             &mut after_delete,
@@ -11581,6 +11582,165 @@ mod tests {
             released, expected,
             "release polygonized the marquee-moved curve"
         );
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn partial_lasso_drag_preserves_real_curve_fixture() {
+        let mut project =
+            q0s_format::v2::parse(include_bytes!("../testdata/marquee_curve_regression.q1s"))
+                .expect("parse user curve regression fixture");
+        project.assets.retain(|asset| asset.id() == 1);
+        project.q0rgs[0].layers[0]
+            .placements
+            .retain(|placement| placement.target == Target::Asset(1));
+        let Asset::Vector(original_vector) = &project.assets[0] else {
+            panic!("fixture asset must be vector");
+        };
+        let original_path = original_vector.paths[0].clone();
+        assert!(original_path
+            .anchors
+            .iter()
+            .any(|anchor| anchor.in_handle.is_some() || anchor.out_handle.is_some()));
+        let outline = crate::render::flatten_path(&original_path);
+        let min_x = outline.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+        let max_x = outline
+            .iter()
+            .map(|p| p.x)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let min_y = outline.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+        let max_y = outline
+            .iter()
+            .map(|p| p.y)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let middle = (min_x + max_x) * 0.5;
+        let polygon = [
+            Vec2::new(min_x - 10.0, min_y - 10.0),
+            Vec2::new(middle, min_y - 10.0),
+            Vec2::new(middle, max_y + 10.0),
+            Vec2::new(min_x - 10.0, max_y + 10.0),
+        ];
+        let original_visible =
+            crate::appearance::visible_source_surface_for_vector(original_vector, None);
+        let anchor_only = vector_fill_geometry(original_vector);
+        assert!(
+            original_visible.difference(&anchor_only).unsigned_area()
+                + anchor_only.difference(&original_visible).unsigned_area()
+                > 0.5,
+            "fixture must expose the angular anchor-only rendering defect"
+        );
+        let mut app = EditorApp::default();
+        app.state.project = project;
+        let source_ref = PlacementRef {
+            q0rg_id: 1,
+            layer_id: app.state.project.q0rgs[0].layers[0].layer_id,
+            placement_idx: 0,
+        };
+        let refs = cut_raw_areas_for_drag_with_clip(
+            &mut app,
+            &[source_ref],
+            (min_x - 10.0, min_y - 10.0, middle, max_y + 10.0),
+            Some(&polygon),
+        );
+        assert!(!refs.is_empty());
+        let selected_id = raw_placement_asset_id(
+            &app.state.project,
+            refs[0].q0rg_id,
+            refs[0].layer_id,
+            refs[0].placement_idx,
+        )
+        .expect("separate selected asset");
+        assert_ne!(selected_id, 1);
+        let vector = |id| match app
+            .state
+            .project
+            .assets
+            .iter()
+            .find(|asset| asset.id() == id)
+        {
+            Some(Asset::Vector(vector)) => vector,
+            _ => panic!("missing vector fragment"),
+        };
+        assert_eq!(vector(1).paths[0], original_path);
+        assert_eq!(vector(selected_id).paths[0], original_path);
+        let visible = |id| {
+            crate::appearance::visible_source_surface_for_vector(
+                vector(id),
+                app.state.project.asset_appearances.get(&id),
+            )
+        };
+        let selected_before_move = visible(selected_id);
+        let combined = visible(1).union(&selected_before_move);
+        assert!(combined.difference(&original_visible).unsigned_area() < 0.05);
+        assert!(original_visible.difference(&combined).unsigned_area() < 0.05);
+
+        let start_appearances = capture_whole_asset_appearances_for_raw_refs(&mut app, &refs);
+        let delta = Vec2::new(32.0, 17.0);
+        for reference in &refs {
+            assert!(replace_raw_path_translated(
+                &mut app.state.project,
+                reference.q0rg_id,
+                reference.layer_id,
+                reference.placement_idx,
+                reference.path_idx,
+                &original_path,
+                delta,
+            ));
+        }
+        assert!(translate_captured_appearances(
+            &mut app.state.project,
+            &start_appearances,
+            delta,
+        ));
+        let Asset::Vector(source_after) = app
+            .state
+            .project
+            .assets
+            .iter()
+            .find(|asset| asset.id() == 1)
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(source_after.paths[0], original_path);
+        let Asset::Vector(selected_after) = app
+            .state
+            .project
+            .assets
+            .iter()
+            .find(|asset| asset.id() == selected_id)
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            selected_after.paths[0].anchors.len(),
+            original_path.anchors.len()
+        );
+        for (moved, original) in selected_after.paths[0]
+            .anchors
+            .iter()
+            .zip(&original_path.anchors)
+        {
+            let translated = |point: Vec2| Vec2::new(point.x + delta.x, point.y + delta.y);
+            assert_eq!(moved.point, translated(original.point));
+            assert_eq!(moved.in_handle, original.in_handle.map(translated));
+            assert_eq!(moved.out_handle, original.out_handle.map(translated));
+        }
+        let selected_after_move = crate::appearance::visible_source_surface_for_vector(
+            selected_after,
+            app.state.project.asset_appearances.get(&selected_id),
+        );
+        let expected = crate::appearance::transform_surface(
+            &selected_before_move,
+            Affine {
+                tx: delta.x,
+                ty: delta.y,
+                ..Affine::IDENTITY
+            },
+        );
+        assert!(selected_after_move.difference(&expected).unsigned_area() < 0.05);
+        assert!(expected.difference(&selected_after_move).unsigned_area() < 0.05);
     }
 
     #[test]

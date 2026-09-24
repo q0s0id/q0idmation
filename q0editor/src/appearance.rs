@@ -3,8 +3,8 @@ use std::collections::BTreeSet;
 use geo::{BooleanOps, Buffer, Contains, Coord, LineString, MultiPolygon, Point, Polygon};
 use q0s_format::transform::Affine;
 use q0s_format::v2::{
-    Asset, Path as VPath, ProjectV2, Rgba, Target, Transform2D, Tween, Vec2, VectorAppearance,
-    VectorAsset, VectorMaterial,
+    Anchor, Asset, Path as VPath, ProjectV2, Rgba, Target, Transform2D, Tween, Vec2,
+    VectorAppearance, VectorAsset, VectorMaterial,
 };
 
 use crate::app::EditorApp;
@@ -76,7 +76,17 @@ pub(crate) fn partition_appearance(
     } else {
         original.material_source.clone()
     };
-    let material_geometry = paths_to_coverage(&material_source);
+    let material_geometry = rendered_curve_surface(&VectorAsset {
+        asset_id: 0,
+        paths: material_source.clone(),
+        fill: Some(Rgba {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 255,
+        }),
+        stroke: None,
+    });
     if material_geometry.0.is_empty() {
         return None;
     }
@@ -274,6 +284,40 @@ pub(crate) fn paths_to_coverage(paths: &[VPath]) -> MultiPolygon<f64> {
     })
 }
 
+// The canonical brush geometry intentionally uses anchors alone for fast paint
+// merging. A clipped appearance is rendered from this surface, however, so it
+// must follow the same sampled Bezier outline as an uncut vector.
+fn rendered_curve_surface(vector: &VectorAsset) -> MultiPolygon<f64> {
+    if !vector.paths.iter().any(|path| {
+        path.anchors
+            .iter()
+            .any(|anchor| anchor.in_handle.is_some() || anchor.out_handle.is_some())
+    }) {
+        return crate::brush::vector_fill_geometry(vector);
+    }
+    let flattened = VectorAsset {
+        asset_id: vector.asset_id,
+        paths: vector
+            .paths
+            .iter()
+            .map(|path| VPath {
+                anchors: crate::render::flatten_path(path)
+                    .into_iter()
+                    .map(|point| Anchor {
+                        point,
+                        in_handle: None,
+                        out_handle: None,
+                    })
+                    .collect(),
+                closed: path.closed,
+            })
+            .collect(),
+        fill: vector.fill,
+        stroke: None,
+    };
+    crate::brush::vector_fill_geometry(&flattened)
+}
+
 pub(crate) fn mask_paths_to_coverage(paths: &[VPath]) -> MultiPolygon<f64> {
     paths_to_coverage(paths)
 }
@@ -399,7 +443,12 @@ pub(crate) fn prepare_visible_material_hit_tester(
     let inverse_field = appearance.field_transform.inverse()?;
     let support_is_post_material_clip = !appearance.clip_mask.is_empty();
     let support = if support_is_post_material_clip {
-        mask_paths_to_coverage(&appearance.clip_mask)
+        let clip = mask_paths_to_coverage(&appearance.clip_mask);
+        if appearance.material == VectorMaterial::Solid {
+            material_source_surface(vector, appearance).intersection(&clip)
+        } else {
+            clip
+        }
     } else {
         material_source_surface(vector, appearance)
     };
@@ -649,11 +698,17 @@ pub(crate) fn material_source_surface(
     vector: &VectorAsset,
     appearance: &VectorAppearance,
 ) -> MultiPolygon<f64> {
-    if appearance.material_source.is_empty() {
-        crate::brush::vector_fill_geometry(vector)
+    let source = if appearance.material_source.is_empty() {
+        vector
     } else {
-        paths_to_coverage(&appearance.material_source)
-    }
+        return rendered_curve_surface(&VectorAsset {
+            asset_id: vector.asset_id,
+            paths: appearance.material_source.clone(),
+            fill: vector.fill,
+            stroke: None,
+        });
+    };
+    rendered_curve_surface(source)
 }
 
 fn clip_surface(surface: MultiPolygon<f64>, appearance: &VectorAppearance) -> MultiPolygon<f64> {
@@ -675,7 +730,7 @@ pub(crate) fn visible_source_surface_for_vector(
     vector: &VectorAsset,
     appearance: Option<&VectorAppearance>,
 ) -> MultiPolygon<f64> {
-    let source = crate::brush::vector_fill_geometry(vector);
+    let source = rendered_curve_surface(vector);
     let Some(appearance) = appearance else {
         return source;
     };
@@ -700,7 +755,7 @@ pub(crate) fn canonical_visible_source_surface_for_vector(
     appearance: &VectorAppearance,
 ) -> Option<MultiPolygon<f64>> {
     let inverse_field = appearance.field_transform.inverse()?;
-    let source = transform_surface(&crate::brush::vector_fill_geometry(vector), inverse_field);
+    let source = transform_surface(&rendered_curve_surface(vector), inverse_field);
     let clipped = if appearance.clip_mask.is_empty() {
         source
     } else {
@@ -730,6 +785,9 @@ pub(crate) fn visible_material_surface_for_vector(
     let clipped = if appearance.clip_mask.is_empty() {
         let material_source = material_source_surface(vector, appearance);
         material_support(&material_source, appearance.material)
+    } else if appearance.material == VectorMaterial::Solid {
+        material_source_surface(vector, appearance)
+            .intersection(&mask_paths_to_coverage(&appearance.clip_mask))
     } else {
         mask_paths_to_coverage(&appearance.clip_mask)
     };
