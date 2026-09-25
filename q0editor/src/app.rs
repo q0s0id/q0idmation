@@ -79,6 +79,7 @@ struct ProjectWorkspace {
     media_import_job: Option<MediaImportJob>,
 }
 
+#[allow(dead_code)]
 pub(crate) struct Q0langDocument {
     pub(crate) path: PathBuf,
     pub(crate) text: String,
@@ -231,6 +232,7 @@ pub enum Action {
     CloseQ0langEditor,
     OpenFrameScriptEditor(u16, u16, u16),
     DeleteFrameScript(u16, u16, u16),
+    SetFrameLabel(u16, u16, Option<String>),
     AddProjectDependency(PathBuf, Option<u16>),
     RenameProjectDependency(u16, String),
     ReparentProjectDependency(u16, Option<u16>),
@@ -1603,6 +1605,9 @@ impl EditorApp {
                 self.import_media_from_path(ctx, &path);
             }
             Action::SaveProject => {
+                if !crate::text_tool::finish_edit(self) {
+                    return;
+                }
                 if self.active_document_is_q0lang() {
                     self.save_current_q0lang();
                 } else if self.project_active {
@@ -1616,6 +1621,9 @@ impl EditorApp {
                 }
             }
             Action::SaveProjectAs => {
+                if !crate::text_tool::finish_edit(self) {
+                    return;
+                }
                 if self.active_document_is_q0lang() {
                     let suggested = self
                         .active_q0lang_document()
@@ -1685,6 +1693,9 @@ impl EditorApp {
                 }
             }
             Action::SelectTool(tool) => {
+                if !crate::text_tool::finish_edit(self) {
+                    return;
+                }
                 self.session.current_tool = tool;
                 self.session.tool_state = ToolState::Idle;
                 self.session.status = format!("tool: {}", tool.label());
@@ -2647,6 +2658,50 @@ impl EditorApp {
             Action::CloseQ0langEditor => {
                 self.session.show_q0lang_editor = false;
             }
+            Action::SetFrameLabel(q0rg_id, frame, label) => {
+                let label = label.map(|name| name.trim().to_owned());
+                if !self
+                    .state
+                    .project
+                    .q0rgs
+                    .iter()
+                    .any(|q| q.q0rg_id == q0rg_id && frame < q.frame_count)
+                {
+                    self.session.status = "frame label destination no longer exists".to_string();
+                    return;
+                }
+                if let Some(name) = &label {
+                    if let Err(error) = q0s_format::v2::validate_frame_label_name(name) {
+                        self.session.status = error.to_string();
+                        return;
+                    }
+                    if self
+                        .state
+                        .project
+                        .runtime
+                        .resolve_frame_label(q0rg_id, name)
+                        .is_some_and(|existing| existing != frame)
+                    {
+                        self.session.status =
+                            format!("frame label `{name}` already exists in this symbol");
+                        return;
+                    }
+                }
+                let key = q0s_format::v2::FrameLabelKey::new(q0rg_id, frame);
+                if self.state.project.runtime.frame_labels.get(&key) == label.as_ref() {
+                    return;
+                }
+                self.history.snapshot(&self.state.project);
+                if let Some(label) = label {
+                    self.state.project.runtime.frame_labels.insert(key, label);
+                    self.session.status = format!("frame {} label saved", u32::from(frame) + 1);
+                } else {
+                    self.state.project.runtime.frame_labels.remove(&key);
+                    self.session.status = "frame label removed".to_string();
+                }
+                self.state.dirty = true;
+                self.session.reset_q0lang_preview();
+            }
             Action::OpenFrameScriptEditor(q0rg_id, layer_id, frame) => {
                 if self.state.project.layer_is_folder(q0rg_id, layer_id) {
                     self.session.status = "folders cannot contain frame code".to_string();
@@ -2897,6 +2952,16 @@ impl EditorApp {
                 q0rg_id, layer_id, ..
             } => locked(*q0rg_id, *layer_id),
             Selection::Paths(paths) => paths.iter().any(|path| locked(path.q0rg_id, path.layer_id)),
+            Selection::RawParts {
+                fills,
+                strokes,
+                objects,
+            } => fills
+                .iter()
+                .chain(strokes)
+                .map(|path| (path.q0rg_id, path.layer_id))
+                .chain(objects.iter().map(|item| (item.q0rg_id, item.layer_id)))
+                .any(|(q0rg_id, layer_id)| locked(q0rg_id, layer_id)),
             Selection::PathPoints { path, .. } => locked(path.q0rg_id, path.layer_id),
             Selection::RawArea {
                 placements,
@@ -3002,6 +3067,11 @@ impl EditorApp {
         }
         self.history.snapshot(&self.state.project);
         self.state.project.q0rgs.retain(|q| q.q0rg_id != q0rg_id);
+        self.state
+            .project
+            .runtime
+            .frame_labels
+            .retain(|key, _| key.q0rg_id != q0rg_id);
         self.state
             .project
             .audio_clips
@@ -3510,12 +3580,21 @@ impl EditorApp {
             .iter()
             .filter(|script| script.q0rg_id == q0rg_id && script.frame >= requested)
             .count();
+        let removed_frame_labels = self
+            .state
+            .project
+            .runtime
+            .frame_labels
+            .keys()
+            .filter(|key| key.q0rg_id == q0rg_id && key.frame >= requested)
+            .count();
 
         if requested < q0rg.frame_count
             && (removed_keyframes > 0
                 || removed_tweens > 0
                 || removed_audio > 0
-                || removed_frame_scripts > 0)
+                || removed_frame_scripts > 0
+                || removed_frame_labels > 0)
         {
             self.pending_frame_truncate = Some((
                 q0rg_id,
@@ -3534,6 +3613,11 @@ impl EditorApp {
     fn apply_frame_count(&mut self, q0rg_id: u16, frame_count: u16) {
         self.history.snapshot(&self.state.project);
         let frame_count = frame_count.max(1);
+        self.state
+            .project
+            .runtime
+            .frame_labels
+            .retain(|key, _| key.q0rg_id != q0rg_id || key.frame < frame_count);
         let audio_to_remove: std::collections::HashSet<(u16, u16, u16, u16)> = self
             .state
             .project
@@ -5742,6 +5826,36 @@ impl EditorApp {
                 self.session.selection = Selection::None;
                 true
             }
+            Selection::RawParts {
+                fills,
+                strokes,
+                objects,
+            } => {
+                // Raw style parts are materialized before deletion so removing
+                // an outline does not also erase its fill (and vice versa).
+                // Display-object mixing is deliberately not created by the
+                // selector; reject legacy/invalid mixed state defensively.
+                if !objects.is_empty() || (fills.is_empty() && strokes.is_empty()) {
+                    return false;
+                }
+                self.history.snapshot(&self.state.project);
+                let Some(paths) = crate::tools::materialize_raw_style_parts(self, &fills, &strokes)
+                else {
+                    return false;
+                };
+                let changed = crate::selection_edit::remove_materialized_paths_and_objects(
+                    &mut self.state.project,
+                    &paths,
+                    &[],
+                    self.session.current_frame,
+                );
+                if changed {
+                    self.state.dirty = true;
+                    self.session.selection = Selection::None;
+                    self.textures.invalidate();
+                }
+                changed
+            }
             Selection::Q0rg(_) | Selection::None => false,
         }
     }
@@ -7197,6 +7311,14 @@ impl EditorApp {
         if let Some((q0rg_id, frames, keyframes, tweens, audio_clips, frame_scripts)) =
             self.pending_frame_truncate
         {
+            let frame_labels = self
+                .state
+                .project
+                .runtime
+                .frame_labels
+                .keys()
+                .filter(|key| key.q0rg_id == q0rg_id && key.frame >= frames)
+                .count();
             let mut confirm = false;
             let mut cancel = false;
             egui::Window::new("Shorten symbol?")
@@ -7206,7 +7328,7 @@ impl EditorApp {
                 .show(ctx, |ui| {
                     ui.label(format!("Reduce the symbol to {frames} frame(s)?"));
                     ui.label(format!(
-                        "This removes {keyframes} keyframe(s), {tweens} tween(s), {audio_clips} audio clip(s), and {frame_scripts} frame script(s)."
+                        "This removes {keyframes} keyframe(s), {tweens} tween(s), {audio_clips} audio clip(s), {frame_scripts} frame script(s), and {frame_labels} frame label(s)."
                     ));
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -7287,7 +7409,12 @@ impl EditorApp {
     fn resolve_preview_timeline_target(&self, target: &TimelineTarget) -> Option<u16> {
         match target {
             TimelineTarget::Frame(frame) => Some(*frame),
-            TimelineTarget::Label(label) => label.parse::<u16>().ok(),
+            TimelineTarget::Label(label) => self
+                .state
+                .project
+                .runtime
+                .resolve_frame_label(self.session.current_q0rg_id, label)
+                .or_else(|| label.parse::<u16>().ok()),
         }
     }
 
@@ -7328,15 +7455,19 @@ impl EditorApp {
         for action in actions {
             match action {
                 RuntimeAction::GoRun(target) => {
-                    self.session.playing = true;
                     if let Some(frame) = self.resolve_preview_timeline_target(target) {
+                        self.session.playing = true;
                         self.preview_runtime_transition_to_frame(frame, transition_budget);
+                    } else {
+                        self.report_missing_preview_frame_label(target);
                     }
                 }
                 RuntimeAction::GoStop(target) => {
-                    self.session.playing = false;
                     if let Some(frame) = self.resolve_preview_timeline_target(target) {
+                        self.session.playing = false;
                         self.preview_runtime_transition_to_frame(frame, transition_budget);
+                    } else {
+                        self.report_missing_preview_frame_label(target);
                     }
                 }
                 RuntimeAction::ShellCommand { .. }
@@ -7351,6 +7482,17 @@ impl EditorApp {
                     // introduced by the host-api phase rather than by writing the project.
                 }
             }
+        }
+    }
+
+    fn report_missing_preview_frame_label(&mut self, target: &TimelineTarget) {
+        if let TimelineTarget::Label(label) = target {
+            self.session
+                .preview_script_diagnostics
+                .push(RuntimeDiagnostic {
+                    line: 0,
+                    message: format!("unknown frame label `{label}` in the current symbol"),
+                });
         }
     }
 
@@ -7534,7 +7676,6 @@ impl App for EditorApp {
             self.render_settings_dialog(ctx);
         }
         self.render_new_project_dialog(ctx);
-        crate::text_tool::render_dialog(self, ctx);
         self.render_destructive_change_dialogs(ctx);
         self.render_unsaved_changes_dialog(ctx);
 
@@ -9862,6 +10003,72 @@ mod tests {
             Some((1, 8, 1, 0, 0, 0))
         ));
         assert!(!app.state.dirty);
+    }
+
+    #[test]
+    fn frame_label_add_rename_remove_is_validated_and_undoable() {
+        let mut app = EditorApp::default();
+        let ctx = Context::default();
+        app.handle(&ctx, Action::SetFrameLabel(1, 3, Some(" intro ".into())));
+        assert_eq!(app.state.project.runtime.frame_label(1, 3), Some("intro"));
+        app.handle(&ctx, Action::SetFrameLabel(1, 5, Some("intro".into())));
+        assert_eq!(app.state.project.runtime.frame_label(1, 5), None);
+        assert!(app.session.status.contains("already exists"));
+        app.handle(&ctx, Action::SetFrameLabel(1, 3, Some("ending".into())));
+        assert_eq!(
+            app.state.project.runtime.resolve_frame_label(1, "intro"),
+            None
+        );
+        assert_eq!(
+            app.state.project.runtime.resolve_frame_label(1, "ending"),
+            Some(3)
+        );
+        app.handle(&ctx, Action::SetFrameLabel(1, 3, None));
+        assert_eq!(app.state.project.runtime.frame_label(1, 3), None);
+        app.handle(&ctx, Action::Undo);
+        assert_eq!(app.state.project.runtime.frame_label(1, 3), Some("ending"));
+        app.handle(&ctx, Action::Undo);
+        assert_eq!(app.state.project.runtime.frame_label(1, 3), Some("intro"));
+    }
+
+    #[test]
+    fn shortening_over_labels_waits_for_confirmation_then_removes_them() {
+        let mut app = EditorApp::default();
+        app.state
+            .project
+            .runtime
+            .frame_labels
+            .insert(q0s_format::v2::FrameLabelKey::new(1, 12), "outro".into());
+        app.handle(&Context::default(), Action::SetQ0rgFrameCount(1, 8));
+        assert!(app.pending_frame_truncate.is_some());
+        assert_eq!(app.state.project.runtime.frame_label(1, 12), Some("outro"));
+        app.apply_frame_count(1, 8);
+        assert!(app.state.project.runtime.frame_labels.is_empty());
+        app.handle(&Context::default(), Action::Undo);
+        assert_eq!(app.state.project.runtime.frame_label(1, 12), Some("outro"));
+    }
+
+    #[test]
+    fn preview_resolves_labels_in_current_symbol_and_reports_missing_targets() {
+        let mut app = EditorApp::default();
+        app.state
+            .project
+            .runtime
+            .frame_labels
+            .insert(q0s_format::v2::FrameLabelKey::new(1, 4), "intro".into());
+        let mut budget = MAX_PREVIEW_FRAME_SCRIPT_TRANSITIONS;
+        app.run_preview_q0lang_source_with_budget("gostop! \"intro\"", &mut budget);
+        assert_eq!(app.session.current_frame, 4);
+        assert!(!app.session.playing);
+        assert!(app.session.preview_script_diagnostics.is_empty());
+        app.run_preview_q0lang_source_with_budget("gorun! \"unknown\"", &mut budget);
+        assert_eq!(app.session.current_frame, 4);
+        assert!(!app.session.playing);
+        assert!(app
+            .session
+            .preview_script_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("unknown frame label")));
     }
     #[test]
     fn deleting_symbol_removes_instances_and_is_undoable() {

@@ -24,6 +24,7 @@ pub fn compile(program: &Program) -> CompiledProgram {
         chunk: Chunk::new(),
         diagnostics: program.diagnostics.clone(),
         fatal: false,
+        loops: Vec::new(),
     };
     compiler.compile_statements(
         &program.statements,
@@ -72,6 +73,12 @@ struct Compiler {
     chunk: Chunk,
     diagnostics: Vec<Diagnostic>,
     fatal: bool,
+    loops: Vec<LoopContext>,
+}
+
+struct LoopContext {
+    continue_target: usize,
+    break_patches: Vec<(usize, usize)>,
 }
 
 impl Compiler {
@@ -176,6 +183,43 @@ impl Compiler {
             Statement::While { condition, body } => {
                 self.compile_while(condition, body, line, context)
             }
+            Statement::ForRange {
+                name,
+                start,
+                stop,
+                step,
+                body,
+            } => {
+                self.compile_for(name, [start, stop, step], body, line, context);
+            }
+            Statement::Break | Statement::Continue => {
+                let Some(loop_context) = self.loops.last() else {
+                    self.diagnostics.push(Diagnostic {
+                        line,
+                        message: format!(
+                            "{} is only valid inside a loop in the same function",
+                            if matches!(statement, Statement::Break) {
+                                "break"
+                            } else {
+                                "continue"
+                            }
+                        ),
+                    });
+                    self.fatal = true;
+                    return;
+                };
+                if matches!(statement, Statement::Continue) {
+                    let target = loop_context.continue_target;
+                    self.emit_jump_to(target, line);
+                } else {
+                    let patch = self.emit_jump_placeholder(Opcode::Jump, line);
+                    self.loops
+                        .last_mut()
+                        .unwrap()
+                        .break_patches
+                        .push((patch, line));
+                }
+            }
             Statement::Return { value } => {
                 if !context.in_function {
                     self.diagnostics.push(Diagnostic {
@@ -242,7 +286,9 @@ impl Compiler {
 
         if let Some(body) = body {
             let context = CompileContext::function(params, Some(body));
+            let enclosing_loops = std::mem::take(&mut self.loops);
             self.compile_block(body, &context);
+            self.loops = enclosing_loops;
         }
         self.emit_constant(VmValue::Null, line);
         self.chunk.emit_op(Opcode::Return, line);
@@ -284,12 +330,60 @@ impl Compiler {
         let loop_start = self.chunk.current_offset();
         self.compile_value(condition, line, context);
         let exit_patch = self.emit_jump_placeholder(Opcode::JumpIfFalse, line);
+        self.loops.push(LoopContext {
+            continue_target: loop_start,
+            break_patches: Vec::new(),
+        });
         self.compile_block(body, context);
-        self.chunk.emit_op(Opcode::Jump, line);
-        let loop_start = self.offset_u32(loop_start, line);
-        self.chunk.emit_u32(loop_start);
+        self.emit_jump_to(loop_start, line);
         let exit = self.chunk.current_offset();
         self.patch_offset(exit_patch, exit, line);
+        self.finish_loop(exit);
+    }
+
+    fn compile_for(
+        &mut self,
+        name: &str,
+        bounds: [&Value; 3],
+        body: &Block,
+        line: usize,
+        context: &CompileContext,
+    ) {
+        for value in bounds {
+            self.compile_value(value, line, context);
+        }
+        self.chunk.emit_op(Opcode::RangeStart, line);
+        let loop_start = self.chunk.current_offset();
+        let is_local = context.is_local(name);
+        let name = self.name_constant(name, line);
+        self.chunk.emit_op(Opcode::RangeNext, line);
+        self.chunk.emit_u32(name);
+        self.chunk.emit_u8(u8::from(is_local));
+        let exit_patch = self.chunk.current_offset();
+        self.chunk.emit_u32(0);
+        self.loops.push(LoopContext {
+            continue_target: loop_start,
+            break_patches: Vec::new(),
+        });
+        self.compile_block(body, context);
+        self.emit_jump_to(loop_start, line);
+        let exit = self.chunk.current_offset();
+        self.patch_offset(exit_patch, exit, line);
+        self.finish_loop(exit);
+        self.chunk.emit_op(Opcode::RangeEnd, line);
+    }
+
+    fn emit_jump_to(&mut self, target: usize, line: usize) {
+        self.chunk.emit_op(Opcode::Jump, line);
+        let target = self.offset_u32(target, line);
+        self.chunk.emit_u32(target);
+    }
+
+    fn finish_loop(&mut self, exit: usize) {
+        let loop_context = self.loops.pop().unwrap();
+        for (patch, line) in loop_context.break_patches {
+            self.patch_offset(patch, exit, line);
+        }
     }
 
     fn compile_args(
@@ -510,6 +604,10 @@ fn collect_assigned_names(block: &Block, out: &mut BTreeSet<String>) {
                 }
             }
             Statement::DoBlock { body } | Statement::While { body, .. } => {
+                collect_assigned_names(body, out);
+            }
+            Statement::ForRange { name, body, .. } => {
+                out.insert(name.clone());
                 collect_assigned_names(body, out);
             }
             Statement::If {

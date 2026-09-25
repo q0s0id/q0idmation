@@ -35,8 +35,20 @@ pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
         app.settings.q0lang_font_size.0.clamp(8.0, 72.0),
         FontFamily::Name(super::fonts::Q0LANG_FAMILY.into()),
     );
-    let parsed = super::parser::parse(&draft.source);
-    let diagnostics = parsed.diagnostics.clone();
+    let analysis = super::authoring::analyze(ctx, &draft.source);
+    let diagnostics = &analysis.diagnostics;
+    let text_edit_id = egui::Id::new((
+        "frame_script_source",
+        draft.q0rg_id,
+        draft.layer_id,
+        draft.frame,
+    ));
+    super::editor::edit_shortcuts(
+        ctx,
+        text_edit_id,
+        &mut draft.source,
+        app.settings.q0lang_tab_width.max(1) as usize,
+    );
     let had_existing = app
         .state
         .project
@@ -54,7 +66,7 @@ pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
     let mut remove = false;
     let mut close = false;
     egui::Window::new(format!(
-        "Frame Code - {} / {} / {}",
+        "frame code - {} / {} / {}",
         q0rg_name,
         layer_name,
         draft.frame + 1
@@ -96,29 +108,36 @@ pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
         });
         ui.separator();
 
+        super::authoring::tools_ui(ui, text_edit_id, &mut draft.source);
+        ui.separator();
+
         let theme_for_layouter = theme.clone();
         let font_for_layouter = font_id.clone();
-        let mut layouter = move |ui: &egui::Ui, text: &str, wrap_width: f32| {
+        let mut layouter = move |ui: &egui::Ui, text: &str, _wrap_width: f32| {
             let job = super::syntax::layout_line(
                 text,
                 &theme_for_layouter,
                 font_for_layouter.clone(),
-                wrap_width,
+                f32::INFINITY,
             );
             ui.fonts(|fonts| fonts.layout_job(job))
         };
-        ui.add_sized(
-            [
-                ui.available_width(),
-                (ui.available_height() - 115.0).max(180.0),
-            ],
-            TextEdit::multiline(&mut draft.source)
-                .id_source("frame_script_source")
-                .desired_width(f32::INFINITY)
-                .desired_rows(18)
-                .font(font_id.clone())
-                .layouter(&mut layouter),
-        );
+        egui::ScrollArea::both()
+            .id_source(text_edit_id.with("scroll"))
+            .auto_shrink([false, false])
+            .max_height((ui.available_height() - 115.0).max(180.0))
+            .show(ui, |ui| {
+                let output = TextEdit::multiline(&mut draft.source)
+                    .id(text_edit_id)
+                    .desired_width(ui.available_width().max(240.0))
+                    .desired_rows(18)
+                    .font(font_id.clone())
+                    .layouter(&mut layouter)
+                    .show(ui);
+                super::authoring::scroll_to_selection(ui, &output);
+            });
+        let analysis = super::authoring::analyze(ctx, &draft.source);
+        let diagnostics = &analysis.diagnostics;
 
         if !diagnostics.is_empty() {
             ui.separator();
@@ -126,31 +145,42 @@ pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
                 .id_source("frame_script_diagnostics")
                 .max_height(70.0)
                 .show(ui, |ui| {
-                    for diagnostic in &diagnostics {
-                        ui.label(
-                            RichText::new(format!(
-                                "line {}: {}",
-                                diagnostic.line, diagnostic.message
-                            ))
-                            .small()
-                            .color(theme.syntax_signal.to_color32()),
-                        );
+                    for diagnostic in diagnostics {
+                        if ui
+                            .selectable_label(
+                                false,
+                                RichText::new(format!(
+                                    "line {}: {}",
+                                    diagnostic.line, diagnostic.message
+                                ))
+                                .small()
+                                .color(theme.syntax_signal.to_color32()),
+                            )
+                            .clicked()
+                        {
+                            super::authoring::select_line(
+                                ctx,
+                                text_edit_id,
+                                &draft.source,
+                                diagnostic.line,
+                            );
+                        }
                     }
                 });
         }
 
         ui.separator();
         ui.horizontal(|ui| {
-            if ui.button("Save").clicked() {
+            if ui.button("save").clicked() {
                 save = true;
             }
             if ui
-                .add_enabled(had_existing, egui::Button::new("Remove frame code"))
+                .add_enabled(had_existing, egui::Button::new("remove frame code"))
                 .clicked()
             {
                 remove = true;
             }
-            if ui.button("Close").clicked() {
+            if ui.button("close").clicked() {
                 close = true;
             }
             ui.label(

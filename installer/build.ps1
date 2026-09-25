@@ -354,7 +354,10 @@ try {
     # A running app holds its release EXE open and blocks the linker.
     $busy = @()
     foreach ($name in @("q0editor", "q0player")) {
-        $process = Get-Process -Name $name -ErrorAction SilentlyContinue
+        $releaseExe = Join-Path $releaseTargetDir "release\$name.exe"
+        $process = Get-Process -Name $name -ErrorAction SilentlyContinue | Where-Object {
+            $_.Path -and ([string]::Equals($_.Path, $releaseExe, [System.StringComparison]::OrdinalIgnoreCase))
+        }
         if ($process) { $busy += $name }
     }
     if ($busy.Count -gt 0) {

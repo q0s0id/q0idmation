@@ -1,3 +1,4 @@
+mod authoring;
 pub mod editor;
 pub mod fonts;
 pub mod frame_editor;

@@ -1328,13 +1328,14 @@ fn vec2_distance(a: Vec2, b: Vec2) -> f32 {
 struct RawFillCandidate {
     asset_id: u16,
     color: Rgba,
-    source_surfaces: Vec<MultiPolygon<f64>>,
+    stroke: Option<q0s_format::v2::Stroke>,
     geometry: MultiPolygon<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct RawFillStyle {
     color: Rgba,
+    stroke: Option<q0s_format::v2::Stroke>,
     material: Option<VectorMaterial>,
     fragmented: bool,
 }
@@ -1343,9 +1344,12 @@ fn raw_fill_style(project: &ProjectV2, candidate: &RawFillCandidate) -> RawFillS
     let appearance = project.asset_appearances.get(&candidate.asset_id);
     RawFillStyle {
         color: candidate.color,
-        material: appearance.map(|appearance| appearance.material),
+        stroke: candidate.stroke,
+        material: appearance
+            .map(|appearance| appearance.material)
+            .filter(|m| *m != VectorMaterial::Solid),
         fragmented: appearance.is_some_and(|appearance| {
-            !appearance.material_source.is_empty() || !appearance.clip_mask.is_empty()
+            appearance.material != VectorMaterial::Solid && !appearance.clip_mask.is_empty()
         }),
     }
 }
@@ -1397,6 +1401,7 @@ pub fn commit_brush_region_with_material(
     let freshly_painted = region.clone();
     let requested_style = RawFillStyle {
         color: settings.color,
+        stroke: None,
         material: requested_material,
         fragmented: false,
     };
@@ -1593,100 +1598,77 @@ fn merge_touching_raw_fills_after_edit_impl(
     }
 
     let mut updates = Vec::new();
-    for (style, mut items) in groups {
-        if let Some(edited_asset_ids) = edited_asset_ids {
-            let mut active = items
-                .iter()
-                .map(|item| edited_asset_ids.contains(&item.asset_id))
-                .collect::<Vec<_>>();
-            if !active.iter().any(|active| *active) {
-                continue;
-            }
-            loop {
-                let mut changed = false;
-                for candidate_index in 0..items.len() {
-                    if active[candidate_index] {
-                        continue;
-                    }
-                    if (0..items.len()).any(|active_index| {
-                        active[active_index]
-                            && raw_surface_sets_require_boundary_merge(
-                                &items[active_index].source_surfaces,
-                                &items[candidate_index].source_surfaces,
-                            )
-                    }) {
-                        active[candidate_index] = true;
-                        changed = true;
-                    }
-                }
-                if !changed {
-                    break;
-                }
-            }
-            items = items
-                .into_iter()
-                .zip(active)
-                .filter_map(|(item, active)| active.then_some(item))
-                .collect();
-        }
-
-        // One asset already renders all of its contours in one fill pass. Even if
-        // some of those contours overlap, rebuilding that asset cannot improve
-        // merge-drawing semantics and only risks destroying its Bezier boundary.
-        if items.len() < 2 {
-            continue;
-        }
-        // A post-material fragment is a slice of one already-resolved filter
-        // field. Geometry-merging those slices would make the filter evaluate
-        // again from the merged contours and resurrect the split-edge glow.
+    for (style, items) in groups {
+        // Clipped halo fragments retain their resolved material field. Solid
+        // fragments are ordinary visible paint and can participate in a union.
         if style.fragmented {
             continue;
         }
-        let color = style.color;
-        let source_surfaces: Vec<MultiPolygon<f64>> = items
-            .iter()
-            .flat_map(|item| item.source_surfaces.iter().cloned())
-            .collect();
-        // Strict containment is not a boundary merge. Automatically unioning a
-        // small moved fill fully inside a larger one makes the moved object
-        // disappear and destroys its independent editability.
-        if !raw_surfaces_require_boundary_merge(&source_surfaces) {
-            continue;
+        let mut visited = vec![false; items.len()];
+        for seed in 0..items.len() {
+            if visited[seed] {
+                continue;
+            }
+            let mut connected = vec![seed];
+            visited[seed] = true;
+            let mut cursor = 0;
+            while cursor < connected.len() {
+                let current = connected[cursor];
+                for other in 0..items.len() {
+                    if !visited[other]
+                        && raw_regions_intersect(&items[current].geometry, &items[other].geometry)
+                    {
+                        visited[other] = true;
+                        connected.push(other);
+                    }
+                }
+                cursor += 1;
+            }
+            // Older projects may contain a "merged" asset that merely stores
+            // overlapping source contours. Canonicalize it on its next edit too.
+            let legacy_overlap = connected.len() == 1
+                && project
+                    .assets
+                    .iter()
+                    .find_map(|asset| match asset {
+                        Asset::Vector(vector) if vector.asset_id == items[seed].asset_id => Some(
+                            vector.paths.len()
+                                > items[seed]
+                                    .geometry
+                                    .0
+                                    .iter()
+                                    .map(|p| 1 + p.interiors().len())
+                                    .sum::<usize>(),
+                        ),
+                        _ => None,
+                    })
+                    .unwrap_or(false);
+            if (connected.len() < 2 && !legacy_overlap)
+                || edited_asset_ids.is_some_and(|edited| {
+                    !connected
+                        .iter()
+                        .any(|i| edited.contains(&items[*i].asset_id))
+                })
+            {
+                continue;
+            }
+            let mut merged = MultiPolygon(Vec::new());
+            let mut asset_ids = BTreeSet::new();
+            for index in connected {
+                asset_ids.insert(items[index].asset_id);
+                merged = merged.union(&items[index].geometry);
+            }
+            // Persist only the union boundary. Concatenating source paths left
+            // interior edges selectable/stroked and could cancel opposite windings.
+            let paths = coverage_to_paths(&merged);
+            if !paths.is_empty() {
+                updates.push((style, asset_ids, paths));
+            }
         }
-
-        let mut merged = MultiPolygon(Vec::new());
-        let mut asset_ids = BTreeSet::new();
-        let mut paths = Vec::new();
-        for item in &items {
-            asset_ids.insert(item.asset_id);
-            merged = merged.union(&item.geometry);
-            let Some(Asset::Vector(vector)) = project
-                .assets
-                .iter()
-                .find(|asset| asset.id() == item.asset_id)
-            else {
-                paths.clear();
-                break;
-            };
-            paths.extend(vector.paths.iter().cloned());
-        }
-        // Post-transform merge is a topology operation, not a geometry refit.
-        // Keep the exact source VPaths, including every cubic handle, and merely
-        // place the touching contours into one fill-only asset. The renderer
-        // tessellates all contours in one fill pass, so translucent overlap does
-        // not stack as separate objects and merge-drawing semantics are retained
-        // without turning smooth brush boundaries into anchor-only polygons.
-        if paths.is_empty()
-            || !merged_paths_preserve_every_source(color, &paths, &merged, &source_surfaces)
-        {
-            continue;
-        }
-        updates.push((style, asset_ids, paths));
     }
     if updates.is_empty() {
         return false;
     }
-
     for (style, asset_ids, paths) in updates {
         #[cfg(feature = "appearance-mask-eraser")]
         let merged_appearance = style.material.map(|material| {
@@ -1698,87 +1680,21 @@ fn merge_touching_raw_fills_after_edit_impl(
             )
         });
         remove_current_layer_asset_placements(project, q0rg_id, layer_id, frame, &asset_ids);
-        remove_unreferenced_assets(project, &asset_ids);
+        // Allocate before deleting old assets so a new shape never inherits an
+        // old asset id and its cached body/halo/selection geometry.
         let new_asset_id = append_raw_fill(project, q0rg_id, layer_id, frame, style.color, paths);
-        #[cfg(not(feature = "appearance-mask-eraser"))]
-        let _ = new_asset_id;
+        if let Some(Asset::Vector(vector)) =
+            project.assets.iter_mut().find(|a| a.id() == new_asset_id)
+        {
+            vector.stroke = style.stroke;
+        }
         #[cfg(feature = "appearance-mask-eraser")]
         if let Some(appearance) = merged_appearance {
             project.asset_appearances.insert(new_asset_id, appearance);
         }
+        remove_unreferenced_assets(project, &asset_ids);
     }
     true
-}
-
-fn raw_surface_pair_requires_boundary_merge(a: &MultiPolygon<f64>, b: &MultiPolygon<f64>) -> bool {
-    let a_area = a.unsigned_area();
-    let b_area = b.unsigned_area();
-    if a_area <= 1.0e-8 || b_area <= 1.0e-8 {
-        return false;
-    }
-    let intersection_area = a.intersection(b).unsigned_area();
-    let min_area = a_area.min(b_area);
-    let tolerance = (min_area * 1.0e-7).max(1.0e-8);
-    // Partial overlap means both visible boundaries participate in the
-    // resulting planar surface. Full containment/identity does not.
-    if intersection_area > tolerance && intersection_area < min_area - tolerance {
-        return true;
-    }
-    if intersection_area <= tolerance {
-        let union = a.union(b);
-        return union.0.len() < a.0.len() + b.0.len();
-    }
-    false
-}
-
-fn raw_surface_sets_require_boundary_merge(
-    left: &[MultiPolygon<f64>],
-    right: &[MultiPolygon<f64>],
-) -> bool {
-    left.iter().any(|a| {
-        right
-            .iter()
-            .any(|b| raw_surface_pair_requires_boundary_merge(a, b))
-    })
-}
-
-fn raw_surfaces_require_boundary_merge(surfaces: &[MultiPolygon<f64>]) -> bool {
-    for left in 0..surfaces.len() {
-        for right in left + 1..surfaces.len() {
-            if raw_surface_pair_requires_boundary_merge(&surfaces[left], &surfaces[right]) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn merged_paths_preserve_every_source(
-    color: Rgba,
-    paths: &[VPath],
-    expected: &MultiPolygon<f64>,
-    sources: &[MultiPolygon<f64>],
-) -> bool {
-    let reconstructed = vector_fill_geometry(&VectorAsset {
-        asset_id: 0,
-        paths: paths.to_vec(),
-        fill: Some(color),
-        stroke: None,
-    });
-    if reconstructed.0.is_empty() {
-        return false;
-    }
-    let tolerance = (expected.unsigned_area() * 0.002).max(0.02);
-    let mismatch = expected
-        .difference(&reconstructed)
-        .union(&reconstructed.difference(expected))
-        .unsigned_area();
-    if mismatch > tolerance {
-        return false;
-    }
-    sources
-        .iter()
-        .all(|source| source.difference(&reconstructed).unsigned_area() <= tolerance)
 }
 
 /// Subtract one already-unioned eraser gesture from every raw fill on the
@@ -1855,6 +1771,14 @@ fn erase_brush_region_impl(
         frame,
         &seen_assets,
     );
+    let changed_asset_ids: BTreeSet<u16> = updates
+        .iter()
+        .map(|(original_asset_id, _)| {
+            *writable_assets
+                .get(original_asset_id)
+                .unwrap_or(original_asset_id)
+        })
+        .collect();
     let mut remove_asset_ids = BTreeSet::new();
     for (original_asset_id, geometry) in &updates {
         let asset_id = *writable_assets
@@ -1883,6 +1807,7 @@ fn erase_brush_region_impl(
         &remove_asset_ids,
     );
     remove_unreferenced_assets(&mut app.state.project, &remove_asset_ids);
+    app.textures.invalidate_assets(changed_asset_ids);
 
     app.session.selection = crate::state::Selection::None;
     app.session.status = "Raw fill erased".to_string();
@@ -1895,7 +1820,7 @@ fn collect_raw_fill_candidates(
     q0rg_id: u16,
     layer_id: u16,
     frame: u16,
-    include_source_surfaces: bool,
+    include_stroked_fills: bool,
 ) -> Vec<RawFillCandidate> {
     let Some(layer) = project
         .q0rgs
@@ -1917,6 +1842,7 @@ fn collect_raw_fill_candidates(
             let placement = layer.placements.get(placement_idx)?;
             if placement.transform != Transform2D::IDENTITY
                 || !matches!(placement.tween, Tween::None)
+                || !placement.fx.is_identity()
             {
                 return None;
             }
@@ -1926,34 +1852,37 @@ fn collect_raw_fill_candidates(
             let Some(Asset::Vector(vector)) = assets_by_id.get(&asset_id).copied() else {
                 return None;
             };
+            if project
+                .asset_names
+                .get(&asset_id)
+                .is_some_and(|name| crate::text_tool::decode_source(name).is_some())
+            {
+                return None;
+            }
             let color = vector.fill?;
-            if vector.stroke.is_some() {
+            if (!include_stroked_fills && vector.stroke.is_some())
+                || vector.paths.iter().any(|p| !p.closed)
+            {
                 return None;
             }
             let geometry = vector_fill_geometry(vector);
-            let source_surfaces = if include_source_surfaces {
-                vector
-                    .paths
-                    .iter()
-                    .filter(|path| path.closed)
-                    .filter_map(|path| {
-                        let single = VectorAsset {
-                            asset_id: 0,
-                            paths: vec![path.clone()],
-                            fill: Some(color),
-                            stroke: None,
-                        };
-                        let surface = vector_fill_geometry(&single);
-                        (!surface.0.is_empty()).then_some(surface)
-                    })
-                    .collect()
+            #[cfg(feature = "appearance-mask-eraser")]
+            let geometry = if project
+                .asset_appearances
+                .get(&asset_id)
+                .is_some_and(|a| a.material == VectorMaterial::Solid)
+            {
+                crate::appearance::visible_source_surface_for_vector(
+                    vector,
+                    project.asset_appearances.get(&asset_id),
+                )
             } else {
-                Vec::new()
+                geometry
             };
             (!geometry.0.is_empty()).then_some(RawFillCandidate {
                 asset_id,
                 color,
-                source_surfaces,
+                stroke: vector.stroke,
                 geometry,
             })
         })
@@ -2315,17 +2244,33 @@ fn path_to_polygon(path: &VPath) -> Option<Polygon<f64>> {
         return None;
     }
 
-    // Brush Bézier handles are a render approximation of the canonical raw
-    // boundary, not a second source of merge-drawing geometry. Re-flattening
-    // every curved segment here multiplied the point count by 16 on every
-    // successive brush commit: N -> 16N -> 256N -> ... and caused the
-    // exponential freezes reported after the second and third strokes.
-    let mut coords: Vec<Coord<f64>> = path
-        .anchors
-        .iter()
-        .map(|anchor| Coord {
-            x: anchor.point.x as f64,
-            y: anchor.point.y as f64,
+    // Adaptive subdivision follows authored curves without multiplying every
+    // already-short brush segment by a fixed sample count on each union.
+    let mut points = vec![path.anchors[0].point];
+    for i in 0..path.anchors.len() {
+        let a = &path.anchors[i];
+        let b = &path.anchors[(i + 1) % path.anchors.len()];
+        if a.out_handle.is_none() && b.in_handle.is_none() {
+            points.push(b.point);
+        } else {
+            let p1 = a.out_handle.unwrap_or(a.point);
+            let p2 = b.in_handle.unwrap_or(b.point);
+            let curve = lyon_path::geom::CubicBezierSegment {
+                from: lyon_path::math::point(a.point.x, a.point.y),
+                ctrl1: lyon_path::math::point(p1.x, p1.y),
+                ctrl2: lyon_path::math::point(p2.x, p2.y),
+                to: lyon_path::math::point(b.point.x, b.point.y),
+            };
+            curve.for_each_flattened(0.1, &mut |line| {
+                points.push(Vec2::new(line.to.x, line.to.y))
+            });
+        }
+    }
+    let mut coords: Vec<Coord<f64>> = points
+        .into_iter()
+        .map(|p| Coord {
+            x: p.x as f64,
+            y: p.y as f64,
         })
         .collect();
     coords.dedup();
@@ -2382,6 +2327,41 @@ mod tests {
             smoothing,
             ..BrushSettings::default()
         }
+    }
+
+    fn render_current_frame_once(app: &mut EditorApp) {
+        let ctx = egui::Context::default();
+        let stage_rect = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(
+                app.state.project.meta.stage_width as f32,
+                app.state.project.meta.stage_height as f32,
+            ),
+        );
+        let view = crate::render::StageView {
+            origin: stage_rect.min,
+            scale: 1.0,
+            stage_rect,
+        };
+        let q0rg_id = app.session.current_q0rg_id;
+        let frame = app.session.current_frame;
+        let project = &app.state.project;
+        let textures = &mut app.textures;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(stage_rect),
+                ..Default::default()
+            },
+            |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Middle,
+                    egui::Id::new("brush-eraser-cache-regression"),
+                ));
+                crate::render::render_stage(
+                    &painter, project, q0rg_id, frame, &view, textures, ctx,
+                );
+            },
+        );
     }
 
     fn square_path(min_x: f32, min_y: f32, max_x: f32, max_y: f32) -> VPath {
@@ -3596,7 +3576,7 @@ mod tests {
     }
 
     #[test]
-    fn contained_raw_fill_is_not_destroyed_by_post_drag_merge() {
+    fn contained_raw_fill_merges_into_one_surface() {
         let mut app = EditorApp::default();
         let color = Rgba {
             r: 20,
@@ -3627,25 +3607,19 @@ mod tests {
             },
         ];
 
-        assert!(!merge_touching_raw_fills_after_edit(
+        assert!(merge_touching_raw_fills_after_edit(
             &mut app.state.project,
             1,
             1,
             0
         ));
-        assert_eq!(app.state.project.q0rgs[0].layers[0].placements.len(), 2);
-        assert_eq!(app.state.project.assets.len(), 2);
-        let inner = app
-            .state
-            .project
-            .assets
-            .iter()
-            .find(|asset| asset.id() == 2)
-            .unwrap();
-        let Asset::Vector(inner) = inner else {
+        assert_eq!(app.state.project.q0rgs[0].layers[0].placements.len(), 1);
+        assert_eq!(app.state.project.assets.len(), 1);
+        let Asset::Vector(vector) = &app.state.project.assets[0] else {
             unreachable!()
         };
-        assert!(vector_fill_geometry(inner).contains(&Point::new(50.0, 50.0)));
+        assert_eq!(vector.paths.len(), 1);
+        assert!((vector_fill_geometry(vector).unsigned_area() - 10_000.0).abs() < 0.1);
     }
 
     #[test]
@@ -3692,7 +3666,7 @@ mod tests {
             panic!("merged raw fill must remain vector");
         };
         assert_eq!(vector.fill, Some(color));
-        assert_eq!(vector.paths.len(), 2);
+        assert_eq!(vector.paths.len(), 1);
         assert!((vector_fill_geometry(vector).unsigned_area() - 150.0).abs() < 0.1);
     }
     #[test]
@@ -3771,22 +3745,36 @@ mod tests {
         let Asset::Vector(vector) = &app.state.project.assets[0] else {
             panic!("merged raw fill must remain vector");
         };
-        assert_eq!(vector.paths.len(), 2);
-        assert!(vector.paths.contains(&left));
-        assert!(vector.paths.contains(&right));
         assert_eq!(
-            vector
-                .paths
-                .iter()
-                .flat_map(|path| &path.anchors)
-                .filter(|anchor| anchor.in_handle.is_some() || anchor.out_handle.is_some())
-                .count(),
-            8,
-            "post-drag merge dropped cubic handles and polygonized the visible boundary",
+            vector.paths.len(),
+            1,
+            "the internal contours must be removed"
+        );
+        assert!(vector
+            .paths
+            .iter()
+            .flat_map(|p| &p.anchors)
+            .any(|a| a.in_handle.is_some() || a.out_handle.is_some()));
+        let shape = |path| {
+            vector_fill_geometry(&VectorAsset {
+                asset_id: 0,
+                paths: vec![path],
+                fill: Some(color),
+                stroke: None,
+            })
+        };
+        let expected = shape(left).union(&shape(right));
+        let actual = vector_fill_geometry(vector);
+        let difference = expected.difference(&actual).unsigned_area()
+            + actual.difference(&expected).unsigned_area();
+        assert!(
+            difference < expected.unsigned_area() * 0.01,
+            "union changed the visible curved boundary: {difference}"
         );
     }
+
     #[test]
-    fn already_merged_raw_asset_is_not_rebuilt_after_edit() {
+    fn legacy_concatenated_merge_is_normalized_on_edit() {
         let mut app = EditorApp::default();
         let color = Rgba {
             r: 120,
@@ -3812,19 +3800,28 @@ mod tests {
             fx: Default::default(),
         }];
 
-        let before = app.state.project.assets[0].clone();
+        assert!(merge_touching_raw_fills_after_edit(
+            &mut app.state.project,
+            1,
+            1,
+            0
+        ));
+        let Asset::Vector(vector) = &app.state.project.assets[0] else {
+            panic!("raw fill must remain vector");
+        };
+        assert_eq!(vector.paths.len(), 1);
+        assert!((vector_fill_geometry(vector).unsigned_area() - 150.0).abs() < 0.1);
+        let normalized = app.state.project.clone();
         assert!(!merge_touching_raw_fills_after_edit(
             &mut app.state.project,
             1,
             1,
             0
         ));
-        assert_eq!(app.state.project.assets[0], before);
-        let Asset::Vector(vector) = &app.state.project.assets[0] else {
-            panic!("raw fill must remain vector");
-        };
-        assert_eq!(vector.paths.len(), 2);
-        assert!((vector_fill_geometry(vector).unsigned_area() - 150.0).abs() < 0.1);
+        assert_eq!(
+            app.state.project, normalized,
+            "an already-canonical boundary must stay untouched"
+        );
     }
 
     #[test]
@@ -3968,7 +3965,7 @@ mod tests {
     }
 
     #[test]
-    fn brush_candidate_collection_skips_edit_only_source_surfaces() {
+    fn brush_and_edit_candidates_share_the_same_geometry() {
         let mut app = EditorApp::default();
         let paint = settings(16.0, 40);
         let gesture = stroke(
@@ -3989,10 +3986,6 @@ mod tests {
             false,
         );
         assert!(!cheap.is_empty());
-        assert!(cheap
-            .iter()
-            .all(|candidate| candidate.source_surfaces.is_empty()));
-
         let edit = collect_raw_fill_candidates(
             &app.state.project,
             app.session.current_q0rg_id,
@@ -4000,10 +3993,10 @@ mod tests {
             app.session.current_frame,
             true,
         );
-        assert!(
-            edit.iter()
-                .any(|candidate| !candidate.source_surfaces.is_empty()),
-            "post-transform merge still needs individual source surfaces",
+        assert_eq!(cheap.len(), edit.len());
+        assert_eq!(
+            cheap[0].geometry, edit[0].geometry,
+            "click/move and painting must share the same boundary"
         );
     }
 
@@ -4304,6 +4297,28 @@ mod tests {
     }
 
     #[test]
+    fn area_eraser_invalidates_cached_vector_render_geometry_immediately() {
+        let mut app = EditorApp::default();
+        let paint = settings(20.0, 0);
+        let eraser = settings(12.0, 0);
+        let horizontal = stroke(&[Vec2::new(0.0, 20.0), Vec2::new(60.0, 20.0)], paint);
+        let cut = stroke(&[Vec2::new(30.0, -20.0), Vec2::new(30.0, 60.0)], eraser);
+        commit_brush_region(&mut app, brush_finish(horizontal, paint), paint);
+        app.state.project.asset_appearances.clear();
+
+        render_current_frame_once(&mut app);
+        assert_eq!(app.textures.vector_render_geometry_build_count(), 1);
+
+        assert!(erase_brush_region(&mut app, brush_finish(cut, eraser)));
+        render_current_frame_once(&mut app);
+        assert_eq!(
+            app.textures.vector_render_geometry_build_count(),
+            2,
+            "eraser geometry changed in the project but the stage reused the stale pre-erase tessellation"
+        );
+    }
+
+    #[test]
     fn area_eraser_removes_empty_raw_asset_and_placement() {
         let mut app = EditorApp::default();
         let paint = settings(10.0, 0);
@@ -4405,7 +4420,7 @@ mod tests {
     }
 
     #[test]
-    fn boolean_reconstruction_uses_boundary_anchors_not_bezier_samples() {
+    fn boolean_reconstruction_follows_curves_with_bounded_subdivision() {
         let path = VPath {
             anchors: vec![
                 Anchor {
@@ -4434,10 +4449,13 @@ mod tests {
 
         assert!(flatten_path(&path).len() > path.anchors.len() * 8);
         let polygon = path_to_polygon(&path).expect("canonical raw polygon");
-        assert_eq!(
-            polygon.exterior().0.len(),
-            path.anchors.len() + 1,
-            "merge drawing must not multiply Bézier samples on every commit"
+        assert!(
+            polygon.exterior().0.len() > path.anchors.len() + 1,
+            "curved edges cannot be replaced with anchor chords"
+        );
+        assert!(
+            polygon.exterior().0.len() <= flatten_path(&path).len(),
+            "adaptive curve sampling exceeded fixed sampling"
         );
     }
 

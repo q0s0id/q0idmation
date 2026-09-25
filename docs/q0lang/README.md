@@ -1,129 +1,86 @@
-# q0lang: гайд
+# q0lang
 
-q0lang - маленький скриптовый язык для q0idmation, q0rg-символов и будущих `.q0l`
-файлов. Базовая идея остается брутально-простой: чистые вычисления пишутся
-как обычный код, а команда, которая прямо что-то делает во внешнем мире,
-заканчивается на `!`.
+q0lang связывает код с анимацией q0s: вычисляет значения, вызывает функции, управляет кадрами, экземплярами и ригами. один компилятор и виртуальная машина используются редактором, плеером и терминальной программой q0shell.
 
-Текущее состояние:
+этот справочник описывает реализацию в текущем репозитории. доступность команд зависит от программы, которая запускает скрипт: файловые команды работают в q0shell, перемещение экземпляров работает в q0player.
 
-- parser и runtime лежат в `q0s-format`, поэтому `q0editor` и `q0player`
-  используют одно и то же ядро языка;
-- `q0editor` валидирует скрипты и показывает Script summary в q0lang-редакторе;
-- `q0player` выполняет script у entry-q0rg при загрузке v2 `.q0s`;
-- `gorun!` и `gostop!` уже влияют на playback при загрузке файла.
-- `q0.math` уже дает базовую арифметику и функции вроде `sin`, `cos`, `sqrt`,
-  `clamp`, `lerp`.
-- `q0shell` запускает q0lang-файлы как низкоуровневый терминальный host и
-  выполняет файловые команды `q0shell.*!`.
+## быстрый старт
 
-## Быстрый старт
+сохрани следующий текст как `hello.q0lang` или `hello.q0l`. оба расширения обозначают обычный текст utf-8.
+
+```q0lang
+import q0.math
+import q0shell
+
+pb func ease_out t {
+  return 1 - (1 - t) ^ 3
+}
+
+for i in range(5) {
+  progress = i / 4
+  x = lerp(0, 100, ease_out(progress))
+  q0shell.print! "шаг", i, "x =", x
+}
+```
+
+запусти из корня репозитория:
+
+```powershell
+cargo run -p q0shell -- hello.q0lang
+```
+
+готовый такой же пример лежит в [examples/basic.q0lang](examples/basic.q0lang):
+
+```powershell
+cargo run -p q0shell -- docs/q0lang/examples/basic.q0lang
+```
+
+результат:
+
+```text
+шаг 0 x = 0
+шаг 1 x = 57.8125
+шаг 2 x = 87.5
+шаг 3 x = 98.4375
+шаг 4 x = 100
+```
+
+`pb func` определяет функцию, `return` возвращает результат, `for` проходит значения от нуля до четырёх. у обычного вызова функции используются скобки. у команды с `!` аргументы идут после пробела и разделяются запятыми.
+
+## код в анимации
+
+общий скрипт q0rg подходит для начальных значений и функций. код отдельного кадра запускается при входе в кадр. отдельные `.q0l` / `.q0lang` файлы подключаются через граф проекта; для плеера их нужно включить в bundled-экспорт.
+
+в общий скрипт q0rg можно поместить:
 
 ```q0lang
 import q0.timeline
-import q0.mouse
-import q0.math
-import q0shell
 
-start = 2
-title = "intro"
-wobble = sin(pi / 2) * 12
-
-q0shell.print! "loaded", title
-gostop! start + 1
-listen mouse.click onClick
-
-pb func onClick target
-do! {
-  gorun! 3
+pb func start_frame {
+  return 12
 }
+
+gostop! start_frame()
 ```
 
-## Главные правила
+плеер перейдёт на кадр с индексом `12` и остановится; в короткой анимации индекс ограничится последним кадром. индексы в коде начинаются с **нуля**, хотя редактор показывает номера с единицы. не ставь безусловный `gostop! 12` в код самого кадра `12`: переход снова запускает его код.
 
-Переменные объявляются стандартно:
+## справочник
 
-```q0lang
-frame = 12
-name = "Intro"
-target = frame + 2
-```
+| страница | содержание |
+| --- | --- |
+| [синтаксис и типы](syntax.md) | значения, операции, условия, циклы, функции, области видимости |
+| [встроенные библиотеки](builtins.md) | все импорты, математические функции и команды |
+| [анимация и host api](hosts.md) | кадры, клавиатура, экземпляры, риги, сцены, доступность |
+| [события](events.md) | подписки и текущие границы поддержки |
+| [q0shell](q0shell.md) | запуск файлов, параметры командной строки, файловые команды |
+| [runtime и qvm](runtime.md) | порядок выполнения, состояние, диагностика, лимиты, байткод |
+| [рецепты](examples.md) | математика анимации, управление игроком, организация скриптов |
 
-Строки пишутся как строки, без декоративной пыли:
+готовые исходники лежат в [examples](examples). `q0s-format/tests/q0lang_docs.rs` проверяет разбор и компиляцию примеров актуального справочника и выполняет самостоятельные примеры с проверкой результата.
 
-```q0lang
-text = "Hello"
-```
+массивов, объектов, классов, замыканий, исключений, асинхронных функций и пользовательских модулей через `import` пока нет. имена вида `player.x` являются общими именами host api, а не полями обычного объекта. именные метки кадров и автоматический вызов обработчиков мыши ещё не подключены.
 
-Старый вид `..."Hello"` считается legacy-синтаксисом и получает diagnostic.
+[qvm_plan.md](qvm_plan.md) и [q0lang_overhaul_plan.md](q0lang_overhaul_plan.md) сохраняют историю проектирования; их планы не заменяют текущий справочник.
 
-Сигналы выполнения заканчиваются на `!`:
-
-```q0lang
-gorun! 4
-gostop! 0
-do! {
-  gorun! 2
-}
-```
-
-Объявления и подписки без прямого выполнения пишутся без `!`:
-
-```q0lang
-listen mouse.click onClick
-xlisten mouse.click onClick
-pb func openDoor actor speed
-pr func cacheFrame frame
-```
-
-Математика уже работает в assignments и timeline targets:
-
-```q0lang
-import q0.math
-
-t = 0.25
-x = lerp(10, 90, t)
-y = sin(t * tau) * 40
-target = clamp(round(x / 10), 1, 12)
-gorun! target
-```
-
-Timeline - это host-модуль `q0.timeline`, а не весь язык. q0editor только
-одна из оболочек: ядро parser/runtime лежит в `q0s-format` и может жить в
-player, CLI, тестах и будущих `.q0l`-инструментах.
-
-## q0shell
-
-`q0shell` - третья программа рядом с q0player и q0editor. Она запускает
-q0lang-файл без графической среды:
-
-```powershell
-cargo run -p q0shell -- tools/build.q0lang --root .
-cargo run -p q0shell -- -e "q0shell.print! 'loaded'" --root .
-```
-
-Команды начинаются с `q0shell.` и заканчиваются на `!`, потому что они реально
-трогают внешний мир:
-
-```q0lang
-import q0shell
-import q0.math
-
-name = "artefact-" + round(sin(pi / 2) * 10)
-q0shell.mkdir! "out"
-q0shell.write! "out/report.txt", name
-q0shell.append! "out/report.txt", "\nDONE"
-q0shell.read! "out/report.txt"
-```
-
-По умолчанию host работает внутри текущей папки. `--root DIR` задает другой
-корень. Абсолютные пути и `..` запрещены, чтобы команда была грубой, но не
-слепой.
-
-## Файлы в этой папке
-
-- [syntax.md](syntax.md) - справочник синтаксиса.
-- [runtime.md](runtime.md) - что сейчас реально исполняет runtime.
-- [builtins.md](builtins.md) - встроенные библиотеки и символы.
-- [q0shell.md](q0shell.md) - терминальный host и файловые команды.
-- [examples/basic.q0lang](examples/basic.q0lang) - маленький пример скрипта.
+источники: [parser](../../q0s-format/src/q0lang/parser.rs), [compiler](../../q0s-format/src/q0lang/compiler.rs), [runtime](../../q0s-format/src/q0lang/runtime.rs), [qvm](../../q0vm/src/lib.rs), [player](../../q0player/src/lib.rs), [editor](../../q0editor/src/app.rs), [shell](../../q0shell/src/lib.rs).

@@ -78,14 +78,35 @@ impl Runtime {
         self.execute_compiled(&compiled, instruction_budget)
     }
 
+    pub fn dispatch_event(
+        &mut self,
+        event: &str,
+        args: &[RuntimeValue],
+        instruction_budget: usize,
+    ) -> ExecutionReport {
+        let state = VmState {
+            vars: std::mem::take(&mut self.vars),
+            listeners: std::mem::take(&mut self.listeners),
+            imported_libraries: std::mem::take(&mut self.imported_libraries),
+            public_functions: std::mem::take(&mut self.public_functions),
+            private_functions: std::mem::take(&mut self.private_functions),
+            functions: std::mem::take(&mut self.compiled_functions),
+        };
+        let mut vm = Vm::with_state(state);
+        let vm_report = vm.dispatch_event(event, args, instruction_budget);
+        self.install_vm_state(vm.state);
+        self.translate_vm_report(vm_report, Vec::new())
+    }
+
     fn execute_compiled(
         &mut self,
         compiled: &compiler::CompiledProgram,
         instruction_budget: usize,
     ) -> ExecutionReport {
-        let mut report = ExecutionReport {
+        let report = ExecutionReport {
             actions: Vec::new(),
             diagnostics: compiled.diagnostics.clone(),
+            instructions_executed: 0,
         };
         if compiled.fatal {
             return report;
@@ -102,7 +123,15 @@ impl Runtime {
         let mut vm = Vm::with_state(state);
         let vm_report = vm.execute(&compiled.chunk, instruction_budget);
         self.install_vm_state(vm.state);
-        report.diagnostics.extend(
+        self.translate_vm_report(vm_report, report.diagnostics)
+    }
+
+    fn translate_vm_report(
+        &self,
+        vm_report: q0vm::ExecutionReport,
+        mut diagnostics: Vec<Diagnostic>,
+    ) -> ExecutionReport {
+        diagnostics.extend(
             vm_report
                 .diagnostics
                 .into_iter()
@@ -111,7 +140,11 @@ impl Runtime {
                     message: diagnostic.message,
                 }),
         );
-
+        let mut report = ExecutionReport {
+            actions: Vec::new(),
+            diagnostics,
+            instructions_executed: vm_report.instructions_executed,
+        };
         for action in vm_report.actions {
             match action {
                 HostAction::GoRun(target) => report
@@ -120,11 +153,9 @@ impl Runtime {
                 HostAction::GoStop(target) => report
                     .actions
                     .push(RuntimeAction::GoStop(resolve_timeline_target(target))),
-                HostAction::ShellCommand { command, args } => {
-                    report
-                        .actions
-                        .push(RuntimeAction::ShellCommand { command, args });
-                }
+                HostAction::ShellCommand { command, args } => report
+                    .actions
+                    .push(RuntimeAction::ShellCommand { command, args }),
                 HostAction::RigCommand { command, args } => {
                     emit_rig_command(&command, &args, &mut report);
                 }
@@ -335,6 +366,7 @@ pub enum TimelineTarget {
 pub struct ExecutionReport {
     pub actions: Vec<RuntimeAction>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
+    pub instructions_executed: usize,
 }
 
 pub type RuntimeDiagnostic = Diagnostic;

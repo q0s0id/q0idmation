@@ -32,6 +32,14 @@ pub struct LayerRename {
     pub focus_requested: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameLabelEdit {
+    pub q0rg_id: u16,
+    pub frame: u16,
+    pub draft: String,
+    pub focus_requested: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimelineLayerDrag {
     pub q0rg_id: u16,
@@ -182,6 +190,15 @@ pub enum Selection {
     /// Marquee selection of several raw-graphics contours. They can share one
     /// Placement/asset; selection still remains path-granular.
     Paths(Vec<PathRef>),
+    /// Flash-style raw fill/outline selection. A closed path may contribute its
+    /// fill and stroke independently, so both vectors intentionally may contain
+    /// the same PathRef. `objects` lets Shift-selection mix raw parts and display
+    /// objects without collapsing the two raw styles back into one contour.
+    RawParts {
+        fills: Vec<PathRef>,
+        strokes: Vec<PathRef>,
+        objects: Vec<PlacementRef>,
+    },
     /// V-tool marquee selection of only part of one raw contour. The selected
     /// boundary anchors move together and reshape the fill, matching Animate's
     /// partial raw-shape selection rather than Subselect's whole-path editing.
@@ -708,7 +725,11 @@ pub struct Session {
     pub library_sort_ascending: bool,
     pub library_rename: Option<LibraryRename>,
     pub text_editor: Option<crate::text_tool::TextDraft>,
+    pub text_defaults: crate::text_tool::TextDraft,
+    pub text_inspector: Option<crate::text_tool::TextDraft>,
+    pub text_canvas_click_consumed: bool,
     pub layer_rename: Option<LayerRename>,
+    pub frame_label_edit: Option<FrameLabelEdit>,
     pub timeline_layer_drag: Option<TimelineLayerDrag>,
     pub timeline_frame_drag: Option<TimelineFrameDrag>,
     pub playing: bool,
@@ -830,8 +851,12 @@ impl Session {
             library_search: String::new(),
             library_sort_ascending: true,
             text_editor: None,
+            text_defaults: Default::default(),
+            text_inspector: None,
+            text_canvas_click_consumed: false,
             library_rename: None,
             layer_rename: None,
+            frame_label_edit: None,
             timeline_layer_drag: None,
             timeline_frame_drag: None,
             playing: false,
@@ -1090,6 +1115,18 @@ impl Session {
                     .filter(|r| path_ref_exists(project, *r))
                     .collect();
                 self.selection = collapse_path_refs(kept);
+            }
+            Selection::RawParts {
+                ref mut fills,
+                ref mut strokes,
+                ref mut objects,
+            } => {
+                fills.retain(|reference| path_ref_exists(project, *reference));
+                strokes.retain(|reference| path_ref_exists(project, *reference));
+                objects.retain(|reference| placement_ref_exists(project, *reference));
+                if fills.is_empty() && strokes.is_empty() && objects.is_empty() {
+                    self.selection = Selection::None;
+                }
             }
             Selection::PathPoints {
                 path,

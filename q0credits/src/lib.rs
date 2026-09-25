@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use egui::{Align2, Color32, FontId, Id, Rect, Rounding, Sense, Stroke, Ui, pos2, vec2};
+use egui::{pos2, vec2, Align2, Color32, FontId, Id, Rect, Rounding, Sense, Stroke, Ui};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {

@@ -25,6 +25,41 @@ use crate::settings::PersistFontSize;
 
 const EDITOR_ANALYSIS_INSTRUCTION_BUDGET: usize = 4_096;
 
+#[derive(Clone)]
+struct ExecutionSummary {
+    source: String,
+    report: super::runtime::ExecutionReport,
+    variables: usize,
+    listeners: usize,
+}
+
+fn execution_summary(
+    ctx: &Context,
+    id: egui::Id,
+    source: &str,
+) -> std::sync::Arc<ExecutionSummary> {
+    let cache_id = id.with("execution_summary");
+    if let Some(summary) =
+        ctx.data(|data| data.get_temp::<std::sync::Arc<ExecutionSummary>>(cache_id))
+    {
+        if summary.source == source {
+            return summary;
+        }
+    }
+    let analysis = super::authoring::analyze(ctx, source);
+    let mut runtime = super::runtime::Runtime::new();
+    let report =
+        runtime.execute_program_with_budget(&analysis.program, EDITOR_ANALYSIS_INSTRUCTION_BUDGET);
+    let summary = std::sync::Arc::new(ExecutionSummary {
+        source: source.to_owned(),
+        report,
+        variables: runtime.vars.len(),
+        listeners: runtime.listeners.len(),
+    });
+    ctx.data_mut(|data| data.insert_temp(cache_id, summary.clone()));
+    summary
+}
+
 /// Render the script editor window.  No-op when `session.show_q0lang_editor`
 /// is false, so the caller can unconditionally invoke it from `App::update`.
 pub fn render(app: &mut EditorApp, ctx: &Context) {
@@ -64,13 +99,6 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
     );
     let tab_width = app.settings.q0lang_tab_width.max(1) as usize;
     let show_lines = app.settings.q0lang_show_line_numbers;
-    let parsed = super::parser::parse(&owned_script);
-    let mut runtime = super::runtime::Runtime::new();
-    let runtime_report =
-        runtime.execute_program_with_budget(&parsed, EDITOR_ANALYSIS_INSTRUCTION_BUDGET);
-    let diagnostics = runtime_report.diagnostics.clone();
-    let statement_count = parsed.statements.len();
-
     let mut new_font_name: Option<String> = None;
     let mut new_font_size: Option<f32> = None;
     let mut new_tab_width: Option<u8> = None;
@@ -85,23 +113,7 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
     // focused; otherwise the user might be typing in a regular text
     // box (the font picker, etc.) and we'd hijack their keys.
     // -----------------------------------------------------------------
-    let focused = ctx.memory(|m| m.has_focus(text_edit_id));
-    if focused {
-        // Enter (no shift) → auto-indent insert.
-        let want_enter = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
-        // Shift+Enter falls through to the TextEdit and inserts a plain
-        // newline — we don't consume it so the widget's default kicks in.
-        let want_tab = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab));
-        let want_shift_tab = ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::Tab));
-
-        if want_enter {
-            apply_auto_indent(ctx, text_edit_id, &mut owned_script, tab_width);
-        } else if want_tab {
-            insert_tab(ctx, text_edit_id, &mut owned_script, tab_width);
-        } else if want_shift_tab {
-            outdent(ctx, text_edit_id, &mut owned_script, tab_width);
-        }
-    }
+    edit_shortcuts(ctx, text_edit_id, &mut owned_script, tab_width);
 
     // Captured from the TextEdit's Response inside the Window closure so
     // we can decide outside whether to (a) snapshot history (only on
@@ -121,7 +133,7 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
             // ------ top toolbar: font picker, size, tab width, gutter toggle ------
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("Font")
+                    egui::RichText::new("font")
                         .color(theme.text_dim.to_color32())
                         .small(),
                 );
@@ -143,7 +155,7 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
 
                 ui.separator();
                 ui.label(
-                    egui::RichText::new("Size")
+                    egui::RichText::new("size")
                         .color(theme.text_dim.to_color32())
                         .small(),
                 );
@@ -161,7 +173,7 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
 
                 ui.separator();
                 ui.label(
-                    egui::RichText::new("Tab")
+                    egui::RichText::new("tab")
                         .color(theme.text_dim.to_color32())
                         .small(),
                 );
@@ -175,20 +187,23 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
 
                 ui.separator();
                 let mut sl = show_lines;
-                if ui.checkbox(&mut sl, "Line numbers").changed() {
+                if ui.checkbox(&mut sl, "line numbers").changed() {
                     new_show_lines = Some(sl);
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .button("Close")
-                        .on_hover_text("Hide the editor (the script stays in the project)")
+                        .button("close")
+                        .on_hover_text("hide the editor (the script stays in the project)")
                         .clicked()
                     {
                         close_requested = true;
                     }
                 });
             });
+            ui.separator();
+
+            super::authoring::tools_ui(ui, text_edit_id, &mut owned_script);
             ui.separator();
 
             // ------ main body: gutter + text edit, both inside one ScrollArea
@@ -198,12 +213,12 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
             // Layouter for the TextEdit — closure borrows `theme` and `font_id`.
             let theme_for_layouter = theme.clone();
             let font_for_layouter = font_id.clone();
-            let mut layouter = move |ui: &egui::Ui, text: &str, wrap_width: f32| {
+            let mut layouter = move |ui: &egui::Ui, text: &str, _wrap_width: f32| {
                 let job = super::syntax::layout_line(
                     text,
                     &theme_for_layouter,
                     font_for_layouter.clone(),
-                    wrap_width,
+                    f32::INFINITY,
                 );
                 ui.fonts(|f| f.layout_job(job))
             };
@@ -214,7 +229,9 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
             let row_height = ctx.fonts(|f| f.row_height(&font_id));
 
             egui::ScrollArea::both()
+                .id_source(text_edit_id.with("scroll"))
                 .auto_shrink([false, false])
+                .max_height((ui.available_height() - 170.0).max(140.0))
                 .show(ui, |ui| {
                     ui.horizontal_top(|ui| {
                         if show_lines {
@@ -230,7 +247,12 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
                             let painter = ui.painter_at(rect);
                             painter.rect_filled(rect, 0.0, theme.syntax_gutter_bg.to_color32());
                             let right_pad = 6.0;
-                            for n in 1..=line_count {
+                            for n in visible_lines(
+                                rect.top() + 2.0,
+                                row_height,
+                                line_count,
+                                ui.clip_rect(),
+                            ) {
                                 let y = rect.top() + 2.0 + (n - 1) as f32 * row_height;
                                 let pos = egui::pos2(rect.right() - right_pad, y);
                                 painter.text(
@@ -260,7 +282,9 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
                             .desired_width(avail)
                             .frame(false)
                             .layouter(&mut layouter);
-                        let resp = ui.add(edit);
+                        let output = edit.font(font_id.clone()).show(ui);
+                        super::authoring::scroll_to_selection(ui, &output);
+                        let resp = output.response;
                         if resp.gained_focus() {
                             text_gained_focus = true;
                         }
@@ -272,24 +296,40 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
                     });
                 });
 
+            let analysis = super::authoring::analyze(ctx, &owned_script);
+            let diagnostics = &analysis.diagnostics;
+            let statement_count = analysis.program.statements.len();
             ui.separator();
             if !diagnostics.is_empty() {
-                egui::CollapsingHeader::new(format!("Issues ({})", diagnostics.len()))
+                egui::CollapsingHeader::new(format!("issues ({})", diagnostics.len()))
                     .default_open(true)
                     .show(ui, |ui| {
-                        for d in &diagnostics {
-                            ui.label(
-                                egui::RichText::new(format!("line {}: {}", d.line, d.message))
-                                    .color(theme.syntax_signal.to_color32())
-                                    .small(),
-                            );
+                        for d in diagnostics {
+                            if ui
+                                .selectable_label(
+                                    false,
+                                    egui::RichText::new(format!("line {}: {}", d.line, d.message))
+                                        .color(theme.syntax_signal.to_color32())
+                                        .small(),
+                                )
+                                .clicked()
+                            {
+                                super::authoring::select_line(
+                                    ctx,
+                                    text_edit_id,
+                                    &owned_script,
+                                    d.line,
+                                );
+                            }
                         }
                     });
                 ui.separator();
             }
-            egui::CollapsingHeader::new("Script summary")
+            egui::CollapsingHeader::new("execution preview")
                 .default_open(false)
                 .show(ui, |ui| {
+                    let summary = execution_summary(ctx, text_edit_id, &owned_script);
+                    let runtime_report = &summary.report;
                     ui.label(
                         egui::RichText::new(format!(
                             "{} action{}, {} variable{}, {} event listener{}",
@@ -299,18 +339,30 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
                             } else {
                                 "s"
                             },
-                            runtime.vars.len(),
-                            if runtime.vars.len() == 1 { "" } else { "s" },
-                            runtime.listeners.len(),
-                            if runtime.listeners.len() == 1 {
-                                ""
-                            } else {
-                                "s"
-                            },
+                            summary.variables,
+                            if summary.variables == 1 { "" } else { "s" },
+                            summary.listeners,
+                            if summary.listeners == 1 { "" } else { "s" },
                         ))
                         .color(theme.text_dim.to_color32())
                         .small(),
                     );
+                    for diagnostic in &runtime_report.diagnostics {
+                        if ui
+                            .selectable_label(
+                                false,
+                                format!("line {}: {}", diagnostic.line, diagnostic.message),
+                            )
+                            .clicked()
+                        {
+                            super::authoring::select_line(
+                                ctx,
+                                text_edit_id,
+                                &owned_script,
+                                diagnostic.line,
+                            );
+                        }
+                    }
                     for action in &runtime_report.actions {
                         ui.label(
                             egui::RichText::new(runtime_action_label(action))
@@ -320,7 +372,7 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
                     }
                 });
             ui.separator();
-            egui::CollapsingHeader::new("Built-in libraries")
+            egui::CollapsingHeader::new("built-in libraries")
                 .default_open(false)
                 .show(ui, |ui| {
                     for lib in super::parser::BUILTIN_LIBRARIES {
@@ -343,10 +395,10 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
                     None => (1, 1),
                 };
                 let chars = owned_script.chars().count();
-                let lines = owned_script.lines().count().max(1);
+                let lines = owned_script.split('\n').count();
                 ui.label(
                     egui::RichText::new(format!(
-                        "Ln {ln}, Col {col} | {lines} line{}, {chars} char{} | q0lang: {}",
+                        "ln {ln}, col {col} | {lines} line{}, {chars} char{} | q0lang: {}",
                         if lines == 1 { "" } else { "s" },
                         if chars == 1 { "" } else { "s" },
                         if diagnostics.is_empty() {
@@ -368,7 +420,7 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         egui::RichText::new(
-                            "Enter: auto-indent | Shift+Enter: plain newline | Tab: spaces",
+                            "enter: auto-indent | shift+enter: plain newline | tab: spaces",
                         )
                         .color(theme.text_dim.to_color32())
                         .small(),
@@ -457,7 +509,6 @@ pub fn render_standalone(app: &mut EditorApp, ui: &mut egui::Ui) {
     );
     let tab_width = app.settings.q0lang_tab_width.max(1) as usize;
     let show_lines = app.settings.q0lang_show_line_numbers;
-    let mut status: Option<String> = None;
 
     let Some(document) = app.active_q0lang_document_mut() else {
         ui.centered_and_justified(|ui| ui.label("no q0lang document"));
@@ -466,71 +517,10 @@ pub fn render_standalone(app: &mut EditorApp, ui: &mut egui::Ui) {
     let text_edit_id = egui::Id::new(("q0lang_document_text", document.path.clone()));
     let focused = ui.ctx().memory(|memory| memory.has_focus(text_edit_id));
 
-    if focused {
-        let (find, replace, go_line, duplicate, toggle_comment, move_up, move_down) =
-            ui.ctx().input_mut(|input| {
-                (
-                    input.consume_key(Modifiers::COMMAND, Key::F),
-                    input.consume_key(Modifiers::COMMAND, Key::H),
-                    input.consume_key(Modifiers::COMMAND, Key::G),
-                    input.consume_key(Modifiers::COMMAND, Key::D),
-                    input.consume_key(Modifiers::COMMAND, Key::Slash),
-                    input.consume_key(Modifiers::ALT, Key::ArrowUp),
-                    input.consume_key(Modifiers::ALT, Key::ArrowDown),
-                )
-            });
-        if find {
-            document.show_find = true;
-            document.show_replace = false;
-        }
-        if replace {
-            document.show_find = true;
-            document.show_replace = true;
-        }
-        if go_line {
-            document.show_find = true;
-            document.search.clear();
-            status = Some("go to line: type a line number in find and press enter".to_string());
-        }
-        if duplicate && duplicate_current_line(ui.ctx(), text_edit_id, &mut document.text) {
-            document.dirty = true;
-        }
-        if toggle_comment
-            && toggle_comment_selected_lines(ui.ctx(), text_edit_id, &mut document.text)
-        {
-            document.dirty = true;
-        }
-        if move_up && move_current_line(ui.ctx(), text_edit_id, &mut document.text, -1) {
-            document.dirty = true;
-        }
-        if move_down && move_current_line(ui.ctx(), text_edit_id, &mut document.text, 1) {
-            document.dirty = true;
-        }
+    document.dirty |= edit_shortcuts(ui.ctx(), text_edit_id, &mut document.text, tab_width);
 
-        let want_enter = ui
-            .ctx()
-            .input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter));
-        let want_tab = ui
-            .ctx()
-            .input_mut(|input| input.consume_key(Modifiers::NONE, Key::Tab));
-        let want_shift_tab = ui
-            .ctx()
-            .input_mut(|input| input.consume_key(Modifiers::SHIFT, Key::Tab));
-        if want_enter {
-            apply_auto_indent(ui.ctx(), text_edit_id, &mut document.text, tab_width);
-            document.dirty = true;
-        } else if want_tab {
-            insert_tab(ui.ctx(), text_edit_id, &mut document.text, tab_width);
-            document.dirty = true;
-        } else if want_shift_tab {
-            let before = document.text.clone();
-            outdent(ui.ctx(), text_edit_id, &mut document.text, tab_width);
-            document.dirty |= before != document.text;
-        }
-    }
-
-    let parsed = super::parser::parse(&document.text);
-    let diagnostics = parsed.diagnostics.clone();
+    let analysis = super::authoring::analyze(ui.ctx(), &document.text);
+    let diagnostics = &analysis.diagnostics;
     let path_text = document.path.display().to_string();
 
     ui.horizontal(|ui| {
@@ -563,79 +553,19 @@ pub fn render_standalone(app: &mut EditorApp, ui: &mut egui::Ui) {
         });
     });
 
-    if document.show_find {
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label("find");
-            let find_response = ui.add_sized(
-                [220.0, 22.0],
-                TextEdit::singleline(&mut document.search).hint_text("text or line number"),
-            );
-            if find_response.gained_focus() {
-                find_response.request_focus();
-            }
-            let enter =
-                find_response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
-            if ui.small_button("prev").clicked()
-                && select_match(
-                    ui.ctx(),
-                    text_edit_id,
-                    &document.text,
-                    &document.search,
-                    false,
-                )
-            {
-                status = Some(format!("found `{}`", document.search));
-            }
-            if ui.small_button("next").clicked() || enter {
-                if let Ok(line) = document.search.trim().parse::<usize>() {
-                    if select_line(ui.ctx(), text_edit_id, &document.text, line) {
-                        status = Some(format!("line {line}"));
-                    }
-                } else if select_match(
-                    ui.ctx(),
-                    text_edit_id,
-                    &document.text,
-                    &document.search,
-                    true,
-                ) {
-                    status = Some(format!("found `{}`", document.search));
-                }
-            }
-            if document.show_replace {
-                ui.separator();
-                ui.label("replace");
-                ui.add_sized([180.0, 22.0], TextEdit::singleline(&mut document.replace));
-                if ui.small_button("all").clicked() && !document.search.is_empty() {
-                    let count = document.text.matches(&document.search).count();
-                    if count > 0 {
-                        document.text = document.text.replace(&document.search, &document.replace);
-                        document.dirty = true;
-                    }
-                    status = Some(format!(
-                        "replaced {count} match{}",
-                        if count == 1 { "" } else { "es" }
-                    ));
-                }
-            }
-            if ui.small_button("x").clicked() {
-                document.show_find = false;
-                document.show_replace = false;
-            }
-        });
-    }
+    document.dirty |= super::authoring::tools_ui(ui, text_edit_id, &mut document.text);
 
     ui.separator();
     let line_count =
         document.text.lines().count().max(1) + usize::from(document.text.ends_with('\n'));
     let theme_for_layouter = theme.clone();
     let font_for_layouter = font_id.clone();
-    let mut layouter = move |ui: &egui::Ui, text: &str, wrap_width: f32| {
+    let mut layouter = move |ui: &egui::Ui, text: &str, _wrap_width: f32| {
         let job = super::syntax::layout_line(
             text,
             &theme_for_layouter,
             font_for_layouter.clone(),
-            wrap_width,
+            f32::INFINITY,
         );
         ui.fonts(|fonts| fonts.layout_job(job))
     };
@@ -644,6 +574,7 @@ pub fn render_standalone(app: &mut EditorApp, ui: &mut egui::Ui) {
     egui::ScrollArea::both()
         .id_source(("q0lang_document_scroll", &document.path))
         .auto_shrink([false, false])
+        .max_height((ui.available_height() - 130.0).max(160.0))
         .show(ui, |ui| {
             ui.horizontal_top(|ui| {
                 if show_lines {
@@ -655,7 +586,8 @@ pub fn render_standalone(app: &mut EditorApp, ui: &mut egui::Ui) {
                         .allocate_exact_size(Vec2::new(gutter_width, total_height), Sense::hover());
                     let painter = ui.painter_at(rect);
                     painter.rect_filled(rect, 0.0, theme.syntax_gutter_bg.to_color32());
-                    for n in 1..=line_count {
+                    for n in visible_lines(rect.top() + 2.0, row_height, line_count, ui.clip_rect())
+                    {
                         painter.text(
                             egui::pos2(
                                 rect.right() - 6.0,
@@ -678,15 +610,16 @@ pub fn render_standalone(app: &mut EditorApp, ui: &mut egui::Ui) {
                 }
 
                 let available = ui.available_width().max(300.0);
-                let response = ui.add(
-                    TextEdit::multiline(&mut document.text)
-                        .id(text_edit_id)
-                        .desired_rows(line_count.max(32))
-                        .desired_width(available)
-                        .frame(false)
-                        .layouter(&mut layouter),
-                );
-                if response.changed() {
+                let output = TextEdit::multiline(&mut document.text)
+                    .id(text_edit_id)
+                    .desired_rows(line_count.max(32))
+                    .desired_width(available)
+                    .frame(false)
+                    .font(font_id.clone())
+                    .layouter(&mut layouter)
+                    .show(ui);
+                super::authoring::scroll_to_selection(ui, &output);
+                if output.response.changed() {
                     document.dirty = true;
                     ui.ctx().request_repaint();
                 }
@@ -724,18 +657,25 @@ pub fn render_standalone(app: &mut EditorApp, ui: &mut egui::Ui) {
         }
     }
 
+    let analysis = super::authoring::analyze(ui.ctx(), &document.text);
+    let diagnostics = &analysis.diagnostics;
     if !diagnostics.is_empty() {
         ui.separator();
         egui::CollapsingHeader::new(format!("issues ({})", diagnostics.len()))
             .default_open(true)
             .show(ui, |ui| {
-                for diagnostic in &diagnostics {
+                for diagnostic in diagnostics {
                     let label = format!("line {}: {}", diagnostic.line, diagnostic.message);
                     if ui
                         .selectable_label(false, egui::RichText::new(label).small())
                         .clicked()
                     {
-                        select_line(ui.ctx(), text_edit_id, &document.text, diagnostic.line);
+                        super::authoring::select_line(
+                            ui.ctx(),
+                            text_edit_id,
+                            &document.text,
+                            diagnostic.line,
+                        );
                     }
                 }
             });
@@ -761,17 +701,65 @@ pub fn render_standalone(app: &mut EditorApp, ui: &mut egui::Ui) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
                 egui::RichText::new(
-                    "ctrl+f find  ctrl+h replace  ctrl+/ comment  ctrl+d duplicate  alt+?/? move",
+                    "ctrl+f find  ctrl+h replace  ctrl+g line  ctrl+/ comment  ctrl+d duplicate  alt+up/down move",
                 )
                 .small()
                 .color(theme.text_dim.to_color32()),
             );
         });
     });
+}
 
-    if let Some(status) = status {
-        app.session.status = status;
+/// Editing keys behave identically for standalone, scene and frame scripts.
+pub(super) fn edit_shortcuts(
+    ctx: &Context,
+    id: egui::Id,
+    text: &mut String,
+    tab_width: usize,
+) -> bool {
+    if !ctx.memory(|memory| memory.has_focus(id)) {
+        return false;
     }
+    let (duplicate, comment, up, down, enter, tab, outdent_key) = ctx.input_mut(|input| {
+        (
+            input.consume_key(Modifiers::COMMAND, Key::D),
+            input.consume_key(Modifiers::COMMAND, Key::Slash),
+            input.consume_key(Modifiers::ALT, Key::ArrowUp),
+            input.consume_key(Modifiers::ALT, Key::ArrowDown),
+            input.consume_key(Modifiers::NONE, Key::Enter),
+            input.consume_key(Modifiers::NONE, Key::Tab),
+            input.consume_key(Modifiers::SHIFT, Key::Tab),
+        )
+    });
+    if !(duplicate || comment || up || down || enter || tab || outdent_key) {
+        return false;
+    }
+    let before = text.clone();
+    if duplicate {
+        duplicate_current_line(ctx, id, text);
+    } else if comment {
+        toggle_comment_selected_lines(ctx, id, text);
+    } else if up || down {
+        move_current_line(ctx, id, text, if up { -1 } else { 1 });
+    } else if enter {
+        apply_auto_indent(ctx, id, text, tab_width);
+    } else if tab {
+        insert_tab(ctx, id, text, tab_width);
+    } else {
+        outdent(ctx, id, text, tab_width);
+    }
+    *text != before
+}
+
+fn visible_lines(
+    top: f32,
+    row_height: f32,
+    count: usize,
+    clip: egui::Rect,
+) -> std::ops::RangeInclusive<usize> {
+    let first = ((clip.top() - top) / row_height).floor().max(0.0) as usize + 1;
+    let last = (((clip.bottom() - top) / row_height).ceil().max(0.0) as usize + 1).min(count);
+    first..=last
 }
 
 fn current_cursor_index(ctx: &Context, id: egui::Id, fallback: usize) -> usize {
@@ -782,71 +770,7 @@ fn current_cursor_index(ctx: &Context, id: egui::Id, fallback: usize) -> usize {
 }
 
 fn set_cursor_range(ctx: &Context, id: egui::Id, start: usize, end: usize) {
-    if let Some(mut state) = TextEditState::load(ctx, id) {
-        state.cursor.set_char_range(Some(CCursorRange::two(
-            CCursor::new(start),
-            CCursor::new(end),
-        )));
-        state.store(ctx, id);
-        ctx.memory_mut(|memory| memory.request_focus(id));
-    }
-}
-
-fn select_line(ctx: &Context, id: egui::Id, text: &str, line: usize) -> bool {
-    if line == 0 {
-        return false;
-    }
-    let mut current_line = 1usize;
-    let mut start = 0usize;
-    let mut end = text.chars().count();
-    for (index, ch) in text.chars().enumerate() {
-        if current_line == line && start == 0 && line != 1 {
-            start = index;
-        }
-        if ch == '\n' {
-            if current_line == line {
-                end = index;
-                break;
-            }
-            current_line += 1;
-            if current_line == line {
-                start = index + 1;
-            }
-        }
-    }
-    if current_line < line {
-        return false;
-    }
-    set_cursor_range(ctx, id, start, end);
-    true
-}
-
-fn select_match(ctx: &Context, id: egui::Id, text: &str, needle: &str, forward: bool) -> bool {
-    if needle.is_empty() {
-        return false;
-    }
-    let total_chars = text.chars().count();
-    let cursor = current_cursor_index(ctx, id, total_chars).min(total_chars);
-    let cursor_byte = char_to_byte(text, cursor);
-    let found_byte = if forward {
-        text[cursor_byte..]
-            .find(needle)
-            .map(|offset| cursor_byte + offset)
-            .or_else(|| text[..cursor_byte].find(needle))
-    } else {
-        text[..cursor_byte].rfind(needle).or_else(|| {
-            text[cursor_byte..]
-                .rfind(needle)
-                .map(|offset| cursor_byte + offset)
-        })
-    };
-    let Some(found_byte) = found_byte else {
-        return false;
-    };
-    let start = byte_to_char(text, found_byte);
-    let end = start + needle.chars().count();
-    set_cursor_range(ctx, id, start, end);
-    true
+    super::authoring::select_range(ctx, id, start..end);
 }
 
 fn line_bounds_chars(text: &str, cursor: usize) -> (usize, usize) {
@@ -897,7 +821,12 @@ fn toggle_comment_selected_lines(ctx: &Context, id: egui::Id, text: &mut String)
     let min = range.primary.index.min(range.secondary.index);
     let max = range.primary.index.max(range.secondary.index);
     let (start, _) = line_bounds_chars(text, min);
-    let (_, end) = line_bounds_chars(text, max);
+    let last_selected = if max > min && text.chars().nth(max.saturating_sub(1)) == Some('\n') {
+        max - 1
+    } else {
+        max
+    };
+    let (_, end) = line_bounds_chars(text, last_selected);
     let start_byte = char_to_byte(text, start);
     let end_byte = char_to_byte(text, end);
     let block = text[start_byte..end_byte].to_string();
@@ -996,6 +925,11 @@ fn completion_candidates(prefix: &str) -> Vec<String> {
         "if".to_string(),
         "else".to_string(),
         "while".to_string(),
+        "for".to_string(),
+        "in".to_string(),
+        "range".to_string(),
+        "break".to_string(),
+        "continue".to_string(),
         "return".to_string(),
         "true".to_string(),
         "false".to_string(),
@@ -1051,8 +985,11 @@ fn apply_auto_indent(ctx: &Context, id: egui::Id, text: &mut String, tab_width: 
     };
     let cursor_range = state.cursor.char_range();
     let cur = cursor_range
-        .map(|r| r.primary.index)
+        .map(|r| r.primary.index.min(r.secondary.index))
         .unwrap_or_else(|| text.chars().count());
+    let selection_end = cursor_range
+        .map(|r| r.primary.index.max(r.secondary.index))
+        .unwrap_or(cur);
     let byte_pos = char_to_byte(text, cur);
 
     // Walk back from byte_pos to start of line (or string).
@@ -1071,7 +1008,7 @@ fn apply_auto_indent(ctx: &Context, id: egui::Id, text: &mut String, tab_width: 
         String::new()
     };
     let to_insert = format!("\n{indent}{extra}");
-    text.insert_str(byte_pos, &to_insert);
+    text.replace_range(byte_pos..char_to_byte(text, selection_end), &to_insert);
 
     let new_cursor_chars = cur + to_insert.chars().count();
     state
@@ -1090,14 +1027,17 @@ fn insert_tab(ctx: &Context, id: egui::Id, text: &mut String, tab_width: usize) 
     };
     let cursor_range = state.cursor.char_range();
     let cur = cursor_range
-        .map(|r| r.primary.index)
+        .map(|r| r.primary.index.min(r.secondary.index))
         .unwrap_or_else(|| text.chars().count());
+    let selection_end = cursor_range
+        .map(|r| r.primary.index.max(r.secondary.index))
+        .unwrap_or(cur);
     let byte_pos = char_to_byte(text, cur);
     let line_start = text[..byte_pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
     let col_chars = text[line_start..byte_pos].chars().count();
     let spaces_to_next_stop = tab_width - (col_chars % tab_width);
     let pad: String = std::iter::repeat_n(' ', spaces_to_next_stop).collect();
-    text.insert_str(byte_pos, &pad);
+    text.replace_range(byte_pos..char_to_byte(text, selection_end), &pad);
     let new_cursor_chars = cur + pad.chars().count();
     state
         .cursor

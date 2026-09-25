@@ -45,6 +45,8 @@ struct ClassicBrushPreviewTexture {
     size: [usize; 2],
     screen_rect: Rect,
     pixels_per_point: f32,
+    view_origin: Pos2,
+    view_scale: f32,
 }
 
 fn preview_polygon_contains(point: Pos2, polygon: &[Pos2]) -> bool {
@@ -340,10 +342,14 @@ struct FxPlacementTexture {
     crop: [u32; 4],
     blend_mode: BlendMode,
     raster_translation: Vec2,
+    raster_transform: Affine,
 }
 
 #[derive(Default)]
 pub struct TextureCache {
+    pub(crate) hidden_text_placement: Option<(u16, u16, usize)>,
+    /// Reuse a transformed soft-effect tile while the pointer is held down.
+    pub(crate) interactive_transform: bool,
     by_asset_id: HashMap<u16, TextureHandle>,
     vector_render_by_asset: HashMap<u16, CachedVectorRenderGeometry>,
     by_q0v_frame: HashMap<(u16, u32), TextureHandle>,
@@ -402,7 +408,12 @@ pub struct TextureCache {
 }
 
 impl TextureCache {
-    pub fn begin_classic_brush_preview(&mut self, ctx: &Context, screen_rect: Rect) {
+    pub fn begin_classic_brush_preview(
+        &mut self,
+        ctx: &Context,
+        screen_rect: Rect,
+        view: &StageView,
+    ) {
         let pixels_per_point = ctx.pixels_per_point().clamp(1.0, 2.0);
         let width = (screen_rect.width().max(1.0) * pixels_per_point)
             .ceil()
@@ -419,7 +430,18 @@ impl TextureCache {
             size,
             screen_rect,
             pixels_per_point,
+            view_origin: view.origin,
+            view_scale: view.scale,
         });
+    }
+
+    pub fn classic_brush_preview_matches_view(&self, screen_rect: Rect, view: &StageView) -> bool {
+        let Some(preview) = self.classic_brush_preview.as_ref() else {
+            return false;
+        };
+        preview.screen_rect == screen_rect
+            && (preview.view_origin - view.origin).length_sq() <= 1.0e-6
+            && (preview.view_scale - view.scale).abs() <= 1.0e-6
     }
 
     pub fn clear_classic_brush_preview(&mut self) {
@@ -1277,6 +1299,30 @@ fn build_cached_vector_render_geometry(vector: &VectorAsset) -> CachedVectorRend
     }
 }
 
+pub(crate) fn text_preview_mesh(paths: Vec<VPath>) -> Option<Mesh> {
+    let vector = VectorAsset {
+        asset_id: 0,
+        paths,
+        fill: Some(Rgba {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 255,
+        }),
+        stroke: None,
+    };
+    cached_vector_fill_mesh(
+        &build_cached_vector_render_geometry(&vector),
+        Affine::IDENTITY,
+        &StageView {
+            origin: Pos2::ZERO,
+            scale: 1.0,
+            stage_rect: Rect::EVERYTHING,
+        },
+        Color32::WHITE,
+    )
+}
+
 fn cached_vector_fill_mesh(
     geometry: &CachedVectorRenderGeometry,
     transform: Affine,
@@ -1398,14 +1444,6 @@ fn linear_affine_bits(affine: Affine) -> [u32; 4] {
         affine.a22.to_bits(),
     ]
 }
-fn transform_same_except_translation(left: Transform2D, right: Transform2D) -> bool {
-    left.sx == right.sx
-        && left.sy == right.sy
-        && left.rotation == right.rotation
-        && left.skew_x == right.skew_x
-        && left.skew_y == right.skew_y
-}
-
 #[derive(Debug, Clone, Copy)]
 struct FxProjectChange {
     q0rg_id: u16,
@@ -1469,17 +1507,11 @@ fn project_fx_cache_compatible_changes(
                     || left_placement.target != right_placement.target
                     || left_placement.tween != right_placement.tween
                     || !placement_fx_same_except_blend(left_placement.fx, right_placement.fx)
-                    || !transform_same_except_translation(
-                        left_placement.transform,
-                        right_placement.transform,
-                    )
                 {
                     return None;
                 }
-                let translation_changed = left_placement.transform.tx
-                    != right_placement.transform.tx
-                    || left_placement.transform.ty != right_placement.transform.ty;
-                if translation_changed || blend_mode_changed {
+                let transform_changed = left_placement.transform != right_placement.transform;
+                if transform_changed || blend_mode_changed {
                     changes.push(FxProjectChange {
                         q0rg_id: left_q0rg.q0rg_id,
                         layer_id: left_layer.layer_id,
@@ -1567,8 +1599,7 @@ fn sync_project_fx_cache_safe_fields(snapshot: &mut ProjectV2, project: &Project
                 .iter_mut()
                 .zip(&project_layer.placements)
             {
-                snapshot_placement.transform.tx = project_placement.transform.tx;
-                snapshot_placement.transform.ty = project_placement.transform.ty;
+                snapshot_placement.transform = project_placement.transform;
                 snapshot_placement.fx.blend_mode = project_placement.fx.blend_mode;
             }
         }
@@ -1576,6 +1607,19 @@ fn sync_project_fx_cache_safe_fields(snapshot: &mut ProjectV2, project: &Project
 }
 
 fn sync_fx_project_snapshot(project: &ProjectV2, textures: &mut TextureCache) {
+    // Most raw glow uses asset appearances, not placement FX. Avoid cloning
+    // the entire document on every transform when this cache has no consumers.
+    if !project
+        .q0rgs
+        .iter()
+        .flat_map(|q| &q.layers)
+        .flat_map(|l| &l.placements)
+        .any(|p| !p.fx.is_identity())
+    {
+        textures.fx_project_snapshot = None;
+        textures.fx_placement_textures.clear();
+        return;
+    }
     let compatible_changes = textures
         .fx_project_snapshot
         .as_ref()
@@ -1843,6 +1887,32 @@ fn render_fx_placement(
         outer_only,
     };
     if !textures.fx_placement_textures.contains_key(&key) {
+        if textures.interactive_transform {
+            if let Some((old_key, cached)) =
+                textures.fx_placement_textures.iter().find(|(old, tile)| {
+                    old.host_q0rg_id == key.host_q0rg_id
+                        && old.layer_id == key.layer_id
+                        && old.placement_idx == key.placement_idx
+                        && old.local_frame == key.local_frame
+                        && old.tint == key.tint
+                        && old.outer_only == key.outer_only
+                        && tile.blend_mode == BlendMode::Normal
+                        && tile.raster_transform.inverse().is_some()
+                })
+            {
+                paint_transformed_fx_tile(painter, project, *old_key, cached, composed, view);
+                return;
+            }
+        }
+        // Keep other objects warm, and bound historical affine variants of this tile.
+        textures.fx_placement_textures.retain(|old, _| {
+            old.host_q0rg_id != key.host_q0rg_id
+                || old.layer_id != key.layer_id
+                || old.placement_idx != key.placement_idx
+                || old.local_frame != key.local_frame
+                || old.tint != key.tint
+                || old.outer_only != key.outer_only
+        });
         if textures.fx_placement_textures.len() >= 48 {
             textures.fx_placement_textures.clear();
         }
@@ -1904,6 +1974,7 @@ fn render_fx_placement(
                     fx.blend_mode
                 },
                 raster_translation: Vec2::new(composed.tx, composed.ty),
+                raster_transform: composed,
             },
         );
     }
@@ -1925,6 +1996,48 @@ fn render_fx_placement(
         cached.texture.id(),
         cached.blend_mode,
     );
+}
+
+fn paint_transformed_fx_tile(
+    painter: &Painter,
+    project: &ProjectV2,
+    key: FxPlacementKey,
+    cached: &FxPlacementTexture,
+    current: Affine,
+    view: &StageView,
+) {
+    let Some(inverse) = cached.raster_transform.inverse() else {
+        return;
+    };
+    let delta = Affine::compose(current, inverse);
+    let rect = fx_crop_screen_rect(
+        project,
+        key.width,
+        key.height,
+        cached.crop,
+        cached.raster_translation,
+        cached.raster_translation,
+        &StageView {
+            origin: Pos2::ZERO,
+            scale: 1.0,
+            stage_rect: Rect::EVERYTHING,
+        },
+    );
+    let mut mesh = Mesh::with_texture(cached.texture.id());
+    for (point, uv) in [
+        (rect.left_top(), pos2(0.0, 0.0)),
+        (rect.right_top(), pos2(1.0, 0.0)),
+        (rect.right_bottom(), pos2(1.0, 1.0)),
+        (rect.left_bottom(), pos2(0.0, 1.0)),
+    ] {
+        mesh.vertices.push(Vertex {
+            pos: stage_to_screen(delta.apply(Vec2::new(point.x, point.y)), view),
+            uv,
+            color: Color32::WHITE,
+        });
+    }
+    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+    painter.add(Shape::Mesh(mesh));
 }
 
 pub fn render_stage(
@@ -2015,6 +2128,9 @@ fn render_q0rg(
             continue;
         }
         for resolved in resolve_layer_at_frame(layer, local_frame) {
+            if textures.hidden_text_placement == Some((q0rg_id, layer.layer_id, resolved.index)) {
+                continue;
+            }
             let placement = resolved.placement;
             let local_affine = rig_pose
                 .as_ref()
@@ -4812,6 +4928,30 @@ mod tests {
                 "{label} translation created another fx texture"
             );
             assert_eq!(cache.fx_project_snapshot.as_ref(), Some(&project));
+
+            cache.interactive_transform = true;
+            for step in 1..=24 {
+                let transform = &mut project.q0rgs[0].layers[0].placements[0].transform;
+                transform.rotation = step as f32 * 0.03;
+                transform.sx = 1.0 + step as f32 * 0.02;
+                transform.skew_x = step as f32 * 0.005;
+                render_once(&project, &mut cache, "live-affine");
+                assert_eq!(
+                    cache.fx_serial, serial_before_drag,
+                    "{label} re-rasterized during a live rotation/scale/skew"
+                );
+                assert_eq!(cache.fx_placement_textures.len(), 1);
+            }
+            cache.interactive_transform = false;
+            render_once(&project, &mut cache, "released-affine");
+            assert_eq!(
+                cache.fx_serial,
+                serial_before_drag + 1,
+                "{label} must refine the effect once after pointer release"
+            );
+            render_once(&project, &mut cache, "settled-affine");
+            assert_eq!(cache.fx_serial, serial_before_drag + 1);
+            assert_eq!(cache.fx_placement_textures.len(), 1);
         }
     }
     #[test]
@@ -4917,6 +5057,8 @@ mod tests {
         let warm_serial = cache.fx_serial;
 
         project.q0rgs[0].layers[0].placements[1].transform.tx += 25.0;
+        project.q0rgs[0].layers[0].placements[1].transform.rotation += 0.5;
+        project.q0rgs[0].layers[0].placements[1].transform.sx = 1.8;
         render_once(&project, &mut cache, "filtered-source-unrelated-move");
         assert_eq!(
             cache.fx_serial, warm_serial,
@@ -4924,6 +5066,7 @@ mod tests {
         );
 
         project.q0rgs[1].layers[0].placements[0].transform.tx += 12.0;
+        project.q0rgs[1].layers[0].placements[0].transform.rotation += 0.5;
         render_once(&project, &mut cache, "filtered-source-internal-move");
         assert!(
             cache.fx_serial > warm_serial,
@@ -5259,7 +5402,12 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
-                cache.begin_classic_brush_preview(ctx, rect);
+                let view = StageView {
+                    origin: Pos2::ZERO,
+                    scale: 1.0,
+                    stage_rect: rect,
+                };
+                cache.begin_classic_brush_preview(ctx, rect, &view);
                 let started = std::time::Instant::now();
                 for index in 0..600 {
                     let x = 20.0 + (index % 120) as f32 * 6.0;

@@ -8,8 +8,8 @@
 //! resolution-independent on playback.
 //!
 //! v1 (legacy bitmap-only) is still parsed by `parse_q0s` so old movies
-//! keep playing. Current v13 adds per-placement alpha, blend modes, blur,
-//! glow and drop-shadow data; v12 and earlier decode those properties as identity.
+//! keep playing. Current v21 adds named frame labels scoped to each q0rg;
+//! v20 and earlier decode their labels as empty.
 
 use crate::error::Error;
 #[cfg(test)]
@@ -38,7 +38,8 @@ pub const Q0S_VERSION_RIG_POSE_VARIANTS: u16 = 17;
 pub const Q0S_VERSION_AUDIO_CLIP_FX: u16 = 18;
 pub const Q0S_VERSION_AUDIO_TIMELINE_CLIPS: u16 = 19;
 pub const Q0S_VERSION_PROJECT_RUNTIME: u16 = 20;
-pub const Q0S_VERSION_CURRENT: u16 = Q0S_VERSION_PROJECT_RUNTIME;
+pub const Q0S_VERSION_FRAME_LABELS: u16 = 21;
+pub const Q0S_VERSION_CURRENT: u16 = Q0S_VERSION_FRAME_LABELS;
 
 /// Serialise a `ProjectV2` as the current vector `.q0s` bytes. Internally we
 /// reuse the current `.q1s` writer and patch the magic+version header in-place
@@ -105,6 +106,9 @@ pub fn parse_q0s_v2(bytes: &[u8]) -> Result<ProjectV2, Error> {
         Q0S_VERSION_AUDIO_TIMELINE_CLIPS => {
             v2::parse_body_after_header(bytes, v2::Q1S_VERSION_AUDIO_TIMELINE_CLIPS)
         }
+        Q0S_VERSION_PROJECT_RUNTIME => {
+            v2::parse_body_after_header(bytes, v2::Q1S_VERSION_PROJECT_RUNTIME)
+        }
         Q0S_VERSION_CURRENT => v2::parse_body_after_header(bytes, v2::Q1S_VERSION_CURRENT),
         _ => Err(Error::UnsupportedVersion(version)),
     }
@@ -139,6 +143,7 @@ pub fn is_q0s_v2(bytes: &[u8]) -> bool {
             | Q0S_VERSION_RIG_POSE_VARIANTS
             | Q0S_VERSION_AUDIO_CLIP_FX
             | Q0S_VERSION_AUDIO_TIMELINE_CLIPS
+            | Q0S_VERSION_PROJECT_RUNTIME
             | Q0S_VERSION_CURRENT
     )
 }
@@ -1119,11 +1124,36 @@ mod tests {
         let bytes = write_q0s_v2(&project).expect("write project runtime q0s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_PROJECT_RUNTIME
+            Q0S_VERSION_CURRENT
         );
         assert_eq!(
             parse_q0s_v2(&bytes).expect("parse project runtime q0s"),
             project
         );
+    }
+
+    #[test]
+    fn frame_labels_survive_q0s_export_and_previous_runtime_version_still_loads() {
+        let mut project = small_project();
+        let mut legacy = v2::write_version(&project, v2::Q1S_VERSION_PROJECT_RUNTIME).unwrap();
+        legacy[0..4].copy_from_slice(&Q0S_V2_MAGIC);
+        legacy[4..6].copy_from_slice(&Q0S_VERSION_PROJECT_RUNTIME.to_le_bytes());
+        assert!(is_q0s_v2(&legacy));
+        assert_eq!(parse_q0s_v2(&legacy).unwrap(), project);
+        project
+            .runtime
+            .frame_labels
+            .insert(v2::FrameLabelKey::new(1, 0), "start".into());
+        project
+            .runtime
+            .frame_labels
+            .insert(v2::FrameLabelKey::new(1, 1), "finish".into());
+        let bytes = write_q0s_v2(&project).unwrap();
+        assert!(is_q0s_v2(&bytes));
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            Q0S_VERSION_FRAME_LABELS
+        );
+        assert_eq!(parse_q0s_v2(&bytes).unwrap(), project);
     }
 }

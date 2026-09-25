@@ -29,7 +29,10 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     let canvas_interacted = response.clicked_by(PointerButton::Primary)
         || response.drag_started_by(PointerButton::Primary)
         || response.secondary_clicked();
-    release_canvas_keyboard_focus(ui.ctx(), canvas_interacted);
+    release_canvas_keyboard_focus(
+        ui.ctx(),
+        canvas_interacted && app.session.text_editor.is_none(),
+    );
     if canvas_interacted {
         app.session.timeline_selection = None;
         app.session.pending_timeline_frame = None;
@@ -83,6 +86,13 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     };
     let q0rg_id = app.session.current_q0rg_id;
     let frame = app.session.current_frame;
+    app.textures.hidden_text_placement = app
+        .session
+        .text_editor
+        .as_ref()
+        .and_then(|draft| draft.placement)
+        .map(|r| (r.q0rg_id, r.layer_id, r.placement_idx));
+    app.textures.interactive_transform = ui.input(|i| i.pointer.primary_down());
 
     // Editing inside a q0rg uses a subtle full-stage veil. The veil is drawn
     // before the symbol, so the current q0rg remains crisp while the canvas
@@ -215,10 +225,13 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
 
     // Tool interaction (Pen / Brush / Select / primitives) and overlays.
     let ctx = ui.ctx().clone();
-    if !library_drag_active {
+    let editing_text = crate::text_tool::render_canvas(app, ui, &view);
+    if !library_drag_active && !editing_text {
         crate::tools::handle(app, &response, &painter, &view, &ctx);
     }
-    crate::tools::draw_selection_overlay(app, &painter, &view);
+    if !editing_text {
+        crate::tools::draw_selection_overlay(app, &painter, &view);
+    }
     crate::tools::draw_brush_size_preview(app, &painter, &view);
 
     // Right-click context menu — pre-select the placement under cursor so the

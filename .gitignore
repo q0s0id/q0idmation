@@ -4,3 +4,5 @@
 /.vscode/
 /.idea/
 /maskeraser/
+__pycache__/
+*.pyc

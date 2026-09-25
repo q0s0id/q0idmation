@@ -39,11 +39,52 @@ impl PlacementTransformOverride {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct RuntimeSceneState {
     placement_transforms: HashMap<InstanceKey, PlacementTransformOverride>,
+    children: HashMap<InstanceKey, RuntimeChildState>,
+    playback_requests: HashMap<InstanceKey, PlaybackRequest>,
+    pub rig_overrides: crate::rig::RigRuntimeOverrides,
+}
+
+/// State below one *placement*, rather than below a shared symbol definition.
+/// Two copies of a q0rg therefore have independent animation and transforms.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RuntimeChildState {
+    pub frame: u16,
+    pub scene: RuntimeSceneState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PlaybackRequest {
+    pub frame: Option<u16>,
+    pub playing: Option<bool>,
 }
 
 impl RuntimeSceneState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn child_context(&self, key: InstanceKey, fallback_frame: u16) -> (u16, &Self) {
+        self.children
+            .get(&key)
+            .map_or((fallback_frame, self), |child| (child.frame, &child.scene))
+    }
+
+    pub fn take_child(&mut self, key: InstanceKey) -> RuntimeChildState {
+        self.children.remove(&key).unwrap_or_default()
+    }
+
+    pub fn set_child(&mut self, key: InstanceKey, child: RuntimeChildState) {
+        self.children.insert(key, child);
+    }
+
+    pub fn request_playback(&mut self, key: InstanceKey, request: PlaybackRequest) {
+        if request.frame.is_some() || request.playing.is_some() {
+            self.playback_requests.insert(key, request);
+        }
+    }
+
+    pub fn take_playback_request(&mut self, key: InstanceKey) -> PlaybackRequest {
+        self.playback_requests.remove(&key).unwrap_or_default()
     }
 
     pub fn transform_override(&self, key: InstanceKey) -> Option<PlacementTransformOverride> {
@@ -76,11 +117,15 @@ impl RuntimeSceneState {
     }
 
     pub fn clear_instance(&mut self, key: InstanceKey) -> bool {
-        self.placement_transforms.remove(&key).is_some()
+        let removed = self.placement_transforms.remove(&key).is_some();
+        let request = self.playback_requests.remove(&key).is_some();
+        self.children.remove(&key).is_some() || removed || request
     }
 
     pub fn is_empty(&self) -> bool {
         self.placement_transforms.is_empty()
+            && self.children.is_empty()
+            && self.rig_overrides.is_empty()
     }
 }
 

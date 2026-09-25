@@ -1,3 +1,4 @@
+mod objects;
 pub mod ui;
 
 use std::collections::HashMap;
@@ -106,6 +107,7 @@ pub struct Player {
     initial_script_diagnostics: Vec<RuntimeDiagnostic>,
     rig_runtime_overrides: RigRuntimeOverrides,
     scene_runtime: RuntimeSceneState,
+    objects: objects::ObjectWorld,
     scene_library: HashMap<String, Arc<ProjectV2>>,
     active_scene_alias: Option<String>,
     scene_generation: u64,
@@ -343,6 +345,7 @@ impl Player {
             initial_script_diagnostics: Vec::new(),
             rig_runtime_overrides: RigRuntimeOverrides::new(),
             scene_runtime: RuntimeSceneState::new(),
+            objects: objects::ObjectWorld::default(),
             scene_library: HashMap::new(),
             active_scene_alias: None,
             scene_generation: 0,
@@ -397,6 +400,7 @@ impl Player {
                 initial_script_diagnostics,
                 rig_runtime_overrides: RigRuntimeOverrides::new(),
                 scene_runtime: RuntimeSceneState::new(),
+                objects: objects::ObjectWorld::default(),
                 scene_library,
                 active_scene_alias: None,
                 scene_generation: 0,
@@ -439,6 +443,7 @@ impl Player {
             if player.frame_script_entries == entries_before_init {
                 player.run_current_frame_scripts(&mut transition_budget);
             }
+            player.update_objects(false);
             Ok(player)
         } else {
             let movie = parse_q0s(bytes)?;
@@ -451,6 +456,7 @@ impl Player {
                 initial_script_diagnostics: Vec::new(),
                 rig_runtime_overrides: RigRuntimeOverrides::new(),
                 scene_runtime: RuntimeSceneState::new(),
+                objects: objects::ObjectWorld::default(),
                 scene_library: HashMap::new(),
                 active_scene_alias: None,
                 scene_generation: 0,
@@ -510,6 +516,65 @@ impl Player {
         self.q0lang
             .as_ref()
             .is_some_and(|runtime| runtime.imported_libraries.contains("q0.input"))
+    }
+
+    pub fn uses_mouse_events(&self) -> bool {
+        self.q0lang
+            .as_ref()
+            .is_some_and(|runtime| runtime.imported_libraries.contains("q0.mouse"))
+            || self.has_autonomous_objects()
+    }
+
+    /// Feed a stage-space pointer event into q0lang. Mouse coordinates are
+    /// exposed through `mouse.*` globals; every mouse handler receives one
+    /// `target` argument (`"stage"` for the root runtime, object name for
+    /// object-local runtimes).
+    pub fn dispatch_pointer_event(
+        &mut self,
+        event: &str,
+        x: f32,
+        y: f32,
+        inside: bool,
+        wheel_x: f32,
+        wheel_y: f32,
+    ) {
+        if !matches!(self.inner, Inner::V2 { .. }) {
+            return;
+        }
+        self.sync_q0lang_host_globals();
+        let stage_args = [RuntimeValue::String("stage".into())];
+        let report = if let Some(runtime) = self.q0lang.as_mut() {
+            runtime
+                .vars
+                .insert("mouse.x".into(), RuntimeValue::Number(f64::from(x)));
+            runtime
+                .vars
+                .insert("mouse.y".into(), RuntimeValue::Number(f64::from(y)));
+            runtime
+                .vars
+                .insert("mouse.inside".into(), RuntimeValue::Bool(inside));
+            runtime.vars.insert(
+                "mouse.wheel_x".into(),
+                RuntimeValue::Number(f64::from(wheel_x)),
+            );
+            runtime.vars.insert(
+                "mouse.wheel_y".into(),
+                RuntimeValue::Number(f64::from(wheel_y)),
+            );
+            Some(runtime.dispatch_event(event, &stage_args, objects::OBJECT_INSTRUCTION_BUDGET))
+        } else {
+            None
+        };
+        if let Some(report) = report {
+            let available = objects::MAX_RUNTIME_DIAGNOSTICS
+                .saturating_sub(self.initial_script_diagnostics.len());
+            self.initial_script_diagnostics
+                .extend(report.diagnostics.into_iter().take(available));
+            self.apply_q0lang_scene_writes();
+            let mut transition_budget = MAX_FRAME_SCRIPT_TRANSITIONS;
+            self.apply_q0lang_actions_with_budget(&report.actions, &mut transition_budget);
+        }
+        self.dispatch_object_pointer(event, &stage_args);
     }
 
     pub fn runtime_instance_metrics(
@@ -672,6 +737,7 @@ impl Player {
         if matches!(self.inner, Inner::V2 { .. }) {
             let mut transition_budget = MAX_FRAME_SCRIPT_TRANSITIONS;
             self.run_current_frame_scripts(&mut transition_budget);
+            self.update_objects(false);
         }
     }
 
@@ -701,13 +767,20 @@ impl Player {
 
     pub fn tick(&mut self, delta_sec: f32) {
         let interactive_runtime = self.uses_game_input();
-        if !self.playing && !interactive_runtime {
+        if !self.playing && !interactive_runtime && !self.objects.has_active_scripts() {
             return;
         }
-        self.accumulator_sec += delta_sec.max(0.0);
+        // A suspended window must not replay minutes of scripts in one UI
+        // update. NaN/inf deltas are also rejected before the fixed-step loop.
+        if !delta_sec.is_finite() {
+            return;
+        }
         let frame_time = 1.0_f32 / self.fps() as f32;
+        self.accumulator_sec += delta_sec.clamp(0.0, frame_time * 16.0);
         let mut transition_budget = MAX_FRAME_SCRIPT_TRANSITIONS;
-        while self.accumulator_sec >= frame_time {
+        let mut steps = 0;
+        while self.accumulator_sec >= frame_time && steps < 16 {
+            steps += 1;
             self.accumulator_sec -= frame_time;
 
             // q0.input marks an interactive runtime. Its fixed-step game clock
@@ -719,19 +792,30 @@ impl Player {
                     self.advance_timeline_one_frame();
                 }
                 self.run_current_frame_scripts(&mut transition_budget);
+                self.update_objects(true);
+                continue;
+            }
+
+            if !self.playing {
+                self.update_objects(true);
                 continue;
             }
 
             if self.advance_timeline_one_frame() {
                 self.run_current_frame_scripts(&mut transition_budget);
+                self.update_objects(true);
                 if !self.playing {
                     self.accumulator_sec = 0.0;
                     break;
                 }
             } else if !self.playing {
+                self.update_objects(true);
                 self.accumulator_sec = 0.0;
                 break;
             }
+        }
+        if steps == 16 {
+            self.accumulator_sec = self.accumulator_sec.min(frame_time);
         }
     }
 
@@ -906,6 +990,7 @@ impl Player {
                 );
             }
         }
+        self.sync_object_playback_globals();
     }
 
     fn apply_q0lang_scene_writes(&mut self) {
@@ -943,6 +1028,7 @@ impl Player {
         for (key, x, y) in writes {
             self.scene_runtime.set_position(key, x, y);
         }
+        self.apply_object_playback_writes();
     }
 
     fn runtime_transition_to_frame(&mut self, target_frame: usize, transition_budget: &mut usize) {
@@ -970,15 +1056,19 @@ impl Player {
         for action in actions {
             match action {
                 RuntimeAction::GoRun(target) => {
-                    self.playing = true;
                     if let Some(frame) = self.resolve_timeline_target(target) {
+                        self.playing = true;
                         self.runtime_transition_to_frame(frame, transition_budget);
+                    } else {
+                        self.report_missing_frame_label(target);
                     }
                 }
                 RuntimeAction::GoStop(target) => {
-                    self.playing = false;
                     if let Some(frame) = self.resolve_timeline_target(target) {
+                        self.playing = false;
                         self.runtime_transition_to_frame(frame, transition_budget);
+                    } else {
+                        self.report_missing_frame_label(target);
                     }
                 }
                 RuntimeAction::ShellCommand { .. } => {}
@@ -1022,6 +1112,16 @@ impl Player {
     }
 
     fn switch_to_bundled_scene(&mut self, alias: &str, transition_budget: &mut usize) {
+        if *transition_budget == 0 {
+            self.playing = false;
+            self.initial_script_diagnostics.push(RuntimeDiagnostic {
+                line: 0,
+                message: format!(
+                    "scene transition budget exceeded ({MAX_FRAME_SCRIPT_TRANSITIONS})"
+                ),
+            });
+            return;
+        }
         let Some(project) = self.scene_library.get(alias).cloned() else {
             self.initial_script_diagnostics.push(RuntimeDiagnostic {
                 line: 0,
@@ -1046,6 +1146,10 @@ impl Player {
         let fps = project.meta.fps.max(1);
         let audio_timeline = build_project_audio_timeline(project.as_ref());
 
+        // Scene entry scripts can switch scenes again, including back to
+        // themselves. Share the frame-jump budget across the entire chain.
+        *transition_budget -= 1;
+
         self.inner = Inner::V2 {
             project,
             entry_q0rg_id,
@@ -1054,6 +1158,7 @@ impl Player {
             frame_index: 0,
         };
         self.scene_runtime = RuntimeSceneState::new();
+        self.objects = objects::ObjectWorld::default();
         self.rig_runtime_overrides.clear();
         self.audio_timeline = audio_timeline;
         self.accumulator_sec = 0.0;
@@ -1195,7 +1300,29 @@ impl Player {
     fn resolve_timeline_target(&self, target: &TimelineTarget) -> Option<usize> {
         match target {
             TimelineTarget::Frame(frame) => Some(usize::from(*frame)),
-            TimelineTarget::Label(label) => label.parse::<usize>().ok(),
+            TimelineTarget::Label(label) => {
+                let named = match &self.inner {
+                    Inner::V2 {
+                        project,
+                        entry_q0rg_id,
+                        ..
+                    } => project
+                        .runtime
+                        .resolve_frame_label(*entry_q0rg_id, label)
+                        .map(usize::from),
+                    _ => None,
+                };
+                named.or_else(|| label.parse::<usize>().ok())
+            }
+        }
+    }
+
+    fn report_missing_frame_label(&mut self, target: &TimelineTarget) {
+        if let TimelineTarget::Label(label) = target {
+            self.initial_script_diagnostics.push(RuntimeDiagnostic {
+                line: 0,
+                message: format!("unknown frame label `{label}` in the current symbol"),
+            });
         }
     }
 
@@ -1379,6 +1506,7 @@ mod tests {
         PLAYER_AUDIO_SAMPLE_RATE,
     };
     use image::ImageEncoder;
+    use q0s_format::q0lang::runtime::RuntimeValue;
     use q0video::q0v::{Q0vSpec, Q0vWriter, MEDIA_TICKS_PER_SECOND};
     use std::io::Cursor;
 
@@ -1421,7 +1549,7 @@ mod tests {
     }
 
     fn q0s_v2_with_entry_script(script: &str, frame_count: u16) -> Vec<u8> {
-        use q0s_format::v2::{ProjectMeta, ProjectV2, Q0rg};
+        use q0s_format::v2::{Layer, ProjectMeta, ProjectV2, Q0rg};
 
         let project = ProjectV2 {
             meta: ProjectMeta {
@@ -1442,7 +1570,12 @@ mod tests {
                 name: "Stage".to_string(),
                 frame_count,
                 script: script.to_string(),
-                layers: Vec::new(),
+                layers: vec![Layer {
+                    layer_id: 1,
+                    name: "layer 1".to_string(),
+                    explicit_keyframes: Vec::new(),
+                    placements: Vec::new(),
+                }],
             }],
         };
         q0s_format::write_q0s_v2(&project).expect("write q0s v2")
@@ -2420,6 +2553,54 @@ pb func update current_vy {
     }
 
     #[test]
+    fn recursive_scene_entry_is_stopped_by_shared_transition_budget() {
+        let bytes = q0s_v2_with_entry_script("", 2);
+        let mut player = Player::from_bytes(&bytes).expect("load player");
+        let mut scene = player.project_v2().expect("project").clone();
+        scene.q0rgs[0].script = "q0scene.switch! \"loop\"\n".into();
+        player
+            .scene_library
+            .insert("loop".into(), std::sync::Arc::new(scene));
+        let mut budget = 4;
+        player.switch_to_bundled_scene("loop", &mut budget);
+        assert_eq!(budget, 0);
+        assert_eq!(player.scene_generation(), 4);
+        assert!(!player.is_playing());
+        assert!(player
+            .initial_script_diagnostics()
+            .iter()
+            .any(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("scene transition budget exceeded")
+            }));
+    }
+
+    #[test]
+    fn scene_switch_and_frame_jump_consume_the_same_budget() {
+        let bytes = q0s_v2_with_entry_script("", 2);
+        let mut player = Player::from_bytes(&bytes).expect("load player");
+        let mut scene = player.project_v2().expect("project").clone();
+        scene.q0rgs[0].script = "gostop! 1\n".into();
+        player
+            .scene_library
+            .insert("next".into(), std::sync::Arc::new(scene));
+        let mut budget = 1;
+        player.switch_to_bundled_scene("next", &mut budget);
+        assert_eq!(budget, 0);
+        assert_eq!(player.current_frame(), 0);
+        assert_eq!(player.scene_generation(), 1);
+        assert!(player
+            .initial_script_diagnostics()
+            .iter()
+            .any(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("frame-script transition budget exceeded")
+            }));
+    }
+
+    #[test]
     fn v2_entry_q0lang_gostop_runs_on_load() {
         let bytes = q0s_v2_with_entry_script("gostop! 2\n", 4);
         let player = Player::from_bytes(&bytes).expect("must parse");
@@ -2435,6 +2616,63 @@ pb func update current_vy {
 
         assert_eq!(player.current_frame(), 3);
         assert!(player.is_playing());
+    }
+
+    #[test]
+    fn named_timeline_targets_survive_export_and_enter_destination_code() {
+        let bytes = q0s_v2_with_entry_script("gostop! \"intro\"\n", 5);
+        let mut project = q0s_format::parse_q0s_v2(&bytes).unwrap();
+        project
+            .runtime
+            .frame_labels
+            .insert(q0s_format::v2::FrameLabelKey::new(1, 3), "intro".into());
+        project
+            .runtime
+            .frame_scripts
+            .push(q0s_format::v2::FrameScript {
+                q0rg_id: 1,
+                layer_id: 1,
+                frame: 3,
+                source: "arrived = 42".into(),
+            });
+        let bytes = q0s_format::write_q0s_v2(&project).unwrap();
+        let player = Player::from_bytes(&bytes).unwrap();
+        assert_eq!(player.current_frame(), 3);
+        assert!(!player.is_playing());
+        assert!(player.initial_script_diagnostics().is_empty());
+        assert_eq!(
+            player.q0lang.as_ref().unwrap().vars["arrived"],
+            RuntimeValue::Number(42.0)
+        );
+    }
+
+    #[test]
+    fn missing_frame_labels_report_a_diagnostic_without_changing_playback() {
+        let bytes = q0s_v2_with_entry_script("gostop! 1\ngorun! \"missing\"\n", 5);
+        let player = Player::from_bytes(&bytes).unwrap();
+        assert_eq!(player.current_frame(), 1);
+        assert!(!player.is_playing());
+        assert!(player
+            .initial_script_diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("unknown frame label `missing`")));
+    }
+
+    #[test]
+    fn named_numeric_labels_take_precedence_over_legacy_numeric_strings() {
+        let bytes = q0s_v2_with_entry_script("gostop! \"2\"\n", 5);
+        assert_eq!(Player::from_bytes(&bytes).unwrap().current_frame(), 2);
+        let mut project = q0s_format::parse_q0s_v2(&bytes).unwrap();
+        project
+            .runtime
+            .frame_labels
+            .insert(q0s_format::v2::FrameLabelKey::new(1, 4), "2".into());
+        assert_eq!(
+            Player::from_bytes(&q0s_format::write_q0s_v2(&project).unwrap())
+                .unwrap()
+                .current_frame(),
+            4
+        );
     }
 
     #[test]

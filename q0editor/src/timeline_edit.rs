@@ -510,6 +510,20 @@ pub fn remove_selected_frame_columns(
         }
         true
     });
+    project.runtime.frame_labels = std::mem::take(&mut project.runtime.frame_labels)
+        .into_iter()
+        .filter_map(|(mut key, label)| {
+            if key.q0rg_id == q0rg_id {
+                if (first_frame..=last_frame).contains(&key.frame) {
+                    return None;
+                }
+                if key.frame > last_frame {
+                    key.frame -= width;
+                }
+            }
+            Some((key, label))
+        })
+        .collect();
 
     let q0rg = &mut project.q0rgs[q0rg_index];
     if first_frame == 0 && last_frame == old_count - 1 {
@@ -1993,6 +2007,38 @@ mod tests {
                 && script.frame == 5
                 && script.source == "b = 2"
         }));
+    }
+
+    #[test]
+    fn frame_labels_shift_with_deleted_columns_and_stay_scoped_to_symbols() {
+        use q0s_format::v2::FrameLabelKey;
+        let mut project = crate::state::default_project();
+        project.q0rgs[0].frame_count = 10;
+        let mut child = project.q0rgs[0].clone();
+        child.q0rg_id = 2;
+        project.q0rgs.push(child);
+        project.runtime.frame_labels.extend([
+            (FrameLabelKey::new(1, 0), "start".into()),
+            (FrameLabelKey::new(1, 2), "cut".into()),
+            (FrameLabelKey::new(1, 7), "ending".into()),
+            (FrameLabelKey::new(2, 7), "ending".into()),
+        ]);
+        remove_selected_frame_columns(
+            &mut project,
+            1,
+            TimelineSelection {
+                anchor_layer_id: 1,
+                focus_layer_id: 1,
+                anchor_frame: 1,
+                focus_frame: 3,
+            },
+        )
+        .unwrap();
+        assert_eq!(project.runtime.resolve_frame_label(1, "start"), Some(0));
+        assert_eq!(project.runtime.resolve_frame_label(1, "cut"), None);
+        assert_eq!(project.runtime.resolve_frame_label(1, "ending"), Some(4));
+        assert_eq!(project.runtime.resolve_frame_label(2, "ending"), Some(7));
+        q0s_format::v2::validate(&project).unwrap();
     }
 
     #[test]

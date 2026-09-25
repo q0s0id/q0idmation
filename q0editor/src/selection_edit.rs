@@ -19,6 +19,7 @@ pub fn selection_can_clip(selection: &Selection) -> bool {
     match selection {
         Selection::Placement { .. } | Selection::Path { .. } => true,
         Selection::Paths(items) => !items.is_empty(),
+        Selection::RawParts { .. } => false,
         Selection::Multi(items) => !items.is_empty(),
         Selection::Mixed { paths, objects } => !paths.is_empty() || !objects.is_empty(),
         Selection::RawArea {
@@ -195,6 +196,25 @@ fn selected_raw_vectors(project: &ProjectV2, selection: &Selection) -> Vec<RawVe
             continue;
         }
         let source = crate::tools::vector_fill_geometry(vector);
+        // A marquee can be recorded from authored anchor bounds while the cubic
+        // handles bow a tiny amount outside that rectangle. Treat that as a
+        // whole-path selection rather than destructively polygonizing the curve.
+        let authored_whole_path = if clip_polygon.is_none() {
+            let mut saw_closed_anchor = false;
+            let mut all_inside = true;
+            for path in vector.paths.iter().filter(|path| path.closed) {
+                for anchor in &path.anchors {
+                    saw_closed_anchor = true;
+                    all_inside &= anchor.point.x >= bounds_min.x - 1.0e-3
+                        && anchor.point.x <= bounds_max.x + 1.0e-3
+                        && anchor.point.y >= bounds_min.y - 1.0e-3
+                        && anchor.point.y <= bounds_max.y + 1.0e-3;
+                }
+            }
+            saw_closed_anchor && all_inside
+        } else {
+            false
+        };
 
         #[cfg(feature = "appearance-mask-eraser")]
         if let Some(appearance) = project.asset_appearances.get(&asset_id) {
@@ -256,7 +276,7 @@ fn selected_raw_vectors(project: &ProjectV2, selection: &Selection) -> Vec<RawVe
         if selected.unsigned_area() <= 0.05 {
             continue;
         }
-        let whole_body = source.difference(&clip).unsigned_area() <= 0.05;
+        let whole_body = authored_whole_path || source.difference(&clip).unsigned_area() <= 0.05;
         let paths = if whole_body {
             // A marquee enclosing the complete raw fill is a selection, not a
             // geometric cut. Keep the authored VPaths verbatim so Convert to

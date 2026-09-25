@@ -7,7 +7,7 @@ use egui::{
 use crate::app::{Action, EditorApp, LayerDropTarget};
 use crate::settings::Theme;
 use crate::state::{
-    LayerRename, LibraryItem, Selection, TimelineFrameDrag, TimelineLayerDrag,
+    FrameLabelEdit, LayerRename, LibraryItem, Selection, TimelineFrameDrag, TimelineLayerDrag,
     TimelineLayerSelection, TimelineSelection,
 };
 
@@ -21,6 +21,35 @@ const CELL_PAD_Y: f32 = 1.0;
 /// sees there's room to extend the q0rg. They render as darker chequered
 /// cells and can hold a virtual playhead until F5/F6/F7 materialises them.
 const VIRTUAL_FRAMES_BUFFER: u16 = 30;
+
+/// Visible slots with one neighbour on each side for glyphs and stroke edges.
+/// Keep document coordinates unchanged: scrolling must never renumber frames.
+fn visible_slots(
+    origin: f32,
+    size: f32,
+    count: usize,
+    min: f32,
+    max: f32,
+) -> std::ops::Range<usize> {
+    if max <= min || max < origin || min > origin + size * count as f32 {
+        return 0..0;
+    }
+    let start = (((min - origin) / size).floor().max(0.0) as usize).saturating_sub(1);
+    let end = (((max - origin) / size).ceil().max(0.0) as usize).saturating_add(1);
+    start.min(count)..end.min(count)
+}
+
+fn visible_frame_slots(painter: &egui::Painter, base_x: f32, count: u16) -> std::ops::Range<u16> {
+    let clip = painter.clip_rect();
+    let range = visible_slots(
+        base_x,
+        FRAME_W,
+        usize::from(count),
+        clip.left(),
+        clip.right(),
+    );
+    range.start as u16..range.end as u16
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LayerMoveIcon {
@@ -262,6 +291,16 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 Sense::click_and_drag(),
             );
             let painter = ui.painter_at(rect);
+            let clip = painter.clip_rect();
+            let frame_slots =
+                visible_frame_slots(&painter, rect.min.x + LAYER_LABEL_W, visible_frames);
+            let row_slots = visible_slots(
+                rect.min.y + ROW_H,
+                ROW_H,
+                layer_count,
+                clip.top(),
+                clip.bottom(),
+            );
 
             // Timeline base panel вЂ” same as the editor's window colour
             // so it visually merges with the surrounding chrome.
@@ -279,7 +318,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 Stroke::new(1.0_f32, theme.stroke_dark.to_color32()),
             );
             let fps = app.state.project.meta.fps as u32;
-            for f in 0..visible_frames {
+            for f in frame_slots.clone() {
                 let x = rect.min.x + LAYER_LABEL_W + (f as f32) * FRAME_W;
                 let frame_one_based = f + 1;
                 let beyond = f >= frame_count;
@@ -325,12 +364,32 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     );
                 }
             }
+            for (key, label) in &app.state.project.runtime.frame_labels {
+                if key.q0rg_id != q0rg_id || !frame_slots.contains(&key.frame) {
+                    continue;
+                }
+                let x = rect.min.x + LAYER_LABEL_W + key.frame as f32 * FRAME_W + 1.0;
+                let y = rect.min.y + 2.0;
+                let color = theme.accent.to_color32();
+                painter.line_segment([pos2(x, y), pos2(x, y + 9.0)], Stroke::new(1.3_f32, color));
+                painter.add(egui::Shape::convex_polygon(
+                    vec![pos2(x, y), pos2(x + 7.0, y + 2.5), pos2(x, y + 5.0)],
+                    color,
+                    Stroke::NONE,
+                ));
+                ui.interact(
+                    Rect::from_min_size(pos2(x, rect.min.y), vec2(FRAME_W, ROW_H)),
+                    egui::Id::new(("frame_label_hover", q0rg_id, key.frame)),
+                    Sense::hover(),
+                )
+                .on_hover_text(format!("{label}\nframe {}", u32::from(key.frame) + 1));
+            }
             // Rig keys live at q0rg scope rather than on one artwork layer. A
             // compact diamond in the frame header makes their timing visible
             // without inventing a fake layer row. When a rig control is selected,
             // only that control's keys are shown.
             for frame in &rig_key_frames {
-                if *frame >= frame_count {
+                if *frame >= frame_count || !frame_slots.contains(frame) {
                     continue;
                 }
                 let center = pos2(
@@ -354,8 +413,11 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             // ends without confusing it with the solid theme-coloured playhead.
             let edge_x = rect.min.x + LAYER_LABEL_W + (frame_count as f32) * FRAME_W;
             let edge_color = Color32::from_rgb(0xC8, 0x95, 0x30);
-            let mut y = rect.min.y;
-            while y < rect.min.y + total_h {
+            let mut y = rect.min.y + ((clip.top() - rect.min.y).max(0.0) / 7.0).floor() * 7.0;
+            while edge_x >= clip.left()
+                && edge_x <= clip.right()
+                && y < (rect.min.y + total_h).min(clip.bottom())
+            {
                 let y_end = (y + 4.0).min(rect.min.y + total_h);
                 painter.line_segment(
                     [pos2(edge_x, y), pos2(edge_x, y_end)],
@@ -370,7 +432,13 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             let mut click_label_layer: Option<u16> = None;
             let mut open_frame_script: Option<(u16, u16, u16)> = None;
             let mut started_layer_drag: Option<u16> = None;
-            for (li, layer_index) in visible_layer_indices.iter().copied().enumerate() {
+            for (li, layer_index) in visible_layer_indices
+                .iter()
+                .copied()
+                .enumerate()
+                .take(row_slots.end)
+                .skip(row_slots.start)
+            {
                 let layer = &app.state.project.q0rgs[q0rg_idx].layers[layer_index];
                 let metadata = app.state.project.layer_metadata(q0rg_id, layer.layer_id);
                 let is_folder = metadata.kind == q0s_format::v2::LayerKind::Folder;
@@ -930,6 +998,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             response.context_menu(|ui| timeline_context_menu(app, ui));
         });
     render_layer_rename_dialog(app, ui.ctx());
+    render_frame_label_dialog(app, ui.ctx());
 }
 
 fn layer_parent_for_drop_lane(
@@ -1157,6 +1226,8 @@ fn timeline_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
         .unwrap_or("Layer");
     ui.label(egui::RichText::new(layer_name).strong().small());
     ui.separator();
+    frame_label_context_menu(app, ui);
+    ui.separator();
     if ui.button("Cut  (Ctrl+X)").clicked() {
         app.queue(Action::CutSelection);
         ui.close_menu();
@@ -1323,6 +1394,43 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
         {
             app.session
                 .set_timeline_frame((displayed_frame - 1) as u16, frame_count);
+        }
+        ui.menu_button("labels", |ui| {
+            frame_label_context_menu(app, ui);
+            let mut labels = app
+                .state
+                .project
+                .runtime
+                .frame_labels
+                .iter()
+                .filter(|(key, _)| key.q0rg_id == app.session.current_q0rg_id)
+                .map(|(key, label)| (key.frame, label.clone()))
+                .collect::<Vec<_>>();
+            labels.sort_by_key(|(frame, _)| *frame);
+            if !labels.is_empty() {
+                ui.separator();
+                for (frame, label) in labels {
+                    if ui
+                        .button(format!("{}  {label}", u32::from(frame) + 1))
+                        .clicked()
+                    {
+                        app.session.set_timeline_frame(frame, frame_count);
+                        ui.close_menu();
+                    }
+                }
+            }
+        });
+        if let Some(label) = app
+            .state
+            .project
+            .runtime
+            .frame_label(app.session.current_q0rg_id, app.session.timeline_frame())
+        {
+            ui.label(
+                egui::RichText::new(label)
+                    .small()
+                    .color(theme.accent.to_color32()),
+            );
         }
         ui.separator();
 
@@ -1529,6 +1637,131 @@ fn render_layer_rename_dialog(app: &mut EditorApp, ctx: &egui::Context) {
     }
 }
 
+fn frame_label_context_menu(app: &mut EditorApp, ui: &mut Ui) {
+    let q0rg_id = app.session.current_q0rg_id;
+    let frame = app.session.timeline_frame();
+    let valid = app
+        .state
+        .project
+        .q0rgs
+        .iter()
+        .any(|q| q.q0rg_id == q0rg_id && frame < q.frame_count);
+    let existing = app
+        .state
+        .project
+        .runtime
+        .frame_label(q0rg_id, frame)
+        .map(str::to_owned);
+    if ui
+        .add_enabled(
+            valid,
+            egui::Button::new(if existing.is_some() {
+                "edit frame label..."
+            } else {
+                "add frame label..."
+            }),
+        )
+        .clicked()
+    {
+        app.session.frame_label_edit = Some(FrameLabelEdit {
+            q0rg_id,
+            frame,
+            draft: existing.clone().unwrap_or_default(),
+            focus_requested: true,
+        });
+        ui.close_menu();
+    }
+    if existing.is_some() && ui.button("remove frame label").clicked() {
+        app.queue(Action::SetFrameLabel(q0rg_id, frame, None));
+        ui.close_menu();
+    }
+}
+
+fn render_frame_label_dialog(app: &mut EditorApp, ctx: &egui::Context) {
+    let Some(mut edit) = app.session.frame_label_edit.take() else {
+        return;
+    };
+    if !app
+        .state
+        .project
+        .q0rgs
+        .iter()
+        .any(|q| q.q0rg_id == edit.q0rg_id && edit.frame < q.frame_count)
+    {
+        return;
+    }
+    let mut open = true;
+    let mut submit = false;
+    let mut cancel = false;
+    egui::Window::new(format!("frame {} label", u32::from(edit.frame) + 1))
+        .id(egui::Id::new("timeline_frame_label_dialog"))
+        .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut edit.draft)
+                    .desired_width(300.0)
+                    .hint_text("intro"),
+            );
+            if edit.focus_requested {
+                response.request_focus();
+                edit.focus_requested = false;
+            }
+            let name = edit.draft.trim();
+            let error = q0s_format::v2::validate_frame_label_name(name)
+                .err()
+                .map(|error| error.to_string())
+                .or_else(|| {
+                    app.state
+                        .project
+                        .runtime
+                        .resolve_frame_label(edit.q0rg_id, name)
+                        .filter(|frame| *frame != edit.frame)
+                        .map(|frame| {
+                            format!(
+                                "this label is already used on frame {}",
+                                u32::from(frame) + 1
+                            )
+                        })
+                });
+            ui.label("names belong to this symbol. update script targets after renaming.");
+            if let Some(error) = &error {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+            if response.lost_focus()
+                && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                && error.is_none()
+            {
+                submit = true;
+            }
+            if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                cancel = true;
+            }
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(error.is_none(), egui::Button::new("save label"))
+                    .clicked()
+                {
+                    submit = true;
+                }
+                if ui.button("cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+    if submit {
+        app.queue(Action::SetFrameLabel(
+            edit.q0rg_id,
+            edit.frame,
+            Some(edit.draft),
+        ));
+    } else if open && !cancel {
+        app.session.frame_label_edit = Some(edit);
+    }
+}
+
 fn draw_visibility_icon(painter: &egui::Painter, rect: Rect, visible: bool, color: Color32) {
     let center = rect.center();
     let half_w = (rect.width() * 0.47).min(6.0);
@@ -1698,7 +1931,7 @@ fn draw_empty_cells(
     };
     let beyond = theme.empty_beyond.to_color32();
     let beyond_5 = theme.empty_beyond_5.to_color32();
-    for f in 0..visible_frames {
+    for f in visible_frame_slots(painter, base_x, visible_frames) {
         let x0 = base_x + (f as f32) * FRAME_W;
         let x1 = x0 + FRAME_W;
         let cell = Rect::from_min_max(pos2(x0, cell_top), pos2(x1, cell_bot));
@@ -1722,10 +1955,11 @@ fn draw_frame_script_markers(
     layout: AudioWaveformLayout,
 ) {
     let color = theme.accent.to_color32();
+    let frame_slots = visible_frame_slots(painter, layout.base_x, layout.frame_count);
     for script in &project.runtime.frame_scripts {
         if script.q0rg_id != q0rg_id
             || script.layer_id != layer_id
-            || script.frame >= layout.frame_count
+            || !frame_slots.contains(&script.frame)
         {
             continue;
         }
@@ -1832,6 +2066,10 @@ fn draw_layer_spans(
     is_current_layer: bool,
 ) {
     let keyframes = visible_keyframes(layer, frame_count);
+    let frame_slots = visible_frame_slots(painter, base_x, frame_count);
+    if frame_slots.is_empty() {
+        return;
+    }
 
     let cell_top = row_y + CELL_PAD_Y;
     let cell_bot = row_y + ROW_H - CELL_PAD_Y;
@@ -1850,7 +2088,11 @@ fn draw_layer_spans(
             .copied()
             .map(|next| next.saturating_sub(1))
             .unwrap_or_else(|| frame_count.saturating_sub(1));
-        if span_end < keyframe || layer.is_blank_keyframe(keyframe) {
+        if span_end < frame_slots.start
+            || keyframe >= frame_slots.end
+            || span_end < keyframe
+            || layer.is_blank_keyframe(keyframe)
+        {
             continue;
         }
         let has_tween = layer
@@ -1878,7 +2120,9 @@ fn draw_layer_spans(
 
     // Every keyframe starts a new span. Draw the left edge explicitly so two
     // adjacent keys never visually fuse into one long cell.
-    for keyframe in keyframe_separator_frames(&keyframes) {
+    for keyframe in
+        keyframe_separator_frames(&keyframes).filter(|frame| frame_slots.contains(frame))
+    {
         let x = base_x + f32::from(keyframe) * FRAME_W;
         painter.line_segment(
             [pos2(x, cell_top), pos2(x, cell_bot)],
@@ -1889,7 +2133,10 @@ fn draw_layer_spans(
     let mut arrows = std::collections::BTreeSet::new();
     for placement in &layer.placements {
         if let Some(to_frame) = placement.tween.to_frame() {
-            if placement.frame < frame_count && to_frame < frame_count {
+            if placement.frame < frame_slots.end
+                && to_frame >= frame_slots.start
+                && to_frame < frame_count
+            {
                 arrows.insert((placement.frame, to_frame));
             }
         }
@@ -1916,7 +2163,10 @@ fn draw_layer_spans(
 
     let keyframe_color = theme.keyframe.to_color32();
     let keyframe_y = row_y + ROW_H - 5.0;
-    for keyframe in keyframes {
+    for keyframe in keyframes
+        .into_iter()
+        .filter(|frame| frame_slots.contains(frame))
+    {
         let x = base_x + (f32::from(keyframe) + 0.5) * FRAME_W;
         if layer.is_blank_keyframe(keyframe) {
             painter.circle_stroke(
@@ -2017,7 +2267,15 @@ fn draw_timeline_selection(
     let fill = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 54);
     let stroke = Stroke::new(1.0_f32, accent);
 
-    for layer_index in first_layer..=last_layer {
+    let clip = painter.clip_rect();
+    let rows = visible_slots(
+        first_row_y,
+        ROW_H,
+        layer_ids.len(),
+        clip.top(),
+        clip.bottom(),
+    );
+    for layer_index in first_layer.max(rows.start)..last_layer.saturating_add(1).min(rows.end) {
         let row_y = first_row_y + layer_index as f32 * ROW_H;
         let x0 = base_x + f32::from(first_frame) * FRAME_W;
         let x1 = base_x + (f32::from(last_frame) + 1.0) * FRAME_W;
@@ -2059,6 +2317,71 @@ fn truncate_label(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use q0s_format::v2::{Layer, Placement, Target, Transform2D, Tween};
+
+    #[test]
+    fn viewport_slots_keep_partially_visible_frames_and_clamp_document_edges() {
+        assert_eq!(visible_slots(174.0, 12.0, 65_535, 0.0, 774.0), 0..51);
+        assert_eq!(visible_slots(-1200.0, 12.0, 65_535, 0.5, 600.5), 99..152);
+        assert_eq!(visible_slots(174.0, 12.0, 10, 500.0, 800.0), 0..0);
+        assert_eq!(visible_slots(174.0, 12.0, 10, 0.0, 170.0), 0..0);
+        assert_eq!(visible_slots(0.0, ROW_H, 1000, 260.0, 390.0), 9..16);
+    }
+
+    #[test]
+    fn timeline_cell_paint_work_depends_on_viewport_not_movie_length() {
+        fn paint_count(frames: u16, base_x: f32) -> usize {
+            let ctx = egui::Context::default();
+            let output = ctx.run(Default::default(), |ctx| {
+                let painter = ctx
+                    .layer_painter(egui::LayerId::background())
+                    .with_clip_rect(Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, ROW_H)));
+                draw_empty_cells(
+                    &painter,
+                    &Theme::default(),
+                    base_x,
+                    0.0,
+                    frames,
+                    frames,
+                    false,
+                );
+            });
+            output.shapes.len()
+        }
+        let short = paint_count(100, 0.0);
+        let long = paint_count(u16::MAX, 0.0);
+        let scrolled = paint_count(u16::MAX, -12_000.0);
+        assert!(short > 0 && short <= 52, "visible cells: {short}");
+        assert_eq!(short, long);
+        assert!(scrolled <= 53, "scrolled cells: {scrolled}");
+    }
+
+    #[test]
+    fn held_span_remains_visible_when_its_keyframe_is_offscreen() {
+        let layer = Layer {
+            layer_id: 1,
+            name: "layer".into(),
+            explicit_keyframes: vec![],
+            placements: vec![placement(0)],
+        };
+        let ctx = egui::Context::default();
+        let output = ctx.run(Default::default(), |ctx| {
+            let painter = ctx
+                .layer_painter(egui::LayerId::background())
+                .with_clip_rect(Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, ROW_H)));
+            draw_layer_spans(
+                &painter,
+                &Theme::default(),
+                &layer,
+                -1200.0,
+                0.0,
+                500,
+                false,
+            );
+        });
+        assert!(output.shapes.iter().any(|shape| matches!(
+            &shape.shape, egui::Shape::Rect(rect) if rect.rect.left() < 0.0 && rect.rect.right() > 600.0
+        )), "a held frame must fill the viewport even if its key is offscreen");
+    }
 
     fn placement(frame: u16) -> Placement {
         Placement {

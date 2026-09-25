@@ -56,6 +56,7 @@ pub struct PlayerApp {
     pending_open: Option<PathBuf>,
     timeline_audio: Option<TimelineAudioPlayback>,
     observed_scene_generation: u64,
+    last_pointer_stage: Option<(f32, f32, bool)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,6 +212,7 @@ impl PlayerApp {
             pending_open: initial_file,
             timeline_audio: None,
             observed_scene_generation: 0,
+            last_pointer_stage: None,
         }
     }
 
@@ -264,6 +266,7 @@ impl PlayerApp {
                 let scene_generation = player.scene_generation();
                 self.player = Some(player);
                 self.observed_scene_generation = scene_generation;
+                self.last_pointer_stage = None;
                 let audio_warning = self.sync_timeline_audio().err();
                 self.file_path = Some(path.to_path_buf());
                 self.frame_tex = None;
@@ -309,6 +312,7 @@ impl PlayerApp {
         self.player = None;
         self.timeline_audio = None;
         self.observed_scene_generation = 0;
+        self.last_pointer_stage = None;
         self.file_path = None;
         self.stats = None;
         self.frame_tex = None;
@@ -807,12 +811,78 @@ impl PlayerApp {
         }
     }
 
+    fn dispatch_stage_pointer(&mut self, ctx: &Context, canvas_rect: egui::Rect) {
+        let Some(player) = self.player.as_mut() else {
+            self.last_pointer_stage = None;
+            return;
+        };
+        if !player.uses_mouse_events() || player.format() != PlayerFormat::VectorV2 {
+            self.last_pointer_stage = None;
+            return;
+        }
+        let Some(project) = player.project_v2() else {
+            return;
+        };
+        let stage_w = project.meta.stage_width.max(1) as f32;
+        let stage_h = project.meta.stage_height.max(1) as f32;
+        let scale = (canvas_rect.width() / stage_w)
+            .min(canvas_rect.height() / stage_h)
+            .max(0.001);
+        let drawn = egui::vec2(stage_w * scale, stage_h * scale);
+        let stage_rect = egui::Rect::from_center_size(canvas_rect.center(), drawn);
+        let (pointer_pos, delta, pressed, released, clicked, double_clicked, scroll) =
+            ctx.input(|input| {
+                (
+                    input.pointer.latest_pos(),
+                    input.pointer.delta(),
+                    input.pointer.primary_pressed(),
+                    input.pointer.primary_released(),
+                    input.pointer.primary_clicked(),
+                    input
+                        .pointer
+                        .button_double_clicked(egui::PointerButton::Primary),
+                    input.raw_scroll_delta,
+                )
+            });
+        let (x, y, inside) = if let Some(pos) = pointer_pos {
+            (
+                ((pos.x - stage_rect.left()) / scale).clamp(0.0, stage_w),
+                ((pos.y - stage_rect.top()) / scale).clamp(0.0, stage_h),
+                stage_rect.contains(pos),
+            )
+        } else {
+            let (x, y, _) = self.last_pointer_stage.unwrap_or((0.0, 0.0, false));
+            (x, y, false)
+        };
+        let now = (x, y, inside);
+        if self.last_pointer_stage != Some(now) || delta != egui::Vec2::ZERO {
+            player.dispatch_pointer_event("mouse.move", x, y, inside, 0.0, 0.0);
+        }
+        if pressed && inside {
+            player.dispatch_pointer_event("mouse.down", x, y, true, 0.0, 0.0);
+        }
+        if released {
+            player.dispatch_pointer_event("mouse.up", x, y, inside, 0.0, 0.0);
+        }
+        if clicked && inside {
+            player.dispatch_pointer_event("mouse.click", x, y, true, 0.0, 0.0);
+        }
+        if double_clicked && inside {
+            player.dispatch_pointer_event("mouse.double", x, y, true, 0.0, 0.0);
+        }
+        if inside && scroll != egui::Vec2::ZERO {
+            player.dispatch_pointer_event("mouse.wheel", x, y, true, scroll.x, scroll.y);
+        }
+        self.last_pointer_stage = Some(now);
+    }
+
     fn viewport(&mut self, ctx: &Context) {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(self.settings.theme.viewport_bg.to_color32()))
             .show(ctx, |ui| {
                 let canvas_rect = ui.max_rect();
                 let painter = ui.painter_at(canvas_rect);
+                self.dispatch_stage_pointer(ctx, canvas_rect);
 
                 let format = self.player.as_ref().map(|p| p.format());
 

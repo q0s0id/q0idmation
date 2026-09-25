@@ -13,6 +13,20 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     ScrollArea::vertical()
         .auto_shrink([false, true])
         .show(ui, |ui| {
+            if crate::text_tool::render_properties(app, ui) {
+                if app.session.text_editor.is_none() {
+                    if let Selection::Placement {
+                        q0rg_id,
+                        layer_id,
+                        placement_idx,
+                    } = app.session.selection
+                    {
+                        ui.separator();
+                        placement_properties(app, ui, q0rg_id, layer_id, placement_idx);
+                    }
+                }
+                return;
+            }
             if render_audio_clip_properties(app, ui) {
                 return;
             }
@@ -40,6 +54,26 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     ui.label(egui::RichText::new(format!("{} contours", refs.len())).strong());
                     ui.label(
                         egui::RichText::new("Delete removes only these selected contours")
+                            .color(app.settings.theme.text_dim.to_color32())
+                            .small(),
+                    );
+                }
+                Selection::RawParts {
+                    fills,
+                    strokes,
+                    objects,
+                } => {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} fill part(s) + {} outline(s) + {} object(s)",
+                            fills.len(),
+                            strokes.len(),
+                            objects.len()
+                        ))
+                        .strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new("Drag to detach only the selected raw parts")
                             .color(app.settings.theme.text_dim.to_color32())
                             .small(),
                     );
@@ -403,12 +437,18 @@ fn render_tool_properties(app: &mut EditorApp, ui: &mut Ui) {
         ToolPropertyKind::Select => tool_hint(
             app,
             ui,
-            "Select connected raw fills, partial areas, or display objects. Drag the selection to move it.",
+            "Drag the selection to move it. Alt-drag its centre to move the transform anchor.",
         ),
-        ToolPropertyKind::Lasso => tool_hint(app, ui,
-            "Draw a loop to select contours and objects inside or touching it."),
-        ToolPropertyKind::Text => tool_hint(app, ui,
-            "Click the stage to add text. Click existing text to edit it."),
+        ToolPropertyKind::Lasso => tool_hint(
+            app,
+            ui,
+            "Draw a loop to select contours and objects inside or touching it.",
+        ),
+        ToolPropertyKind::Text => tool_hint(
+            app,
+            ui,
+            "Click the stage to add text. Click existing text to edit it.",
+        ),
         ToolPropertyKind::Hand => tool_hint(
             app,
             ui,
@@ -420,9 +460,7 @@ fn render_tool_properties(app: &mut EditorApp, ui: &mut Ui) {
             "Edit individual vector anchors and handles. This tool has no drawing style.",
         ),
         ToolPropertyKind::Pen => stroke_tool_properties(app, ui, "Pen path", true, true),
-        ToolPropertyKind::Pencil => {
-            stroke_tool_properties(app, ui, "Freehand line", false, true)
-        }
+        ToolPropertyKind::Pencil => stroke_tool_properties(app, ui, "Freehand line", false, true),
         ToolPropertyKind::Brush => brush_properties(app, ui),
         ToolPropertyKind::Eraser => eraser_properties(app, ui),
         ToolPropertyKind::Line => stroke_tool_properties(app, ui, "Straight line", false, true),
@@ -1192,7 +1230,6 @@ fn color32_to_rgba(c: Color32) -> Rgba {
 }
 
 fn asset_properties(app: &mut EditorApp, ui: &mut Ui, id: u16) {
-    text_properties(app, ui, id);
     let Some(asset_idx) = app.state.project.assets.iter().position(|a| a.id() == id) else {
         ui.label("Selection is no longer available");
         return;
@@ -1472,17 +1509,6 @@ fn placement_properties(
     layer_id: u16,
     placement_idx: usize,
 ) {
-    if let Some(asset_id) = crate::text_tool::selected_asset_id(
-        app,
-        &Selection::Placement {
-            q0rg_id,
-            layer_id,
-            placement_idx,
-        },
-    ) {
-        text_properties(app, ui, asset_id);
-        ui.separator();
-    }
     let before = app.state.project.clone();
     let current_frame = app.session.current_frame;
     let Some((source_frame, mut transform, tween, mut fx)) = app
@@ -1801,24 +1827,6 @@ fn placement_properties(
             placement_idx: new_idx,
         };
         app.state.mark_dirty();
-    }
-}
-
-fn text_properties(app: &mut EditorApp, ui: &mut Ui, asset_id: u16) {
-    let Some((content, size)) = app
-        .state
-        .project
-        .asset_names
-        .get(&asset_id)
-        .and_then(|name| crate::text_tool::decode_source(name))
-    else {
-        return;
-    };
-    ui.label(egui::RichText::new("Text").strong());
-    ui.label(egui::RichText::new(content).color(app.settings.theme.text_dim.to_color32()));
-    ui.label(format!("{} px · vector outlines", size as u16));
-    if ui.button("Edit text...").clicked() {
-        crate::text_tool::begin_edit(app, asset_id);
     }
 }
 

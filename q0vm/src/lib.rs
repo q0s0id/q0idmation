@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 pub const BYTECODE_MAGIC: [u8; 4] = *b"QVM\0";
-pub const BYTECODE_VERSION: u16 = 1;
+// Version 2 adds range iteration. Version 1 chunks remain readable; older
+// players reject new chunks at the header instead of misreading instructions.
+pub const BYTECODE_VERSION: u16 = 2;
 pub const DEFAULT_INSTRUCTION_BUDGET: usize = 100_000;
 pub const DEFAULT_STACK_LIMIT: usize = 4_096;
 pub const DEFAULT_CALL_DEPTH_LIMIT: usize = 128;
@@ -155,6 +157,9 @@ pub enum Opcode {
     CallUser = 35,
     Return = 36,
     Scene = 37,
+    RangeStart = 38,
+    RangeNext = 39,
+    RangeEnd = 40,
 }
 
 impl TryFrom<u8> for Opcode {
@@ -200,6 +205,9 @@ impl TryFrom<u8> for Opcode {
             35 => Self::CallUser,
             36 => Self::Return,
             37 => Self::Scene,
+            38 => Self::RangeStart,
+            39 => Self::RangeNext,
+            40 => Self::RangeEnd,
             _ => return Err(()),
         })
     }
@@ -334,7 +342,7 @@ impl Chunk {
             return Err(BytecodeError::Malformed("bad qvm bytecode magic"));
         }
         let version = cursor.read_u16()?;
-        if version != BYTECODE_VERSION {
+        if version != 1 && version != BYTECODE_VERSION {
             return Err(BytecodeError::UnsupportedVersion(version));
         }
         let constant_count = cursor.read_u32()? as usize;
@@ -424,9 +432,19 @@ pub struct Vm {
     pub state: VmState,
     stack: Vec<Value>,
     locals: Vec<BTreeMap<String, Value>>,
+    ranges: Vec<RangeState>,
     ip: usize,
     stack_limit: usize,
     call_depth_limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct RangeState {
+    current: f64,
+    stop: f64,
+    step: f64,
+    started: bool,
+    call_depth: usize,
 }
 
 impl Default for Vm {
@@ -441,6 +459,7 @@ impl Vm {
             state: VmState::default(),
             stack: Vec::new(),
             locals: Vec::new(),
+            ranges: Vec::new(),
             ip: 0,
             stack_limit: DEFAULT_STACK_LIMIT,
             call_depth_limit: DEFAULT_CALL_DEPTH_LIMIT,
@@ -466,6 +485,7 @@ impl Vm {
         let mut report = ExecutionReport::default();
         self.stack.clear();
         self.locals.clear();
+        self.ranges.clear();
         self.ip = 0;
         let budget = instruction_budget.max(1);
         let result = self.run_range(chunk, chunk.code.len(), budget, &mut report);
@@ -473,6 +493,86 @@ impl Vm {
             report.diagnostics.push(Diagnostic::new(line, message));
         }
         report
+    }
+
+    /// Dispatch one registered event to a snapshot of its q0lang handlers.
+    /// Handlers run against the same VM state and share one instruction budget.
+    pub fn dispatch_event(
+        &mut self,
+        event: &str,
+        args: &[Value],
+        instruction_budget: usize,
+    ) -> ExecutionReport {
+        let mut report = ExecutionReport::default();
+        let handlers = self.state.listeners.get(event).cloned().unwrap_or_default();
+        let budget = instruction_budget.max(1);
+        for handler in handlers {
+            if report.instructions_executed >= budget {
+                report.diagnostics.push(Diagnostic::new(
+                    0,
+                    format!("qvm instruction budget exceeded ({budget})"),
+                ));
+                break;
+            }
+            if let Err((line, message)) = self.invoke_function(&handler, args, budget, &mut report)
+            {
+                report.diagnostics.push(Diagnostic::new(line, message));
+            }
+        }
+        report
+    }
+
+    fn invoke_function(
+        &mut self,
+        name: &str,
+        args: &[Value],
+        budget: usize,
+        report: &mut ExecutionReport,
+    ) -> Result<(), (usize, String)> {
+        let function = self
+            .state
+            .functions
+            .get(name)
+            .cloned()
+            .ok_or_else(|| (0, format!("unknown q0lang event handler `{name}`")))?;
+        if function.signature.params.len() != args.len() {
+            return Err((
+                0,
+                format!(
+                    "event handler `{name}` expects {} argument(s), got {}",
+                    function.signature.params.len(),
+                    args.len()
+                ),
+            ));
+        }
+        if self.locals.len() >= self.call_depth_limit {
+            return Err((
+                0,
+                format!("qvm call depth limit exceeded ({})", self.call_depth_limit),
+            ));
+        }
+
+        self.stack.clear();
+        self.locals.clear();
+        self.ranges.clear();
+        let locals = function
+            .signature
+            .params
+            .iter()
+            .cloned()
+            .zip(args.iter().cloned())
+            .collect::<BTreeMap<_, _>>();
+        self.locals.push(locals);
+        self.ip = function.entry;
+        let result = self.run_range(&function.chunk, function.end, budget, report);
+        self.locals.clear();
+        self.stack.clear();
+        self.ranges.clear();
+        self.ip = 0;
+        match result {
+            Ok(RunSignal::Return(_) | RunSignal::Halt) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     fn run_range(
@@ -547,6 +647,9 @@ impl Vm {
                 Opcode::Pop => self.pop().map(|_| ()),
                 Opcode::Jump => self.op_jump(chunk),
                 Opcode::JumpIfFalse => self.op_jump_if_false(chunk),
+                Opcode::RangeStart => self.op_range_start(),
+                Opcode::RangeNext => self.op_range_next(chunk),
+                Opcode::RangeEnd => self.op_range_end(),
             };
             result.map_err(|message| (line, message))?;
         }
@@ -561,6 +664,92 @@ impl Vm {
             .cloned()
             .ok_or_else(|| "qvm constant index outside pool".to_string())?;
         self.push(value)
+    }
+
+    fn op_range_start(&mut self) -> Result<(), String> {
+        let step = self.pop()?;
+        let stop = self.pop()?;
+        let start = self.pop()?;
+        let finite_number = |value: Value, argument: &str| match value {
+            Value::Number(number) if number.is_finite() => Ok(number),
+            _ => Err(format!("range {argument} must be a finite number")),
+        };
+        let start = finite_number(start, "start")?;
+        let stop = finite_number(stop, "stop")?;
+        let step = finite_number(step, "step")?;
+        if step == 0.0 {
+            return Err("range step must not be zero".to_string());
+        }
+        if self.ranges.len() >= self.stack_limit {
+            return Err(format!(
+                "qvm range nesting limit exceeded ({})",
+                self.stack_limit
+            ));
+        }
+        self.ranges.push(RangeState {
+            current: start,
+            stop,
+            step,
+            started: false,
+            call_depth: self.locals.len(),
+        });
+        Ok(())
+    }
+
+    fn op_range_next(&mut self, chunk: &Chunk) -> Result<(), String> {
+        let name = self.read_named_constant(chunk)?;
+        let local = match self.read_u8(chunk)? {
+            0 => false,
+            1 => true,
+            _ => return Err("invalid qvm range variable scope".to_string()),
+        };
+        let exit = self.read_u32(chunk)? as usize;
+        if chunk.code.get(exit) != Some(&(Opcode::RangeEnd as u8)) {
+            return Err("qvm range exit must point to range end".to_string());
+        }
+        let range = self
+            .ranges
+            .last_mut()
+            .filter(|range| range.call_depth == self.locals.len())
+            .ok_or_else(|| "qvm range iteration outside range".to_string())?;
+        if range.started {
+            let next = range.current + range.step;
+            if next == range.current {
+                return Err("range step is too small to advance the counter".to_string());
+            }
+            // Overflow in the direction of the finite stop simply exhausts
+            // the range; an infinite counter is never exposed to the script.
+            range.current = next;
+        }
+        if (range.step > 0.0 && range.current >= range.stop)
+            || (range.step < 0.0 && range.current <= range.stop)
+        {
+            self.ip = exit;
+            return Ok(());
+        }
+        range.started = true;
+        let value = Value::Number(range.current);
+        if local {
+            self.locals
+                .last_mut()
+                .ok_or_else(|| "qvm local range outside function".to_string())?
+                .insert(name, value);
+        } else {
+            self.state.vars.insert(name, value);
+        }
+        Ok(())
+    }
+
+    fn op_range_end(&mut self) -> Result<(), String> {
+        if !self
+            .ranges
+            .last()
+            .is_some_and(|range| range.call_depth == self.locals.len())
+        {
+            return Err("qvm range end outside range".to_string());
+        }
+        self.ranges.pop();
+        Ok(())
     }
 
     fn op_push_raw(&mut self, chunk: &Chunk) -> Result<(), String> {
@@ -809,12 +998,14 @@ impl Vm {
             .collect::<BTreeMap<_, _>>();
         let return_ip = self.ip;
         let stack_base = self.stack.len();
+        let range_base = self.ranges.len();
         self.locals.push(locals);
         self.ip = function.entry;
         let nested = self.run_range(&function.chunk, function.end, budget, report);
         self.locals.pop();
         self.ip = return_ip;
         self.stack.truncate(stack_base);
+        self.ranges.truncate(range_base);
 
         match nested {
             Ok(RunSignal::Return(value)) => self.push(value),
@@ -1179,6 +1370,51 @@ mod tests {
         let decoded = Chunk::decode(&bytes).expect("decode");
         assert_eq!(decoded, chunk);
         assert_eq!(decoded.encode().expect("re-encode"), bytes);
+    }
+
+    #[test]
+    fn version_one_chunks_remain_readable_and_future_versions_are_rejected() {
+        let mut chunk = Chunk::new();
+        chunk.emit_op(Opcode::Halt, 1);
+        let mut bytes = chunk.encode().unwrap();
+        bytes[4..6].copy_from_slice(&1_u16.to_le_bytes());
+        assert_eq!(Chunk::decode(&bytes).unwrap(), chunk);
+        bytes[4..6].copy_from_slice(&3_u16.to_le_bytes());
+        assert_eq!(
+            Chunk::decode(&bytes),
+            Err(BytecodeError::UnsupportedVersion(3))
+        );
+    }
+
+    #[test]
+    fn malformed_range_instructions_report_errors_without_panicking() {
+        for (scope, exit, expected) in [
+            (2, 0, "invalid qvm range variable scope"),
+            (0, u32::MAX, "range exit must point to range end"),
+            (0, 10, "range iteration outside range"),
+        ] {
+            let mut chunk = Chunk::new();
+            let name = string_constant(&mut chunk, "i");
+            chunk.emit_op(Opcode::RangeNext, 7);
+            chunk.emit_u32(name);
+            chunk.emit_u8(scope);
+            chunk.emit_u32(exit);
+            chunk.emit_op(Opcode::RangeEnd, 7);
+            let report = Vm::new().execute(&chunk, 100);
+            assert_eq!(report.diagnostics[0].line, 7);
+            assert!(
+                report.diagnostics[0].message.contains(expected),
+                "{:?}",
+                report.diagnostics
+            );
+        }
+        for opcode in [Opcode::RangeStart, Opcode::RangeNext, Opcode::RangeEnd] {
+            let mut chunk = Chunk::new();
+            chunk.emit_op(opcode, 8);
+            let report = Vm::new().execute(&chunk, 100);
+            assert_eq!(report.diagnostics.len(), 1);
+            assert_eq!(report.diagnostics[0].line, 8);
+        }
     }
 
     #[test]

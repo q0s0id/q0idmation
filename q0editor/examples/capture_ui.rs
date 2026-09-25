@@ -5,9 +5,9 @@
 
 use eframe::App;
 use q0editor::{
-    EditorApp,
     app::{Action, NewProjectSpec},
     settings::{Settings, Theme},
+    EditorApp,
 };
 use std::path::PathBuf;
 

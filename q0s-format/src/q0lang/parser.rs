@@ -67,6 +67,15 @@ pub enum Statement {
         condition: Value,
         body: Block,
     },
+    ForRange {
+        name: String,
+        start: Value,
+        stop: Value,
+        step: Value,
+        body: Block,
+    },
+    Break,
+    Continue,
     Return {
         value: Option<Value>,
     },
@@ -154,6 +163,26 @@ pub struct BuiltinLibrary {
 
 pub const BUILTIN_LIBRARIES: &[BuiltinLibrary] = &[
     BuiltinLibrary {
+        name: "q0.object",
+        symbols: &[
+            "self.x",
+            "self.y",
+            "self.frame",
+            "self.playing",
+            "self.name",
+            "self.id",
+            "self.width",
+            "self.height",
+            "self.left",
+            "self.right",
+            "self.top",
+            "self.bottom",
+            "self.hovered",
+            "self.mouse_x",
+            "self.mouse_y",
+        ],
+    },
+    BuiltinLibrary {
         name: "q0.mouse",
         symbols: &[
             "mouse.down",
@@ -233,7 +262,7 @@ pub const BUILTIN_LIBRARIES: &[BuiltinLibrary] = &[
         name: "q0.core",
         symbols: &[
             "do!", "listen", "xlisten", "pb", "pr", "func", "if", "else", "while", "return",
-            "true", "false", "null", "and", "or", "not",
+            "true", "false", "null", "and", "or", "not", "for", "in", "range", "break", "continue",
         ],
     },
 ];
@@ -352,6 +381,21 @@ impl<'a> Parser<'a> {
             }
             "if" => self.parse_if(line_no, &line, depth),
             "while" => self.parse_while(line_no, &line, depth),
+            "for" => self.parse_for(line_no, &line, depth),
+            "break" | "continue" => {
+                if parts.len() != 1 {
+                    self.diagnostics.push(Diagnostic {
+                        line: line_no,
+                        message: format!("{first} does not take arguments"),
+                    });
+                    return None;
+                }
+                Some(if first == "break" {
+                    Statement::Break
+                } else {
+                    Statement::Continue
+                })
+            }
             "return" => self.parse_return(line_no, &line),
             "else" => {
                 self.diagnostics.push(Diagnostic {
@@ -623,6 +667,80 @@ impl<'a> Parser<'a> {
             Some(parse_value(rest, line_no, &mut self.diagnostics))
         };
         Some(Statement::Return { value })
+    }
+
+    fn parse_for(&mut self, line_no: usize, line: &str, depth: usize) -> Option<Statement> {
+        let header = block_header_expression(line, "for");
+        // Consume the body even when the header is invalid: its statements must
+        // not accidentally escape the loop and execute at top level.
+        let (body, suffix, close_line) = if header.is_some() {
+            self.parse_block(line_no, "for", depth + 1)
+        } else {
+            (Block::default(), None, line_no)
+        };
+        if let Some(suffix) = suffix {
+            self.diagnostics.push(Diagnostic {
+                line: close_line,
+                message: format!("unexpected text after for closing brace: `{suffix}`"),
+            });
+        }
+        let Some(header) = header else {
+            self.diagnostics.push(Diagnostic {
+                line: line_no,
+                message: "for expects: for name in range(stop), range(start, stop), or range(start, stop, step) {".to_string(),
+            });
+            return None;
+        };
+        let mut words = header.splitn(2, char::is_whitespace);
+        let name = words.next().unwrap_or_default();
+        let rest = words.next().unwrap_or_default().trim_start();
+        let range_src = rest
+            .strip_prefix("in")
+            .filter(|_| rest.as_bytes().get(2).is_some_and(u8::is_ascii_whitespace))
+            .map(str::trim_start);
+        if !is_plain_ident(name) || range_src.is_none() {
+            self.diagnostics.push(Diagnostic {
+                line: line_no,
+                message: "for expects an identifier followed by `in range(...)`".to_string(),
+            });
+            return None;
+        }
+        let value = parse_value(range_src.unwrap(), line_no, &mut self.diagnostics);
+        let Value::Call {
+            name: function,
+            args,
+        } = value
+        else {
+            self.diagnostics.push(Diagnostic {
+                line: line_no,
+                message: "for expects range(stop), range(start, stop), or range(start, stop, step)"
+                    .to_string(),
+            });
+            return None;
+        };
+        if function != "range" || !(1..=3).contains(&args.len()) {
+            self.diagnostics.push(Diagnostic {
+                line: line_no,
+                message: "for range expects 1, 2, or 3 arguments".to_string(),
+            });
+            return None;
+        }
+        let mut args = args.into_iter();
+        let first = args.next().unwrap();
+        let (start, stop) = match args.next() {
+            Some(stop) => (first, stop),
+            None => (Value::Number("0".to_string()), first),
+        };
+        let step = args
+            .next()
+            .unwrap_or_else(|| Value::Number("1".to_string()));
+        Some(Statement::ForRange {
+            name: name.to_string(),
+            start,
+            stop,
+            step,
+            body,
+        })
     }
 
     fn parse_assignment(&mut self, line_no: usize, line: &str) -> Option<Statement> {

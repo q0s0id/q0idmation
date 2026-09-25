@@ -34,13 +34,15 @@
 //!   v10 post-material fragments append per appearance:
 //!     [2] material source path count, source paths[], [2] clip path count, clip paths[]
 //!
-//! Reading: v2 through v14 are accepted; v2 placements get skew_x/y = 0,
+//! Reading: v2 through v22 are accepted; v2 placements get skew_x/y = 0,
 //! v2/v3 layers get no explicit blank-keyframe markers, v2-v4 assets
 //! keep deterministic default labels, and v2-v5 projects have ordinary
 //! top-level layers without folders.
 //!   v11 transformed appearance fields append per appearance:
 //!     [24] field affine a11 a12 a21 a22 tx ty (6 x f32)
-//! Writing: always v14 (see `Q1S_VERSION_CURRENT`).
+//! v22 appends frame labels after the project runtime block:
+//!   [2] label_count, entries[]: [2] q0rg_id, [2] frame, [2+N] name.
+//! Older files have no labels. Writing: always v22 (`Q1S_VERSION_CURRENT`).
 
 use crate::transform::Affine;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -76,7 +78,9 @@ pub const Q1S_VERSION_AUDIO_CLIP_FX: u16 = 19;
 pub const Q1S_VERSION_AUDIO_TIMELINE_CLIPS: u16 = 20;
 /// Linked project graph, frame scripts and stable runtime object names.
 pub const Q1S_VERSION_PROJECT_RUNTIME: u16 = 21;
-pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_PROJECT_RUNTIME;
+/// Named timeline destinations, scoped to each q0rg.
+pub const Q1S_VERSION_FRAME_LABELS: u16 = 22;
+pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_FRAME_LABELS;
 /// Kept as an alias so external code that imported the v2-era constant keeps
 /// compiling. It now means "the current write-out version".
 pub const Q1S_V2_VERSION: u16 = Q1S_VERSION_CURRENT;
@@ -1144,6 +1148,47 @@ pub struct ProjectRuntimeData {
     pub project_graph: ProjectGraph,
     pub frame_scripts: Vec<FrameScript>,
     pub instance_names: HashMap<InstanceKey, String>,
+    /// One label per frame; names are unique within their owning q0rg.
+    pub frame_labels: HashMap<FrameLabelKey, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FrameLabelKey {
+    pub q0rg_id: u16,
+    pub frame: u16,
+}
+
+impl FrameLabelKey {
+    pub const fn new(q0rg_id: u16, frame: u16) -> Self {
+        Self { q0rg_id, frame }
+    }
+}
+
+impl ProjectRuntimeData {
+    pub fn frame_label(&self, q0rg_id: u16, frame: u16) -> Option<&str> {
+        self.frame_labels
+            .get(&FrameLabelKey::new(q0rg_id, frame))
+            .map(String::as_str)
+    }
+
+    /// Exact, case-sensitive lookup; another symbol's labels are never visible.
+    pub fn resolve_frame_label(&self, q0rg_id: u16, name: &str) -> Option<u16> {
+        self.frame_labels
+            .iter()
+            .find_map(|(key, label)| (key.q0rg_id == q0rg_id && label == name).then_some(key.frame))
+    }
+}
+
+pub fn validate_frame_label_name(name: &str) -> Result<(), Error> {
+    if name.is_empty() || name.trim() != name || name.chars().any(char::is_control) {
+        return Err(Error::Validation(
+            "frame label must be non-empty, trimmed, and contain no control characters",
+        ));
+    }
+    if name.len() > usize::from(u16::MAX) {
+        return Err(Error::Overflow("frame label exceeds u16 string length"));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2272,6 +2317,25 @@ fn runtime_alias_is_valid(alias: &str) -> bool {
 }
 
 fn validate_project_runtime(project: &ProjectV2) -> Result<(), Error> {
+    let mut label_names = HashSet::new();
+    for (key, label) in &project.runtime.frame_labels {
+        validate_frame_label_name(label)?;
+        let q0rg = project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == key.q0rg_id)
+            .ok_or(Error::Validation("frame label references a missing q0rg"))?;
+        if key.frame >= q0rg.frame_count {
+            return Err(Error::Validation(
+                "frame label is outside the q0rg timeline",
+            ));
+        }
+        if !label_names.insert((key.q0rg_id, label.as_str())) {
+            return Err(Error::Validation(
+                "frame label names must be unique within a q0rg",
+            ));
+        }
+    }
     let nodes = &project.runtime.project_graph.nodes;
     let mut node_ids = HashSet::new();
     let mut parent_by_id = HashMap::new();
@@ -3120,6 +3184,7 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
         && version != Q1S_VERSION_RIG_POSE_VARIANTS
         && version != Q1S_VERSION_AUDIO_CLIP_FX
         && version != Q1S_VERSION_AUDIO_TIMELINE_CLIPS
+        && version != Q1S_VERSION_PROJECT_RUNTIME
         && version != Q1S_VERSION_CURRENT
     {
         return Err(Error::UnsupportedVersion(version));
@@ -3182,6 +3247,11 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
     if version < Q1S_VERSION_PROJECT_RUNTIME && project.runtime != ProjectRuntimeData::default() {
         return Err(Error::Validation(
             "q1s v20 cannot store project runtime metadata",
+        ));
+    }
+    if version < Q1S_VERSION_FRAME_LABELS && !project.runtime.frame_labels.is_empty() {
+        return Err(Error::Validation(
+            "q1s v21 and earlier cannot store frame labels",
         ));
     }
     if version < Q1S_VERSION_RIGGING
@@ -3496,6 +3566,18 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
         }
     }
 
+    if version >= Q1S_VERSION_FRAME_LABELS {
+        let count = u16::try_from(project.runtime.frame_labels.len())
+            .map_err(|_| Error::Overflow("frame label count exceeds u16"))?;
+        out.extend_from_slice(&count.to_le_bytes());
+        let mut labels = project.runtime.frame_labels.iter().collect::<Vec<_>>();
+        labels.sort_by_key(|(key, _)| (key.q0rg_id, key.frame));
+        for (key, label) in labels {
+            out.extend_from_slice(&key.q0rg_id.to_le_bytes());
+            out.extend_from_slice(&key.frame.to_le_bytes());
+            write_string_u16(&mut out, label)?;
+        }
+    }
     Ok(out)
 }
 
@@ -4279,6 +4361,7 @@ pub fn parse(bytes: &[u8]) -> Result<ProjectV2, Error> {
         && version != Q1S_VERSION_RIG_POSE_VARIANTS
         && version != Q1S_VERSION_AUDIO_CLIP_FX
         && version != Q1S_VERSION_AUDIO_TIMELINE_CLIPS
+        && version != Q1S_VERSION_PROJECT_RUNTIME
         && version != Q1S_VERSION_CURRENT
     {
         return Err(Error::UnsupportedVersion(version));
@@ -4525,6 +4608,17 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
         }
     }
 
+    if version >= Q1S_VERSION_FRAME_LABELS {
+        let count = c.read_u16()?;
+        runtime.frame_labels.reserve(usize::from(count));
+        for _ in 0..count {
+            let key = FrameLabelKey::new(c.read_u16()?, c.read_u16()?);
+            let label = c.read_string_u16()?;
+            if runtime.frame_labels.insert(key, label).is_some() {
+                return Err(Error::Validation("duplicate frame label entry"));
+            }
+        }
+    }
     c.finish()?;
 
     let project = ProjectV2 {
@@ -6857,7 +6951,7 @@ mod compatibility_tests {
         let bytes = write(&project).expect("write project runtime q1s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q1S_VERSION_PROJECT_RUNTIME
+            Q1S_VERSION_CURRENT
         );
         assert_eq!(parse(&bytes).expect("parse project runtime q1s"), project);
     }
@@ -6870,6 +6964,121 @@ mod compatibility_tests {
         let parsed = parse(&bytes).expect("parse q1s v20 fixture");
         assert_eq!(parsed, project);
         assert_eq!(parsed.runtime, ProjectRuntimeData::default());
+    }
+
+    #[test]
+    fn frame_labels_roundtrip_deterministically_and_are_scoped_to_symbols() {
+        let mut project = legacy_project();
+        let mut child = project.q0rgs[0].clone();
+        child.q0rg_id = 2;
+        project.q0rgs.push(child);
+        project
+            .runtime
+            .frame_labels
+            .insert(FrameLabelKey::new(1, 0), "intro".into());
+        project
+            .runtime
+            .frame_labels
+            .insert(FrameLabelKey::new(1, 1), "конец сцены".into());
+        project
+            .runtime
+            .frame_labels
+            .insert(FrameLabelKey::new(2, 1), "intro".into());
+        let bytes = write(&project).unwrap();
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            Q1S_VERSION_FRAME_LABELS
+        );
+        let decoded = parse(&bytes).unwrap();
+        assert_eq!(decoded, project);
+        assert_eq!(write(&decoded).unwrap(), bytes);
+        assert_eq!(decoded.runtime.resolve_frame_label(1, "intro"), Some(0));
+        assert_eq!(decoded.runtime.resolve_frame_label(2, "intro"), Some(1));
+        assert_eq!(decoded.runtime.resolve_frame_label(2, "конец сцены"), None);
+        assert_eq!(decoded.runtime.resolve_frame_label(1, "Intro"), None);
+        assert!(write_version(&project, Q1S_VERSION_PROJECT_RUNTIME).is_err());
+    }
+
+    #[test]
+    fn q1s_v21_migrates_to_empty_labels_without_losing_frame_code() {
+        let mut project = legacy_project();
+        project.runtime.frame_scripts.push(FrameScript {
+            q0rg_id: 1,
+            layer_id: 1,
+            frame: 1,
+            source: "gostop! 1".into(),
+        });
+        let legacy = write_version(&project, Q1S_VERSION_PROJECT_RUNTIME).unwrap();
+        let decoded = parse(&legacy).unwrap();
+        assert_eq!(decoded, project);
+        assert!(decoded.runtime.frame_labels.is_empty());
+        assert_eq!(parse(&write(&decoded).unwrap()).unwrap(), project);
+    }
+
+    #[test]
+    fn frame_label_validation_rejects_duplicates_invalid_names_and_destinations() {
+        let mut project = legacy_project();
+        project
+            .runtime
+            .frame_labels
+            .insert(FrameLabelKey::new(1, 0), "intro".into());
+        project
+            .runtime
+            .frame_labels
+            .insert(FrameLabelKey::new(1, 1), "intro".into());
+        assert_eq!(
+            validate(&project),
+            Err(Error::Validation(
+                "frame label names must be unique within a q0rg"
+            ))
+        );
+        for (key, label, expected) in [
+            (
+                FrameLabelKey::new(99, 0),
+                "intro",
+                "frame label references a missing q0rg",
+            ),
+            (
+                FrameLabelKey::new(1, 2),
+                "intro",
+                "frame label is outside the q0rg timeline",
+            ),
+            (
+                FrameLabelKey::new(1, 0),
+                "",
+                "frame label must be non-empty, trimmed, and contain no control characters",
+            ),
+            (
+                FrameLabelKey::new(1, 0),
+                " intro",
+                "frame label must be non-empty, trimmed, and contain no control characters",
+            ),
+            (
+                FrameLabelKey::new(1, 0),
+                "line\nbreak",
+                "frame label must be non-empty, trimmed, and contain no control characters",
+            ),
+        ] {
+            project.runtime.frame_labels.clear();
+            project.runtime.frame_labels.insert(key, label.into());
+            assert_eq!(validate(&project), Err(Error::Validation(expected)));
+        }
+    }
+
+    #[test]
+    fn duplicate_frame_label_entries_on_wire_are_rejected() {
+        let mut bytes = write(&legacy_project()).unwrap();
+        bytes.truncate(bytes.len() - 2); // Replace the empty label block.
+        bytes.extend_from_slice(&2_u16.to_le_bytes());
+        for name in ["first", "second"] {
+            bytes.extend_from_slice(&1_u16.to_le_bytes());
+            bytes.extend_from_slice(&0_u16.to_le_bytes());
+            write_string_u16(&mut bytes, name).unwrap();
+        }
+        assert_eq!(
+            parse(&bytes),
+            Err(Error::Validation("duplicate frame label entry"))
+        );
     }
 
     #[test]

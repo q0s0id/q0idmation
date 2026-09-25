@@ -57,7 +57,7 @@ pub struct Token {
 /// Top-level keywords. Case-sensitive.
 const KEYWORDS: &[&str] = &[
     "import", "listen", "xlisten", "pb", "pr", "func", "if", "else", "return", "true", "false",
-    "null", "while", "and", "or", "not",
+    "null", "while", "and", "or", "not", "for", "in", "range", "break", "continue",
 ];
 
 /// Built-in libraries / module names known from the q0lang notes. Highlighted
@@ -176,7 +176,8 @@ pub fn tokenize(src: &str) -> Vec<Token> {
             i += 1;
             while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
                 if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    i += 2;
+                    i += 1;
+                    i += src[i..].chars().next().map_or(0, char::len_utf8);
                     continue;
                 }
                 if bytes[i] == b'"' {
