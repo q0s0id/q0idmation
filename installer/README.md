@@ -1,6 +1,6 @@
 # q0idmation Windows installers
 
-q0idmation has two independent per-user NSIS installers for Windows x64:
+q0idmation has two independent per-user NSIS installers for Windows x64. The installer and uninstaller UI is English-only; custom NSIS UI strings are kept ASCII to avoid locale/encoding artifacts:
 
 | File pattern | Contents | Association |
 |---|---|---|

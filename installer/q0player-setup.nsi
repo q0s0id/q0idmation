@@ -61,7 +61,7 @@ VIAddVersionKey "LegalCopyright"  "(C) 2026 q0s"
 
 !define MUI_ABORTWARNING
 !define MUI_FINISHPAGE_RUN "$INSTDIR\${APP_EXE}"
-!define MUI_FINISHPAGE_RUN_TEXT "Запустить ${APP_NAME}"
+!define MUI_FINISHPAGE_RUN_TEXT "Run ${APP_NAME}"
 
 ;--------------------------------
 ; Pages
@@ -78,12 +78,12 @@ VIAddVersionKey "LegalCopyright"  "(C) 2026 q0s"
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_UNPAGE_FINISH
 
-!insertmacro MUI_LANGUAGE "Russian"
+!insertmacro MUI_LANGUAGE "English"
 
 ;--------------------------------
 ; Sections
 
-Section "q0player (обязательно)" SecPlayer
+Section "q0player (required)" SecPlayer
   SectionIn RO
   SetOutPath "$INSTDIR"
   File "..\target\release\${APP_EXE}"
@@ -181,15 +181,15 @@ q0player_install_q0v_backup_done:
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 SectionEnd
 
-Section "Ярлык на рабочем столе" SecDesktop
+Section "Desktop shortcut" SecDesktop
   CreateShortcut "$DESKTOP\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}" "" "$INSTDIR\${APP_EXE}" 0
 SectionEnd
 
 ;--------------------------------
 ; Component descriptions
 
-LangString DESC_SecPlayer  ${LANG_RUSSIAN} "Установить q0player и зарегистрировать .q0s в системе."
-LangString DESC_SecDesktop ${LANG_RUSSIAN} "Создать ярлык q0player на рабочем столе."
+LangString DESC_SecPlayer  ${LANG_ENGLISH} "Install q0player and register .q0s and .q0v with Windows."
+LangString DESC_SecDesktop ${LANG_ENGLISH} "Create a q0player shortcut on the desktop."
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
   !insertmacro MUI_DESCRIPTION_TEXT ${SecPlayer}  $(DESC_SecPlayer)

@@ -59,7 +59,7 @@ VIAddVersionKey "LegalCopyright"  "(C) 2026 q0s"
 !define MUI_ABORTWARNING
 !define MUI_COMPONENTSPAGE_SMALLDESC
 !define MUI_FINISHPAGE_RUN "$INSTDIR\${APP_EXE}"
-!define MUI_FINISHPAGE_RUN_TEXT "Запустить ${APP_NAME}"
+!define MUI_FINISHPAGE_RUN_TEXT "Run ${APP_NAME}"
 
 ;--------------------------------
 ; Pages
@@ -76,12 +76,12 @@ VIAddVersionKey "LegalCopyright"  "(C) 2026 q0s"
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_UNPAGE_FINISH
 
-!insertmacro MUI_LANGUAGE "Russian"
+!insertmacro MUI_LANGUAGE "English"
 
 ;--------------------------------
 ; Sections
 
-Section "q0editor (обязательно)" SecEditor
+Section "q0editor (required)" SecEditor
   SectionIn RO
   SetOutPath "$INSTDIR"
   File "..\target\release\${APP_EXE}"
@@ -143,15 +143,15 @@ q0editor_install_backup_done:
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 SectionEnd
 
-Section "Ярлык на рабочем столе" SecDesktop
+Section "Desktop shortcut" SecDesktop
   CreateShortcut "$DESKTOP\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}" "" "$INSTDIR\${APP_EXE}" 0
 SectionEnd
 
 ;--------------------------------
 ; Component descriptions
 
-LangString DESC_SecEditor  ${LANG_RUSSIAN} "Установить q0editor и зарегистрировать .q1s в системе."
-LangString DESC_SecDesktop ${LANG_RUSSIAN} "Создать ярлык q0editor на рабочем столе."
+LangString DESC_SecEditor  ${LANG_ENGLISH} "Install q0editor and register .q1s with Windows."
+LangString DESC_SecDesktop ${LANG_ENGLISH} "Create a q0editor shortcut on the desktop."
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
   !insertmacro MUI_DESCRIPTION_TEXT ${SecEditor}  $(DESC_SecEditor)

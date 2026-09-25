@@ -311,6 +311,20 @@ try {
     try {
         $releaseTargetDir = Join-Path $WorkspaceDir "target"
 
+        foreach ($installerSource in @("q0editor-setup.nsi", "q0player-setup.nsi")) {
+            $installerPath = Join-Path $InstallerDir $installerSource
+            $installerText = [IO.File]::ReadAllText($installerPath, [Text.UTF8Encoding]::new($false, $true))
+            if ($installerText -notmatch '!insertmacro MUI_LANGUAGE "English"') {
+                throw "$installerSource must use the English MUI language"
+            }
+            if ($installerText -match '[^\x00-\x7F]') {
+                throw "$installerSource contains non-ASCII UI text; keep installer strings English/ASCII to prevent encoding artifacts"
+            }
+            if ($installerText -match 'LANG_RUSSIAN|MUI_LANGUAGE "Russian"') {
+                throw "$installerSource still contains Russian installer language references"
+            }
+        }
+
         & $CargoFmt fmt --all -- --check
         if ($LASTEXITCODE -ne 0) {
             throw "cargo fmt check exited with $LASTEXITCODE"
