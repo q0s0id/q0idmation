@@ -7,8 +7,8 @@ Before starting, open `BUILD-INFO.txt` next to the installers and note its
 Build ID. Optionally verify both installers against `SHA256SUMS.txt`:
 
 ```powershell
-Get-FileHash .\q0editor-*-windows-x64-setup.exe -Algorithm SHA256
-Get-FileHash .\q0player-*-windows-x64-setup.exe -Algorithm SHA256
+Get-FileHash .\q0editor-*-windows-*-setup.exe -Algorithm SHA256
+Get-FileHash .\q0player-*-windows-*-setup.exe -Algorithm SHA256
 ```
 
 ## Checklist

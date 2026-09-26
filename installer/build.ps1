@@ -4,6 +4,11 @@
 # They must match. NSIS receives that version explicitly; version.nsh is only
 # the safe fallback for a direct, manual makensis invocation.
 
+param(
+    [ValidateSet("x64", "arm64")]
+    [string]$Architecture = "x64"
+)
+
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 3.0
 
@@ -11,6 +16,10 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $WorkspaceDir = Split-Path -Parent $ScriptDir
 $InstallerDir = $ScriptDir
 $DistDir = Join-Path $InstallerDir "dist"
+$RustTargetTriple = if ($Architecture -eq "arm64") { "aarch64-pc-windows-msvc" } else { "x86_64-pc-windows-msvc" }
+$ArtifactPlatform = if ($Architecture -eq "arm64") { "windows-arm64" } else { "windows-x64" }
+$PlatformLabel = if ($Architecture -eq "arm64") { "Windows ARM64" } else { "Windows x64" }
+$CargoTargetArgs = if ($Architecture -eq "arm64") { @("--target", $RustTargetTriple) } else { @() }
 
 $AttemptDir = $null
 $AttemptFiles = @()
@@ -83,6 +92,20 @@ function Step($message) {
     Write-Host "==> $message" -ForegroundColor Cyan
 }
 
+function Find-Arm64MsvcCompiler {
+    $patterns = @(
+        "$env:ProgramFiles\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\arm64\cl.exe",
+        "${env:ProgramFiles(x86)}\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\arm64\cl.exe"
+    )
+    foreach ($pattern in $patterns) {
+        $match = Get-ChildItem -Path $pattern -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+        if ($match) { return $match.FullName }
+    }
+    return $null
+}
+
 function Remove-AttemptFiles {
     param(
         [string[]]$Paths,
@@ -151,6 +174,10 @@ try {
     Write-Host "[ok] NSIS: $MakeNsis" -ForegroundColor DarkGreen
     Write-Host "[ok] Git: $Git" -ForegroundColor DarkGreen
 
+    if ($Architecture -eq "arm64" -and -not (Find-Arm64MsvcCompiler)) {
+        throw "Windows ARM64 packaging requires the Visual Studio C++ ARM64 build tools. Install the ARM64 MSVC component, then rerun with -Architecture arm64."
+    }
+
     Push-Location $WorkspaceDir
     try {
         $metadataJson = & $Cargo metadata --no-deps --format-version 1
@@ -201,8 +228,8 @@ try {
     $RustHostLine = @($RustVerbose | Where-Object { $_ -like "host: *" }) | Select-Object -First 1
     if (-not $RustHostLine) { throw "rustc -vV did not report a host triple" }
     $RustHostTriple = $RustHostLine.Substring(6).Trim()
-    if ($RustHostTriple -ne "x86_64-pc-windows-msvc") {
-        throw "this packaging script produces Windows x64 artifacts; Rust host is $RustHostTriple"
+    if ($RustHostTriple -notmatch '^(x86_64|aarch64)-pc-windows-msvc$') {
+        throw "this packaging script requires a Windows MSVC Rust host; Rust host is $RustHostTriple"
     }
     $NsisVersion = ((& $MakeNsis /VERSION) | Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or -not $NsisVersion) { throw "makensis /VERSION failed" }
@@ -257,7 +284,7 @@ try {
         "yyyyMMdd'T'HHmmss'Z'",
         [Globalization.CultureInfo]::InvariantCulture
     )
-    $BuildId = "q0idmation-$ArtifactVersion-windows-x64-$GitShortCommit-$BuildStamp"
+    $BuildId = "q0idmation-$ArtifactVersion-$ArtifactPlatform-$GitShortCommit-$BuildStamp"
 
     Write-Host "[ok] beta version $BetaVersion" -ForegroundColor DarkGreen
     Write-Host "[ok] Rust host $RustHostTriple" -ForegroundColor DarkGreen
@@ -283,12 +310,12 @@ try {
         [pscustomobject]@{
             App = "q0player"
             Script = "q0player-setup.nsi"
-            FileName = "q0player-$ArtifactVersion-windows-x64-setup.exe"
+            FileName = "q0player-$ArtifactVersion-$ArtifactPlatform-setup.exe"
         },
         [pscustomobject]@{
             App = "q0editor"
             Script = "q0editor-setup.nsi"
-            FileName = "q0editor-$ArtifactVersion-windows-x64-setup.exe"
+            FileName = "q0editor-$ArtifactVersion-$ArtifactPlatform-setup.exe"
         }
     )
     foreach ($spec in $InstallerSpecs) {
@@ -310,6 +337,11 @@ try {
     Push-Location $WorkspaceDir
     try {
         $releaseTargetDir = Join-Path $WorkspaceDir "target"
+        $releaseBinaryDir = if ($Architecture -eq "arm64") {
+            Join-Path $releaseTargetDir "$RustTargetTriple\release"
+        } else {
+            Join-Path $releaseTargetDir "release"
+        }
 
         foreach ($installerSource in @("q0editor-setup.nsi", "q0player-setup.nsi")) {
             $installerPath = Join-Path $InstallerDir $installerSource
@@ -333,6 +365,13 @@ try {
         & $Cargo check --workspace --locked --target-dir $releaseTargetDir
         if ($LASTEXITCODE -ne 0) {
             throw "cargo check exited with $LASTEXITCODE"
+        }
+
+        if ($Architecture -eq "arm64") {
+            & $Cargo check --workspace --locked --target $RustTargetTriple --target-dir $releaseTargetDir
+            if ($LASTEXITCODE -ne 0) {
+                throw "cargo check for $RustTargetTriple exited with $LASTEXITCODE"
+            }
         }
 
         & $Cargo test --workspace --locked --target-dir $releaseTargetDir
@@ -368,7 +407,7 @@ try {
     # A running app holds its release EXE open and blocks the linker.
     $busy = @()
     foreach ($name in @("q0editor", "q0player")) {
-        $releaseExe = Join-Path $releaseTargetDir "release\$name.exe"
+        $releaseExe = Join-Path $releaseBinaryDir "$name.exe"
         $process = Get-Process -Name $name -ErrorAction SilentlyContinue | Where-Object {
             $_.Path -and ([string]::Equals($_.Path, $releaseExe, [System.StringComparison]::OrdinalIgnoreCase))
         }
@@ -392,7 +431,7 @@ try {
     try {
         # Pin the directory so inherited CARGO_TARGET_DIR cannot redirect the
         # build while NSIS still reads workspace\target\release.
-        & $Cargo build --release --locked -p q0editor -p q0player --target-dir $releaseTargetDir
+        & $Cargo build --release --locked -p q0editor -p q0player --target-dir $releaseTargetDir @CargoTargetArgs
         if ($LASTEXITCODE -ne 0) {
             throw "cargo build exited with $LASTEXITCODE"
         }
@@ -400,8 +439,8 @@ try {
         Pop-Location
     }
 
-    $editorExe = Join-Path $WorkspaceDir "target\release\q0editor.exe"
-    $playerExe = Join-Path $WorkspaceDir "target\release\q0player.exe"
+    $editorExe = Join-Path $releaseBinaryDir "q0editor.exe"
+    $playerExe = Join-Path $releaseBinaryDir "q0player.exe"
     foreach ($exe in @($editorExe, $playerExe)) {
         if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
             throw "expected release binary is missing: $exe"
@@ -416,9 +455,11 @@ try {
         foreach ($spec in $InstallerSpecs) {
             $relativeOutput = "dist\$AttemptName\$($spec.FileName)"
             Write-Host "  makensis $($spec.Script) -> $($spec.FileName)"
+            $relativeBinaryDir = if ($Architecture -eq "arm64") { "..\target\$RustTargetTriple\release" } else { "..\target\release" }
             & $MakeNsis /V2 `
                 "/DAPP_VERSION=$BetaVersion" `
                 "/DAPP_VERSION_NUMERIC=$NumericVersion" `
+                "/DAPP_BINARY_DIR=$relativeBinaryDir" `
                 "/DOUTPUT_FILE=$relativeOutput" `
                 $spec.Script
             if ($LASTEXITCODE -ne 0) {
@@ -459,7 +500,8 @@ try {
         "Git tags: $GitTags",
         "Git remote: $GitRemote",
         "Git working tree: clean",
-        "Platform: Windows x64",
+        "Platform: $PlatformLabel",
+        "Rust target: $RustTargetTriple",
         "Rust host: $RustHostTriple",
         "Rust: $RustVersion",
         "Cargo: $CargoVersion",

@@ -1,7 +1,7 @@
 # q0idmation
 
 q0idmation is a free and open-source 2D animation toolkit written in Rust. The current beta
-ships two Windows applications:
+ships two Windows applications for x64 and ARM64:
 
 - `q0editor` creates and edits `.q1s` projects and exports `.q0s` movies.
 - `q0player` opens and plays `.q0s` movies.
@@ -27,6 +27,17 @@ Available modes are `debug` (default), `release`, `check`, `verify`, and `run`:
 .\build.ps1 verify
 .\build.ps1 run
 ```
+
+Windows ARM64 uses the Rust target `aarch64-pc-windows-msvc`:
+
+```powershell
+rustup target add aarch64-pc-windows-msvc
+.\build.ps1 -Mode check -Architecture arm64
+.\build.ps1 -Mode release -Architecture arm64
+```
+
+ARM64 compile checks can use Visual Studio LLVM automatically. Linking the final `.exe`
+requires the Visual Studio C++ ARM64 build tools.
 
 To build the complete workspace manually:
 
@@ -61,6 +72,12 @@ Build both release binaries and independent per-user installers with:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\installer\build.ps1
+```
+
+For ARM64 installers:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\installer\build.ps1 -Architecture arm64
 ```
 
 See [installer/README.md](installer/README.md) for prerequisites and output

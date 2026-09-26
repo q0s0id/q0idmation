@@ -1,11 +1,13 @@
 # q0idmation Windows installers
 
-q0idmation has two independent per-user NSIS installers for Windows x64. The installer and uninstaller UI is English-only; custom NSIS UI strings are kept ASCII to avoid locale/encoding artifacts:
+q0idmation has two independent per-user NSIS installers for Windows x64 and Windows ARM64. The installer and uninstaller UI is English-only; custom NSIS UI strings are kept ASCII to avoid locale/encoding artifacts:
 
 | File pattern | Contents | Association |
 |---|---|---|
-| `dist\q0editor-<version>-windows-x64-setup.exe` | `q0editor.exe` only | `.q1s` |
-| `dist\q0player-<version>-windows-x64-setup.exe` | `q0player.exe` only | `.q0s`, `.q0v` |
+| `dist\q0editor-<version>-windows-<arch>-setup.exe` | `q0editor.exe` only | `.q1s` |
+| `dist\q0player-<version>-windows-<arch>-setup.exe` | `q0player.exe` only | `.q0s`, `.q0v` |
+
+`<arch>` is `x64` or `arm64`.
 
 The release version comes from `cargo metadata --no-deps`. The `q0editor` and
 `q0player` package versions must match or packaging stops before NSIS runs.
@@ -29,7 +31,9 @@ files.
 
 ## Requirements
 
-- Windows x64 with Rust host `x86_64-pc-windows-msvc`;
+- Windows with an MSVC Rust host;
+- Rust target `x86_64-pc-windows-msvc` for x64 builds or `aarch64-pc-windows-msvc` for ARM64 builds;
+- Visual Studio C++ build tools for the selected target architecture;
 - Rust and Cargo with the `rustfmt` and `clippy` components;
 - Python 3.10 or newer for the generated icons and BMP files;
 - NSIS 3.x. The script also checks the standard NSIS install directories.
@@ -43,6 +47,13 @@ Run from the workspace root:
 powershell -ExecutionPolicy Bypass -File .\installer\build.ps1
 ```
 
+For Windows ARM64:
+
+```powershell
+rustup target add aarch64-pc-windows-msvc
+powershell -ExecutionPolicy Bypass -File .\installer\build.ps1 -Architecture arm64
+```
+
 Alternatively, start `installer\build.bat`. The script:
 
 1. locates Python, Git, NSIS and the complete Rust toolchain, including custom
@@ -52,7 +63,7 @@ Alternatively, start `installer\build.bat`. The script:
 4. requires formatting, workspace check, tests and strict Clippy to pass;
 5. generates installer assets with `installer\build_assets.py` and verifies
    that generation does not modify the committed source tree;
-6. builds locked release binaries for q0editor and q0player;
+6. builds locked release binaries for q0editor and q0player for the selected architecture;
 7. builds both versioned installers in an isolated staging directory;
 8. verifies sizes and SHA256 hashes, creates the manifests, then publishes the
    complete set to `installer\dist`.

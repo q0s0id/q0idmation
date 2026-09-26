@@ -19,6 +19,9 @@ SetCompressor /SOLID lzma
 !define PREVIOUS_PROG_ID_VALUE "PreviousDefaultProgId"
 !define UNINST_KEY      "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}"
 !define APP_REG_KEY     "Software\q0idmation\${APP_NAME}"
+!ifndef APP_BINARY_DIR
+  !define APP_BINARY_DIR "..\target\release"
+!endif
 
 Name "${APP_NAME} ${APP_VERSION}"
 !ifndef OUTPUT_FILE
@@ -84,7 +87,7 @@ VIAddVersionKey "LegalCopyright"  "(C) 2026 q0s"
 Section "q0editor (required)" SecEditor
   SectionIn RO
   SetOutPath "$INSTDIR"
-  File "..\target\release\${APP_EXE}"
+  File "${APP_BINARY_DIR}\${APP_EXE}"
   File "assets\q0editor.ico"
   File "LICENSE.txt"
 
