@@ -307,6 +307,14 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                             // moving the widget to a tooltip layer while it is inside
                             // the scrolling grid.
                             response.dnd_set_drag_payload(payload);
+                            if response.dragged() {
+                                draw_library_drag_preview(
+                                    ui.ctx(),
+                                    row.icon,
+                                    &row.name,
+                                    app.settings.theme.accent.to_color32(),
+                                );
+                            }
                         }
                         let drag_hint = if row_is_active {
                             if crate::audio::library_item_is_audio_only(&app.state.project, payload)
@@ -540,6 +548,54 @@ fn render_rename_dialog(app: &mut EditorApp, ctx: &egui::Context) {
 
 const LIBRARY_ICON_SIZE: f32 = 14.0;
 const LIBRARY_ICON_GAP: f32 = 5.0;
+
+fn draw_library_drag_preview(ctx: &egui::Context, icon: LibraryIcon, name: &str, accent: Color32) {
+    let Some(pointer) = ctx.pointer_interact_pos() else {
+        return;
+    };
+    let style = ctx.style();
+    let visuals = &style.visuals;
+    let text_color = visuals.widgets.active.fg_stroke.color;
+    let font_id = TextStyle::Button.resolve(&style);
+    let label = truncate_label(name, 28);
+    let galley = ctx.fonts(|fonts| fonts.layout_no_wrap(label, font_id, text_color));
+    let padding = vec2(8.0, 5.0);
+    let content_height = galley.size().y.max(LIBRARY_ICON_SIZE);
+    let size = vec2(
+        padding.x * 2.0 + LIBRARY_ICON_SIZE + LIBRARY_ICON_GAP + galley.size().x,
+        padding.y * 2.0 + content_height,
+    );
+    let rect = Rect::from_min_size(pointer + vec2(12.0, 12.0), size);
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        egui::Id::new("library_drag_preview"),
+    ));
+    painter.add(egui::Shape::mesh(
+        visuals
+            .window_shadow
+            .tessellate(rect, visuals.window_rounding),
+    ));
+    painter.rect(
+        rect,
+        visuals.window_rounding,
+        visuals.window_fill,
+        Stroke::new(1.0_f32, accent),
+    );
+    let content = rect.shrink2(padding);
+    let icon_rect = Rect::from_center_size(
+        pos2(content.left() + LIBRARY_ICON_SIZE * 0.5, content.center().y),
+        vec2(LIBRARY_ICON_SIZE, LIBRARY_ICON_SIZE),
+    );
+    draw_library_icon(&painter, icon_rect, icon, text_color, accent);
+    painter.galley(
+        pos2(
+            icon_rect.right() + LIBRARY_ICON_GAP,
+            content.center().y - galley.size().y * 0.5,
+        ),
+        galley,
+        text_color,
+    );
+}
 
 fn library_name_cell(
     ui: &mut Ui,

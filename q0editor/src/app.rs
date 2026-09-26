@@ -5209,20 +5209,6 @@ impl EditorApp {
             self.session.status = "audio frames cannot contain artwork".to_string();
             return;
         }
-        if let LibraryItem::Asset(asset_id) = item {
-            if matches!(
-                self.state
-                    .project
-                    .assets
-                    .iter()
-                    .find(|asset| asset.id() == asset_id),
-                Some(Asset::Vector(_))
-            ) {
-                self.place_vector_asset_as_raw(asset_id, position);
-                return;
-            }
-        }
-
         let parent_q0rg_id = self.session.current_q0rg_id;
         let target = match item {
             LibraryItem::Q0rg(target_q0rg_id) => {
@@ -5302,77 +5288,6 @@ impl EditorApp {
                 LibraryItem::Asset(_) => "Asset placed".to_string(),
             };
         }
-    }
-
-    fn place_vector_asset_as_raw(&mut self, asset_id: u16, position: Vec2) {
-        let Some(Asset::Vector(source)) = self
-            .state
-            .project
-            .assets
-            .iter()
-            .find(|asset| asset.id() == asset_id)
-            .cloned()
-        else {
-            self.session.status = "That vector is no longer available".to_string();
-            return;
-        };
-        if source.paths.is_empty() {
-            self.session.status = "Empty vector cannot be placed".to_string();
-            return;
-        }
-
-        let transform = crate::render::centered_target_transform(
-            &self.state.project,
-            Target::Asset(asset_id),
-            position,
-        );
-        let new_asset_id = crate::tools::next_asset_id_pub(&self.state.project);
-        let baked = bake_vector_asset(&source, new_asset_id, Affine::from_transform(transform));
-        let q0rg_id = self.session.current_q0rg_id;
-        let layer_id = self.session.current_layer_id;
-        let frame = self.session.current_frame;
-
-        self.history.snapshot(&self.state.project);
-        if crate::tools::materialize_layer_keyframe_for_edit(
-            &mut self.state.project,
-            q0rg_id,
-            layer_id,
-            frame,
-        )
-        .is_none()
-        {
-            return;
-        }
-        self.state.project.assets.push(Asset::Vector(baked));
-        let Some(layer) = self
-            .state
-            .project
-            .q0rgs
-            .iter_mut()
-            .find(|q0rg| q0rg.q0rg_id == q0rg_id)
-            .and_then(|q0rg| {
-                q0rg.layers
-                    .iter_mut()
-                    .find(|layer| layer.layer_id == layer_id)
-            })
-        else {
-            crate::tools::remove_assets_and_metadata(&mut self.state.project, [new_asset_id]);
-            return;
-        };
-        let placement_idx = layer.placements.len();
-        layer.placements.push(Placement {
-            instance_id: 0,
-            frame,
-            target: Target::Asset(new_asset_id),
-            transform: Transform2D::IDENTITY,
-            tween: Tween::None,
-            fx: Default::default(),
-        });
-        let path_count = source.paths.len();
-        self.session.selection = raw_vector_selection(q0rg_id, layer_id, placement_idx, path_count);
-        self.session.status = "Vector placed as raw graphics".to_string();
-        self.state.dirty = true;
-        self.textures.invalidate();
     }
 
     fn would_create_q0rg_cycle(&self, parent_q0rg_id: u16, child_q0rg_id: u16) -> bool {
@@ -10101,7 +10016,7 @@ mod tests {
     }
 
     #[test]
-    fn placing_vector_from_library_bakes_a_raw_copy_instead_of_an_object_placement() {
+    fn placing_vector_from_library_reuses_the_existing_asset() {
         let mut app = EditorApp::default();
         app.state.project.assets.push(Asset::Vector(VectorAsset {
             asset_id: 77,
@@ -10114,6 +10029,7 @@ mod tests {
             }),
             stroke: None,
         }));
+        let asset_count_before = app.state.project.assets.len();
         let drop = Vec2::new(100.0, 80.0);
 
         app.handle(
@@ -10121,49 +10037,24 @@ mod tests {
             Action::PlaceLibraryItemAt(LibraryItem::Asset(77), drop),
         );
 
+        assert_eq!(
+            app.state.project.assets.len(),
+            asset_count_before,
+            "placing a library vector must not create another library vector"
+        );
         let layer = &app.state.project.q0rgs[0].layers[0];
-        let placement = layer.placements.last().expect("placed vector copy");
-        let Target::Asset(copy_id) = placement.target else {
-            panic!("vector copy target");
-        };
-        assert_ne!(copy_id, 77, "library source asset must remain immutable");
-        assert_eq!(placement.transform, Transform2D::IDENTITY);
+        let placement = layer.placements.last().expect("placed vector instance");
+        assert_eq!(placement.target, Target::Asset(77));
+        assert!((placement.transform.tx - 90.0).abs() < 0.001);
+        assert!((placement.transform.ty - 70.0).abs() < 0.001);
         assert!(matches!(
             app.session.selection,
-            Selection::Path { .. } | Selection::Paths(_)
+            Selection::Placement {
+                q0rg_id: 1,
+                layer_id: 1,
+                placement_idx: 0
+            }
         ));
-        let Asset::Vector(source) = app
-            .state
-            .project
-            .assets
-            .iter()
-            .find(|a| a.id() == 77)
-            .unwrap()
-        else {
-            unreachable!()
-        };
-        assert_eq!(source.paths[0].anchors[0].point, Vec2::new(0.0, 0.0));
-        let Asset::Vector(copy) = app
-            .state
-            .project
-            .assets
-            .iter()
-            .find(|a| a.id() == copy_id)
-            .unwrap()
-        else {
-            unreachable!()
-        };
-        let points: Vec<Vec2> = copy
-            .paths
-            .iter()
-            .flat_map(crate::render::flatten_path)
-            .collect();
-        let min_x = points.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
-        let max_x = points.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max);
-        let min_y = points.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
-        let max_y = points.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
-        assert!((min_x - 90.0).abs() < 0.001 && (max_x - 110.0).abs() < 0.001);
-        assert!((min_y - 70.0).abs() < 0.001 && (max_y - 90.0).abs() < 0.001);
     }
 
     #[test]
