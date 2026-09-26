@@ -167,6 +167,14 @@ pub struct PathRef {
     pub path_idx: usize,
 }
 
+/// Editor-only reference to one authored stroke segment. This never reaches
+/// q1s: once edited, the segment is materialized as ordinary open raw paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StrokeSegmentRef {
+    pub path: PathRef,
+    pub segment_idx: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Selection {
     None,
@@ -199,6 +207,9 @@ pub enum Selection {
         strokes: Vec<PathRef>,
         objects: Vec<PlacementRef>,
     },
+    /// One authored segment of a closed raw outline. Selection itself is
+    /// non-destructive; the first edit cuts it into ordinary open raw paths.
+    StrokeSegment(StrokeSegmentRef),
     /// V-tool marquee selection of only part of one raw contour. The selected
     /// boundary anchors move together and reshape the fill, matching Animate's
     /// partial raw-shape selection rather than Subselect's whole-path editing.
@@ -1118,6 +1129,13 @@ impl Session {
                     self.selection = Selection::None;
                 }
             }
+            Selection::StrokeSegment(segment) => {
+                if path_segment_count(project, segment.path)
+                    .is_none_or(|count| segment.segment_idx >= count)
+                {
+                    self.selection = Selection::None;
+                }
+            }
             Selection::PathPoints {
                 path,
                 ref mut anchor_indices,
@@ -1648,6 +1666,36 @@ fn path_anchor_count(project: &ProjectV2, r: PathRef) -> Option<usize> {
             | q0s_format::v2::Asset::Rig(_) => None,
         })
         .map(|path| path.anchors.len())
+}
+
+fn path_segment_count(project: &ProjectV2, r: PathRef) -> Option<usize> {
+    project
+        .q0rgs
+        .iter()
+        .find(|q| q.q0rg_id == r.q0rg_id)
+        .and_then(|q| q.layers.iter().find(|layer| layer.layer_id == r.layer_id))
+        .and_then(|layer| layer.placements.get(r.placement_idx))
+        .and_then(|placement| match placement.target {
+            q0s_format::v2::Target::Asset(asset_id) => {
+                project.assets.iter().find(|asset| asset.id() == asset_id)
+            }
+            q0s_format::v2::Target::Q0rg(_) => None,
+        })
+        .and_then(|asset| match asset {
+            q0s_format::v2::Asset::Vector(vector) => vector.paths.get(r.path_idx),
+            q0s_format::v2::Asset::Bitmap(_)
+            | q0s_format::v2::Asset::Q0v(_)
+            | q0s_format::v2::Asset::Rig(_) => None,
+        })
+        .map(|path| {
+            if path.anchors.len() < 2 {
+                0
+            } else if path.closed {
+                path.anchors.len()
+            } else {
+                path.anchors.len() - 1
+            }
+        })
 }
 
 fn placement_ref_exists(project: &ProjectV2, reference: PlacementRef) -> bool {

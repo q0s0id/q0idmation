@@ -3102,6 +3102,9 @@ impl EditorApp {
                 q0rg_id, layer_id, ..
             } => locked(*q0rg_id, *layer_id),
             Selection::Paths(paths) => paths.iter().any(|path| locked(path.q0rg_id, path.layer_id)),
+            Selection::StrokeSegment(segment) => {
+                locked(segment.path.q0rg_id, segment.path.layer_id)
+            }
             Selection::RawParts {
                 fills,
                 strokes,
@@ -5699,6 +5702,24 @@ impl EditorApp {
                 path_idx,
             }]),
             Selection::Paths(refs) => self.delete_raw_path_refs(&refs),
+            Selection::StrokeSegment(segment) => {
+                self.history.snapshot(&self.state.project);
+                let Some(path) = crate::tools::materialize_raw_stroke_segment(self, segment) else {
+                    return false;
+                };
+                let changed = crate::selection_edit::remove_materialized_paths_and_objects(
+                    &mut self.state.project,
+                    &[path],
+                    &[],
+                    self.session.current_frame,
+                );
+                if changed {
+                    self.state.dirty = true;
+                    self.session.selection = Selection::None;
+                    self.textures.invalidate();
+                }
+                changed
+            }
             Selection::PathPoints {
                 path,
                 mut anchor_indices,

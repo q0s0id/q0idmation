@@ -58,6 +58,19 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                             .small(),
                     );
                 }
+                Selection::StrokeSegment(segment) => {
+                    ui.label(egui::RichText::new("Stroke segment").strong());
+                    ui.label(
+                        egui::RichText::new(format!("Segment {}", segment.segment_idx + 1))
+                            .color(app.settings.theme.text_dim.to_color32())
+                            .small(),
+                    );
+                    ui.label(
+                        egui::RichText::new("Drag to detach this part of the outline")
+                            .color(app.settings.theme.text_dim.to_color32())
+                            .small(),
+                    );
+                }
                 Selection::RawParts {
                     fills,
                     strokes,

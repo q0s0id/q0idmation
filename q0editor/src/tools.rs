@@ -23,7 +23,7 @@ use crate::render::{CachedInteractivePath, CachedSelectionPaint, SelectionPaintK
 
 use crate::state::{
     AppearanceTransformSnapshot, BrushSizePreview, GroupTransformOperation, Handle, PathRef,
-    PlacementRef, Selection, Tool, ToolState, TransformEdge, TransformPivot,
+    PlacementRef, Selection, StrokeSegmentRef, Tool, ToolState, TransformEdge, TransformPivot,
 };
 
 const HIT_RADIUS: f32 = 6.0;
@@ -526,11 +526,15 @@ fn selection_transform_bounds(app: &EditorApp) -> Option<(f32, f32, f32, f32)> {
         Selection::None
         | Selection::Asset(_)
         | Selection::Q0rg(_)
-        | Selection::PathPoints { .. } => None,
+        | Selection::PathPoints { .. }
+        | Selection::StrokeSegment(_) => None,
     }
 }
 
 fn selection_default_pivot(app: &EditorApp) -> Option<Vec2> {
+    if matches!(app.session.selection, Selection::StrokeSegment(_)) {
+        return None;
+    }
     if let Selection::Placement {
         q0rg_id,
         layer_id,
@@ -1557,7 +1561,7 @@ fn select_raw_area_by_clip(
                 continue;
             };
             if vector.fill.is_none() {
-                if clip_polygon.is_some() && vector.stroke.is_some() {
+                if vector.stroke.is_some() {
                     let (selected, _) = clip_stroked_paths(vector, &clip);
                     if !selected.is_empty() {
                         let padding = vector.stroke.map_or(3.0, |stroke| stroke.width * 0.5 + 3.0);
@@ -1971,7 +1975,7 @@ fn cut_raw_areas_for_drag_prepared(
         else {
             continue;
         };
-        if vector.fill.is_none() && vector.stroke.is_some() && clip_polygon.is_some() {
+        if vector.fill.is_none() && vector.stroke.is_some() {
             let (selected, remainder) = clip_stroked_paths(vector, &region);
             if !selected.is_empty() {
                 stroke_jobs.push((*r, asset_id, selected, remainder));
@@ -2377,6 +2381,7 @@ fn raw_style_selection_parts(
             Vec::new(),
         )),
         Selection::Paths(paths) => Some((paths.clone(), Vec::new(), Vec::new())),
+        Selection::StrokeSegment(segment) => Some((Vec::new(), vec![segment.path], Vec::new())),
         _ => None,
     }
 }
@@ -2385,9 +2390,13 @@ fn add_selection_hit(current: &Selection, clicked: Selection) -> Selection {
     // Once either side distinguishes fill from outline, keep those channels
     // separate. In particular the same PathRef is allowed in both vectors: that
     // means the user Shift-selected both the paint and its outline.
-    if matches!(current, Selection::RawParts { .. })
-        || matches!(clicked, Selection::RawParts { .. })
-    {
+    if matches!(
+        current,
+        Selection::RawParts { .. } | Selection::StrokeSegment(_)
+    ) || matches!(
+        clicked,
+        Selection::RawParts { .. } | Selection::StrokeSegment(_)
+    ) {
         let Some((mut fills, mut strokes, mut objects)) = raw_style_selection_parts(current) else {
             return clicked;
         };
@@ -3799,13 +3808,9 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                             objects: Vec::new(),
                         }
                     }
-                    RawSelectionHit::StrokePart(path) => {
-                        app.session.status = "Outline selected".to_string();
-                        Selection::RawParts {
-                            fills: Vec::new(),
-                            strokes: vec![path],
-                            objects: Vec::new(),
-                        }
+                    RawSelectionHit::StrokePart(segment) => {
+                        app.session.status = "Stroke segment selected".to_string();
+                        Selection::StrokeSegment(segment)
                     }
                     RawSelectionHit::Path(path) => {
                         app.session.status = "Contour selected".to_string();
@@ -4040,6 +4045,13 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                     }
                 }
             }
+            if let Selection::StrokeSegment(segment) = app.session.selection.clone() {
+                if point_hits_stroke_segment(&app.state.project, segment, p)
+                    && begin_dragging_raw_stroke_segment(app, segment, p, "Moving stroke segment")
+                {
+                    return;
+                }
+            }
             if let Selection::RawParts {
                 fills,
                 strokes,
@@ -4269,13 +4281,12 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                             return;
                         }
                     }
-                    RawSelectionHit::StrokePart(path) => {
-                        if begin_dragging_raw_style_parts(
+                    RawSelectionHit::StrokePart(segment) => {
+                        if begin_dragging_raw_stroke_segment(
                             app,
-                            Vec::new(),
-                            vec![path],
+                            segment,
                             p,
-                            "Moving outline",
+                            "Moving stroke segment",
                         ) {
                             return;
                         }
@@ -4986,8 +4997,8 @@ enum RawSelectionHit {
     /// A fill whose source vector also has a stroke. It must remain distinct
     /// from that outline until/if the user Shift-selects both.
     FillPart(Vec<PathRef>),
-    /// One independently selectable outline on a fill+stroke vector.
-    StrokePart(PathRef),
+    /// One authored segment of a fill+stroke closed outline.
+    StrokePart(StrokeSegmentRef),
     /// One open or stroke-only raw path, where the path is already the whole
     /// visible raw element and no style split is needed.
     Path(PathRef),
@@ -5079,21 +5090,30 @@ fn hit_test_raw_selection_cached(
             if let Some(stroke) = vector.stroke.as_ref() {
                 let stroke_radius = stroke.width.max(1.0) * 0.5 + 3.0;
                 for (path_idx, path) in vector.paths.iter().enumerate().rev() {
-                    let points = flatten_path(path);
-                    if points.len() >= 2
-                        && nearest_segment_distance(&points, cursor) <= stroke_radius
-                    {
-                        let reference = PathRef {
-                            q0rg_id,
-                            layer_id: layer.layer_id,
-                            placement_idx,
-                            path_idx,
-                        };
-                        return Some(if vector.fill.is_some() && path.closed {
-                            RawSelectionHit::StrokePart(reference)
-                        } else {
-                            RawSelectionHit::Path(reference)
-                        });
+                    let reference = PathRef {
+                        q0rg_id,
+                        layer_id: layer.layer_id,
+                        placement_idx,
+                        path_idx,
+                    };
+                    if vector.fill.is_some() && path.closed {
+                        if let Some((segment_idx, distance)) =
+                            nearest_authored_stroke_segment(path, cursor)
+                        {
+                            if distance <= stroke_radius {
+                                return Some(RawSelectionHit::StrokePart(StrokeSegmentRef {
+                                    path: reference,
+                                    segment_idx,
+                                }));
+                            }
+                        }
+                    } else {
+                        let points = flatten_path(path);
+                        if points.len() >= 2
+                            && nearest_segment_distance(&points, cursor) <= stroke_radius
+                        {
+                            return Some(RawSelectionHit::Path(reference));
+                        }
                     }
                 }
             }
@@ -5193,21 +5213,30 @@ fn hit_test_raw_selection(
             if let Some(stroke) = vector.stroke.as_ref() {
                 let stroke_radius = stroke.width.max(1.0) * 0.5 + 3.0;
                 for (path_idx, path) in vector.paths.iter().enumerate().rev() {
-                    let points = flatten_path(path);
-                    if points.len() >= 2
-                        && nearest_segment_distance(&points, cursor) <= stroke_radius
-                    {
-                        let reference = PathRef {
-                            q0rg_id,
-                            layer_id: layer.layer_id,
-                            placement_idx,
-                            path_idx,
-                        };
-                        return Some(if vector.fill.is_some() && path.closed {
-                            RawSelectionHit::StrokePart(reference)
-                        } else {
-                            RawSelectionHit::Path(reference)
-                        });
+                    let reference = PathRef {
+                        q0rg_id,
+                        layer_id: layer.layer_id,
+                        placement_idx,
+                        path_idx,
+                    };
+                    if vector.fill.is_some() && path.closed {
+                        if let Some((segment_idx, distance)) =
+                            nearest_authored_stroke_segment(path, cursor)
+                        {
+                            if distance <= stroke_radius {
+                                return Some(RawSelectionHit::StrokePart(StrokeSegmentRef {
+                                    path: reference,
+                                    segment_idx,
+                                }));
+                            }
+                        }
+                    } else {
+                        let points = flatten_path(path);
+                        if points.len() >= 2
+                            && nearest_segment_distance(&points, cursor) <= stroke_radius
+                        {
+                            return Some(RawSelectionHit::Path(reference));
+                        }
                     }
                 }
             }
@@ -6532,8 +6561,11 @@ fn raw_area_selection_contains_point(
         else {
             return false;
         };
-        if vector.fill.is_none() && vector.stroke.is_some() && clip_polygon.is_some() {
-            let region = selection_clip_polygon((0.0, 0.0, 0.0, 0.0), clip_polygon);
+        if vector.fill.is_none() && vector.stroke.is_some() {
+            let region = selection_clip_polygon(
+                (bounds_min.x, bounds_min.y, bounds_max.x, bounds_max.y),
+                clip_polygon,
+            );
             let (selected, _) = clip_stroked_paths(vector, &region);
             let radius = vector.stroke.map_or(3.0, |stroke| stroke.width * 0.5 + 3.0);
             return selected.iter().any(|path| {
@@ -6573,6 +6605,9 @@ fn selected_raw_body_contains_point(app: &EditorApp, point: Vec2) -> bool {
             point,
         ),
         Selection::Paths(refs) => point_hits_selected_raw_paths(&app.state.project, refs, point),
+        Selection::StrokeSegment(segment) => {
+            point_hits_stroke_segment(&app.state.project, *segment, point)
+        }
         Selection::RawArea {
             placements,
             bounds_min,
@@ -7056,6 +7091,45 @@ fn begin_dragging_raw_paths(
     true
 }
 
+fn begin_dragging_raw_stroke_segment(
+    app: &mut EditorApp,
+    segment: StrokeSegmentRef,
+    start_cursor: Vec2,
+    status: &str,
+) -> bool {
+    app.history.snapshot(&app.state.project);
+    let Some(reference) = materialize_raw_stroke_segment(app, segment) else {
+        return false;
+    };
+    let refs = isolate_raw_refs_for_live_transform(app, vec![reference]).unwrap_or_default();
+    let start_paths: Vec<VPath> = refs
+        .iter()
+        .filter_map(|reference| {
+            raw_path_clone(
+                &app.state.project,
+                reference.q0rg_id,
+                reference.layer_id,
+                reference.placement_idx,
+                reference.path_idx,
+            )
+        })
+        .collect();
+    if refs.is_empty() || start_paths.len() != refs.len() {
+        return false;
+    }
+    app.session.selection = selection_from_group_parts(refs.clone(), Vec::new());
+    let start_appearances = capture_whole_asset_appearances_for_raw_refs(app, &refs);
+    app.session.tool_state = ToolState::DraggingPaths {
+        refs,
+        start_cursor,
+        start_paths: std::sync::Arc::new(start_paths),
+        start_appearances: std::sync::Arc::new(start_appearances),
+        start_pivot: None,
+    };
+    app.session.status = status.to_string();
+    true
+}
+
 fn begin_dragging_raw_style_parts(
     app: &mut EditorApp,
     fills: Vec<PathRef>,
@@ -7450,6 +7524,176 @@ fn raw_path_clone(
         return None;
     };
     vector.paths.get(path_idx).cloned()
+}
+
+fn authored_stroke_segment(path: &VPath, segment_idx: usize) -> Option<VPath> {
+    let count = path.anchors.len();
+    if count < 2 {
+        return None;
+    }
+    let segment_count = if path.closed { count } else { count - 1 };
+    if segment_idx >= segment_count {
+        return None;
+    }
+    let next = if segment_idx + 1 < count {
+        segment_idx + 1
+    } else {
+        0
+    };
+    let mut start = path.anchors[segment_idx].clone();
+    let mut end = path.anchors[next].clone();
+    start.in_handle = None;
+    end.out_handle = None;
+    Some(VPath {
+        anchors: vec![start, end],
+        closed: false,
+    })
+}
+
+fn split_stroke_path_for_segment(path: &VPath, segment_idx: usize) -> Option<(VPath, Vec<VPath>)> {
+    let selected = authored_stroke_segment(path, segment_idx)?;
+    let count = path.anchors.len();
+    let mut remainder = Vec::new();
+    if path.closed {
+        let next = (segment_idx + 1) % count;
+        let mut anchors = Vec::with_capacity(count);
+        let mut index = next;
+        loop {
+            anchors.push(path.anchors[index].clone());
+            if index == segment_idx {
+                break;
+            }
+            index = (index + 1) % count;
+        }
+        if anchors.len() >= 2 {
+            anchors[0].in_handle = None;
+            anchors.last_mut()?.out_handle = None;
+            remainder.push(VPath {
+                anchors,
+                closed: false,
+            });
+        }
+    } else {
+        if segment_idx > 0 {
+            let mut before = path.anchors[..=segment_idx].to_vec();
+            before.last_mut()?.out_handle = None;
+            if before.len() >= 2 {
+                remainder.push(VPath {
+                    anchors: before,
+                    closed: false,
+                });
+            }
+        }
+        if segment_idx + 1 < count - 1 {
+            let mut after = path.anchors[segment_idx + 1..].to_vec();
+            after[0].in_handle = None;
+            if after.len() >= 2 {
+                remainder.push(VPath {
+                    anchors: after,
+                    closed: false,
+                });
+            }
+        }
+    }
+    Some((selected, remainder))
+}
+
+fn nearest_authored_stroke_segment(path: &VPath, cursor: Vec2) -> Option<(usize, f32)> {
+    let count = path.anchors.len();
+    if count < 2 {
+        return None;
+    }
+    let segment_count = if path.closed { count } else { count - 1 };
+    (0..segment_count)
+        .filter_map(|segment_idx| {
+            let segment = authored_stroke_segment(path, segment_idx)?;
+            let points = flatten_path(&segment);
+            (points.len() >= 2).then(|| (segment_idx, nearest_segment_distance(&points, cursor)))
+        })
+        .min_by(|left, right| left.1.total_cmp(&right.1))
+}
+
+pub(crate) fn stroke_segment_snapshot(
+    project: &ProjectV2,
+    segment: StrokeSegmentRef,
+) -> Option<VectorAsset> {
+    let asset_id = raw_placement_asset_id(
+        project,
+        segment.path.q0rg_id,
+        segment.path.layer_id,
+        segment.path.placement_idx,
+    )?;
+    let Asset::Vector(vector) = project.assets.iter().find(|asset| asset.id() == asset_id)? else {
+        return None;
+    };
+    let path = vector.paths.get(segment.path.path_idx)?;
+    let selected = authored_stroke_segment(path, segment.segment_idx)?;
+    Some(VectorAsset {
+        asset_id: 0,
+        paths: vec![selected],
+        fill: None,
+        stroke: vector.stroke,
+    })
+}
+
+fn point_hits_stroke_segment(project: &ProjectV2, segment: StrokeSegmentRef, point: Vec2) -> bool {
+    let asset_id = raw_placement_asset_id(
+        project,
+        segment.path.q0rg_id,
+        segment.path.layer_id,
+        segment.path.placement_idx,
+    );
+    let Some(asset_id) = asset_id else {
+        return false;
+    };
+    let Some(Asset::Vector(vector)) = project.assets.iter().find(|asset| asset.id() == asset_id)
+    else {
+        return false;
+    };
+    let Some(stroke) = vector.stroke else {
+        return false;
+    };
+    let Some(path) = vector.paths.get(segment.path.path_idx) else {
+        return false;
+    };
+    let Some(segment_path) = authored_stroke_segment(path, segment.segment_idx) else {
+        return false;
+    };
+    let points = flatten_path(&segment_path);
+    points.len() >= 2
+        && nearest_segment_distance(&points, point) <= stroke.width.max(1.0) * 0.5 + 3.0
+}
+
+pub(crate) fn materialize_raw_stroke_segment(
+    app: &mut EditorApp,
+    segment: StrokeSegmentRef,
+) -> Option<PathRef> {
+    let mut refs = materialize_raw_style_parts(app, &[], &[segment.path])?;
+    if refs.len() != 1 {
+        return None;
+    }
+    let reference = refs.remove(0);
+    let asset_id = raw_placement_asset_id(
+        &app.state.project,
+        reference.q0rg_id,
+        reference.layer_id,
+        reference.placement_idx,
+    )?;
+    let Asset::Vector(vector) = app
+        .state
+        .project
+        .assets
+        .iter_mut()
+        .find(|asset| asset.id() == asset_id)?
+    else {
+        return None;
+    };
+    let source = vector.paths.get(reference.path_idx)?.clone();
+    let (selected, remainder) = split_stroke_path_for_segment(&source, segment.segment_idx)?;
+    vector.paths[reference.path_idx] = selected;
+    vector.paths.extend(remainder);
+    app.textures.invalidate();
+    Some(reference)
 }
 
 fn replace_raw_path_translated(
@@ -8684,11 +8928,7 @@ pub(crate) fn selection_at_point_cached(
                 strokes: Vec::new(),
                 objects: Vec::new(),
             },
-            RawSelectionHit::StrokePart(path) => Selection::RawParts {
-                fills: Vec::new(),
-                strokes: vec![path],
-                objects: Vec::new(),
-            },
+            RawSelectionHit::StrokePart(segment) => Selection::StrokeSegment(segment),
             RawSelectionHit::Path(path) => Selection::Path {
                 q0rg_id: path.q0rg_id,
                 layer_id: path.layer_id,
@@ -8720,11 +8960,7 @@ pub fn selection_at_point_pub(
                 strokes: Vec::new(),
                 objects: Vec::new(),
             },
-            RawSelectionHit::StrokePart(path) => Selection::RawParts {
-                fills: Vec::new(),
-                strokes: vec![path],
-                objects: Vec::new(),
-            },
+            RawSelectionHit::StrokePart(segment) => Selection::StrokeSegment(segment),
             RawSelectionHit::Path(path) => Selection::Path {
                 q0rg_id: path.q0rg_id,
                 layer_id: path.layer_id,
@@ -9684,6 +9920,41 @@ fn draw_selection_content_overlay(app: &mut EditorApp, painter: &Painter, view: 
                 Stroke::new(2.0_f32, Color32::from_black_alpha(180)),
             );
             painter.rect_stroke(rect, 0.0, Stroke::new(1.0_f32, accent));
+        }
+        return;
+    }
+    if let Selection::StrokeSegment(segment) = app.session.selection {
+        if let Some(vector) = stroke_segment_snapshot(&app.state.project, segment) {
+            if let Some(path) = vector.paths.first() {
+                let affine = app
+                    .state
+                    .project
+                    .q0rgs
+                    .iter()
+                    .find(|q0rg| q0rg.q0rg_id == segment.path.q0rg_id)
+                    .and_then(|q0rg| {
+                        q0rg.layers
+                            .iter()
+                            .find(|layer| layer.layer_id == segment.path.layer_id)
+                    })
+                    .and_then(|layer| layer.placements.get(segment.path.placement_idx))
+                    .map(|placement| Affine::from_transform(placement.transform))
+                    .unwrap_or(Affine::IDENTITY);
+                let points: Vec<Pos2> = flatten_path(path)
+                    .into_iter()
+                    .map(|point| stage_to_screen(affine.apply(point), view))
+                    .collect();
+                if points.len() >= 2 {
+                    painter.add(Shape::line(
+                        points.clone(),
+                        Stroke::new(3.0_f32, Color32::from_black_alpha(210)),
+                    ));
+                    painter.add(Shape::line(
+                        points,
+                        Stroke::new(1.5_f32, selection_color(app)),
+                    ));
+                }
+            }
         }
         return;
     }
@@ -12367,6 +12638,101 @@ mod tests {
     }
 
     #[test]
+    fn marquee_clips_open_pencil_stroke_instead_of_ignoring_it() {
+        let mut project = crate::state::default_project();
+        project.assets.push(Asset::Vector(VectorAsset {
+            asset_id: 1,
+            paths: vec![VPath {
+                anchors: vec![anchor(Vec2::new(0.0, 50.0)), anchor(Vec2::new(100.0, 50.0))],
+                closed: false,
+            }],
+            fill: None,
+            stroke: Some(blue_stroke()),
+        }));
+        project.q0rgs[0].layers[0].placements.push(Placement {
+            instance_id: 0,
+            frame: 0,
+            target: Target::Asset(1),
+            transform: Transform2D::IDENTITY,
+            tween: Tween::None,
+            fx: Default::default(),
+        });
+
+        let rect = (25.0, 35.0, 75.0, 65.0);
+        let selection = marquee_selection(&project, 1, 0, rect);
+        let Selection::RawArea {
+            placements,
+            bounds_min,
+            bounds_max,
+            clip_polygon,
+            ..
+        } = &selection
+        else {
+            panic!("partial pencil stroke must be a clipped RawArea: {selection:?}");
+        };
+        assert_eq!(placements.len(), 1);
+        assert!(clip_polygon.is_none());
+        assert!((bounds_min.x - 21.0).abs() < 0.01);
+        assert!((bounds_max.x - 79.0).abs() < 0.01);
+        assert!(raw_area_selection_contains_point(
+            &project,
+            placements,
+            *bounds_min,
+            *bounds_max,
+            None,
+            Vec2::new(50.0, 50.0),
+        ));
+
+        let payload = crate::selection_edit::capture_clipboard(&project, &selection);
+        assert_eq!(payload.raw_vectors.len(), 1);
+        let copied = &payload.raw_vectors[0].vector;
+        assert!(copied.fill.is_none());
+        assert!(copied.stroke.is_some());
+        assert_eq!(copied.paths.len(), 1);
+        assert!((copied.paths[0].anchors[0].point.x - 21.0).abs() < 0.01);
+        assert!((copied.paths[0].anchors.last().unwrap().point.x - 79.0).abs() < 0.01);
+
+        let mut app = EditorApp::default();
+        app.state.project = project.clone();
+        let refs = cut_raw_areas_for_drag_with_clip(
+            &mut app,
+            placements,
+            (bounds_min.x, bounds_min.y, bounds_max.x, bounds_max.y),
+            None,
+        );
+        assert!(!refs.is_empty());
+        let Asset::Vector(cut_vector) = &app.state.project.assets[0] else {
+            panic!("cut pencil stroke must stay vector");
+        };
+        assert!(cut_vector.fill.is_none());
+        assert!(cut_vector.stroke.is_some());
+        assert!(
+            cut_vector.paths.len() >= 3,
+            "expected left + right + selected stroke pieces"
+        );
+        let moved = &cut_vector.paths[refs[0].path_idx];
+        assert!((moved.anchors[0].point.x - bounds_min.x).abs() < 0.01);
+        assert!((moved.anchors.last().unwrap().point.x - bounds_max.x).abs() < 0.01);
+
+        let mut after_delete = project;
+        assert!(crate::selection_edit::remove_raw_area_and_objects(
+            &mut after_delete,
+            placements,
+            &[],
+            *bounds_min,
+            *bounds_max,
+            None,
+            0,
+        ));
+        let Asset::Vector(remainder) = &after_delete.assets[0] else {
+            panic!("remaining pencil stroke");
+        };
+        assert_eq!(remainder.paths.len(), 2);
+        assert!(remainder.fill.is_none());
+        assert!(remainder.stroke.is_some());
+    }
+
+    #[test]
     fn lasso_clips_open_stroke_instead_of_selecting_the_whole_path() {
         let mut project = crate::state::default_project();
         project.assets.push(Asset::Vector(VectorAsset {
@@ -13112,7 +13478,7 @@ mod tests {
     }
 
     #[test]
-    fn fill_and_outline_are_independently_selectable_and_shift_combinable() {
+    fn fill_and_outline_segment_are_independently_selectable_and_shift_combinable() {
         let app = fill_and_outline_app();
         let fill = selection_at_point_pub(&app.state.project, 1, 0, Vec2::new(50.0, 50.0))
             .expect("fill selection");
@@ -13131,20 +13497,16 @@ mod tests {
         assert!(strokes.is_empty());
         assert!(objects.is_empty());
 
-        let Selection::RawParts {
-            fills: outline_fills,
-            strokes: outline_strokes,
-            objects: outline_objects,
-        } = &outline
-        else {
-            panic!("fill+stroke vector edge must select only its outline: {outline:?}");
+        let Selection::StrokeSegment(segment) = outline else {
+            panic!("clicking one rectangle side must select only that stroke segment");
         };
-        assert!(outline_fills.is_empty());
-        assert_eq!(outline_strokes.len(), 1);
-        assert!(outline_objects.is_empty());
-        assert_eq!(fills[0], outline_strokes[0]);
+        assert_eq!(segment.path, fills[0]);
+        assert_eq!(
+            segment.segment_idx, 3,
+            "left rectangle side is the closing segment"
+        );
 
-        let combined = add_selection_hit(&fill, outline);
+        let combined = add_selection_hit(&fill, Selection::StrokeSegment(segment));
         let Selection::RawParts {
             fills,
             strokes,
@@ -13157,6 +13519,111 @@ mod tests {
         assert_eq!(strokes.len(), 1);
         assert!(objects.is_empty());
         assert_eq!(fills[0], strokes[0]);
+    }
+
+    #[test]
+    fn moving_one_rectangle_stroke_segment_detaches_only_that_side() {
+        let mut app = fill_and_outline_app();
+        let selection = selection_at_point_pub(&app.state.project, 1, 0, Vec2::new(20.0, 50.0))
+            .expect("left outline segment");
+        let Selection::StrokeSegment(segment) = selection else {
+            panic!("expected editor-only stroke segment selection");
+        };
+
+        let copied = crate::selection_edit::capture_clipboard(
+            &app.state.project,
+            &Selection::StrokeSegment(segment),
+        );
+        assert_eq!(copied.raw_vectors.len(), 1);
+        assert!(copied.raw_vectors[0].vector.fill.is_none());
+        assert!(copied.raw_vectors[0].vector.stroke.is_some());
+        assert_eq!(copied.raw_vectors[0].vector.paths.len(), 1);
+        assert!(!copied.raw_vectors[0].vector.paths[0].closed);
+        assert_eq!(copied.raw_vectors[0].vector.paths[0].anchors.len(), 2);
+
+        assert!(begin_dragging_raw_stroke_segment(
+            &mut app,
+            segment,
+            Vec2::new(20.0, 50.0),
+            "move one side",
+        ));
+        let ToolState::DraggingPaths { refs, .. } = app.session.tool_state.clone() else {
+            panic!("segment drag must become ordinary raw-path dragging");
+        };
+        assert_eq!(refs.len(), 1);
+
+        // The fill remains a closed, stationary rectangle with no stroke.
+        let fill_vector = app
+            .state
+            .project
+            .assets
+            .iter()
+            .find_map(|asset| match asset {
+                Asset::Vector(vector) if vector.fill.is_some() => Some(vector),
+                _ => None,
+            })
+            .expect("stationary fill carrier");
+        assert!(fill_vector.stroke.is_none());
+        assert_eq!(fill_vector.paths.len(), 1);
+        assert!(fill_vector.paths[0].closed);
+        assert_eq!(fill_vector.paths[0].anchors[0].point, Vec2::new(20.0, 20.0));
+
+        // The unselected three sides remain ordinary visible stroke geometry.
+        let selected_asset_id = raw_placement_asset_id(
+            &app.state.project,
+            refs[0].q0rg_id,
+            refs[0].layer_id,
+            refs[0].placement_idx,
+        )
+        .expect("selected segment carrier");
+        let remainder = app
+            .state
+            .project
+            .assets
+            .iter()
+            .find_map(|asset| match asset {
+                Asset::Vector(vector)
+                    if vector.asset_id != selected_asset_id
+                        && vector.fill.is_none()
+                        && vector.stroke.is_some() =>
+                {
+                    Some(vector)
+                }
+                _ => None,
+            })
+            .expect("three-side stroke remainder");
+        assert_eq!(remainder.paths.len(), 1);
+        assert!(!remainder.paths[0].closed);
+        assert_eq!(remainder.paths[0].anchors.len(), 4);
+
+        // Move the selected side and bake the live transform: it must stay visible
+        // as one independent open stroke rather than disappearing.
+        assert!(set_raw_refs_live_transform(
+            &mut app.state.project,
+            &refs,
+            Affine {
+                tx: 15.0,
+                ..Affine::IDENTITY
+            },
+        ));
+        assert!(bake_raw_refs_live_transform(&mut app, &refs));
+        let selected = app
+            .state
+            .project
+            .assets
+            .iter()
+            .find_map(|asset| match asset {
+                Asset::Vector(vector) if vector.asset_id == selected_asset_id => Some(vector),
+                _ => None,
+            })
+            .expect("moved selected stroke segment");
+        assert!(selected.fill.is_none());
+        assert!(selected.stroke.is_some());
+        assert_eq!(selected.paths.len(), 1);
+        assert!(!selected.paths[0].closed);
+        assert_eq!(selected.paths[0].anchors.len(), 2);
+        assert!((selected.paths[0].anchors[0].point.x - 35.0).abs() < 0.001);
+        assert!((selected.paths[0].anchors[1].point.x - 35.0).abs() < 0.001);
     }
 
     #[test]
@@ -15607,7 +16074,8 @@ mod tests {
                     RawSelectionHit::Fill(refs) | RawSelectionHit::FillPart(refs) => {
                         refs.first().copied()
                     }
-                    RawSelectionHit::Path(path) | RawSelectionHit::StrokePart(path) => Some(path),
+                    RawSelectionHit::Path(path) => Some(path),
+                    RawSelectionHit::StrokePart(segment) => Some(segment.path),
                 })
                 .map(|reference| reference.placement_idx),
             Some(0),
@@ -15619,7 +16087,8 @@ mod tests {
                     RawSelectionHit::Fill(refs) | RawSelectionHit::FillPart(refs) => {
                         refs.first().copied()
                     }
-                    RawSelectionHit::Path(path) | RawSelectionHit::StrokePart(path) => Some(path),
+                    RawSelectionHit::Path(path) => Some(path),
+                    RawSelectionHit::StrokePart(segment) => Some(segment.path),
                 })
                 .map(|reference| reference.placement_idx),
             Some(selected_placement),

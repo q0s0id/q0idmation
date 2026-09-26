@@ -17,7 +17,7 @@ pub struct PasteResult {
 
 pub fn selection_can_clip(selection: &Selection) -> bool {
     match selection {
-        Selection::Placement { .. } | Selection::Path { .. } => true,
+        Selection::Placement { .. } | Selection::Path { .. } | Selection::StrokeSegment(_) => true,
         Selection::Paths(items) => !items.is_empty(),
         Selection::RawParts { .. } => false,
         Selection::Multi(items) => !items.is_empty(),
@@ -66,6 +66,16 @@ fn selected_object_placements(project: &ProjectV2, selection: &Selection) -> Vec
 }
 
 fn selected_raw_vectors(project: &ProjectV2, selection: &Selection) -> Vec<RawVectorClipboard> {
+    if let Selection::StrokeSegment(segment) = selection {
+        return crate::tools::stroke_segment_snapshot(project, *segment)
+            .map(|vector| {
+                vec![RawVectorClipboard {
+                    vector,
+                    appearance: None,
+                }]
+            })
+            .unwrap_or_default();
+    }
     let path_refs: Option<Vec<PathRef>> = match selection {
         Selection::Path {
             q0rg_id,
@@ -180,7 +190,7 @@ fn selected_raw_vectors(project: &ProjectV2, selection: &Selection) -> Vec<RawVe
         else {
             continue;
         };
-        if vector.fill.is_none() && vector.stroke.is_some() && clip_polygon.is_some() {
+        if vector.fill.is_none() && vector.stroke.is_some() {
             let (paths, _) = crate::tools::clip_stroked_paths(vector, &clip.0[0]);
             if !paths.is_empty() {
                 vectors.push(RawVectorClipboard {
@@ -639,7 +649,7 @@ pub fn remove_raw_area_and_objects(
         else {
             continue;
         };
-        if snapshot.fill.is_none() && snapshot.stroke.is_some() && clip_polygon.is_some() {
+        if snapshot.fill.is_none() && snapshot.stroke.is_some() {
             let (selected, remainder) = crate::tools::clip_stroked_paths(&snapshot, &clip.0[0]);
             if selected.is_empty() {
                 continue;

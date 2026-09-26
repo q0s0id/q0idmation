@@ -356,7 +356,8 @@ pub(crate) fn selection_can_be_deleted(selection: &crate::state::Selection) -> b
         | crate::state::Selection::Q0rg(_)
         | crate::state::Selection::Placement { .. }
         | crate::state::Selection::Path { .. }
-        | crate::state::Selection::PathPoints { .. } => true,
+        | crate::state::Selection::PathPoints { .. }
+        | crate::state::Selection::StrokeSegment(_) => true,
         crate::state::Selection::Paths(items) => !items.is_empty(),
         crate::state::Selection::RawParts {
             fills,
