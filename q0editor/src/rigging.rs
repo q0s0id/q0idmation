@@ -4865,7 +4865,7 @@ fn render_pro_graph(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
 pub fn handle_stage(
     app: &mut EditorApp,
     response: &Response,
-    painter: &Painter,
+    _painter: &Painter,
     view: &StageView,
     ctx: &Context,
 ) {
@@ -4882,7 +4882,6 @@ pub fn handle_stage(
         RigEditMode::AddBone => handle_add_bone(app, response, pointer_stage, view),
         RigEditMode::Pose => handle_pose(app, response, pointer_stage, view),
     }
-    paint_overlay(app, painter, view);
     if response.hovered() {
         ctx.set_cursor_icon(match app.session.rig_edit_mode {
             RigEditMode::AddBone => egui::CursorIcon::Crosshair,
@@ -5162,7 +5161,7 @@ fn nearest_bone(
         .min_by(|a, b| a.1.total_cmp(&b.1))
         .map(|(id, _)| id)
 }
-fn paint_overlay(app: &EditorApp, painter: &Painter, view: &StageView) {
+pub fn paint_stage_overlay(app: &EditorApp, painter: &Painter, view: &StageView) {
     let Some(rig) = rig_for_q0rg(&app.state.project, app.session.current_q0rg_id) else {
         return;
     };

@@ -78,12 +78,24 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         Stroke::new(1.0_f32, app.settings.theme.stage_border.to_color32()),
     );
 
-    // Real ProjectV2 render via egui::Painter.
     let view = StageView {
         origin: stage_rect.min,
         scale,
         stage_rect,
     };
+
+    // Resolve interaction before painting the project. egui is immediate-mode:
+    // if tools mutate the model after `render_stage`, artwork is one UI frame
+    // behind its selection handles. Input-first keeps both on the same state.
+    let editing_text = app.session.text_editor.is_some() || app.session.text_canvas_click_consumed;
+    let library_payload = response.dnd_hover_payload::<LibraryItem>();
+    let library_drag_active = library_payload.is_some();
+    let ctx = ui.ctx().clone();
+    if !library_drag_active && !editing_text {
+        crate::tools::handle(app, &response, &painter, &view, &ctx);
+    }
+    // Tool input can enter another q0rg on double-click, so resolve the scene
+    // identity only after interaction has finished for this frame.
     let q0rg_id = app.session.current_q0rg_id;
     let frame = app.session.current_frame;
     app.textures.hidden_text_placement = app
@@ -155,8 +167,6 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     // Library drag-and-drop uses the real renderer for its translucent ghost.
     // While a Library payload is over the stage, normal tools are suspended so
     // releasing the item cannot accidentally create a brush dab or marquee.
-    let library_payload = response.dnd_hover_payload::<LibraryItem>();
-    let library_drag_active = library_payload.is_some();
     if let (Some(item), Some(pointer)) =
         (library_payload.as_deref(), ui.ctx().pointer_interact_pos())
     {
@@ -223,13 +233,10 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         }
     }
 
-    // Tool interaction (Pen / Brush / Select / primitives) and overlays.
-    let ctx = ui.ctx().clone();
+    // Canvas text UI and transient overlays stay above the freshly rendered scene.
     let editing_text = crate::text_tool::render_canvas(app, ui, &view);
-    if !library_drag_active && !editing_text {
-        crate::tools::handle(app, &response, &painter, &view, &ctx);
-    }
     if !editing_text {
+        crate::tools::draw_overlay(app, &response, &painter, &view);
         crate::tools::draw_selection_overlay(app, &painter, &view);
     }
     crate::tools::draw_brush_size_preview(app, &painter, &view);

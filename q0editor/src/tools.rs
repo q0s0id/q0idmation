@@ -39,13 +39,6 @@ pub fn handle(
     view: &StageView,
     ctx: &Context,
 ) {
-    // `render_stage` runs before tool input. A brush committed on pointer-up is
-    // therefore absent from this frame's stage render, so its draft must stay
-    // visible through the release frame. Once we enter the next tool frame the
-    // committed vector has already had a chance to render and the handoff can
-    // be retired before painting overlays.
-    expire_brush_preview_handoff(app);
-
     // Temporary H/Space hand and MMB pan own the gesture completely. Do not
     // let the underlying brush/select/etc. observe the same primary events.
     // Any gesture that was already being drawn still lives in stage space,
@@ -53,7 +46,6 @@ pub fn handle(
     // screen-space preview glued to the monitor until pointer-up.
     if app.session.viewport.hand_active || app.session.viewport.panning {
         sync_classic_brush_preview_for_view(app, response, view, ctx);
-        draw_in_progress_overlay(app, painter, view);
         if response.hovered() {
             ctx.set_cursor_icon(if app.session.viewport.panning {
                 egui::CursorIcon::Grabbing
@@ -145,14 +137,24 @@ pub fn handle(
         }
     }
 
+    if response.clicked() || response.drag_stopped() {
+        ctx.request_repaint();
+    }
+}
+
+/// Paint transient tool UI only after the project scene has been rendered.
+/// Keeping model mutation in `handle` and visual overlays here ensures both
+/// the artwork and its selection/transform UI observe the same frame state.
+pub fn draw_overlay(app: &EditorApp, response: &Response, painter: &Painter, view: &StageView) {
     draw_in_progress_overlay(app, painter, view);
+    if app.session.viewport.hand_active || app.session.viewport.panning {
+        return;
+    }
     draw_brush_cursor(app, painter, view);
     draw_eraser_cursor(app, painter, view);
     draw_transform_cursor(app, response, painter, view);
-    // The stage was painted before input changed the model. Always present
-    // the committed geometry on the next frame, even after the pointer stops.
-    if response.clicked() || response.drag_stopped() {
-        ctx.request_repaint();
+    if app.session.current_tool == Tool::Rig {
+        crate::rigging::paint_stage_overlay(app, painter, view);
     }
 }
 
@@ -836,7 +838,6 @@ fn advanced_brush(app: &mut EditorApp, response: &Response, view: &StageView, ct
         if let ToolState::AdvancedBrushDrawing { stroke } =
             std::mem::replace(&mut app.session.tool_state, ToolState::Idle)
         {
-            let preview_handoff = stroke.clone();
             let region = crate::advanced_brush::advanced_finish(stroke);
             let classic_bridge = crate::brush::BrushSettings {
                 color: settings.color,
@@ -853,7 +854,6 @@ fn advanced_brush(app: &mut EditorApp, response: &Response, view: &StageView, ct
                 classic_bridge,
                 advanced_material(settings),
             );
-            app.session.advanced_brush_preview_handoff = Some(preview_handoff);
             ctx.request_repaint();
         }
         return;
@@ -1068,7 +1068,7 @@ fn classic_brush(app: &mut EditorApp, response: &Response, view: &StageView, ctx
         {
             let region = crate::brush::brush_finish(stroke, settings);
             crate::brush::commit_brush_region(app, region, settings);
-            app.session.classic_brush_preview_handoff = true;
+            app.textures.clear_classic_brush_preview();
             ctx.request_repaint();
         } else {
             app.textures.clear_classic_brush_preview();
@@ -9432,26 +9432,9 @@ fn paint_advanced_gpu_preview(
     painter.add(Shape::Mesh(advanced_preview_mesh(&dabs, view, settings)));
 }
 
-fn expire_brush_preview_handoff(app: &mut EditorApp) {
-    if std::mem::take(&mut app.session.classic_brush_preview_handoff) {
-        app.textures.clear_classic_brush_preview();
-    }
-    app.session.advanced_brush_preview_handoff = None;
-}
-
 fn draw_in_progress_overlay(app: &EditorApp, painter: &Painter, view: &StageView) {
     let red = Color32::from_rgb(0xCC, 0x33, 0x33);
     let cursor = painter.ctx().pointer_hover_pos();
-
-    // Release-frame handoff: the committed project geometry was created after
-    // this frame's stage render, so keep drawing the exact draft until the next
-    // frame swaps it for the real vector.
-    if app.session.classic_brush_preview_handoff {
-        app.textures.paint_classic_brush_preview(painter);
-    }
-    if let Some(stroke) = app.session.advanced_brush_preview_handoff.as_ref() {
-        paint_advanced_gpu_preview(painter, stroke, view);
-    }
 
     match &app.session.tool_state {
         ToolState::LassoDrawing { points } => {
@@ -12971,27 +12954,6 @@ mod tests {
             );
             assert!(surface_mismatch_area(&moved_visible, &expected_moved) < 0.05);
         }
-    }
-
-    #[test]
-    fn brush_preview_handoff_lives_for_release_frame_then_expires() {
-        let mut app = EditorApp::default();
-        app.session.classic_brush_preview_handoff = true;
-        app.session.advanced_brush_preview_handoff = Some(crate::advanced_brush::advanced_begin(
-            crate::advanced_brush::AdvancedBrushSettings::default(),
-            crate::advanced_brush::AdvancedBrushSample::mouse(Vec2::new(10.0, 12.0), 0.0),
-        ));
-
-        // These flags are what `draw_in_progress_overlay` sees during the
-        // pointer-up frame, after the committed geometry missed `render_stage`.
-        assert!(app.session.classic_brush_preview_handoff);
-        assert!(app.session.advanced_brush_preview_handoff.is_some());
-
-        // The next tool frame starts only after `render_stage` has seen the
-        // committed project, so the draft handoff must disappear here.
-        expire_brush_preview_handoff(&mut app);
-        assert!(!app.session.classic_brush_preview_handoff);
-        assert!(app.session.advanced_brush_preview_handoff.is_none());
     }
 
     #[cfg(feature = "appearance-mask-eraser")]
