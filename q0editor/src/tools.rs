@@ -104,13 +104,20 @@ pub fn handle(
         return;
     }
 
-    let cursor_stage = response
-        .hover_pos()
-        .map(|p| screen_to_stage(p, view))
-        .filter(|p| {
-            // Allow cursor while in-stage; tools clamp themselves to stage rect.
-            p.x.is_finite() && p.y.is_finite()
-        });
+    let cursor_screen = if response.is_pointer_button_down_on()
+        || response.drag_started_by(PointerButton::Primary)
+        || response.dragged_by(PointerButton::Primary)
+    {
+        response
+            .interact_pointer_pos()
+            .or_else(|| response.hover_pos())
+    } else {
+        response.hover_pos()
+    };
+    let cursor_stage = cursor_screen.map(|p| screen_to_stage(p, view)).filter(|p| {
+        // Allow cursor while in-stage; tools clamp themselves to stage rect.
+        p.x.is_finite() && p.y.is_finite()
+    });
 
     match app.session.current_tool {
         Tool::Hand => {}
@@ -8140,7 +8147,7 @@ fn skew_placement_from_cursor(
     Some(next)
 }
 
-fn valid_scale(value: f32) -> f32 {
+pub(crate) fn valid_scale(value: f32) -> f32 {
     if !value.is_finite() {
         return 1.0;
     }
@@ -11909,6 +11916,77 @@ fn find_bucket_target(
 mod tests {
     use super::*;
     use q0s_format::v2::{Layer, ProjectMeta, Q0rg};
+
+    #[test]
+    fn reflected_nested_q0rg_visible_body_remains_hittable() {
+        let mut project = crate::state::default_project();
+        project.assets.push(Asset::Vector(VectorAsset {
+            asset_id: 77,
+            paths: vec![VPath {
+                anchors: [
+                    Vec2::new(0.0, 0.0),
+                    Vec2::new(20.0, 0.0),
+                    Vec2::new(20.0, 20.0),
+                    Vec2::new(0.0, 20.0),
+                ]
+                .into_iter()
+                .map(anchor)
+                .collect(),
+                closed: true,
+            }],
+            fill: Some(Rgba {
+                r: 200,
+                g: 100,
+                b: 50,
+                a: 255,
+            }),
+            stroke: None,
+        }));
+        project.q0rgs.push(Q0rg {
+            q0rg_id: 2,
+            name: "child".into(),
+            frame_count: 1,
+            script: String::new(),
+            layers: vec![Layer {
+                layer_id: 1,
+                name: "art".into(),
+                explicit_keyframes: Vec::new(),
+                placements: vec![Placement {
+                    instance_id: 0,
+                    frame: 0,
+                    target: Target::Asset(77),
+                    transform: Transform2D::IDENTITY,
+                    tween: Tween::None,
+                    fx: Default::default(),
+                }],
+            }],
+        });
+        project.q0rgs[0].layers[0].placements.push(Placement {
+            instance_id: 0,
+            frame: 0,
+            target: Target::Q0rg(2),
+            transform: Transform2D {
+                tx: 50.0,
+                ty: 40.0,
+                sx: 1.0,
+                sy: -1.0,
+                rotation: 0.0,
+                skew_x: 0.0,
+                skew_y: 0.0,
+            },
+            tween: Tween::None,
+            fx: Default::default(),
+        });
+
+        assert_eq!(
+            placement_bbox(&project, &project.q0rgs[0].layers[0].placements[0]),
+            Some((50.0, 20.0, 70.0, 40.0)),
+        );
+        assert_eq!(
+            hit_test_selectable_placement(&project, 1, 0, Vec2::new(60.0, 30.0)),
+            Some((1, 0)),
+        );
+    }
 
     fn vector_fill_or_stroke_bounds(vector: &VectorAsset) -> Option<(f32, f32, f32, f32)> {
         let mut points = vector.paths.iter().flat_map(flatten_path);

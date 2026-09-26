@@ -4509,6 +4509,98 @@ mod tests {
     use q0s_format::v2::{Anchor, Layer, Path as VPath};
 
     #[test]
+    fn reflected_nested_q0rg_still_emits_render_shapes() {
+        let mut project = crate::state::default_project();
+        project.assets.push(Asset::Vector(VectorAsset {
+            asset_id: 77,
+            paths: vec![VPath {
+                anchors: [
+                    Vec2::new(0.0, 0.0),
+                    Vec2::new(20.0, 0.0),
+                    Vec2::new(20.0, 20.0),
+                    Vec2::new(0.0, 20.0),
+                ]
+                .into_iter()
+                .map(|point| Anchor {
+                    point,
+                    in_handle: None,
+                    out_handle: None,
+                })
+                .collect(),
+                closed: true,
+            }],
+            fill: Some(Rgba {
+                r: 200,
+                g: 100,
+                b: 50,
+                a: 255,
+            }),
+            stroke: None,
+        }));
+        project.q0rgs.push(q0s_format::v2::Q0rg {
+            q0rg_id: 2,
+            name: "child".into(),
+            frame_count: 1,
+            script: String::new(),
+            layers: vec![Layer {
+                layer_id: 1,
+                name: "art".into(),
+                explicit_keyframes: Vec::new(),
+                placements: vec![Placement {
+                    instance_id: 0,
+                    frame: 0,
+                    target: Target::Asset(77),
+                    transform: Transform2D::IDENTITY,
+                    tween: Tween::None,
+                    fx: Default::default(),
+                }],
+            }],
+        });
+        project.q0rgs[0].layers[0].placements.push(Placement {
+            instance_id: 0,
+            frame: 0,
+            target: Target::Q0rg(2),
+            transform: Transform2D {
+                tx: 50.0,
+                ty: 40.0,
+                sx: 1.0,
+                sy: -1.0,
+                rotation: 0.0,
+                skew_x: 0.0,
+                skew_y: 0.0,
+            },
+            tween: Tween::None,
+            fx: Default::default(),
+        });
+
+        let ctx = Context::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(200.0, 200.0));
+        let view = StageView {
+            origin: Pos2::ZERO,
+            scale: 1.0,
+            stage_rect: rect,
+        };
+        let mut cache = TextureCache::default();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Middle,
+                    egui::Id::new("reflected-nested-q0rg"),
+                ));
+                render_stage(&painter, &project, 1, 0, &view, &mut cache, ctx);
+            },
+        );
+        assert!(
+            !output.shapes.is_empty(),
+            "reflected q0rg emitted no shapes for its nested vector",
+        );
+    }
+
+    #[test]
     fn library_preview_bbox_includes_glow_and_blur_without_changing_object_bbox() {
         for fx in [
             PlacementFx {

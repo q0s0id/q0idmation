@@ -2717,8 +2717,8 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
                 if !p.transform.sx.is_finite() || !p.transform.sy.is_finite() {
                     return Err(Error::Validation("placement scale must be finite"));
                 }
-                if p.transform.sx <= 0.0 || p.transform.sy <= 0.0 {
-                    return Err(Error::Validation("placement scale must be positive"));
+                if p.transform.sx == 0.0 || p.transform.sy == 0.0 {
+                    return Err(Error::Validation("placement scale must be non-zero"));
                 }
                 if !p.transform.rotation.is_finite() {
                     return Err(Error::Validation("placement rotation must be finite"));
@@ -5378,6 +5378,19 @@ mod compatibility_tests {
                 }],
             }],
         }
+    }
+
+    #[test]
+    fn current_q1s_preserves_reflected_placement_scale() {
+        let mut project = legacy_project();
+        project.q0rgs[0].layers[0].placements[0].transform.sx = -1.25;
+        project.q0rgs[0].layers[0].placements[0].transform.sy = -0.75;
+
+        validate(&project).expect("reflected placement must validate");
+        let bytes = write(&project).expect("write reflected q1s");
+        let parsed = parse(&bytes).expect("parse reflected q1s");
+        assert_eq!(parsed.q0rgs[0].layers[0].placements[0].transform.sx, -1.25);
+        assert_eq!(parsed.q0rgs[0].layers[0].placements[0].transform.sy, -0.75);
     }
 
     #[test]

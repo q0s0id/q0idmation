@@ -1567,20 +1567,26 @@ fn placement_properties(
                 };
             row(ui, "X", egui::DragValue::new(&mut transform.tx).speed(0.5));
             row(ui, "Y", egui::DragValue::new(&mut transform.ty).speed(0.5));
-            row(
+            let scale_x_response = row(
                 ui,
                 "Scale X",
                 egui::DragValue::new(&mut transform.sx)
                     .speed(0.01)
-                    .clamp_range(0.01..=64.0),
+                    .clamp_range(-64.0..=64.0),
             );
-            row(
+            if scale_x_response.changed() {
+                transform.sx = crate::tools::valid_scale(transform.sx);
+            }
+            let scale_y_response = row(
                 ui,
                 "Scale Y",
                 egui::DragValue::new(&mut transform.sy)
                     .speed(0.01)
-                    .clamp_range(0.01..=64.0),
+                    .clamp_range(-64.0..=64.0),
             );
+            if scale_y_response.changed() {
+                transform.sy = crate::tools::valid_scale(transform.sy);
+            }
             let mut rotation_degrees = transform.rotation.to_degrees();
             let rotation_response = row(
                 ui,
