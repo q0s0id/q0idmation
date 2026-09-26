@@ -4,7 +4,7 @@ use egui::{
 };
 use q0s_format::v2::{Asset, Placement, ProjectV2, Rgba, Target, Transform2D, Tween};
 
-use crate::app::{Action, EditorApp};
+use crate::app::{Action, EditorApp, LibrarySelection, LibrarySource, ProjectLibrarySummary};
 use crate::render::{
     active_placements_at, placement_bbox, q0rg_frame_bbox, render_asset_preview, render_stage,
     StageView,
@@ -54,6 +54,8 @@ impl LibraryIcon {
 
 #[derive(Debug, Clone)]
 struct LibraryRow {
+    tab_id: u64,
+    library_label: String,
     key: LibraryKey,
     icon: LibraryIcon,
     name: String,
@@ -84,51 +86,106 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     });
     ui.separator();
 
-    let project_name = if app.state.project.meta.name.trim().is_empty() {
-        "untitled"
-    } else {
-        app.state.project.meta.name.as_str()
+    let libraries = app.project_library_summaries();
+    let active_tab = app.active_project_tab_id();
+    let source_is_valid = match app.library_source {
+        Some(LibrarySource::All) => !libraries.is_empty(),
+        Some(LibrarySource::Project(tab_id)) => libraries.iter().any(|lib| lib.tab_id == tab_id),
+        None => false,
     };
+    if !source_is_valid {
+        app.library_source = active_tab
+            .filter(|tab_id| libraries.iter().any(|lib| lib.tab_id == *tab_id))
+            .map(LibrarySource::Project)
+            .or_else(|| {
+                libraries
+                    .first()
+                    .map(|lib| LibrarySource::Project(lib.tab_id))
+            });
+        app.library_selection = None;
+    }
+
+    if libraries.is_empty() {
+        ui.label(
+            egui::RichText::new("No open q1s libraries")
+                .small()
+                .color(app.settings.theme.text_dim.to_color32()),
+        );
+        return;
+    }
+
+    let source = app.library_source.unwrap_or(LibrarySource::All);
+    let selected_source_text = match source {
+        LibrarySource::All => "All libraries".to_string(),
+        LibrarySource::Project(tab_id) => libraries
+            .iter()
+            .find(|lib| lib.tab_id == tab_id)
+            .map(|lib| lib.label.clone())
+            .unwrap_or_else(|| "All libraries".to_string()),
+    };
+    let mut requested_source = source;
     egui::ComboBox::from_id_source("library_project_picker")
         .width(ui.available_width())
-        .selected_text(project_name)
+        .selected_text(selected_source_text)
         .show_ui(ui, |ui| {
-            let _ = ui.selectable_label(true, project_name);
+            ui.selectable_value(&mut requested_source, LibrarySource::All, "All libraries");
+            ui.separator();
+            for library in &libraries {
+                ui.selectable_value(
+                    &mut requested_source,
+                    LibrarySource::Project(library.tab_id),
+                    &library.label,
+                );
+            }
         });
+    if requested_source != source {
+        app.library_source = Some(requested_source);
+        app.library_selection = None;
+    }
+    let source = app.library_source.unwrap_or(requested_source);
+    let showing_all = matches!(source, LibrarySource::All);
 
-    draw_preview(app, ui);
+    let mut rows = collect_rows(app, source, &libraries);
+    if app.library_selection.is_some_and(|selection| {
+        !rows
+            .iter()
+            .any(|row| row.tab_id == selection.tab_id && row.key == key_for_item(selection.item))
+    }) {
+        app.library_selection = None;
+    }
 
+    draw_preview(app, ui, app.library_selection);
+
+    let needle = app.library_search.trim().to_lowercase();
+    if !needle.is_empty() {
+        rows.retain(|row| {
+            row.name.to_lowercase().contains(&needle)
+                || row.kind.to_lowercase().contains(&needle)
+                || row.detail.to_lowercase().contains(&needle)
+                || row.library_label.to_lowercase().contains(&needle)
+        });
+    }
+    rows.sort_by_key(|row| (row.name.to_lowercase(), row.library_label.to_lowercase()));
+    if !app.library_sort_ascending {
+        rows.reverse();
+    }
+
+    let selected_active_item = app
+        .library_selection
+        .filter(|selection| Some(selection.tab_id) == active_tab)
+        .map(|selection| selection.item);
     let mut place_selected: Option<LibraryItem> = None;
     let mut enter_selected = None;
     let mut rename_selected = None;
     let mut delete_selected = None;
     ui.horizontal(|ui| {
-        let count = app
-            .state
-            .project
-            .q0rgs
-            .iter()
-            .filter(|q0rg| q0rg.q0rg_id != app.state.project.meta.entry_q0rg_id)
-            .count()
-            + app
-                .state
-                .project
-                .assets
-                .iter()
-                .filter(|asset| !matches!(asset, Asset::Rig(_)))
-                .count();
         ui.label(
-            egui::RichText::new(format!("Items: {count}"))
+            egui::RichText::new(format!("Items: {}", rows.len()))
                 .small()
                 .color(app.settings.theme.text_dim.to_color32()),
         );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let selected_item = match app.session.selection {
-                Selection::Q0rg(id) => Some(LibraryItem::Q0rg(id)),
-                Selection::Asset(id) => Some(LibraryItem::Asset(id)),
-                _ => None,
-            };
-            if let Some(item) = selected_item {
+            if let Some(item) = selected_active_item {
                 let can_place = !matches!(item, LibraryItem::Q0rg(id) if id == app.session.current_q0rg_id)
                     && !crate::audio::library_item_is_audio_only(&app.state.project, item);
                 if ui
@@ -166,35 +223,22 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     });
 
     ui.add(
-        egui::TextEdit::singleline(&mut app.session.library_search)
+        egui::TextEdit::singleline(&mut app.library_search)
             .hint_text("Search library...")
             .desired_width(f32::INFINITY),
     );
 
-    let mut rows = collect_rows(app);
-    let needle = app.session.library_search.trim().to_lowercase();
-    if !needle.is_empty() {
-        rows.retain(|row| {
-            row.name.to_lowercase().contains(&needle)
-                || row.kind.to_lowercase().contains(&needle)
-                || row.detail.to_lowercase().contains(&needle)
-        });
-    }
-    rows.sort_by_key(|row| row.name.to_lowercase());
-    if !app.session.library_sort_ascending {
-        rows.reverse();
-    }
-
     ui.add_space(3.0);
+    let columns = if showing_all { 5 } else { 4 };
     egui::Grid::new("library_header")
-        .num_columns(4)
+        .num_columns(columns)
         .min_col_width(28.0)
         .spacing([8.0, 3.0])
         .show(ui, |ui| {
             if ui
                 .selectable_label(
                     false,
-                    if app.session.library_sort_ascending {
+                    if app.library_sort_ascending {
                         "Name A-Z"
                     } else {
                         "Name Z-A"
@@ -202,11 +246,14 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 )
                 .clicked()
             {
-                app.session.library_sort_ascending = !app.session.library_sort_ascending;
+                app.library_sort_ascending = !app.library_sort_ascending;
             }
             ui.label("Type");
             ui.label("Uses");
             ui.label("ID");
+            if showing_all {
+                ui.label("Library");
+            }
             ui.end_row();
         });
     ui.separator();
@@ -224,7 +271,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     }
 
     let mut selected = None;
-    let mut enter = None;
+    let mut enter: Option<(u64, u16)> = None;
     let mut rename = None;
     let mut delete = None;
     egui::ScrollArea::vertical()
@@ -232,70 +279,75 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         .show(ui, |ui| {
             egui::Grid::new("library_items")
                 .striped(true)
-                .num_columns(4)
+                .num_columns(columns)
                 .min_col_width(28.0)
                 .spacing([8.0, 2.0])
                 .show(ui, |ui| {
                     for row in &rows {
-                        let is_selected = match row.key {
-                            LibraryKey::Q0rg(id) => {
-                                matches!(app.session.selection, Selection::Q0rg(selected) if selected == id)
-                            }
-                            LibraryKey::Asset(id) => {
-                                matches!(app.session.selection, Selection::Asset(selected) if selected == id)
-                            }
-                        };
-                        let (kind_tag, id, payload) = match row.key {
-                            LibraryKey::Q0rg(id) => (0_u8, id, LibraryItem::Q0rg(id)),
-                            LibraryKey::Asset(id) => (1_u8, id, LibraryItem::Asset(id)),
-                        };
-                        let drag = ui.dnd_drag_source(
-                            egui::Id::new(("library_drag", kind_tag, id)),
-                            payload,
-                            |ui| {
-                                library_name_cell(
-                                    ui,
-                                    is_selected,
-                                    row.icon,
-                                    &truncate_label(&row.name, 28),
-                                    app.settings.theme.accent.to_color32(),
-                                )
+                        let payload = item_for_key(row.key);
+                        let is_selected = app.library_selection.is_some_and(|selection| {
+                            selection.tab_id == row.tab_id && selection.item == payload
+                        });
+                        let row_is_active = Some(row.tab_id) == active_tab;
+                        let response = library_name_cell(
+                            ui,
+                            is_selected,
+                            row.icon,
+                            &truncate_label(&row.name, 28),
+                            app.settings.theme.accent.to_color32(),
+                            if row_is_active {
+                                Sense::click_and_drag()
+                            } else {
+                                Sense::click()
                             },
                         );
-                        let drag_hint = if crate::audio::library_item_is_audio_only(
-                            &app.state.project,
-                            payload,
-                        ) {
-                            "Drag onto timeline to place"
+                        if row_is_active {
+                            // Use the row's own stable interaction for drag-and-drop.
+                            // This keeps it clickable and prevents dnd_drag_source from
+                            // moving the widget to a tooltip layer while it is inside
+                            // the scrolling grid.
+                            response.dnd_set_drag_payload(payload);
+                        }
+                        let drag_hint = if row_is_active {
+                            if crate::audio::library_item_is_audio_only(&app.state.project, payload)
+                            {
+                                "Drag onto timeline to place"
+                            } else {
+                                "Drag onto stage to place"
+                            }
                         } else {
-                            "Drag onto stage to place"
+                            "Open its q1s to edit or place this item"
                         };
-                        let response = drag
-                            .response
-                            .on_hover_text(format!("{}\n{}\n{drag_hint}", row.name, row.detail));
-                        response.clone().context_menu(|ui| {
-                            if can_rename_item(app, payload) && ui.button("Rename").clicked() {
-                                rename = Some(payload);
-                                ui.close_menu();
-                            }
-                            let can_delete = !matches!(
-                                payload,
-                                LibraryItem::Q0rg(id)
-                                    if id == app.state.project.meta.entry_q0rg_id
-                            );
-                            if can_delete && ui.button("Delete").clicked() {
-                                delete = Some(payload);
-                                ui.close_menu();
-                            }
-                        });
-                        if response.clicked() {
-                            selected = Some(row.key);
+                        let response = response.on_hover_text(format!(
+                            "{}\n{}\n{}\n{drag_hint}",
+                            row.name, row.detail, row.library_label
+                        ));
+                        if row_is_active {
+                            response.clone().context_menu(|ui| {
+                                if can_rename_item(app, payload) && ui.button("Rename").clicked() {
+                                    rename = Some(payload);
+                                    ui.close_menu();
+                                }
+                                let can_delete = !matches!(
+                                    payload,
+                                    LibraryItem::Q0rg(id)
+                                        if id == app.state.project.meta.entry_q0rg_id
+                                );
+                                if can_delete && ui.button("Delete").clicked() {
+                                    delete = Some(payload);
+                                    ui.close_menu();
+                                }
+                            });
+                        }
+                        if response.clicked() || response.drag_started() {
+                            selected = Some(LibrarySelection {
+                                tab_id: row.tab_id,
+                                item: payload,
+                            });
                         }
                         if response.double_clicked() {
                             if let LibraryKey::Q0rg(id) = row.key {
-                                if id != app.session.current_q0rg_id {
-                                    enter = Some(id);
-                                }
+                                enter = Some((row.tab_id, id));
                             }
                         }
                         ui.label(row.kind);
@@ -303,16 +355,22 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         ui.label(match row.key {
                             LibraryKey::Q0rg(id) | LibraryKey::Asset(id) => id.to_string(),
                         });
+                        if showing_all {
+                            ui.label(&row.library_label);
+                        }
                         ui.end_row();
                     }
                 });
         });
 
-    if let Some(key) = selected {
-        app.session.selection = match key {
-            LibraryKey::Q0rg(id) => Selection::Q0rg(id),
-            LibraryKey::Asset(id) => Selection::Asset(id),
-        };
+    if let Some(selection) = selected {
+        app.library_selection = Some(selection);
+        if Some(selection.tab_id) == active_tab {
+            app.session.selection = match selection.item {
+                LibraryItem::Q0rg(id) => Selection::Q0rg(id),
+                LibraryItem::Asset(id) => Selection::Asset(id),
+            };
+        }
     }
     if let Some(item) = place_selected {
         let center = q0s_format::v2::Vec2::new(
@@ -321,7 +379,12 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         );
         app.queue(Action::PlaceLibraryItemAt(item, center));
     }
-    if let Some(id) = enter.or(enter_selected) {
+    if let Some((tab_id, id)) = enter {
+        if Some(tab_id) != active_tab {
+            app.queue(Action::SwitchDocumentTab(tab_id));
+        }
+        app.queue(Action::EnterQ0rg(id));
+    } else if let Some(id) = enter_selected {
         app.queue(Action::EnterQ0rg(id));
     }
     if ui.input(|input| input.key_pressed(egui::Key::F2)) {
@@ -337,10 +400,21 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
 }
 
 fn selected_library_item(app: &EditorApp) -> Option<LibraryItem> {
-    match app.session.selection {
-        Selection::Q0rg(id) => Some(LibraryItem::Q0rg(id)),
-        Selection::Asset(id) => Some(LibraryItem::Asset(id)),
-        _ => None,
+    let selection = app.library_selection?;
+    (Some(selection.tab_id) == app.active_project_tab_id()).then_some(selection.item)
+}
+
+fn key_for_item(item: LibraryItem) -> LibraryKey {
+    match item {
+        LibraryItem::Q0rg(id) => LibraryKey::Q0rg(id),
+        LibraryItem::Asset(id) => LibraryKey::Asset(id),
+    }
+}
+
+fn item_for_key(key: LibraryKey) -> LibraryItem {
+    match key {
+        LibraryKey::Q0rg(id) => LibraryItem::Q0rg(id),
+        LibraryKey::Asset(id) => LibraryItem::Asset(id),
     }
 }
 
@@ -473,6 +547,7 @@ fn library_name_cell(
     icon: LibraryIcon,
     name: &str,
     accent: Color32,
+    sense: Sense,
 ) -> Response {
     let button_padding = ui.spacing().button_padding;
     let galley = egui::WidgetText::from(name.to_owned()).into_galley(
@@ -486,7 +561,7 @@ fn library_name_cell(
         button_padding.x * 2.0 + LIBRARY_ICON_SIZE + LIBRARY_ICON_GAP + galley.size().x,
         (button_padding.y * 2.0 + content_height).max(ui.spacing().interact_size.y),
     );
-    let (rect, response) = ui.allocate_at_least(desired_size, Sense::click());
+    let (rect, response) = ui.allocate_at_least(desired_size, sense);
     response.widget_info(|| {
         WidgetInfo::selected(WidgetType::SelectableLabel, selected, name.to_owned())
     });
@@ -631,8 +706,32 @@ fn draw_library_icon(
     }
 }
 
-fn collect_rows(app: &EditorApp) -> Vec<LibraryRow> {
-    let project = &app.state.project;
+fn collect_rows(
+    app: &EditorApp,
+    source: LibrarySource,
+    libraries: &[ProjectLibrarySummary],
+) -> Vec<LibraryRow> {
+    let mut rows = Vec::new();
+    for library in libraries {
+        if matches!(source, LibrarySource::Project(tab_id) if tab_id != library.tab_id) {
+            continue;
+        }
+        if let Some(project) = app.project_for_document_tab(library.tab_id) {
+            rows.extend(collect_rows_for_project(
+                project,
+                library.tab_id,
+                &library.label,
+            ));
+        }
+    }
+    rows
+}
+
+fn collect_rows_for_project(
+    project: &ProjectV2,
+    tab_id: u64,
+    library_label: &str,
+) -> Vec<LibraryRow> {
     let mut rows = Vec::with_capacity(project.q0rgs.len() + project.assets.len());
     for q0rg in &project.q0rgs {
         if q0rg.q0rg_id == project.meta.entry_q0rg_id {
@@ -646,6 +745,8 @@ fn collect_rows(app: &EditorApp) -> Vec<LibraryRow> {
             .filter(|placement| matches!(placement.target, Target::Q0rg(id) if id == q0rg.q0rg_id))
             .count();
         rows.push(LibraryRow {
+            tab_id,
+            library_label: library_label.to_string(),
             key: LibraryKey::Q0rg(q0rg.q0rg_id),
             icon: LibraryIcon::for_q0rg(q0rg.q0rg_id, project.meta.entry_q0rg_id),
             name: q0rg.name.clone(),
@@ -753,6 +854,8 @@ fn collect_rows(app: &EditorApp) -> Vec<LibraryRow> {
             ),
         };
         rows.push(LibraryRow {
+            tab_id,
+            library_label: library_label.to_string(),
             key: LibraryKey::Asset(id),
             icon: LibraryIcon::for_asset(asset),
             name,
@@ -764,129 +867,122 @@ fn collect_rows(app: &EditorApp) -> Vec<LibraryRow> {
     rows
 }
 
-fn draw_preview(app: &mut EditorApp, ui: &mut Ui) {
+fn draw_preview(app: &mut EditorApp, ui: &mut Ui, selection: Option<LibrarySelection>) {
     let height = (ui.clip_rect().bottom() - ui.cursor().top() - 145.0).clamp(64.0, 142.0);
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
     let border = app.settings.theme.stroke_dark.to_color32();
-    let painter = ui.painter_at(rect).with_clip_rect(rect);
-    painter.rect_filled(rect, 0.0, app.settings.theme.deep_bg.to_color32());
-    painter.rect_stroke(rect, 0.0, Stroke::new(1.0_f32, border));
-
-    let key = match app.session.selection {
-        Selection::Q0rg(id) => LibraryKey::Q0rg(id),
-        Selection::Asset(id) => LibraryKey::Asset(id),
-        _ => LibraryKey::Q0rg(app.session.current_q0rg_id),
-    };
-    let frame = match key {
-        LibraryKey::Q0rg(id) if id == app.session.current_q0rg_id => app.session.current_frame,
-        _ => 0,
-    };
-    let background = preview_background_for_key(&app.state.project, key, frame);
+    let text_dim = app.settings.theme.text_dim.to_color32();
+    let deep_bg = app.settings.theme.deep_bg.to_color32();
+    let window_fill = ui.visuals().window_fill();
     let preview_light = app.settings.theme.library_preview_light.to_color32();
     let preview_dark = app.settings.theme.library_preview_dark.to_color32();
+    let painter = ui.painter_at(rect).with_clip_rect(rect);
+    painter.rect_filled(rect, 0.0, deep_bg);
+    painter.rect_stroke(rect, 0.0, Stroke::new(1.0_f32, border));
 
-    let label = match key {
-        LibraryKey::Q0rg(id) => app
-            .state
-            .project
-            .q0rgs
-            .iter()
-            .find(|q0rg| q0rg.q0rg_id == id)
-            .map(|q0rg| q0rg.name.as_str())
-            .unwrap_or("Missing q0rg"),
-        LibraryKey::Asset(id) => app
-            .state
-            .project
-            .assets
-            .iter()
-            .find(|asset| asset.id() == id)
-            .map(|asset| match asset {
-                Asset::Vector(_) => app
-                    .state
-                    .project
-                    .asset_names
-                    .get(&id)
-                    .map(String::as_str)
-                    .unwrap_or("Vector asset"),
-                Asset::Bitmap(_) => "Bitmap asset",
-                Asset::Q0v(_) => app
-                    .state
-                    .project
-                    .asset_names
-                    .get(&id)
-                    .map(String::as_str)
-                    .unwrap_or("Video asset"),
-                Asset::Rig(_) => "Rig metadata",
-            })
-            .unwrap_or("Missing asset"),
-    };
-    painter.text(
-        rect.left_top() + vec2(7.0, 6.0),
-        egui::Align2::LEFT_TOP,
-        label,
-        FontId::proportional(11.0),
-        app.settings.theme.text_dim.to_color32(),
-    );
-
-    let content_rect = Rect::from_min_max(rect.min + vec2(8.0, 23.0), rect.max - vec2(8.0, 8.0));
-    draw_preview_background(
-        &painter,
-        content_rect,
-        background,
-        preview_light,
-        preview_dark,
-    );
-    painter.rect_stroke(
-        content_rect,
-        0.0,
-        Stroke::new(1.0_f32, border.gamma_multiply(0.8)),
-    );
-    let bbox = match key {
-        LibraryKey::Q0rg(id) => q0rg_frame_bbox(&app.state.project, id, frame),
-        LibraryKey::Asset(id) => placement_bbox(
-            &app.state.project,
-            &Placement {
-                instance_id: 0,
-                frame: 0,
-                target: Target::Asset(id),
-                transform: Transform2D::IDENTITY,
-                tween: Tween::None,
-                fx: Default::default(),
-            },
-        ),
-    };
-
-    let Some(bounds) = bbox else {
-        painter.rect_filled(content_rect, 4.0, ui.visuals().window_fill());
+    let Some(selection) = selection else {
         painter.text(
-            content_rect.center(),
+            rect.center(),
             egui::Align2::CENTER_CENTER,
-            "No artwork yet",
+            "Select a library item",
             FontId::proportional(12.0),
-            app.settings.theme.text_dim.to_color32(),
+            text_dim,
         );
         return;
     };
-    let view = preview_view(content_rect, bounds);
-    match key {
-        LibraryKey::Q0rg(id) => render_stage(
+    let key = key_for_item(selection.item);
+    let ctx = ui.ctx().clone();
+    let _ = app.with_project_library_view_mut(selection.tab_id, |project, session, textures| {
+        let frame = match key {
+            LibraryKey::Q0rg(id) if id == session.current_q0rg_id => session.current_frame,
+            _ => 0,
+        };
+        let background = preview_background_for_key(project, key, frame);
+        let label = match key {
+            LibraryKey::Q0rg(id) => project
+                .q0rgs
+                .iter()
+                .find(|q0rg| q0rg.q0rg_id == id)
+                .map(|q0rg| q0rg.name.as_str())
+                .unwrap_or("Missing q0rg"),
+            LibraryKey::Asset(id) => project
+                .assets
+                .iter()
+                .find(|asset| asset.id() == id)
+                .map(|asset| match asset {
+                    Asset::Vector(_) => project
+                        .asset_names
+                        .get(&id)
+                        .map(String::as_str)
+                        .unwrap_or("Vector asset"),
+                    Asset::Bitmap(_) => "Bitmap asset",
+                    Asset::Q0v(_) => project
+                        .asset_names
+                        .get(&id)
+                        .map(String::as_str)
+                        .unwrap_or("Video asset"),
+                    Asset::Rig(_) => "Rig metadata",
+                })
+                .unwrap_or("Missing asset"),
+        };
+        painter.text(
+            rect.left_top() + vec2(7.0, 6.0),
+            egui::Align2::LEFT_TOP,
+            label,
+            FontId::proportional(11.0),
+            text_dim,
+        );
+
+        let content_rect =
+            Rect::from_min_max(rect.min + vec2(8.0, 23.0), rect.max - vec2(8.0, 8.0));
+        draw_preview_background(
             &painter,
-            &app.state.project,
-            id,
-            frame,
-            &view,
-            &mut app.textures,
-            ui.ctx(),
-        ),
-        LibraryKey::Asset(id) => render_asset_preview(
-            &painter,
-            &app.state.project,
-            id,
-            &view,
-            &mut app.textures,
-            ui.ctx(),
-        ),
-    }
+            content_rect,
+            background,
+            preview_light,
+            preview_dark,
+        );
+        painter.rect_stroke(
+            content_rect,
+            0.0,
+            Stroke::new(1.0_f32, border.gamma_multiply(0.8)),
+        );
+        let bbox = match key {
+            LibraryKey::Q0rg(id) => q0rg_frame_bbox(project, id, frame),
+            LibraryKey::Asset(id) => placement_bbox(
+                project,
+                &Placement {
+                    instance_id: 0,
+                    frame: 0,
+                    target: Target::Asset(id),
+                    transform: Transform2D::IDENTITY,
+                    tween: Tween::None,
+                    fx: Default::default(),
+                },
+            ),
+        };
+
+        let Some(bounds) = bbox else {
+            painter.rect_filled(content_rect, 4.0, window_fill);
+            painter.text(
+                content_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "No artwork yet",
+                FontId::proportional(12.0),
+                text_dim,
+            );
+            return;
+        };
+        let view = preview_view(content_rect, bounds);
+        match key {
+            LibraryKey::Q0rg(id) => {
+                render_stage(&painter, project, id, frame, &view, textures, &ctx)
+            }
+            LibraryKey::Asset(id) => {
+                render_asset_preview(&painter, project, id, &view, textures, &ctx)
+            }
+        }
+    });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1127,7 +1223,7 @@ mod tests {
     #[test]
     fn entry_stage_is_not_a_draggable_library_item() {
         let app = EditorApp::default();
-        let rows = collect_rows(&app);
+        let rows = collect_rows_for_project(&app.state.project, 1, "test.q1s");
         assert!(rows.iter().all(|row| !matches!(
             row.key,
             LibraryKey::Q0rg(id) if id == app.state.project.meta.entry_q0rg_id
@@ -1181,7 +1277,7 @@ mod tests {
             .asset_names
             .insert(7, "hero vector".to_string());
 
-        let rows = collect_rows(&app);
+        let rows = collect_rows_for_project(&app.state.project, 1, "test.q1s");
         assert_eq!(
             rows.iter()
                 .find(|row| row.key == LibraryKey::Asset(7))

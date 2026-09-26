@@ -51,6 +51,10 @@ pub struct EditorApp {
     audio_playback: Option<crate::audio::EditorAudioPlayback>,
     external_open_inbox: Option<crate::single_instance::ExternalOpenInbox>,
     show_project_tree: bool,
+    pub(crate) library_source: Option<LibrarySource>,
+    pub(crate) library_selection: Option<LibrarySelection>,
+    pub(crate) library_search: String,
+    pub(crate) library_sort_ascending: bool,
     document_tabs: Vec<DocumentTab>,
     active_document_tab: Option<u64>,
     last_document_tab: Option<u64>,
@@ -118,6 +122,25 @@ pub struct DocumentTabSummary {
     pub kind: DocumentKindSummary,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LibrarySource {
+    All,
+    Project(u64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LibrarySelection {
+    pub tab_id: u64,
+    pub item: LibraryItem,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectLibrarySummary {
+    pub tab_id: u64,
+    pub label: String,
+    pub active: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewProjectSpec {
     pub name: String,
@@ -140,6 +163,50 @@ fn project_tab_title(project_name: &str, path: Option<&std::path::Path>) -> Stri
         "untitled".to_string()
     } else {
         project_name.to_string()
+    }
+}
+
+fn project_library_title(project_name: &str, path: Option<&std::path::Path>) -> String {
+    if let Some(file_name) = path
+        .and_then(std::path::Path::file_name)
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+    {
+        return file_name.to_string();
+    }
+
+    let name = project_name.trim();
+    let name = if name.is_empty() { "untitled" } else { name };
+    if name.to_ascii_lowercase().ends_with(".q1s") {
+        name.to_string()
+    } else {
+        format!("{name}.q1s")
+    }
+}
+
+fn unique_symbol_name(
+    project: &ProjectV2,
+    requested: &str,
+    exclude_q0rg_id: Option<u16>,
+) -> String {
+    let base = requested.trim();
+    let occupied = |candidate: &str| {
+        project
+            .q0rgs
+            .iter()
+            .any(|q0rg| Some(q0rg.q0rg_id) != exclude_q0rg_id && q0rg.name == candidate)
+    };
+    if !occupied(base) {
+        return base.to_string();
+    }
+
+    let mut suffix = 2_u32;
+    loop {
+        let candidate = format!("{base} #{suffix}");
+        if !occupied(&candidate) {
+            return candidate;
+        }
+        suffix = suffix.saturating_add(1);
     }
 }
 impl Default for NewProjectSpec {
@@ -442,6 +509,10 @@ impl Default for EditorApp {
             audio_playback: None,
             external_open_inbox: None,
             show_project_tree: false,
+            library_source: None,
+            library_selection: None,
+            library_search: String::new(),
+            library_sort_ascending: true,
             document_tabs: Vec::new(),
             active_document_tab: None,
             last_document_tab: None,
@@ -567,6 +638,82 @@ impl EditorApp {
                 }
             })
             .collect()
+    }
+
+    pub(crate) fn project_library_summaries(&self) -> Vec<ProjectLibrarySummary> {
+        self.document_tabs
+            .iter()
+            .filter_map(|tab| {
+                let active = self.active_document_tab == Some(tab.id) && self.project_active;
+                let DocumentKind::Project { workspace } = &tab.kind else {
+                    return None;
+                };
+                let (project_name, path) = if active {
+                    (
+                        self.state.project.meta.name.as_str(),
+                        self.state.file_path.as_deref(),
+                    )
+                } else {
+                    let workspace = workspace.as_ref()?;
+                    (
+                        workspace.state.project.meta.name.as_str(),
+                        workspace.state.file_path.as_deref(),
+                    )
+                };
+                Some(ProjectLibrarySummary {
+                    tab_id: tab.id,
+                    label: project_library_title(project_name, path),
+                    active,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn active_project_tab_id(&self) -> Option<u64> {
+        if self.project_active {
+            self.active_document_tab
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn project_for_document_tab(&self, tab_id: u64) -> Option<&ProjectV2> {
+        if self.active_document_tab == Some(tab_id) && self.project_active {
+            return Some(&self.state.project);
+        }
+        let tab = self.document_tabs.iter().find(|tab| tab.id == tab_id)?;
+        match &tab.kind {
+            DocumentKind::Project { workspace } => {
+                workspace.as_ref().map(|workspace| &workspace.state.project)
+            }
+            DocumentKind::Q0lang(_) => None,
+        }
+    }
+
+    pub(crate) fn with_project_library_view_mut<R>(
+        &mut self,
+        tab_id: u64,
+        render: impl FnOnce(&ProjectV2, &Session, &mut TextureCache) -> R,
+    ) -> Option<R> {
+        if self.active_document_tab == Some(tab_id) && self.project_active {
+            return Some(render(
+                &self.state.project,
+                &self.session,
+                &mut self.textures,
+            ));
+        }
+        let tab = self.document_tabs.iter_mut().find(|tab| tab.id == tab_id)?;
+        match &mut tab.kind {
+            DocumentKind::Project { workspace } => {
+                let workspace = workspace.as_mut()?;
+                Some(render(
+                    &workspace.state.project,
+                    &workspace.session,
+                    &mut workspace.textures,
+                ))
+            }
+            DocumentKind::Q0lang(_) => None,
+        }
     }
 
     pub(crate) fn active_q0lang_document_mut(&mut self) -> Option<&mut Q0langDocument> {
@@ -2087,9 +2234,11 @@ impl EditorApp {
                     .max()
                     .unwrap_or(0)
                     + 1;
+                let symbol_name =
+                    unique_symbol_name(&self.state.project, &format!("Symbol {next_id}"), None);
                 self.state.project.q0rgs.push(Q0rg {
                     q0rg_id: next_id,
-                    name: format!("Symbol {next_id}"),
+                    name: symbol_name,
                     frame_count: 24,
                     script: String::new(),
                     layers: vec![Layer {
@@ -2122,11 +2271,12 @@ impl EditorApp {
                             .q0rgs
                             .iter()
                             .find(|q0rg| q0rg.q0rg_id == q0rg_id)
-                            .map(|q0rg| q0rg.name.as_str())
+                            .map(|q0rg| q0rg.name.clone())
                         else {
                             self.session.status = "symbol no longer exists".to_string();
                             return;
                         };
+                        let name = unique_symbol_name(&self.state.project, &name, Some(q0rg_id));
                         if current_name == name {
                             self.session.status = "symbol name unchanged".to_string();
                             return;
@@ -3737,9 +3887,11 @@ impl EditorApp {
                 .unwrap_or(0)
                 .saturating_add(1)
                 .max(1);
+            let symbol_name =
+                unique_symbol_name(&self.state.project, &format!("Symbol {new_q0rg_id}"), None);
             self.state.project.q0rgs.push(Q0rg {
                 q0rg_id: new_q0rg_id,
-                name: format!("Symbol {new_q0rg_id}"),
+                name: symbol_name,
                 frame_count: 1,
                 script: String::new(),
                 layers: vec![Layer {
@@ -3958,9 +4110,11 @@ impl EditorApp {
                 placements,
             })
             .collect();
+        let symbol_name =
+            unique_symbol_name(&self.state.project, &format!("Symbol {new_q0rg_id}"), None);
         self.state.project.q0rgs.push(Q0rg {
             q0rg_id: new_q0rg_id,
-            name: format!("Symbol {new_q0rg_id}"),
+            name: symbol_name,
             frame_count: 1,
             script: String::new(),
             layers: new_layers,
@@ -8468,6 +8622,66 @@ mod tests {
             .map(|tab| tab.title.as_str())
             .collect::<Vec<_>>();
         assert_eq!(titles, vec!["APPROVED", "smoke-lag"]);
+    }
+
+    #[test]
+    fn library_picker_uses_q1s_file_names_and_keeps_all_libraries_distinct() {
+        let mut app = EditorApp::default();
+        app.handle(
+            &Context::default(),
+            Action::CreateProject(NewProjectSpec {
+                name: "All libraries".to_string(),
+                ..NewProjectSpec::default()
+            }),
+        );
+        app.state.file_path = Some(PathBuf::from(r"F:\projects\All libraries.q1s"));
+
+        app.handle(
+            &Context::default(),
+            Action::CreateProject(NewProjectSpec {
+                name: "Other".to_string(),
+                ..NewProjectSpec::default()
+            }),
+        );
+
+        let libraries = app.project_library_summaries();
+        let labels = libraries
+            .iter()
+            .map(|library| library.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["All libraries.q1s", "Other.q1s"]);
+        assert!(!labels.contains(&"All libraries"));
+    }
+
+    #[test]
+    fn duplicate_symbol_names_get_hash_suffixes_instead_of_failing() {
+        let mut app = EditorApp::default();
+        for _ in 0..3 {
+            app.handle(&Context::default(), Action::AddQ0rg);
+        }
+
+        app.handle(
+            &Context::default(),
+            Action::RenameLibraryItem(LibraryItem::Q0rg(2), "Hero".to_string()),
+        );
+        app.handle(
+            &Context::default(),
+            Action::RenameLibraryItem(LibraryItem::Q0rg(3), "Hero".to_string()),
+        );
+        app.handle(
+            &Context::default(),
+            Action::RenameLibraryItem(LibraryItem::Q0rg(4), "Hero".to_string()),
+        );
+
+        let names = app
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .filter(|q0rg| q0rg.q0rg_id >= 2)
+            .map(|q0rg| q0rg.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["Hero", "Hero #2", "Hero #3"]);
     }
     #[test]
     fn home_and_document_tabs_preserve_independent_document_state() {
