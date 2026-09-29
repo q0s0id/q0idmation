@@ -1,3 +1,7 @@
+use std::collections::{hash_map::DefaultHasher, HashMap};
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+
 use egui::{
     pos2, vec2, Align, Color32, FontId, Layout, Rect, Response, Sense, Stroke, TextStyle, Ui,
     WidgetInfo, WidgetType,
@@ -9,7 +13,7 @@ use crate::render::{
     active_placements_at, placement_bbox, q0rg_frame_bbox, render_asset_preview, render_stage,
     StageView,
 };
-use crate::state::{LibraryItem, LibraryRename, Selection};
+use crate::state::{LibraryDragPayload, LibraryItem, LibraryRename, Selection};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LibraryKey {
@@ -62,6 +66,103 @@ struct LibraryRow {
     kind: &'static str,
     uses: usize,
     detail: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LibraryCache {
+    key: u64,
+    rows: Arc<Vec<LibraryRow>>,
+}
+
+impl Default for LibraryCache {
+    fn default() -> Self {
+        Self {
+            key: u64::MAX,
+            rows: Arc::new(Vec::new()),
+        }
+    }
+}
+
+fn hash_library_project(project: &ProjectV2, hasher: &mut impl Hasher) {
+    project.meta.entry_q0rg_id.hash(hasher);
+    project.q0rgs.len().hash(hasher);
+    project.assets.len().hash(hasher);
+    project.asset_names.len().hash(hasher);
+    for q0rg in &project.q0rgs {
+        q0rg.q0rg_id.hash(hasher);
+        q0rg.name.hash(hasher);
+        q0rg.frame_count.hash(hasher);
+        q0rg.layers.len().hash(hasher);
+        for layer in &q0rg.layers {
+            layer.placements.len().hash(hasher);
+            for placement in &layer.placements {
+                match placement.target {
+                    Target::Q0rg(id) => {
+                        0_u8.hash(hasher);
+                        id.hash(hasher);
+                    }
+                    Target::Asset(id) => {
+                        1_u8.hash(hasher);
+                        id.hash(hasher);
+                    }
+                }
+            }
+        }
+    }
+    for asset in &project.assets {
+        let id = asset.id();
+        id.hash(hasher);
+        project.asset_names.get(&id).hash(hasher);
+        match asset {
+            Asset::Bitmap(bitmap) => {
+                0_u8.hash(hasher);
+                bitmap.width.hash(hasher);
+                bitmap.height.hash(hasher);
+            }
+            Asset::Vector(vector) => {
+                1_u8.hash(hasher);
+                vector.paths.len().hash(hasher);
+            }
+            Asset::Q0v(video) => {
+                2_u8.hash(hasher);
+                video.bytes.len().hash(hasher);
+            }
+            Asset::Rig(rig) => {
+                3_u8.hash(hasher);
+                rig.nodes.len().hash(hasher);
+                rig.controls.len().hash(hasher);
+            }
+        }
+    }
+}
+
+fn library_rows_cache_key(
+    app: &EditorApp,
+    source: LibrarySource,
+    libraries: &[ProjectLibrarySummary],
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    match source {
+        LibrarySource::All => 0_u8.hash(&mut hasher),
+        LibrarySource::Project(tab_id) => {
+            1_u8.hash(&mut hasher);
+            tab_id.hash(&mut hasher);
+        }
+    }
+    app.library_search.hash(&mut hasher);
+    app.library_sort_ascending.hash(&mut hasher);
+    for library in libraries {
+        if matches!(source, LibrarySource::Project(tab_id) if tab_id != library.tab_id) {
+            continue;
+        }
+        library.tab_id.hash(&mut hasher);
+        library.label.hash(&mut hasher);
+        let Some(project) = app.project_for_document_tab(library.tab_id) else {
+            continue;
+        };
+        hash_library_project(project, &mut hasher);
+    }
+    hasher.finish()
 }
 
 pub fn render(app: &mut EditorApp, ui: &mut Ui) {
@@ -145,7 +246,28 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     let source = app.library_source.unwrap_or(requested_source);
     let showing_all = matches!(source, LibrarySource::All);
 
-    let mut rows = collect_rows(app, source, &libraries);
+    let cache_key = library_rows_cache_key(app, source, &libraries);
+    if app.library_cache.key != cache_key {
+        let mut rows = collect_rows(app, source, &libraries);
+        let needle = app.library_search.trim().to_lowercase();
+        if !needle.is_empty() {
+            rows.retain(|row| {
+                row.name.to_lowercase().contains(&needle)
+                    || row.kind.to_lowercase().contains(&needle)
+                    || row.detail.to_lowercase().contains(&needle)
+                    || row.library_label.to_lowercase().contains(&needle)
+            });
+        }
+        rows.sort_by_cached_key(|row| (row.name.to_lowercase(), row.library_label.to_lowercase()));
+        if !app.library_sort_ascending {
+            rows.reverse();
+        }
+        app.library_cache = LibraryCache {
+            key: cache_key,
+            rows: Arc::new(rows),
+        };
+    }
+    let rows = Arc::clone(&app.library_cache.rows);
     if app.library_selection.is_some_and(|selection| {
         !rows
             .iter()
@@ -157,18 +279,6 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     draw_preview(app, ui, app.library_selection);
 
     let needle = app.library_search.trim().to_lowercase();
-    if !needle.is_empty() {
-        rows.retain(|row| {
-            row.name.to_lowercase().contains(&needle)
-                || row.kind.to_lowercase().contains(&needle)
-                || row.detail.to_lowercase().contains(&needle)
-                || row.library_label.to_lowercase().contains(&needle)
-        });
-    }
-    rows.sort_by_key(|row| (row.name.to_lowercase(), row.library_label.to_lowercase()));
-    if !app.library_sort_ascending {
-        rows.reverse();
-    }
 
     let selected_active_item = app
         .library_selection
@@ -274,57 +384,61 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     let mut enter: Option<(u64, u16)> = None;
     let mut rename = None;
     let mut delete = None;
+    // Only instantiate widgets for rows intersecting the viewport. A large FLA can
+    // contain tens of thousands of library items; building every egui row every
+    // frame is pure off-screen work.
+    let row_height = ui.spacing().interact_size.y;
     egui::ScrollArea::vertical()
+        .id_source(LIBRARY_ITEMS_SCROLL_ID)
         .auto_shrink([false, true])
-        .show(ui, |ui| {
+        .show_rows(ui, row_height, rows.len(), |ui, visible_rows| {
             egui::Grid::new("library_items")
                 .striped(true)
                 .num_columns(columns)
                 .min_col_width(28.0)
                 .spacing([8.0, 2.0])
                 .show(ui, |ui| {
-                    for row in &rows {
+                    for row in &rows[visible_rows] {
                         let payload = item_for_key(row.key);
                         let is_selected = app.library_selection.is_some_and(|selection| {
                             selection.tab_id == row.tab_id && selection.item == payload
                         });
                         let row_is_active = Some(row.tab_id) == active_tab;
+                        let drag_payload = LibraryDragPayload {
+                            source_tab_id: row.tab_id,
+                            item: payload,
+                        };
                         let response = library_name_cell(
                             ui,
                             is_selected,
                             row.icon,
                             &truncate_label(&row.name, 28),
                             app.settings.theme.accent.to_color32(),
-                            if row_is_active {
-                                Sense::click_and_drag()
-                            } else {
-                                Sense::click()
-                            },
+                            Sense::click_and_drag(),
                         );
-                        if row_is_active {
-                            // Use the row's own stable interaction for drag-and-drop.
-                            // This keeps it clickable and prevents dnd_drag_source from
-                            // moving the widget to a tooltip layer while it is inside
-                            // the scrolling grid.
-                            response.dnd_set_drag_payload(payload);
-                            if response.dragged() {
-                                draw_library_drag_preview(
-                                    ui.ctx(),
-                                    row.icon,
-                                    &row.name,
-                                    app.settings.theme.accent.to_color32(),
-                                );
-                            }
+                        // Every open project is a real source library. The payload
+                        // carries its tab id so identical project-local asset/q0rg ids
+                        // can never alias during a cross-project drop.
+                        response.dnd_set_drag_payload(drag_payload);
+                        if response.dragged() {
+                            draw_library_drag_preview(
+                                ui.ctx(),
+                                row.icon,
+                                &row.name,
+                                app.settings.theme.accent.to_color32(),
+                            );
                         }
-                        let drag_hint = if row_is_active {
-                            if crate::audio::library_item_is_audio_only(&app.state.project, payload)
-                            {
+                        let audio_only = app.library_drag_item_is_audio_only(drag_payload);
+                        let drag_hint = if audio_only {
+                            if row_is_active {
                                 "Drag onto timeline to place"
                             } else {
-                                "Drag onto stage to place"
+                                "Drag onto timeline to copy into current project"
                             }
+                        } else if row_is_active {
+                            "Drag onto stage to place"
                         } else {
-                            "Open its q1s to edit or place this item"
+                            "Drag onto stage to copy into current project"
                         };
                         let response = response.on_hover_text(format!(
                             "{}\n{}\n{}\n{drag_hint}",
@@ -546,6 +660,16 @@ fn render_rename_dialog(app: &mut EditorApp, ctx: &egui::Context) {
     }
 }
 
+const LIBRARY_ITEMS_SCROLL_ID: &str = "library_items_scroll";
+
+#[cfg(test)]
+fn show_library_items_scroll<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    egui::ScrollArea::vertical()
+        .id_source(LIBRARY_ITEMS_SCROLL_ID)
+        .auto_shrink([false, true])
+        .show(ui, add_contents)
+        .inner
+}
 const LIBRARY_ICON_SIZE: f32 = 14.0;
 const LIBRARY_ICON_GAP: f32 = 5.0;
 
@@ -783,23 +907,38 @@ fn collect_rows(
     rows
 }
 
+fn library_use_counts(project: &ProjectV2) -> (HashMap<u16, usize>, HashMap<u16, usize>) {
+    let mut q0rg_uses = HashMap::with_capacity(project.q0rgs.len());
+    let mut asset_uses = HashMap::with_capacity(project.assets.len());
+    for placement in project
+        .q0rgs
+        .iter()
+        .flat_map(|owner| owner.layers.iter())
+        .flat_map(|layer| layer.placements.iter())
+    {
+        match placement.target {
+            Target::Q0rg(id) => *q0rg_uses.entry(id).or_insert(0) += 1,
+            Target::Asset(id) => *asset_uses.entry(id).or_insert(0) += 1,
+        }
+    }
+    (q0rg_uses, asset_uses)
+}
+
 fn collect_rows_for_project(
     project: &ProjectV2,
     tab_id: u64,
     library_label: &str,
 ) -> Vec<LibraryRow> {
+    // Usage counts used to scan every placement once per library row. On imported
+    // FLA projects with thousands of symbols/assets that made Library O(items *
+    // placements) every UI frame. Count all targets once instead.
+    let (q0rg_uses, asset_uses) = library_use_counts(project);
     let mut rows = Vec::with_capacity(project.q0rgs.len() + project.assets.len());
     for q0rg in &project.q0rgs {
         if q0rg.q0rg_id == project.meta.entry_q0rg_id {
             continue;
         }
-        let uses = project
-            .q0rgs
-            .iter()
-            .flat_map(|owner| owner.layers.iter())
-            .flat_map(|layer| layer.placements.iter())
-            .filter(|placement| matches!(placement.target, Target::Q0rg(id) if id == q0rg.q0rg_id))
-            .count();
+        let uses = q0rg_uses.get(&q0rg.q0rg_id).copied().unwrap_or(0);
         rows.push(LibraryRow {
             tab_id,
             library_label: library_label.to_string(),
@@ -816,15 +955,7 @@ fn collect_rows_for_project(
             continue;
         }
         let id = asset.id();
-        let uses = project
-            .q0rgs
-            .iter()
-            .flat_map(|owner| owner.layers.iter())
-            .flat_map(|layer| layer.placements.iter())
-            .filter(
-                |placement| matches!(placement.target, Target::Asset(asset_id) if asset_id == id),
-            )
-            .count();
+        let uses = asset_uses.get(&id).copied().unwrap_or(0);
         let (name, kind, detail) = match asset {
             Asset::Bitmap(bitmap) => (
                 format!("Bitmap {id}"),
@@ -1246,6 +1377,19 @@ fn draw_preview_background(
     }
 }
 
+pub(crate) fn draw_q0rg_frame_preview_background(
+    painter: &egui::Painter,
+    project: &ProjectV2,
+    q0rg_id: u16,
+    frame: u16,
+    rect: Rect,
+    light: Color32,
+    dark: Color32,
+) {
+    let background = preview_background_for_key(project, LibraryKey::Q0rg(q0rg_id), frame);
+    draw_preview_background(painter, rect, background, light, dark);
+}
+
 fn preview_view(rect: Rect, bounds: (f32, f32, f32, f32)) -> StageView {
     let width = (bounds.2 - bounds.0).abs().max(1.0);
     let height = (bounds.3 - bounds.1).abs().max(1.0);
@@ -1277,6 +1421,76 @@ mod tests {
     use super::*;
 
     #[test]
+    fn library_project_fingerprint_changes_with_row_visible_metadata() {
+        fn fingerprint(project: &ProjectV2) -> u64 {
+            let mut hasher = DefaultHasher::new();
+            hash_library_project(project, &mut hasher);
+            hasher.finish()
+        }
+
+        let mut project = crate::state::default_project();
+        let initial = fingerprint(&project);
+        assert_eq!(initial, fingerprint(&project));
+        project.q0rgs[0].name.push_str(" changed");
+        assert_ne!(initial, fingerprint(&project));
+    }
+
+    #[test]
+    fn library_use_counts_scan_targets_once_and_count_both_kinds() {
+        let mut project = crate::state::default_project();
+        project
+            .assets
+            .push(Asset::Vector(q0s_format::v2::VectorAsset {
+                asset_id: 77,
+                paths: Vec::new(),
+                fill: None,
+                stroke: None,
+            }));
+        project.q0rgs.push(q0s_format::v2::Q0rg {
+            q0rg_id: 2,
+            name: "child".into(),
+            frame_count: 1,
+            script: String::new(),
+            layers: vec![q0s_format::v2::Layer {
+                layer_id: 1,
+                name: "child layer".into(),
+                explicit_keyframes: Vec::new(),
+                placements: Vec::new(),
+            }],
+        });
+        let layer = &mut project.q0rgs[0].layers[0];
+        layer.placements.extend([
+            Placement {
+                instance_id: 1,
+                frame: 0,
+                target: Target::Q0rg(2),
+                transform: Transform2D::IDENTITY,
+                tween: Tween::None,
+                fx: Default::default(),
+            },
+            Placement {
+                instance_id: 2,
+                frame: 0,
+                target: Target::Q0rg(2),
+                transform: Transform2D::IDENTITY,
+                tween: Tween::None,
+                fx: Default::default(),
+            },
+            Placement {
+                instance_id: 3,
+                frame: 0,
+                target: Target::Asset(77),
+                transform: Transform2D::IDENTITY,
+                tween: Tween::None,
+                fx: Default::default(),
+            },
+        ]);
+        let (q0rg_uses, asset_uses) = library_use_counts(&project);
+        assert_eq!(q0rg_uses.get(&2), Some(&2));
+        assert_eq!(asset_uses.get(&77), Some(&1));
+    }
+
+    #[test]
     fn entry_stage_is_not_a_draggable_library_item() {
         let app = EditorApp::default();
         let rows = collect_rows_for_project(&app.state.project, 1, "test.q1s");
@@ -1284,6 +1498,49 @@ mod tests {
             row.key,
             LibraryKey::Q0rg(id) if id == app.state.project.meta.entry_q0rg_id
         )));
+    }
+
+    #[test]
+    fn library_item_scroll_offset_stays_stable_across_small_panel_resizes() {
+        fn render_at_height(ctx: &egui::Context, height: f32) -> egui::Id {
+            let mut scroll_id = None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, height))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.add_space(210.0);
+                        scroll_id =
+                            Some(ui.make_persistent_id(egui::Id::new(LIBRARY_ITEMS_SCROLL_ID)));
+                        show_library_items_scroll(ui, |ui| {
+                            for row in 0..80 {
+                                ui.label(format!("library row {row}"));
+                            }
+                        });
+                    });
+                },
+            );
+            scroll_id.expect("library item scroll id")
+        }
+
+        let ctx = egui::Context::default();
+        let id = render_at_height(&ctx, 400.0);
+        let mut state = egui::scroll_area::State::load(&ctx, id).expect("scroll state");
+        state.offset.y = 80.0;
+        state.store(&ctx, id);
+
+        for height in [418.0, 404.0, 416.0, 402.0] {
+            assert_eq!(render_at_height(&ctx, height), id);
+            let state =
+                egui::scroll_area::State::load(&ctx, id).expect("scroll state after resize");
+            assert!(
+                (state.offset.y - 80.0).abs() < 0.01,
+                "library list jumped to {} at panel height {height}",
+                state.offset.y
+            );
+        }
     }
 
     #[test]

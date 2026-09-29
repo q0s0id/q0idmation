@@ -709,6 +709,68 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_dense_advanced_commits_merge_without_progressive_freeze() {
+        use std::time::{Duration, Instant};
+
+        let mut app = crate::app::EditorApp::default();
+        let settings = AdvancedBrushSettings {
+            stabilizer: 0,
+            smoothing: 0,
+            pressure_size: false,
+            size: 18.0,
+            ..AdvancedBrushSettings::default()
+        };
+        let bridge = crate::brush::BrushSettings {
+            color: settings.color,
+            size: settings.size,
+            smoothing: 0,
+            nib: crate::brush::BrushNib::Circle,
+            scale_with_stage: true,
+            sync_with_eraser: true,
+            ..crate::brush::BrushSettings::default()
+        };
+        let started = Instant::now();
+        for stroke_index in 0..3 {
+            let samples = (0..180)
+                .map(|index| {
+                    let x = 20.0 + index as f32 * 2.0;
+                    let y = 120.0 + (index as f32 * 0.09).sin() * 18.0 + stroke_index as f32 * 6.0;
+                    sample(x, y, 1.0, index as f64 / 180.0)
+                })
+                .collect();
+            let region = advanced_finish(AdvancedBrushStroke { samples, settings });
+            crate::brush::commit_brush_region_with_material(&mut app, region, bridge, None);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "three overlapping Advanced commits took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            app.state.project.q0rgs[0].layers[0].placements.len(),
+            1,
+            "touching Advanced paint must remain one raw connected surface"
+        );
+        let vector = app
+            .state
+            .project
+            .assets
+            .iter()
+            .find_map(|asset| match asset {
+                q0s_format::v2::Asset::Vector(vector) if vector.fill == Some(settings.color) => {
+                    Some(vector)
+                }
+                _ => None,
+            })
+            .expect("merged Advanced raw vector");
+        let anchors: usize = vector.paths.iter().map(|path| path.anchors.len()).sum();
+        assert!(
+            anchors < 8_000,
+            "merged Advanced boundary exploded to {anchors} anchors"
+        );
+    }
+
+    #[test]
     fn sparse_advanced_samples_commit_as_one_continuous_surface() {
         let settings = AdvancedBrushSettings {
             stabilizer: 0,

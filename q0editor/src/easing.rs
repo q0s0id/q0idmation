@@ -130,6 +130,9 @@ pub struct TweenRef {
     pub q0rg_id: u16,
     pub layer_id: u16,
     pub placement_idx: usize,
+    /// Source camera keyframe for project-camera tweens. Placement refs keep
+    /// this as None; camera refs use zeroes in the placement identity fields.
+    pub camera_frame: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,6 +337,7 @@ pub fn create_tweens_for_selection(
                 q0rg_id,
                 layer_id: plan.layer_id,
                 placement_idx,
+                camera_frame: None,
             });
         }
     }
@@ -368,6 +372,7 @@ pub fn tween_targets_for_selection(
                     q0rg_id,
                     layer_id,
                     placement_idx,
+                    camera_frame: None,
                 });
             }
         }
@@ -378,6 +383,33 @@ pub fn tween_targets_for_selection(
 }
 
 pub fn selected_tween_targets(app: &EditorApp) -> Vec<TweenRef> {
+    if app.camera_track_is_selected() {
+        let (first_frame, last_frame) = app
+            .session
+            .camera_timeline_selection
+            .map(|selection| (selection.first_frame(), selection.last_frame()))
+            .unwrap_or_else(|| {
+                let frame = app.session.timeline_frame();
+                (frame, frame)
+            });
+        return app
+            .state
+            .project
+            .runtime
+            .camera
+            .keys
+            .iter()
+            .filter_map(|key| {
+                let to_frame = key.tween.to_frame()?;
+                (key.frame <= last_frame && to_frame >= first_frame).then_some(TweenRef {
+                    q0rg_id: app.state.project.meta.entry_q0rg_id,
+                    layer_id: 0,
+                    placement_idx: 0,
+                    camera_frame: Some(key.frame),
+                })
+            })
+            .collect();
+    }
     let Some(selection) = app.session.timeline_selection else {
         return Vec::new();
     };
@@ -408,6 +440,17 @@ impl EasingEditorState {
 }
 
 fn tween_for_target(app: &EditorApp, target: TweenRef) -> Option<(u16, Tween)> {
+    if let Some(camera_frame) = target.camera_frame {
+        return app
+            .state
+            .project
+            .runtime
+            .camera
+            .keys
+            .iter()
+            .find(|key| key.frame == camera_frame)
+            .and_then(|key| key.tween.to_frame().map(|_| (key.frame, key.tween)));
+    }
     app.state
         .project
         .q0rgs
@@ -454,6 +497,7 @@ pub fn render_tween_properties(
             q0rg_id,
             layer_id,
             placement_idx,
+            camera_frame: None,
         }],
         false,
     );
@@ -749,6 +793,21 @@ fn apply_tween_easing(app: &mut EditorApp, targets: &[TweenRef], easing: Easing)
     app.history.snapshot(&app.state.project);
     let mut updated_count = 0usize;
     for target in changed {
+        if let Some(camera_frame) = target.camera_frame {
+            if let Some(key) = app
+                .state
+                .project
+                .runtime
+                .camera
+                .keys
+                .iter_mut()
+                .find(|key| key.frame == camera_frame && key.tween.to_frame().is_some())
+            {
+                key.tween = key.tween.with_easing(easing);
+                updated_count += 1;
+            }
+            continue;
+        }
         let Some(placement) = app
             .state
             .project
@@ -794,6 +853,21 @@ fn remove_tweens(app: &mut EditorApp, targets: &[TweenRef]) {
     app.history.snapshot(&app.state.project);
     let mut removed = 0usize;
     for target in removable {
+        if let Some(camera_frame) = target.camera_frame {
+            if let Some(key) = app
+                .state
+                .project
+                .runtime
+                .camera
+                .keys
+                .iter_mut()
+                .find(|key| key.frame == camera_frame && key.tween.to_frame().is_some())
+            {
+                key.tween = Tween::None;
+                removed += 1;
+            }
+            continue;
+        }
         let Some(placement) = app
             .state
             .project
@@ -1146,11 +1220,13 @@ mod tests {
                 q0rg_id: 1,
                 layer_id: 1,
                 placement_idx: 0,
+                camera_frame: None,
             },
             TweenRef {
                 q0rg_id: 1,
                 layer_id: 2,
                 placement_idx: 0,
+                camera_frame: None,
             },
         ];
         let easing = Easing::Preset {
@@ -1194,5 +1270,47 @@ mod tests {
         assert_eq!(presets.len(), 1);
         assert_eq!(presets[0].name, "wobble");
         assert!(presets[0].curve().easing().is_valid());
+    }
+
+    #[test]
+    fn camera_tween_uses_the_same_easing_editor_path_as_artwork_tweens() {
+        let mut app = EditorApp::default();
+        app.state.project.q0rgs[0].frame_count = 12;
+        app.state.project.runtime.camera.enabled = true;
+        app.state.project.runtime.camera.keys = vec![
+            q0s_format::v2::CameraKey {
+                frame: 0,
+                state: app.state.project.default_camera_state(),
+                tween: Tween::Linear { to_frame: 6 },
+            },
+            q0s_format::v2::CameraKey {
+                frame: 6,
+                state: q0s_format::v2::CameraState {
+                    zoom: 2.0,
+                    ..app.state.project.default_camera_state()
+                },
+                tween: Tween::None,
+            },
+        ];
+        app.session.camera_track_selected = true;
+        app.session.camera_timeline_selection =
+            Some(crate::state::CameraTimelineSelection::single(3));
+        let artwork_before = app.state.project.q0rgs.clone();
+        let targets = selected_tween_targets(&app);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].camera_frame, Some(0));
+        let easing = Easing::Preset {
+            family: EasingFamily::Bounce,
+            mode: EasingMode::InOut,
+        };
+
+        apply_tween_easing(&mut app, &targets, easing);
+
+        assert_eq!(
+            app.state.project.runtime.camera.keys[0].tween.easing(),
+            easing
+        );
+        assert_eq!(app.state.project.q0rgs, artwork_before);
+        assert!(app.history.can_undo());
     }
 }

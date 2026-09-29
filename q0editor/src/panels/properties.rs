@@ -1,6 +1,9 @@
 use egui::{Color32, ScrollArea, Ui};
+use q0s_format::transform::Affine;
 use q0s_format::v2::{
-    Asset, BlendMode, BlurFx, DropShadowFx, GlowFx, PlacementFx, Rgba, Stroke as VStroke,
+    Asset, BlendMode, BlurFx, DropShadowFx, GlowFx, GradientFill, GradientKind, GradientStop,
+    PlacementFx, Q0rgPlayback, Q0rgPlaybackMode, Rgba, Stroke as VStroke, Target, VectorAppearance,
+    VectorAsset, VectorMaterial,
 };
 
 use crate::app::{Action, EditorApp};
@@ -27,6 +30,15 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 }
                 return;
             }
+            if app.camera_track_is_selected() {
+                let camera_tweens = crate::easing::selected_tween_targets(app);
+                if !camera_tweens.is_empty() {
+                    crate::easing::render_selected_tween_properties(app, ui, &camera_tweens);
+                } else {
+                    render_camera_properties(app, ui);
+                }
+                return;
+            }
             if render_audio_clip_properties(app, ui) {
                 return;
             }
@@ -49,7 +61,10 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     layer_id,
                     placement_idx,
                     path_idx,
-                } => raw_path_properties(app, ui, q0rg_id, layer_id, placement_idx, path_idx),
+                } => {
+                    raw_path_properties(app, ui, q0rg_id, layer_id, placement_idx, path_idx);
+                    selected_stroke_properties(app, ui);
+                }
                 Selection::Paths(refs) => {
                     ui.label(egui::RichText::new(format!("{} contours", refs.len())).strong());
                     ui.label(
@@ -57,6 +72,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                             .color(app.settings.theme.text_dim.to_color32())
                             .small(),
                     );
+                    selected_stroke_properties(app, ui);
                 }
                 Selection::StrokeSegment(segment) => {
                     ui.label(egui::RichText::new("Stroke segment").strong());
@@ -70,17 +86,20 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                             .color(app.settings.theme.text_dim.to_color32())
                             .small(),
                     );
+                    selected_stroke_properties(app, ui);
                 }
                 Selection::RawParts {
                     fills,
                     strokes,
+                    stroke_segments,
                     objects,
                 } => {
                     ui.label(
                         egui::RichText::new(format!(
-                            "{} fill part(s) + {} outline(s) + {} object(s)",
+                            "{} fill part(s) + {} outline(s) + {} outline segment(s) + {} object(s)",
                             fills.len(),
                             strokes.len(),
+                            stroke_segments.len(),
                             objects.len()
                         ))
                         .strong(),
@@ -90,6 +109,9 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                             .color(app.settings.theme.text_dim.to_color32())
                             .small(),
                     );
+                    if !strokes.is_empty() || !stroke_segments.is_empty() {
+                        selected_stroke_properties(app, ui);
+                    }
                 }
                 Selection::PathPoints { anchor_indices, .. } => {
                     ui.label(
@@ -101,6 +123,20 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     );
                     ui.label(
                         egui::RichText::new("V drag reshapes only this selected area")
+                            .color(app.settings.theme.text_dim.to_color32())
+                            .small(),
+                    );
+                }
+                Selection::SubselectPoints { anchor_indices, .. } => {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Subselect: {} vector point(s)",
+                            anchor_indices.len()
+                        ))
+                        .strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new("Switching to Select transforms the whole raw path")
                             .color(app.settings.theme.text_dim.to_color32())
                             .small(),
                     );
@@ -138,6 +174,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                             .color(app.settings.theme.text_dim.to_color32())
                             .small(),
                     );
+                    selected_stroke_properties(app, ui);
                 }
                 Selection::Multi(refs) => {
                     ui.label(egui::RichText::new(format!("{} objects", refs.len())).strong());
@@ -155,6 +192,127 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             // which hid the fill colour control behind selection-only properties.
             render_tool_properties(app, ui);
         });
+}
+
+fn render_camera_properties(app: &mut EditorApp, ui: &mut Ui) {
+    let frame = app.session.current_frame;
+    let before = app.state.project.clone();
+    let mut state = app.state.project.camera_state_at(frame);
+    let has_exact_key = app.state.project.runtime.camera.has_keyframe(frame);
+    let mut changed = false;
+    let mut wants_snapshot = false;
+
+    ui.label(egui::RichText::new("Camera").strong().size(15.0));
+    ui.label(
+        egui::RichText::new(if has_exact_key {
+            format!("keyframe {}", frame + 1)
+        } else {
+            format!("held/interpolated state at frame {}", frame + 1)
+        })
+        .small()
+        .color(app.settings.theme.text_dim.to_color32()),
+    );
+    ui.add_space(6.0);
+
+    egui::Grid::new("camera_properties")
+        .num_columns(2)
+        .show(ui, |ui| {
+            ui.label("X");
+            let response = ui.add(egui::DragValue::new(&mut state.center_x).speed(1.0));
+            wants_snapshot |= response.drag_started() || response.gained_focus();
+            changed |= response.changed();
+            ui.end_row();
+
+            ui.label("Y");
+            let response = ui.add(egui::DragValue::new(&mut state.center_y).speed(1.0));
+            wants_snapshot |= response.drag_started() || response.gained_focus();
+            changed |= response.changed();
+            ui.end_row();
+
+            ui.label("Zoom");
+            let mut zoom_percent = state.zoom * 100.0;
+            let response = ui.add(
+                egui::DragValue::new(&mut zoom_percent)
+                    .speed(1.0)
+                    .clamp_range(1.0..=6400.0)
+                    .suffix("%"),
+            );
+            wants_snapshot |= response.drag_started() || response.gained_focus();
+            if response.changed() {
+                state.zoom = (zoom_percent / 100.0).clamp(0.01, 64.0);
+                changed = true;
+            }
+            ui.end_row();
+
+            ui.label("Rotation");
+            let mut degrees = state.rotation.to_degrees();
+            let response = ui.add(egui::DragValue::new(&mut degrees).speed(0.5).suffix(" deg"));
+            wants_snapshot |= response.drag_started() || response.gained_focus();
+            if response.changed() {
+                state.rotation = degrees.to_radians();
+                changed = true;
+            }
+            ui.end_row();
+        });
+
+    ui.add_space(6.0);
+    if ui.button("Reset camera at this frame").clicked() {
+        state = app.state.project.default_camera_state();
+        changed = true;
+        wants_snapshot = true;
+    }
+    ui.label(
+        egui::RichText::new("F6 creates a camera key. Tween animates position, zoom and rotation.")
+            .small()
+            .color(app.settings.theme.text_dim.to_color32()),
+    );
+
+    if changed {
+        if wants_snapshot {
+            app.history.snapshot(&before);
+        }
+        if !app.state.project.runtime.camera.has_keyframe(frame) {
+            for key in &mut app.state.project.runtime.camera.keys {
+                if key.frame < frame
+                    && key
+                        .tween
+                        .to_frame()
+                        .is_some_and(|to_frame| frame <= to_frame)
+                {
+                    key.tween = key.tween.with_to_frame(frame);
+                }
+            }
+            app.state
+                .project
+                .runtime
+                .camera
+                .keys
+                .push(q0s_format::v2::CameraKey {
+                    frame,
+                    state,
+                    tween: q0s_format::v2::Tween::None,
+                });
+            app.state
+                .project
+                .runtime
+                .camera
+                .keys
+                .sort_by_key(|key| key.frame);
+        }
+        if let Some(key) = app
+            .state
+            .project
+            .runtime
+            .camera
+            .keys
+            .iter_mut()
+            .find(|key| key.frame == frame)
+        {
+            key.state = state;
+        }
+        app.state.mark_dirty();
+        app.session.status = format!("camera updated at frame {}", frame + 1);
+    }
 }
 
 fn render_audio_clip_properties(app: &mut EditorApp, ui: &mut Ui) -> bool {
@@ -289,6 +447,40 @@ fn render_audio_clip_properties(app: &mut EditorApp, ui: &mut Ui) -> bool {
     true
 }
 
+fn selected_stroke_properties(app: &mut EditorApp, ui: &mut Ui) {
+    let Some((mut width, mixed)) =
+        crate::tools::selected_stroke_width(&app.state.project, &app.session.selection)
+    else {
+        return;
+    };
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("Stroke").strong());
+    if mixed {
+        ui.label(
+            egui::RichText::new("Mixed widths - editing makes them equal")
+                .color(app.settings.theme.text_dim.to_color32())
+                .small(),
+        );
+    }
+    egui::Grid::new("selected_stroke_style")
+        .num_columns(2)
+        .show(ui, |ui| {
+            ui.label("Width");
+            let response = ui.add(
+                egui::DragValue::new(&mut width)
+                    .speed(0.1)
+                    .clamp_range(0.1..=64.0),
+            );
+            if response.drag_started() || response.gained_focus() {
+                app.history.snapshot(&app.state.project);
+            }
+            if response.changed() {
+                crate::tools::set_selected_stroke_width(app, width);
+            }
+            ui.end_row();
+        });
+}
+
 fn raw_path_properties(
     app: &EditorApp,
     ui: &mut Ui,
@@ -341,7 +533,9 @@ fn raw_path_properties(
 fn stage_properties(app: &mut EditorApp, ui: &mut Ui) {
     ui.label(egui::RichText::new("Stage").strong());
     let mut dirty = false;
-    let snapshot_before = app.state.project.clone();
+    // Stage controls are drawn on every frame. Keep only the small metadata
+    // value eagerly, then clone the full project if an edit actually starts.
+    let meta_before = app.state.project.meta.clone();
     let mut wants_snapshot = false;
     egui::Grid::new("stage_props")
         .num_columns(2)
@@ -391,8 +585,23 @@ fn stage_properties(app: &mut EditorApp, ui: &mut Ui) {
                 dirty = true;
             }
             ui.end_row();
+
+            ui.label("Background");
+            let mut background = rgba_to_color32(app.state.project.meta.background_color);
+            let r = ui.color_edit_button_srgba(&mut background);
+            if r.gained_focus() || r.clicked() {
+                wants_snapshot = true;
+            }
+            if r.changed() {
+                app.state.project.meta.background_color = color32_to_rgba(background);
+                app.state.project.meta.background_color.a = 255;
+                dirty = true;
+            }
+            ui.end_row();
         });
     if wants_snapshot {
+        let mut snapshot_before = app.state.project.clone();
+        snapshot_before.meta = meta_before;
         app.history.snapshot(&snapshot_before);
     }
     if dirty {
@@ -1242,6 +1451,190 @@ fn color32_to_rgba(c: Color32) -> Rgba {
     Rgba { r, g, b, a }
 }
 
+fn default_gradient_for_vector(vector: &VectorAsset) -> GradientFill {
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for path in &vector.paths {
+        for anchor in &path.anchors {
+            for point in std::iter::once(anchor.point)
+                .chain(anchor.in_handle)
+                .chain(anchor.out_handle)
+            {
+                min_x = min_x.min(point.x);
+                min_y = min_y.min(point.y);
+                max_x = max_x.max(point.x);
+                max_y = max_y.max(point.y);
+            }
+        }
+    }
+    if !min_x.is_finite() || !min_y.is_finite() || !max_x.is_finite() || !max_y.is_finite() {
+        min_x = -50.0;
+        min_y = -50.0;
+        max_x = 50.0;
+        max_y = 50.0;
+    }
+    let center_x = (min_x + max_x) * 0.5;
+    let center_y = (min_y + max_y) * 0.5;
+    let half_width = ((max_x - min_x) * 0.5).max(1.0);
+    let half_height = ((max_y - min_y) * 0.5).max(1.0);
+    GradientFill {
+        kind: GradientKind::Linear,
+        stops: vec![
+            GradientStop {
+                position: 0.0,
+                color: Rgba {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 255,
+                },
+            },
+            GradientStop {
+                position: 1.0,
+                color: Rgba {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                },
+            },
+        ],
+        transform: Affine {
+            a11: half_width,
+            a12: 0.0,
+            a21: 0.0,
+            a22: half_height,
+            tx: center_x,
+            ty: center_y,
+        },
+    }
+}
+
+fn edit_gradient(ui: &mut Ui, id: u16, gradient: &mut GradientFill) -> bool {
+    let mut changed = false;
+    ui.label("Gradient type");
+    let previous = gradient.kind;
+    egui::ComboBox::from_id_source(format!("asset_gradient_kind_{id}"))
+        .selected_text(match gradient.kind {
+            GradientKind::Linear => "Linear",
+            GradientKind::Radial => "Radial",
+        })
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut gradient.kind, GradientKind::Linear, "Linear");
+            ui.selectable_value(&mut gradient.kind, GradientKind::Radial, "Radial");
+        });
+    if gradient.kind != previous {
+        changed = true;
+    }
+    ui.end_row();
+
+    let labels = [
+        ("Gradient X axis X", &mut gradient.transform.a11),
+        ("Gradient Y axis X", &mut gradient.transform.a12),
+        ("Gradient X axis Y", &mut gradient.transform.a21),
+        ("Gradient Y axis Y", &mut gradient.transform.a22),
+        ("Gradient center X", &mut gradient.transform.tx),
+        ("Gradient center Y", &mut gradient.transform.ty),
+    ];
+    for (label, value) in labels {
+        ui.label(label);
+        if ui.add(egui::DragValue::new(value).speed(0.25)).changed() {
+            changed = true;
+        }
+        ui.end_row();
+    }
+
+    ui.label("Stops");
+    ui.vertical(|ui| {
+        let mut remove = None;
+        let can_remove = gradient.stops.len() > 2;
+        for (index, stop) in gradient.stops.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(format!("{}", index + 1));
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut stop.position)
+                            .speed(0.01)
+                            .clamp_range(0.0..=1.0),
+                    )
+                    .changed()
+                {
+                    changed = true;
+                }
+                let mut color = rgba_to_color32(stop.color);
+                if ui.color_edit_button_srgba(&mut color).changed() {
+                    stop.color = color32_to_rgba(color);
+                    changed = true;
+                }
+                let mut alpha = stop.color.a;
+                ui.label("A");
+                if ui
+                    .add(egui::DragValue::new(&mut alpha).clamp_range(0..=255))
+                    .changed()
+                {
+                    stop.color.a = alpha;
+                    changed = true;
+                }
+                if can_remove && ui.small_button("x").clicked() {
+                    remove = Some(index);
+                }
+            });
+        }
+        if let Some(index) = remove {
+            gradient.stops.remove(index);
+            changed = true;
+        }
+        if gradient.stops.len() < 256 && ui.small_button("+ stop").clicked() {
+            let color = gradient
+                .stops
+                .last()
+                .map(|stop| stop.color)
+                .unwrap_or(Rgba {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                });
+            gradient.stops.push(GradientStop {
+                position: 0.5,
+                color,
+            });
+            changed = true;
+        }
+    });
+    ui.end_row();
+    if changed {
+        gradient.stops.sort_by(|a, b| {
+            a.position
+                .partial_cmp(&b.position)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    changed
+}
+
+fn empty_vector_appearance() -> VectorAppearance {
+    VectorAppearance {
+        material: VectorMaterial::Solid,
+        erase_mask: Vec::new(),
+        material_source: Vec::new(),
+        clip_mask: Vec::new(),
+        field_transform: Affine::IDENTITY,
+        fill_gradient: None,
+    }
+}
+
+fn appearance_is_empty(appearance: &VectorAppearance) -> bool {
+    matches!(appearance.material, VectorMaterial::Solid)
+        && appearance.erase_mask.is_empty()
+        && appearance.material_source.is_empty()
+        && appearance.clip_mask.is_empty()
+        && appearance.field_transform == Affine::IDENTITY
+        && appearance.fill_gradient.is_none()
+}
+
 fn asset_properties(app: &mut EditorApp, ui: &mut Ui, id: u16) {
     let Some(asset_idx) = app.state.project.assets.iter().position(|a| a.id() == id) else {
         ui.label("Selection is no longer available");
@@ -1249,6 +1642,13 @@ fn asset_properties(app: &mut EditorApp, ui: &mut Ui, id: u16) {
     };
     ui.label(egui::RichText::new("Asset").strong());
 
+    let mut gradient = app
+        .state
+        .project
+        .asset_appearances
+        .get(&id)
+        .and_then(|appearance| appearance.fill_gradient.clone());
+    let mut gradient_dirty = false;
     let mut dirty = false;
     let asset = &mut app.state.project.assets[asset_idx];
     match asset {
@@ -1383,10 +1783,54 @@ fn asset_properties(app: &mut EditorApp, ui: &mut Ui, id: u16) {
                             *fill = color32_to_rgba(c);
                             dirty = true;
                         }
+                    } else if gradient.take().is_some() {
+                        gradient_dirty = true;
                     }
                     ui.end_row();
+
+                    ui.label("Gradient");
+                    let mut has_gradient = gradient.is_some();
+                    if ui
+                        .add_enabled(v.fill.is_some(), egui::Checkbox::new(&mut has_gradient, ""))
+                        .changed()
+                    {
+                        gradient = has_gradient.then(|| default_gradient_for_vector(v));
+                        gradient_dirty = true;
+                    }
+                    ui.end_row();
+
+                    if let Some(fill_gradient) = gradient.as_mut() {
+                        if edit_gradient(ui, id, fill_gradient) {
+                            gradient_dirty = true;
+                        }
+                    }
                 });
         }
+    }
+
+    if gradient_dirty {
+        if let Some(fill_gradient) = gradient {
+            let appearance = app
+                .state
+                .project
+                .asset_appearances
+                .entry(id)
+                .or_insert_with(empty_vector_appearance);
+            appearance.fill_gradient = Some(fill_gradient);
+        } else {
+            let remove = if let Some(appearance) = app.state.project.asset_appearances.get_mut(&id)
+            {
+                appearance.fill_gradient = None;
+                appearance_is_empty(appearance)
+            } else {
+                false
+            };
+            if remove {
+                app.state.project.asset_appearances.remove(&id);
+            }
+        }
+        app.textures.invalidate_assets([id]);
+        dirty = true;
     }
 
     if dirty {
@@ -1496,6 +1940,17 @@ fn q0rg_properties(app: &mut EditorApp, ui: &mut Ui, id: u16) {
     }
 }
 
+fn q0rg_playback_mode_name(mode: Q0rgPlaybackMode) -> &'static str {
+    match mode {
+        Q0rgPlaybackMode::Loop => "Loop",
+        Q0rgPlaybackMode::PlayOnce => "Play once",
+        Q0rgPlaybackMode::LoopReversed => "Loop reversed",
+        Q0rgPlaybackMode::PlayReversedOnce => "Play reversed once",
+        Q0rgPlaybackMode::SingleFrame => "Single frame",
+        Q0rgPlaybackMode::Manual => "manual",
+    }
+}
+
 fn blend_mode_name(mode: BlendMode) -> &'static str {
     match mode {
         BlendMode::Normal => "Normal",
@@ -1524,7 +1979,7 @@ fn placement_properties(
 ) {
     let before = app.state.project.clone();
     let current_frame = app.session.current_frame;
-    let Some((source_frame, mut transform, tween, mut fx)) = app
+    let Some((source_frame, target, mut transform, tween, mut fx)) = app
         .state
         .project
         .q0rgs
@@ -1536,7 +1991,13 @@ fn placement_properties(
             let active = q0s_format::raster::active_placement_states_at(layer, current_frame)
                 .into_iter()
                 .find(|active| active.index == placement_idx)?;
-            Some((source.frame, active.transform, source.tween, active.fx))
+            Some((
+                source.frame,
+                source.target,
+                active.transform,
+                source.tween,
+                active.fx,
+            ))
         })
     else {
         ui.label("Selection is no longer available");
@@ -1546,6 +2007,7 @@ fn placement_properties(
     let mut wants_snapshot = false;
     let mut transform_dirty = false;
     let mut fx_dirty = false;
+    let mut manual_playback_edit = None;
     ui.label(egui::RichText::new("Placement").strong());
     if source_frame != current_frame {
         ui.label(
@@ -1613,12 +2075,252 @@ fn placement_properties(
 
     crate::easing::render_tween_properties(app, ui, q0rg_id, layer_id, placement_idx, tween);
 
+    if let Target::Q0rg(child_id) = target {
+        let child_frames = app
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == child_id)
+            .map(|q0rg| q0rg.frame_count.max(1))
+            .unwrap_or(1);
+        let max_frame = child_frames - 1;
+        ui.separator();
+        ui.label(egui::RichText::new("Playback").strong());
+        egui::Grid::new("placement_q0rg_playback")
+            .num_columns(2)
+            .show(ui, |ui| {
+                ui.label("Mode");
+                let mode_before = fx.q0rg_playback.mode;
+                egui::ComboBox::from_id_source("placement_q0rg_playback_mode")
+                    .selected_text(q0rg_playback_mode_name(fx.q0rg_playback.mode))
+                    .show_ui(ui, |ui| {
+                        for mode in [
+                            Q0rgPlaybackMode::Loop,
+                            Q0rgPlaybackMode::PlayOnce,
+                            Q0rgPlaybackMode::LoopReversed,
+                            Q0rgPlaybackMode::PlayReversedOnce,
+                            Q0rgPlaybackMode::SingleFrame,
+                            Q0rgPlaybackMode::Manual,
+                        ] {
+                            ui.selectable_value(
+                                &mut fx.q0rg_playback.mode,
+                                mode,
+                                q0rg_playback_mode_name(mode),
+                            );
+                        }
+                    });
+                if fx.q0rg_playback.mode != mode_before {
+                    fx_dirty = true;
+                    wants_snapshot = true;
+                    if fx.q0rg_playback.mode == Q0rgPlaybackMode::Manual {
+                        fx.q0rg_playback.single_frame =
+                            q0s_format::v2::resolve_q0rg_playback_frame(
+                                &app.state.project,
+                                child_id,
+                                current_frame,
+                                source_frame,
+                                Q0rgPlayback {
+                                    mode: mode_before,
+                                    ..fx.q0rg_playback
+                                },
+                            )
+                            .min(max_frame);
+                        manual_playback_edit = Some(fx.q0rg_playback);
+                    }
+                }
+                ui.end_row();
+
+                if fx.q0rg_playback.mode == Q0rgPlaybackMode::SingleFrame {
+                    ui.label("Frame");
+                    let mut display = fx.q0rg_playback.single_frame.min(max_frame) + 1;
+                    let response = ui.add(
+                        egui::DragValue::new(&mut display)
+                            .clamp_range(1..=child_frames)
+                            .speed(1),
+                    );
+                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
+                    if response.changed() {
+                        fx.q0rg_playback.single_frame = display.saturating_sub(1);
+                    }
+                    ui.end_row();
+                } else if fx.q0rg_playback.mode != Q0rgPlaybackMode::Manual {
+                    ui.label("First frame");
+                    let mut first = fx.q0rg_playback.first_frame.min(max_frame) + 1;
+                    let response = ui.add(
+                        egui::DragValue::new(&mut first)
+                            .clamp_range(1..=child_frames)
+                            .speed(1),
+                    );
+                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
+                    if response.changed() {
+                        fx.q0rg_playback.first_frame = first.saturating_sub(1);
+                        if let Some(last) = fx.q0rg_playback.last_frame {
+                            fx.q0rg_playback.last_frame =
+                                Some(last.max(fx.q0rg_playback.first_frame));
+                        }
+                    }
+                    ui.end_row();
+
+                    ui.label("Last frame");
+                    let mut last = fx
+                        .q0rg_playback
+                        .last_frame
+                        .unwrap_or(max_frame)
+                        .min(max_frame)
+                        + 1;
+                    let response = ui.add(
+                        egui::DragValue::new(&mut last)
+                            .clamp_range(
+                                (fx.q0rg_playback.first_frame.min(max_frame) + 1)..=child_frames,
+                            )
+                            .speed(1),
+                    );
+                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
+                    if response.changed() {
+                        fx.q0rg_playback.last_frame = Some(last.saturating_sub(1));
+                    }
+                    ui.end_row();
+                } else {
+                    ui.label("frame picker");
+                    ui.label("choose a frame below");
+                    ui.end_row();
+                }
+
+                let preview_frame = q0s_format::v2::resolve_q0rg_playback_frame(
+                    &app.state.project,
+                    child_id,
+                    current_frame,
+                    source_frame,
+                    fx.q0rg_playback,
+                );
+                ui.label("Preview frame");
+                ui.label(format!("{} / {}", preview_frame + 1, child_frames));
+                ui.end_row();
+            });
+
+        if fx.q0rg_playback.mode == Q0rgPlaybackMode::Manual {
+            let selected_frame = fx.q0rg_playback.single_frame.min(max_frame);
+            let preview_light = app.settings.theme.library_preview_light.to_color32();
+            let preview_dark = app.settings.theme.library_preview_dark.to_color32();
+            egui::ScrollArea::vertical()
+                .id_source((
+                    "placement_q0rg_manual_frames",
+                    q0rg_id,
+                    layer_id,
+                    placement_idx,
+                ))
+                .max_height(190.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let width = ui.available_width().max(48.0);
+                    let gap = ui.spacing().item_spacing.x.max(4.0);
+                    let min_card_size = 64.0;
+                    let columns = (((width + gap) / (min_card_size + gap)).floor() as usize).max(1);
+                    let card_size = ((width - gap * columns.saturating_sub(1) as f32)
+                        / columns as f32)
+                        .max(48.0);
+                    egui::Grid::new((
+                        "placement_q0rg_manual_frame_grid",
+                        q0rg_id,
+                        layer_id,
+                        placement_idx,
+                    ))
+                    .num_columns(columns)
+                    .spacing(egui::vec2(gap, gap))
+                    .show(ui, |ui| {
+                        for frame in 0..child_frames {
+                            let selected = frame == selected_frame;
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(card_size, card_size),
+                                egui::Sense::click(),
+                            );
+                            let visuals = ui.visuals();
+                            let (fill, stroke) = if selected {
+                                (visuals.selection.bg_fill, visuals.selection.stroke)
+                            } else {
+                                (
+                                    visuals.widgets.inactive.bg_fill,
+                                    visuals.widgets.inactive.fg_stroke,
+                                )
+                            };
+                            let painter = ui.painter_at(rect);
+                            painter.rect_filled(rect, 4.0, fill);
+                            painter.rect_stroke(rect, 4.0, stroke);
+                            painter.text(
+                                egui::pos2(rect.center().x, rect.top() + 4.0),
+                                egui::Align2::CENTER_TOP,
+                                format!("{}", frame + 1),
+                                egui::FontId::proportional(11.0),
+                                visuals.text_color(),
+                            );
+                            let preview_rect = egui::Rect::from_min_max(
+                                rect.min + egui::vec2(3.0, 18.0),
+                                rect.max - egui::vec2(3.0, 3.0),
+                            );
+                            if ui.is_rect_visible(preview_rect) {
+                                let preview_painter = ui.painter_at(preview_rect);
+                                crate::panels::library::draw_q0rg_frame_preview_background(
+                                    &preview_painter,
+                                    &app.state.project,
+                                    child_id,
+                                    frame,
+                                    preview_rect,
+                                    preview_light,
+                                    preview_dark,
+                                );
+                                if let Some(bounds) = crate::render::q0rg_frame_bbox(
+                                    &app.state.project,
+                                    child_id,
+                                    frame,
+                                ) {
+                                    let preview_view =
+                                        placement_frame_preview_view(preview_rect, bounds);
+                                    crate::render::render_stage(
+                                        &preview_painter,
+                                        &app.state.project,
+                                        child_id,
+                                        frame,
+                                        &preview_view,
+                                        &mut app.textures,
+                                        ui.ctx(),
+                                    );
+                                } else {
+                                    preview_painter.text(
+                                        preview_rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        "empty",
+                                        egui::FontId::proportional(10.0),
+                                        visuals.weak_text_color(),
+                                    );
+                                }
+                            }
+                            if response.clicked() {
+                                fx.q0rg_playback.single_frame = frame;
+                                manual_playback_edit = Some(fx.q0rg_playback);
+                                fx_dirty = true;
+                                wants_snapshot = true;
+                            }
+                            if (usize::from(frame) + 1) % columns == 0 {
+                                ui.end_row();
+                            }
+                        }
+                        if usize::from(child_frames) % columns != 0 {
+                            ui.end_row();
+                        }
+                    });
+                });
+        }
+    }
+
     ui.separator();
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("FX").strong());
         let reset = ui.add_enabled(!fx.is_identity(), egui::Button::new("Reset"));
         if reset.clicked() {
+            let playback = fx.q0rg_playback;
             fx = PlacementFx::default();
+            fx.q0rg_playback = playback;
             fx_dirty = true;
             wants_snapshot = true;
         }
@@ -1675,8 +2377,10 @@ fn placement_properties(
                 b: 24,
                 a: 255,
             },
-            radius: 8.0,
+            radius_x: 8.0,
+            radius_y: 8.0,
             strength: 1.0,
+            quality: 3,
         });
         fx_dirty = true;
         wants_snapshot = true;
@@ -1694,10 +2398,19 @@ fn placement_properties(
                         glow.color = color32_to_rgba(color);
                     }
                     ui.end_row();
-
-                    ui.label("Radius");
+                    ui.label("Radius X");
                     let response = ui.add(
-                        egui::DragValue::new(&mut glow.radius)
+                        egui::DragValue::new(&mut glow.radius_x)
+                            .speed(0.25)
+                            .clamp_range(0.0..=256.0)
+                            .suffix(" px"),
+                    );
+                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
+                    ui.end_row();
+
+                    ui.label("Radius Y");
+                    let response = ui.add(
+                        egui::DragValue::new(&mut glow.radius_y)
                             .speed(0.25)
                             .clamp_range(0.0..=256.0)
                             .suffix(" px"),
@@ -1713,6 +2426,12 @@ fn placement_properties(
                     );
                     note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
                     ui.end_row();
+
+                    ui.label("Quality");
+                    let response =
+                        ui.add(egui::DragValue::new(&mut glow.quality).clamp_range(1..=15));
+                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
+                    ui.end_row();
                 });
         });
     }
@@ -1720,22 +2439,45 @@ fn placement_properties(
     let mut blur_enabled = fx.blur.is_some();
     let blur_toggle = ui.checkbox(&mut blur_enabled, "Blur");
     if blur_toggle.changed() {
-        fx.blur = blur_enabled.then_some(BlurFx { radius: 4.0 });
+        fx.blur = blur_enabled.then_some(BlurFx {
+            radius_x: 4.0,
+            radius_y: 4.0,
+            quality: 3,
+        });
         fx_dirty = true;
         wants_snapshot = true;
     }
     if let Some(blur) = fx.blur.as_mut() {
         ui.indent("placement_blur", |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Radius");
-                let response = ui.add(
-                    egui::DragValue::new(&mut blur.radius)
-                        .speed(0.25)
-                        .clamp_range(0.0..=256.0)
-                        .suffix(" px"),
-                );
-                note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
-            });
+            egui::Grid::new("placement_blur_grid")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    ui.label("Radius X");
+                    let response = ui.add(
+                        egui::DragValue::new(&mut blur.radius_x)
+                            .speed(0.25)
+                            .clamp_range(0.0..=256.0)
+                            .suffix(" px"),
+                    );
+                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
+                    ui.end_row();
+
+                    ui.label("Radius Y");
+                    let response = ui.add(
+                        egui::DragValue::new(&mut blur.radius_y)
+                            .speed(0.25)
+                            .clamp_range(0.0..=256.0)
+                            .suffix(" px"),
+                    );
+                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
+                    ui.end_row();
+
+                    ui.label("Quality");
+                    let response =
+                        ui.add(egui::DragValue::new(&mut blur.quality).clamp_range(1..=15));
+                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
+                    ui.end_row();
+                });
         });
     }
 
@@ -1840,12 +2582,97 @@ fn placement_properties(
         transform,
         fx,
     ) {
+        if let Some(playback) = manual_playback_edit {
+            propagate_manual_q0rg_playback(
+                &mut app.state.project,
+                q0rg_id,
+                layer_id,
+                new_idx,
+                current_frame,
+                playback,
+            );
+        }
         app.session.selection = Selection::Placement {
             q0rg_id,
             layer_id,
             placement_idx: new_idx,
         };
         app.state.mark_dirty();
+    }
+}
+
+fn placement_frame_preview_view(
+    rect: egui::Rect,
+    bounds: (f32, f32, f32, f32),
+) -> crate::render::StageView {
+    let width = (bounds.2 - bounds.0).abs().max(1.0);
+    let height = (bounds.3 - bounds.1).abs().max(1.0);
+    let scale = (rect.width() / width).min(rect.height() / height) * 0.82;
+    let center_x = (bounds.0 + bounds.2) * 0.5;
+    let center_y = (bounds.1 + bounds.3) * 0.5;
+    crate::render::StageView {
+        origin: egui::pos2(
+            rect.center().x - center_x * scale,
+            rect.center().y - center_y * scale,
+        ),
+        scale,
+        stage_rect: rect,
+    }
+}
+
+fn propagate_manual_q0rg_playback(
+    project: &mut q0s_format::v2::ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    selected_placement_idx: usize,
+    frame: u16,
+    playback: q0s_format::v2::Q0rgPlayback,
+) {
+    let Some(layer) = project
+        .q0rgs
+        .iter_mut()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+        .and_then(|q0rg| {
+            q0rg.layers
+                .iter_mut()
+                .find(|layer| layer.layer_id == layer_id)
+        })
+    else {
+        return;
+    };
+    let Some(selected) = layer.placements.get(selected_placement_idx) else {
+        return;
+    };
+    if selected.frame != frame {
+        return;
+    }
+    let target = selected.target;
+    if !matches!(target, Target::Q0rg(_)) {
+        return;
+    }
+    let occurrence = layer
+        .placements
+        .iter()
+        .take(selected_placement_idx)
+        .filter(|placement| placement.frame == frame && placement.target == target)
+        .count();
+    let future_frames: std::collections::BTreeSet<u16> = layer
+        .placements
+        .iter()
+        .map(|placement| placement.frame)
+        .filter(|keyframe| *keyframe >= frame)
+        .collect();
+    for keyframe in future_frames {
+        if let Some(index) = layer
+            .placements
+            .iter()
+            .enumerate()
+            .filter(|(_, placement)| placement.frame == keyframe && placement.target == target)
+            .nth(occurrence)
+            .map(|(index, _)| index)
+        {
+            layer.placements[index].fx.q0rg_playback = playback;
+        }
     }
 }
 
@@ -1957,8 +2784,10 @@ mod tests {
                     b: 0,
                     a: 255,
                 },
-                radius: 8.0,
+                radius_x: 8.0,
+                radius_y: 8.0,
                 strength: 1.0,
+                quality: 3,
             }),
             ..Default::default()
         };

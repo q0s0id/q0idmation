@@ -240,6 +240,12 @@ mod tests {
                 fps: 24,
                 stage_width: 64,
                 stage_height: 64,
+                background_color: q0s_format::v2::Rgba {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                },
                 entry_q0rg_id: 1,
             },
             assets: vec![Asset::Vector(v2::VectorAsset {

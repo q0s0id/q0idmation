@@ -30,18 +30,92 @@ pub fn selection_can_clip(selection: &Selection) -> bool {
         Selection::None
         | Selection::Asset(_)
         | Selection::Q0rg(_)
-        | Selection::PathPoints { .. } => false,
+        | Selection::PathPoints { .. }
+        | Selection::SubselectPoints { .. } => false,
     }
 }
 
 pub fn capture_clipboard(project: &ProjectV2, selection: &Selection) -> ClipboardPayload {
     let placements = selected_object_placements(project, selection);
     let raw_vectors = selected_raw_vectors(project, selection);
+    let artwork_center = clipboard_artwork_bounds(project, &placements, &raw_vectors)
+        .map(|(min, max)| Vec2::new((min.x + max.x) * 0.5, (min.y + max.y) * 0.5));
     ClipboardPayload {
         placements,
         raw_vectors,
+        artwork_center,
         timeline: None,
     }
+}
+
+fn union_vec_bounds(
+    left: Option<(Vec2, Vec2)>,
+    right: Option<(Vec2, Vec2)>,
+) -> Option<(Vec2, Vec2)> {
+    match (left, right) {
+        (Some((a_min, a_max)), Some((b_min, b_max))) => Some((
+            Vec2::new(a_min.x.min(b_min.x), a_min.y.min(b_min.y)),
+            Vec2::new(a_max.x.max(b_max.x), a_max.y.max(b_max.y)),
+        )),
+        (Some(bounds), None) | (None, Some(bounds)) => Some(bounds),
+        (None, None) => None,
+    }
+}
+
+fn raw_clipboard_bounds(source: &RawVectorClipboard) -> Option<(Vec2, Vec2)> {
+    #[cfg(feature = "appearance-mask-eraser")]
+    if let Some(appearance) = source.appearance.as_ref() {
+        let indices: Vec<usize> = (0..source.vector.paths.len()).collect();
+        if let Some((min_x, min_y, max_x, max_y)) =
+            crate::appearance::fast_visible_material_bounds_for_paths(
+                &source.vector,
+                Some(appearance),
+                &indices,
+            )
+        {
+            return Some((Vec2::new(min_x, min_y), Vec2::new(max_x, max_y)));
+        }
+    }
+
+    let mut bounds: Option<(Vec2, Vec2)> = None;
+    for path in &source.vector.paths {
+        for point in crate::render::flatten_path(path) {
+            let point_bounds = Some((point, point));
+            bounds = union_vec_bounds(bounds, point_bounds);
+        }
+    }
+    let (mut min, mut max) = bounds?;
+    if let Some(stroke) = source.vector.stroke {
+        let pad = stroke.width.max(0.0) * 0.5;
+        min.x -= pad;
+        min.y -= pad;
+        max.x += pad;
+        max.y += pad;
+    }
+    Some((min, max))
+}
+
+fn clipboard_artwork_bounds(
+    project: &ProjectV2,
+    placements: &[Placement],
+    raw_vectors: &[RawVectorClipboard],
+) -> Option<(Vec2, Vec2)> {
+    let raw_bounds = raw_vectors.iter().fold(None, |bounds, source| {
+        union_vec_bounds(bounds, raw_clipboard_bounds(source))
+    });
+    placements.iter().fold(raw_bounds, |bounds, placement| {
+        let placement_bounds = crate::render::placement_bbox(project, placement)
+            .map(|(min_x, min_y, max_x, max_y)| (Vec2::new(min_x, min_y), Vec2::new(max_x, max_y)));
+        union_vec_bounds(bounds, placement_bounds)
+    })
+}
+
+pub fn paste_offset_for_target(payload: &ClipboardPayload, target_center: Vec2) -> Vec2 {
+    payload
+        .artwork_center
+        .map_or(Vec2::new(0.0, 0.0), |center| {
+            Vec2::new(target_center.x - center.x, target_center.y - center.y)
+        })
 }
 
 fn selected_object_placements(project: &ProjectV2, selection: &Selection) -> Vec<Placement> {
@@ -920,6 +994,7 @@ mod tests {
                 material_source: Vec::new(),
                 clip_mask: Vec::new(),
                 field_transform: Affine::IDENTITY,
+                fill_gradient: None,
             },
         );
         ProjectV2 {
@@ -928,6 +1003,12 @@ mod tests {
                 fps: 24,
                 stage_width: 640,
                 stage_height: 480,
+                background_color: q0s_format::v2::Rgba {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                },
                 entry_q0rg_id: 1,
             },
             assets: vec![Asset::Vector(VectorAsset {
@@ -985,6 +1066,117 @@ mod tests {
         q0s_format::v2::validate(&project)
             .expect("deleting the asset must also remove its sparse appearance metadata");
         assert!(!project.asset_appearances.contains_key(&1));
+    }
+
+    #[test]
+    fn mixed_raw_and_q0rg_clipboard_pastes_as_one_centered_group() {
+        let mut project = appearance_raw_project();
+        project.asset_appearances.clear();
+        let child_path = VPath {
+            anchors: vec![
+                Anchor {
+                    point: Vec2::new(0.0, 0.0),
+                    in_handle: None,
+                    out_handle: None,
+                },
+                Anchor {
+                    point: Vec2::new(20.0, 0.0),
+                    in_handle: None,
+                    out_handle: None,
+                },
+                Anchor {
+                    point: Vec2::new(20.0, 20.0),
+                    in_handle: None,
+                    out_handle: None,
+                },
+                Anchor {
+                    point: Vec2::new(0.0, 20.0),
+                    in_handle: None,
+                    out_handle: None,
+                },
+            ],
+            closed: true,
+        };
+        project.assets.push(Asset::Vector(VectorAsset {
+            asset_id: 2,
+            paths: vec![child_path],
+            fill: Some(Rgba {
+                r: 30,
+                g: 40,
+                b: 50,
+                a: 255,
+            }),
+            stroke: None,
+        }));
+        project.q0rgs.push(Q0rg {
+            q0rg_id: 2,
+            name: "Child".into(),
+            frame_count: 1,
+            script: String::new(),
+            layers: vec![Layer {
+                layer_id: 1,
+                name: "Child Layer".into(),
+                explicit_keyframes: vec![0],
+                placements: vec![Placement {
+                    instance_id: 0,
+                    frame: 0,
+                    target: Target::Asset(2),
+                    transform: Transform2D::IDENTITY,
+                    tween: Tween::None,
+                    fx: Default::default(),
+                }],
+            }],
+        });
+        project.q0rgs[0].layers[0].placements.push(Placement {
+            instance_id: 42,
+            frame: 0,
+            target: Target::Q0rg(2),
+            transform: Transform2D {
+                tx: 100.0,
+                ty: 0.0,
+                ..Transform2D::IDENTITY
+            },
+            tween: Tween::None,
+            fx: Default::default(),
+        });
+
+        let payload = capture_clipboard(
+            &project,
+            &Selection::Mixed {
+                paths: vec![PathRef {
+                    q0rg_id: 1,
+                    layer_id: 1,
+                    placement_idx: 0,
+                    path_idx: 0,
+                }],
+                objects: vec![PlacementRef {
+                    q0rg_id: 1,
+                    layer_id: 1,
+                    placement_idx: 1,
+                }],
+            },
+        );
+        assert_eq!(payload.artwork_center, Some(Vec2::new(60.0, 10.0)));
+        let target = Vec2::new(300.0, 200.0);
+        let offset = paste_offset_for_target(&payload, target);
+        assert_eq!(offset, Vec2::new(240.0, 190.0));
+
+        let result = paste_payload(&mut project, 1, 1, 0, &payload, offset);
+        assert_eq!(result.raw_placements.len(), 1);
+        assert_eq!(result.objects.len(), 1);
+        let (raw_min, raw_max) = result.raw_bounds.expect("pasted raw bounds");
+        assert_eq!(raw_min, Vec2::new(240.0, 190.0));
+        assert_eq!(raw_max, Vec2::new(260.0, 210.0));
+        let pasted_object = &project.q0rgs[0].layers[0].placements[result.objects[0].placement_idx];
+        assert_eq!(pasted_object.transform.tx, 340.0);
+        assert_eq!(pasted_object.transform.ty, 190.0);
+        let object_bounds = crate::render::placement_bbox(&project, pasted_object).unwrap();
+        let pasted_group_center = Vec2::new(
+            (raw_min.x.min(object_bounds.0) + raw_max.x.max(object_bounds.2)) * 0.5,
+            (raw_min.y.min(object_bounds.1) + raw_max.y.max(object_bounds.3)) * 0.5,
+        );
+        assert_eq!(pasted_group_center, target);
+        assert_eq!(pasted_object.transform.tx - raw_min.x, 100.0);
     }
 
     #[test]

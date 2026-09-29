@@ -15,20 +15,24 @@
 
 use std::collections::HashMap;
 
-use egui::epaint::{PathShape, Vertex};
+use egui::epaint::Vertex;
 use egui::{
     pos2, Color32, ColorImage, Context, Mesh, Painter, Pos2, Rect, Shape, Stroke, TextureHandle,
     TextureOptions,
 };
 use lyon_path::math::point as lyon_point;
 use lyon_tessellation::geometry_builder::{BuffersBuilder, Positions, VertexBuffers};
-use lyon_tessellation::{FillOptions, FillRule as LyonFillRule, FillTessellator};
+use lyon_tessellation::{
+    FillOptions, FillRule as LyonFillRule, FillTessellator, LineJoin, StrokeOptions,
+    StrokeTessellator,
+};
 use q0s_format::geom::flatten_path;
 use q0s_format::raster::active_placement_states_at;
 use q0s_format::runtime_scene::RuntimeSceneState;
 use q0s_format::transform::Affine;
 use q0s_format::v2::{
-    Asset, BlendMode, InstanceKey, Placement, PlacementFx, ProjectV2, Rgba, Target, Vec2,
+    Asset, BlendMode, GradientFill, InstanceKey, Placement, PlacementFx, ProjectV2, Rgba, Target,
+    Vec2, VectorAppearance,
 };
 
 const Q0RG_RECURSION_LIMIT: u8 = 8;
@@ -160,7 +164,12 @@ pub fn paint_v2_frame_with_runtime_overrides(
     );
     if white_stage_bg {
         let stage_rect = Rect::from_min_size(origin, drawn);
-        painter.rect_filled(stage_rect, 0.0, Color32::WHITE);
+        let bg = project.meta.background_color;
+        painter.rect_filled(
+            stage_rect,
+            0.0,
+            Color32::from_rgba_unmultiplied(bg.r, bg.g, bg.b, 255),
+        );
     }
     let view = StageView { origin, scale };
     paint_q0rg(
@@ -169,13 +178,21 @@ pub fn paint_v2_frame_with_runtime_overrides(
         project,
         q0rg_id,
         frame,
-        Affine::IDENTITY,
+        authored_root_affine(project, q0rg_id, frame),
         &view,
         0,
         cache,
         rig_overrides,
         scene_state,
     );
+}
+
+fn authored_root_affine(project: &ProjectV2, q0rg_id: u16, frame: u16) -> Affine {
+    if q0rg_id == project.meta.entry_q0rg_id && project.runtime.camera.enabled {
+        project.camera_affine_at(frame)
+    } else {
+        Affine::IDENTITY
+    }
 }
 
 fn fx_raster_size(stage_rect: Rect, ctx: &Context) -> (u32, u32) {
@@ -364,6 +381,7 @@ fn paint_q0rg(
                             painter,
                             ctx,
                             asset,
+                            project.asset_appearances.get(&asset_id),
                             composed,
                             view,
                             cache,
@@ -373,12 +391,19 @@ fn paint_q0rg(
                     }
                 }
                 Target::Q0rg(child_id) if child_id != q0rg_id => {
+                    let child_frame = q0s_format::v2::resolve_q0rg_playback_frame(
+                        project,
+                        child_id,
+                        local_frame,
+                        placement.frame,
+                        active.fx.q0rg_playback,
+                    );
                     paint_q0rg(
                         painter,
                         ctx,
                         project,
                         child_id,
-                        local_frame,
+                        child_frame,
                         composed,
                         view,
                         depth + 1,
@@ -398,6 +423,7 @@ fn paint_asset(
     painter: &Painter,
     ctx: &Context,
     asset: &Asset,
+    appearance: Option<&VectorAppearance>,
     transform: Affine,
     view: &StageView,
     cache: &mut TextureCache,
@@ -522,20 +548,66 @@ fn paint_asset(
             // each PathShape independently destroys those holes. egui 0.27 also
             // assumes PathShape fills are convex, which produces the old giant
             // diagonal "lasso" fans for concave brush graphics.
-            let fill_color = v.fill.map(rgba_to_color32).unwrap_or(Color32::TRANSPARENT);
-            if fill_color != Color32::TRANSPARENT {
-                let contours: Vec<Vec<Pos2>> = v
-                    .paths
-                    .iter()
-                    .filter(|path| path.closed)
-                    .map(|path| {
-                        flatten_path(path, BEZIER_SAMPLES)
+            let local_contours: Vec<Vec<Pos2>> = v
+                .paths
+                .iter()
+                .filter(|path| path.closed)
+                .map(|path| {
+                    flatten_path(path, BEZIER_SAMPLES)
+                        .iter()
+                        .map(|point| Pos2::new(point.x, point.y))
+                        .collect()
+                })
+                .collect();
+            if let Some(appearance) = appearance {
+                if let Some(gradient) = appearance.fill_gradient.as_ref() {
+                    paint_complex_gradient(
+                        painter,
+                        &local_contours,
+                        gradient,
+                        appearance.field_transform,
+                        transform,
+                        view,
+                    );
+                } else {
+                    let fill_color = v.fill.map(rgba_to_color32).unwrap_or(Color32::TRANSPARENT);
+                    if fill_color != Color32::TRANSPARENT {
+                        let contours: Vec<Vec<Pos2>> = local_contours
                             .iter()
-                            .map(|point| stage_to_screen(transform.apply(*point), view))
-                            .collect()
-                    })
-                    .collect();
-                paint_complex_fill(painter, &contours, fill_color);
+                            .map(|contour| {
+                                contour
+                                    .iter()
+                                    .map(|point| {
+                                        stage_to_screen(
+                                            transform.apply(Vec2::new(point.x, point.y)),
+                                            view,
+                                        )
+                                    })
+                                    .collect()
+                            })
+                            .collect();
+                        paint_complex_fill(painter, &contours, fill_color);
+                    }
+                }
+            } else {
+                let fill_color = v.fill.map(rgba_to_color32).unwrap_or(Color32::TRANSPARENT);
+                if fill_color != Color32::TRANSPARENT {
+                    let contours: Vec<Vec<Pos2>> = local_contours
+                        .iter()
+                        .map(|contour| {
+                            contour
+                                .iter()
+                                .map(|point| {
+                                    stage_to_screen(
+                                        transform.apply(Vec2::new(point.x, point.y)),
+                                        view,
+                                    )
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    paint_complex_fill(painter, &contours, fill_color);
+                }
             }
 
             // Stroke width is logical (stage units). Multiply by the
@@ -563,12 +635,14 @@ fn paint_asset(
                     None => Stroke::NONE,
                 };
                 if stroke != Stroke::NONE {
-                    painter.add(Shape::Path(PathShape {
-                        points: polyline_screen.clone(),
-                        closed: path.closed,
-                        fill: Color32::TRANSPARENT,
-                        stroke,
-                    }));
+                    if let Some(mesh) = bounded_stroke_mesh(
+                        &polyline_screen,
+                        stroke.width,
+                        path.closed,
+                        stroke.color,
+                    ) {
+                        painter.add(Shape::Mesh(mesh));
+                    }
                 }
                 // Round caps via end-circles — egui's stroke is butt by
                 // default. Mirrors the editor render so editor and
@@ -593,6 +667,144 @@ fn paint_asset(
     }
 }
 
+fn paint_complex_gradient(
+    painter: &Painter,
+    contours: &[Vec<Pos2>],
+    gradient: &GradientFill,
+    field_transform: Affine,
+    transform: Affine,
+    view: &StageView,
+) {
+    let mut effective = gradient.clone();
+    effective.transform = Affine::compose(field_transform, gradient.transform);
+    let gradient = &effective;
+    let Some(buffers) = tessellate_complex_fill(contours) else {
+        return;
+    };
+    let mut mesh = Mesh::default();
+    for triangle in buffers.indices.chunks_exact(3) {
+        let local = [
+            Vec2::new(
+                buffers.vertices[triangle[0] as usize].x,
+                buffers.vertices[triangle[0] as usize].y,
+            ),
+            Vec2::new(
+                buffers.vertices[triangle[1] as usize].x,
+                buffers.vertices[triangle[1] as usize].y,
+            ),
+            Vec2::new(
+                buffers.vertices[triangle[2] as usize].x,
+                buffers.vertices[triangle[2] as usize].y,
+            ),
+        ];
+        emit_gradient_triangle(&mut mesh, local, gradient, transform, view, 0);
+    }
+    if !mesh.indices.is_empty() {
+        painter.add(Shape::Mesh(mesh));
+    }
+}
+
+fn gradient_color_error(actual: Rgba, expected: Rgba) -> u8 {
+    [
+        actual.r.abs_diff(expected.r),
+        actual.g.abs_diff(expected.g),
+        actual.b.abs_diff(expected.b),
+        actual.a.abs_diff(expected.a),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0)
+}
+
+fn average_gradient_color(a: Rgba, b: Rgba) -> Rgba {
+    let avg = |left: u8, right: u8| ((u16::from(left) + u16::from(right)) / 2) as u8;
+    Rgba {
+        r: avg(a.r, b.r),
+        g: avg(a.g, b.g),
+        b: avg(a.b, b.b),
+        a: avg(a.a, b.a),
+    }
+}
+
+fn emit_gradient_triangle(
+    mesh: &mut Mesh,
+    triangle: [Vec2; 3],
+    gradient: &GradientFill,
+    transform: Affine,
+    view: &StageView,
+    depth: u8,
+) {
+    let colors = triangle.map(|point| gradient.sample(point));
+    let ab = Vec2::new(
+        (triangle[0].x + triangle[1].x) * 0.5,
+        (triangle[0].y + triangle[1].y) * 0.5,
+    );
+    let bc = Vec2::new(
+        (triangle[1].x + triangle[2].x) * 0.5,
+        (triangle[1].y + triangle[2].y) * 0.5,
+    );
+    let ca = Vec2::new(
+        (triangle[2].x + triangle[0].x) * 0.5,
+        (triangle[2].y + triangle[0].y) * 0.5,
+    );
+    let error = [
+        gradient_color_error(
+            gradient.sample(ab),
+            average_gradient_color(colors[0], colors[1]),
+        ),
+        gradient_color_error(
+            gradient.sample(bc),
+            average_gradient_color(colors[1], colors[2]),
+        ),
+        gradient_color_error(
+            gradient.sample(ca),
+            average_gradient_color(colors[2], colors[0]),
+        ),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
+    if error > 3 && depth < 5 {
+        emit_gradient_triangle(
+            mesh,
+            [triangle[0], ab, ca],
+            gradient,
+            transform,
+            view,
+            depth + 1,
+        );
+        emit_gradient_triangle(
+            mesh,
+            [ab, triangle[1], bc],
+            gradient,
+            transform,
+            view,
+            depth + 1,
+        );
+        emit_gradient_triangle(
+            mesh,
+            [ca, bc, triangle[2]],
+            gradient,
+            transform,
+            view,
+            depth + 1,
+        );
+        emit_gradient_triangle(mesh, [ab, bc, ca], gradient, transform, view, depth + 1);
+        return;
+    }
+    let Ok(base) = u32::try_from(mesh.vertices.len()) else {
+        return;
+    };
+    for (point, color) in triangle.into_iter().zip(colors) {
+        mesh.vertices.push(Vertex {
+            pos: stage_to_screen(transform.apply(point), view),
+            uv: Pos2::ZERO,
+            color: rgba_to_color32(color),
+        });
+    }
+    mesh.indices.extend_from_slice(&[base, base + 1, base + 2]);
+}
+
 fn paint_complex_fill(painter: &Painter, contours: &[Vec<Pos2>], color: Color32) {
     let Some(buffers) = tessellate_complex_fill(contours) else {
         return;
@@ -607,6 +819,54 @@ fn paint_complex_fill(painter: &Painter, contours: &[Vec<Pos2>], color: Color32)
     }
     mesh.indices = buffers.indices;
     painter.add(Shape::Mesh(mesh));
+}
+
+fn tessellate_bounded_stroke(
+    points: &[Pos2],
+    width: f32,
+    closed: bool,
+) -> Option<VertexBuffers<lyon_path::math::Point, u32>> {
+    if points.len() < 2 || !width.is_finite() || width <= 0.0 {
+        return None;
+    }
+    let mut path_builder = lyon_path::Path::builder();
+    path_builder.begin(lyon_point(points[0].x, points[0].y));
+    for point in &points[1..] {
+        if !point.x.is_finite() || !point.y.is_finite() {
+            return None;
+        }
+        path_builder.line_to(lyon_point(point.x, point.y));
+    }
+    path_builder.end(closed);
+    let path = path_builder.build();
+    let mut buffers: VertexBuffers<lyon_path::math::Point, u32> = VertexBuffers::new();
+    let mut tessellator = StrokeTessellator::new();
+    let options = StrokeOptions::default()
+        .with_line_width(width)
+        .with_line_join(LineJoin::Bevel)
+        .with_tolerance(0.05);
+    tessellator
+        .tessellate_path(
+            &path,
+            &options,
+            &mut BuffersBuilder::new(&mut buffers, Positions),
+        )
+        .ok()?;
+    Some(buffers)
+}
+
+fn bounded_stroke_mesh(points: &[Pos2], width: f32, closed: bool, color: Color32) -> Option<Mesh> {
+    let buffers = tessellate_bounded_stroke(points, width, closed)?;
+    let mut mesh = Mesh::default();
+    for point in buffers.vertices {
+        mesh.vertices.push(Vertex {
+            pos: Pos2::new(point.x, point.y),
+            uv: Pos2::ZERO,
+            color,
+        });
+    }
+    mesh.indices = buffers.indices;
+    Some(mesh)
 }
 
 fn tessellate_complex_fill(
@@ -707,6 +967,77 @@ mod tests {
     }
 
     #[test]
+    fn bounded_open_stroke_does_not_emit_unbounded_hairpin_vertices() {
+        let points = vec![
+            pos2(2.85, 16.10),
+            pos2(2.85, 16.00),
+            pos2(2.80, 15.95),
+            pos2(2.80, 15.90),
+            pos2(2.70, 15.55),
+            pos2(4.55, 16.10),
+        ];
+        let buffers = tessellate_bounded_stroke(&points, 1.0, false).expect("bounded stroke");
+        assert!(buffers
+            .vertices
+            .iter()
+            .all(|p| p.x > 2.0 && p.x < 5.2 && p.y > 14.8 && p.y < 16.8));
+    }
+
+    #[test]
+    fn radial_gradient_mesh_subdivides_and_samples_transparent_interior() {
+        let gradient = GradientFill {
+            kind: q0s_format::v2::GradientKind::Radial,
+            stops: vec![
+                q0s_format::v2::GradientStop {
+                    position: 0.0,
+                    color: Rgba {
+                        r: 255,
+                        g: 0,
+                        b: 0,
+                        a: 0,
+                    },
+                },
+                q0s_format::v2::GradientStop {
+                    position: 1.0,
+                    color: Rgba {
+                        r: 0,
+                        g: 0,
+                        b: 255,
+                        a: 255,
+                    },
+                },
+            ],
+            transform: Affine::IDENTITY,
+        };
+        let view = StageView {
+            origin: pos2(0.0, 0.0),
+            scale: 1.0,
+        };
+        let mut mesh = Mesh::default();
+        emit_gradient_triangle(
+            &mut mesh,
+            [
+                Vec2::new(-1.0, -1.0),
+                Vec2::new(1.0, -1.0),
+                Vec2::new(0.0, 1.0),
+            ],
+            &gradient,
+            Affine::IDENTITY,
+            &view,
+            0,
+        );
+        assert!(
+            mesh.vertices.len() > 3,
+            "player radial gradient must subdivide curved colour space instead of interpolating only triangle corners"
+        );
+        assert!(
+            mesh.vertices.iter().any(|vertex| vertex.color.a() < 240),
+            "player mesh must sample transparent interior gradient stops"
+        );
+        assert_eq!(mesh.indices.len() % 3, 0);
+    }
+
+    #[test]
     fn complex_fill_preserves_oppositely_wound_hole_contour() {
         let exterior = vec![
             pos2(0.0, 0.0),
@@ -769,6 +1100,12 @@ mod tests {
                 fps: 24,
                 stage_width: 16,
                 stage_height: 16,
+                background_color: q0s_format::v2::Rgba {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                },
                 entry_q0rg_id: 1,
             },
             assets: vec![Asset::Bitmap(BitmapAsset {
@@ -895,6 +1232,12 @@ mod tests {
                 fps: 24,
                 stage_width: 16,
                 stage_height: 16,
+                background_color: q0s_format::v2::Rgba {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                },
                 entry_q0rg_id: 1,
             },
             assets: vec![Asset::Bitmap(BitmapAsset {
@@ -964,6 +1307,53 @@ mod tests {
             painted_shape_count(&project),
             0,
             "hidden layer must emit no interactive player shapes"
+        );
+    }
+
+    #[test]
+    fn interactive_player_uses_authored_camera_only_for_entry_q0rg() {
+        use q0s_format::v2::{CameraKey, CameraState, ProjectMeta, Tween};
+
+        let mut project = ProjectV2 {
+            meta: ProjectMeta {
+                name: "camera-player".into(),
+                fps: 24,
+                stage_width: 100,
+                stage_height: 80,
+                background_color: q0s_format::v2::Rgba {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                },
+                entry_q0rg_id: 1,
+            },
+            assets: Vec::new(),
+            asset_names: Default::default(),
+            asset_appearances: Default::default(),
+            layer_metadata: Default::default(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
+            q0rgs: Vec::new(),
+        };
+        project.runtime.camera.enabled = true;
+        project.runtime.camera.keys.push(CameraKey {
+            frame: 0,
+            state: CameraState {
+                center_x: 60.0,
+                center_y: 40.0,
+                zoom: 2.0,
+                rotation: 0.25,
+            },
+            tween: Tween::None,
+        });
+
+        let expected = project.camera_affine_at(0);
+        assert_eq!(authored_root_affine(&project, 1, 0), expected);
+        assert_eq!(
+            authored_root_affine(&project, 2, 0),
+            Affine::IDENTITY,
+            "nested/local q0rg previews must not receive the project camera twice"
         );
     }
 }

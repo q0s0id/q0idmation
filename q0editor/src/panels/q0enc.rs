@@ -593,10 +593,22 @@ fn render_frame_source(
     ui.add_space(6.0);
     ui.label(RichText::new("render").strong());
     ui.horizontal(|ui| {
-        ui.label("size");
-        ui.add(egui::DragValue::new(&mut state.width).clamp_range(1..=16_384));
-        ui.label("×");
-        ui.add(egui::DragValue::new(&mut state.height).clamp_range(1..=16_384));
+        ui.label("upscale");
+        let mut scale = state.render_scale;
+        if ui
+            .add(
+                egui::DragValue::new(&mut scale)
+                    .clamp_range(
+                        crate::q0enc::MIN_RENDER_SCALE..=crate::q0enc::max_render_scale(project),
+                    )
+                    .speed(0.1)
+                    .suffix("x"),
+            )
+            .changed()
+        {
+            state.set_render_scale(project, scale);
+        }
+        ui.label(format!("{} × {} px", state.width, state.height));
     });
     ui.horizontal(|ui| {
         ui.label("antialiasing");

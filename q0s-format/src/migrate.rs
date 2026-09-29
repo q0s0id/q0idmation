@@ -62,6 +62,12 @@ pub fn migrate_v1_to_v2(v1: Q1Project) -> Result<ProjectV2, Error> {
             fps: v1.meta.fps,
             stage_width: v1.meta.stage_width,
             stage_height: v1.meta.stage_height,
+            background_color: crate::v2::Rgba {
+                r: 255,
+                g: 255,
+                b: 255,
+                a: 255,
+            },
             entry_q0rg_id: v1.meta.entry_scene_id,
         },
         assets,

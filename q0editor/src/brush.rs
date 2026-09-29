@@ -1,5 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use geo::algorithm::buffer::{BufferStyle, LineCap, LineJoin};
 use geo::sweep::Cross;
 use geo::{
     Area, BooleanOps, BoundingRect, Buffer, Contains, ConvexHull, Coord, Intersections, Intersects,
@@ -555,6 +556,31 @@ fn variable_nib_segment(
     MultiPoint(points).convex_hull()
 }
 
+const ROUND_NIB_SEGMENTS: usize = 64;
+
+fn circular_sweep_buffer(
+    line: &LineString<f64>,
+    radius: f64,
+    path_length: f32,
+    size: f32,
+) -> MultiPolygon<f64> {
+    // geo's default round buffer is intentionally fairly coarse. That is fine
+    // for long strokes, where the cap occupies a tiny part of the silhouette,
+    // but a dot-like gesture is almost entirely cap and visibly turns polygonal.
+    // Match the 64-segment static circular nib only for strokes shorter than one
+    // brush diameter, keeping the long-stroke fast path unchanged.
+    if path_length <= size.max(0.1) {
+        let max_angle = std::f64::consts::TAU / ROUND_NIB_SEGMENTS as f64;
+        line.buffer_with_style(
+            BufferStyle::new(radius)
+                .line_cap(LineCap::Round(max_angle))
+                .line_join(LineJoin::Round(max_angle)),
+        )
+    } else {
+        line.buffer(radius)
+    }
+}
+
 fn sweep_trajectory_nib(nib: BrushNib, size: f32, trajectory: &[Vec2]) -> MultiPolygon<f64> {
     let Some(first) = trajectory.first().copied() else {
         return MultiPolygon(Vec::new());
@@ -565,21 +591,29 @@ fn sweep_trajectory_nib(nib: BrushNib, size: f32, trajectory: &[Vec2]) -> MultiP
 
     if nib == BrushNib::Circle {
         let radius = f64::from(size.max(0.1)) * 0.5;
-        let mut coords: Vec<Coord<f64>> = trajectory
-            .iter()
-            .map(|point| Coord {
+        let mut path_length = 0.0_f32;
+        let mut coords: Vec<Coord<f64>> = Vec::with_capacity(trajectory.len());
+        for point in trajectory {
+            if let Some(previous) = coords.last() {
+                path_length +=
+                    vec2_distance(Vec2::new(previous.x as f32, previous.y as f32), *point);
+            }
+            let coord = Coord {
                 x: f64::from(point.x),
                 y: f64::from(point.y),
-            })
-            .collect();
-        coords.dedup();
+            };
+            if coords.last().copied() != Some(coord) {
+                coords.push(coord);
+            }
+        }
         if coords.len() == 1 {
             return sweep_nib(nib, size, first, first);
         }
         if (coords[0].x, coords[0].y) > (coords[coords.len() - 1].x, coords[coords.len() - 1].y) {
             coords.reverse();
         }
-        return LineString::new(coords).buffer(radius);
+        let line = LineString::new(coords);
+        return circular_sweep_buffer(&line, radius, path_length, size);
     }
 
     let mut coverage = sweep_nib(nib, size, first, first);
@@ -602,7 +636,7 @@ pub fn sweep_nib(nib: BrushNib, size: f32, start: Vec2, end: Vec2) -> MultiPolyg
         } else {
             (end, start)
         };
-        return Line::new(
+        let line = LineString::new(vec![
             Coord {
                 x: f64::from(start.x),
                 y: f64::from(start.y),
@@ -611,8 +645,8 @@ pub fn sweep_nib(nib: BrushNib, size: f32, start: Vec2, end: Vec2) -> MultiPolyg
                 x: f64::from(end.x),
                 y: f64::from(end.y),
             },
-        )
-        .buffer(radius);
+        ]);
+        return circular_sweep_buffer(&line, radius, vec2_distance(start, end), size);
     }
 
     let mut points = Vec::with_capacity(8);
@@ -690,10 +724,9 @@ fn polygon_from_nib_outline(points: Vec<Vec2>) -> MultiPolygon<f64> {
 }
 
 fn circular_nib_imprint(center: Vec2, radius: f64) -> MultiPolygon<f64> {
-    const SEGMENTS: usize = 64;
-    let mut coords = Vec::with_capacity(SEGMENTS + 1);
-    for index in 0..SEGMENTS {
-        let angle = std::f64::consts::TAU * index as f64 / SEGMENTS as f64;
+    let mut coords = Vec::with_capacity(ROUND_NIB_SEGMENTS + 1);
+    for index in 0..ROUND_NIB_SEGMENTS {
+        let angle = std::f64::consts::TAU * index as f64 / ROUND_NIB_SEGMENTS as f64;
         coords.push(Coord {
             x: f64::from(center.x) + radius * angle.cos(),
             y: f64::from(center.y) + radius * angle.sin(),
@@ -999,13 +1032,586 @@ fn ring_to_path(ring: &LineString<f64>) -> Option<VPath> {
         return None;
     }
 
-    let linear = linear_ring_path(&points);
-    let curved = curved_ring_path(&points);
+    let fit_tolerance = canonical_curve_fit_tolerance(&points);
+    let baseline_points = collapse_subprecision_ring_points(&points, fit_tolerance);
+    if baseline_points.len() < 3 {
+        return None;
+    }
+    let hairpin_points = collapse_micro_hairpins(&baseline_points, fit_tolerance);
+    let aggressive_points = collapse_micro_backsteps(&hairpin_points, fit_tolerance);
+    for fit_points in [&aggressive_points, &hairpin_points, &baseline_points] {
+        if fit_points.len() < 3 {
+            continue;
+        }
+        for tolerance_scale in [1.0_f32, 0.5, 0.25, 0.125] {
+            let tolerance = fit_tolerance * tolerance_scale;
+            if let Some(fitted) = fit_closed_ring_path(fit_points, tolerance) {
+                if fitted.anchors.len() < fit_points.len()
+                    && fitted_ring_path_is_safe(ring, &fitted, tolerance)
+                {
+                    return Some(fitted);
+                }
+            }
+        }
+    }
+    let linear = linear_ring_path(&baseline_points);
+    let curved = curved_ring_path(&baseline_points);
     if curved_path_is_safe(ring, &curved) {
         Some(curved)
     } else {
         Some(linear)
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FittedCubic {
+    p0: Vec2,
+    p1: Vec2,
+    p2: Vec2,
+    p3: Vec2,
+}
+
+fn canonical_curve_fit_tolerance(points: &[Vec2]) -> f32 {
+    let Some((min, max)) = points_bounds(points) else {
+        return 0.0025;
+    };
+    let diagonal = (max.x - min.x).hypot(max.y - min.y);
+    (diagonal * 1.0e-5).clamp(0.0025, 0.05)
+}
+
+fn collapse_subprecision_ring_points(points: &[Vec2], tolerance: f32) -> Vec<Vec2> {
+    if points.len() < 4 {
+        return points.to_vec();
+    }
+    // Representation canonicalization only: discard consecutive samples that
+    // are below useful f32/sub-pixel precision. No artistic smoothing here.
+    let minimum_spacing = (tolerance * 0.1).max(1.0e-5);
+    let mut compact = Vec::with_capacity(points.len());
+    for &point in points {
+        if compact
+            .last()
+            .is_none_or(|&previous| vec2_distance(previous, point) > minimum_spacing)
+        {
+            compact.push(point);
+        }
+    }
+    while compact.len() > 3
+        && vec2_distance(compact[0], *compact.last().unwrap()) <= minimum_spacing
+    {
+        compact.pop();
+    }
+    compact
+}
+
+fn collapse_micro_hairpins(points: &[Vec2], tolerance: f32) -> Vec<Vec2> {
+    if points.len() < 4 {
+        return points.to_vec();
+    }
+    let minimum_spacing = (tolerance * 0.1).max(1.0e-5);
+    let return_radius = (tolerance * 0.15).max(minimum_spacing);
+    let excursion_limit = tolerance * 0.5;
+    let mut compact = points.to_vec();
+    for _ in 0..4 {
+        if compact.len() <= 3 {
+            break;
+        }
+        let count = compact.len();
+        let mut remove = vec![false; count];
+        for index in 0..count {
+            let previous = compact[(index + count - 1) % count];
+            let current = compact[index];
+            let next = compact[(index + 1) % count];
+            if vec2_distance(previous, next) <= return_radius
+                && vec2_distance(previous, current).max(vec2_distance(current, next))
+                    <= excursion_limit
+            {
+                remove[index] = true;
+            }
+        }
+        let remove_count = remove.iter().filter(|&&value| value).count();
+        if remove_count == 0 || count - remove_count < 3 {
+            break;
+        }
+        compact = compact
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, point)| (!remove[index]).then_some(point))
+            .collect();
+        compact = collapse_subprecision_ring_points(&compact, tolerance);
+    }
+    compact
+}
+
+fn collapse_micro_backsteps(points: &[Vec2], tolerance: f32) -> Vec<Vec2> {
+    if points.len() < 4 {
+        return points.to_vec();
+    }
+    let mut compact = points.to_vec();
+    for _ in 0..4 {
+        let count = compact.len();
+        if count <= 3 {
+            break;
+        }
+        let mut remove = vec![false; count];
+        for index in 0..count {
+            let previous = compact[(index + count - 1) % count];
+            let current = compact[index];
+            let next_index = (index + 1) % count;
+            let next = compact[next_index];
+            let after = compact[(index + 2) % count];
+            let incoming = vec2_sub(current, previous);
+            let backstep = vec2_sub(next, current);
+            let outgoing = vec2_sub(after, next);
+            let incoming_len = vec2_length(incoming);
+            let backstep_len = vec2_length(backstep);
+            let outgoing_len = vec2_length(outgoing);
+            if backstep_len <= tolerance * 0.75
+                && incoming_len > backstep_len * 4.0
+                && outgoing_len > backstep_len * 4.0
+            {
+                let incoming_unit = vec2_scale(incoming, incoming_len.recip());
+                let backstep_unit = vec2_scale(backstep, backstep_len.max(1.0e-12).recip());
+                let outgoing_unit = vec2_scale(outgoing, outgoing_len.recip());
+                if vec2_dot(incoming_unit, outgoing_unit) > 0.8
+                    && vec2_dot(incoming_unit, backstep_unit) < -0.5
+                    && vec2_dot(outgoing_unit, backstep_unit) < -0.5
+                {
+                    remove[next_index] = true;
+                }
+            }
+        }
+        let remove_count = remove.iter().filter(|&&value| value).count();
+        if remove_count == 0 || count - remove_count < 3 {
+            break;
+        }
+        compact = compact
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, point)| (!remove[index]).then_some(point))
+            .collect();
+        compact = collapse_subprecision_ring_points(&compact, tolerance);
+    }
+    compact
+}
+
+fn normalized_or(value: Vec2, fallback: Vec2) -> Vec2 {
+    let length = vec2_length(value);
+    if length > 1.0e-8 {
+        vec2_scale(value, length.recip())
+    } else {
+        let fallback_length = vec2_length(fallback);
+        if fallback_length > 1.0e-8 {
+            vec2_scale(fallback, fallback_length.recip())
+        } else {
+            Vec2::new(1.0, 0.0)
+        }
+    }
+}
+
+fn bezier_basis(t: f32) -> [f32; 4] {
+    let mt = 1.0 - t;
+    [mt * mt * mt, 3.0 * mt * mt * t, 3.0 * mt * t * t, t * t * t]
+}
+
+fn cubic_derivative(curve: FittedCubic, t: f32) -> Vec2 {
+    let mt = 1.0 - t;
+    vec2_add(
+        vec2_add(
+            vec2_scale(vec2_sub(curve.p1, curve.p0), 3.0 * mt * mt),
+            vec2_scale(vec2_sub(curve.p2, curve.p1), 6.0 * mt * t),
+        ),
+        vec2_scale(vec2_sub(curve.p3, curve.p2), 3.0 * t * t),
+    )
+}
+
+fn cubic_second_derivative(curve: FittedCubic, t: f32) -> Vec2 {
+    let a = vec2_add(vec2_sub(curve.p2, vec2_scale(curve.p1, 2.0)), curve.p0);
+    let b = vec2_add(vec2_sub(curve.p3, vec2_scale(curve.p2, 2.0)), curve.p1);
+    vec2_add(vec2_scale(a, 6.0 * (1.0 - t)), vec2_scale(b, 6.0 * t))
+}
+
+fn chord_parameters(points: &[Vec2]) -> Vec<f32> {
+    let mut values = Vec::with_capacity(points.len());
+    values.push(0.0);
+    for pair in points.windows(2) {
+        let next = values.last().copied().unwrap_or(0.0) + vec2_distance(pair[0], pair[1]);
+        values.push(next);
+    }
+    let total = values.last().copied().unwrap_or(0.0);
+    if total <= 1.0e-8 {
+        let denom = (points.len().saturating_sub(1)).max(1) as f32;
+        for (index, value) in values.iter_mut().enumerate() {
+            *value = index as f32 / denom;
+        }
+    } else {
+        for value in &mut values {
+            *value /= total;
+        }
+    }
+    values
+}
+
+fn generate_fitted_cubic(
+    points: &[Vec2],
+    parameters: &[f32],
+    start_tangent: Vec2,
+    end_tangent: Vec2,
+) -> FittedCubic {
+    let p0 = points[0];
+    let p3 = *points.last().unwrap_or(&p0);
+    let mut c00 = 0.0_f32;
+    let mut c01 = 0.0_f32;
+    let mut c11 = 0.0_f32;
+    let mut x0 = 0.0_f32;
+    let mut x1 = 0.0_f32;
+
+    for (&point, &t) in points.iter().zip(parameters) {
+        let [b0, b1, b2, b3] = bezier_basis(t);
+        let a1 = vec2_scale(start_tangent, b1);
+        let a2 = vec2_scale(end_tangent, b2);
+        let base = vec2_add(vec2_scale(p0, b0 + b1), vec2_scale(p3, b2 + b3));
+        let residual = vec2_sub(point, base);
+        c00 += vec2_dot(a1, a1);
+        c01 += vec2_dot(a1, a2);
+        c11 += vec2_dot(a2, a2);
+        x0 += vec2_dot(a1, residual);
+        x1 += vec2_dot(a2, residual);
+    }
+
+    let determinant = c00 * c11 - c01 * c01;
+    let chord = vec2_distance(p0, p3);
+    let fallback = chord / 3.0;
+    let (mut alpha_start, mut alpha_end) = if determinant.abs() > 1.0e-10 {
+        (
+            (x0 * c11 - x1 * c01) / determinant,
+            (c00 * x1 - c01 * x0) / determinant,
+        )
+    } else {
+        (fallback, fallback)
+    };
+    let minimum_handle = chord * 1.0e-4;
+    if !alpha_start.is_finite()
+        || !alpha_end.is_finite()
+        || alpha_start < minimum_handle
+        || alpha_end < minimum_handle
+    {
+        alpha_start = fallback;
+        alpha_end = fallback;
+    }
+    // Least-squares fitting can technically minimize sampled error with a
+    // control handle far beyond the segment chord. Between samples that can
+    // create a tiny Bezier loop even though the source polyline is simple. A
+    // cubic never needs a handle longer than the endpoint chord here: tighter
+    // bends are recursively split into smaller fitted runs instead.
+    let max_handle = chord.max(minimum_handle);
+    alpha_start = alpha_start.min(max_handle);
+    alpha_end = alpha_end.min(max_handle);
+
+    FittedCubic {
+        p0,
+        p1: vec2_add(p0, vec2_scale(start_tangent, alpha_start)),
+        p2: vec2_add(p3, vec2_scale(end_tangent, alpha_end)),
+        p3,
+    }
+}
+
+fn fitted_cubic_has_sample_loop(curve: FittedCubic) -> bool {
+    const SAMPLES: usize = 16;
+    let mut points = Vec::with_capacity(SAMPLES + 1);
+    for index in 0..=SAMPLES {
+        let t = index as f32 / SAMPLES as f32;
+        points.push(cubic_point(curve.p0, curve.p1, curve.p2, curve.p3, t));
+    }
+    for i in 0..SAMPLES {
+        let a = points[i];
+        let b = points[i + 1];
+        for j in (i + 2)..SAMPLES {
+            let c = points[j];
+            let d = points[j + 1];
+            if segments_intersect(a, b, c, d) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn fitted_cubic_max_error(points: &[Vec2], parameters: &[f32], curve: FittedCubic) -> (f32, usize) {
+    let mut max_error = 0.0_f32;
+    let mut split = points.len() / 2;
+    for index in 1..points.len().saturating_sub(1) {
+        let point = cubic_point(curve.p0, curve.p1, curve.p2, curve.p3, parameters[index]);
+        let error = vec2_distance(point, points[index]);
+        if error > max_error {
+            max_error = error;
+            split = index;
+        }
+    }
+    (max_error, split)
+}
+
+fn reparameterize_cubic(points: &[Vec2], parameters: &mut [f32], curve: FittedCubic) {
+    for (point, parameter) in points
+        .iter()
+        .zip(parameters.iter_mut())
+        .skip(1)
+        .take(points.len().saturating_sub(2))
+    {
+        let q = cubic_point(curve.p0, curve.p1, curve.p2, curve.p3, *parameter);
+        let q1 = cubic_derivative(curve, *parameter);
+        let q2 = cubic_second_derivative(curve, *parameter);
+        let delta = vec2_sub(q, *point);
+        let denominator = vec2_dot(q1, q1) + vec2_dot(delta, q2);
+        if denominator.abs() <= 1.0e-10 {
+            continue;
+        }
+        let next = *parameter - vec2_dot(delta, q1) / denominator;
+        if next.is_finite() {
+            *parameter = next.clamp(0.0, 1.0);
+        }
+    }
+    for index in 1..parameters.len() {
+        parameters[index] = parameters[index].max(parameters[index - 1]);
+    }
+}
+
+fn fit_cubic_run(
+    points: &[Vec2],
+    start_tangent: Vec2,
+    end_tangent: Vec2,
+    tolerance: f32,
+    depth: u8,
+    output: &mut Vec<FittedCubic>,
+) {
+    if points.len() < 2 {
+        return;
+    }
+    if points.len() == 2 {
+        let chord = vec2_sub(points[1], points[0]);
+        output.push(FittedCubic {
+            p0: points[0],
+            p1: vec2_add(points[0], vec2_scale(chord, 1.0 / 3.0)),
+            p2: vec2_add(points[0], vec2_scale(chord, 2.0 / 3.0)),
+            p3: points[1],
+        });
+        return;
+    }
+
+    let mut parameters = chord_parameters(points);
+    let mut curve = generate_fitted_cubic(points, &parameters, start_tangent, end_tangent);
+    let mut error = fitted_cubic_max_error(points, &parameters, curve);
+    if error.0 <= tolerance && !fitted_cubic_has_sample_loop(curve) {
+        output.push(curve);
+        return;
+    }
+
+    if error.0 <= tolerance * 4.0 {
+        for _ in 0..4 {
+            reparameterize_cubic(points, &mut parameters, curve);
+            curve = generate_fitted_cubic(points, &parameters, start_tangent, end_tangent);
+            error = fitted_cubic_max_error(points, &parameters, curve);
+            if error.0 <= tolerance && !fitted_cubic_has_sample_loop(curve) {
+                output.push(curve);
+                return;
+            }
+        }
+    }
+
+    let split = if fitted_cubic_has_sample_loop(curve) {
+        points.len() / 2
+    } else {
+        error.1
+    }
+    .clamp(1, points.len() - 2);
+    if depth >= 20 {
+        let left_tangent = normalized_or(vec2_sub(points[split], points[split - 1]), start_tangent);
+        let right_tangent = normalized_or(vec2_sub(points[split], points[split + 1]), end_tangent);
+        fit_cubic_run(
+            &points[..=split],
+            start_tangent,
+            left_tangent,
+            tolerance,
+            depth + 1,
+            output,
+        );
+        fit_cubic_run(
+            &points[split..],
+            vec2_scale(right_tangent, -1.0),
+            end_tangent,
+            tolerance,
+            depth + 1,
+            output,
+        );
+        return;
+    }
+
+    let center_tangent = normalized_or(
+        vec2_sub(points[split - 1], points[split + 1]),
+        vec2_scale(start_tangent, -1.0),
+    );
+    fit_cubic_run(
+        &points[..=split],
+        start_tangent,
+        center_tangent,
+        tolerance,
+        depth + 1,
+        output,
+    );
+    fit_cubic_run(
+        &points[split..],
+        vec2_scale(center_tangent, -1.0),
+        end_tangent,
+        tolerance,
+        depth + 1,
+        output,
+    );
+}
+
+fn is_authored_corner(points: &[Vec2], index: usize) -> bool {
+    let count = points.len();
+    let previous = points[(index + count - 1) % count];
+    let current = points[index];
+    let next = points[(index + 1) % count];
+    let incoming = vec2_sub(current, previous);
+    let outgoing = vec2_sub(next, current);
+    let incoming_len = vec2_length(incoming);
+    let outgoing_len = vec2_length(outgoing);
+    if incoming_len <= 1.0e-6 || outgoing_len <= 1.0e-6 {
+        return false;
+    }
+    let alignment = vec2_dot(
+        vec2_scale(incoming, incoming_len.recip()),
+        vec2_scale(outgoing, outgoing_len.recip()),
+    );
+    alignment < 0.5
+}
+
+fn fitted_segments_to_closed_path(segments: &[FittedCubic]) -> Option<VPath> {
+    if segments.len() < 3 {
+        return None;
+    }
+    let mut anchors: Vec<Anchor> = segments
+        .iter()
+        .map(|segment| Anchor {
+            point: segment.p0,
+            in_handle: None,
+            out_handle: Some(segment.p1),
+        })
+        .collect();
+    for (index, segment) in segments.iter().enumerate() {
+        let next = (index + 1) % anchors.len();
+        anchors[next].in_handle = Some(segment.p2);
+    }
+    Some(VPath {
+        anchors,
+        closed: true,
+    })
+}
+
+fn fit_closed_ring_path(points: &[Vec2], tolerance: f32) -> Option<VPath> {
+    if points.len() < 4 {
+        return None;
+    }
+    let count = points.len();
+    let mut breaks = vec![0_usize, count / 4, count / 2, count * 3 / 4];
+    breaks.extend((0..count).filter(|&index| is_authored_corner(points, index)));
+    breaks.sort_unstable();
+    breaks.dedup();
+    if breaks.len() < 3 {
+        return None;
+    }
+
+    let mut segments = Vec::new();
+    for break_index in 0..breaks.len() {
+        let start = breaks[break_index];
+        let end = if break_index + 1 < breaks.len() {
+            breaks[break_index + 1]
+        } else {
+            breaks[0] + count
+        };
+        let mut run = Vec::with_capacity(end - start + 1);
+        for index in start..=end {
+            run.push(points[index % count]);
+        }
+        if run.len() < 2 {
+            continue;
+        }
+        let start_tangent = normalized_or(vec2_sub(run[1], run[0]), Vec2::new(1.0, 0.0));
+        let end_tangent = normalized_or(
+            vec2_sub(run[run.len() - 2], run[run.len() - 1]),
+            vec2_scale(start_tangent, -1.0),
+        );
+        fit_cubic_run(
+            &run,
+            start_tangent,
+            end_tangent,
+            tolerance,
+            0,
+            &mut segments,
+        );
+    }
+    fitted_segments_to_closed_path(&segments)
+}
+
+fn fitted_ring_path_is_safe(original: &LineString<f64>, candidate: &VPath, tolerance: f32) -> bool {
+    if candidate.anchors.len() < 3
+        || candidate
+            .anchors
+            .iter()
+            .flat_map(|anchor| {
+                [Some(anchor.point), anchor.in_handle, anchor.out_handle]
+                    .into_iter()
+                    .flatten()
+            })
+            .any(|point| !point.x.is_finite() || !point.y.is_finite())
+    {
+        return false;
+    }
+    let mut flattened = flatten_path(candidate);
+    if flattened.len() > 1 && flattened.first() == flattened.last() {
+        flattened.pop();
+    }
+    if flattened.len() < 3 || polyline_self_intersects(&flattened) {
+        return false;
+    }
+    let original_area = signed_ring_area(original);
+    let candidate_area = signed_points_area(&flattened);
+    if original_area.abs() <= 1.0e-8
+        || candidate_area.abs() <= 1.0e-8
+        || original_area.signum() != candidate_area.signum()
+    {
+        return false;
+    }
+    let original_points: Vec<Vec2> = original
+        .0
+        .iter()
+        .map(|coord| Vec2::new(coord.x as f32, coord.y as f32))
+        .collect();
+    let Some((original_min, original_max)) = points_bounds(&original_points) else {
+        return false;
+    };
+    let Some((candidate_min, candidate_max)) = points_bounds(&flattened) else {
+        return false;
+    };
+    let bbox_tolerance = tolerance * 2.0 + 1.0e-4;
+    if candidate_min.x < original_min.x - bbox_tolerance
+        || candidate_min.y < original_min.y - bbox_tolerance
+        || candidate_max.x > original_max.x + bbox_tolerance
+        || candidate_max.y > original_max.y + bbox_tolerance
+        || candidate_min.x > original_min.x + bbox_tolerance
+        || candidate_min.y > original_min.y + bbox_tolerance
+        || candidate_max.x < original_max.x - bbox_tolerance
+        || candidate_max.y < original_max.y - bbox_tolerance
+    {
+        return false;
+    }
+    let perimeter = original
+        .0
+        .windows(2)
+        .map(|pair| (pair[1].x - pair[0].x).hypot(pair[1].y - pair[0].y))
+        .sum::<f64>();
+    let allowed_area_delta = perimeter * f64::from(tolerance) * 2.5 + 1.0e-6;
+    (candidate_area.abs() - original_area.abs()).abs() <= allowed_area_delta
 }
 
 fn linear_ring_path(points: &[Vec2]) -> VPath {
@@ -1218,6 +1824,19 @@ fn point_segment_distance(point: Vec2, start: Vec2, end: Vec2) -> f32 {
 }
 
 fn polyline_self_intersects(points: &[Vec2]) -> bool {
+    const BROADPHASE_EPSILON: f32 = 1.0e-5;
+
+    #[derive(Clone, Copy)]
+    struct SegmentBounds {
+        index: usize,
+        a: Vec2,
+        b: Vec2,
+        min_primary: f32,
+        max_primary: f32,
+        min_secondary: f32,
+        max_secondary: f32,
+    }
+
     let count = points.len();
     if count < 4 {
         return false;
@@ -1225,47 +1844,56 @@ fn polyline_self_intersects(points: &[Vec2]) -> bool {
     let Some((min, max)) = points_bounds(points) else {
         return false;
     };
-    let max_extent = (max.x - min.x).max(max.y - min.y).max(1.0e-3);
-    let cell_size = (max_extent / (count as f32).sqrt()).max(1.0e-3);
-    let mut cells: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
-    let mut checked_pairs: HashSet<(usize, usize)> = HashSet::new();
+    // Sweep along the longer overall axis. The previous uniform grid used one
+    // global cell size and became effectively quadratic for a huge dense ring:
+    // hundreds of thousands of tiny Bezier samples piled into the same cells.
+    // This broad phase never changes the exact intersection predicate below;
+    // it only discards segment pairs whose expanded AABBs cannot intersect.
+    let sweep_x = max.x - min.x >= max.y - min.y;
+    let mut segments = Vec::with_capacity(count);
+    for index in 0..count {
+        let a = points[index];
+        let b = points[(index + 1) % count];
+        let (a_primary, a_secondary, b_primary, b_secondary) = if sweep_x {
+            (a.x, a.y, b.x, b.y)
+        } else {
+            (a.y, a.x, b.y, b.x)
+        };
+        segments.push(SegmentBounds {
+            index,
+            a,
+            b,
+            min_primary: a_primary.min(b_primary),
+            max_primary: a_primary.max(b_primary),
+            min_secondary: a_secondary.min(b_secondary),
+            max_secondary: a_secondary.max(b_secondary),
+        });
+    }
+    segments.sort_unstable_by(|left, right| {
+        left.min_primary
+            .total_cmp(&right.min_primary)
+            .then_with(|| left.max_primary.total_cmp(&right.max_primary))
+            .then_with(|| left.index.cmp(&right.index))
+    });
 
-    for first in 0..count {
-        let first_next = (first + 1) % count;
-        let a = points[first];
-        let b = points[first_next];
-        let min_cell_x = ((a.x.min(b.x) - min.x) / cell_size).floor() as i32;
-        let max_cell_x = ((a.x.max(b.x) - min.x) / cell_size).floor() as i32;
-        let min_cell_y = ((a.y.min(b.y) - min.y) / cell_size).floor() as i32;
-        let max_cell_y = ((a.y.max(b.y) - min.y) / cell_size).floor() as i32;
-
-        for cell_x in min_cell_x..=max_cell_x {
-            for cell_y in min_cell_y..=max_cell_y {
-                let bucket = cells.entry((cell_x, cell_y)).or_default();
-                for &second in bucket.iter() {
-                    let pair = if first < second {
-                        (first, second)
-                    } else {
-                        (second, first)
-                    };
-                    if !checked_pairs.insert(pair) {
-                        continue;
-                    }
-                    let second_next = (second + 1) % count;
-                    if first == second
-                        || first_next == second
-                        || second_next == first
-                        || (first == 0 && second_next == 0)
-                    {
-                        continue;
-                    }
-                    if segments_intersect(a, b, points[second], points[second_next]) {
-                        return true;
-                    }
-                }
-                bucket.push(first);
+    let mut active: Vec<SegmentBounds> = Vec::new();
+    for current in segments {
+        active
+            .retain(|candidate| candidate.max_primary + BROADPHASE_EPSILON >= current.min_primary);
+        for candidate in &active {
+            let distance = current.index.abs_diff(candidate.index);
+            let adjacent = distance <= 1 || distance + 1 == count;
+            if adjacent
+                || candidate.max_secondary + BROADPHASE_EPSILON < current.min_secondary
+                || current.max_secondary + BROADPHASE_EPSILON < candidate.min_secondary
+            {
+                continue;
+            }
+            if segments_intersect(current.a, current.b, candidate.a, candidate.b) {
+                return true;
             }
         }
+        active.push(current);
     }
     false
 }
@@ -1414,23 +2042,45 @@ pub fn commit_brush_region_with_material(
     // Merge drawing is local topology, not a reason to rewrite every same-colour
     // fill in the frame. Keep disconnected raw components as independent assets;
     // only the connected component reached by this fresh stroke is absorbed.
-    // This preserves Flash-style boundary merging while making commit cost depend
-    // on nearby geometry instead of the total amount of artwork already drawn.
-    loop {
-        let mut changed = false;
-        for candidate in &candidates {
+    //
+    // Do not progressively union a growing Advanced Brush contour while looking
+    // for that component. A dense contour makes each subsequent boolean pass more
+    // expensive than the previous one and was the source of pointer-up freezes.
+    // Connectivity does not require a union: every point in A union B belongs to
+    // A or B. Walk touching source surfaces first, then run one balanced union.
+    let mut connected_indices = Vec::new();
+    let mut frontier = Vec::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        if raw_fill_style(&app.state.project, candidate) == requested_style
+            && !same_style_assets.contains(&candidate.asset_id)
+            && raw_regions_intersect(&candidate.geometry, &painted)
+        {
+            same_style_assets.insert(candidate.asset_id);
+            connected_indices.push(index);
+            frontier.push(index);
+        }
+    }
+    let mut frontier_cursor = 0;
+    while frontier_cursor < frontier.len() {
+        let source_index = frontier[frontier_cursor];
+        frontier_cursor += 1;
+        for (index, candidate) in candidates.iter().enumerate() {
             if raw_fill_style(&app.state.project, candidate) == requested_style
                 && !same_style_assets.contains(&candidate.asset_id)
-                && raw_regions_intersect(&candidate.geometry, &painted)
+                && raw_regions_intersect(&candidate.geometry, &candidates[source_index].geometry)
             {
                 same_style_assets.insert(candidate.asset_id);
-                painted = painted.union(&candidate.geometry);
-                changed = true;
+                connected_indices.push(index);
+                frontier.push(index);
             }
         }
-        if !changed {
-            break;
+    }
+    if !connected_indices.is_empty() {
+        let mut surfaces = painted.0;
+        for index in connected_indices {
+            surfaces.extend(candidates[index].geometry.0.iter().cloned());
         }
+        painted = geo::unary_union(surfaces.iter());
     }
     let painted_paths = coverage_to_paths(&painted);
     if painted_paths.is_empty() {
@@ -1545,6 +2195,14 @@ pub fn commit_brush_region_with_material(
 /// contours must end with the same topology or semi-transparent overlaps render
 /// darker and remain separately selectable. Disconnected regions are left
 /// alone, while touching or overlapping components are consolidated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawFillMerge {
+    pub q0rg_id: u16,
+    pub layer_id: u16,
+    pub old_asset_ids: BTreeSet<u16>,
+    pub new_asset_id: u16,
+}
+
 #[cfg(test)]
 pub(crate) fn merge_touching_raw_fills_after_edit(
     project: &mut ProjectV2,
@@ -1552,7 +2210,7 @@ pub(crate) fn merge_touching_raw_fills_after_edit(
     layer_id: u16,
     frame: u16,
 ) -> bool {
-    merge_touching_raw_fills_after_edit_impl(project, q0rg_id, layer_id, frame, None)
+    !merge_touching_raw_fills_after_edit_impl(project, q0rg_id, layer_id, frame, None).is_empty()
 }
 
 pub(crate) fn merge_touching_raw_fills_after_edit_focused(
@@ -1562,8 +2220,25 @@ pub(crate) fn merge_touching_raw_fills_after_edit_focused(
     frame: u16,
     edited_asset_ids: &BTreeSet<u16>,
 ) -> bool {
+    !merge_touching_raw_fills_after_edit_focused_with_remap(
+        project,
+        q0rg_id,
+        layer_id,
+        frame,
+        edited_asset_ids,
+    )
+    .is_empty()
+}
+
+pub(crate) fn merge_touching_raw_fills_after_edit_focused_with_remap(
+    project: &mut ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    frame: u16,
+    edited_asset_ids: &BTreeSet<u16>,
+) -> Vec<RawFillMerge> {
     if edited_asset_ids.is_empty() {
-        return false;
+        return Vec::new();
     }
     merge_touching_raw_fills_after_edit_impl(
         project,
@@ -1580,7 +2255,7 @@ fn merge_touching_raw_fills_after_edit_impl(
     layer_id: u16,
     frame: u16,
     edited_asset_ids: Option<&BTreeSet<u16>>,
-) -> bool {
+) -> Vec<RawFillMerge> {
     let candidates = collect_raw_fill_candidates(project, q0rg_id, layer_id, frame, true);
     let mut groups: Vec<(RawFillStyle, Vec<RawFillCandidate>)> = Vec::new();
     for candidate in candidates {
@@ -1667,8 +2342,9 @@ fn merge_touching_raw_fills_after_edit_impl(
         }
     }
     if updates.is_empty() {
-        return false;
+        return Vec::new();
     }
+    let mut merges = Vec::with_capacity(updates.len());
     for (style, asset_ids, paths) in updates {
         #[cfg(feature = "appearance-mask-eraser")]
         let merged_appearance = style.material.map(|material| {
@@ -1693,8 +2369,14 @@ fn merge_touching_raw_fills_after_edit_impl(
             project.asset_appearances.insert(new_asset_id, appearance);
         }
         remove_unreferenced_assets(project, &asset_ids);
+        merges.push(RawFillMerge {
+            q0rg_id,
+            layer_id,
+            old_asset_ids: asset_ids,
+            new_asset_id,
+        });
     }
-    true
+    merges
 }
 
 /// Subtract one already-unioned eraser gesture from every raw fill on the
@@ -2441,6 +3123,160 @@ mod tests {
     }
 
     #[test]
+    fn dense_smooth_boundary_is_stored_as_beziers_not_thousands_of_authored_points() {
+        let center = Vec2::new(300.0, 180.0);
+        let rx = 240.0_f32;
+        let ry = 90.0_f32;
+        let samples = 4096_usize;
+        let mut coords = Vec::with_capacity(samples + 1);
+        for index in 0..samples {
+            let angle = std::f32::consts::TAU * index as f32 / samples as f32;
+            coords.push(Coord {
+                x: f64::from(center.x + rx * angle.cos()),
+                y: f64::from(center.y + ry * angle.sin()),
+            });
+        }
+        coords.push(coords[0]);
+        let ring = LineString::new(coords);
+
+        let path = ring_to_path(&ring).expect("dense ellipse path");
+        assert!(
+            path.anchors.len() <= 64,
+            "a smooth 4096-sample ellipse survived as {} authored anchors instead of cubic Beziers",
+            path.anchors.len()
+        );
+        assert!(path
+            .anchors
+            .iter()
+            .any(|anchor| anchor.in_handle.is_some() || anchor.out_handle.is_some()));
+
+        let flattened = flatten_path(&path);
+        let max_radial_error = flattened
+            .iter()
+            .map(|point| {
+                let nx = (point.x - center.x) / rx;
+                let ny = (point.y - center.y) / ry;
+                (nx * nx + ny * ny - 1.0).abs()
+            })
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_radial_error < 0.002,
+            "curve fitting visibly drifted from the smooth source: normalized error {max_radial_error}"
+        );
+        assert_paths_are_finite_and_simple(std::slice::from_ref(&path));
+    }
+
+    #[test]
+    fn subprecision_boundary_samples_are_eaten_before_bezier_fitting() {
+        let origin = Vec2::new(550.0, 126.0);
+        let mut points = Vec::new();
+        for edge in 0..4 {
+            let (start, end) = match edge {
+                0 => (Vec2::new(0.0, 0.0), Vec2::new(80.0, 0.0)),
+                1 => (Vec2::new(80.0, 0.0), Vec2::new(80.0, 40.0)),
+                2 => (Vec2::new(80.0, 40.0), Vec2::new(0.0, 40.0)),
+                _ => (Vec2::new(0.0, 40.0), Vec2::new(0.0, 0.0)),
+            };
+            for index in 0..1024 {
+                let t = index as f32 / 1024.0;
+                let base = Vec2::new(
+                    origin.x + start.x + (end.x - start.x) * t,
+                    origin.y + start.y + (end.y - start.y) * t,
+                );
+                points.push(base);
+                // A second authored sample below useful f32/visual precision.
+                points.push(Vec2::new(base.x + 0.000_06, base.y + 0.000_02));
+            }
+        }
+        let mut coords: Vec<Coord<f64>> = points
+            .iter()
+            .map(|point| Coord {
+                x: f64::from(point.x),
+                y: f64::from(point.y),
+            })
+            .collect();
+        coords.push(coords[0]);
+        let ring = LineString::new(coords);
+        let path = ring_to_path(&ring).expect("compact quantized rectangle");
+
+        assert!(
+            path.anchors.len() <= 16,
+            "subprecision samples survived as {} authored anchors",
+            path.anchors.len()
+        );
+        let flattened = flatten_path(&path);
+        let (min, max) = points_bounds(&flattened).expect("compact bounds");
+        assert!((min.x - origin.x).abs() < 0.01);
+        assert!((min.y - origin.y).abs() < 0.01);
+        assert!((max.x - (origin.x + 80.0)).abs() < 0.01);
+        assert!((max.y - (origin.y + 40.0)).abs() < 0.01);
+        assert_paths_are_finite_and_simple(std::slice::from_ref(&path));
+    }
+
+    #[test]
+    fn curve_compaction_preserves_dense_hole_topology_and_winding() {
+        fn dense_circle(
+            center: Vec2,
+            radius: f32,
+            samples: usize,
+            reverse: bool,
+        ) -> LineString<f64> {
+            let mut coords = Vec::with_capacity(samples + 1);
+            for index in 0..samples {
+                let logical = if reverse { samples - 1 - index } else { index };
+                let angle = std::f32::consts::TAU * logical as f32 / samples as f32;
+                coords.push(Coord {
+                    x: f64::from(center.x + radius * angle.cos()),
+                    y: f64::from(center.y + radius * angle.sin()),
+                });
+            }
+            coords.push(coords[0]);
+            LineString::new(coords)
+        }
+
+        let exterior = dense_circle(Vec2::new(200.0, 160.0), 120.0, 4096, false);
+        let hole = dense_circle(Vec2::new(200.0, 160.0), 45.0, 2048, true);
+        let coverage = MultiPolygon(vec![Polygon::new(exterior, vec![hole])]);
+        let paths = coverage_to_paths(&coverage);
+        assert_eq!(paths.len(), 2, "curve compaction changed hole count");
+        assert!(paths.iter().all(|path| path.anchors.len() <= 64));
+        let outer_area = signed_points_area(&flatten_path(&paths[0]));
+        let hole_area = signed_points_area(&flatten_path(&paths[1]));
+        assert!(
+            outer_area.signum() != hole_area.signum(),
+            "hole winding was lost"
+        );
+        assert_paths_are_finite_and_simple(&paths);
+    }
+
+    #[test]
+    fn canonical_curve_compaction_is_independent_of_brush_smoothing_slider() {
+        let low = settings(18.0, 0);
+        let high = settings(18.0, 100);
+        let points: Vec<Vec2> = (0..=320)
+            .map(|index| {
+                let x = index as f32 * 1.25;
+                Vec2::new(x, 80.0 + (x * 0.018).sin() * 24.0)
+            })
+            .collect();
+
+        let zero_region = brush_finish(stroke(&points, low), low);
+        let high_region = brush_finish(stroke(&points, high), high);
+        let zero_linear_anchors = anchor_count(&coverage_to_linear_paths(&zero_region));
+        let zero_paths = coverage_to_paths(&zero_region);
+        let high_paths = coverage_to_paths(&high_region);
+        let zero_anchors = anchor_count(&zero_paths);
+        let high_anchors = anchor_count(&high_paths);
+        assert!(
+            zero_anchors * 4 < zero_linear_anchors,
+            "smoothing=0 canonicalization barely compacted the same silhouette: linear={zero_linear_anchors}, cubic={zero_anchors}"
+        );
+        assert!(high_anchors <= zero_anchors);
+        assert_paths_are_finite_and_simple(&zero_paths);
+        assert_paths_are_finite_and_simple(&high_paths);
+    }
+
+    #[test]
     fn smoothing_zero_keeps_every_raw_sweep_sample() {
         let settings = settings(10.0, 0);
         let points = [
@@ -2780,6 +3616,40 @@ mod tests {
         let stroke = stroke(&[Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0)], settings);
         assert!(stroke.coverage.contains(&Point::new(5.75, 0.0)));
         assert_eq!(stroke.samples.len(), 2);
+    }
+
+    #[test]
+    fn dot_like_circular_stroke_keeps_a_smooth_capsule_instead_of_coarse_caps() {
+        let settings = settings(40.0, 0);
+        let start = Vec2::new(25.0, 30.0);
+        let end = Vec2::new(25.6, 30.2);
+        let actual = sweep_nib(BrushNib::Circle, settings.size, start, end);
+
+        let ideal_points = nib_outline(BrushNib::Circle, settings.size, start)
+            .into_iter()
+            .chain(nib_outline(BrushNib::Circle, settings.size, end))
+            .map(|point| Point::new(f64::from(point.x), f64::from(point.y)))
+            .collect::<Vec<_>>();
+        let ideal = MultiPolygon(vec![MultiPoint(ideal_points).convex_hull()]);
+        let mismatch = actual
+            .difference(&ideal)
+            .union(&ideal.difference(&actual))
+            .unsigned_area();
+        let mismatch_ratio = mismatch / ideal.unsigned_area().max(1.0e-9);
+        assert!(
+            mismatch_ratio < 0.003,
+            "tiny circular stroke has visibly coarse caps: mismatch ratio {mismatch_ratio}"
+        );
+
+        let finished = brush_finish(stroke(&[start, end], settings), settings);
+        let finished_mismatch = finished
+            .difference(&ideal)
+            .union(&ideal.difference(&finished))
+            .unsigned_area();
+        assert!(
+            finished_mismatch / ideal.unsigned_area().max(1.0e-9) < 0.004,
+            "finished dot-like stroke gained angular shoulders"
+        );
     }
 
     #[test]

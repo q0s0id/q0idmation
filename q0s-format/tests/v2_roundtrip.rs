@@ -12,6 +12,12 @@ fn sample_v2_project() -> ProjectV2 {
             fps: 24,
             stage_width: 320,
             stage_height: 180,
+            background_color: q0s_format::v2::Rgba {
+                r: 255,
+                g: 255,
+                b: 255,
+                a: 255,
+            },
             entry_q0rg_id: 1,
         },
         assets: vec![
@@ -176,6 +182,12 @@ fn q0rg_chain(edge_count: usize) -> ProjectV2 {
             fps: 24,
             stage_width: 64,
             stage_height: 64,
+            background_color: q0s_format::v2::Rgba {
+                r: 255,
+                g: 255,
+                b: 255,
+                a: 255,
+            },
             entry_q0rg_id: 1,
         },
         assets: Vec::new(),
@@ -203,7 +215,11 @@ fn placement_fx_survive_q1s_roundtrip_without_touching_symbol_contents() {
     project.q0rgs[0].layers[0].placements[1].fx = PlacementFx {
         opacity: 0.42,
         blend_mode: BlendMode::Screen,
-        blur: Some(BlurFx { radius: 3.5 }),
+        blur: Some(BlurFx {
+            radius_x: 3.5,
+            radius_y: 1.25,
+            quality: 3,
+        }),
         glow: Some(GlowFx {
             color: Rgba {
                 r: 255,
@@ -211,8 +227,10 @@ fn placement_fx_survive_q1s_roundtrip_without_touching_symbol_contents() {
                 b: 12,
                 a: 180,
             },
-            radius: 9.0,
+            radius_x: 9.0,
+            radius_y: 2.5,
             strength: 1.35,
+            quality: 3,
         }),
         shadow: Some(DropShadowFx {
             color: Rgba {
@@ -228,6 +246,7 @@ fn placement_fx_survive_q1s_roundtrip_without_touching_symbol_contents() {
         }),
         audio_gain: 1.0,
         audio_muted: false,
+        q0rg_playback: Default::default(),
     };
 
     let decoded = parse(&write(&project).expect("write placement fx")).expect("parse placement fx");

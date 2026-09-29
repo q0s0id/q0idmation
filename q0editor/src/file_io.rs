@@ -298,11 +298,36 @@ pub fn save_q0lang_document(path: &Path, text: &str) -> io::Result<()> {
 
 pub fn pick_open_path() -> Option<PathBuf> {
     rfd::FileDialog::new()
-        .add_filter("q0editor documents", &["q1s", "q0l", "q0lang"])
+        .add_filter(
+            "q0editor documents",
+            &["q1s", "fla", "xfl", "q0l", "q0lang"],
+        )
         .add_filter("q0s project (.q1s)", &[Q1S_EXTENSION])
+        .add_filter("Adobe Animate (.fla, .xfl)", q0fla::IMPORT_EXTENSIONS)
         .add_filter("q0lang source (.q0l, .q0lang)", Q0LANG_EXTENSIONS)
         .add_filter("any", &["*"])
         .pick_file()
+}
+
+pub fn pick_fla_import_path() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("Adobe Animate (.fla, .xfl)", q0fla::IMPORT_EXTENSIONS)
+        .pick_file()
+}
+
+pub fn pick_q0fla_save_path(source: &Path) -> Option<PathBuf> {
+    let default_name = source
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| format!("{stem}.q1s"))
+        .unwrap_or_else(|| "imported.q1s".to_string());
+    let mut dialog = rfd::FileDialog::new()
+        .add_filter("q0s project (.q1s)", &[Q1S_EXTENSION])
+        .set_file_name(default_name);
+    if let Some(parent) = source.parent() {
+        dialog = dialog.set_directory(parent);
+    }
+    dialog.save_file()
 }
 
 pub fn pick_q0lang_save_path(suggested: Option<&Path>) -> Option<PathBuf> {
@@ -352,7 +377,7 @@ pub fn pick_save_path(suggested: Option<&Path>) -> Option<PathBuf> {
         .add_filter("q0s project (.q1s)", &[Q1S_EXTENSION])
         .set_file_name("untitled.q1s");
     if let Some(p) = suggested {
-        if let Some(parent) = p.parent() {
+        if let Some(parent) = p.parent().filter(|parent| !parent.as_os_str().is_empty()) {
             dialog = dialog.set_directory(parent);
         }
         if let Some(name) = p.file_name().and_then(|n| n.to_str()) {

@@ -680,6 +680,12 @@ mod tests {
                 fps: 24,
                 stage_width: 640,
                 stage_height: 480,
+                background_color: q0s_format::v2::Rgba {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                },
                 entry_q0rg_id: 1,
             },
             assets: vec![Asset::Q0v(Q0vAsset { asset_id: 7, bytes })],

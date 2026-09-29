@@ -16,8 +16,9 @@ use crate::file_io;
 use crate::panels;
 use crate::render::TextureCache;
 use crate::state::{
-    default_project, FrameScriptEditor, History, LibraryItem, PathRef, PlacementRef, ProjectState,
-    Selection, Session, TimelineClipboard, TimelineSelection, Tool, ToolState,
+    default_project, CameraTimelineSelection, FrameScriptEditor, History, LibraryDragPayload,
+    LibraryItem, PathRef, PlacementRef, ProjectState, Selection, Session, TimelineClipboard,
+    TimelineSelection, Tool, ToolState,
 };
 
 const MAX_PREVIEW_FRAME_SCRIPT_TRANSITIONS: usize = 64;
@@ -32,6 +33,10 @@ pub struct EditorApp {
     pub settings: crate::settings::Settings,
     /// Separate non-modal export workshop and immutable export queue.
     pub q0enc: crate::q0enc::Q0EncState,
+    /// FLA/XFL import/conversion workshop. Global because it can create a project from Home.
+    pub q0fla_open: bool,
+    /// Rolling low-overhead performance history copied with Ctrl+Shift+`.
+    pub perf: crate::perf::PerfLog,
     pub(crate) release_feed: crate::release_feed::ReleaseFeedState,
     /// Set on the first `update()` so we apply the loaded theme once a
     /// real `Context` is available (the egui ctx isn't valid in
@@ -41,6 +46,7 @@ pub struct EditorApp {
     /// the persisted font choice (default `Consolas`) lands in egui before
     /// any TextEdit asks for `FontFamily::Name("q0lang")`.
     q0lang_font_installed: bool,
+    last_window_title: Option<String>,
     pending: Vec<Action>,
     unsaved_action: Option<Action>,
     pending_asset_delete: Option<(u16, usize)>,
@@ -48,6 +54,8 @@ pub struct EditorApp {
     pending_layer_delete: Option<(u16, u16, usize, usize)>,
     pending_frame_truncate: Option<(u16, u16, usize, usize, usize, usize)>,
     media_import_job: Option<MediaImportJob>,
+    pending_clipboard_bitmap: Option<crate::system_clipboard::ClipboardBitmap>,
+    native_paste_key_down: bool,
     audio_playback: Option<crate::audio::EditorAudioPlayback>,
     external_open_inbox: Option<crate::single_instance::ExternalOpenInbox>,
     show_project_tree: bool,
@@ -55,6 +63,7 @@ pub struct EditorApp {
     pub(crate) library_selection: Option<LibrarySelection>,
     pub(crate) library_search: String,
     pub(crate) library_sort_ascending: bool,
+    pub(crate) library_cache: crate::panels::library::LibraryCache,
     document_tabs: Vec<DocumentTab>,
     active_document_tab: Option<u64>,
     last_document_tab: Option<u64>,
@@ -150,6 +159,16 @@ pub struct NewProjectSpec {
     pub frame_count: u16,
 }
 
+fn unsaved_project_file_name(project_name: &str) -> String {
+    let name = project_name.trim();
+    let name = if name.is_empty() { "untitled" } else { name };
+    if name.to_ascii_lowercase().ends_with(".q1s") {
+        name.to_string()
+    } else {
+        format!("{name}.q1s")
+    }
+}
+
 fn project_tab_title(project_name: &str, path: Option<&std::path::Path>) -> String {
     if let Some(file_stem) = path
         .and_then(std::path::Path::file_stem)
@@ -159,11 +178,7 @@ fn project_tab_title(project_name: &str, path: Option<&std::path::Path>) -> Stri
         return file_stem.to_string();
     }
 
-    if project_name.trim().is_empty() {
-        "untitled".to_string()
-    } else {
-        project_name.to_string()
-    }
+    unsaved_project_file_name(project_name)
 }
 
 fn project_library_title(project_name: &str, path: Option<&std::path::Path>) -> String {
@@ -240,6 +255,10 @@ pub enum Action {
     SaveProjectAs,
     OpenQ0Enc,
     ToggleQ0Enc,
+    OpenQ0Fla,
+    ToggleQ0Fla,
+    ImportFlaProject,
+    ConvertFlaToQ1s,
     Exit,
     Undo,
     Redo,
@@ -258,6 +277,7 @@ pub enum Action {
     MoveLayer(u16, u16, i8),
     DropLayer(u16, u16, LayerDropTarget),
     MoveTimelineFrames(TimelineSelection, u16, u16),
+    MoveCameraFrames(CameraTimelineSelection, u16),
     IndentLayer(u16, u16),
     OutdentLayer(u16, u16),
     ToggleLayerFolder(u16, u16),
@@ -275,6 +295,8 @@ pub enum Action {
     PlaceQ0rgInstance(u16),
     PlaceLibraryItemAt(LibraryItem, q0s_format::v2::Vec2),
     PlaceLibraryItemOnTimeline(LibraryItem, u16, u16),
+    PlaceLibraryDragAt(LibraryDragPayload, q0s_format::v2::Vec2),
+    PlaceLibraryDragOnTimeline(LibraryDragPayload, u16, u16),
     EnterQ0rg(u16),
     BreadcrumbJumpTo(usize),
     ExitQ0rg,
@@ -287,6 +309,7 @@ pub enum Action {
     CopySelection,
     CutSelection,
     Paste,
+    PasteInPlace,
     DuplicateSelection,
     BringToFront,
     SendToBack,
@@ -496,9 +519,12 @@ impl Default for EditorApp {
             textures: TextureCache::default(),
             settings,
             q0enc,
+            q0fla_open: false,
+            perf: crate::perf::PerfLog::default(),
             release_feed: crate::release_feed::ReleaseFeedState::default(),
             theme_applied: false,
             q0lang_font_installed: false,
+            last_window_title: None,
             pending: Vec::new(),
             unsaved_action: None,
             pending_asset_delete: None,
@@ -506,6 +532,8 @@ impl Default for EditorApp {
             pending_layer_delete: None,
             pending_frame_truncate: None,
             media_import_job: None,
+            pending_clipboard_bitmap: None,
+            native_paste_key_down: false,
             audio_playback: None,
             external_open_inbox: None,
             show_project_tree: false,
@@ -513,6 +541,7 @@ impl Default for EditorApp {
             library_selection: None,
             library_search: String::new(),
             library_sort_ascending: true,
+            library_cache: crate::panels::library::LibraryCache::default(),
             document_tabs: Vec::new(),
             active_document_tab: None,
             last_document_tab: None,
@@ -526,6 +555,17 @@ impl Default for EditorApp {
 }
 
 impl EditorApp {
+    pub fn copy_performance_snapshot(&mut self, ctx: &Context) {
+        let report = self.perf.snapshot_text(&self.session.selection);
+        let frames = report
+            .lines()
+            .find_map(|line| line.strip_prefix("captured_frames="))
+            .unwrap_or("0")
+            .to_owned();
+        ctx.output_mut(|output| output.copied_text = report);
+        self.session.status = format!("performance log copied ({frames} frames)");
+    }
+
     pub fn queue(&mut self, action: Action) {
         self.pending.push(action);
     }
@@ -1779,8 +1819,10 @@ impl EditorApp {
                         self.save_q0lang_to(&path);
                     }
                 } else if self.project_active {
-                    let suggested = self.state.file_path.clone();
-                    if let Some(path) = file_io::pick_save_path(suggested.as_deref()) {
+                    let suggested = self.state.file_path.clone().unwrap_or_else(|| {
+                        PathBuf::from(unsaved_project_file_name(&self.state.project.meta.name))
+                    });
+                    if let Some(path) = file_io::pick_save_path(Some(&suggested)) {
                         self.save_to(&path);
                     }
                 }
@@ -1799,6 +1841,50 @@ impl EditorApp {
                     "q0enc closed"
                 }
                 .to_string();
+            }
+            Action::OpenQ0Fla => {
+                self.q0fla_open = true;
+                self.session.status = "q0fla opened".to_string();
+            }
+            Action::ToggleQ0Fla => {
+                self.q0fla_open = !self.q0fla_open;
+                self.session.status = if self.q0fla_open {
+                    "q0fla opened"
+                } else {
+                    "q0fla closed"
+                }
+                .to_string();
+            }
+            Action::ImportFlaProject => {
+                if let Some(path) = file_io::pick_fla_import_path() {
+                    self.open_from_path(&path);
+                }
+            }
+            Action::ConvertFlaToQ1s => {
+                if let Some(source) = file_io::pick_fla_import_path() {
+                    match q0fla::import_path(&source) {
+                        Ok(imported) => {
+                            if let Some(destination) = file_io::pick_q0fla_save_path(&source) {
+                                match file_io::save_project(&destination, &imported.project) {
+                                    Ok(()) => {
+                                        self.session.status = format!(
+                                            "q0fla converted {} -> {}; {}",
+                                            source.display(),
+                                            destination.display(),
+                                            imported.report.summary()
+                                        );
+                                    }
+                                    Err(error) => {
+                                        self.session.status = format!("q0fla save failed: {error}");
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            self.session.status = format!("q0fla import failed: {error}");
+                        }
+                    }
+                }
             }
             Action::Exit => {
                 if self.active_workspace_busy() {
@@ -1843,6 +1929,21 @@ impl EditorApp {
                 if !crate::text_tool::finish_edit(self) {
                     return;
                 }
+                // Subselect anchors are editor control points, not a partial raw-fill
+                // selection. Once Subselect is left, promote them to the containing
+                // raw path so Select/Free Transform gets the same whole-path semantics
+                // as a normal click instead of closing an open stroke into a fake fill.
+                if self.session.current_tool == Tool::Subselect && tool != Tool::Subselect {
+                    if let Selection::SubselectPoints { path, .. } = self.session.selection.clone()
+                    {
+                        self.session.selection = Selection::Path {
+                            q0rg_id: path.q0rg_id,
+                            layer_id: path.layer_id,
+                            placement_idx: path.placement_idx,
+                            path_idx: path.path_idx,
+                        };
+                    }
+                }
                 self.session.current_tool = tool;
                 self.session.tool_state = ToolState::Idle;
                 self.session.status = format!("tool: {}", tool.label());
@@ -1882,10 +1983,16 @@ impl EditorApp {
             }
             Action::LastFrame => self.go_to_frame(u16::MAX),
             Action::InsertFrame => {
-                self.insert_frame_smart();
+                if self.camera_track_is_selected() {
+                    self.insert_camera_frame_smart();
+                } else {
+                    self.insert_frame_smart();
+                }
             }
             Action::InsertKeyframe => {
-                if self.session.pending_timeline_frame.is_none()
+                if self.camera_track_is_selected() {
+                    self.insert_camera_keyframe_smart();
+                } else if self.session.pending_timeline_frame.is_none()
                     && self.timeline_selection_is_multi()
                 {
                     self.materialize_timeline_selection();
@@ -1896,7 +2003,9 @@ impl EditorApp {
                 }
             }
             Action::InsertBlankKeyframe => {
-                if self.session.pending_timeline_frame.is_none()
+                if self.camera_track_is_selected() {
+                    self.session.status = "camera track cannot contain blank keyframes".to_string();
+                } else if self.session.pending_timeline_frame.is_none()
                     && self.timeline_selection_is_multi()
                 {
                     self.blank_timeline_selection();
@@ -2134,6 +2243,9 @@ impl EditorApp {
                     self.session.status = "could not move frames".to_string();
                 }
             }
+            Action::MoveCameraFrames(selection, target_frame) => {
+                self.move_camera_frames(selection, target_frame);
+            }
             Action::IndentLayer(q0rg_id, layer_id) => {
                 self.indent_layer(q0rg_id, layer_id);
             }
@@ -2342,6 +2454,10 @@ impl EditorApp {
                 self.request_frame_count_change(q0rg_id, frame_count);
             }
             Action::DeleteSelection => {
+                if self.camera_track_is_selected() {
+                    self.delete_camera_keyframe_at_current();
+                    return;
+                }
                 if self.session.pending_timeline_frame.is_some()
                     && self.session.timeline_selection.is_some()
                 {
@@ -2404,6 +2520,12 @@ impl EditorApp {
             }
             Action::PlaceLibraryItemOnTimeline(item, layer_id, frame) => {
                 self.place_library_item_on_timeline(item, layer_id, frame);
+            }
+            Action::PlaceLibraryDragAt(payload, position) => {
+                self.place_library_drag_at(payload, position);
+            }
+            Action::PlaceLibraryDragOnTimeline(payload, layer_id, frame) => {
+                self.place_library_drag_on_timeline(payload, layer_id, frame);
             }
             Action::EnterQ0rg(child_id) => {
                 self.enter_q0rg(child_id);
@@ -2563,7 +2685,8 @@ impl EditorApp {
                     }
                 }
             }
-            Action::Paste => {
+            paste_action @ (Action::Paste | Action::PasteInPlace) => {
+                let paste_in_place = matches!(paste_action, Action::PasteInPlace);
                 let Some(payload) = self.session.clipboard.clone() else {
                     self.session.status = "clipboard empty".to_string();
                     return;
@@ -2675,6 +2798,17 @@ impl EditorApp {
                             self.session.status = "clipboard empty".to_string();
                             return;
                         }
+                        let offset = if paste_in_place {
+                            q0s_format::v2::Vec2::new(0.0, 0.0)
+                        } else {
+                            let target = self.session.stage_cursor.unwrap_or_else(|| {
+                                q0s_format::v2::Vec2::new(
+                                    self.state.project.meta.stage_width as f32 * 0.5,
+                                    self.state.project.meta.stage_height as f32 * 0.5,
+                                )
+                            });
+                            crate::selection_edit::paste_offset_for_target(&payload, target)
+                        };
                         self.history.snapshot(&self.state.project);
                         let result = crate::selection_edit::paste_payload(
                             &mut self.state.project,
@@ -2682,13 +2816,17 @@ impl EditorApp {
                             self.session.current_layer_id,
                             self.session.current_frame,
                             &payload,
-                            q0s_format::v2::Vec2::new(10.0, 10.0),
+                            offset,
                         );
                         self.session.selection =
                             crate::selection_edit::selection_from_paste(result);
                         self.state.dirty = true;
                         self.textures.invalidate();
-                        self.session.status = "pasted".to_string();
+                        self.session.status = if paste_in_place {
+                            "pasted in place".to_string()
+                        } else {
+                            "pasted at cursor".to_string()
+                        };
                     }
                 }
             }
@@ -2787,8 +2925,20 @@ impl EditorApp {
                 self.reorder_selection(false);
             }
             Action::RemoveFrame => self.remove_frame(),
-            Action::ClearKeyframe => self.clear_keyframe(),
-            Action::CreateMotionTween => self.toggle_motion_tween(),
+            Action::ClearKeyframe => {
+                if self.camera_track_is_selected() {
+                    self.delete_camera_keyframe_at_current();
+                } else {
+                    self.clear_keyframe();
+                }
+            }
+            Action::CreateMotionTween => {
+                if self.camera_track_is_selected() {
+                    self.toggle_camera_tween();
+                } else {
+                    self.toggle_motion_tween();
+                }
+            }
             Action::OpenQ0langEditor(target) => {
                 let resolved = target.unwrap_or(self.session.current_q0rg_id);
                 if self
@@ -3108,14 +3258,22 @@ impl EditorApp {
             Selection::RawParts {
                 fills,
                 strokes,
+                stroke_segments,
                 objects,
             } => fills
                 .iter()
                 .chain(strokes)
                 .map(|path| (path.q0rg_id, path.layer_id))
+                .chain(
+                    stroke_segments
+                        .iter()
+                        .map(|segment| (segment.path.q0rg_id, segment.path.layer_id)),
+                )
                 .chain(objects.iter().map(|item| (item.q0rg_id, item.layer_id)))
                 .any(|(q0rg_id, layer_id)| locked(q0rg_id, layer_id)),
-            Selection::PathPoints { path, .. } => locked(path.q0rg_id, path.layer_id),
+            Selection::PathPoints { path, .. } | Selection::SubselectPoints { path, .. } => {
+                locked(path.q0rg_id, path.layer_id)
+            }
             Selection::RawArea {
                 placements,
                 objects,
@@ -3741,13 +3899,42 @@ impl EditorApp {
             .keys()
             .filter(|key| key.q0rg_id == q0rg_id && key.frame >= requested)
             .count();
+        let (removed_camera_keys, removed_camera_tweens) =
+            if q0rg_id == self.state.project.meta.entry_q0rg_id {
+                (
+                    self.state
+                        .project
+                        .runtime
+                        .camera
+                        .keys
+                        .iter()
+                        .filter(|key| key.frame >= requested)
+                        .count(),
+                    self.state
+                        .project
+                        .runtime
+                        .camera
+                        .keys
+                        .iter()
+                        .filter(|key| {
+                            key.tween
+                                .to_frame()
+                                .is_some_and(|to_frame| to_frame >= requested)
+                        })
+                        .count(),
+                )
+            } else {
+                (0, 0)
+            };
 
         if requested < q0rg.frame_count
             && (removed_keyframes > 0
                 || removed_tweens > 0
                 || removed_audio > 0
                 || removed_frame_scripts > 0
-                || removed_frame_labels > 0)
+                || removed_frame_labels > 0
+                || removed_camera_keys > 0
+                || removed_camera_tweens > 0)
         {
             self.pending_frame_truncate = Some((
                 q0rg_id,
@@ -3797,6 +3984,23 @@ impl EditorApp {
             .runtime
             .frame_scripts
             .retain(|script| script.q0rg_id != q0rg_id || script.frame < frame_count);
+        if q0rg_id == self.state.project.meta.entry_q0rg_id {
+            self.state
+                .project
+                .runtime
+                .camera
+                .keys
+                .retain(|key| key.frame < frame_count);
+            for key in &mut self.state.project.runtime.camera.keys {
+                if key
+                    .tween
+                    .to_frame()
+                    .is_some_and(|to_frame| to_frame >= frame_count)
+                {
+                    key.tween = Tween::None;
+                }
+            }
+        }
         if self
             .session
             .frame_script_editor
@@ -4315,6 +4519,131 @@ impl EditorApp {
         self.session.status = "stroke converted to fill".to_string();
     }
 
+    fn paste_bitmap_from_clipboard(&mut self, clipboard: crate::system_clipboard::ClipboardBitmap) {
+        if !self.project_active || self.show_home || self.active_document_is_q0lang() {
+            return;
+        }
+        if self.current_layer_is_locked() || !self.current_layer_is_visible() {
+            self.session.status =
+                "show and unlock the target layer before pasting a bitmap".to_string();
+            return;
+        }
+        if self.session.pending_timeline_frame.is_some() {
+            self.session.status =
+                "create the future frame with F5, F6, or F7 before pasting a bitmap".to_string();
+            return;
+        }
+        if self.current_layer_is_folder() {
+            self.session.status = "folders cannot contain artwork".to_string();
+            return;
+        }
+        if crate::audio::audio_clip_at_frame(
+            &self.state.project,
+            self.session.current_q0rg_id,
+            self.session.current_layer_id,
+            self.session.current_frame,
+        )
+        .is_some()
+        {
+            self.session.status = "audio frames cannot contain artwork".to_string();
+            return;
+        }
+        let Some(asset_id) = self
+            .state
+            .project
+            .assets
+            .iter()
+            .map(Asset::id)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+        else {
+            self.session.status =
+                "clipboard bitmap paste failed: asset id space exhausted".to_string();
+            return;
+        };
+        let bitmap = match crate::bitmap_import::decode_bitmap_bytes(&clipboard.encoded, asset_id) {
+            Ok(bitmap) => bitmap,
+            Err(error) => {
+                self.session.status = format!("clipboard bitmap paste failed: {error}");
+                return;
+            }
+        };
+        let target = self.session.stage_cursor.unwrap_or_else(|| {
+            Vec2::new(
+                self.state.project.meta.stage_width as f32 * 0.5,
+                self.state.project.meta.stage_height as f32 * 0.5,
+            )
+        });
+        let q0rg_id = self.session.current_q0rg_id;
+        let layer_id = self.session.current_layer_id;
+        let frame = self.session.current_frame;
+        let before = self.state.project.clone();
+        if crate::tools::materialize_layer_keyframe_for_edit(
+            &mut self.state.project,
+            q0rg_id,
+            layer_id,
+            frame,
+        )
+        .is_none()
+        {
+            self.state.project = before;
+            self.session.status = "could not paste bitmap on this frame".to_string();
+            return;
+        }
+        self.history.snapshot(&before);
+        let width = f32::from(bitmap.width);
+        let height = f32::from(bitmap.height);
+        self.state.project.assets.push(Asset::Bitmap(bitmap));
+        let Some(layer) = self
+            .state
+            .project
+            .q0rgs
+            .iter_mut()
+            .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+            .and_then(|q0rg| {
+                q0rg.layers
+                    .iter_mut()
+                    .find(|layer| layer.layer_id == layer_id)
+            })
+        else {
+            self.state.project = before;
+            self.session.status = "could not paste bitmap on this layer".to_string();
+            return;
+        };
+        let placement_idx = layer.placements.len();
+        layer.placements.push(Placement {
+            instance_id: 0,
+            frame,
+            target: Target::Asset(asset_id),
+            transform: Transform2D {
+                tx: target.x - width * 0.5,
+                ty: target.y - height * 0.5,
+                ..Transform2D::IDENTITY
+            },
+            tween: Tween::None,
+            fx: Default::default(),
+        });
+        self.session.selection = Selection::Placement {
+            q0rg_id,
+            layer_id,
+            placement_idx,
+        };
+        self.session.timeline_selection = None;
+        self.session.timeline_layer_selection = None;
+        self.state.dirty = true;
+        self.textures.invalidate();
+        self.session.status = format!(
+            "pasted bitmap from clipboard ({}x{})",
+            width as u32, height as u32
+        );
+    }
+
+    fn process_pending_clipboard_bitmap(&mut self) {
+        if let Some(bitmap) = self.pending_clipboard_bitmap.take() {
+            self.paste_bitmap_from_clipboard(bitmap);
+        }
+    }
     fn import_bitmap_from_path(&mut self, path: &std::path::Path) {
         let Some(asset_id) = self
             .state
@@ -4931,6 +5260,83 @@ impl EditorApp {
         self.session.status = format!("Symbol broken apart into {} item(s)", pieces.len());
         self.state.dirty = true;
         self.textures.invalidate();
+    }
+
+    pub(crate) fn library_drag_item_is_audio_only(&self, payload: LibraryDragPayload) -> bool {
+        self.project_for_document_tab(payload.source_tab_id)
+            .is_some_and(|project| crate::audio::library_item_is_audio_only(project, payload.item))
+    }
+
+    fn import_external_library_drag(
+        &self,
+        payload: LibraryDragPayload,
+    ) -> Result<Option<(ProjectV2, LibraryItem)>, String> {
+        if Some(payload.source_tab_id) == self.active_project_tab_id() {
+            return Ok(None);
+        }
+        let source = self
+            .project_for_document_tab(payload.source_tab_id)
+            .ok_or_else(|| "source library project is no longer open".to_string())?;
+        crate::library_transfer::import_library_item(source, &self.state.project, payload.item)
+            .map(Some)
+    }
+
+    /// Run one cross-project library drop as a single undoable transaction.
+    /// Placement helpers keep their existing history behaviour, but their
+    /// intermediate import snapshot is discarded and replaced with the true
+    /// pre-drag project. If placement is rejected, the imported graph is rolled
+    /// back completely instead of leaving orphan library items behind.
+    fn with_external_library_import(
+        &mut self,
+        payload: LibraryDragPayload,
+        place: impl FnOnce(&mut Self, LibraryItem),
+    ) {
+        let imported = match self.import_external_library_drag(payload) {
+            Ok(None) => {
+                place(self, payload.item);
+                return;
+            }
+            Ok(Some(imported)) => imported,
+            Err(error) => {
+                self.session.status = format!("library copy failed: {error}");
+                return;
+            }
+        };
+        let (candidate, imported_item) = imported;
+        let original = self.state.project.clone();
+        let original_dirty = self.state.dirty;
+        let mut real_history = std::mem::take(&mut self.history);
+        self.state.project = candidate.clone();
+        place(self, imported_item);
+        let placed = self.state.project != candidate;
+        let _temporary_history = std::mem::take(&mut self.history);
+        self.history = std::mem::take(&mut real_history);
+        if placed {
+            self.history.snapshot(&original);
+            self.state.dirty = true;
+            self.textures.invalidate();
+        } else {
+            self.state.project = original;
+            self.state.dirty = original_dirty;
+            self.textures.invalidate();
+        }
+    }
+
+    fn place_library_drag_at(&mut self, payload: LibraryDragPayload, position: Vec2) {
+        self.with_external_library_import(payload, |app, item| {
+            app.place_library_item_at(item, position);
+        });
+    }
+
+    fn place_library_drag_on_timeline(
+        &mut self,
+        payload: LibraryDragPayload,
+        layer_id: u16,
+        frame: u16,
+    ) {
+        self.with_external_library_import(payload, |app, item| {
+            app.place_library_item_on_timeline(item, layer_id, frame);
+        });
     }
 
     fn place_library_item_on_timeline(
@@ -5724,10 +6130,21 @@ impl EditorApp {
                 path,
                 mut anchor_indices,
                 ..
+            }
+            | Selection::SubselectPoints {
+                path,
+                mut anchor_indices,
+                ..
             } => {
                 anchor_indices.sort_unstable();
                 anchor_indices.dedup();
-                let anchor_count = self
+                if anchor_indices.is_empty() {
+                    // Subselect can activate a contour merely to reveal all of
+                    // its points. Delete must not interpret that as "delete the
+                    // whole contour" until concrete anchors are selected.
+                    return false;
+                }
+                let source_path = self
                     .state
                     .project
                     .q0rgs
@@ -5752,9 +6169,21 @@ impl EditorApp {
                         Asset::Vector(vector) => vector.paths.get(path.path_idx),
                         Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => None,
                     })
-                    .map(|raw_path| raw_path.anchors.len())
-                    .unwrap_or(0);
-                if anchor_count.saturating_sub(anchor_indices.len()) < 3 {
+                    .cloned();
+                let Some(source_path) = source_path else {
+                    return false;
+                };
+                anchor_indices.retain(|index| *index < source_path.anchors.len());
+                if anchor_indices.is_empty() {
+                    return false;
+                }
+                let minimum_survivors = if source_path.closed { 3 } else { 1 };
+                if source_path
+                    .anchors
+                    .len()
+                    .saturating_sub(anchor_indices.len())
+                    < minimum_survivors
+                {
                     return self.delete_raw_path_refs(&[path]);
                 }
 
@@ -5786,26 +6215,25 @@ impl EditorApp {
                 let Some(asset_id) = asset_id else {
                     return false;
                 };
-                let Some(Asset::Vector(vector)) = self
+                let changed = self
                     .state
                     .project
                     .assets
                     .iter_mut()
                     .find(|asset| asset.id() == asset_id)
-                else {
-                    return false;
-                };
-                let Some(raw_path) = vector.paths.get_mut(path.path_idx) else {
-                    return false;
-                };
-                for index in anchor_indices.into_iter().rev() {
-                    if index < raw_path.anchors.len() {
-                        raw_path.anchors.remove(index);
-                    }
+                    .and_then(|asset| match asset {
+                        Asset::Vector(vector) => vector.paths.get_mut(path.path_idx),
+                        Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => None,
+                    })
+                    .is_some_and(|raw_path| {
+                        crate::tools::delete_path_anchors_safely(raw_path, &anchor_indices)
+                    });
+                if changed {
+                    self.textures.invalidate_asset(asset_id);
+                    self.state.dirty = true;
+                    self.session.selection = Selection::None;
                 }
-                self.state.dirty = true;
-                self.session.selection = Selection::None;
-                true
+                changed
             }
             Selection::Mixed { paths, objects } => {
                 self.history.snapshot(&self.state.project);
@@ -5919,18 +6347,25 @@ impl EditorApp {
             Selection::RawParts {
                 fills,
                 strokes,
+                stroke_segments,
                 objects,
             } => {
                 // Raw style parts are materialized before deletion so removing
                 // an outline does not also erase its fill (and vice versa).
                 // Display-object mixing is deliberately not created by the
                 // selector; reject legacy/invalid mixed state defensively.
-                if !objects.is_empty() || (fills.is_empty() && strokes.is_empty()) {
+                if !objects.is_empty()
+                    || (fills.is_empty() && strokes.is_empty() && stroke_segments.is_empty())
+                {
                     return false;
                 }
                 self.history.snapshot(&self.state.project);
-                let Some(paths) = crate::tools::materialize_raw_style_parts(self, &fills, &strokes)
-                else {
+                let Some(paths) = crate::tools::materialize_raw_style_parts_with_segments(
+                    self,
+                    &fills,
+                    &strokes,
+                    &stroke_segments,
+                ) else {
                     return false;
                 };
                 let changed = crate::selection_edit::remove_materialized_paths_and_objects(
@@ -6019,12 +6454,397 @@ impl EditorApp {
         }
     }
 
-    /// F5 / Insert Frame. A click in the virtual tail chooses an exact future
-    /// destination; F5 then grows the q0rg through every intervening frame.
-    /// Without a virtual destination, preserve the classic one-step behaviour.
+    fn move_camera_frames(&mut self, selection: CameraTimelineSelection, target_frame: u16) {
+        if !self.camera_track_is_selected() {
+            return;
+        }
+        let first = selection.first_frame();
+        let last = selection.last_frame();
+        let width = last.saturating_sub(first).saturating_add(1);
+        let target_last = target_frame.saturating_add(width.saturating_sub(1));
+        let frame_count = self
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == self.state.project.meta.entry_q0rg_id)
+            .map(|q0rg| q0rg.frame_count)
+            .unwrap_or(1);
+        if target_last >= frame_count {
+            self.session.status = "camera frames cannot be moved past the timeline end".to_string();
+            return;
+        }
+
+        let selected_old = self
+            .state
+            .project
+            .runtime
+            .camera
+            .keys
+            .iter()
+            .filter(|key| (first..=last).contains(&key.frame))
+            .map(|key| key.frame)
+            .collect::<std::collections::BTreeSet<_>>();
+        if selected_old.is_empty() {
+            self.session.status = "no camera keyframes in selection".to_string();
+            return;
+        }
+        let delta = i32::from(target_frame) - i32::from(first);
+        let remap = |frame: u16| -> Option<u16> {
+            if selected_old.contains(&frame) {
+                u16::try_from(i32::from(frame) + delta).ok()
+            } else {
+                Some(frame)
+            }
+        };
+        let moved_frames = selected_old
+            .iter()
+            .filter_map(|frame| remap(*frame))
+            .collect::<std::collections::BTreeSet<_>>();
+        if self
+            .state
+            .project
+            .runtime
+            .camera
+            .keys
+            .iter()
+            .any(|key| !selected_old.contains(&key.frame) && moved_frames.contains(&key.frame))
+        {
+            self.session.status = "camera keyframes cannot overwrite existing keys".to_string();
+            return;
+        }
+
+        let before = self.state.project.clone();
+        for key in &mut self.state.project.runtime.camera.keys {
+            if selected_old.contains(&key.frame) {
+                key.frame = remap(key.frame).expect("validated camera frame remap");
+            }
+            if let Some(to_frame) = key.tween.to_frame() {
+                let mapped_to = remap(to_frame).unwrap_or(to_frame);
+                key.tween = if mapped_to > key.frame {
+                    key.tween.with_to_frame(mapped_to)
+                } else {
+                    Tween::None
+                };
+            }
+        }
+        self.state
+            .project
+            .runtime
+            .camera
+            .keys
+            .sort_by_key(|key| key.frame);
+        if q0s_format::v2::validate(&self.state.project).is_err() {
+            self.state.project = before;
+            self.session.status = "could not move camera frames".to_string();
+            return;
+        }
+        self.history.snapshot(&before);
+        self.session.camera_timeline_selection = Some(CameraTimelineSelection {
+            anchor_frame: target_frame,
+            focus_frame: target_last,
+        });
+        self.session.current_frame = target_frame;
+        self.session.pending_timeline_frame = None;
+        self.state.mark_dirty();
+        self.session.status = "moved camera frames".to_string();
+    }
+
+    pub(crate) fn camera_track_is_selected(&self) -> bool {
+        self.session.camera_track_selected
+            && self.session.current_q0rg_id == self.state.project.meta.entry_q0rg_id
+            && self.state.project.runtime.camera.enabled
+    }
+
+    fn insert_camera_frame_smart(&mut self) {
+        let entry_id = self.state.project.meta.entry_q0rg_id;
+        if self.session.current_q0rg_id != entry_id {
+            self.session.camera_track_selected = false;
+            return;
+        }
+        let frame = self
+            .session
+            .pending_timeline_frame
+            .take()
+            .unwrap_or(self.session.current_frame);
+        let old_count = self
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q| q.q0rg_id == entry_id)
+            .map(|q| q.frame_count)
+            .unwrap_or(0);
+        let Some(new_count) = (if frame >= old_count {
+            frame.checked_add(1)
+        } else {
+            old_count.checked_add(1)
+        }) else {
+            self.session.status = "timeline is already at its maximum length".to_string();
+            return;
+        };
+
+        let before = self.state.project.clone();
+        if frame < old_count {
+            for key in &mut self.state.project.runtime.camera.keys {
+                if key.frame >= frame {
+                    key.frame = key.frame.saturating_add(1);
+                }
+                if let Some(to_frame) = key.tween.to_frame() {
+                    if to_frame >= frame {
+                        key.tween = key.tween.with_to_frame(to_frame.saturating_add(1));
+                    }
+                }
+            }
+            self.state
+                .project
+                .runtime
+                .camera
+                .keys
+                .sort_by_key(|key| key.frame);
+        }
+        if let Some(entry) = self
+            .state
+            .project
+            .q0rgs
+            .iter_mut()
+            .find(|q| q.q0rg_id == entry_id)
+        {
+            entry.frame_count = new_count;
+        }
+        self.history.snapshot(&before);
+        self.state.mark_dirty();
+        self.session.current_frame = frame.min(new_count.saturating_sub(1));
+        self.session.pending_timeline_frame = None;
+        self.session.timeline_selection = None;
+        self.session.timeline_layer_selection = None;
+        self.session.selection = Selection::None;
+        self.session.status = if frame < old_count {
+            format!("inserted camera hold frame at {}", frame + 1)
+        } else {
+            format!("extended camera timeline through frame {}", frame + 1)
+        };
+    }
+
+    fn insert_camera_keyframe_smart(&mut self) {
+        let entry_id = self.state.project.meta.entry_q0rg_id;
+        if self.session.current_q0rg_id != entry_id {
+            self.session.camera_track_selected = false;
+            return;
+        }
+        let current = self
+            .session
+            .pending_timeline_frame
+            .take()
+            .unwrap_or(self.session.current_frame);
+        let has_exact = self.state.project.runtime.camera.has_keyframe(current);
+        let target = if has_exact {
+            current.saturating_add(1)
+        } else {
+            current
+        };
+        let Some(new_count) = target.checked_add(1) else {
+            self.session.status = "timeline is already at its maximum length".to_string();
+            return;
+        };
+        if self.state.project.runtime.camera.has_keyframe(target) {
+            self.session.current_frame = target;
+            self.session.status = format!("camera keyframe already exists at frame {}", target + 1);
+            return;
+        }
+
+        let state = self.state.project.camera_state_at(target);
+        let before = self.state.project.clone();
+        let old_count = self
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q| q.q0rg_id == entry_id)
+            .map(|q| q.frame_count)
+            .unwrap_or(0);
+        for key in &mut self.state.project.runtime.camera.keys {
+            if key.frame < target
+                && key
+                    .tween
+                    .to_frame()
+                    .is_some_and(|to_frame| target <= to_frame)
+            {
+                key.tween = key.tween.with_to_frame(target);
+            }
+        }
+        self.state
+            .project
+            .runtime
+            .camera
+            .keys
+            .push(q0s_format::v2::CameraKey {
+                frame: target,
+                state,
+                tween: Tween::None,
+            });
+        self.state
+            .project
+            .runtime
+            .camera
+            .keys
+            .sort_by_key(|key| key.frame);
+        if target >= old_count {
+            if let Some(entry) = self
+                .state
+                .project
+                .q0rgs
+                .iter_mut()
+                .find(|q| q.q0rg_id == entry_id)
+            {
+                entry.frame_count = new_count;
+            }
+        }
+        self.history.snapshot(&before);
+        self.state.mark_dirty();
+        self.session.current_frame = target;
+        self.session.pending_timeline_frame = None;
+        self.session.timeline_selection = None;
+        self.session.camera_timeline_selection = Some(CameraTimelineSelection::single(target));
+        self.session.timeline_layer_selection = None;
+        self.session.selection = Selection::None;
+        self.session.status = format!("inserted camera keyframe at frame {}", target + 1);
+    }
+
+    fn delete_camera_keyframe_at_current(&mut self) {
+        let selection = self
+            .session
+            .camera_timeline_selection
+            .unwrap_or_else(|| CameraTimelineSelection::single(self.session.current_frame));
+        let first = selection.first_frame();
+        let last = selection.last_frame();
+        let removed_frames = self
+            .state
+            .project
+            .runtime
+            .camera
+            .keys
+            .iter()
+            .filter(|key| (first..=last).contains(&key.frame))
+            .map(|key| key.frame)
+            .collect::<std::collections::BTreeSet<_>>();
+        if removed_frames.is_empty() {
+            self.session.status = "no camera keyframes in selection".to_string();
+            return;
+        }
+        let before = self.state.project.clone();
+        self.state
+            .project
+            .runtime
+            .camera
+            .keys
+            .retain(|key| !removed_frames.contains(&key.frame));
+        for key in &mut self.state.project.runtime.camera.keys {
+            if key
+                .tween
+                .to_frame()
+                .is_some_and(|frame| removed_frames.contains(&frame))
+            {
+                key.tween = Tween::None;
+            }
+        }
+        self.history.snapshot(&before);
+        self.state.mark_dirty();
+        self.session.status = if removed_frames.len() == 1 {
+            format!("removed camera keyframe at frame {}", first + 1)
+        } else {
+            format!("removed {} camera keyframes", removed_frames.len())
+        };
+    }
+
+    fn toggle_camera_tween(&mut self) {
+        if self.session.pending_timeline_frame.is_some() {
+            self.session.status = "create the future frame before camera tweening".to_string();
+            return;
+        }
+        let frame = self.session.current_frame;
+        let mut ordered = self
+            .state
+            .project
+            .runtime
+            .camera
+            .keys
+            .iter()
+            .map(|key| key.frame)
+            .collect::<Vec<_>>();
+        ordered.sort_unstable();
+        let Some(source_frame) = ordered
+            .iter()
+            .copied()
+            .filter(|candidate| *candidate <= frame)
+            .max()
+        else {
+            self.session.status = "camera tween needs a keyframe before this frame".to_string();
+            return;
+        };
+        let Some(target_frame) = ordered
+            .iter()
+            .copied()
+            .find(|candidate| *candidate > source_frame)
+        else {
+            self.session.status = "camera tween needs a later camera keyframe".to_string();
+            return;
+        };
+        let before = self.state.project.clone();
+        let Some(source) = self
+            .state
+            .project
+            .runtime
+            .camera
+            .keys
+            .iter_mut()
+            .find(|key| key.frame == source_frame)
+        else {
+            return;
+        };
+        let removing = source.tween.to_frame() == Some(target_frame);
+        source.tween = if removing {
+            Tween::None
+        } else {
+            Tween::Linear {
+                to_frame: target_frame,
+            }
+        };
+        self.history.snapshot(&before);
+        self.state.mark_dirty();
+        self.session.status = if removing {
+            "removed camera tween".to_string()
+        } else {
+            format!(
+                "created camera tween from frame {} to {}",
+                source_frame + 1,
+                target_frame + 1
+            )
+        };
+    }
+
+    /// F5 / Insert Frame. Inside the existing timeline this inserts one hold
+    /// frame before the focused timeline cell, shifting only that layer's later
+    /// keys. With no cell selection, the playhead and current layer are used.
+    /// A virtual-tail click keeps the existing grow-to-destination behaviour.
     fn insert_frame_smart(&mut self) {
+        let (layer_id, frame) = self
+            .session
+            .timeline_selection
+            .map(|selection| (selection.focus_layer_id, selection.focus_frame))
+            .unwrap_or((self.session.current_layer_id, self.session.current_frame));
+        let q0rg_id = self.session.current_q0rg_id;
+
+        if self.state.project.layer_is_folder(q0rg_id, layer_id) {
+            self.session.status = "folders cannot contain frames".to_string();
+            return;
+        }
+        if self.state.project.layer_is_locked(q0rg_id, layer_id) {
+            self.session.status = "locked timeline frames cannot be changed".to_string();
+            return;
+        }
+
         if let Some(target) = self.session.pending_timeline_frame.take() {
-            let q0rg_id = self.session.current_q0rg_id;
             let old_count = self
                 .state
                 .project
@@ -6034,7 +6854,11 @@ impl EditorApp {
                 .map(|q0rg| q0rg.frame_count)
                 .unwrap_or(0);
             if target >= old_count {
-                self.history.snapshot(&self.state.project);
+                let before = self.state.project.clone();
+                let Some(new_count) = target.checked_add(1) else {
+                    self.session.status = "timeline is already at its maximum length".to_string();
+                    return;
+                };
                 if let Some(q0rg) = self
                     .state
                     .project
@@ -6042,69 +6866,48 @@ impl EditorApp {
                     .iter_mut()
                     .find(|q0rg| q0rg.q0rg_id == q0rg_id)
                 {
-                    q0rg.frame_count = target.saturating_add(1);
+                    q0rg.frame_count = new_count;
+                    self.history.snapshot(&before);
+                    self.state.dirty = true;
                 }
-                self.state.dirty = true;
             }
+            self.session.current_layer_id = layer_id;
             self.session.current_frame = target;
+            self.session.timeline_selection = Some(TimelineSelection::single(layer_id, target));
             self.session.status = format!("extended timeline through frame {}", target + 1);
             return;
         }
 
-        let extended = self.advance_playhead_extending();
-        let next_frame = self.session.current_frame;
-        self.session.status = if extended {
-            format!("frame inserted, now at {}", next_frame + 1)
-        } else {
-            format!("frame {}", next_frame + 1)
-        };
-    }
-    /// Step `current_frame` forward one slot, extending the q0rg's
-    /// `frame_count` when we'd land off the end. Returns whether the
-    /// frame_count was bumped Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р’В Р Р†Р вЂљР’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р РЋРІвЂћСћР В Р’В Р В Р вЂ№Р В Р вЂ Р Р†Р вЂљРЎвЂєР РЋРЎвЂєР В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†РІР‚С›РЎС›Р В Р’В Р вЂ™Р’В Р В Р’В Р В РІР‚в„–Р В Р’В Р В Р вЂ№Р В Р Р‹Р Р†РІР‚С›РЎС› caller usually folds that into the
-    /// status message ("frame inserted" vs. "moved to frame N").
-    /// Snapshots history exactly when the count changes so undo gives
-    /// the right granularity.
-    fn advance_playhead_extending(&mut self) -> bool {
-        let q0rg_id = self.session.current_q0rg_id;
-        let next_frame = self.session.current_frame.saturating_add(1);
-        let mut extended = false;
-        let needs_extend = self
-            .state
-            .project
-            .q0rgs
-            .iter()
-            .find(|q| q.q0rg_id == q0rg_id)
-            .map(|q| next_frame >= q.frame_count)
-            .unwrap_or(false);
-        if needs_extend {
-            self.history.snapshot(&self.state.project);
-            if let Some(q) = self
-                .state
-                .project
-                .q0rgs
-                .iter_mut()
-                .find(|q| q.q0rg_id == q0rg_id)
-            {
-                q.frame_count = q.frame_count.saturating_add(1);
-                extended = true;
+        let target = TimelineSelection::single(layer_id, frame);
+        if self.timeline_selection_touches_audio(target) {
+            self.session.status = "audio frames cannot contain hold frames".to_string();
+            return;
+        }
+
+        let before = self.state.project.clone();
+        match crate::timeline_edit::insert_hold_frame_before(
+            &mut self.state.project,
+            q0rg_id,
+            layer_id,
+            frame,
+        ) {
+            Some(new_count) => {
+                self.history.snapshot(&before);
+                self.state.dirty = true;
+                self.session.current_layer_id = layer_id;
+                self.session.current_frame = frame;
+                self.session.pending_timeline_frame = None;
+                self.session.timeline_selection = Some(TimelineSelection::single(layer_id, frame));
+                self.session.selection = Selection::None;
+                self.textures.invalidate();
+                self.session.status =
+                    format!("inserted hold frame at {}, {new_count} total", frame + 1);
+            }
+            None => {
+                self.session.status = "could not insert hold frame".to_string();
             }
         }
-        let last_frame = self
-            .state
-            .project
-            .q0rgs
-            .iter()
-            .find(|q| q.q0rg_id == q0rg_id)
-            .map(|q| q.frame_count.saturating_sub(1))
-            .unwrap_or(0);
-        self.session.current_frame = next_frame.min(last_frame);
-        if extended {
-            self.state.dirty = true;
-        }
-        extended
     }
-
     pub(crate) fn refresh_audio_playback(&mut self) -> Result<(), String> {
         let has_audio = crate::audio::has_audible_timeline_audio(
             &self.state.project,
@@ -6559,7 +7362,11 @@ impl EditorApp {
     }
 
     fn render_project_tree_dialog(&mut self, ctx: &Context) {
-        if !self.project_active || self.show_home || self.active_document_is_q0lang() {
+        if !self.project_active
+            || self.show_home
+            || self.active_document_is_q0lang()
+            || ctx.wants_keyboard_input()
+        {
             return;
         }
         let mut open = self.show_project_tree;
@@ -6988,6 +7795,31 @@ impl EditorApp {
             }
         }
 
+        if q0fla::is_import_path(path) {
+            match q0fla::import_path(path) {
+                Ok(imported) => {
+                    let summary = imported.report.summary();
+                    let mut workspace = self.workspace_for_project(imported.project, None);
+                    // A quick FLA/XFL open is an import, never an in-place project open.
+                    // It must require Save/Save As before any q1s exists on disk.
+                    workspace.state.dirty = true;
+                    if !self.activate_new_workspace(workspace) {
+                        return false;
+                    }
+                    self.new_project_dialog = None;
+                    self.session.status = format!(
+                        "q0fla imported {} as an unsaved q1s project; {summary}",
+                        path.display()
+                    );
+                    return true;
+                }
+                Err(error) => {
+                    self.session.status = format!("q0fla import failed: {error}");
+                    return false;
+                }
+            }
+        }
+
         let is_project = path
             .extension()
             .and_then(|extension| extension.to_str())
@@ -7028,14 +7860,15 @@ impl EditorApp {
         let dropped = ctx.input(|input| input.raw.dropped_files.clone());
         let Some(file) = dropped.first() else { return };
         let Some(path) = file.path.as_ref() else {
-            self.session.status = "drop a .q1s, .q0l or .q0lang document from Explorer".to_string();
+            self.session.status =
+                "drop a .q1s, .fla, .xfl, .q0l or .q0lang document from Explorer".to_string();
             return;
         };
         let is_project = path
             .extension()
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| extension.eq_ignore_ascii_case(file_io::Q1S_EXTENSION));
-        if is_project || file_io::is_q0lang_path(path) {
+        if is_project || q0fla::is_import_path(path) || file_io::is_q0lang_path(path) {
             self.queue(Action::OpenProjectFromPath(path.clone()));
         } else if self.show_home || !self.project_active {
             self.session.status = "open or create a project before importing media".to_string();
@@ -7046,7 +7879,7 @@ impl EditorApp {
             self.queue(Action::ImportMediaFromPath(path.clone()));
         } else {
             self.session.status = format!(
-                "unsupported dropped file: {} (expected .q1s, .q0l, .q0lang, png, jpg, webp, wav, mp3, ogg, flac, mp4 or q0v)",
+                "unsupported dropped file: {} (expected .q1s, .fla, .xfl, .q0l, .q0lang, png, jpg, webp, wav, mp3, ogg, flac, mp4 or q0v)",
                 path.display()
             );
         }
@@ -7057,7 +7890,8 @@ impl EditorApp {
             return self.save_to(&path);
         }
 
-        let Some(path) = file_io::pick_save_path(None) else {
+        let suggested = PathBuf::from(unsaved_project_file_name(&self.state.project.meta.name));
+        let Some(path) = file_io::pick_save_path(Some(&suggested)) else {
             return false;
         };
         self.save_to(&path)
@@ -7409,6 +8243,34 @@ impl EditorApp {
                 .keys()
                 .filter(|key| key.q0rg_id == q0rg_id && key.frame >= frames)
                 .count();
+            let camera_keys = if q0rg_id == self.state.project.meta.entry_q0rg_id {
+                self.state
+                    .project
+                    .runtime
+                    .camera
+                    .keys
+                    .iter()
+                    .filter(|key| key.frame >= frames)
+                    .count()
+            } else {
+                0
+            };
+            let camera_tweens = if q0rg_id == self.state.project.meta.entry_q0rg_id {
+                self.state
+                    .project
+                    .runtime
+                    .camera
+                    .keys
+                    .iter()
+                    .filter(|key| {
+                        key.tween
+                            .to_frame()
+                            .is_some_and(|to_frame| to_frame >= frames)
+                    })
+                    .count()
+            } else {
+                0
+            };
             let mut confirm = false;
             let mut cancel = false;
             egui::Window::new("Shorten symbol?")
@@ -7418,7 +8280,7 @@ impl EditorApp {
                 .show(ctx, |ui| {
                     ui.label(format!("Reduce the symbol to {frames} frame(s)?"));
                     ui.label(format!(
-                        "This removes {keyframes} keyframe(s), {tweens} tween(s), {audio_clips} audio clip(s), {frame_scripts} frame script(s), and {frame_labels} frame label(s)."
+                        "This removes {keyframes} keyframe(s), {tweens} tween(s), {audio_clips} audio clip(s), {frame_scripts} frame script(s), {frame_labels} frame label(s), {camera_keys} camera key(s), and {camera_tweens} camera tween(s)."
                     ));
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -7640,7 +8502,41 @@ fn color_row(ui: &mut egui::Ui, label: &str, target: &mut crate::settings::Color
 }
 
 impl App for EditorApp {
+    fn raw_input_hook(&mut self, ctx: &Context, raw_input: &mut egui::RawInput) {
+        let native_down = crate::system_clipboard::ctrl_v_down();
+        let native_pressed = native_down && !self.native_paste_key_down;
+        self.native_paste_key_down = native_down;
+
+        if !self.project_active
+            || self.show_home
+            || self.active_document_is_q0lang()
+            || ctx.wants_keyboard_input()
+        {
+            return;
+        }
+        if raw_input.modifiers.shift {
+            return;
+        }
+        let egui_paste = raw_input
+            .events
+            .iter()
+            .any(|event| matches!(event, egui::Event::Paste(_)));
+        if !native_pressed && !egui_paste {
+            return;
+        }
+        if let Ok(Some(bitmap)) = crate::system_clipboard::read_bitmap() {
+            self.pending_clipboard_bitmap = Some(bitmap);
+            // If the clipboard contains both image and text/html, image paste has
+            // priority on the stage. Do not also paste the internal/text payload.
+            raw_input
+                .events
+                .retain(|event| !matches!(event, egui::Event::Paste(_)));
+        }
+    }
+
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        self.perf.begin_frame();
+        let startup_started = Instant::now();
         // First-frame init: install hardcoded base style, then layer the
         // persisted theme on top so user-picked accents survive restart.
         if !self.theme_applied {
@@ -7656,8 +8552,17 @@ impl App for EditorApp {
             let _ = crate::q0lang::fonts::install(ctx, &self.settings.q0lang_font_name);
             self.q0lang_font_installed = true;
         }
+        self.perf
+            .record(crate::perf::PerfSpan::AppStartup, startup_started.elapsed());
+
+        let ingress_started = Instant::now();
         self.poll_external_open_requests(ctx);
         self.poll_media_import();
+        self.process_pending_clipboard_bitmap();
+        self.perf
+            .record(crate::perf::PerfSpan::AppIngress, ingress_started.elapsed());
+
+        let prelude_started = Instant::now();
         if ctx.input(|input| input.viewport().close_requested()) && !self.close_requested {
             if self.media_import_job.is_some() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -7688,13 +8593,18 @@ impl App for EditorApp {
             self.session
                 .clear_inactive_frame_selection(&self.state.project);
         }
+        self.perf
+            .record(crate::perf::PerfSpan::AppPrelude, prelude_started.elapsed());
 
+        let menu_started = Instant::now();
         egui::TopBottomPanel::top("menu_bar")
             .resizable(false)
             .show(ctx, |ui| {
                 panels::menu::render(self, ui);
             });
         panels::tabs::render(self, ctx);
+        self.perf
+            .record(crate::perf::PerfSpan::MenuAndTabs, menu_started.elapsed());
 
         if self.show_home {
             egui::CentralPanel::default()
@@ -7707,6 +8617,7 @@ impl App for EditorApp {
                 crate::q0lang::editor::render_standalone(self, ui);
             });
         } else {
+            let timeline_started = Instant::now();
             egui::TopBottomPanel::bottom("timeline")
                 .resizable(true)
                 .default_height(192.0)
@@ -7714,9 +8625,12 @@ impl App for EditorApp {
                 .show(ctx, |ui| {
                     panels::timeline::render(self, ui);
                 });
+            self.perf
+                .record(crate::perf::PerfSpan::Timeline, timeline_started.elapsed());
             self.session
                 .clear_inactive_frame_selection(&self.state.project);
 
+            let toolbar_started = Instant::now();
             egui::SidePanel::left("toolbar")
                 .resizable(false)
                 .exact_width(48.0)
@@ -7725,6 +8639,8 @@ impl App for EditorApp {
                         .id_source("tools_scroll")
                         .show(ui, |ui| panels::toolbar::render(self, ui));
                 });
+            self.perf
+                .record(crate::perf::PerfSpan::Toolbar, toolbar_started.elapsed());
 
             egui::SidePanel::right("right_dock")
                 .resizable(true)
@@ -7736,12 +8652,22 @@ impl App for EditorApp {
                         .resizable(true)
                         .default_height(half)
                         .show_inside(ui, |ui| {
-                            egui::ScrollArea::vertical()
-                                .id_source("library_panel_scroll")
-                                .show(ui, |ui| panels::library::render(self, ui));
+                            // The Library owns its own item-list ScrollArea. Wrapping the
+                            // whole panel in another vertical ScrollArea makes the preview
+                            // height depend on the outer scroll offset and can create a
+                            // resize feedback loop where both areas keep clamping each other.
+                            let started = Instant::now();
+                            panels::library::render(self, ui);
+                            self.perf
+                                .record(crate::perf::PerfSpan::Library, started.elapsed());
                         });
                     egui::CentralPanel::default().show_inside(ui, |ui| {
+                        let properties_started = Instant::now();
                         panels::properties::render(self, ui);
+                        self.perf.record(
+                            crate::perf::PerfSpan::Properties,
+                            properties_started.elapsed(),
+                        );
                     });
                 });
 
@@ -7749,12 +8675,20 @@ impl App for EditorApp {
                 panels::stage::render(self, ui);
             });
 
+            let auxiliary_started = Instant::now();
             panels::q0enc::render(self, ctx);
             crate::q0lang::render(self, ctx);
             crate::q0lang::frame_editor::render(self, ctx);
             crate::easing::render_editor(self, ctx);
             crate::easing::render_warning(self, ctx);
+            self.perf.record(
+                crate::perf::PerfSpan::AuxiliaryPanels,
+                auxiliary_started.elapsed(),
+            );
         }
+
+        let dialogs_started = Instant::now();
+        panels::q0fla::render(self, ctx);
 
         if self.show_project_tree {
             self.render_project_tree_dialog(ctx);
@@ -7768,6 +8702,8 @@ impl App for EditorApp {
         self.render_new_project_dialog(ctx);
         self.render_destructive_change_dialogs(ctx);
         self.render_unsaved_changes_dialog(ctx);
+        self.perf
+            .record(crate::perf::PerfSpan::Dialogs, dialogs_started.elapsed());
 
         // Update window title
         let title = if self.show_home {
@@ -7785,8 +8721,12 @@ impl App for EditorApp {
         } else {
             self.state.title()
         };
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        if self.last_window_title.as_deref() != Some(title.as_str()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_window_title = Some(title);
+        }
 
+        let action_drain_started = Instant::now();
         self.drain_actions(ctx);
         for status in self.q0enc.poll_events() {
             self.session.status = status;
@@ -7795,6 +8735,10 @@ impl App for EditorApp {
             self.session
                 .clear_inactive_frame_selection(&self.state.project);
         }
+        self.perf.record(
+            crate::perf::PerfSpan::ActionDrain,
+            action_drain_started.elapsed(),
+        );
 
         if self.media_import_job.is_some() {
             ctx.request_repaint_after(Duration::from_millis(50));
@@ -7802,6 +8746,7 @@ impl App for EditorApp {
         if self.session.playing || self.q0enc.queue_running {
             ctx.request_repaint();
         }
+        self.perf.finish_frame();
     }
 }
 
@@ -8013,6 +8958,70 @@ mod tests {
         assert!(matches!(app.session.tool_state, ToolState::Idle));
     }
 
+    #[test]
+    fn switching_from_subselect_to_select_promotes_points_to_whole_raw_path() {
+        let mut app = EditorApp::default();
+        let path = PathRef {
+            q0rg_id: app.session.current_q0rg_id,
+            layer_id: app.session.current_layer_id,
+            placement_idx: 3,
+            path_idx: 7,
+        };
+        app.session.current_tool = Tool::Subselect;
+        app.session.selection = Selection::SubselectPoints {
+            path,
+            anchor_indices: vec![1, 2],
+            bounds_min: Vec2::new(10.0, 20.0),
+            bounds_max: Vec2::new(80.0, 60.0),
+        };
+        app.session.tool_state = ToolState::DraggingPathPoints {
+            path,
+            anchor_indices: vec![1, 2],
+            start_cursor: Vec2::new(20.0, 30.0),
+            start_path: q0s_format::v2::Path {
+                anchors: Vec::new(),
+                closed: false,
+            },
+            start_bounds_min: Vec2::new(10.0, 20.0),
+            start_bounds_max: Vec2::new(80.0, 60.0),
+        };
+
+        app.handle(&Context::default(), Action::SelectTool(Tool::Select));
+
+        assert_eq!(app.session.current_tool, Tool::Select);
+        assert_eq!(
+            app.session.selection,
+            Selection::Path {
+                q0rg_id: path.q0rg_id,
+                layer_id: path.layer_id,
+                placement_idx: path.placement_idx,
+                path_idx: path.path_idx,
+            }
+        );
+        assert!(matches!(app.session.tool_state, ToolState::Idle));
+    }
+
+    #[test]
+    fn select_tool_keeps_real_partial_raw_selection_partial() {
+        let mut app = EditorApp::default();
+        let selection = Selection::PathPoints {
+            path: PathRef {
+                q0rg_id: app.session.current_q0rg_id,
+                layer_id: app.session.current_layer_id,
+                placement_idx: 0,
+                path_idx: 0,
+            },
+            anchor_indices: vec![1, 2],
+            bounds_min: Vec2::new(10.0, 20.0),
+            bounds_max: Vec2::new(80.0, 60.0),
+        };
+        app.session.current_tool = Tool::Select;
+        app.session.selection = selection.clone();
+
+        app.handle(&Context::default(), Action::SelectTool(Tool::Select));
+
+        assert_eq!(app.session.selection, selection);
+    }
     fn app_test_nonce() -> u128 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -8086,6 +9095,7 @@ mod tests {
             material_source: Vec::new(),
             clip_mask: Vec::new(),
             field_transform: Affine::IDENTITY,
+            fill_gradient: None,
         }
     }
 
@@ -8450,6 +9460,7 @@ mod tests {
                 },
                 appearance: None,
             }],
+            artwork_center: None,
             timeline: None,
         });
         app.handle(&Context::default(), Action::Paste);
@@ -8587,6 +9598,143 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(labels, vec!["All libraries.q1s", "Other.q1s"]);
         assert!(!labels.contains(&"All libraries"));
+    }
+
+    #[test]
+    fn cross_project_library_drag_imports_then_places_as_one_undoable_change() {
+        let mut app = EditorApp::default();
+        app.handle(
+            &Context::default(),
+            Action::CreateProject(NewProjectSpec {
+                name: "Source library".to_string(),
+                ..NewProjectSpec::default()
+            }),
+        );
+        let source_tab = app.active_document_tab.expect("source project tab");
+        app.state.project.assets.push(Asset::Vector(VectorAsset {
+            asset_id: 77,
+            paths: vec![test_square(10.0, 20.0)],
+            fill: Some(q0s_format::v2::Rgba {
+                r: 180,
+                g: 80,
+                b: 40,
+                a: 255,
+            }),
+            stroke: None,
+        }));
+        app.state
+            .project
+            .asset_names
+            .insert(77, "Shared Hand".to_string());
+        let source_before = app.state.project.clone();
+
+        app.handle(
+            &Context::default(),
+            Action::CreateProject(NewProjectSpec {
+                name: "Destination".to_string(),
+                ..NewProjectSpec::default()
+            }),
+        );
+        let destination_before = app.state.project.clone();
+        let drop = Vec2::new(240.0, 170.0);
+        app.handle(
+            &Context::default(),
+            Action::PlaceLibraryDragAt(
+                LibraryDragPayload {
+                    source_tab_id: source_tab,
+                    item: LibraryItem::Asset(77),
+                },
+                drop,
+            ),
+        );
+
+        assert_eq!(
+            app.project_for_document_tab(source_tab),
+            Some(&source_before),
+            "dropping from another library must not mutate that open project"
+        );
+        assert_eq!(
+            app.state.project.assets.len(),
+            destination_before.assets.len() + 1
+        );
+        let imported_id = app
+            .state
+            .project
+            .asset_names
+            .iter()
+            .find_map(|(&id, name)| (name == "Shared Hand").then_some(id))
+            .expect("imported asset name");
+        assert_ne!(
+            imported_id, 77,
+            "source ids are project-local and must be remapped"
+        );
+        let layer = &app.state.project.q0rgs[0].layers[0];
+        let placement = layer.placements.last().expect("dropped placement");
+        assert_eq!(placement.target, Target::Asset(imported_id));
+        q0s_format::v2::validate(&app.state.project).expect("cross-project drop project");
+
+        app.handle(&Context::default(), Action::Undo);
+        assert_eq!(
+            app.state.project, destination_before,
+            "one undo must remove both the placed object and imported library dependencies"
+        );
+    }
+
+    #[test]
+    fn rejected_cross_project_library_drop_rolls_back_imported_dependencies() {
+        let mut app = EditorApp::default();
+        app.handle(
+            &Context::default(),
+            Action::CreateProject(NewProjectSpec {
+                name: "Source library".to_string(),
+                ..NewProjectSpec::default()
+            }),
+        );
+        let source_tab = app.active_document_tab.expect("source project tab");
+        app.state.project.assets.push(Asset::Vector(VectorAsset {
+            asset_id: 91,
+            paths: vec![test_square(0.0, 0.0)],
+            fill: Some(q0s_format::v2::Rgba {
+                r: 90,
+                g: 120,
+                b: 150,
+                a: 255,
+            }),
+            stroke: None,
+        }));
+
+        app.handle(
+            &Context::default(),
+            Action::CreateProject(NewProjectSpec {
+                name: "Locked destination".to_string(),
+                ..NewProjectSpec::default()
+            }),
+        );
+        let key = LayerKey::new(app.session.current_q0rg_id, app.session.current_layer_id);
+        app.state.project.layer_metadata.insert(
+            key,
+            LayerMetadata {
+                locked: true,
+                ..Default::default()
+            },
+        );
+        let before = app.state.project.clone();
+        app.handle(
+            &Context::default(),
+            Action::PlaceLibraryDragAt(
+                LibraryDragPayload {
+                    source_tab_id: source_tab,
+                    item: LibraryItem::Asset(91),
+                },
+                Vec2::new(100.0, 100.0),
+            ),
+        );
+
+        assert_eq!(
+            app.state.project, before,
+            "a rejected drop must not leave the copied asset in the destination library"
+        );
+        assert!(app.session.status.contains("unlock"));
     }
 
     #[test]
@@ -8794,15 +9942,85 @@ mod tests {
     }
 
     #[test]
-    fn stepping_inside_existing_timeline_does_not_mark_project_dirty() {
-        let mut app = EditorApp::default();
-        app.state.dirty = false;
+    fn f5_without_timeline_selection_inserts_before_playhead_on_current_layer() {
+        let mut app = app_with_one_timeline_object(6);
+        app.state.project.q0rgs[0].layers[0]
+            .placements
+            .push(Placement {
+                instance_id: 0,
+                frame: 4,
+                target: Target::Asset(77),
+                transform: Transform2D {
+                    tx: 10.0,
+                    ..Transform2D::IDENTITY
+                },
+                tween: Tween::None,
+                fx: Default::default(),
+            });
+        let mut second_layer = app.state.project.q0rgs[0].layers[0].clone();
+        second_layer.layer_id = 2;
+        second_layer.name = "Layer 2".to_string();
+        second_layer.placements[1].transform.tx = 20.0;
+        app.state.project.q0rgs[0].layers.push(second_layer);
+        app.session.current_layer_id = 2;
+        app.session.current_frame = 4;
+        app.session.timeline_selection = None;
 
         app.handle(&Context::default(), Action::InsertFrame);
 
-        assert_eq!(app.session.current_frame, 1);
-        assert!(!app.state.dirty);
-        assert!(!app.history.can_undo());
+        let q0rg = &app.state.project.q0rgs[0];
+        assert_eq!(q0rg.frame_count, 7);
+        assert!(q0rg.layers[0]
+            .placements
+            .iter()
+            .any(|placement| placement.frame == 4 && placement.transform.tx == 10.0));
+        assert!(q0rg.layers[1]
+            .placements
+            .iter()
+            .any(|placement| placement.frame == 5 && placement.transform.tx == 20.0));
+        assert_eq!(app.session.current_layer_id, 2);
+        assert_eq!(app.session.current_frame, 4);
+        assert_eq!(
+            app.session.timeline_selection,
+            Some(TimelineSelection::single(2, 4))
+        );
+        assert!(app.state.dirty);
+        assert!(app.history.can_undo());
+    }
+
+    #[test]
+    fn f5_uses_selected_timeline_cell_instead_of_playhead_fallback() {
+        let mut app = app_with_one_timeline_object(6);
+        let layer_id = app.session.current_layer_id;
+        app.state.project.q0rgs[0].layers[0]
+            .placements
+            .push(Placement {
+                instance_id: 0,
+                frame: 4,
+                target: Target::Asset(77),
+                transform: Transform2D {
+                    tx: 40.0,
+                    ..Transform2D::IDENTITY
+                },
+                tween: Tween::None,
+                fx: Default::default(),
+            });
+        app.session.current_frame = 1;
+        app.session.timeline_selection = Some(TimelineSelection::single(layer_id, 4));
+
+        app.handle(&Context::default(), Action::InsertFrame);
+
+        let q0rg = &app.state.project.q0rgs[0];
+        assert_eq!(q0rg.frame_count, 7);
+        assert!(q0rg.layers[0]
+            .placements
+            .iter()
+            .any(|placement| placement.frame == 5 && placement.transform.tx == 40.0));
+        assert_eq!(
+            crate::render::active_placements_at(&q0rg.layers[0], 4).len(),
+            1
+        );
+        assert_eq!(app.session.current_frame, 4);
     }
 
     #[test]
@@ -9364,6 +10582,58 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_bitmap_paste_centres_display_object_on_stage_cursor() {
+        let mut encoded = Vec::new();
+        image::codecs::bmp::BmpEncoder::new(&mut encoded)
+            .encode(
+                &[
+                    255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0, 255, 0, 255, 0, 255, 255, 32, 64,
+                    96, 255, 255, 255,
+                ],
+                4,
+                2,
+                image::ColorType::Rgb8,
+            )
+            .expect("encode clipboard bmp fixture");
+
+        let mut app = EditorApp {
+            project_active: true,
+            show_home: false,
+            ..Default::default()
+        };
+        app.session.stage_cursor = Some(Vec2::new(300.0, 200.0));
+        let before_assets = app.state.project.assets.len();
+        app.paste_bitmap_from_clipboard(crate::system_clipboard::ClipboardBitmap { encoded });
+
+        assert_eq!(app.state.project.assets.len(), before_assets + 1);
+        let Asset::Bitmap(bitmap) = app
+            .state
+            .project
+            .assets
+            .last()
+            .expect("clipboard bitmap asset")
+        else {
+            panic!("clipboard paste must create a bitmap asset");
+        };
+        assert_eq!((bitmap.width, bitmap.height), (4, 2));
+        let layer = &app.state.project.q0rgs[0].layers[0];
+        let placement = layer.placements.last().expect("clipboard bitmap placement");
+        assert_eq!(placement.target, Target::Asset(bitmap.asset_id));
+        assert!((placement.transform.tx - 298.0).abs() < 1.0e-6);
+        assert!((placement.transform.ty - 199.0).abs() < 1.0e-6);
+        assert!(matches!(
+            app.session.selection,
+            Selection::Placement {
+                q0rg_id: 1,
+                layer_id: 1,
+                placement_idx
+            } if placement_idx == layer.placements.len() - 1
+        ));
+        assert_eq!(app.session.status, "pasted bitmap from clipboard (4x2)");
+        assert!(app.history.can_undo());
+        q0s_format::v2::validate(&app.state.project).expect("clipboard bitmap paste remains valid");
+    }
+    #[test]
     fn project_tree_window_is_independent_from_settings_and_credits() {
         let mut app = EditorApp::default();
         app.session.show_settings = true;
@@ -9425,6 +10695,55 @@ mod tests {
         assert!(!app.q0enc.open);
         assert!(app.session.show_settings);
         assert!(app.session.show_credits);
+    }
+
+    #[test]
+    fn quick_xfl_open_creates_an_unsaved_dirty_q1s_workspace() {
+        let root = std::env::temp_dir().join(format!(
+            "q0editor-q0fla-open-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("create xfl fixture dir");
+        let marker = root.join("animate-source.xfl");
+        std::fs::write(&marker, b"PROXY-CS5").expect("write xfl marker");
+        std::fs::write(
+            root.join("DOMDocument.xml"),
+            br#"<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="960" height="540" frameRate="25"><timelines><DOMTimeline name="Scene 1"><layers><DOMLayer name="Ink"><frames><DOMFrame index="0" duration="10"/></frames></DOMLayer></layers></DOMTimeline></timelines></DOMDocument>"#,
+        )
+        .expect("write DOMDocument.xml");
+
+        let mut app = EditorApp::default();
+        assert!(app.open_from_path(&marker));
+        assert!(app.project_active);
+        assert!(!app.show_home);
+        assert!(
+            app.state.file_path.is_none(),
+            "quick import must not claim the source FLA/XFL as its q1s save path"
+        );
+        assert!(
+            app.state.dirty,
+            "imported project must immediately require a q1s save"
+        );
+        assert_eq!(app.state.project.meta.stage_width, 960);
+        assert_eq!(app.state.project.meta.stage_height, 540);
+        assert_eq!(app.state.project.meta.fps, 25);
+        assert_eq!(app.state.project.q0rgs[0].frame_count, 10);
+        assert_eq!(app.state.project.q0rgs[0].layers[0].name, "Ink");
+        let active = app
+            .document_tab_summaries()
+            .into_iter()
+            .find(|tab| tab.active)
+            .expect("active imported tab");
+        assert_eq!(active.title, "animate-source.q1s");
+        assert!(active.dirty);
+        assert!(app.state.title().contains("animate-source.q1s*"));
+        assert!(!root.join("animate-source.q1s").exists());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -9824,8 +11143,10 @@ mod tests {
                             b: 10,
                             a: 255,
                         },
-                        radius: 10.0,
+                        radius_x: 10.0,
+                        radius_y: 10.0,
                         strength: 1.25,
+                        quality: 3,
                     }),
                     ..Default::default()
                 },
@@ -9875,7 +11196,11 @@ mod tests {
                     transform: Transform2D::IDENTITY,
                     tween: Tween::None,
                     fx: q0s_format::v2::PlacementFx {
-                        blur: Some(q0s_format::v2::BlurFx { radius: 6.0 }),
+                        blur: Some(q0s_format::v2::BlurFx {
+                            radius_x: 6.0,
+                            radius_y: 6.0,
+                            quality: 3,
+                        }),
                         ..Default::default()
                     },
                 }],
@@ -10594,6 +11919,149 @@ mod tests {
     }
 
     #[test]
+    fn delete_selection_removes_subselect_point_keeps_two_point_open_path_and_invalidates_render() {
+        let mut app = EditorApp::default();
+        let q0rg_id = app.state.project.q0rgs[0].q0rg_id;
+        let layer_id = app.state.project.q0rgs[0].layers[0].layer_id;
+        let asset_id = 61000;
+        app.state.project.assets.push(Asset::Vector(VectorAsset {
+            asset_id,
+            paths: vec![VPath {
+                anchors: vec![
+                    Anchor {
+                        point: Vec2::new(0.0, 0.0),
+                        in_handle: None,
+                        out_handle: Some(Vec2::new(2.0, 50.0)),
+                    },
+                    Anchor {
+                        point: Vec2::new(10.0, 0.0),
+                        in_handle: None,
+                        out_handle: None,
+                    },
+                    Anchor {
+                        point: Vec2::new(20.0, 0.0),
+                        in_handle: Some(Vec2::new(18.0, -50.0)),
+                        out_handle: None,
+                    },
+                ],
+                closed: false,
+            }],
+            fill: None,
+            stroke: Some(q0s_format::v2::Stroke {
+                color: q0s_format::v2::Rgba {
+                    r: 10,
+                    g: 20,
+                    b: 30,
+                    a: 255,
+                },
+                width: 2.0,
+                cap: q0s_format::geom::CapShape::Round,
+            }),
+        }));
+        app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            instance_id: 0,
+            frame: 0,
+            target: Target::Asset(asset_id),
+            transform: Transform2D::IDENTITY,
+            tween: Tween::None,
+            fx: Default::default(),
+        }];
+        app.session.current_q0rg_id = q0rg_id;
+        app.session.current_layer_id = layer_id;
+        app.session.current_frame = 0;
+
+        let ctx = Context::default();
+        let rect = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(200.0, 100.0));
+        let view = crate::render::StageView {
+            origin: egui::pos2(20.0, 20.0),
+            scale: 1.0,
+            stage_rect: rect,
+        };
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Middle,
+                    egui::Id::new("subselect-delete-cache-before"),
+                ));
+                crate::render::render_stage(
+                    &painter,
+                    &app.state.project,
+                    q0rg_id,
+                    0,
+                    &view,
+                    &mut app.textures,
+                    ctx,
+                );
+            },
+        );
+        let builds_before = app.textures.vector_render_geometry_build_count();
+        assert_eq!(builds_before, 1);
+
+        app.session.selection = Selection::SubselectPoints {
+            path: PathRef {
+                q0rg_id,
+                layer_id,
+                placement_idx: 0,
+                path_idx: 0,
+            },
+            anchor_indices: vec![1],
+            bounds_min: Vec2::new(10.0, 0.0),
+            bounds_max: Vec2::new(10.0, 0.0),
+        };
+        app.handle(&ctx, Action::DeleteSelection);
+
+        let path = match app
+            .state
+            .project
+            .assets
+            .iter()
+            .find(|asset| asset.id() == asset_id)
+            .unwrap()
+        {
+            Asset::Vector(vector) => &vector.paths[0],
+            _ => unreachable!(),
+        };
+        assert_eq!(path.anchors.len(), 2);
+        assert_eq!(path.anchors[0].point, Vec2::new(0.0, 0.0));
+        assert_eq!(path.anchors[1].point, Vec2::new(20.0, 0.0));
+        assert_eq!(path.anchors[0].out_handle, None);
+        assert_eq!(path.anchors[1].in_handle, None);
+        assert!(matches!(app.session.selection, Selection::None));
+        q0s_format::v2::validate(&app.state.project).expect("two-point open path remains valid");
+
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Middle,
+                    egui::Id::new("subselect-delete-cache-after"),
+                ));
+                crate::render::render_stage(
+                    &painter,
+                    &app.state.project,
+                    q0rg_id,
+                    0,
+                    &view,
+                    &mut app.textures,
+                    ctx,
+                );
+            },
+        );
+        assert_eq!(
+            app.textures.vector_render_geometry_build_count(),
+            builds_before + 1,
+            "Delete mutated authored anchors but left the stale vector render cache warm"
+        );
+    }
+
+    #[test]
     fn delete_selection_routes_library_symbol_through_symbol_delete() {
         let mut app = EditorApp::default();
         app.handle(&Context::default(), Action::AddQ0rg);
@@ -11129,5 +12597,105 @@ mod tests {
         let mut budget = MAX_PREVIEW_FRAME_SCRIPT_TRANSITIONS;
         app.preview_runtime_transition_to_frame(1, &mut budget);
         assert_eq!(preview_runtime_var(&app, "order").as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn camera_f6_tween_delete_and_undo_never_mutate_artwork_layers() {
+        let mut app = EditorApp::default();
+        let ctx = Context::default();
+        let artwork_before = app.state.project.q0rgs.clone();
+        app.state.project.runtime.camera.enabled = true;
+        app.session.camera_track_selected = true;
+
+        app.handle(&ctx, Action::InsertKeyframe);
+        assert!(app.state.project.runtime.camera.has_keyframe(0));
+
+        app.session.current_frame = 10;
+        app.handle(&ctx, Action::InsertKeyframe);
+        assert!(app.state.project.runtime.camera.has_keyframe(10));
+
+        app.session.current_frame = 5;
+        app.handle(&ctx, Action::CreateMotionTween);
+        let source = app
+            .state
+            .project
+            .runtime
+            .camera
+            .keys
+            .iter()
+            .find(|key| key.frame == 0)
+            .expect("camera source key");
+        assert_eq!(source.tween.to_frame(), Some(10));
+
+        app.session.current_frame = 10;
+        app.handle(&ctx, Action::DeleteSelection);
+        assert!(!app.state.project.runtime.camera.has_keyframe(10));
+        assert_eq!(app.state.project.runtime.camera.keys[0].tween, Tween::None);
+        assert_eq!(app.state.project.q0rgs, artwork_before);
+
+        app.handle(&ctx, Action::Undo);
+        assert!(app.state.project.runtime.camera.has_keyframe(10));
+        assert_eq!(app.state.project.q0rgs, artwork_before);
+    }
+
+    #[test]
+    fn camera_frame_range_moves_and_clears_without_becoming_an_artwork_layer() {
+        let mut app = EditorApp::default();
+        let ctx = Context::default();
+        app.state.project.q0rgs[0].frame_count = 20;
+        let artwork_before = app.state.project.q0rgs.clone();
+        app.state.project.runtime.camera.enabled = true;
+        app.state.project.runtime.camera.keys = vec![
+            q0s_format::v2::CameraKey {
+                frame: 2,
+                state: app.state.project.default_camera_state(),
+                tween: Tween::Linear { to_frame: 6 },
+            },
+            q0s_format::v2::CameraKey {
+                frame: 6,
+                state: q0s_format::v2::CameraState {
+                    center_x: 400.0,
+                    ..app.state.project.default_camera_state()
+                },
+                tween: Tween::None,
+            },
+        ];
+        app.session.camera_track_selected = true;
+        let selection = CameraTimelineSelection {
+            anchor_frame: 2,
+            focus_frame: 6,
+        };
+        app.session.camera_timeline_selection = Some(selection);
+
+        app.handle(&ctx, Action::MoveCameraFrames(selection, 8));
+
+        assert_eq!(
+            app.state
+                .project
+                .runtime
+                .camera
+                .keys
+                .iter()
+                .map(|key| key.frame)
+                .collect::<Vec<_>>(),
+            vec![8, 12]
+        );
+        assert_eq!(
+            app.state.project.runtime.camera.keys[0].tween.to_frame(),
+            Some(12)
+        );
+        assert_eq!(app.state.project.q0rgs, artwork_before);
+        assert_eq!(
+            app.session.camera_timeline_selection,
+            Some(CameraTimelineSelection {
+                anchor_frame: 8,
+                focus_frame: 12,
+            })
+        );
+
+        app.handle(&ctx, Action::DeleteSelection);
+        assert!(app.state.project.runtime.camera.keys.is_empty());
+        assert_eq!(app.state.project.q0rgs, artwork_before);
+        q0s_format::v2::validate(&app.state.project).unwrap();
     }
 }

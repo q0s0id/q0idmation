@@ -7,14 +7,14 @@ use egui::{
 use crate::app::{Action, EditorApp, LayerDropTarget};
 use crate::settings::Theme;
 use crate::state::{
-    FrameLabelEdit, LayerRename, LibraryItem, Selection, TimelineFrameDrag, TimelineLayerDrag,
-    TimelineLayerSelection, TimelineSelection,
+    CameraFrameDrag, CameraTimelineSelection, FrameLabelEdit, LayerRename, LibraryDragPayload,
+    Selection, TimelineFrameDrag, TimelineLayerDrag, TimelineLayerSelection, TimelineSelection,
 };
 
 const FRAME_W: f32 = 12.0;
 const ROW_H: f32 = 26.0;
 const LAYER_LABEL_W: f32 = 174.0;
-/// Gap above and below the cell fill вЂ” leaves room for thin row separators
+/// Gap above and below the cell fill РІР‚вЂќ leaves room for thin row separators
 /// like the original Flash CS3 timeline.
 const CELL_PAD_Y: f32 = 1.0;
 /// How many "virtual" frame slots to render past `frame_count` so the user
@@ -280,12 +280,16 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     // sees the q0rg's edge and has somewhere to drop "+ Frame" hits visually.
     let visible_frames = frame_count.saturating_add(VIRTUAL_FRAMES_BUFFER);
 
+    let camera_row_enabled =
+        q0rg_id == app.state.project.meta.entry_q0rg_id && app.state.project.runtime.camera.enabled;
+    let camera_row_count = usize::from(camera_row_enabled);
+
     ScrollArea::both()
         .auto_shrink([false, false])
         .max_height(ui.available_height())
         .show(ui, |ui| {
             let total_w = LAYER_LABEL_W + (visible_frames as f32) * FRAME_W;
-            let total_h = ROW_H * (layer_count as f32 + 1.0);
+            let total_h = ROW_H * (layer_count as f32 + camera_row_count as f32 + 1.0);
             let (rect, response) = ui.allocate_exact_size(
                 vec2(total_w.max(ui.available_width()), total_h),
                 Sense::click_and_drag(),
@@ -295,14 +299,14 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             let frame_slots =
                 visible_frame_slots(&painter, rect.min.x + LAYER_LABEL_W, visible_frames);
             let row_slots = visible_slots(
-                rect.min.y + ROW_H,
+                rect.min.y + ROW_H * (camera_row_count as f32 + 1.0),
                 ROW_H,
                 layer_count,
                 clip.top(),
                 clip.bottom(),
             );
 
-            // Timeline base panel вЂ” same as the editor's window colour
+            // Timeline base panel РІР‚вЂќ same as the editor's window colour
             // so it visually merges with the surrounding chrome.
             painter.rect_filled(rect, 0.0, theme.window.to_color32());
 
@@ -322,7 +326,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 let x = rect.min.x + LAYER_LABEL_W + (f as f32) * FRAME_W;
                 let frame_one_based = f + 1;
                 let beyond = f >= frame_count;
-                // Tick lines вЂ” every 5th frame full-height, others only in
+                // Tick lines РІР‚вЂќ every 5th frame full-height, others only in
                 // the layer area (below the header). Virtual cells past
                 // `frame_count` get fainter ticks.
                 if f % 5 == 0 {
@@ -341,7 +345,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         Stroke::new(1.0_f32, theme.timeline_grid.to_color32()),
                     );
                 }
-                // Frame number every 5th frame вЂ” but only inside the q0rg's
+                // Frame number every 5th frame РІР‚вЂќ but only inside the q0rg's
                 // own range. Virtual cells past frame_count get no number.
                 if !beyond && (frame_one_based % 5 == 0 || f == 0) {
                     painter.text(
@@ -352,7 +356,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         theme.text_dim.to_color32(),
                     );
                 }
-                // Second marker (1s, 2s, вЂ¦) at every fps-th frame above the number.
+                // Second marker (1s, 2s, РІР‚В¦) at every fps-th frame above the number.
                 if !beyond && fps > 0 && (frame_one_based as u32).is_multiple_of(fps) {
                     let secs = (frame_one_based as u32) / fps;
                     painter.text(
@@ -426,6 +430,18 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 y += 7.0;
             }
 
+            if camera_row_enabled {
+                draw_camera_layer_row(
+                    app,
+                    &painter,
+                    &theme,
+                    rect,
+                    rect.min.y + ROW_H,
+                    frame_count,
+                    visible_frames,
+                );
+            }
+
             // Layer rows
             let mut click_layer: Option<u16> = None;
             let mut click_frame: Option<u16> = None;
@@ -444,7 +460,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 let is_folder = metadata.kind == q0s_format::v2::LayerKind::Folder;
                 let effective_visible = app.state.project.layer_is_visible(q0rg_id, layer.layer_id);
                 let effective_locked = app.state.project.layer_is_locked(q0rg_id, layer.layer_id);
-                let row_y = rect.min.y + ROW_H * (li as f32 + 1.0);
+                let row_y = rect.min.y + ROW_H * (li as f32 + camera_row_count as f32 + 1.0);
                 let row_rect =
                     Rect::from_min_size(pos2(rect.min.x, row_y), vec2(rect.width(), ROW_H));
                 let is_current_layer = layer.layer_id == app.session.current_layer_id;
@@ -470,7 +486,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     is_current_layer,
                 );
 
-                // Label (left-side fixed column) вЂ” pull tones from the
+                // Label (left-side fixed column) РІР‚вЂќ pull tones from the
                 // panel/window pair so any theme reads as a coherent strip.
                 let label_rect =
                     Rect::from_min_size(pos2(rect.min.x, row_y), vec2(LAYER_LABEL_W, ROW_H));
@@ -553,7 +569,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     Stroke::new(1.0_f32, theme.stroke_dark.to_color32()),
                 );
 
-                // Bottom row separator вЂ” hairline in the theme's stroke colour.
+                // Bottom row separator РІР‚вЂќ hairline in the theme's stroke colour.
                 painter.line_segment(
                     [
                         pos2(rect.min.x, row_y + ROW_H),
@@ -647,7 +663,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     }
                 }
 
-                // Click in row в†’ set current_layer + current_frame
+                // Click in row РІвЂ вЂ™ set current_layer + current_frame
                 if let Some(pos) = response.interact_pointer_pos() {
                     if row_rect.contains(pos) && response.clicked() {
                         if visibility_rect.contains(pos) {
@@ -725,11 +741,18 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 );
             }
 
-            let library_payload = response.dnd_hover_payload::<LibraryItem>();
+            let library_payload = response.dnd_hover_payload::<LibraryDragPayload>();
             let library_drop_cell =
                 ui.input(|input| input.pointer.latest_pos())
                     .and_then(|position| {
-                        timeline_cell_at(rect, position, frame_count, &layer_ids, &folder_layer_ids)
+                        timeline_cell_at(
+                            rect,
+                            position,
+                            frame_count,
+                            &layer_ids,
+                            &folder_layer_ids,
+                            camera_row_count,
+                        )
                     });
             if library_payload.is_some() {
                 if let Some((layer_id, frame)) = library_drop_cell {
@@ -740,7 +763,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         let cell = Rect::from_min_size(
                             pos2(
                                 rect.min.x + LAYER_LABEL_W + frame as f32 * FRAME_W,
-                                rect.min.y + ROW_H * (row as f32 + 1.0),
+                                rect.min.y + ROW_H * (row as f32 + camera_row_count as f32 + 1.0),
                             ),
                             vec2(FRAME_W, ROW_H),
                         )
@@ -759,12 +782,12 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 }
             }
             let released_library_item = response
-                .dnd_release_payload::<LibraryItem>()
+                .dnd_release_payload::<LibraryDragPayload>()
                 .map(|payload| *payload);
-            if let (Some(item), Some((layer_id, frame))) =
+            if let (Some(payload), Some((layer_id, frame))) =
                 (released_library_item, library_drop_cell)
             {
-                app.queue(Action::PlaceLibraryItemOnTimeline(item, layer_id, frame));
+                app.queue(Action::PlaceLibraryDragOnTimeline(payload, layer_id, frame));
             }
 
             draw_timeline_selection(
@@ -773,7 +796,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 app.session.timeline_selection,
                 &layer_ids,
                 rect.min.x + LAYER_LABEL_W,
-                rect.min.y + ROW_H,
+                rect.min.y + ROW_H * (camera_row_count as f32 + 1.0),
                 visible_frames,
             );
 
@@ -788,7 +811,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 Stroke::new(1.5_f32, theme.playhead.to_color32()),
             );
 
-            // Header click в†’ set current frame
+            // Header click РІвЂ вЂ™ set current frame
             if let Some(pos) = response.interact_pointer_pos() {
                 if app.session.timeline_layer_drag.is_none()
                     && header_rect.contains(pos)
@@ -804,8 +827,120 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 }
             }
 
+            let camera_row_rect = camera_row_enabled.then(|| {
+                Rect::from_min_size(
+                    pos2(rect.min.x, rect.min.y + ROW_H),
+                    vec2(rect.width(), ROW_H),
+                )
+            });
+            let camera_pointer_frame = response.interact_pointer_pos().and_then(|pos| {
+                let row = camera_row_rect?;
+                if !row.contains(pos) || pos.x < rect.min.x + LAYER_LABEL_W {
+                    return None;
+                }
+                let frame = ((pos.x - (rect.min.x + LAYER_LABEL_W)) / FRAME_W).floor() as i32;
+                (frame >= 0 && frame < i32::from(visible_frames)).then_some(frame as u16)
+            });
+            let pointer_on_camera_row = response
+                .interact_pointer_pos()
+                .zip(camera_row_rect)
+                .is_some_and(|(pos, row)| row.contains(pos));
+
+            if camera_row_enabled && pointer_on_camera_row && response.clicked() {
+                app.session.camera_track_selected = true;
+                app.session.timeline_selection = None;
+                app.session.timeline_layer_selection = None;
+                app.session.timeline_frame_drag = None;
+                app.session.selection = Selection::None;
+                if let Some(frame) = camera_pointer_frame {
+                    let extend = ui.input(|input| input.modifiers.shift);
+                    app.session.camera_timeline_selection = if extend {
+                        app.session
+                            .camera_timeline_selection
+                            .map(|mut selection| {
+                                selection.focus_frame = frame;
+                                selection
+                            })
+                            .or_else(|| Some(CameraTimelineSelection::single(frame)))
+                    } else {
+                        Some(CameraTimelineSelection::single(frame))
+                    };
+                    app.session.set_timeline_frame(frame, frame_count);
+                } else {
+                    app.session.camera_timeline_selection = None;
+                }
+            }
+
+            if camera_row_enabled
+                && app.session.timeline_layer_drag.is_none()
+                && library_payload.is_none()
+            {
+                if let Some(frame) = camera_pointer_frame {
+                    if response.drag_started_by(PointerButton::Primary) {
+                        app.session.camera_track_selected = true;
+                        app.session.timeline_selection = None;
+                        app.session.timeline_layer_selection = None;
+                        app.session.timeline_frame_drag = None;
+                        app.session.selection = Selection::None;
+                        let existing = app.session.camera_timeline_selection;
+                        let inside_existing = existing.is_some_and(|selection| {
+                            (selection.first_frame()..=selection.last_frame()).contains(&frame)
+                        });
+                        let existing_has_key = existing.is_some_and(|selection| {
+                            app.state.project.runtime.camera.keys.iter().any(|key| {
+                                (selection.first_frame()..=selection.last_frame())
+                                    .contains(&key.frame)
+                            })
+                        });
+                        if inside_existing && existing_has_key {
+                            app.session.camera_frame_drag =
+                                existing.map(|selection| CameraFrameDrag { selection });
+                        } else {
+                            app.session.camera_timeline_selection =
+                                Some(CameraTimelineSelection::single(frame));
+                            app.session.set_timeline_frame(frame, frame_count);
+                        }
+                    } else if response.dragged() && app.session.camera_frame_drag.is_none() {
+                        app.session.camera_track_selected = true;
+                        let mut selection = app
+                            .session
+                            .camera_timeline_selection
+                            .unwrap_or_else(|| CameraTimelineSelection::single(frame));
+                        selection.focus_frame = frame;
+                        app.session.camera_timeline_selection = Some(selection);
+                        app.session.set_timeline_frame(frame, frame_count);
+                    }
+                }
+            }
+
+            if let (Some(drag), Some(target_frame)) =
+                (app.session.camera_frame_drag, camera_pointer_frame)
+            {
+                let width = drag
+                    .selection
+                    .last_frame()
+                    .saturating_sub(drag.selection.first_frame())
+                    .saturating_add(1);
+                let preview = Rect::from_min_size(
+                    pos2(
+                        rect.min.x + LAYER_LABEL_W + f32::from(target_frame) * FRAME_W,
+                        rect.min.y + ROW_H + CELL_PAD_Y,
+                    ),
+                    vec2(f32::from(width) * FRAME_W, ROW_H - CELL_PAD_Y * 2.0),
+                );
+                painter.rect_filled(preview, 1.0, theme.accent.to_color32().gamma_multiply(0.18));
+                painter.rect_stroke(
+                    preview,
+                    1.0,
+                    Stroke::new(1.5_f32, theme.accent.to_color32()),
+                );
+            }
+
             if let Some(id) = click_layer {
                 app.session.current_layer_id = id;
+                app.session.camera_track_selected = false;
+                app.session.camera_timeline_selection = None;
+                app.session.camera_frame_drag = None;
             }
             if let Some(layer_id) = click_label_layer {
                 let extend = ui.input(|input| input.modifiers.shift);
@@ -853,6 +988,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                             visible_frames,
                             &layer_ids,
                             &folder_layer_ids,
+                            camera_row_count,
                         )
                     });
 
@@ -916,7 +1052,8 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         let preview = Rect::from_min_size(
                             pos2(
                                 rect.min.x + LAYER_LABEL_W + target_frame as f32 * FRAME_W,
-                                rect.min.y + ROW_H * (target_row as f32 + 1.0),
+                                rect.min.y
+                                    + ROW_H * (target_row as f32 + camera_row_count as f32 + 1.0),
                             ),
                             vec2(width as f32 * FRAME_W, source_rows as f32 * ROW_H),
                         )
@@ -954,13 +1091,20 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         }
                     }
                 }
+                if let Some(drag) = app.session.camera_frame_drag.take() {
+                    if let Some(target_frame) = camera_pointer_frame {
+                        app.queue(Action::MoveCameraFrames(drag.selection, target_frame));
+                    }
+                }
             } else if !ui.input(|input| input.pointer.primary_down()) {
                 app.session.timeline_layer_drag = None;
                 app.session.timeline_frame_drag = None;
+                app.session.camera_frame_drag = None;
             }
             // Right-click on a frame cell: position the playhead there first,
             // then open the context menu so its actions act on the *clicked*
             // frame, not whatever was previously selected.
+            let secondary_on_camera = response.secondary_clicked() && pointer_on_camera_row;
             if response.secondary_clicked() {
                 if let Some(pos) = response.interact_pointer_pos() {
                     let rel_x = pos.x - (rect.min.x + LAYER_LABEL_W);
@@ -970,32 +1114,50 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                             app.session.set_timeline_frame(f as u16, frame_count);
                         }
                     }
-                    // Identify which layer row was clicked.
-                    let row_idx = ((pos.y - rect.min.y) / ROW_H).floor() as i32 - 1;
-                    if row_idx >= 0 {
-                        if let Some(layer_index) = visible_layer_indices.get(row_idx as usize) {
-                            let layer = &app.state.project.q0rgs[q0rg_idx].layers[*layer_index];
-                            app.session.current_layer_id = layer.layer_id;
-                            app.session.selection = Selection::None;
-                            let clicked_label = pos.x < rect.min.x + LAYER_LABEL_W;
-                            if clicked_label
-                                || app.state.project.layer_is_folder(q0rg_id, layer.layer_id)
-                            {
-                                app.session.timeline_selection = None;
-                                app.session.timeline_layer_selection =
-                                    Some(TimelineLayerSelection::single(layer.layer_id));
-                            } else {
-                                app.session.timeline_layer_selection = None;
-                                app.session.timeline_selection = Some(TimelineSelection::single(
-                                    layer.layer_id,
-                                    app.session.timeline_frame(),
-                                ));
+                    if secondary_on_camera {
+                        app.session.camera_track_selected = true;
+                        app.session.timeline_selection = None;
+                        app.session.timeline_layer_selection = None;
+                        app.session.selection = Selection::None;
+                        if let Some(frame) = camera_pointer_frame {
+                            app.session.camera_timeline_selection =
+                                Some(CameraTimelineSelection::single(frame));
+                        }
+                    } else {
+                        // Identify which ordinary layer row was clicked.
+                        let row_idx = ((pos.y - rect.min.y) / ROW_H).floor() as i32
+                            - 1
+                            - camera_row_count as i32;
+                        if row_idx >= 0 {
+                            if let Some(layer_index) = visible_layer_indices.get(row_idx as usize) {
+                                let layer = &app.state.project.q0rgs[q0rg_idx].layers[*layer_index];
+                                app.session.current_layer_id = layer.layer_id;
+                                app.session.camera_track_selected = false;
+                                app.session.camera_timeline_selection = None;
+                                app.session.selection = Selection::None;
+                                let clicked_label = pos.x < rect.min.x + LAYER_LABEL_W;
+                                if clicked_label
+                                    || app.state.project.layer_is_folder(q0rg_id, layer.layer_id)
+                                {
+                                    app.session.timeline_selection = None;
+                                    app.session.timeline_layer_selection =
+                                        Some(TimelineLayerSelection::single(layer.layer_id));
+                                } else {
+                                    app.session.timeline_layer_selection = None;
+                                    app.session.timeline_selection =
+                                        Some(TimelineSelection::single(
+                                            layer.layer_id,
+                                            app.session.timeline_frame(),
+                                        ));
+                                }
                             }
                         }
                     }
                 }
             }
-            response.context_menu(|ui| timeline_context_menu(app, ui));
+            if !secondary_on_camera {
+                response.context_menu(|ui| timeline_context_menu(app, ui));
+            }
         });
     render_layer_rename_dialog(app, ui.ctx());
     render_frame_label_dialog(app, ui.ctx());
@@ -1064,7 +1226,9 @@ fn layer_drop_target_at(
     if row_count == 0 {
         return None;
     }
-    let first_row_y = rect.min.y + ROW_H;
+    let camera_rows =
+        usize::from(q0rg_id == project.meta.entry_q0rg_id && project.runtime.camera.enabled);
+    let first_row_y = rect.min.y + ROW_H * (camera_rows as f32 + 1.0);
     let raw_row = ((pos.y - first_row_y) / ROW_H).floor() as isize;
     let row_index = raw_row.clamp(0, row_count as isize - 1) as usize;
     let target_id = visible_layer_ids[row_index];
@@ -1125,6 +1289,8 @@ fn draw_layer_drop_preview(
     target: LayerDropTarget,
 ) {
     let accent = theme.accent.to_color32();
+    let camera_rows =
+        usize::from(q0rg_id == project.meta.entry_q0rg_id && project.runtime.camera.enabled);
     match target {
         LayerDropTarget::IntoFolder(folder_id) => {
             let Some(index) = visible_layer_ids
@@ -1133,7 +1299,7 @@ fn draw_layer_drop_preview(
             else {
                 return;
             };
-            let row_y = rect.min.y + ROW_H * (index as f32 + 1.0);
+            let row_y = rect.min.y + ROW_H * (index as f32 + camera_rows as f32 + 1.0);
             let highlight = Rect::from_min_size(
                 pos2(rect.min.x + 1.0, row_y + 1.0),
                 vec2(LAYER_LABEL_W - 2.0, ROW_H - 2.0),
@@ -1188,7 +1354,7 @@ fn draw_layer_drop_preview(
             };
             let line_after = !before;
             let y = rect.min.y
-                + ROW_H * (line_index as f32 + 1.0)
+                + ROW_H * (line_index as f32 + camera_rows as f32 + 1.0)
                 + if line_after { ROW_H } else { 0.0 };
             let indent = parent_folder_id
                 .map(|parent_id| {
@@ -1355,9 +1521,292 @@ fn timeline_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
     }
 }
 
+fn draw_camera_layer_row(
+    app: &EditorApp,
+    painter: &egui::Painter,
+    theme: &Theme,
+    rect: Rect,
+    row_y: f32,
+    frame_count: u16,
+    visible_frames: u16,
+) {
+    let selected = app.session.camera_track_selected;
+    let row_rect = Rect::from_min_size(pos2(rect.min.x, row_y), vec2(rect.width(), ROW_H));
+    painter.rect_filled(row_rect, 0.0, theme.empty_beyond.to_color32());
+    draw_empty_cells(
+        painter,
+        theme,
+        rect.min.x + LAYER_LABEL_W,
+        row_y,
+        frame_count,
+        visible_frames,
+        selected,
+    );
+
+    let label_rect = Rect::from_min_size(pos2(rect.min.x, row_y), vec2(LAYER_LABEL_W, ROW_H));
+    let base_label = if selected {
+        theme.panel.to_color32()
+    } else {
+        blend(theme.panel.to_color32(), theme.window.to_color32(), 0.5)
+    };
+    painter.rect_filled(
+        label_rect,
+        0.0,
+        blend(base_label, theme.accent.to_color32(), 0.10),
+    );
+    if selected {
+        painter.rect_filled(
+            label_rect.shrink(1.0),
+            2.0,
+            theme.accent.to_color32().gamma_multiply(0.22),
+        );
+        painter.rect_stroke(
+            label_rect.shrink(1.0),
+            2.0,
+            Stroke::new(1.0_f32, theme.accent.to_color32()),
+        );
+    }
+    let icon_rect =
+        Rect::from_center_size(label_rect.left_center() + vec2(11.0, 0.0), vec2(13.0, 13.0));
+    draw_layer_icon(
+        painter,
+        icon_rect,
+        false,
+        false,
+        theme.text.to_color32(),
+        theme.accent.to_color32(),
+    );
+    painter.text(
+        label_rect.left_center() + vec2(22.0, 0.0),
+        Align2::LEFT_CENTER,
+        "Camera",
+        FontId::proportional(11.0),
+        theme.text.to_color32(),
+    );
+    painter.line_segment(
+        [
+            pos2(rect.min.x + LAYER_LABEL_W, row_y),
+            pos2(rect.min.x + LAYER_LABEL_W, row_y + ROW_H),
+        ],
+        Stroke::new(1.0_f32, theme.stroke_dark.to_color32()),
+    );
+    painter.line_segment(
+        [
+            pos2(rect.min.x, row_y + ROW_H),
+            pos2(rect.min.x + rect.width(), row_y + ROW_H),
+        ],
+        Stroke::new(1.0_f32, theme.stroke_dark.to_color32()),
+    );
+
+    draw_camera_spans(
+        painter,
+        theme,
+        &app.state.project.runtime.camera,
+        rect.min.x + LAYER_LABEL_W,
+        row_y,
+        frame_count,
+        selected,
+    );
+
+    if let Some(selection) = app.session.camera_timeline_selection.filter(|_| selected) {
+        let first = selection
+            .first_frame()
+            .min(visible_frames.saturating_sub(1));
+        let last = selection.last_frame().min(visible_frames.saturating_sub(1));
+        if first <= last {
+            let accent = timeline_selection_color(theme);
+            let fill = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 54);
+            let selected_rect = Rect::from_min_max(
+                pos2(
+                    rect.min.x + LAYER_LABEL_W + f32::from(first) * FRAME_W,
+                    row_y + CELL_PAD_Y,
+                ),
+                pos2(
+                    rect.min.x + LAYER_LABEL_W + (f32::from(last) + 1.0) * FRAME_W,
+                    row_y + ROW_H - CELL_PAD_Y,
+                ),
+            );
+            painter.rect_filled(selected_rect, 0.0, fill);
+            painter.rect_stroke(selected_rect, 0.0, Stroke::new(1.0_f32, accent));
+        }
+    }
+}
+
+fn draw_camera_spans(
+    painter: &egui::Painter,
+    theme: &Theme,
+    camera: &q0s_format::v2::CameraTrack,
+    base_x: f32,
+    row_y: f32,
+    frame_count: u16,
+    is_current_layer: bool,
+) {
+    let keyframes = camera
+        .keys
+        .iter()
+        .map(|key| key.frame)
+        .filter(|frame| *frame < frame_count)
+        .collect::<Vec<_>>();
+    let frame_slots = visible_frame_slots(painter, base_x, frame_count);
+    if frame_slots.is_empty() {
+        return;
+    }
+    let cell_top = row_y + CELL_PAD_Y;
+    let cell_bot = row_y + ROW_H - CELL_PAD_Y;
+    let static_base = if is_current_layer {
+        theme.extension_active.to_color32()
+    } else {
+        theme.extension.to_color32()
+    };
+    let static_fill = blend(static_base, theme.accent.to_color32(), 0.12);
+    let tween_fill = blend(
+        theme.tween_fill.to_color32(),
+        theme.accent.to_color32(),
+        0.12,
+    );
+    let tween_arrow = blend(
+        theme.tween_arrow.to_color32(),
+        theme.accent.to_color32(),
+        0.18,
+    );
+    let stroke_dark = theme.stroke_dark.to_color32();
+
+    for (position, keyframe) in keyframes.iter().copied().enumerate() {
+        let span_end = keyframes
+            .get(position + 1)
+            .copied()
+            .map(|next| next.saturating_sub(1))
+            .unwrap_or_else(|| frame_count.saturating_sub(1));
+        if span_end < frame_slots.start || keyframe >= frame_slots.end || span_end < keyframe {
+            continue;
+        }
+        let has_tween = camera
+            .keys
+            .iter()
+            .find(|key| key.frame == keyframe)
+            .and_then(|key| key.tween.to_frame())
+            .is_some();
+        let x0 = base_x + f32::from(keyframe) * FRAME_W;
+        let x1 = base_x + (f32::from(span_end) + 1.0) * FRAME_W;
+        painter.rect_filled(
+            Rect::from_min_max(pos2(x0, cell_top), pos2(x1, cell_bot)),
+            0.0,
+            if has_tween { tween_fill } else { static_fill },
+        );
+        if !has_tween && span_end > keyframe {
+            let cap_x = base_x + (f32::from(span_end) + 1.0) * FRAME_W - 1.0;
+            painter.line_segment(
+                [pos2(cap_x, cell_top + 1.0), pos2(cap_x, cell_bot - 1.0)],
+                Stroke::new(1.0_f32, stroke_dark),
+            );
+            let glyph = Rect::from_min_size(pos2(cap_x - 5.0, cell_bot - 6.0), vec2(4.0, 4.0));
+            painter.rect_stroke(glyph, 0.0, Stroke::new(1.0_f32, stroke_dark));
+        }
+    }
+    for keyframe in
+        keyframe_separator_frames(&keyframes).filter(|frame| frame_slots.contains(frame))
+    {
+        let x = base_x + f32::from(keyframe) * FRAME_W;
+        painter.line_segment(
+            [pos2(x, cell_top), pos2(x, cell_bot)],
+            Stroke::new(1.0_f32, stroke_dark),
+        );
+    }
+    for key in &camera.keys {
+        let Some(to_frame) = key.tween.to_frame() else {
+            continue;
+        };
+        if key.frame >= frame_slots.end || to_frame < frame_slots.start || to_frame >= frame_count {
+            continue;
+        }
+        let from_x = base_x + (f32::from(key.frame) + 0.5) * FRAME_W + 4.0;
+        let to_x = base_x + (f32::from(to_frame) + 0.5) * FRAME_W - 4.0;
+        let mid_y = row_y + ROW_H * 0.5;
+        if to_x > from_x + 2.0 {
+            painter.line_segment(
+                [pos2(from_x, mid_y), pos2(to_x, mid_y)],
+                Stroke::new(1.0_f32, tween_arrow),
+            );
+            painter.line_segment(
+                [pos2(to_x, mid_y), pos2(to_x - 3.0, mid_y - 2.5)],
+                Stroke::new(1.0_f32, tween_arrow),
+            );
+            painter.line_segment(
+                [pos2(to_x, mid_y), pos2(to_x - 3.0, mid_y + 2.5)],
+                Stroke::new(1.0_f32, tween_arrow),
+            );
+        }
+    }
+    let keyframe_y = row_y + ROW_H - 5.0;
+    let keyframe_color = blend(theme.keyframe.to_color32(), theme.accent.to_color32(), 0.22);
+    for keyframe in keyframes
+        .into_iter()
+        .filter(|frame| frame_slots.contains(frame))
+    {
+        let x = base_x + (f32::from(keyframe) + 0.5) * FRAME_W;
+        painter.circle_filled(pos2(x, keyframe_y), 2.8, keyframe_color);
+    }
+}
+
 fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
     ui.horizontal_wrapped(|ui| {
         ui.label(egui::RichText::new("Timeline").strong());
+        ui.separator();
+        let camera_available = app.session.current_q0rg_id == app.state.project.meta.entry_q0rg_id;
+        let camera_enabled = app.state.project.runtime.camera.enabled;
+        let camera_response = ui
+            .add_enabled_ui(camera_available, |ui| {
+                let (rect, response) = ui.allocate_exact_size(vec2(28.0, 20.0), Sense::click());
+                let visuals = ui.style().interact(&response);
+                let fill = if camera_enabled {
+                    theme.accent.to_color32().gamma_multiply(0.22)
+                } else {
+                    visuals.bg_fill
+                };
+                ui.painter()
+                    .rect_filled(rect.expand(visuals.expansion), visuals.rounding, fill);
+                ui.painter().rect_stroke(
+                    rect.expand(visuals.expansion),
+                    visuals.rounding,
+                    visuals.bg_stroke,
+                );
+                let color = if camera_enabled {
+                    theme.accent.to_color32()
+                } else {
+                    visuals.fg_stroke.color
+                };
+                let body = Rect::from_center_size(rect.center() - vec2(2.0, 0.0), vec2(13.0, 9.0));
+                ui.painter()
+                    .rect_stroke(body, 1.5, Stroke::new(1.4_f32, color));
+                ui.painter().add(egui::Shape::convex_polygon(
+                    vec![
+                        pos2(body.right(), body.top() + 2.0),
+                        pos2(body.right() + 5.0, body.top()),
+                        pos2(body.right() + 5.0, body.bottom()),
+                        pos2(body.right(), body.bottom() - 2.0),
+                    ],
+                    color,
+                    Stroke::NONE,
+                ));
+                response
+            })
+            .inner
+            .on_hover_text("Enable the project camera track");
+        if camera_response.clicked() {
+            let before = app.state.project.clone();
+            app.state.project.runtime.camera.enabled = !camera_enabled;
+            app.history.snapshot(&before);
+            app.state.mark_dirty();
+            app.session.camera_track_selected = app.state.project.runtime.camera.enabled;
+            app.session.timeline_selection = None;
+            app.session.timeline_layer_selection = None;
+            app.session.selection = Selection::None;
+            app.session.status = if app.state.project.runtime.camera.enabled {
+                "camera track enabled".to_string()
+            } else {
+                "camera track disabled".to_string()
+            };
+        }
         ui.separator();
         let play_label = if app.session.playing { "Pause" } else { "Play" };
         if ui.button(play_label).clicked() {
@@ -1480,6 +1929,13 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().button_padding = vec2(8.0, 4.0);
         let can_delete = app.session.timeline_selection.is_some()
+            || (app.camera_track_is_selected()
+                && app
+                    .state
+                    .project
+                    .runtime
+                    .camera
+                    .has_keyframe(app.session.current_frame))
             || super::menu::selection_can_be_deleted(&app.session.selection);
         if ui
             .add_enabled(can_delete, egui::Button::new("Delete"))
@@ -1525,7 +1981,8 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
         {
             app.queue(Action::InsertFrame);
         }
-        let keyframes_enabled = app.session.timeline_selection.is_some()
+        let keyframes_enabled = app.camera_track_is_selected()
+            || app.session.timeline_selection.is_some()
             || !app
                 .state
                 .project
@@ -1538,7 +1995,10 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
             app.queue(Action::InsertKeyframe);
         }
         if ui
-            .add_enabled(keyframes_enabled, egui::Button::new("+ Blank Key"))
+            .add_enabled(
+                keyframes_enabled && !app.camera_track_is_selected(),
+                egui::Button::new("+ Blank Key"),
+            )
             .on_hover_text("Insert blank keyframe (F7)")
             .clicked()
         {
@@ -1551,7 +2011,8 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
         {
             app.queue(Action::RemoveFrame);
         }
-        let can_tween = app.session.timeline_selection.is_some()
+        let can_tween = (app.session.timeline_selection.is_some()
+            || app.camera_track_is_selected())
             && app.session.pending_timeline_frame.is_none();
         if ui
             .add_enabled(can_tween, egui::Button::new("Tween"))
@@ -1907,11 +2368,11 @@ fn draw_layer_icon(
 
 /// Paint per-frame base cells before any span/keyframe glyphs go on top.
 /// Three states:
-///   * inside `frame_count`, no placement covering this frame    в†’ mid grey
+///   * inside `frame_count`, no placement covering this frame    РІвЂ вЂ™ mid grey
 ///     (active layer is a touch brighter so it's clear which row drawing
 ///     will land in).
-///   * beyond `frame_count`                                       в†’ very dark
-///   * beyond + every-5th                                          в†’ slightly
+///   * beyond `frame_count`                                       РІвЂ вЂ™ very dark
+///   * beyond + every-5th                                          РІвЂ вЂ™ slightly
 ///     brighter dark, producing a chequered "virtual frames" band.
 fn draw_empty_cells(
     painter: &egui::Painter,
@@ -2226,6 +2687,7 @@ fn timeline_cell_at(
     frame_count: u16,
     layer_ids: &[u16],
     folder_layer_ids: &[u16],
+    camera_row_count: usize,
 ) -> Option<(u16, u16)> {
     let rel_x = pos.x - (rect.min.x + LAYER_LABEL_W);
     if rel_x < 0.0 {
@@ -2235,7 +2697,7 @@ fn timeline_cell_at(
     if frame < 0 || frame >= i32::from(frame_count) {
         return None;
     }
-    let row = ((pos.y - rect.min.y) / ROW_H).floor() as i32 - 1;
+    let row = ((pos.y - rect.min.y) / ROW_H).floor() as i32 - 1 - camera_row_count as i32;
     if row < 0 {
         return None;
     }
@@ -2719,6 +3181,7 @@ mod tests {
                 5,
                 &layers,
                 &[],
+                0,
             ),
             Some((10, 2))
         );
@@ -2729,6 +3192,7 @@ mod tests {
                 5,
                 &layers,
                 &[],
+                0,
             ),
             None
         );
@@ -2739,6 +3203,7 @@ mod tests {
                 35,
                 &layers,
                 &[],
+                0,
             ),
             Some((10, 6))
         );
@@ -2749,8 +3214,38 @@ mod tests {
                 35,
                 &layers,
                 &[],
+                0,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn camera_row_occupies_a_real_timeline_row_without_becoming_an_artwork_drop_target() {
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 200.0));
+        let layers = [10_u16, 20_u16];
+        assert_eq!(
+            timeline_cell_at(
+                rect,
+                pos2(LAYER_LABEL_W + FRAME_W * 2.5, ROW_H * 1.5),
+                20,
+                &layers,
+                &[],
+                1,
+            ),
+            None,
+            "camera row must not masquerade as artwork layer 10"
+        );
+        assert_eq!(
+            timeline_cell_at(
+                rect,
+                pos2(LAYER_LABEL_W + FRAME_W * 2.5, ROW_H * 2.5),
+                20,
+                &layers,
+                &[],
+                1,
+            ),
+            Some((10, 2))
         );
     }
 

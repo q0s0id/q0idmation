@@ -9,6 +9,8 @@ use image::{DynamicImage, ImageBuffer, ImageOutputFormat, RgbaImage};
 use q0s_format::v2::ProjectV2;
 
 const MAX_RENDER_ALLOCATION_BYTES: u64 = 512 * 1024 * 1024;
+pub const MAX_RENDER_DIMENSION: u32 = 16_384;
+pub const MIN_RENDER_SCALE: f32 = 1.0;
 pub const MEDIA_TICKS_PER_SECOND: u64 = 10_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,6 +340,7 @@ pub struct Q0EncState {
     pub last_frame: u16,
     pub width: u32,
     pub height: u32,
+    pub render_scale: f32,
     pub supersampling: u8,
     pub transparent: bool,
     pub image_codec: ImageCodec,
@@ -373,6 +376,7 @@ impl Default for Q0EncState {
             last_frame: 0,
             width: u32::from(crate::state::DEFAULT_STAGE_WIDTH),
             height: u32::from(crate::state::DEFAULT_STAGE_HEIGHT),
+            render_scale: MIN_RENDER_SCALE,
             supersampling: 2,
             transparent: false,
             image_codec: ImageCodec::Png,
@@ -398,6 +402,26 @@ impl Default for Q0EncState {
     }
 }
 
+pub fn max_render_scale(project: &ProjectV2) -> f32 {
+    let largest_dimension =
+        u32::from(project.meta.stage_width.max(project.meta.stage_height)).max(1);
+    (MAX_RENDER_DIMENSION as f32 / largest_dimension as f32).max(MIN_RENDER_SCALE)
+}
+
+fn sanitize_render_scale(project: &ProjectV2, scale: f32) -> f32 {
+    if scale.is_finite() {
+        scale.clamp(MIN_RENDER_SCALE, max_render_scale(project))
+    } else {
+        MIN_RENDER_SCALE
+    }
+}
+
+fn scaled_render_dimension(base: u16, scale: f32) -> u32 {
+    (f64::from(base) * f64::from(scale))
+        .round()
+        .clamp(1.0, f64::from(u32::MAX)) as u32
+}
+
 impl Q0EncState {
     pub fn apply_persisted_preferences(
         &mut self,
@@ -416,8 +440,8 @@ impl Q0EncState {
         self.open = true;
         self.source_project_path = file_path.map(Path::to_path_buf);
         self.source_q0rg_id = project.meta.entry_q0rg_id;
-        self.width = u32::from(project.meta.stage_width);
-        self.height = u32::from(project.meta.stage_height);
+        self.render_scale = MIN_RENDER_SCALE;
+        self.sync_render_dimensions(project);
         self.first_frame = 0;
         self.last_frame = source_last_frame(project, self.source_q0rg_id);
         self.sequence_subfolder = format!("{}-frames", project_stem(file_path));
@@ -475,6 +499,16 @@ impl Q0EncState {
         self.output_text = output.display().to_string();
     }
 
+    pub fn set_render_scale(&mut self, project: &ProjectV2, scale: f32) {
+        self.render_scale = sanitize_render_scale(project, scale);
+        self.sync_render_dimensions(project);
+    }
+
+    fn sync_render_dimensions(&mut self, project: &ProjectV2) {
+        self.width = scaled_render_dimension(project.meta.stage_width, self.render_scale);
+        self.height = scaled_render_dimension(project.meta.stage_height, self.render_scale);
+    }
+
     pub fn reconcile_with_project(&mut self, project: &ProjectV2) {
         if !project
             .q0rgs
@@ -489,8 +523,8 @@ impl Q0EncState {
         if self.selected_format == ExportFormat::Image {
             self.last_frame = self.first_frame;
         }
-        self.width = self.width.max(1);
-        self.height = self.height.max(1);
+        self.render_scale = sanitize_render_scale(project, self.render_scale);
+        self.sync_render_dimensions(project);
         self.supersampling = match self.supersampling {
             1 | 2 | 4 => self.supersampling,
             _ => 2,
@@ -1142,7 +1176,8 @@ fn render_frame(project: &ProjectV2, options: &ExportOptions, frame: u16) -> Vec
     let background = if transparent {
         [0, 0, 0, 0]
     } else {
-        [255, 255, 255, 255]
+        let bg = project.meta.background_color;
+        [bg.r, bg.g, bg.b, 255]
     };
     q0s_format::raster::rasterize_q0rg_frame_scaled(
         project,
@@ -1501,6 +1536,43 @@ mod tests {
         let state = Q0EncState::default();
         assert_eq!(state.width, u32::from(project.meta.stage_width));
         assert_eq!(state.height, u32::from(project.meta.stage_height));
+        assert_eq!(state.render_scale, 1.0);
+    }
+
+    #[test]
+    fn upscale_factor_drives_pixel_export_dimensions() {
+        let mut project = crate::state::default_project();
+        project.meta.stage_width = 640;
+        project.meta.stage_height = 360;
+        let mut state = Q0EncState::default();
+        state.open_for_project(&project, None);
+
+        state.set_render_scale(&project, 2.5);
+        assert_eq!(state.render_scale, 2.5);
+        assert_eq!((state.width, state.height), (1600, 900));
+
+        for format in [
+            ExportFormat::Mp4,
+            ExportFormat::Q0v,
+            ExportFormat::PngSequence,
+            ExportFormat::Gif,
+            ExportFormat::Image,
+        ] {
+            state.selected_format = format;
+            let options = state.current_options();
+            assert_eq!((options.width, options.height), (1600, 900));
+        }
+    }
+
+    #[test]
+    fn q0s_validation_does_not_require_pixel_dimensions() {
+        let project = crate::state::default_project();
+        let mut state = Q0EncState::default();
+        state.open_for_project(&project, None);
+        state.selected_format = ExportFormat::Q0s;
+        state.width = 0;
+        state.height = 0;
+        assert!(state.current_options().validate(&project).is_ok());
     }
 
     #[test]
@@ -1804,6 +1876,35 @@ mod tests {
         std::fs::remove_file(output).expect("cleanup transparent still");
     }
 
+    #[test]
+    fn opaque_still_uses_document_background_color() {
+        let mut project = crate::state::default_project();
+        project.meta.stage_width = 1;
+        project.meta.stage_height = 1;
+        project.meta.background_color = q0s_format::v2::Rgba {
+            r: 18,
+            g: 52,
+            b: 86,
+            a: 255,
+        };
+        project.q0rgs[0].frame_count = 1;
+        let output = unique_output("document-background").with_extension("png");
+        let mut state = Q0EncState::default();
+        state.open_for_project(&project, None);
+        state.select_format(ExportFormat::Image, None);
+        state.width = 1;
+        state.height = 1;
+        state.supersampling = 1;
+        state.transparent = false;
+        state.output_text = output.display().to_string();
+        state.enqueue(&project).expect("enqueue opaque still");
+        state.start_queue();
+        wait_for_queue(&mut state);
+
+        let decoded = image::open(&output).expect("open opaque still").to_rgba8();
+        assert_eq!(decoded.get_pixel(0, 0).0, [18, 52, 86, 255]);
+        std::fs::remove_file(output).expect("cleanup opaque still");
+    }
     #[test]
     fn cancelled_sequence_removes_its_private_staging_folder() {
         let project = visual_project(3);

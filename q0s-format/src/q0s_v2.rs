@@ -8,8 +8,11 @@
 //! resolution-independent on playback.
 //!
 //! v1 (legacy bitmap-only) is still parsed by `parse_q0s` so old movies
-//! keep playing. Current v21 adds named frame labels scoped to each q0rg;
-//! v20 and earlier decode their labels as empty.
+//! keep playing. Current vector revisions mirror the corresponding q1s body:
+//! v21 frame labels, v22 camera, v23 stage background, v24 q0rg playback, and
+//! v25 native linear/radial RGBA fill gradients, and v26 independent X/Y blur
+//! and glow radii. v27 adds manually keyframed q0rg playback. Older revisions
+//! remain readable.
 
 use crate::error::Error;
 #[cfg(test)]
@@ -39,7 +42,13 @@ pub const Q0S_VERSION_AUDIO_CLIP_FX: u16 = 18;
 pub const Q0S_VERSION_AUDIO_TIMELINE_CLIPS: u16 = 19;
 pub const Q0S_VERSION_PROJECT_RUNTIME: u16 = 20;
 pub const Q0S_VERSION_FRAME_LABELS: u16 = 21;
-pub const Q0S_VERSION_CURRENT: u16 = Q0S_VERSION_FRAME_LABELS;
+pub const Q0S_VERSION_CAMERA_TRACK: u16 = 22;
+pub const Q0S_VERSION_STAGE_BACKGROUND: u16 = 23;
+pub const Q0S_VERSION_Q0RG_PLAYBACK: u16 = 24;
+pub const Q0S_VERSION_FILL_GRADIENTS: u16 = 25;
+pub const Q0S_VERSION_ANISOTROPIC_FX: u16 = 26;
+pub const Q0S_VERSION_MANUAL_Q0RG_PLAYBACK: u16 = 27;
+pub const Q0S_VERSION_CURRENT: u16 = Q0S_VERSION_MANUAL_Q0RG_PLAYBACK;
 
 /// Serialise a `ProjectV2` as the current vector `.q0s` bytes. Internally we
 /// reuse the current `.q1s` writer and patch the magic+version header in-place
@@ -109,6 +118,24 @@ pub fn parse_q0s_v2(bytes: &[u8]) -> Result<ProjectV2, Error> {
         Q0S_VERSION_PROJECT_RUNTIME => {
             v2::parse_body_after_header(bytes, v2::Q1S_VERSION_PROJECT_RUNTIME)
         }
+        Q0S_VERSION_FRAME_LABELS => {
+            v2::parse_body_after_header(bytes, v2::Q1S_VERSION_FRAME_LABELS)
+        }
+        Q0S_VERSION_CAMERA_TRACK => {
+            v2::parse_body_after_header(bytes, v2::Q1S_VERSION_CAMERA_TRACK)
+        }
+        Q0S_VERSION_STAGE_BACKGROUND => {
+            v2::parse_body_after_header(bytes, v2::Q1S_VERSION_STAGE_BACKGROUND)
+        }
+        Q0S_VERSION_Q0RG_PLAYBACK => {
+            v2::parse_body_after_header(bytes, v2::Q1S_VERSION_Q0RG_PLAYBACK)
+        }
+        Q0S_VERSION_FILL_GRADIENTS => {
+            v2::parse_body_after_header(bytes, v2::Q1S_VERSION_FILL_GRADIENTS)
+        }
+        Q0S_VERSION_ANISOTROPIC_FX => {
+            v2::parse_body_after_header(bytes, v2::Q1S_VERSION_ANISOTROPIC_FX)
+        }
         Q0S_VERSION_CURRENT => v2::parse_body_after_header(bytes, v2::Q1S_VERSION_CURRENT),
         _ => Err(Error::UnsupportedVersion(version)),
     }
@@ -144,6 +171,12 @@ pub fn is_q0s_v2(bytes: &[u8]) -> bool {
             | Q0S_VERSION_AUDIO_CLIP_FX
             | Q0S_VERSION_AUDIO_TIMELINE_CLIPS
             | Q0S_VERSION_PROJECT_RUNTIME
+            | Q0S_VERSION_FRAME_LABELS
+            | Q0S_VERSION_CAMERA_TRACK
+            | Q0S_VERSION_STAGE_BACKGROUND
+            | Q0S_VERSION_Q0RG_PLAYBACK
+            | Q0S_VERSION_FILL_GRADIENTS
+            | Q0S_VERSION_ANISOTROPIC_FX
             | Q0S_VERSION_CURRENT
     )
 }
@@ -152,9 +185,10 @@ pub fn is_q0s_v2(bytes: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::v2::{
-        Anchor, Asset, Easing, EasingFamily, EasingMode, Layer, Path as VPath, Placement,
-        ProjectMeta, Q0rg, Rgba, RigAsset, RigChannel, RigControl, RigControlKind, RigKey, RigNode,
-        RigPropertyRef, Target, Transform2D, Tween, Vec2, VectorAsset,
+        Anchor, Asset, Easing, EasingFamily, EasingMode, GradientFill, GradientKind, GradientStop,
+        Layer, Path as VPath, Placement, ProjectMeta, Q0rg, Rgba, RigAsset, RigChannel, RigControl,
+        RigControlKind, RigKey, RigNode, RigPropertyRef, Target, Transform2D, Tween, Vec2,
+        VectorAppearance, VectorAsset, VectorMaterial,
     };
 
     fn test_q0v_bytes() -> Vec<u8> {
@@ -201,6 +235,12 @@ mod tests {
                 fps: 24,
                 stage_width: 64,
                 stage_height: 64,
+                background_color: Rgba {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                },
                 entry_q0rg_id: 1,
             },
             assets: vec![Asset::Vector(VectorAsset {
@@ -277,12 +317,68 @@ mod tests {
     }
 
     #[test]
+    fn current_q0s_roundtrip_preserves_rgba_fill_gradients() {
+        let mut project = small_project();
+        project.asset_appearances.insert(
+            1,
+            VectorAppearance {
+                material: VectorMaterial::Solid,
+                erase_mask: Vec::new(),
+                material_source: Vec::new(),
+                clip_mask: Vec::new(),
+                field_transform: crate::transform::Affine::IDENTITY,
+                fill_gradient: Some(GradientFill {
+                    kind: GradientKind::Radial,
+                    stops: vec![
+                        GradientStop {
+                            position: 0.0,
+                            color: Rgba {
+                                r: 255,
+                                g: 0,
+                                b: 0,
+                                a: 32,
+                            },
+                        },
+                        GradientStop {
+                            position: 1.0,
+                            color: Rgba {
+                                r: 0,
+                                g: 0,
+                                b: 255,
+                                a: 224,
+                            },
+                        },
+                    ],
+                    transform: crate::transform::Affine {
+                        a11: 30.0,
+                        a12: 5.0,
+                        a21: -2.0,
+                        a22: 24.0,
+                        tx: 12.0,
+                        ty: 9.0,
+                    },
+                }),
+            },
+        );
+        let bytes = write_q0s_v2(&project).expect("write gradient q0s");
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            Q0S_VERSION_CURRENT
+        );
+        assert_eq!(parse_q0s_v2(&bytes).expect("parse gradient q0s"), project);
+    }
+
+    #[test]
     fn current_q0s_roundtrip_preserves_placement_fx() {
         let mut project = small_project();
         project.q0rgs[0].layers[0].placements[0].fx = v2::PlacementFx {
             opacity: 0.55,
             blend_mode: v2::BlendMode::Multiply,
-            blur: Some(v2::BlurFx { radius: 4.0 }),
+            blur: Some(v2::BlurFx {
+                radius_x: 4.0,
+                radius_y: 4.0,
+                quality: 3,
+            }),
             glow: Some(v2::GlowFx {
                 color: v2::Rgba {
                     r: 250,
@@ -290,8 +386,10 @@ mod tests {
                     b: 20,
                     a: 200,
                 },
-                radius: 8.0,
+                radius_x: 8.0,
+                radius_y: 8.0,
                 strength: 1.2,
+                quality: 3,
             }),
             shadow: Some(v2::DropShadowFx {
                 color: v2::Rgba {
@@ -307,6 +405,7 @@ mod tests {
             }),
             audio_gain: 1.0,
             audio_muted: false,
+            q0rg_playback: Default::default(),
         };
         let bytes = write_q0s_v2(&project).expect("write placement fx q0s");
         assert_eq!(
@@ -502,6 +601,7 @@ mod tests {
                 material_source: Vec::new(),
                 clip_mask: Vec::new(),
                 field_transform: crate::transform::Affine::IDENTITY,
+                fill_gradient: None,
             },
         );
 
@@ -527,6 +627,7 @@ mod tests {
                 material_source: Vec::new(),
                 clip_mask: Vec::new(),
                 field_transform: crate::transform::Affine::IDENTITY,
+                fill_gradient: None,
             },
         );
         let mut bytes = v2::write_version(&project, v2::Q1S_VERSION_APPEARANCE_MASKS)
@@ -558,6 +659,7 @@ mod tests {
                 material_source: source.clone(),
                 clip_mask: source,
                 field_transform: crate::transform::Affine::IDENTITY,
+                fill_gradient: None,
             },
         );
         let bytes = write_q0s_v2(&project).expect("write q0s fragments");
@@ -586,6 +688,7 @@ mod tests {
                 material_source: source.clone(),
                 clip_mask: source,
                 field_transform: crate::transform::Affine::IDENTITY,
+                fill_gradient: None,
             },
         );
         let mut bytes = v2::write_version(&project, v2::Q1S_VERSION_APPEARANCE_FRAGMENTS)
@@ -626,6 +729,7 @@ mod tests {
                 material_source: source.clone(),
                 clip_mask: source,
                 field_transform,
+                fill_gradient: None,
             },
         );
         let bytes = write_q0s_v2(&project).expect("write affine q0s");
@@ -1133,6 +1237,25 @@ mod tests {
     }
 
     #[test]
+    fn q0s_v21_migrates_to_identity_camera() {
+        let mut project = small_project();
+        project
+            .runtime
+            .frame_labels
+            .insert(v2::FrameLabelKey::new(1, 0), "start".into());
+        let mut legacy = v2::write_version(&project, v2::Q1S_VERSION_FRAME_LABELS).unwrap();
+        legacy[0..4].copy_from_slice(&Q0S_V2_MAGIC);
+        legacy[4..6].copy_from_slice(&Q0S_VERSION_FRAME_LABELS.to_le_bytes());
+        let decoded = parse_q0s_v2(&legacy).unwrap();
+        assert_eq!(decoded.runtime.camera, v2::CameraTrack::default());
+        assert_eq!(decoded.runtime.frame_labels, project.runtime.frame_labels);
+        assert_eq!(
+            decoded.camera_affine_at(0),
+            crate::transform::Affine::IDENTITY
+        );
+    }
+
+    #[test]
     fn frame_labels_survive_q0s_export_and_previous_runtime_version_still_loads() {
         let mut project = small_project();
         let mut legacy = v2::write_version(&project, v2::Q1S_VERSION_PROJECT_RUNTIME).unwrap();
@@ -1152,7 +1275,7 @@ mod tests {
         assert!(is_q0s_v2(&bytes));
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_FRAME_LABELS
+            Q0S_VERSION_CURRENT
         );
         assert_eq!(parse_q0s_v2(&bytes).unwrap(), project);
     }

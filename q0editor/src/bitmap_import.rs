@@ -14,6 +14,7 @@ pub enum BitmapImportError {
     EncodedTooLarge(u64),
     DimensionsTooLarge(u32, u32),
     PixelBudgetExceeded(u64),
+    InvalidRgbaLength { expected: usize, actual: usize },
 }
 
 impl std::fmt::Display for BitmapImportError {
@@ -33,6 +34,10 @@ impl std::fmt::Display for BitmapImportError {
             Self::PixelBudgetExceeded(pixels) => write!(
                 f,
                 "decoded image is too large ({pixels} pixels; limit is {MAX_DECODED_PIXELS})"
+            ),
+            Self::InvalidRgbaLength { expected, actual } => write!(
+                f,
+                "rgba payload length {actual} does not match expected {expected}"
             ),
         }
     }
@@ -76,6 +81,15 @@ pub fn decode_bitmap_path(path: &Path, asset_id: u16) -> Result<BitmapAsset, Bit
 pub fn decode_bitmap_bytes(bytes: &[u8], asset_id: u16) -> Result<BitmapAsset, BitmapImportError> {
     let image = image::load_from_memory(bytes)?;
     let (width, height) = image.dimensions();
+    bitmap_from_rgba(width, height, image.into_rgba8().into_raw(), asset_id)
+}
+
+pub fn bitmap_from_rgba(
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+    asset_id: u16,
+) -> Result<BitmapAsset, BitmapImportError> {
     if width == 0 || height == 0 {
         return Err(BitmapImportError::Empty);
     }
@@ -86,7 +100,16 @@ pub fn decode_bitmap_bytes(bytes: &[u8], asset_id: u16) -> Result<BitmapAsset, B
     if pixels > MAX_DECODED_PIXELS {
         return Err(BitmapImportError::PixelBudgetExceeded(pixels));
     }
-    let rgba = image.into_rgba8().into_raw();
+    let expected = usize::try_from(pixels)
+        .ok()
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or(BitmapImportError::PixelBudgetExceeded(pixels))?;
+    if rgba.len() != expected {
+        return Err(BitmapImportError::InvalidRgbaLength {
+            expected,
+            actual: rgba.len(),
+        });
+    }
     Ok(BitmapAsset {
         asset_id,
         width: width as u16,

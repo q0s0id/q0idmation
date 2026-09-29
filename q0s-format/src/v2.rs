@@ -34,15 +34,22 @@
 //!   v10 post-material fragments append per appearance:
 //!     [2] material source path count, source paths[], [2] clip path count, clip paths[]
 //!
-//! Reading: v2 through v22 are accepted; v2 placements get skew_x/y = 0,
-//! v2/v3 layers get no explicit blank-keyframe markers, v2-v4 assets
-//! keep deterministic default labels, and v2-v5 projects have ordinary
+//! Reading: v2 through the current revision are accepted; v2 placements get
+//! skew_x/y = 0, v2/v3 layers get no explicit blank-keyframe markers, v2-v4
+//! assets keep deterministic default labels, and v2-v5 projects have ordinary
 //! top-level layers without folders.
 //!   v11 transformed appearance fields append per appearance:
 //!     [24] field affine a11 a12 a21 a22 tx ty (6 x f32)
-//! v22 appends frame labels after the project runtime block:
-//!   [2] label_count, entries[]: [2] q0rg_id, [2] frame, [2+N] name.
-//! Older files have no labels. Writing: always v22 (`Q1S_VERSION_CURRENT`).
+//! v22 appends frame labels after the project runtime block.
+//! v23 appends the authored project camera track.
+//! v24 adds the document stage background colour.
+//! v25 adds per-instance q0rg playback mode/range data.
+//! v26 adds linear/radial vector fill gradients with RGBA stops and an affine
+//! gradient transform.
+//! v27 stores independent horizontal/vertical blur and glow radii. Older
+//! revisions decode isotropic placement effects into matching X/Y radii.
+//! v28 adds manually keyframed q0rg playback.
+//! Writing always uses `Q1S_VERSION_CURRENT`.
 
 use crate::transform::Affine;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -80,7 +87,22 @@ pub const Q1S_VERSION_AUDIO_TIMELINE_CLIPS: u16 = 20;
 pub const Q1S_VERSION_PROJECT_RUNTIME: u16 = 21;
 /// Named timeline destinations, scoped to each q0rg.
 pub const Q1S_VERSION_FRAME_LABELS: u16 = 22;
-pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_FRAME_LABELS;
+/// Project-level authored camera track. The camera is not a display object and
+/// does not modify placement transforms; it is evaluated as a final view affine.
+pub const Q1S_VERSION_CAMERA_TRACK: u16 = 23;
+/// Authored stage underlay colour. It is document metadata, not artwork: transparent
+/// exports can still clear to alpha zero while opaque exports/player playback use it.
+pub const Q1S_VERSION_STAGE_BACKGROUND: u16 = 24;
+/// Per-instance q0rg playback range and direction.
+pub const Q1S_VERSION_Q0RG_PLAYBACK: u16 = 25;
+/// Per-vector linear/radial fill gradients with RGBA colour stops.
+pub const Q1S_VERSION_FILL_GRADIENTS: u16 = 26;
+/// Independent horizontal/vertical placement blur and glow radii.
+pub const Q1S_VERSION_ANISOTROPIC_FX: u16 = 27;
+/// manually selected nested-q0rg frames can be authored independently over
+/// the parent animation timeline.
+pub const Q1S_VERSION_MANUAL_Q0RG_PLAYBACK: u16 = 28;
+pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_MANUAL_Q0RG_PLAYBACK;
 /// Kept as an alias so external code that imported the v2-era constant keeps
 /// compiling. It now means "the current write-out version".
 pub const Q1S_V2_VERSION: u16 = Q1S_VERSION_CURRENT;
@@ -117,11 +139,18 @@ const PLACEMENT_FX_GLOW: u8 = 1 << 3;
 const PLACEMENT_FX_SHADOW: u8 = 1 << 4;
 const PLACEMENT_FX_AUDIO_GAIN: u8 = 1 << 5;
 const PLACEMENT_FX_AUDIO_MUTED: u8 = 1 << 6;
+const PLACEMENT_FX_Q0RG_PLAYBACK: u8 = 1 << 7;
 const BLEND_MODE_NORMAL: u8 = 0;
 const BLEND_MODE_MULTIPLY: u8 = 1;
 const BLEND_MODE_SCREEN: u8 = 2;
 const BLEND_MODE_ADD: u8 = 3;
 const BLEND_MODE_OVERLAY: u8 = 4;
+const Q0RG_PLAYBACK_LOOP: u8 = 0;
+const Q0RG_PLAYBACK_PLAY_ONCE: u8 = 1;
+const Q0RG_PLAYBACK_LOOP_REVERSED: u8 = 2;
+const Q0RG_PLAYBACK_PLAY_REVERSED_ONCE: u8 = 3;
+const Q0RG_PLAYBACK_SINGLE_FRAME: u8 = 4;
+const Q0RG_PLAYBACK_MANUAL: u8 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Vec2 {
@@ -164,6 +193,7 @@ pub struct ProjectMeta {
     pub fps: u16,
     pub stage_width: u16,
     pub stage_height: u16,
+    pub background_color: Rgba,
     pub entry_q0rg_id: u16,
 }
 
@@ -213,6 +243,100 @@ pub enum VectorMaterial {
 /// rotate/skew/scale affect the glow itself instead of re-running an axis-aligned blur.
 /// Empty source/clip vectors preserve the legacy behaviour: current vector geometry
 /// is the material source and the whole finite material support is visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GradientKind {
+    Linear,
+    Radial,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GradientStop {
+    pub position: f32,
+    pub color: Rgba,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GradientFill {
+    pub kind: GradientKind,
+    /// Sorted stops in the inclusive 0..=1 range. Stop alpha is part of RGBA.
+    pub stops: Vec<GradientStop>,
+    /// Maps normalized gradient space into the vector asset's local coordinates.
+    /// Linear gradients run from x=-1 (0) to x=1 (1). Radial gradients use
+    /// radius 1 as position 1.
+    pub transform: Affine,
+}
+
+impl GradientFill {
+    pub fn normalized_point(&self, local: Vec2) -> Option<Vec2> {
+        self.transform.inverse().map(|inverse| inverse.apply(local))
+    }
+
+    pub fn position_at(&self, local: Vec2) -> Option<f32> {
+        let gradient = self.normalized_point(local)?;
+        Some(
+            match self.kind {
+                GradientKind::Linear => (gradient.x + 1.0) * 0.5,
+                GradientKind::Radial => (gradient.x * gradient.x + gradient.y * gradient.y).sqrt(),
+            }
+            .clamp(0.0, 1.0),
+        )
+    }
+
+    pub fn sample(&self, local: Vec2) -> Rgba {
+        let Some(position) = self.position_at(local) else {
+            return self.stops.last().map(|stop| stop.color).unwrap_or(Rgba {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 0,
+            });
+        };
+        self.sample_position(position)
+    }
+
+    pub fn sample_position(&self, position: f32) -> Rgba {
+        let position = position.clamp(0.0, 1.0);
+        let Some(first) = self.stops.first() else {
+            return Rgba {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 0,
+            };
+        };
+        if position <= first.position {
+            return first.color;
+        }
+        for pair in self.stops.windows(2) {
+            let left = pair[0];
+            let right = pair[1];
+            if position <= right.position {
+                let span = right.position - left.position;
+                let t = if span.abs() <= f32::EPSILON {
+                    1.0
+                } else {
+                    ((position - left.position) / span).clamp(0.0, 1.0)
+                };
+                let lerp = |a: u8, b: u8| -> u8 {
+                    (f32::from(a) + (f32::from(b) - f32::from(a)) * t)
+                        .round()
+                        .clamp(0.0, 255.0) as u8
+                };
+                return Rgba {
+                    r: lerp(left.color.r, right.color.r),
+                    g: lerp(left.color.g, right.color.g),
+                    b: lerp(left.color.b, right.color.b),
+                    a: lerp(left.color.a, right.color.a),
+                };
+            }
+        }
+        self.stops
+            .last()
+            .map(|stop| stop.color)
+            .unwrap_or(first.color)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct VectorAppearance {
     pub material: VectorMaterial,
@@ -220,6 +344,9 @@ pub struct VectorAppearance {
     pub material_source: Vec<Path>,
     pub clip_mask: Vec<Path>,
     pub field_transform: Affine,
+    /// Optional native vector fill gradient. The vector's solid `fill` remains
+    /// the canonical fill channel/fallback; this paint overrides its visible RGBA.
+    pub fill_gradient: Option<GradientFill>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -830,14 +957,18 @@ pub enum BlendMode {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BlurFx {
-    pub radius: f32,
+    pub radius_x: f32,
+    pub radius_y: f32,
+    pub quality: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GlowFx {
     pub color: Rgba,
-    pub radius: f32,
+    pub radius_x: f32,
+    pub radius_y: f32,
     pub strength: f32,
+    pub quality: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -849,6 +980,98 @@ pub struct DropShadowFx {
     pub strength: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Q0rgPlaybackMode {
+    #[default]
+    Loop,
+    PlayOnce,
+    LoopReversed,
+    PlayReversedOnce,
+    SingleFrame,
+    Manual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Q0rgPlayback {
+    pub mode: Q0rgPlaybackMode,
+    /// Inclusive first frame of the playback range.
+    pub first_frame: u16,
+    /// Inclusive last frame. None follows the q0rg's current final frame.
+    pub last_frame: Option<u16>,
+    /// Frame used when mode is SingleFrame or Manual.
+    pub single_frame: u16,
+}
+
+impl Default for Q0rgPlayback {
+    fn default() -> Self {
+        Self {
+            mode: Q0rgPlaybackMode::Loop,
+            first_frame: 0,
+            last_frame: None,
+            single_frame: 0,
+        }
+    }
+}
+
+impl Q0rgPlayback {
+    pub fn resolve(self, parent_frame: u16, placement_frame: u16, frame_count: u16) -> u16 {
+        if frame_count == 0 {
+            return 0;
+        }
+        // Old q1s/q0s files had no per-instance playback metadata and rendered
+        // nested q0rgs directly on the parent timeline clock. Keep that exact
+        // behavior for the all-default value so loading an old project cannot
+        // silently retime its existing symbols. Any authored playback/range
+        // setting switches to placement-relative time below.
+        if self == Self::default() {
+            return parent_frame % frame_count;
+        }
+        let max_frame = frame_count - 1;
+        if matches!(
+            self.mode,
+            Q0rgPlaybackMode::SingleFrame | Q0rgPlaybackMode::Manual
+        ) {
+            return self.single_frame.min(max_frame);
+        }
+        let first = self.first_frame.min(max_frame);
+        let last = self
+            .last_frame
+            .unwrap_or(max_frame)
+            .min(max_frame)
+            .max(first);
+        let span = u32::from(last - first) + 1;
+        let elapsed = u32::from(parent_frame.saturating_sub(placement_frame));
+        match self.mode {
+            Q0rgPlaybackMode::Loop => first + (elapsed % span) as u16,
+            Q0rgPlaybackMode::PlayOnce => {
+                first.saturating_add(elapsed.min(u32::from(last - first)) as u16)
+            }
+            Q0rgPlaybackMode::LoopReversed => last - (elapsed % span) as u16,
+            Q0rgPlaybackMode::PlayReversedOnce => last
+                .saturating_sub(elapsed.min(u32::from(last - first)) as u16)
+                .max(first),
+            Q0rgPlaybackMode::SingleFrame => self.single_frame.min(max_frame),
+            Q0rgPlaybackMode::Manual => self.single_frame.min(max_frame),
+        }
+    }
+}
+
+pub fn resolve_q0rg_playback_frame(
+    project: &ProjectV2,
+    child_q0rg_id: u16,
+    parent_frame: u16,
+    placement_frame: u16,
+    playback: Q0rgPlayback,
+) -> u16 {
+    let frame_count = project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == child_q0rg_id)
+        .map(|q0rg| q0rg.frame_count)
+        .unwrap_or(1);
+    playback.resolve(parent_frame, placement_frame, frame_count)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PlacementFx {
     pub opacity: f32,
@@ -858,6 +1081,7 @@ pub struct PlacementFx {
     pub shadow: Option<DropShadowFx>,
     pub audio_gain: f32,
     pub audio_muted: bool,
+    pub q0rg_playback: Q0rgPlayback,
 }
 
 impl Default for PlacementFx {
@@ -870,13 +1094,16 @@ impl Default for PlacementFx {
             shadow: None,
             audio_gain: 1.0,
             audio_muted: false,
+            q0rg_playback: Q0rgPlayback::default(),
         }
     }
 }
 
 impl PlacementFx {
     pub fn is_identity(self) -> bool {
-        let blur_identity = self.blur.is_none_or(|blur| blur.radius <= 1.0e-6);
+        let blur_identity = self
+            .blur
+            .is_none_or(|blur| blur.radius_x <= 1.0e-6 && blur.radius_y <= 1.0e-6);
         let glow_identity = self
             .glow
             .is_none_or(|glow| glow.strength <= 1.0e-6 || glow.color.a == 0);
@@ -908,6 +1135,11 @@ impl PlacementFx {
             } else {
                 self.audio_muted
             },
+            q0rg_playback: if t >= 1.0 {
+                target.q0rg_playback
+            } else {
+                self.q0rg_playback
+            },
         }
     }
 }
@@ -935,13 +1167,19 @@ fn lerp_blur(a: Option<BlurFx>, b: Option<BlurFx>, t: f32) -> Option<BlurFx> {
     match (a, b) {
         (None, None) => None,
         (Some(a), Some(b)) => Some(BlurFx {
-            radius: lerp_f32(a.radius, b.radius, t),
+            radius_x: lerp_f32(a.radius_x, b.radius_x, t),
+            radius_y: lerp_f32(a.radius_y, b.radius_y, t),
+            quality: if t >= 1.0 { b.quality } else { a.quality },
         }),
         (None, Some(b)) => Some(BlurFx {
-            radius: lerp_f32(0.0, b.radius, t),
+            radius_x: lerp_f32(0.0, b.radius_x, t),
+            radius_y: lerp_f32(0.0, b.radius_y, t),
+            quality: b.quality,
         }),
         (Some(a), None) => (t < 1.0).then_some(BlurFx {
-            radius: lerp_f32(a.radius, 0.0, t),
+            radius_x: lerp_f32(a.radius_x, 0.0, t),
+            radius_y: lerp_f32(a.radius_y, 0.0, t),
+            quality: a.quality,
         }),
     }
 }
@@ -951,13 +1189,17 @@ fn lerp_glow(a: Option<GlowFx>, b: Option<GlowFx>, t: f32) -> Option<GlowFx> {
         (None, None) => None,
         (Some(a), Some(b)) => Some(GlowFx {
             color: lerp_rgba(a.color, b.color, t),
-            radius: lerp_f32(a.radius, b.radius, t),
+            radius_x: lerp_f32(a.radius_x, b.radius_x, t),
+            radius_y: lerp_f32(a.radius_y, b.radius_y, t),
             strength: lerp_f32(a.strength, b.strength, t),
+            quality: if t >= 1.0 { b.quality } else { a.quality },
         }),
         (None, Some(b)) => Some(GlowFx {
             color: b.color,
-            radius: b.radius,
+            radius_x: b.radius_x,
+            radius_y: b.radius_y,
             strength: lerp_f32(0.0, b.strength, t),
+            quality: b.quality,
         }),
         (Some(a), None) => (t < 1.0).then_some(GlowFx {
             strength: lerp_f32(a.strength, 0.0, t),
@@ -1143,13 +1385,78 @@ impl InstanceKey {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CameraState {
+    /// Camera centre in project stage/world coordinates.
+    pub center_x: f32,
+    pub center_y: f32,
+    /// 1.0 means the camera covers exactly the base stage size. Values above
+    /// one zoom in; values below one zoom out.
+    pub zoom: f32,
+    /// Authored radians. This is intentionally not normalized so a tween from
+    /// 0 to TAU performs a full revolution instead of collapsing to no motion.
+    pub rotation: f32,
+}
+
+impl CameraState {
+    pub fn identity_for_stage(stage_width: u16, stage_height: u16) -> Self {
+        Self {
+            center_x: f32::from(stage_width) * 0.5,
+            center_y: f32::from(stage_height) * 0.5,
+            zoom: 1.0,
+            rotation: 0.0,
+        }
+    }
+
+    fn lerp(self, other: Self, t: f32) -> Self {
+        let lerp = |a: f32, b: f32| a + (b - a) * t;
+
+        // `zoom` is the inverse size of the authored camera viewport. Interpolating
+        // zoom itself makes the visible camera rectangle shrink/grow hyperbolically,
+        // so a Linear camera tween visibly behaves like ease-out/ease-in even though
+        // its numeric zoom percentage is linear. Camera motion is authored in view
+        // space: centre and viewport size move linearly, while explicit easing shapes
+        // `t` before this interpolation.
+        let inv_zoom = lerp(self.zoom.recip(), other.zoom.recip());
+        Self {
+            center_x: lerp(self.center_x, other.center_x),
+            center_y: lerp(self.center_y, other.center_y),
+            zoom: inv_zoom.recip(),
+            rotation: lerp(self.rotation, other.rotation),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CameraKey {
+    pub frame: u16,
+    pub state: CameraState,
+    pub tween: Tween,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CameraTrack {
+    pub enabled: bool,
+    pub keys: Vec<CameraKey>,
+}
+
+impl CameraTrack {
+    pub fn has_keyframe(&self, frame: u16) -> bool {
+        self.keys.iter().any(|key| key.frame == frame)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProjectRuntimeData {
     pub project_graph: ProjectGraph,
     pub frame_scripts: Vec<FrameScript>,
     pub instance_names: HashMap<InstanceKey, String>,
     /// One label per frame; names are unique within their owning q0rg.
     pub frame_labels: HashMap<FrameLabelKey, String>,
+    /// Authored project camera. Kept outside q0rg layer/display-object data so
+    /// camera animation can never mutate object coordinates or become selectable
+    /// artwork.
+    pub camera: CameraTrack,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1220,6 +1527,70 @@ pub struct ProjectV2 {
     /// Old files decode this as an empty/default block.
     pub runtime: ProjectRuntimeData,
     pub q0rgs: Vec<Q0rg>,
+}
+
+impl ProjectV2 {
+    pub fn default_camera_state(&self) -> CameraState {
+        CameraState::identity_for_stage(self.meta.stage_width, self.meta.stage_height)
+    }
+
+    /// Evaluate authored camera animation without mutating any scene object.
+    /// Disabled/empty camera tracks are exactly the legacy identity view.
+    pub fn camera_state_at(&self, frame: u16) -> CameraState {
+        let track = &self.runtime.camera;
+        let fallback = self.default_camera_state();
+        if !track.enabled || track.keys.is_empty() {
+            return fallback;
+        }
+        let Some(source) = track
+            .keys
+            .iter()
+            .filter(|key| key.frame <= frame)
+            .max_by_key(|key| key.frame)
+            .copied()
+        else {
+            return fallback;
+        };
+        let Some(to_frame) = source.tween.to_frame() else {
+            return source.state;
+        };
+        if to_frame <= source.frame || frame >= to_frame {
+            return track
+                .keys
+                .iter()
+                .find(|key| key.frame == to_frame)
+                .map_or(source.state, |key| key.state);
+        }
+        let Some(target) = track.keys.iter().find(|key| key.frame == to_frame) else {
+            return source.state;
+        };
+        let span = f32::from(to_frame - source.frame);
+        let raw_t = f32::from(frame - source.frame) / span;
+        source
+            .state
+            .lerp(target.state, source.tween.easing().sample(raw_t))
+    }
+
+    /// World/stage -> camera-stage affine. The identity camera produces the
+    /// exact identity matrix, preserving legacy pixels and hit-test geometry.
+    pub fn camera_affine_at(&self, frame: u16) -> Affine {
+        let state = self.camera_state_at(frame);
+        let stage_cx = f32::from(self.meta.stage_width) * 0.5;
+        let stage_cy = f32::from(self.meta.stage_height) * 0.5;
+        let (sin, cos) = state.rotation.sin_cos();
+        let a11 = state.zoom * cos;
+        let a12 = state.zoom * sin;
+        let a21 = -state.zoom * sin;
+        let a22 = state.zoom * cos;
+        Affine {
+            a11,
+            a12,
+            a21,
+            a22,
+            tx: stage_cx - a11 * state.center_x - a12 * state.center_y,
+            ty: stage_cy - a21 * state.center_x - a22 * state.center_y,
+        }
+    }
 }
 
 pub fn audio_clip_end_frame(project: &ProjectV2, clip: AudioClip) -> Option<u16> {
@@ -2460,6 +2831,56 @@ fn validate_project_runtime(project: &ProjectV2) -> Result<(), Error> {
             ));
         }
     }
+
+    let entry = project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == project.meta.entry_q0rg_id)
+        .ok_or(Error::Validation("entry q0rg is missing"))?;
+    let camera_frames = project
+        .runtime
+        .camera
+        .keys
+        .iter()
+        .map(|key| key.frame)
+        .collect::<HashSet<_>>();
+    if camera_frames.len() != project.runtime.camera.keys.len() {
+        return Err(Error::Validation("camera keyframes must be unique"));
+    }
+    for key in &project.runtime.camera.keys {
+        if key.frame >= entry.frame_count {
+            return Err(Error::Validation(
+                "camera key is outside the entry timeline",
+            ));
+        }
+        if ![
+            key.state.center_x,
+            key.state.center_y,
+            key.state.zoom,
+            key.state.rotation,
+        ]
+        .into_iter()
+        .all(f32::is_finite)
+            || key.state.zoom <= 0.0
+        {
+            return Err(Error::Validation(
+                "camera state must be finite with zoom > 0",
+            ));
+        }
+        if !key.tween.easing().is_valid() {
+            return Err(Error::Validation("camera tween easing is invalid"));
+        }
+        if let Some(to_frame) = key.tween.to_frame() {
+            if to_frame <= key.frame
+                || to_frame >= entry.frame_count
+                || !camera_frames.contains(&to_frame)
+            {
+                return Err(Error::Validation(
+                    "camera tween must target a later camera keyframe",
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2594,9 +3015,14 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
                 "vector appearance references a missing or non-vector asset",
             ));
         };
-        if vector.fill.is_none() || vector.stroke.is_some() {
+        let gradient_only = appearance.fill_gradient.is_some()
+            && matches!(appearance.material, VectorMaterial::Solid)
+            && appearance.erase_mask.is_empty()
+            && appearance.material_source.is_empty()
+            && appearance.clip_mask.is_empty();
+        if vector.fill.is_none() || (vector.stroke.is_some() && !gradient_only) {
             return Err(Error::Validation(
-                "vector appearance requires a fill-only vector asset",
+                "vector appearance requires a fill; stroked vectors only support gradient-only appearance",
             ));
         }
         let field = appearance.field_transform;
@@ -2632,6 +3058,50 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
                         "soft halo opacity must be finite and between 0 and 1",
                     ));
                 }
+            }
+        }
+        if let Some(gradient) = &appearance.fill_gradient {
+            if gradient.stops.len() < 2 {
+                return Err(Error::Validation(
+                    "fill gradient requires at least two colour stops",
+                ));
+            }
+            if gradient.stops.len() > 256 {
+                return Err(Error::Validation("fill gradient exceeds 256 colour stops"));
+            }
+            let transform = gradient.transform;
+            if ![
+                transform.a11,
+                transform.a12,
+                transform.a21,
+                transform.a22,
+                transform.tx,
+                transform.ty,
+            ]
+            .into_iter()
+            .all(f32::is_finite)
+            {
+                return Err(Error::Validation("fill gradient transform must be finite"));
+            }
+            let determinant = transform.a11 * transform.a22 - transform.a12 * transform.a21;
+            if determinant.abs() < 1.0e-9 {
+                return Err(Error::Validation(
+                    "fill gradient transform must be invertible",
+                ));
+            }
+            let mut previous = -1.0_f32;
+            for stop in &gradient.stops {
+                if !stop.position.is_finite() || !(0.0..=1.0).contains(&stop.position) {
+                    return Err(Error::Validation(
+                        "fill gradient stop position must be finite and between 0 and 1",
+                    ));
+                }
+                if stop.position < previous {
+                    return Err(Error::Validation(
+                        "fill gradient stops must be sorted by position",
+                    ));
+                }
+                previous = stop.position;
             }
         }
         for paths in [
@@ -2736,17 +3206,58 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
                         "placement audio gain must be finite and between 0 and 4",
                     ));
                 }
+                if let Target::Q0rg(target_id) = p.target {
+                    let target_frames = project
+                        .q0rgs
+                        .iter()
+                        .find(|target| target.q0rg_id == target_id)
+                        .map(|target| target.frame_count)
+                        .unwrap_or(0);
+                    if target_frames > 0 {
+                        let max_frame = target_frames - 1;
+                        if p.fx.q0rg_playback.first_frame > max_frame
+                            || p.fx
+                                .q0rg_playback
+                                .last_frame
+                                .is_some_and(|last| last > max_frame)
+                            || p.fx.q0rg_playback.single_frame > max_frame
+                        {
+                            return Err(Error::Validation(
+                                "q0rg playback frame is outside target frame_count",
+                            ));
+                        }
+                        if p.fx
+                            .q0rg_playback
+                            .last_frame
+                            .is_some_and(|last| last < p.fx.q0rg_playback.first_frame)
+                        {
+                            return Err(Error::Validation(
+                                "q0rg playback last frame must not precede first frame",
+                            ));
+                        }
+                    }
+                }
                 if let Some(blur) = p.fx.blur {
-                    if !blur.radius.is_finite() || !(0.0..=512.0).contains(&blur.radius) {
+                    if !blur.radius_x.is_finite()
+                        || !blur.radius_y.is_finite()
+                        || !(0.0..=512.0).contains(&blur.radius_x)
+                        || !(0.0..=512.0).contains(&blur.radius_y)
+                        || !(1..=15).contains(&blur.quality)
+                    {
                         return Err(Error::Validation(
-                            "placement blur radius must be finite and between 0 and 512",
+                            "placement blur radii must be finite and between 0 and 512 with quality 1..=15",
                         ));
                     }
                 }
                 if let Some(glow) = p.fx.glow {
-                    if !glow.radius.is_finite() || !(0.0..=512.0).contains(&glow.radius) {
+                    if !glow.radius_x.is_finite()
+                        || !glow.radius_y.is_finite()
+                        || !(0.0..=512.0).contains(&glow.radius_x)
+                        || !(0.0..=512.0).contains(&glow.radius_y)
+                        || !(1..=15).contains(&glow.quality)
+                    {
                         return Err(Error::Validation(
-                            "placement glow radius must be finite and between 0 and 512",
+                            "placement glow radii must be finite and between 0 and 512 with quality 1..=15",
                         ));
                     }
                     if !glow.strength.is_finite() || !(0.0..=4.0).contains(&glow.strength) {
@@ -3185,6 +3696,12 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
         && version != Q1S_VERSION_AUDIO_CLIP_FX
         && version != Q1S_VERSION_AUDIO_TIMELINE_CLIPS
         && version != Q1S_VERSION_PROJECT_RUNTIME
+        && version != Q1S_VERSION_FRAME_LABELS
+        && version != Q1S_VERSION_CAMERA_TRACK
+        && version != Q1S_VERSION_STAGE_BACKGROUND
+        && version != Q1S_VERSION_Q0RG_PLAYBACK
+        && version != Q1S_VERSION_FILL_GRADIENTS
+        && version != Q1S_VERSION_ANISOTROPIC_FX
         && version != Q1S_VERSION_CURRENT
     {
         return Err(Error::UnsupportedVersion(version));
@@ -3239,6 +3756,30 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
             "q1s v18 cannot store audio clip gain or mute",
         ));
     }
+    if version < Q1S_VERSION_Q0RG_PLAYBACK
+        && project
+            .q0rgs
+            .iter()
+            .flat_map(|q0rg| &q0rg.layers)
+            .flat_map(|layer| &layer.placements)
+            .any(|placement| placement.fx.q0rg_playback != Q0rgPlayback::default())
+    {
+        return Err(Error::Validation(
+            "legacy q1s versions cannot store q0rg playback settings",
+        ));
+    }
+    if version < Q1S_VERSION_MANUAL_Q0RG_PLAYBACK
+        && project
+            .q0rgs
+            .iter()
+            .flat_map(|q0rg| &q0rg.layers)
+            .flat_map(|layer| &layer.placements)
+            .any(|placement| placement.fx.q0rg_playback.mode == Q0rgPlaybackMode::Manual)
+    {
+        return Err(Error::Validation(
+            "legacy q1s versions cannot store manual q0rg playback",
+        ));
+    }
     if version < Q1S_VERSION_AUDIO_TIMELINE_CLIPS && !project.audio_clips.is_empty() {
         return Err(Error::Validation(
             "q1s v19 cannot store timeline audio clips",
@@ -3252,6 +3793,11 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
     if version < Q1S_VERSION_FRAME_LABELS && !project.runtime.frame_labels.is_empty() {
         return Err(Error::Validation(
             "q1s v21 and earlier cannot store frame labels",
+        ));
+    }
+    if version < Q1S_VERSION_CAMERA_TRACK && project.runtime.camera != CameraTrack::default() {
+        return Err(Error::Validation(
+            "q1s v22 and earlier cannot store camera animation",
         ));
     }
     if version < Q1S_VERSION_RIGGING
@@ -3357,6 +3903,36 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
         ));
     }
 
+    if version < Q1S_VERSION_FILL_GRADIENTS
+        && project
+            .asset_appearances
+            .values()
+            .any(|appearance| appearance.fill_gradient.is_some())
+    {
+        return Err(Error::Validation(
+            "legacy q1s versions cannot store vector fill gradients",
+        ));
+    }
+
+    if version < Q1S_VERSION_ANISOTROPIC_FX
+        && project
+            .q0rgs
+            .iter()
+            .flat_map(|q0rg| &q0rg.layers)
+            .flat_map(|layer| &layer.placements)
+            .any(|placement| {
+                placement.fx.blur.is_some_and(|blur| {
+                    (blur.radius_x - blur.radius_y).abs() > 1.0e-6 || blur.quality != 3
+                }) || placement.fx.glow.is_some_and(|glow| {
+                    (glow.radius_x - glow.radius_y).abs() > 1.0e-6 || glow.quality != 3
+                })
+            })
+    {
+        return Err(Error::Validation(
+            "q1s v26 and earlier cannot store anisotropic blur/glow or filter quality",
+        ));
+    }
+
     if version < Q1S_VERSION_EASING
         && project
             .q0rgs
@@ -3367,6 +3943,20 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
     {
         return Err(Error::Validation(
             "legacy q1s versions cannot store easing curves",
+        ));
+    }
+
+    if version < Q1S_VERSION_STAGE_BACKGROUND
+        && project.meta.background_color
+            != (Rgba {
+                r: 255,
+                g: 255,
+                b: 255,
+                a: 255,
+            })
+    {
+        return Err(Error::Validation(
+            "legacy q1s versions cannot store a non-white stage background",
         ));
     }
 
@@ -3387,6 +3977,14 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
     out.extend_from_slice(&project.meta.stage_width.to_le_bytes());
     out.extend_from_slice(&project.meta.stage_height.to_le_bytes());
     out.extend_from_slice(&project.meta.entry_q0rg_id.to_le_bytes());
+    if version >= Q1S_VERSION_STAGE_BACKGROUND {
+        out.extend_from_slice(&[
+            project.meta.background_color.r,
+            project.meta.background_color.g,
+            project.meta.background_color.b,
+            project.meta.background_color.a,
+        ]);
+    }
 
     let mut assets: Vec<&Asset> = project.assets.iter().collect();
     assets.sort_by_key(|a| a.id());
@@ -3483,6 +4081,39 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
                     out.extend_from_slice(&value.to_le_bytes());
                 }
             }
+            if version >= Q1S_VERSION_FILL_GRADIENTS {
+                match &appearance.fill_gradient {
+                    None => out.push(0),
+                    Some(gradient) => {
+                        out.push(match gradient.kind {
+                            GradientKind::Linear => 1,
+                            GradientKind::Radial => 2,
+                        });
+                        let stop_count = u16::try_from(gradient.stops.len())
+                            .map_err(|_| Error::Overflow("gradient stop count exceeds u16"))?;
+                        out.extend_from_slice(&stop_count.to_le_bytes());
+                        for stop in &gradient.stops {
+                            out.extend_from_slice(&stop.position.to_le_bytes());
+                            out.extend_from_slice(&[
+                                stop.color.r,
+                                stop.color.g,
+                                stop.color.b,
+                                stop.color.a,
+                            ]);
+                        }
+                        for value in [
+                            gradient.transform.a11,
+                            gradient.transform.a12,
+                            gradient.transform.a21,
+                            gradient.transform.a22,
+                            gradient.transform.tx,
+                            gradient.transform.ty,
+                        ] {
+                            out.extend_from_slice(&value.to_le_bytes());
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -3576,6 +4207,33 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
             out.extend_from_slice(&key.q0rg_id.to_le_bytes());
             out.extend_from_slice(&key.frame.to_le_bytes());
             write_string_u16(&mut out, label)?;
+        }
+    }
+    if version >= Q1S_VERSION_CAMERA_TRACK {
+        out.push(u8::from(project.runtime.camera.enabled));
+        let count = u16::try_from(project.runtime.camera.keys.len())
+            .map_err(|_| Error::Overflow("camera key count exceeds u16"))?;
+        out.extend_from_slice(&count.to_le_bytes());
+        let mut keys = project.runtime.camera.keys.clone();
+        keys.sort_by_key(|key| key.frame);
+        for key in keys {
+            out.extend_from_slice(&key.frame.to_le_bytes());
+            out.extend_from_slice(&key.state.center_x.to_le_bytes());
+            out.extend_from_slice(&key.state.center_y.to_le_bytes());
+            out.extend_from_slice(&key.state.zoom.to_le_bytes());
+            out.extend_from_slice(&key.state.rotation.to_le_bytes());
+            match key.tween {
+                Tween::None => out.push(TWEEN_KIND_NONE),
+                Tween::Linear { to_frame } => {
+                    out.push(TWEEN_KIND_LINEAR);
+                    out.extend_from_slice(&to_frame.to_le_bytes());
+                }
+                Tween::Eased { to_frame, easing } => {
+                    out.push(TWEEN_KIND_EASED);
+                    out.extend_from_slice(&to_frame.to_le_bytes());
+                    write_easing(&mut out, easing);
+                }
+            }
         }
     }
     Ok(out)
@@ -4130,6 +4788,9 @@ fn write_placement_fx(out: &mut Vec<u8>, fx: PlacementFx, version: u16) {
             flags |= PLACEMENT_FX_AUDIO_MUTED;
         }
     }
+    if version >= Q1S_VERSION_Q0RG_PLAYBACK && fx.q0rg_playback != Q0rgPlayback::default() {
+        flags |= PLACEMENT_FX_Q0RG_PLAYBACK;
+    }
     out.push(flags);
     if flags & PLACEMENT_FX_OPACITY != 0 {
         out.extend_from_slice(&fx.opacity.to_le_bytes());
@@ -4144,12 +4805,22 @@ fn write_placement_fx(out: &mut Vec<u8>, fx: PlacementFx, version: u16) {
         });
     }
     if let Some(blur) = fx.blur {
-        out.extend_from_slice(&blur.radius.to_le_bytes());
+        out.extend_from_slice(&blur.radius_x.to_le_bytes());
+        if version >= Q1S_VERSION_ANISOTROPIC_FX {
+            out.extend_from_slice(&blur.radius_y.to_le_bytes());
+            out.push(blur.quality);
+        }
     }
     if let Some(glow) = fx.glow {
         out.extend_from_slice(&[glow.color.r, glow.color.g, glow.color.b, glow.color.a]);
-        out.extend_from_slice(&glow.radius.to_le_bytes());
+        out.extend_from_slice(&glow.radius_x.to_le_bytes());
+        if version >= Q1S_VERSION_ANISOTROPIC_FX {
+            out.extend_from_slice(&glow.radius_y.to_le_bytes());
+        }
         out.extend_from_slice(&glow.strength.to_le_bytes());
+        if version >= Q1S_VERSION_ANISOTROPIC_FX {
+            out.push(glow.quality);
+        }
     }
     if flags & PLACEMENT_FX_AUDIO_GAIN != 0 {
         out.extend_from_slice(&fx.audio_gain.to_le_bytes());
@@ -4166,6 +4837,25 @@ fn write_placement_fx(out: &mut Vec<u8>, fx: PlacementFx, version: u16) {
         out.extend_from_slice(&shadow.offset_y.to_le_bytes());
         out.extend_from_slice(&shadow.strength.to_le_bytes());
     }
+    if flags & PLACEMENT_FX_Q0RG_PLAYBACK != 0 {
+        out.push(match fx.q0rg_playback.mode {
+            Q0rgPlaybackMode::Loop => Q0RG_PLAYBACK_LOOP,
+            Q0rgPlaybackMode::PlayOnce => Q0RG_PLAYBACK_PLAY_ONCE,
+            Q0rgPlaybackMode::LoopReversed => Q0RG_PLAYBACK_LOOP_REVERSED,
+            Q0rgPlaybackMode::PlayReversedOnce => Q0RG_PLAYBACK_PLAY_REVERSED_ONCE,
+            Q0rgPlaybackMode::SingleFrame => Q0RG_PLAYBACK_SINGLE_FRAME,
+            Q0rgPlaybackMode::Manual => Q0RG_PLAYBACK_MANUAL,
+        });
+        out.extend_from_slice(&fx.q0rg_playback.first_frame.to_le_bytes());
+        match fx.q0rg_playback.last_frame {
+            Some(last) => {
+                out.push(1);
+                out.extend_from_slice(&last.to_le_bytes());
+            }
+            None => out.push(0),
+        }
+        out.extend_from_slice(&fx.q0rg_playback.single_frame.to_le_bytes());
+    }
 }
 
 fn read_placement_fx(c: &mut Cursor<'_>, version: u16) -> Result<PlacementFx, Error> {
@@ -4177,6 +4867,9 @@ fn read_placement_fx(c: &mut Cursor<'_>, version: u16) -> Result<PlacementFx, Er
         | PLACEMENT_FX_SHADOW;
     if version >= Q1S_VERSION_AUDIO_CLIP_FX {
         allowed_flags |= PLACEMENT_FX_AUDIO_GAIN | PLACEMENT_FX_AUDIO_MUTED;
+    }
+    if version >= Q1S_VERSION_Q0RG_PLAYBACK {
+        allowed_flags |= PLACEMENT_FX_Q0RG_PLAYBACK;
     }
     if flags & !allowed_flags != 0 {
         return Err(Error::Validation("invalid placement fx flags"));
@@ -4199,22 +4892,45 @@ fn read_placement_fx(c: &mut Cursor<'_>, version: u16) -> Result<PlacementFx, Er
         BlendMode::Normal
     };
     let blur = if flags & PLACEMENT_FX_BLUR != 0 {
+        let radius_x = c.read_f32()?;
+        let (radius_y, quality) = if version >= Q1S_VERSION_ANISOTROPIC_FX {
+            (c.read_f32()?, c.read_u8()?)
+        } else {
+            (radius_x, 3)
+        };
         Some(BlurFx {
-            radius: c.read_f32()?,
+            radius_x,
+            radius_y,
+            quality,
         })
     } else {
         None
     };
     let glow = if flags & PLACEMENT_FX_GLOW != 0 {
+        let color = Rgba {
+            r: c.read_u8()?,
+            g: c.read_u8()?,
+            b: c.read_u8()?,
+            a: c.read_u8()?,
+        };
+        let radius_x = c.read_f32()?;
+        let radius_y = if version >= Q1S_VERSION_ANISOTROPIC_FX {
+            c.read_f32()?
+        } else {
+            radius_x
+        };
+        let strength = c.read_f32()?;
+        let quality = if version >= Q1S_VERSION_ANISOTROPIC_FX {
+            c.read_u8()?
+        } else {
+            3
+        };
         Some(GlowFx {
-            color: Rgba {
-                r: c.read_u8()?,
-                g: c.read_u8()?,
-                b: c.read_u8()?,
-                a: c.read_u8()?,
-            },
-            radius: c.read_f32()?,
-            strength: c.read_f32()?,
+            color,
+            radius_x,
+            radius_y,
+            strength,
+            quality,
         })
     } else {
         None
@@ -4241,6 +4957,34 @@ fn read_placement_fx(c: &mut Cursor<'_>, version: u16) -> Result<PlacementFx, Er
     } else {
         None
     };
+    let q0rg_playback = if flags & PLACEMENT_FX_Q0RG_PLAYBACK != 0 {
+        let mode = match c.read_u8()? {
+            Q0RG_PLAYBACK_LOOP => Q0rgPlaybackMode::Loop,
+            Q0RG_PLAYBACK_PLAY_ONCE => Q0rgPlaybackMode::PlayOnce,
+            Q0RG_PLAYBACK_LOOP_REVERSED => Q0rgPlaybackMode::LoopReversed,
+            Q0RG_PLAYBACK_PLAY_REVERSED_ONCE => Q0rgPlaybackMode::PlayReversedOnce,
+            Q0RG_PLAYBACK_SINGLE_FRAME => Q0rgPlaybackMode::SingleFrame,
+            Q0RG_PLAYBACK_MANUAL if version >= Q1S_VERSION_MANUAL_Q0RG_PLAYBACK => {
+                Q0rgPlaybackMode::Manual
+            }
+            _ => return Err(Error::Validation("invalid q0rg playback mode")),
+        };
+        let first_frame = c.read_u16()?;
+        let last_frame = match c.read_u8()? {
+            0 => None,
+            1 => Some(c.read_u16()?),
+            _ => return Err(Error::Validation("invalid q0rg playback last-frame flag")),
+        };
+        let single_frame = c.read_u16()?;
+        Q0rgPlayback {
+            mode,
+            first_frame,
+            last_frame,
+            single_frame,
+        }
+    } else {
+        Q0rgPlayback::default()
+    };
     Ok(PlacementFx {
         opacity,
         blend_mode,
@@ -4249,6 +4993,7 @@ fn read_placement_fx(c: &mut Cursor<'_>, version: u16) -> Result<PlacementFx, Er
         shadow,
         audio_gain,
         audio_muted,
+        q0rg_playback,
     })
 }
 
@@ -4362,6 +5107,12 @@ pub fn parse(bytes: &[u8]) -> Result<ProjectV2, Error> {
         && version != Q1S_VERSION_AUDIO_CLIP_FX
         && version != Q1S_VERSION_AUDIO_TIMELINE_CLIPS
         && version != Q1S_VERSION_PROJECT_RUNTIME
+        && version != Q1S_VERSION_FRAME_LABELS
+        && version != Q1S_VERSION_CAMERA_TRACK
+        && version != Q1S_VERSION_STAGE_BACKGROUND
+        && version != Q1S_VERSION_Q0RG_PLAYBACK
+        && version != Q1S_VERSION_FILL_GRADIENTS
+        && version != Q1S_VERSION_ANISOTROPIC_FX
         && version != Q1S_VERSION_CURRENT
     {
         return Err(Error::UnsupportedVersion(version));
@@ -4391,6 +5142,21 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
     let stage_width = c.read_u16()?;
     let stage_height = c.read_u16()?;
     let entry_q0rg_id = c.read_u16()?;
+    let background_color = if version >= Q1S_VERSION_STAGE_BACKGROUND {
+        Rgba {
+            r: c.read_u8()?,
+            g: c.read_u8()?,
+            b: c.read_u8()?,
+            a: c.read_u8()?,
+        }
+    } else {
+        Rgba {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 255,
+        }
+    };
 
     let mut assets = Vec::with_capacity(usize::from(asset_count));
     let mut asset_names = HashMap::new();
@@ -4507,6 +5273,45 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
             } else {
                 Affine::IDENTITY
             };
+            let fill_gradient = if version >= Q1S_VERSION_FILL_GRADIENTS {
+                match c.read_u8()? {
+                    0 => None,
+                    kind @ (1 | 2) => {
+                        let stop_count = c.read_u16()?;
+                        let mut stops = Vec::with_capacity(usize::from(stop_count));
+                        for _ in 0..stop_count {
+                            stops.push(GradientStop {
+                                position: c.read_f32()?,
+                                color: Rgba {
+                                    r: c.read_u8()?,
+                                    g: c.read_u8()?,
+                                    b: c.read_u8()?,
+                                    a: c.read_u8()?,
+                                },
+                            });
+                        }
+                        Some(GradientFill {
+                            kind: if kind == 1 {
+                                GradientKind::Linear
+                            } else {
+                                GradientKind::Radial
+                            },
+                            stops,
+                            transform: Affine {
+                                a11: c.read_f32()?,
+                                a12: c.read_f32()?,
+                                a21: c.read_f32()?,
+                                a22: c.read_f32()?,
+                                tx: c.read_f32()?,
+                                ty: c.read_f32()?,
+                            },
+                        })
+                    }
+                    _ => return Err(Error::Validation("invalid fill gradient kind")),
+                }
+            } else {
+                None
+            };
             if asset_appearances
                 .insert(
                     asset_id,
@@ -4516,6 +5321,7 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
                         material_source,
                         clip_mask,
                         field_transform,
+                        fill_gradient,
                     },
                 )
                 .is_some()
@@ -4619,6 +5425,40 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
             }
         }
     }
+    if version >= Q1S_VERSION_CAMERA_TRACK {
+        runtime.camera.enabled = match c.read_u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(Error::Validation("invalid camera enabled flag")),
+        };
+        let count = c.read_u16()?;
+        runtime.camera.keys.reserve(usize::from(count));
+        for _ in 0..count {
+            let frame = c.read_u16()?;
+            let state = CameraState {
+                center_x: c.read_f32()?,
+                center_y: c.read_f32()?,
+                zoom: c.read_f32()?,
+                rotation: c.read_f32()?,
+            };
+            let tween = match c.read_u8()? {
+                TWEEN_KIND_NONE => Tween::None,
+                TWEEN_KIND_LINEAR => Tween::Linear {
+                    to_frame: c.read_u16()?,
+                },
+                TWEEN_KIND_EASED => Tween::Eased {
+                    to_frame: c.read_u16()?,
+                    easing: read_easing(&mut c)?,
+                },
+                _ => return Err(Error::Validation("invalid camera tween kind")),
+            };
+            runtime.camera.keys.push(CameraKey {
+                frame,
+                state,
+                tween,
+            });
+        }
+    }
     c.finish()?;
 
     let project = ProjectV2 {
@@ -4627,6 +5467,7 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
             fps,
             stage_width,
             stage_height,
+            background_color,
             entry_q0rg_id,
         },
         assets,
@@ -5341,6 +6182,12 @@ mod compatibility_tests {
                 fps: 24,
                 stage_width: 64,
                 stage_height: 64,
+                background_color: Rgba {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                },
                 entry_q0rg_id: 1,
             },
             assets: vec![Asset::Vector(VectorAsset {
@@ -5378,6 +6225,154 @@ mod compatibility_tests {
                 }],
             }],
         }
+    }
+
+    #[test]
+    fn q0rg_playback_modes_resolve_ranges_and_keep_legacy_default_clock() {
+        assert_eq!(Q0rgPlayback::default().resolve(7, 5, 4), 3);
+
+        let looped = Q0rgPlayback {
+            mode: Q0rgPlaybackMode::Loop,
+            first_frame: 1,
+            last_frame: Some(3),
+            single_frame: 0,
+        };
+        assert_eq!(looped.resolve(5, 5, 5), 1);
+        assert_eq!(looped.resolve(6, 5, 5), 2);
+        assert_eq!(looped.resolve(7, 5, 5), 3);
+        assert_eq!(looped.resolve(8, 5, 5), 1);
+
+        let once = Q0rgPlayback {
+            mode: Q0rgPlaybackMode::PlayOnce,
+            ..looped
+        };
+        assert_eq!(once.resolve(5, 5, 5), 1);
+        assert_eq!(once.resolve(6, 5, 5), 2);
+        assert_eq!(once.resolve(99, 5, 5), 3);
+
+        let reverse_loop = Q0rgPlayback {
+            mode: Q0rgPlaybackMode::LoopReversed,
+            ..looped
+        };
+        assert_eq!(reverse_loop.resolve(5, 5, 5), 3);
+        assert_eq!(reverse_loop.resolve(6, 5, 5), 2);
+        assert_eq!(reverse_loop.resolve(7, 5, 5), 1);
+        assert_eq!(reverse_loop.resolve(8, 5, 5), 3);
+
+        let reverse_once = Q0rgPlayback {
+            mode: Q0rgPlaybackMode::PlayReversedOnce,
+            ..looped
+        };
+        assert_eq!(reverse_once.resolve(5, 5, 5), 3);
+        assert_eq!(reverse_once.resolve(6, 5, 5), 2);
+        assert_eq!(reverse_once.resolve(99, 5, 5), 1);
+
+        let single = Q0rgPlayback {
+            mode: Q0rgPlaybackMode::SingleFrame,
+            single_frame: 2,
+            ..Q0rgPlayback::default()
+        };
+        assert_eq!(single.resolve(0, 0, 5), 2);
+        assert_eq!(single.resolve(99, 50, 5), 2);
+    }
+
+    fn project_with_q0rg_playback() -> ProjectV2 {
+        let mut project = legacy_project();
+        project.meta.background_color = Rgba {
+            r: 18,
+            g: 52,
+            b: 86,
+            a: 255,
+        };
+        project.q0rgs[0].layers[0].placements[0].target = Target::Q0rg(2);
+        project.q0rgs[0].layers[0].placements[0].fx.q0rg_playback = Q0rgPlayback {
+            mode: Q0rgPlaybackMode::PlayOnce,
+            first_frame: 1,
+            last_frame: Some(3),
+            single_frame: 0,
+        };
+        project.q0rgs.push(Q0rg {
+            q0rg_id: 2,
+            name: "Child".to_string(),
+            frame_count: 4,
+            script: String::new(),
+            layers: vec![Layer {
+                layer_id: 1,
+                name: "Child layer".to_string(),
+                explicit_keyframes: vec![0],
+                placements: Vec::new(),
+            }],
+        });
+        project
+    }
+
+    #[test]
+    fn background_and_q0rg_playback_roundtrip_through_current_q1s_and_q0s() {
+        let project = project_with_q0rg_playback();
+        validate(&project).expect("new metadata validates");
+        let q1s = write(&project).expect("write current q1s");
+        let q1s_back = parse(&q1s).expect("parse current q1s");
+        assert_eq!(
+            q1s_back.meta.background_color,
+            project.meta.background_color
+        );
+        assert_eq!(
+            q1s_back.q0rgs[0].layers[0].placements[0].fx.q0rg_playback,
+            project.q0rgs[0].layers[0].placements[0].fx.q0rg_playback
+        );
+
+        let q0s = crate::q0s_v2::write_q0s_v2(&project).expect("write current q0s");
+        let q0s_back = crate::q0s_v2::parse_q0s_v2(&q0s).expect("parse current q0s");
+        assert_eq!(
+            q0s_back.meta.background_color,
+            project.meta.background_color
+        );
+        assert_eq!(
+            q0s_back.q0rgs[0].layers[0].placements[0].fx.q0rg_playback,
+            project.q0rgs[0].layers[0].placements[0].fx.q0rg_playback
+        );
+    }
+
+    #[test]
+    fn previous_camera_version_defaults_new_document_metadata_without_retiming() {
+        let project = legacy_project();
+        let bytes = write_version(&project, Q1S_VERSION_CAMERA_TRACK).expect("write q1s v23");
+        let parsed = parse(&bytes).expect("parse q1s v23");
+        assert_eq!(
+            parsed.meta.background_color,
+            Rgba {
+                r: 255,
+                g: 255,
+                b: 255,
+                a: 255
+            }
+        );
+        assert_eq!(
+            parsed.q0rgs[0].layers[0].placements[0].fx.q0rg_playback,
+            Q0rgPlayback::default()
+        );
+        assert_eq!(Q0rgPlayback::default().resolve(7, 5, 4), 3);
+    }
+
+    #[test]
+    fn legacy_writers_reject_background_and_playback_instead_of_dropping_them() {
+        let mut background = legacy_project();
+        background.meta.background_color = Rgba {
+            r: 1,
+            g: 2,
+            b: 3,
+            a: 255,
+        };
+        assert!(write_version(&background, Q1S_VERSION_CAMERA_TRACK).is_err());
+
+        let mut playback = project_with_q0rg_playback();
+        playback.meta.background_color = Rgba {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 255,
+        };
+        assert!(write_version(&playback, Q1S_VERSION_STAGE_BACKGROUND).is_err());
     }
 
     #[test]
@@ -5704,6 +6699,7 @@ mod compatibility_tests {
                 material_source: Vec::new(),
                 clip_mask: Vec::new(),
                 field_transform: crate::transform::Affine::IDENTITY,
+                fill_gradient: None,
             },
         );
         project
@@ -7000,7 +7996,7 @@ mod compatibility_tests {
         let bytes = write(&project).unwrap();
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q1S_VERSION_FRAME_LABELS
+            Q1S_VERSION_CURRENT
         );
         let decoded = parse(&bytes).unwrap();
         assert_eq!(decoded, project);
@@ -7026,6 +8022,33 @@ mod compatibility_tests {
         assert_eq!(decoded, project);
         assert!(decoded.runtime.frame_labels.is_empty());
         assert_eq!(parse(&write(&decoded).unwrap()).unwrap(), project);
+    }
+
+    #[test]
+    fn q1s_v22_migrates_to_identity_camera_and_rejects_camera_downgrade() {
+        let mut project = legacy_project();
+        project
+            .runtime
+            .frame_labels
+            .insert(FrameLabelKey::new(1, 0), "start".into());
+        let legacy = write_version(&project, Q1S_VERSION_FRAME_LABELS).unwrap();
+        let decoded = parse(&legacy).unwrap();
+        assert_eq!(decoded.runtime.camera, CameraTrack::default());
+        assert_eq!(decoded.runtime.frame_labels, project.runtime.frame_labels);
+        assert_eq!(decoded.camera_affine_at(0), Affine::IDENTITY);
+
+        project.runtime.camera.enabled = true;
+        project.runtime.camera.keys.push(CameraKey {
+            frame: 0,
+            state: project.default_camera_state(),
+            tween: Tween::None,
+        });
+        assert_eq!(
+            write_version(&project, Q1S_VERSION_FRAME_LABELS),
+            Err(Error::Validation(
+                "q1s v22 and earlier cannot store camera animation"
+            ))
+        );
     }
 
     #[test]
@@ -7080,7 +8103,9 @@ mod compatibility_tests {
 
     #[test]
     fn duplicate_frame_label_entries_on_wire_are_rejected() {
-        let mut bytes = write(&legacy_project()).unwrap();
+        // Keep this fixture at v22, where frame labels are the final wire block.
+        // v23 appends camera data after them.
+        let mut bytes = write_version(&legacy_project(), Q1S_VERSION_FRAME_LABELS).unwrap();
         bytes.truncate(bytes.len() - 2); // Replace the empty label block.
         bytes.extend_from_slice(&2_u16.to_le_bytes());
         for name in ["first", "second"] {
@@ -7092,6 +8117,213 @@ mod compatibility_tests {
             parse(&bytes),
             Err(Error::Validation("duplicate frame label entry"))
         );
+    }
+
+    #[test]
+    fn fill_gradient_roundtrip_preserves_alpha_and_rejects_v25_downgrade() {
+        let mut project = legacy_project();
+        let Asset::Vector(vector) = &mut project.assets[0] else {
+            panic!("legacy fixture vector")
+        };
+        vector.fill = Some(Rgba {
+            r: 10,
+            g: 20,
+            b: 30,
+            a: 255,
+        });
+        vector.stroke = None;
+        project.asset_appearances.insert(
+            1,
+            VectorAppearance {
+                material: VectorMaterial::Solid,
+                erase_mask: Vec::new(),
+                material_source: Vec::new(),
+                clip_mask: Vec::new(),
+                field_transform: Affine::IDENTITY,
+                fill_gradient: Some(GradientFill {
+                    kind: GradientKind::Linear,
+                    stops: vec![
+                        GradientStop {
+                            position: 0.0,
+                            color: Rgba {
+                                r: 12,
+                                g: 34,
+                                b: 56,
+                                a: 0,
+                            },
+                        },
+                        GradientStop {
+                            position: 0.4,
+                            color: Rgba {
+                                r: 100,
+                                g: 110,
+                                b: 120,
+                                a: 128,
+                            },
+                        },
+                        GradientStop {
+                            position: 1.0,
+                            color: Rgba {
+                                r: 220,
+                                g: 230,
+                                b: 240,
+                                a: 255,
+                            },
+                        },
+                    ],
+                    transform: Affine {
+                        a11: 30.0,
+                        a12: 3.0,
+                        a21: -1.0,
+                        a22: 20.0,
+                        tx: 8.0,
+                        ty: 9.0,
+                    },
+                }),
+            },
+        );
+        let bytes = write(&project).expect("write gradient q1s");
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            Q1S_VERSION_CURRENT
+        );
+        assert_eq!(parse(&bytes).expect("parse gradient q1s"), project);
+        assert_eq!(
+            write_version(&project, Q1S_VERSION_Q0RG_PLAYBACK),
+            Err(Error::Validation(
+                "legacy q1s versions cannot store vector fill gradients"
+            ))
+        );
+    }
+
+    #[test]
+    fn current_q1s_roundtrip_preserves_anisotropic_blur_and_glow() {
+        let mut project = legacy_project();
+        project.q0rgs[0].layers[0].placements[0].fx = PlacementFx {
+            blur: Some(BlurFx {
+                radius_x: 16.0,
+                radius_y: 0.0,
+                quality: 3,
+            }),
+            glow: Some(GlowFx {
+                color: Rgba {
+                    r: 255,
+                    g: 204,
+                    b: 51,
+                    a: 255,
+                },
+                radius_x: 2.0,
+                radius_y: 7.0,
+                strength: 1.0,
+                quality: 3,
+            }),
+            ..PlacementFx::default()
+        };
+        let bytes = write(&project).expect("write anisotropic fx");
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            Q1S_VERSION_CURRENT
+        );
+        assert_eq!(parse(&bytes).expect("parse anisotropic fx"), project);
+    }
+
+    #[test]
+    fn q1s_v26_keeps_isotropic_fx_and_rejects_anisotropic_fx() {
+        let mut isotropic = legacy_project();
+        isotropic.q0rgs[0].layers[0].placements[0].fx = PlacementFx {
+            blur: Some(BlurFx {
+                radius_x: 4.0,
+                radius_y: 4.0,
+                quality: 3,
+            }),
+            glow: Some(GlowFx {
+                color: Rgba {
+                    r: 255,
+                    g: 0,
+                    b: 0,
+                    a: 200,
+                },
+                radius_x: 8.0,
+                radius_y: 8.0,
+                strength: 1.25,
+                quality: 3,
+            }),
+            ..PlacementFx::default()
+        };
+        let bytes = write_version(&isotropic, Q1S_VERSION_FILL_GRADIENTS)
+            .expect("q1s v26 must retain old isotropic placement fx wire format");
+        assert_eq!(
+            parse(&bytes).expect("parse q1s v26 isotropic fx"),
+            isotropic
+        );
+
+        let mut anisotropic = isotropic;
+        anisotropic.q0rgs[0].layers[0].placements[0]
+            .fx
+            .blur
+            .as_mut()
+            .unwrap()
+            .radius_y = 1.0;
+        assert_eq!(
+            write_version(&anisotropic, Q1S_VERSION_FILL_GRADIENTS),
+            Err(Error::Validation(
+                "q1s v26 and earlier cannot store anisotropic blur/glow or filter quality"
+            ))
+        );
+    }
+
+    #[test]
+    fn gradient_sampling_interpolates_rgba_for_linear_and_radial_space() {
+        let stops = vec![
+            GradientStop {
+                position: 0.0,
+                color: Rgba {
+                    r: 0,
+                    g: 20,
+                    b: 40,
+                    a: 0,
+                },
+            },
+            GradientStop {
+                position: 1.0,
+                color: Rgba {
+                    r: 200,
+                    g: 220,
+                    b: 240,
+                    a: 200,
+                },
+            },
+        ];
+        let linear = GradientFill {
+            kind: GradientKind::Linear,
+            stops: stops.clone(),
+            transform: Affine::IDENTITY,
+        };
+        assert_eq!(
+            linear.sample(Vec2::new(0.0, 0.0)),
+            Rgba {
+                r: 100,
+                g: 120,
+                b: 140,
+                a: 100
+            }
+        );
+        let radial = GradientFill {
+            kind: GradientKind::Radial,
+            stops,
+            transform: Affine::IDENTITY,
+        };
+        assert_eq!(
+            radial.sample(Vec2::new(0.5, 0.0)),
+            Rgba {
+                r: 100,
+                g: 120,
+                b: 140,
+                a: 100
+            }
+        );
+        assert_eq!(radial.sample(Vec2::new(0.0, 0.0)).a, 0);
+        assert_eq!(radial.sample(Vec2::new(2.0, 0.0)).a, 200);
     }
 
     #[test]

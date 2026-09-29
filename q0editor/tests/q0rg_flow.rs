@@ -241,6 +241,7 @@ fn convert_to_q0rg_keeps_vector_appearance_attached_to_the_asset() {
         material_source: Vec::new(),
         clip_mask: Vec::new(),
         field_transform: q0s_format::transform::Affine::IDENTITY,
+        fill_gradient: None,
     };
     app.state
         .project
@@ -326,6 +327,7 @@ fn convert_clicked_raw_glow_to_q0rg_preserves_material_state() {
             material_source: Vec::new(),
             clip_mask: Vec::new(),
             field_transform: q0s_format::transform::Affine::IDENTITY,
+            fill_gradient: None,
         },
     );
     app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
@@ -440,6 +442,7 @@ fn convert_raw_area_to_q0rg_preserves_resolved_glow_pixels() {
             material_source: Vec::new(),
             clip_mask: Vec::new(),
             field_transform: q0s_format::transform::Affine::IDENTITY,
+            fill_gradient: None,
         },
     );
     app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
@@ -576,6 +579,7 @@ fn convert_halo_only_raw_area_to_q0rg_preserves_visible_glow_without_loss() {
             material_source: Vec::new(),
             clip_mask: Vec::new(),
             field_transform: q0s_format::transform::Affine::IDENTITY,
+            fill_gradient: None,
         },
     );
     app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
@@ -1474,6 +1478,7 @@ fn copy_paste_raw_glow_carries_appearance_with_fresh_asset_id() {
             material_source: Vec::new(),
             clip_mask: Vec::new(),
             field_transform: q0s_format::transform::Affine::IDENTITY,
+            fill_gradient: None,
         },
     );
     app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
@@ -1495,6 +1500,9 @@ fn copy_paste_raw_glow_carries_appearance_with_fresh_asset_id() {
     let clipboard = app.session.clipboard.as_ref().expect("raw glow clipboard");
     assert_eq!(clipboard.raw_vectors.len(), 1);
     assert!(clipboard.raw_vectors[0].appearance.is_some());
+    let cursor = Vec2::new(180.0, 140.0);
+    let expected_delta = q0editor::selection_edit::paste_offset_for_target(clipboard, cursor);
+    app.session.stage_cursor = Some(cursor);
     drive_one(&mut app, Action::Paste);
 
     let layer = &app.state.project.q0rgs[0].layers[0];
@@ -1510,8 +1518,21 @@ fn copy_paste_raw_glow_carries_appearance_with_fresh_asset_id() {
         .get(&pasted_asset_id)
         .expect("pasted raw glow appearance");
     assert!(!pasted.material_source.is_empty());
-    assert!((pasted.field_transform.tx - 10.0).abs() < 1.0e-6);
-    assert!((pasted.field_transform.ty - 10.0).abs() < 1.0e-6);
+    assert!((pasted.field_transform.tx - expected_delta.x).abs() < 1.0e-6);
+    assert!((pasted.field_transform.ty - expected_delta.y).abs() < 1.0e-6);
+    let pasted_vector = app
+        .state
+        .project
+        .assets
+        .iter()
+        .find_map(|asset| match asset {
+            Asset::Vector(vector) if vector.asset_id == pasted_asset_id => Some(vector),
+            _ => None,
+        })
+        .expect("pasted raw glow vector");
+    let first = pasted_vector.paths[0].anchors[0].point;
+    assert!((first.x - (20.0 + expected_delta.x)).abs() < 1.0e-6);
+    assert!((first.y - (20.0 + expected_delta.y)).abs() < 1.0e-6);
     q0s_format::v2::validate(&app.state.project).expect("pasted raw glow validates");
 }
 
@@ -1614,18 +1635,34 @@ fn edit_cut_removes_mixed_selection_and_paste_restores_both_kinds() {
     );
     assert!(app.session.clipboard.is_some());
 
-    drive_one(&mut app, Action::Paste);
+    drive_one(&mut app, Action::PasteInPlace);
     let root_layer = &app.state.project.q0rgs[0].layers[0];
     assert_eq!(
         root_layer.placements.len(),
         3,
         "remainder + pasted raw + pasted q0rg"
     );
-    assert!(root_layer
+    let pasted_q0rg = root_layer
         .placements
         .iter()
-        .any(|placement| matches!(placement.target, Target::Q0rg(_))));
-    q0s_format::v2::validate(&app.state.project).expect("cut/paste validates");
+        .find(|placement| matches!(placement.target, Target::Q0rg(_)))
+        .expect("pasted q0rg");
+    assert!((pasted_q0rg.transform.tx - 5.0).abs() < 1.0e-6);
+    assert!((pasted_q0rg.transform.ty - 0.0).abs() < 1.0e-6);
+    match &app.session.selection {
+        Selection::RawArea {
+            bounds_min,
+            bounds_max,
+            objects,
+            ..
+        } => {
+            assert_eq!(*bounds_min, Vec2::new(0.0, 0.0));
+            assert_eq!(*bounds_max, Vec2::new(10.0, 10.0));
+            assert_eq!(objects.len(), 1);
+        }
+        other => panic!("paste in place should select restored mixed area, got {other:?}"),
+    }
+    q0s_format::v2::validate(&app.state.project).expect("cut/paste-in-place validates");
 }
 
 // ---- internal: dispatch actions through the public action queue ----
@@ -1648,14 +1685,24 @@ fn invoke_breadcrumb_jump(app: &mut EditorApp, depth: usize) {
 
 fn invoke_shortcut(app: &mut EditorApp, key: egui::Key, modifiers: egui::Modifiers) {
     let ctx = egui::Context::default();
-    ctx.begin_frame(egui::RawInput {
-        events: vec![egui::Event::Key {
+    let event = if modifiers.command && key == egui::Key::C {
+        egui::Event::Copy
+    } else if modifiers.command && key == egui::Key::X {
+        egui::Event::Cut
+    } else if modifiers.command && key == egui::Key::V {
+        egui::Event::Paste("native clipboard payload".to_string())
+    } else {
+        egui::Event::Key {
             key,
             physical_key: None,
             pressed: true,
             repeat: false,
             modifiers,
-        }],
+        }
+    };
+    ctx.begin_frame(egui::RawInput {
+        modifiers,
+        events: vec![event],
         ..Default::default()
     });
     q0editor::panels::menu::handle_global_shortcuts(app, &ctx);

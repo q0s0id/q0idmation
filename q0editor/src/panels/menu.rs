@@ -134,6 +134,16 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     ui.close_menu();
                 }
                 if ui
+                    .add_enabled(
+                        has_clip,
+                        shortcut_button_widget("Paste in Place", "Ctrl+Shift+V"),
+                    )
+                    .clicked()
+                {
+                    app.queue(Action::PasteInPlace);
+                    ui.close_menu();
+                }
+                if ui
                     .add_enabled(can_clip, shortcut_button_widget("Duplicate", "Ctrl+D"))
                     .clicked()
                 {
@@ -266,12 +276,6 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 if project_resp.clicked() {
                     app.queue(Action::ToggleProjectTree);
                 }
-                let q0enc_resp = ui
-                    .selectable_label(app.q0enc.open, "q0enc")
-                    .on_hover_text("Open or close the export workshop");
-                if q0enc_resp.clicked() {
-                    app.queue(Action::ToggleQ0Enc);
-                }
             }
             let home_resp = ui
                 .selectable_label(app.home_visible(), "Home")
@@ -282,6 +286,26 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 } else {
                     Action::ShowHome
                 });
+            }
+
+            // q0enc/q0fla are tools, not navigation. Keep them together and
+            // slightly left of the main Home/Project/Credits/Settings group.
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+            if app.has_active_project() && !app.home_visible() {
+                let q0enc_resp = ui
+                    .selectable_label(app.q0enc.open, "q0enc")
+                    .on_hover_text("Open or close the export workshop");
+                if q0enc_resp.clicked() {
+                    app.queue(Action::ToggleQ0Enc);
+                }
+            }
+            let q0fla_resp = ui
+                .selectable_label(app.q0fla_open, "q0fla")
+                .on_hover_text("Open or close the FLA/XFL import workshop");
+            if q0fla_resp.clicked() {
+                app.queue(Action::ToggleQ0Fla);
             }
         });
     });
@@ -357,13 +381,20 @@ pub(crate) fn selection_can_be_deleted(selection: &crate::state::Selection) -> b
         | crate::state::Selection::Placement { .. }
         | crate::state::Selection::Path { .. }
         | crate::state::Selection::PathPoints { .. }
+        | crate::state::Selection::SubselectPoints { .. }
         | crate::state::Selection::StrokeSegment(_) => true,
         crate::state::Selection::Paths(items) => !items.is_empty(),
         crate::state::Selection::RawParts {
             fills,
             strokes,
+            stroke_segments,
             objects,
-        } => !fills.is_empty() || !strokes.is_empty() || !objects.is_empty(),
+        } => {
+            !fills.is_empty()
+                || !strokes.is_empty()
+                || !stroke_segments.is_empty()
+                || !objects.is_empty()
+        }
         crate::state::Selection::Mixed { paths, objects } => {
             !paths.is_empty() || !objects.is_empty()
         }
@@ -391,8 +422,44 @@ fn status_is_error(status: &str) -> bool {
     .any(|needle| status.contains(needle))
 }
 
+fn consume_performance_snapshot_shortcut(input: &mut egui::InputState) -> bool {
+    input.consume_key(Modifiers::NONE, Key::F4)
+}
+
+/// egui-winit converts native Ctrl+X/C/V into Cut/Copy/Paste events and returns
+/// before emitting Event::Key for the pressed key. Handle that real native
+/// path explicitly; the key-based fallback below is retained for other backends
+/// and for synthetic callers.
+fn consume_native_clipboard_shortcut(input: &mut egui::InputState) -> Option<Action> {
+    let paste_in_place = input.modifiers.shift;
+    let mut shortcut = None;
+    input.events.retain(|event| {
+        let action = match event {
+            egui::Event::Cut => Some(Action::CutSelection),
+            egui::Event::Copy => Some(Action::CopySelection),
+            egui::Event::Paste(_) => Some(if paste_in_place {
+                Action::PasteInPlace
+            } else {
+                Action::Paste
+            }),
+            _ => None,
+        };
+        if let Some(action) = action {
+            if shortcut.is_none() {
+                shortcut = Some(action);
+            }
+            false
+        } else {
+            true
+        }
+    });
+    shortcut
+}
+
 pub fn handle_home_shortcuts(app: &mut EditorApp, ctx: &egui::Context) {
+    let mut copy_perf = false;
     ctx.input_mut(|input| {
+        copy_perf |= consume_performance_snapshot_shortcut(input);
         if input.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Tab) {
             app.queue(Action::CycleDocumentTab(-1));
         } else if input.consume_key(Modifiers::COMMAND, Key::Tab) {
@@ -405,12 +472,21 @@ pub fn handle_home_shortcuts(app: &mut EditorApp, ctx: &egui::Context) {
             app.queue(Action::OpenProject);
         }
     });
+    if copy_perf {
+        app.copy_performance_snapshot(ctx);
+    }
 }
 
 pub fn handle_global_shortcuts(app: &mut EditorApp, ctx: &egui::Context) {
     let typing = ctx.wants_keyboard_input();
     let code_document = app.active_document_is_q0lang();
+    let can_clip = app.session.timeline_selection.is_some()
+        || app.session.timeline_layer_selection.is_some()
+        || crate::selection_edit::selection_can_clip(&app.session.selection);
+    let mut copy_perf = false;
+    let mut arm_native_artwork_clipboard = false;
     ctx.input_mut(|i| {
+        copy_perf |= consume_performance_snapshot_shortcut(i);
         if i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Tab) {
             app.queue(Action::CycleDocumentTab(-1));
         } else if i.consume_key(Modifiers::COMMAND, Key::Tab) {
@@ -449,14 +525,26 @@ pub fn handle_global_shortcuts(app: &mut EditorApp, ctx: &egui::Context) {
             app.queue(Action::OpenQ0Enc);
         }
         if !typing {
-            if i.consume_key(Modifiers::COMMAND, Key::X) {
-                app.queue(Action::CutSelection);
-            }
-            if i.consume_key(Modifiers::COMMAND, Key::C) {
-                app.queue(Action::CopySelection);
-            }
-            if i.consume_key(Modifiers::COMMAND, Key::V) {
-                app.queue(Action::Paste);
+            if let Some(action) = consume_native_clipboard_shortcut(i) {
+                if can_clip && matches!(action, Action::CopySelection | Action::CutSelection) {
+                    // egui-winit only emits Event::Paste when the system clipboard
+                    // contains non-empty text. Keep a harmless marker there so an
+                    // internal artwork copy/cut can always be pasted with Ctrl+V.
+                    arm_native_artwork_clipboard = true;
+                }
+                app.queue(action);
+            } else {
+                if i.consume_key(Modifiers::COMMAND, Key::X) {
+                    app.queue(Action::CutSelection);
+                }
+                if i.consume_key(Modifiers::COMMAND, Key::C) {
+                    app.queue(Action::CopySelection);
+                }
+                if i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::V) {
+                    app.queue(Action::PasteInPlace);
+                } else if i.consume_key(Modifiers::COMMAND, Key::V) {
+                    app.queue(Action::Paste);
+                }
             }
             if i.consume_key(Modifiers::COMMAND, Key::D) {
                 app.queue(Action::DuplicateSelection);
@@ -553,4 +641,244 @@ pub fn handle_global_shortcuts(app: &mut EditorApp, ctx: &egui::Context) {
             }
         }
     });
+    if copy_perf {
+        app.copy_performance_snapshot(ctx);
+    }
+    if arm_native_artwork_clipboard {
+        ctx.output_mut(|output| output.copied_text = "q0editor artwork".to_string());
+    }
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn raw_clipboard_square(min: f32, max: f32) -> crate::state::ClipboardPayload {
+        use q0s_format::v2::{Anchor, Path, Rgba, Vec2, VectorAsset};
+        crate::state::ClipboardPayload {
+            raw_vectors: vec![crate::state::RawVectorClipboard {
+                vector: VectorAsset {
+                    asset_id: 0,
+                    paths: vec![Path {
+                        anchors: vec![
+                            Anchor {
+                                point: Vec2::new(min, min),
+                                in_handle: None,
+                                out_handle: None,
+                            },
+                            Anchor {
+                                point: Vec2::new(max, min),
+                                in_handle: None,
+                                out_handle: None,
+                            },
+                            Anchor {
+                                point: Vec2::new(max, max),
+                                in_handle: None,
+                                out_handle: None,
+                            },
+                            Anchor {
+                                point: Vec2::new(min, max),
+                                in_handle: None,
+                                out_handle: None,
+                            },
+                        ],
+                        closed: true,
+                    }],
+                    fill: Some(Rgba {
+                        r: 20,
+                        g: 30,
+                        b: 40,
+                        a: 255,
+                    }),
+                    stroke: None,
+                },
+                appearance: None,
+            }],
+            artwork_center: Some(Vec2::new((min + max) * 0.5, (min + max) * 0.5)),
+            ..Default::default()
+        }
+    }
+
+    fn vector_bounds_for_shortcut_test(app: &EditorApp) -> (f32, f32, f32, f32) {
+        let vector = app
+            .state
+            .project
+            .assets
+            .iter()
+            .filter_map(|asset| match asset {
+                q0s_format::v2::Asset::Vector(vector) => Some(vector),
+                _ => None,
+            })
+            .next_back()
+            .expect("pasted vector");
+        let mut min_x = f32::INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        for anchor in vector.paths.iter().flat_map(|path| &path.anchors) {
+            min_x = min_x.min(anchor.point.x);
+            min_y = min_y.min(anchor.point.y);
+            max_x = max_x.max(anchor.point.x);
+            max_y = max_y.max(anchor.point.y);
+        }
+        (min_x, min_y, max_x, max_y)
+    }
+
+    fn run_paste_shortcut(app: &mut EditorApp, modifiers: Modifiers) {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                modifiers,
+                // This is the event egui-winit actually emits for native Ctrl+V.
+                // It deliberately does NOT emit Event::Key(V) on key press.
+                events: vec![egui::Event::Paste("system clipboard text".to_string())],
+                ..Default::default()
+            },
+            |ctx| handle_global_shortcuts(app, ctx),
+        );
+        app.flush_pending_actions();
+    }
+
+    fn seed_native_copy_square(app: &mut EditorApp) {
+        use q0s_format::v2::{
+            Anchor, Asset, Path, Placement, Rgba, Target, Transform2D, Tween, Vec2, VectorAsset,
+        };
+        app.state.project.assets.push(Asset::Vector(VectorAsset {
+            asset_id: 1,
+            paths: vec![Path {
+                anchors: vec![
+                    Anchor {
+                        point: Vec2::new(10.0, 10.0),
+                        in_handle: None,
+                        out_handle: None,
+                    },
+                    Anchor {
+                        point: Vec2::new(30.0, 10.0),
+                        in_handle: None,
+                        out_handle: None,
+                    },
+                    Anchor {
+                        point: Vec2::new(30.0, 30.0),
+                        in_handle: None,
+                        out_handle: None,
+                    },
+                    Anchor {
+                        point: Vec2::new(10.0, 30.0),
+                        in_handle: None,
+                        out_handle: None,
+                    },
+                ],
+                closed: true,
+            }],
+            fill: Some(Rgba {
+                r: 20,
+                g: 30,
+                b: 40,
+                a: 255,
+            }),
+            stroke: None,
+        }));
+        app.state.project.q0rgs[0].layers[0]
+            .placements
+            .push(Placement {
+                instance_id: 0,
+                frame: 0,
+                target: Target::Asset(1),
+                transform: Transform2D::IDENTITY,
+                tween: Tween::None,
+                fx: Default::default(),
+            });
+        app.session.selection = crate::state::Selection::Path {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: 0,
+            path_idx: 0,
+        };
+    }
+
+    #[test]
+    fn native_copy_event_fills_internal_clipboard_and_arms_native_paste() {
+        let mut app = EditorApp::default();
+        seed_native_copy_square(&mut app);
+        let ctx = egui::Context::default();
+        let output = ctx.run(
+            egui::RawInput {
+                modifiers: Modifiers::COMMAND,
+                events: vec![egui::Event::Copy],
+                ..Default::default()
+            },
+            |ctx| handle_global_shortcuts(&mut app, ctx),
+        );
+        app.flush_pending_actions();
+
+        let clipboard = app
+            .session
+            .clipboard
+            .as_ref()
+            .expect("internal artwork clipboard");
+        assert_eq!(clipboard.raw_vectors.len(), 1);
+        assert_eq!(output.platform_output.copied_text, "q0editor artwork");
+    }
+
+    #[test]
+    fn ctrl_v_centres_artwork_clipboard_on_stage_cursor() {
+        let mut app = EditorApp::default();
+        app.session.clipboard = Some(raw_clipboard_square(10.0, 30.0));
+        app.session.stage_cursor = Some(q0s_format::v2::Vec2::new(300.0, 200.0));
+
+        run_paste_shortcut(&mut app, Modifiers::COMMAND);
+
+        assert_eq!(
+            vector_bounds_for_shortcut_test(&app),
+            (290.0, 190.0, 310.0, 210.0)
+        );
+        assert_eq!(app.session.status, "pasted at cursor");
+    }
+
+    #[test]
+    fn ctrl_shift_v_pastes_artwork_in_original_coordinates() {
+        let mut app = EditorApp::default();
+        app.session.clipboard = Some(raw_clipboard_square(10.0, 30.0));
+        app.session.stage_cursor = Some(q0s_format::v2::Vec2::new(300.0, 200.0));
+
+        run_paste_shortcut(&mut app, Modifiers::COMMAND | Modifiers::SHIFT);
+
+        assert_eq!(
+            vector_bounds_for_shortcut_test(&app),
+            (10.0, 10.0, 30.0, 30.0)
+        );
+        assert_eq!(app.session.status, "pasted in place");
+    }
+
+    #[test]
+    fn f4_copies_performance_snapshot() {
+        let mut app = EditorApp::default();
+        app.perf.begin_frame();
+        app.perf
+            .record(crate::perf::PerfSpan::Stage, Duration::from_millis(37));
+        app.perf.finish_frame();
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: Key::F4,
+                    physical_key: Some(Key::F4),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| handle_global_shortcuts(&mut app, ctx),
+        );
+
+        assert!(output
+            .platform_output
+            .copied_text
+            .contains("q0editor performance snapshot"));
+        assert!(output.platform_output.copied_text.contains("stage.total"));
+        assert!(app.session.status.contains("performance log copied"));
+    }
 }

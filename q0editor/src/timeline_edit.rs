@@ -439,6 +439,68 @@ pub fn remove_selected_keyframes(
     Some(removed)
 }
 
+/// Insert one ordinary frame before `frame` on a single layer. Keyframes and
+/// layer-local frame scripts at or after the insertion point move right, while
+/// the new cell inherits the preceding visual state (a classic F5 hold frame).
+///
+/// Frame zero is the structural root of a layer, so inserting there keeps that
+/// root in place and lengthens its first span instead of creating an invalid
+/// pre-root cell. Other layers are intentionally left untouched.
+pub fn insert_hold_frame_before(
+    project: &mut ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    frame: u16,
+) -> Option<u16> {
+    let q0rg_index = q0rg_index(project, q0rg_id)?;
+    let old_count = project.q0rgs[q0rg_index].frame_count;
+    if old_count == 0 || frame >= old_count {
+        return None;
+    }
+    let new_count = old_count.checked_add(1)?;
+    let layer_index = project.q0rgs[q0rg_index]
+        .layers
+        .iter()
+        .position(|layer| layer.layer_id == layer_id)?;
+    if project.layer_is_folder(q0rg_id, layer_id) {
+        return None;
+    }
+
+    for script in &mut project.runtime.frame_scripts {
+        if script.q0rg_id == q0rg_id && script.layer_id == layer_id && script.frame >= frame {
+            script.frame = script.frame.checked_add(1)?;
+        }
+    }
+
+    for clip in &mut project.audio_clips {
+        if clip.q0rg_id == q0rg_id && clip.layer_id == layer_id && clip.start_frame >= frame {
+            clip.start_frame = clip.start_frame.checked_add(1)?;
+        }
+    }
+
+    let q0rg = &mut project.q0rgs[q0rg_index];
+    q0rg.frame_count = new_count;
+    let layer = &mut q0rg.layers[layer_index];
+    for placement in &mut layer.placements {
+        if placement.frame >= frame && !(frame == 0 && placement.frame == 0) {
+            placement.frame = placement.frame.checked_add(1)?;
+        }
+        if let Some(to_frame) = placement.tween.to_frame() {
+            if to_frame >= frame {
+                placement.tween = placement.tween.with_to_frame(to_frame.checked_add(1)?);
+            }
+        }
+    }
+    for keyframe in &mut layer.explicit_keyframes {
+        if *keyframe >= frame && !(frame == 0 && *keyframe == 0) {
+            *keyframe = keyframe.checked_add(1)?;
+        }
+    }
+    layer.explicit_keyframes.sort_unstable();
+    layer.explicit_keyframes.dedup();
+    Some(new_count)
+}
+
 /// Remove selected columns of time from the whole q0rg. Later keyframes,
 /// explicit blank keys and tween targets shift left together. A q0rg always
 /// keeps one frame; removing the complete timeline resets drawable layers to
@@ -524,6 +586,32 @@ pub fn remove_selected_frame_columns(
             Some((key, label))
         })
         .collect();
+
+    if q0rg_id == project.meta.entry_q0rg_id {
+        if first_frame == 0 && last_frame == old_count - 1 {
+            project.runtime.camera.keys.clear();
+        } else {
+            let mut shifted_camera = Vec::with_capacity(project.runtime.camera.keys.len());
+            for mut key in project.runtime.camera.keys.drain(..) {
+                if (first_frame..=last_frame).contains(&key.frame) {
+                    continue;
+                }
+                if key.frame > last_frame {
+                    key.frame -= width;
+                }
+                key.tween = match key.tween.to_frame() {
+                    Some(to_frame) if (first_frame..=last_frame).contains(&to_frame) => Tween::None,
+                    Some(to_frame) if to_frame > last_frame => {
+                        key.tween.with_to_frame(to_frame - width)
+                    }
+                    Some(_) | None => key.tween,
+                };
+                shifted_camera.push(key);
+            }
+            shifted_camera.sort_by_key(|key| key.frame);
+            project.runtime.camera.keys = shifted_camera;
+        }
+    }
 
     let q0rg = &mut project.q0rgs[q0rg_index];
     if first_frame == 0 && last_frame == old_count - 1 {
@@ -1369,6 +1457,94 @@ mod tests {
     }
 
     #[test]
+    fn inserting_hold_frame_shifts_only_target_layer_and_its_frame_script() {
+        let mut project = crate::state::default_project();
+        project.q0rgs[0].frame_count = 6;
+        project.q0rgs[0].layers[0].placements = vec![
+            placement(0, 0.0, Tween::None),
+            placement(4, 40.0, Tween::None),
+        ];
+        let mut other_layer = project.q0rgs[0].layers[0].clone();
+        other_layer.layer_id = 2;
+        other_layer.name = "other".to_string();
+        other_layer.placements[1].transform.tx = 80.0;
+        project.q0rgs[0].layers.push(other_layer);
+        project.runtime.frame_scripts.push(FrameScript {
+            q0rg_id: 1,
+            layer_id: 1,
+            frame: 4,
+            source: "target".to_string(),
+        });
+        project.runtime.frame_scripts.push(FrameScript {
+            q0rg_id: 1,
+            layer_id: 2,
+            frame: 4,
+            source: "other".to_string(),
+        });
+
+        let new_count = insert_hold_frame_before(&mut project, 1, 1, 4)
+            .expect("insert target-layer hold frame");
+
+        assert_eq!(new_count, 7);
+        let target = &project.q0rgs[0].layers[0];
+        let other = &project.q0rgs[0].layers[1];
+        assert!(target
+            .placements
+            .iter()
+            .any(|item| item.frame == 5 && item.transform.tx == 40.0));
+        assert_eq!(crate::render::active_placements_at(target, 4).len(), 1);
+        assert!(other
+            .placements
+            .iter()
+            .any(|item| item.frame == 4 && item.transform.tx == 80.0));
+        assert_eq!(project.runtime.frame_scripts[0].frame, 5);
+        assert_eq!(project.runtime.frame_scripts[1].frame, 4);
+    }
+
+    #[test]
+    fn inserting_hold_frame_inside_tween_extends_tween_destination() {
+        let mut project = crate::state::default_project();
+        project.q0rgs[0].frame_count = 6;
+        project.q0rgs[0].layers[0].placements = vec![
+            placement(0, 0.0, Tween::Linear { to_frame: 4 }),
+            placement(4, 40.0, Tween::None),
+        ];
+
+        insert_hold_frame_before(&mut project, 1, 1, 2).expect("insert tween frame");
+
+        let layer = &project.q0rgs[0].layers[0];
+        assert_eq!(layer.placements[0].tween, Tween::Linear { to_frame: 5 });
+        assert!(layer
+            .placements
+            .iter()
+            .any(|item| item.frame == 5 && item.transform.tx == 40.0));
+    }
+
+    #[test]
+    fn inserting_hold_at_frame_zero_keeps_root_key_and_shifts_later_keys() {
+        let mut project = crate::state::default_project();
+        project.q0rgs[0].frame_count = 5;
+        project.q0rgs[0].layers[0].placements = vec![
+            placement(0, 0.0, Tween::None),
+            placement(3, 30.0, Tween::None),
+        ];
+
+        insert_hold_frame_before(&mut project, 1, 1, 0).expect("insert root hold");
+
+        let layer = &project.q0rgs[0].layers[0];
+        assert!(layer.has_keyframe(0));
+        assert!(layer
+            .placements
+            .iter()
+            .any(|item| item.frame == 0 && item.transform.tx == 0.0));
+        assert!(layer
+            .placements
+            .iter()
+            .any(|item| item.frame == 4 && item.transform.tx == 30.0));
+        assert_eq!(project.q0rgs[0].frame_count, 6);
+    }
+
+    #[test]
     fn removing_selected_frame_columns_shifts_keys_blanks_and_tween_targets() {
         let mut project = crate::state::default_project();
         let q0rg = &mut project.q0rgs[0];
@@ -2080,5 +2256,64 @@ mod tests {
             .frame_scripts
             .iter()
             .any(|script| script.layer_id == 1 && script.frame == 3));
+    }
+
+    #[test]
+    fn removing_frame_columns_shifts_camera_keys_and_tween_target_with_entry_time() {
+        use q0s_format::v2::{CameraKey, CameraState};
+
+        let mut project = crate::state::default_project();
+        project.q0rgs[0].frame_count = 10;
+        project.runtime.camera.enabled = true;
+        let identity = project.default_camera_state();
+        project.runtime.camera.keys = vec![
+            CameraKey {
+                frame: 0,
+                state: identity,
+                tween: Tween::Linear { to_frame: 6 },
+            },
+            CameraKey {
+                frame: 2,
+                state: CameraState {
+                    center_x: identity.center_x + 10.0,
+                    ..identity
+                },
+                tween: Tween::None,
+            },
+            CameraKey {
+                frame: 6,
+                state: CameraState {
+                    center_y: identity.center_y + 20.0,
+                    ..identity
+                },
+                tween: Tween::None,
+            },
+        ];
+
+        remove_selected_frame_columns(
+            &mut project,
+            1,
+            TimelineSelection {
+                anchor_layer_id: 1,
+                focus_layer_id: 1,
+                anchor_frame: 1,
+                focus_frame: 3,
+            },
+        )
+        .expect("remove frame columns");
+
+        assert_eq!(project.q0rgs[0].frame_count, 7);
+        assert_eq!(
+            project
+                .runtime
+                .camera
+                .keys
+                .iter()
+                .map(|key| key.frame)
+                .collect::<Vec<_>>(),
+            vec![0, 3]
+        );
+        assert_eq!(project.runtime.camera.keys[0].tween.to_frame(), Some(3));
+        q0s_format::v2::validate(&project).unwrap();
     }
 }

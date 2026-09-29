@@ -22,6 +22,7 @@ pub fn default_brush_appearance() -> VectorAppearance {
         material_source: Vec::new(),
         clip_mask: Vec::new(),
         field_transform: Affine::IDENTITY,
+        fill_gradient: None,
     }
 }
 
@@ -57,6 +58,7 @@ pub(crate) fn merged_brush_appearance(
         material_source: Vec::new(),
         clip_mask: Vec::new(),
         field_transform: Affine::IDENTITY,
+        fill_gradient: None,
     }
 }
 
@@ -97,6 +99,7 @@ pub(crate) fn partition_appearance(
         material_source: material_source.clone(),
         clip_mask: crate::brush::coverage_to_linear_paths(&clip),
         field_transform: original.field_transform,
+        fill_gradient: original.fill_gradient.clone(),
     };
     Some((make(source_clip), make(selected_clip)))
 }
@@ -149,6 +152,7 @@ pub(crate) fn partition_unclipped_appearance_by_source_subset(
         material_source,
         clip_mask: crate::brush::coverage_to_linear_paths(&selected_support),
         field_transform: original.field_transform,
+        fill_gradient: original.fill_gradient.clone(),
     };
     Some((remainder, selected))
 }
@@ -1009,7 +1013,7 @@ pub fn erase_visible_region(app: &mut EditorApp, region: MultiPolygon<f64>) -> b
 #[cfg(test)]
 mod tests {
     use geo::{Area, BoundingRect, Contains, Coord, LineString, Point, Polygon};
-    use q0s_format::v2::{Anchor, Placement};
+    use q0s_format::v2::{Anchor, GradientFill, GradientKind, GradientStop, Placement};
 
     use super::*;
 
@@ -1069,6 +1073,7 @@ mod tests {
                 material_source: Vec::new(),
                 clip_mask: Vec::new(),
                 field_transform: q0s_format::transform::Affine::IDENTITY,
+                fill_gradient: None,
             },
         );
         app.state.project.q0rgs[0].layers[0]
@@ -1082,6 +1087,56 @@ mod tests {
                 fx: Default::default(),
             });
         app
+    }
+
+    #[test]
+    fn splitting_gradient_fill_preserves_the_same_gradient_field_on_both_fragments() {
+        let path = square_path(0.0, 0.0, 10.0, 10.0);
+        let gradient = GradientFill {
+            kind: GradientKind::Radial,
+            stops: vec![
+                GradientStop {
+                    position: 0.0,
+                    color: Rgba {
+                        r: 255,
+                        g: 0,
+                        b: 0,
+                        a: 48,
+                    },
+                },
+                GradientStop {
+                    position: 1.0,
+                    color: Rgba {
+                        r: 0,
+                        g: 0,
+                        b: 255,
+                        a: 220,
+                    },
+                },
+            ],
+            transform: Affine {
+                a11: 5.0,
+                a12: 0.5,
+                a21: -0.25,
+                a22: 4.0,
+                tx: 5.0,
+                ty: 5.0,
+            },
+        };
+        let original = VectorAppearance {
+            material: VectorMaterial::Solid,
+            erase_mask: Vec::new(),
+            material_source: Vec::new(),
+            clip_mask: Vec::new(),
+            field_transform: Affine::IDENTITY,
+            fill_gradient: Some(gradient.clone()),
+        };
+        let partition = rect_region(5.0, -5.0, 15.0, 15.0);
+        let (left, right) =
+            partition_appearance(&original, std::slice::from_ref(&path), &partition)
+                .expect("gradient partition");
+        assert_eq!(left.fill_gradient.as_ref(), Some(&gradient));
+        assert_eq!(right.fill_gradient.as_ref(), Some(&gradient));
     }
 
     #[test]
@@ -1196,6 +1251,7 @@ mod tests {
             material_source: vec![canonical_path],
             clip_mask: vec![square_path(-2.0, -2.0, 13.0, 22.0)],
             field_transform: field,
+            fill_gradient: None,
         };
 
         let current = visible_source_surface_for_vector(&vector, Some(&appearance));
@@ -1234,6 +1290,7 @@ mod tests {
             material_source: Vec::new(),
             clip_mask: Vec::new(),
             field_transform: Affine::IDENTITY,
+            fill_gradient: None,
         };
         // Exercise pre-existing mask content too: both partition paths must retain
         // the same already-erased pixels while assigning the selected glow support.

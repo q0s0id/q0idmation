@@ -1,0 +1,16 @@
+[package]
+name = "q0fla"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Adobe Animate FLA/XFL importer for q0idmation."
+
+[dependencies]
+q0s-format = { path = "../q0s-format" }
+quick-xml = "0.39.2"
+zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
+ttf-parser = "0.25"
+flate2 = "1.0"

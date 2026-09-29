@@ -253,11 +253,11 @@ fn bounds_with_placement_fx(
     let scale = transform_scale.abs().max(1.0e-4);
     let mut result = bounds;
     if let Some(blur) = fx.blur {
-        result = result.union(bounds.expand(blur.radius * scale));
+        result = result.union(bounds.expand(blur.radius_x.max(blur.radius_y) * scale));
     }
     if let Some(glow) = fx.glow {
         if glow.strength > 0.0 && glow.color.a > 0 {
-            result = result.union(bounds.expand(glow.radius * scale));
+            result = result.union(bounds.expand(glow.radius_x.max(glow.radius_y) * scale));
         }
     }
     if let Some(shadow) = fx.shadow {
@@ -271,10 +271,12 @@ fn bounds_with_placement_fx(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn placement_target_stage_bounds(
     project: &ProjectV2,
     host_q0rg_id: u16,
     placement: &Placement,
+    resolved_fx: PlacementFx,
     local_frame: u16,
     composed: Affine,
     depth: u8,
@@ -304,14 +306,23 @@ fn placement_target_stage_bounds(
             asset_stage_bounds(project, deformed.as_ref().unwrap_or(asset), composed)
         }
 
-        Target::Q0rg(child_id) if child_id != host_q0rg_id => q0rg_stage_bounds(
-            project,
-            child_id,
-            local_frame,
-            composed,
-            depth + 1,
-            scene_state,
-        ),
+        Target::Q0rg(child_id) if child_id != host_q0rg_id => {
+            let child_frame = crate::v2::resolve_q0rg_playback_frame(
+                project,
+                child_id,
+                local_frame,
+                placement.frame,
+                resolved_fx.q0rg_playback,
+            );
+            q0rg_stage_bounds(
+                project,
+                child_id,
+                child_frame,
+                composed,
+                depth + 1,
+                scene_state,
+            )
+        }
         Target::Q0rg(_) => None,
     }
 }
@@ -355,6 +366,7 @@ fn q0rg_stage_bounds(
                 project,
                 q0rg_id,
                 placement,
+                active.fx,
                 local_frame,
                 composed,
                 depth,
@@ -436,6 +448,7 @@ pub fn runtime_instance_metrics(
                 project,
                 host_q0rg_id,
                 placement,
+                active.fx,
                 local_frame,
                 effective,
                 0,
@@ -487,6 +500,7 @@ pub fn rasterize_placement_fx_scaled_cropped(
         project,
         host_q0rg_id,
         placement,
+        fx,
         local_frame,
         composed_stage_transform,
         0,
@@ -530,6 +544,7 @@ pub fn rasterize_placement_fx_scaled_cropped(
         project,
         host_q0rg_id,
         placement,
+        fx,
         local_frame,
         composed_pixels,
         &mut source,
@@ -598,6 +613,7 @@ pub fn rasterize_placement_outer_fx_scaled_cropped(
         project,
         host_q0rg_id,
         placement,
+        fx,
         local_frame,
         composed_stage_transform,
         0,
@@ -611,6 +627,7 @@ pub fn rasterize_placement_outer_fx_scaled_cropped(
         shadow: fx.shadow,
         audio_gain: fx.audio_gain,
         audio_muted: fx.audio_muted,
+        q0rg_playback: fx.q0rg_playback,
     };
     let fx_bounds = bounds_with_placement_fx(
         target_bounds,
@@ -652,6 +669,7 @@ pub fn rasterize_placement_outer_fx_scaled_cropped(
         project,
         host_q0rg_id,
         placement,
+        fx,
         local_frame,
         composed_pixels,
         &mut source,
@@ -687,7 +705,14 @@ pub fn rasterize_placement_outer_fx_scaled_cropped(
         );
     }
     if let Some(glow) = local_fx.glow {
-        let mask = gaussian_blur_alpha(&source_alpha, local_width, local_height, glow.radius);
+        let mask = gaussian_blur_alpha_xy(
+            &source_alpha,
+            local_width,
+            local_height,
+            glow.radius_x,
+            glow.radius_y,
+            glow.quality,
+        );
         composite_mask_color(
             &mut group,
             &mask,
@@ -793,11 +818,16 @@ fn rasterize_q0rg_frame_with_root_transform(
     for px in hi.chunks_exact_mut(4) {
         px.copy_from_slice(&bg_rgba);
     }
+    let authored_root = if q0rg_id == project.meta.entry_q0rg_id && project.runtime.camera.enabled {
+        Affine::compose(root, project.camera_affine_at(frame))
+    } else {
+        root
+    };
     render_to_buffer(
         project,
         q0rg_id,
         frame,
-        Affine::compose(Affine::from_uniform_scale(ss as f32), root),
+        Affine::compose(Affine::from_uniform_scale(ss as f32), authored_root),
         &mut hi,
         sw,
         sh,
@@ -900,6 +930,7 @@ fn render_to_buffer(
                     project,
                     q0rg_id,
                     placement,
+                    active.fx,
                     local_frame,
                     composed,
                     buffer,
@@ -917,6 +948,7 @@ fn render_to_buffer(
                     project,
                     q0rg_id,
                     placement,
+                    active.fx,
                     local_frame,
                     composed,
                     &mut source,
@@ -939,6 +971,7 @@ fn render_placement_target(
     project: &ProjectV2,
     host_q0rg_id: u16,
     placement: &Placement,
+    resolved_fx: PlacementFx,
     local_frame: u16,
     composed: Affine,
     buffer: &mut [u8],
@@ -984,10 +1017,17 @@ fn render_placement_target(
             }
         }
         Target::Q0rg(child_id) if child_id != host_q0rg_id => {
-            render_to_buffer(
+            let child_frame = crate::v2::resolve_q0rg_playback_frame(
                 project,
                 child_id,
                 local_frame,
+                placement.frame,
+                resolved_fx.q0rg_playback,
+            );
+            render_to_buffer(
+                project,
+                child_id,
+                child_frame,
                 composed,
                 buffer,
                 w,
@@ -1005,12 +1045,26 @@ fn alpha_channel(rgba: &[u8]) -> Vec<u8> {
     rgba.chunks_exact(4).map(|pixel| pixel[3]).collect()
 }
 
-fn gaussian_blur_rgba(source: &[u8], width: u32, height: u32, support_radius: f32) -> Vec<u8> {
-    if source.is_empty() || support_radius <= 0.5 {
+fn gaussian_blur_rgba_xy(
+    source: &[u8],
+    width: u32,
+    height: u32,
+    support_radius_x: f32,
+    support_radius_y: f32,
+    quality: u8,
+) -> Vec<u8> {
+    if source.is_empty() || (support_radius_x <= 0.5 && support_radius_y <= 0.5) {
         return source.to_vec();
     }
     let alpha = alpha_channel(source);
-    let blurred_alpha = gaussian_blur_alpha(&alpha, width, height, support_radius);
+    let blurred_alpha = gaussian_blur_alpha_xy(
+        &alpha,
+        width,
+        height,
+        support_radius_x,
+        support_radius_y,
+        quality,
+    );
     let mut premul_channels = [Vec::new(), Vec::new(), Vec::new()];
     for channel in &mut premul_channels {
         channel.reserve(alpha.len());
@@ -1021,8 +1075,16 @@ fn gaussian_blur_rgba(source: &[u8], width: u32, height: u32, support_radius: f3
             premul_channels[channel].push(((u16::from(pixel[channel]) * a + 127) / 255) as u8);
         }
     }
-    let blurred_channels =
-        premul_channels.map(|channel| gaussian_blur_alpha(&channel, width, height, support_radius));
+    let blurred_channels = premul_channels.map(|channel| {
+        gaussian_blur_alpha_xy(
+            &channel,
+            width,
+            height,
+            support_radius_x,
+            support_radius_y,
+            quality,
+        )
+    });
     let mut out = vec![0u8; source.len()];
     for (index, pixel) in out.chunks_exact_mut(4).enumerate() {
         let a = blurred_alpha[index];
@@ -1211,10 +1273,13 @@ fn placement_fx_in_pixels(fx: PlacementFx, scale: f32) -> PlacementFx {
         opacity: fx.opacity,
         blend_mode: fx.blend_mode,
         blur: fx.blur.map(|blur| crate::v2::BlurFx {
-            radius: blur.radius * scale,
+            radius_x: blur.radius_x * scale,
+            radius_y: blur.radius_y * scale,
+            quality: blur.quality,
         }),
         glow: fx.glow.map(|glow| crate::v2::GlowFx {
-            radius: glow.radius * scale,
+            radius_x: glow.radius_x * scale,
+            radius_y: glow.radius_y * scale,
             ..glow
         }),
         shadow: fx.shadow.map(|shadow| crate::v2::DropShadowFx {
@@ -1225,16 +1290,17 @@ fn placement_fx_in_pixels(fx: PlacementFx, scale: f32) -> PlacementFx {
         }),
         audio_gain: fx.audio_gain,
         audio_muted: fx.audio_muted,
+        q0rg_playback: fx.q0rg_playback,
     }
 }
 
 fn placement_fx_padding(fx: PlacementFx) -> u32 {
     let mut extent = 0.0f32;
     if let Some(blur) = fx.blur {
-        extent = extent.max(blur.radius);
+        extent = extent.max(blur.radius_x.max(blur.radius_y));
     }
     if let Some(glow) = fx.glow {
-        extent = extent.max(glow.radius);
+        extent = extent.max(glow.radius_x.max(glow.radius_y));
     }
     if let Some(shadow) = fx.shadow {
         extent = extent.max(shadow.blur_radius + shadow.offset_x.abs().max(shadow.offset_y.abs()));
@@ -1269,7 +1335,14 @@ fn apply_placement_fx_full(
     }
 
     if let Some(glow) = fx.glow {
-        let glow_mask = gaussian_blur_alpha(&source_alpha, width, height, glow.radius);
+        let glow_mask = gaussian_blur_alpha_xy(
+            &source_alpha,
+            width,
+            height,
+            glow.radius_x,
+            glow.radius_y,
+            glow.quality,
+        );
         composite_mask_color(
             &mut group,
             &glow_mask,
@@ -1282,7 +1355,14 @@ fn apply_placement_fx_full(
     }
 
     let body = if let Some(blur) = fx.blur {
-        gaussian_blur_rgba(source, width, height, blur.radius)
+        gaussian_blur_rgba_xy(
+            source,
+            width,
+            height,
+            blur.radius_x,
+            blur.radius_y,
+            blur.quality,
+        )
     } else {
         source.to_vec()
     };
@@ -1347,9 +1427,15 @@ pub fn active_placement_states_at(
     layer: &crate::v2::Layer,
     frame: u16,
 ) -> Vec<ActivePlacementState> {
+    // Hot path: rendering, hover and selection all ask this question repeatedly.
+    // Finding the held keyframe does not require allocating/sorting the complete
+    // union returned by Layer::keyframe_frames(). A single max scan is exactly
+    // equivalent for the requested frame.
     let Some(keyframe) = layer
-        .keyframe_frames()
-        .into_iter()
+        .explicit_keyframes
+        .iter()
+        .copied()
+        .chain(layer.placements.iter().map(|placement| placement.frame))
         .filter(|candidate| *candidate <= frame)
         .max()
     else {
@@ -1362,27 +1448,68 @@ pub fn active_placement_states_at(
         .enumerate()
         .filter_map(|(index, placement)| (placement.frame == keyframe).then_some(index))
         .collect();
+    if source_indices.is_empty() {
+        return Vec::new();
+    }
+
+    // Most held frames have no tween at all: avoid building any destination
+    // index in that overwhelmingly common case.
+    let has_forward_tween = source_indices.iter().any(|index| {
+        layer.placements[*index]
+            .tween
+            .to_frame()
+            .is_some_and(|to_frame| to_frame > keyframe)
+    });
+    if !has_forward_tween {
+        return source_indices
+            .into_iter()
+            .map(|index| {
+                let placement = &layer.placements[index];
+                ActivePlacementState {
+                    index,
+                    transform: placement.transform,
+                    fx: placement.fx,
+                }
+            })
+            .collect();
+    }
+
+    fn target_key(target: Target) -> (u8, u16) {
+        match target {
+            Target::Asset(id) => (0, id),
+            Target::Q0rg(id) => (1, id),
+        }
+    }
+
+    // Old code re-scanned the full placement vector for every tween source and
+    // re-counted prior same-target occurrences, which is quadratic on dense
+    // tween keyframes. Index destinations once while preserving placement order.
+    let mut destinations: std::collections::HashMap<(u16, u8, u16), Vec<usize>> =
+        std::collections::HashMap::new();
+    for (index, placement) in layer.placements.iter().enumerate() {
+        let (kind, id) = target_key(placement.target);
+        destinations
+            .entry((placement.frame, kind, id))
+            .or_default()
+            .push(index);
+    }
+    let mut occurrences: std::collections::HashMap<(u8, u16), usize> =
+        std::collections::HashMap::new();
 
     source_indices
-        .iter()
-        .enumerate()
-        .map(|(source_order, index)| {
-            let placement = &layer.placements[*index];
+        .into_iter()
+        .map(|index| {
+            let placement = &layer.placements[index];
+            let key = target_key(placement.target);
+            let occurrence = occurrences.entry(key).or_insert(0);
+            let source_occurrence = *occurrence;
+            *occurrence += 1;
             let (transform, fx) = match placement.tween.to_frame() {
                 Some(to_frame) if to_frame > keyframe && frame >= keyframe => {
-                    let occurrence = source_indices[..source_order]
-                        .iter()
-                        .filter(|candidate| {
-                            layer.placements[**candidate].target == placement.target
-                        })
-                        .count();
-                    let target = layer
-                        .placements
-                        .iter()
-                        .filter(|candidate| {
-                            candidate.frame == to_frame && candidate.target == placement.target
-                        })
-                        .nth(occurrence);
+                    let target = destinations
+                        .get(&(to_frame, key.0, key.1))
+                        .and_then(|indices| indices.get(source_occurrence))
+                        .and_then(|target_index| layer.placements.get(*target_index));
                     let denominator = f32::from(to_frame - keyframe);
                     let raw_t = (f32::from(frame - keyframe) / denominator).clamp(0.0, 1.0);
                     let t = placement.tween.easing().sample(raw_t);
@@ -1398,7 +1525,7 @@ pub fn active_placement_states_at(
                 Some(_) | None => (placement.transform, placement.fx),
             };
             ActivePlacementState {
-                index: *index,
+                index,
                 transform,
                 fx,
             }
@@ -1664,9 +1791,6 @@ fn rasterize_vector_appearance_local_impl(
         VectorMaterial::Solid => {
             if include_base {
                 raster_alpha(&to_contours(&vector.paths))
-                    .into_iter()
-                    .map(|alpha| ((u16::from(alpha) * u16::from(fill.a) + 127) / 255) as u8)
-                    .collect::<Vec<_>>()
             } else {
                 vec![0; pixel_count]
             }
@@ -1684,8 +1808,8 @@ fn rasterize_vector_appearance_local_impl(
                     .into_iter()
                     .zip(blurred)
                     .map(|(body, blur)| {
-                        let base = f32::from(body) * f32::from(fill.a) / 255.0;
-                        let halo = f32::from(blur) * f32::from(fill.a) / 255.0 * opacity;
+                        let base = f32::from(body);
+                        let halo = f32::from(blur) * opacity;
                         base.max(halo).clamp(0.0, 255.0).round() as u8
                     })
                     .collect::<Vec<_>>()
@@ -1695,11 +1819,7 @@ fn rasterize_vector_appearance_local_impl(
                 // egui/lyon vector AA and exposes square background gaps.
                 blurred
                     .into_iter()
-                    .map(|blur| {
-                        (f32::from(blur) * f32::from(fill.a) / 255.0 * opacity)
-                            .clamp(0.0, 255.0)
-                            .round() as u8
-                    })
+                    .map(|blur| (f32::from(blur) * opacity).clamp(0.0, 255.0).round() as u8)
                     .collect::<Vec<_>>()
             }
         }
@@ -1716,12 +1836,31 @@ fn rasterize_vector_appearance_local_impl(
         raster_alpha(&to_contours(&appearance.clip_mask))
     };
 
+    let effective_gradient = appearance
+        .fill_gradient
+        .as_ref()
+        .cloned()
+        .map(|mut gradient| {
+            gradient.transform = Affine::compose(appearance.field_transform, gradient.transform);
+            gradient
+        });
     let mut rgba = vec![0u8; pixel_count.saturating_mul(4)];
     for (index, out) in rgba.chunks_exact_mut(4).enumerate() {
+        let x = (index % width as usize) as f32;
+        let y = (index / width as usize) as f32;
+        let local = Vec2::new(
+            local_min.x + (x + 0.5) / pixels_per_unit,
+            local_min.y + (y + 0.5) / pixels_per_unit,
+        );
+        let paint = effective_gradient
+            .as_ref()
+            .map(|gradient| gradient.sample(local))
+            .unwrap_or(fill);
         let visible =
             (u32::from(255 - erase_alpha[index]) * u32::from(clip_alpha[index]) + 127) / 255;
-        let alpha = ((u32::from(material_alpha[index]) * visible + 127) / 255) as u8;
-        out.copy_from_slice(&[fill.r, fill.g, fill.b, alpha]);
+        let alpha =
+            (u32::from(material_alpha[index]) * visible * u32::from(paint.a) + 32_512) / 65_025;
+        out.copy_from_slice(&[paint.r, paint.g, paint.b, alpha.min(255) as u8]);
     }
     Some(RasterizedVectorAppearance {
         rgba,
@@ -1815,12 +1954,30 @@ fn rasterize_vector_body_local(
             appearance.field_transform,
         ))
     };
+    let effective_gradient = appearance
+        .fill_gradient
+        .as_ref()
+        .cloned()
+        .map(|mut gradient| {
+            gradient.transform = Affine::compose(appearance.field_transform, gradient.transform);
+            gradient
+        });
     let mut rgba = vec![0u8; pixel_count.saturating_mul(4)];
     for (index, out) in rgba.chunks_exact_mut(4).enumerate() {
+        let x = (index % width as usize) as f32;
+        let y = (index / width as usize) as f32;
+        let local = Vec2::new(
+            local_min.x + (x + 0.5) / pixels_per_unit,
+            local_min.y + (y + 0.5) / pixels_per_unit,
+        );
+        let paint = effective_gradient
+            .as_ref()
+            .map(|gradient| gradient.sample(local))
+            .unwrap_or(fill);
         let visible =
             (u32::from(clip_alpha[index]) * u32::from(255 - erase_alpha[index]) + 127) / 255;
-        let alpha = (u32::from(body_alpha[index]) * visible * u32::from(fill.a) + 32_512) / 65_025;
-        out.copy_from_slice(&[fill.r, fill.g, fill.b, alpha.min(255) as u8]);
+        let alpha = (u32::from(body_alpha[index]) * visible * u32::from(paint.a) + 32_512) / 65_025;
+        out.copy_from_slice(&[paint.r, paint.g, paint.b, alpha.min(255) as u8]);
     }
     Some(RasterizedVectorAppearance {
         rgba,
@@ -1832,16 +1989,36 @@ fn rasterize_vector_body_local(
 }
 
 fn gaussian_blur_alpha(source: &[u8], width: u32, height: u32, support_radius: f32) -> Vec<u8> {
-    if source.is_empty() || support_radius <= 0.5 {
+    gaussian_blur_alpha_xy(source, width, height, support_radius, support_radius, 3)
+}
+
+fn gaussian_blur_alpha_xy(
+    source: &[u8],
+    width: u32,
+    height: u32,
+    support_radius_x: f32,
+    support_radius_y: f32,
+    quality: u8,
+) -> Vec<u8> {
+    if source.is_empty() || (support_radius_x <= 0.5 && support_radius_y <= 0.5) {
         return source.to_vec();
     }
-    let sigma = (support_radius / 3.5).max(0.45);
-    let radii = gaussian_box_radii(sigma, 3);
+    let passes = usize::from(quality.clamp(1, 15));
+    let radii_x = if support_radius_x <= 0.5 {
+        vec![0; passes]
+    } else {
+        gaussian_box_radii((support_radius_x / 3.5).max(0.45), passes)
+    };
+    let radii_y = if support_radius_y <= 0.5 {
+        vec![0; passes]
+    } else {
+        gaussian_box_radii((support_radius_y / 3.5).max(0.45), passes)
+    };
     let mut current: Vec<f32> = source.iter().map(|value| f32::from(*value)).collect();
     let mut scratch = vec![0.0f32; current.len()];
-    for radius in radii {
-        box_blur_horizontal_zero(&current, &mut scratch, width, height, radius);
-        box_blur_vertical_zero(&scratch, &mut current, width, height, radius);
+    for (radius_x, radius_y) in radii_x.into_iter().zip(radii_y) {
+        box_blur_horizontal_zero(&current, &mut scratch, width, height, radius_x);
+        box_blur_vertical_zero(&scratch, &mut current, width, height, radius_y);
     }
     current
         .into_iter()
@@ -1958,6 +2135,20 @@ fn rasterize_vector(
         let body_ppu = t.uniform_scale().clamp(1.0, 4.0);
         if let Some(body) = rasterize_vector_body_local(v, appearance, body_ppu) {
             composite_appearance_tile(&body, t, buffer, w, h);
+        }
+        if let Some(stroke) = &v.stroke {
+            for path in &v.paths {
+                let polyline_local = flatten_path(path, FLATTEN_SAMPLES);
+                if polyline_local.len() < 2 {
+                    continue;
+                }
+                let world: Vec<Vec2> = polyline_local.iter().map(|point| t.apply(*point)).collect();
+                let half = (stroke.width * 0.5 * t.uniform_scale()).max(0.5);
+                let outline = brush_outline(&world, half, 8);
+                if outline.len() >= 3 {
+                    scanline_fill(&outline, stroke.color, buffer, w, h);
+                }
+            }
         }
         return;
     }
@@ -2340,7 +2531,10 @@ fn blend_pixel(buffer: &mut [u8], idx: usize, c: Rgba) {
 #[cfg(test)]
 mod resolver_tests {
     use super::*;
-    use crate::v2::{Anchor, Layer, Path as VPath, Placement, ProjectMeta, Q0rg, Tween};
+    use crate::v2::{
+        Anchor, GradientFill, GradientKind, GradientStop, Layer, Path as VPath, Placement,
+        ProjectMeta, Q0rg, Tween, VectorAppearance, VectorMaterial,
+    };
 
     #[test]
     fn tween_interpolates_alpha_and_filters_with_the_same_progress() {
@@ -2368,7 +2562,11 @@ mod resolver_tests {
                     tween: Tween::None,
                     fx: PlacementFx {
                         opacity: 0.0,
-                        blur: Some(crate::v2::BlurFx { radius: 20.0 }),
+                        blur: Some(crate::v2::BlurFx {
+                            radius_x: 20.0,
+                            radius_y: 20.0,
+                            quality: 3,
+                        }),
                         glow: Some(crate::v2::GlowFx {
                             color: Rgba {
                                 r: 255,
@@ -2376,8 +2574,10 @@ mod resolver_tests {
                                 b: 0,
                                 a: 255,
                             },
-                            radius: 12.0,
+                            radius_x: 12.0,
+                            radius_y: 12.0,
                             strength: 2.0,
+                            quality: 3,
                         }),
                         ..Default::default()
                     },
@@ -2393,7 +2593,9 @@ mod resolver_tests {
         assert_eq!(middle.len(), 1);
         assert!((middle[0].transform.tx - 50.0).abs() < 1.0e-5);
         assert!((middle[0].fx.opacity - 0.5).abs() < 1.0e-5);
-        assert!((middle[0].fx.blur.expect("blur fades in").radius - 10.0).abs() < 1.0e-5);
+        let middle_blur = middle[0].fx.blur.expect("blur fades in");
+        assert!((middle_blur.radius_x - 10.0).abs() < 1.0e-5);
+        assert!((middle_blur.radius_y - 10.0).abs() < 1.0e-5);
         assert!((middle[0].fx.glow.expect("glow fades in").strength - 1.0).abs() < 1.0e-5);
 
         let end = active_placement_states_at(&layer, 10);
@@ -2409,6 +2611,12 @@ mod resolver_tests {
                 fps: 24,
                 stage_width: 100,
                 stage_height: 100,
+                background_color: Rgba {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                },
                 entry_q0rg_id: 1,
             },
             assets: Vec::new(),
@@ -2442,7 +2650,11 @@ mod resolver_tests {
                             transform: Transform2D::IDENTITY,
                             tween: Tween::None,
                             fx: PlacementFx {
-                                blur: Some(crate::v2::BlurFx { radius: 8.0 }),
+                                blur: Some(crate::v2::BlurFx {
+                                    radius_x: 8.0,
+                                    radius_y: 8.0,
+                                    quality: 3,
+                                }),
                                 ..Default::default()
                             },
                         },
@@ -2469,7 +2681,11 @@ mod resolver_tests {
             },
             tween: Tween::None,
             fx: PlacementFx {
-                blur: Some(crate::v2::BlurFx { radius: 6.0 }),
+                blur: Some(crate::v2::BlurFx {
+                    radius_x: 6.0,
+                    radius_y: 6.0,
+                    quality: 3,
+                }),
                 glow: Some(crate::v2::GlowFx {
                     color: Rgba {
                         r: 255,
@@ -2477,8 +2693,10 @@ mod resolver_tests {
                         b: 10,
                         a: 255,
                     },
-                    radius: 8.0,
+                    radius_x: 8.0,
+                    radius_y: 8.0,
                     strength: 1.0,
+                    quality: 3,
                 }),
                 ..Default::default()
             },
@@ -2489,6 +2707,12 @@ mod resolver_tests {
                 fps: 24,
                 stage_width: 400,
                 stage_height: 300,
+                background_color: Rgba {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                },
                 entry_q0rg_id: 1,
             },
             assets: vec![Asset::Vector(VectorAsset {
@@ -2608,6 +2832,12 @@ mod resolver_tests {
                 fps: 24,
                 stage_width: 200,
                 stage_height: 150,
+                background_color: Rgba {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                },
                 entry_q0rg_id: 1,
             },
             assets: vec![Asset::Vector(VectorAsset {
@@ -2709,7 +2939,11 @@ mod resolver_tests {
             width,
             height,
             PlacementFx {
-                blur: Some(crate::v2::BlurFx { radius: 4.0 }),
+                blur: Some(crate::v2::BlurFx {
+                    radius_x: 4.0,
+                    radius_y: 4.0,
+                    quality: 3,
+                }),
                 ..Default::default()
             },
             1.0,
@@ -2750,8 +2984,10 @@ mod resolver_tests {
                         b: 0,
                         a: 255,
                     },
-                    radius: 7.0,
+                    radius_x: 7.0,
+                    radius_y: 7.0,
                     strength: 1.0,
+                    quality: 3,
                 }),
                 shadow: Some(crate::v2::DropShadowFx {
                     color: Rgba {
@@ -2894,6 +3130,107 @@ mod resolver_tests {
         assert!((active[1].1.tx - 150.0).abs() < 1.0e-5);
     }
 
+    fn active_placement_states_reference(layer: &Layer, frame: u16) -> Vec<ActivePlacementState> {
+        let Some(keyframe) = layer
+            .keyframe_frames()
+            .into_iter()
+            .filter(|candidate| *candidate <= frame)
+            .max()
+        else {
+            return Vec::new();
+        };
+        let source_indices: Vec<usize> = layer
+            .placements
+            .iter()
+            .enumerate()
+            .filter_map(|(index, placement)| (placement.frame == keyframe).then_some(index))
+            .collect();
+        source_indices
+            .iter()
+            .enumerate()
+            .map(|(source_order, index)| {
+                let placement = &layer.placements[*index];
+                let (transform, fx) = match placement.tween.to_frame() {
+                    Some(to_frame) if to_frame > keyframe && frame >= keyframe => {
+                        let occurrence = source_indices[..source_order]
+                            .iter()
+                            .filter(|candidate| {
+                                layer.placements[**candidate].target == placement.target
+                            })
+                            .count();
+                        let target = layer
+                            .placements
+                            .iter()
+                            .filter(|candidate| {
+                                candidate.frame == to_frame && candidate.target == placement.target
+                            })
+                            .nth(occurrence);
+                        let denominator = f32::from(to_frame - keyframe);
+                        let raw_t = (f32::from(frame - keyframe) / denominator).clamp(0.0, 1.0);
+                        let t = placement.tween.easing().sample(raw_t);
+                        let target_transform = target
+                            .map(|candidate| candidate.transform)
+                            .unwrap_or(placement.transform);
+                        let target_fx =
+                            target.map(|candidate| candidate.fx).unwrap_or(placement.fx);
+                        (
+                            lerp_transform(placement.transform, target_transform, t),
+                            placement.fx.lerp_to(target_fx, t),
+                        )
+                    }
+                    Some(_) | None => (placement.transform, placement.fx),
+                };
+                ActivePlacementState {
+                    index: *index,
+                    transform,
+                    fx,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn optimized_active_resolver_matches_previous_semantics() {
+        let make = |frame, target, tx, tween| Placement {
+            instance_id: 0,
+            frame,
+            target,
+            transform: Transform2D {
+                tx,
+                ..Transform2D::IDENTITY
+            },
+            tween,
+            fx: PlacementFx {
+                opacity: (1.0 - tx.abs() * 0.001).clamp(0.1, 1.0),
+                ..PlacementFx::default()
+            },
+        };
+        let layer = Layer {
+            layer_id: 9,
+            name: "resolver".into(),
+            explicit_keyframes: vec![0, 7, 13],
+            placements: vec![
+                make(0, Target::Asset(1), 0.0, Tween::Linear { to_frame: 6 }),
+                make(0, Target::Asset(1), 100.0, Tween::Linear { to_frame: 6 }),
+                make(0, Target::Q0rg(2), 30.0, Tween::Linear { to_frame: 6 }),
+                make(6, Target::Asset(1), 60.0, Tween::None),
+                make(6, Target::Asset(1), 160.0, Tween::None),
+                make(6, Target::Q0rg(2), 90.0, Tween::None),
+                make(10, Target::Asset(3), 12.0, Tween::Linear { to_frame: 12 }),
+                make(12, Target::Asset(3), 44.0, Tween::None),
+                // Backward/degenerate tween destinations must keep source state.
+                make(13, Target::Asset(4), 77.0, Tween::Linear { to_frame: 12 }),
+            ],
+        };
+        for frame in 0..=16 {
+            assert_eq!(
+                active_placement_states_at(&layer, frame),
+                active_placement_states_reference(&layer, frame),
+                "resolver semantics changed at frame {frame}",
+            );
+        }
+    }
+
     #[test]
     fn transparent_source_over_keeps_straight_rgb() {
         let mut pixel = vec![0, 0, 0, 0];
@@ -2935,6 +3272,79 @@ mod resolver_tests {
             .collect(),
             closed: true,
         }
+    }
+
+    #[test]
+    fn gradient_raster_preserves_color_and_per_stop_alpha() {
+        let vector = VectorAsset {
+            asset_id: 1,
+            paths: vec![rectangle_path(0.0, 0.0, 10.0, 10.0)],
+            fill: Some(Rgba {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255,
+            }),
+            stroke: None,
+        };
+        let mut appearance = VectorAppearance {
+            material: VectorMaterial::Solid,
+            erase_mask: Vec::new(),
+            material_source: Vec::new(),
+            clip_mask: Vec::new(),
+            field_transform: Affine::IDENTITY,
+            fill_gradient: Some(GradientFill {
+                kind: GradientKind::Linear,
+                stops: vec![
+                    GradientStop {
+                        position: 0.0,
+                        color: Rgba {
+                            r: 255,
+                            g: 0,
+                            b: 0,
+                            a: 0,
+                        },
+                    },
+                    GradientStop {
+                        position: 1.0,
+                        color: Rgba {
+                            r: 0,
+                            g: 0,
+                            b: 255,
+                            a: 255,
+                        },
+                    },
+                ],
+                transform: Affine {
+                    a11: 5.0,
+                    a12: 0.0,
+                    a21: 0.0,
+                    a22: 5.0,
+                    tx: 5.0,
+                    ty: 5.0,
+                },
+            }),
+        };
+        let linear = rasterize_vector_body_local(&vector, &appearance, 4.0).unwrap();
+        let left = appearance_pixel(&linear, Vec2::new(1.0, 5.0));
+        let middle = appearance_pixel(&linear, Vec2::new(5.0, 5.0));
+        let right = appearance_pixel(&linear, Vec2::new(9.0, 5.0));
+        assert!(left[0] > left[2] && left[3] < middle[3]);
+        assert!((100..=155).contains(&middle[3]), "middle alpha={middle:?}");
+        assert!(right[2] > right[0] && right[3] > middle[3]);
+
+        appearance.fill_gradient.as_mut().unwrap().kind = GradientKind::Radial;
+        let radial = rasterize_vector_body_local(&vector, &appearance, 4.0).unwrap();
+        let center = appearance_pixel(&radial, Vec2::new(5.0, 5.0));
+        let edge = appearance_pixel(&radial, Vec2::new(9.5, 5.0));
+        assert!(
+            center[3] < 20,
+            "radial center should use transparent first stop: {center:?}"
+        );
+        assert!(
+            edge[3] > 200,
+            "radial edge should approach opaque last stop: {edge:?}"
+        );
     }
 
     #[test]
@@ -3011,6 +3421,7 @@ mod resolver_tests {
             material_source: Vec::new(),
             clip_mask: Vec::new(),
             field_transform: crate::transform::Affine::IDENTITY,
+            fill_gradient: None,
         };
         let tile =
             rasterize_vector_appearance_local(&vector, &appearance, 4.0).expect("appearance tile");
@@ -3056,6 +3467,7 @@ mod resolver_tests {
             material_source: Vec::new(),
             clip_mask: Vec::new(),
             field_transform: crate::transform::Affine::IDENTITY,
+            fill_gradient: None,
         };
         let tile = rasterize_vector_halo_local(&vector, &appearance, 4.0).expect("halo tile");
         assert!(
@@ -3114,6 +3526,7 @@ mod resolver_tests {
             material_source: vec![source_path.clone()],
             clip_mask: Vec::new(),
             field_transform: Affine::IDENTITY,
+            fill_gradient: None,
         };
         let shear = Affine {
             a11: 1.0,
@@ -3140,6 +3553,7 @@ mod resolver_tests {
         let wrong_reblur = VectorAppearance {
             field_transform: Affine::IDENTITY,
             material_source: vec![map_path(&source_path, shear)],
+            fill_gradient: None,
             ..base.clone()
         };
         let wrong_tile = rasterize_vector_halo_local(&vector, &wrong_reblur, 4.0).unwrap();
@@ -3210,6 +3624,7 @@ mod resolver_tests {
             material_source: Vec::new(),
             clip_mask: Vec::new(),
             field_transform: crate::transform::Affine::IDENTITY,
+            fill_gradient: None,
         };
         let left_appearance = VectorAppearance {
             material,
@@ -3217,6 +3632,7 @@ mod resolver_tests {
             material_source: vec![original_path.clone()],
             clip_mask: vec![rectangle_path(-20.0, -20.0, 10.0, 40.0)],
             field_transform: crate::transform::Affine::IDENTITY,
+            fill_gradient: None,
         };
         let right_appearance = VectorAppearance {
             material,
@@ -3224,6 +3640,7 @@ mod resolver_tests {
             material_source: vec![original_path],
             clip_mask: vec![rectangle_path(10.0, -20.0, 40.0, 40.0)],
             field_transform: crate::transform::Affine::IDENTITY,
+            fill_gradient: None,
         };
 
         let whole_tile = rasterize_vector_appearance_local(&original, &whole, 4.0).unwrap();
@@ -3290,6 +3707,7 @@ mod resolver_tests {
             material_source: Vec::new(),
             clip_mask: Vec::new(),
             field_transform: crate::transform::Affine::IDENTITY,
+            fill_gradient: None,
         };
         let fragment = VectorAppearance {
             material: whole.material,
@@ -3297,6 +3715,7 @@ mod resolver_tests {
             material_source: vec![source_path],
             clip_mask: vec![rectangle_path(-10.0, 120.0, 20.0, 180.0)],
             field_transform: crate::transform::Affine::IDENTITY,
+            fill_gradient: None,
         };
         let whole_tile = rasterize_vector_halo_local(&vector, &whole, 4.0).unwrap();
         let fragment_tile = rasterize_vector_halo_local(&vector, &fragment, 4.0).unwrap();
@@ -3341,6 +3760,7 @@ mod resolver_tests {
             material_source: Vec::new(),
             clip_mask: Vec::new(),
             field_transform: crate::transform::Affine::IDENTITY,
+            fill_gradient: None,
         };
         let tile =
             rasterize_vector_appearance_local(&vector, &appearance, 4.0).expect("appearance tile");
@@ -3376,6 +3796,7 @@ mod resolver_tests {
                 material_source: Vec::new(),
                 clip_mask: Vec::new(),
                 field_transform: crate::transform::Affine::IDENTITY,
+                fill_gradient: None,
             },
         );
         let project = ProjectV2 {
@@ -3384,6 +3805,12 @@ mod resolver_tests {
                 fps: 24,
                 stage_width: 64,
                 stage_height: 64,
+                background_color: Rgba {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                },
                 entry_q0rg_id: 1,
             },
             assets: vec![Asset::Vector(vector)],
@@ -3464,6 +3891,12 @@ mod resolver_tests {
                 fps: 24,
                 stage_width: 2,
                 stage_height: 2,
+                background_color: Rgba {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                },
                 entry_q0rg_id: 1,
             },
             assets: vec![Asset::Bitmap(BitmapAsset {
@@ -3505,6 +3938,12 @@ mod resolver_tests {
                 fps: 24,
                 stage_width: 2,
                 stage_height: 2,
+                background_color: Rgba {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                },
                 entry_q0rg_id: 1,
             },
             assets: vec![Asset::Bitmap(BitmapAsset {
@@ -3648,6 +4087,12 @@ mod resolver_tests {
                 fps: 24,
                 stage_width: 32,
                 stage_height: 16,
+                background_color: Rgba {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                },
                 entry_q0rg_id: 1,
             },
             assets: vec![vector, rig],
@@ -3734,8 +4179,10 @@ mod resolver_tests {
                     b: 0,
                     a: 255,
                 },
-                radius: 2.0,
+                radius_x: 2.0,
+                radius_y: 2.0,
                 strength: 1.0,
+                quality: 3,
             }),
             ..Default::default()
         };

@@ -17,6 +17,14 @@ pub enum LibraryItem {
     Asset(u16),
 }
 
+/// Drag-and-drop identity for a library row. `LibraryItem` ids are only unique
+/// within one project, so cross-project drags must carry their source tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LibraryDragPayload {
+    pub source_tab_id: u64,
+    pub item: LibraryItem,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibraryRename {
     pub item: LibraryItem,
@@ -56,6 +64,42 @@ pub struct AppearanceTransformSnapshot {
 pub struct TimelineFrameDrag {
     pub q0rg_id: u16,
     pub selection: TimelineSelection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CameraTimelineSelection {
+    pub anchor_frame: u16,
+    pub focus_frame: u16,
+}
+
+impl CameraTimelineSelection {
+    pub const fn single(frame: u16) -> Self {
+        Self {
+            anchor_frame: frame,
+            focus_frame: frame,
+        }
+    }
+
+    pub const fn first_frame(self) -> u16 {
+        if self.anchor_frame < self.focus_frame {
+            self.anchor_frame
+        } else {
+            self.focus_frame
+        }
+    }
+
+    pub const fn last_frame(self) -> u16 {
+        if self.anchor_frame > self.focus_frame {
+            self.anchor_frame
+        } else {
+            self.focus_frame
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CameraFrameDrag {
+    pub selection: CameraTimelineSelection,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,6 +211,12 @@ pub struct PathRef {
     pub path_idx: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorHandleKind {
+    In,
+    Out,
+}
+
 /// Editor-only reference to one authored stroke segment. This never reaches
 /// q1s: once edited, the segment is materialized as ordinary open raw paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,13 +248,14 @@ pub enum Selection {
     /// Marquee selection of several raw-graphics contours. They can share one
     /// Placement/asset; selection still remains path-granular.
     Paths(Vec<PathRef>),
-    /// Flash-style raw fill/outline selection. A closed path may contribute its
-    /// fill and stroke independently, so both vectors intentionally may contain
-    /// the same PathRef. `objects` lets Shift-selection mix raw parts and display
-    /// objects without collapsing the two raw styles back into one contour.
+    /// Flash-style raw fill/outline selection. Whole raw strokes stay path-granular,
+    /// while authored sides of closed stroked shapes stay segment-granular so a
+    /// Shift-selected fill plus one outline side cannot silently become the whole
+    /// outline. objects keeps display-object selection separate from raw parts.
     RawParts {
         fills: Vec<PathRef>,
         strokes: Vec<PathRef>,
+        stroke_segments: Vec<StrokeSegmentRef>,
         objects: Vec<PlacementRef>,
     },
     /// One authored segment of a closed raw outline. Selection itself is
@@ -214,6 +265,15 @@ pub enum Selection {
     /// boundary anchors move together and reshape the fill, matching Animate's
     /// partial raw-shape selection rather than Subselect's whole-path editing.
     PathPoints {
+        path: PathRef,
+        anchor_indices: Vec<usize>,
+        bounds_min: Vec2,
+        bounds_max: Vec2,
+    },
+    /// Subselect's authored anchor/Bezier-point selection. This is deliberately
+    /// distinct from `PathPoints`: leaving Subselect promotes this to the whole
+    /// raw path instead of reinterpreting anchor points as a partial fill area.
+    SubselectPoints {
         path: PathRef,
         anchor_indices: Vec<usize>,
         bounds_min: Vec2,
@@ -314,6 +374,10 @@ pub struct ClipboardPayload {
     /// Standalone raw vector snapshots. Paste assigns fresh asset ids and
     /// keeps them as identity raw-graphics placements.
     pub raw_vectors: Vec<RawVectorClipboard>,
+    /// Center of the copied artwork group in stage coordinates. All pasted
+    /// artwork receives one shared delta from this point, so mixed raw/q0rg
+    /// selections keep their relative spacing instead of collapsing together.
+    pub artwork_center: Option<Vec2>,
     /// Timeline cells or complete layer/folder blocks. This stays project-local
     /// for the same reason as placement targets: ids refer to the open project.
     pub timeline: Option<TimelineClipboard>,
@@ -406,9 +470,17 @@ impl ProjectState {
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("{} (untitled)", self.project.meta.name));
+            .unwrap_or_else(|| {
+                let name = self.project.meta.name.trim();
+                let name = if name.is_empty() { "untitled" } else { name };
+                if name.to_ascii_lowercase().ends_with(".q1s") {
+                    name.to_string()
+                } else {
+                    format!("{name}.q1s")
+                }
+            });
         let dirty = if self.dirty { "*" } else { "" };
-        format!("{}{} - q0editor", dirty, truncate_label(&path, 72))
+        format!("{}{} - q0editor", truncate_label(&path, 72), dirty)
     }
 }
 
@@ -561,6 +633,15 @@ pub enum ToolState {
         start_path: VPath,
         start_bounds_min: Vec2,
         start_bounds_max: Vec2,
+    },
+    /// Direct-selection drag of one authored Bezier control handle. The source
+    /// path snapshot keeps each pointer tick absolute, so dragging cannot
+    /// accumulate numeric drift or mutate the opposite handle accidentally.
+    DraggingSubselectHandle {
+        path: PathRef,
+        anchor_idx: usize,
+        handle: AnchorHandleKind,
+        start_path: VPath,
     },
     /// Active while the user drags a transform handle around the selection.
     /// `start_*` snapshots are captured on drag-start so each frame's update
@@ -726,6 +807,12 @@ pub struct Session {
     pub timeline_selection: Option<TimelineSelection>,
     /// Selected layer rows for layer clipboard operations.
     pub timeline_layer_selection: Option<TimelineLayerSelection>,
+    /// Project-level camera track selection. Kept separate from layer ids so
+    /// the camera never becomes selectable artwork.
+    pub camera_track_selected: bool,
+    /// Frame-cell selection inside the camera row. It mirrors ordinary
+    /// timeline selection without inventing a fake layer id.
+    pub camera_timeline_selection: Option<CameraTimelineSelection>,
     pub current_tool: Tool,
     pub tool_state: ToolState,
     pub selection: Selection,
@@ -743,6 +830,7 @@ pub struct Session {
     pub frame_label_edit: Option<FrameLabelEdit>,
     pub timeline_layer_drag: Option<TimelineLayerDrag>,
     pub timeline_frame_drag: Option<TimelineFrameDrag>,
+    pub camera_frame_drag: Option<CameraFrameDrag>,
     pub playing: bool,
     pub last_tick: Instant,
     /// Persistent q0lang state for editor playback preview. Scrubbing does not
@@ -796,6 +884,10 @@ pub struct Session {
     pub viewport: Viewport,
     /// Clipboard for display objects, raw graphics, or a mixed selection.
     pub clipboard: Option<ClipboardPayload>,
+    /// Last pointer position observed over the stage canvas, expressed in stage
+    /// coordinates. Keyboard paste uses this even though shortcut handling runs
+    /// before the immediate-mode stage widget is rebuilt for the current frame.
+    pub stage_cursor: Option<Vec2>,
     pub onion: OnionSettings,
     /// True while the q0lang script editor window is open. Driven by
     /// `Action::OpenQ0langEditor` / the close button on the window itself.
@@ -846,6 +938,8 @@ impl Session {
             pending_timeline_frame: None,
             timeline_selection: None,
             timeline_layer_selection: None,
+            camera_track_selected: false,
+            camera_timeline_selection: None,
             current_tool: Tool::Select,
             tool_state: ToolState::Idle,
             selection: Selection::None,
@@ -862,6 +956,7 @@ impl Session {
             frame_label_edit: None,
             timeline_layer_drag: None,
             timeline_frame_drag: None,
+            camera_frame_drag: None,
             playing: false,
             last_tick: Instant::now(),
             preview_q0lang_runtime: q0s_format::q0lang::runtime::Runtime::new(),
@@ -907,6 +1002,7 @@ impl Session {
             tween_warning: None,
             viewport: Viewport::identity(),
             clipboard: None,
+            stage_cursor: None,
             onion: OnionSettings::default(),
             show_q0lang_editor: false,
             q0lang_target: None,
@@ -980,6 +1076,9 @@ impl Session {
                 self.pending_timeline_frame = None;
                 self.timeline_selection = None;
                 self.timeline_layer_selection = None;
+                self.camera_track_selected = false;
+                self.camera_timeline_selection = None;
+                self.camera_frame_drag = None;
                 self.timeline_frame_drag = None;
                 self.reset_q0lang_preview();
             } else if let Some(selection) = self.timeline_selection {
@@ -1003,6 +1102,12 @@ impl Session {
         } else {
             self.timeline_selection = None;
             self.pending_timeline_frame = None;
+            self.camera_track_selected = false;
+        }
+        if self.current_q0rg_id != project.meta.entry_q0rg_id || !project.runtime.camera.enabled {
+            self.camera_track_selected = false;
+            self.camera_timeline_selection = None;
+            self.camera_frame_drag = None;
         }
         if self.timeline_layer_selection.is_some_and(|selection| {
             !project
@@ -1120,12 +1225,21 @@ impl Session {
             Selection::RawParts {
                 ref mut fills,
                 ref mut strokes,
+                ref mut stroke_segments,
                 ref mut objects,
             } => {
                 fills.retain(|reference| path_ref_exists(project, *reference));
                 strokes.retain(|reference| path_ref_exists(project, *reference));
+                stroke_segments.retain(|segment| {
+                    path_segment_count(project, segment.path)
+                        .is_some_and(|count| segment.segment_idx < count)
+                });
                 objects.retain(|reference| placement_ref_exists(project, *reference));
-                if fills.is_empty() && strokes.is_empty() && objects.is_empty() {
+                if fills.is_empty()
+                    && strokes.is_empty()
+                    && stroke_segments.is_empty()
+                    && objects.is_empty()
+                {
                     self.selection = Selection::None;
                 }
             }
@@ -1148,6 +1262,20 @@ impl Session {
                     if anchor_indices.is_empty() {
                         self.selection = Selection::None;
                     }
+                }
+            }
+            Selection::SubselectPoints {
+                path,
+                ref mut anchor_indices,
+                ..
+            } => {
+                if !path_ref_exists(project, path) {
+                    self.selection = Selection::None;
+                } else if let Some(anchor_count) = path_anchor_count(project, path) {
+                    // An empty Subselect point list intentionally means "show all
+                    // authored anchors, none selected"; unlike partial V-selection,
+                    // it remains a valid active contour.
+                    anchor_indices.retain(|index| *index < anchor_count);
                 }
             }
             Selection::RawArea {
@@ -1252,6 +1380,83 @@ impl Session {
                     .unwrap_or(false)
         };
 
+        let selection_is_already_valid = match &self.selection {
+            Selection::Placement {
+                q0rg_id,
+                layer_id,
+                placement_idx,
+            } => placement_on_current_frame(PlacementRef {
+                q0rg_id: *q0rg_id,
+                layer_id: *layer_id,
+                placement_idx: *placement_idx,
+            }),
+            Selection::Path {
+                q0rg_id,
+                layer_id,
+                placement_idx,
+                path_idx,
+            } => {
+                let path = PathRef {
+                    q0rg_id: *q0rg_id,
+                    layer_id: *layer_id,
+                    placement_idx: *placement_idx,
+                    path_idx: *path_idx,
+                };
+                placement_on_current_frame(PlacementRef {
+                    q0rg_id: *q0rg_id,
+                    layer_id: *layer_id,
+                    placement_idx: *placement_idx,
+                }) && path_ref_exists(project, path)
+            }
+            Selection::Paths(refs) => {
+                !refs.is_empty()
+                    && refs.iter().all(|r| {
+                        placement_on_current_frame(PlacementRef {
+                            q0rg_id: r.q0rg_id,
+                            layer_id: r.layer_id,
+                            placement_idx: r.placement_idx,
+                        }) && path_ref_exists(project, *r)
+                    })
+            }
+            Selection::PathPoints { path, .. } | Selection::SubselectPoints { path, .. } => {
+                placement_on_current_frame(PlacementRef {
+                    q0rg_id: path.q0rg_id,
+                    layer_id: path.layer_id,
+                    placement_idx: path.placement_idx,
+                }) && path_ref_exists(project, *path)
+            }
+            Selection::RawArea {
+                placements,
+                objects,
+                ..
+            } => {
+                // RawArea with no raw surfaces intentionally normalises to
+                // Placement/Multi below; otherwise an unchanged area can stay put.
+                !placements.is_empty()
+                    && placements
+                        .iter()
+                        .chain(objects)
+                        .all(|placement| placement_on_current_frame(*placement))
+            }
+            Selection::Multi(refs) => {
+                refs.len() >= 2
+                    && refs
+                        .iter()
+                        .all(|placement| placement_on_current_frame(*placement))
+            }
+            // These variants were not frame-normalised by the old match either.
+            // Returning here preserves that behaviour without cloning their payloads.
+            Selection::None
+            | Selection::Asset(_)
+            | Selection::Q0rg(_)
+            | Selection::RawParts { .. }
+            | Selection::StrokeSegment(_)
+            | Selection::Mixed { .. } => true,
+        };
+        if selection_is_already_valid {
+            return;
+        }
+
         let next = match self.selection.clone() {
             Selection::Placement {
                 q0rg_id,
@@ -1321,6 +1526,28 @@ impl Session {
                 };
                 if placement_on_current_frame(placement) && path_ref_exists(project, path) {
                     Selection::PathPoints {
+                        path,
+                        anchor_indices,
+                        bounds_min,
+                        bounds_max,
+                    }
+                } else {
+                    Selection::None
+                }
+            }
+            Selection::SubselectPoints {
+                path,
+                anchor_indices,
+                bounds_min,
+                bounds_max,
+            } => {
+                let placement = PlacementRef {
+                    q0rg_id: path.q0rg_id,
+                    layer_id: path.layer_id,
+                    placement_idx: path.placement_idx,
+                };
+                if placement_on_current_frame(placement) && path_ref_exists(project, path) {
+                    Selection::SubselectPoints {
                         path,
                         anchor_indices,
                         bounds_min,
@@ -1556,6 +1783,23 @@ fn history_stable_selection(from: &ProjectV2, to: &ProjectV2, selection: Selecti
         } => {
             if stable_path_ref(from, to, path) {
                 Selection::PathPoints {
+                    path,
+                    anchor_indices,
+                    bounds_min,
+                    bounds_max,
+                }
+            } else {
+                Selection::None
+            }
+        }
+        Selection::SubselectPoints {
+            path,
+            anchor_indices,
+            bounds_min,
+            bounds_max,
+        } => {
+            if stable_path_ref(from, to, path) {
+                Selection::SubselectPoints {
                     path,
                     anchor_indices,
                     bounds_min,
@@ -1816,6 +2060,12 @@ pub fn default_project() -> ProjectV2 {
             fps: 24,
             stage_width: DEFAULT_STAGE_WIDTH,
             stage_height: DEFAULT_STAGE_HEIGHT,
+            background_color: q0s_format::v2::Rgba {
+                r: 255,
+                g: 255,
+                b: 255,
+                a: 255,
+            },
             entry_q0rg_id: 1,
         },
         assets: Vec::new(),
