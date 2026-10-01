@@ -61,6 +61,7 @@ struct FxPlacementTexture {
 pub struct TextureCache {
     by_asset_id: HashMap<u16, TextureHandle>,
     by_q0v_frame: HashMap<(u16, u32), TextureHandle>,
+    masked_q0rg_frames: HashMap<(u16, u16, u32, u32), TextureHandle>,
     q0v_media: HashMap<u16, q0video::q0v::Q0vFile>,
     fx_placement_textures: HashMap<FxPlacementKey, FxPlacementTexture>,
     fx_serial: u64,
@@ -70,6 +71,7 @@ impl TextureCache {
     pub fn invalidate(&mut self) {
         self.by_asset_id.clear();
         self.by_q0v_frame.clear();
+        self.masked_q0rg_frames.clear();
         self.q0v_media.clear();
         self.fx_placement_textures.clear();
     }
@@ -172,19 +174,92 @@ pub fn paint_v2_frame_with_runtime_overrides(
         );
     }
     let view = StageView { origin, scale };
-    paint_q0rg(
-        painter,
-        ctx,
-        project,
-        q0rg_id,
-        frame,
-        authored_root_affine(project, q0rg_id, frame),
-        &view,
-        0,
-        cache,
-        rig_overrides,
-        scene_state,
-    );
+    if q0rg_contains_mask(project, q0rg_id, &mut std::collections::HashSet::new(), 0) {
+        let stage_rect = Rect::from_min_size(origin, drawn);
+        let (width, height) = fx_raster_size(stage_rect, ctx);
+        let key = (q0rg_id, frame, width, height);
+        let can_reuse = rig_overrides.is_empty() && scene_state.is_empty();
+        if !can_reuse || !cache.masked_q0rg_frames.contains_key(&key) {
+            if !can_reuse {
+                cache.masked_q0rg_frames.clear();
+            } else if cache.masked_q0rg_frames.len() >= 3 {
+                if let Some(oldest) = cache
+                    .masked_q0rg_frames
+                    .keys()
+                    .copied()
+                    .max_by_key(|cached| cached.1.abs_diff(frame))
+                {
+                    cache.masked_q0rg_frames.remove(&oldest);
+                }
+            }
+            let rgba = q0s_format::raster::rasterize_q0rg_frame_with_runtime_state(
+                project,
+                q0rg_id,
+                frame,
+                width,
+                height,
+                1,
+                [0, 0, 0, 0],
+                rig_overrides,
+                scene_state,
+            );
+            let image = ColorImage::from_rgba_unmultiplied(
+                [width as usize, height as usize],
+                &rgba,
+            );
+            let texture = ctx.load_texture(
+                format!("masked-player-q0rg-{q0rg_id}-frame-{frame}"),
+                image,
+                TextureOptions::LINEAR,
+            );
+            cache.masked_q0rg_frames.insert(key, texture);
+        }
+        if let Some(texture) = cache.masked_q0rg_frames.get(&key) {
+            painter.image(
+                texture.id(),
+                stage_rect,
+                Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
+    } else {
+        paint_q0rg(
+            painter,
+            ctx,
+            project,
+            q0rg_id,
+            frame,
+            authored_root_affine(project, q0rg_id, frame),
+            &view,
+            0,
+            cache,
+            rig_overrides,
+            scene_state,
+        );
+    }
+}
+
+fn q0rg_contains_mask(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    visited: &mut std::collections::HashSet<u16>,
+    depth: u8,
+) -> bool {
+    if depth > Q0RG_RECURSION_LIMIT || !visited.insert(q0rg_id) {
+        return false;
+    }
+    let Some(q0rg) = project.q0rgs.iter().find(|q0rg| q0rg.q0rg_id == q0rg_id) else {
+        return false;
+    };
+    q0rg.layers.iter().any(|layer| {
+        project.layer_metadata(q0rg_id, layer.layer_id).kind == q0s_format::v2::LayerKind::Mask
+            || layer.placements.iter().any(|placement| match placement.target {
+                Target::Q0rg(child_id) => {
+                    q0rg_contains_mask(project, child_id, visited, depth + 1)
+                }
+                Target::Asset(_) => false,
+            })
+    })
 }
 
 fn authored_root_affine(project: &ProjectV2, q0rg_id: u16, frame: u16) -> Affine {
@@ -1127,6 +1202,7 @@ mod tests {
                     script: String::new(),
                     layers: vec![Layer {
                         layer_id: 1,
+                        timeline_frame_count: None,
                         name: "player".into(),
                         explicit_keyframes: vec![0],
                         placements: vec![Placement {
@@ -1150,6 +1226,7 @@ mod tests {
                     script: String::new(),
                     layers: vec![Layer {
                         layer_id: 2,
+                        timeline_frame_count: None,
                         name: "body".into(),
                         explicit_keyframes: vec![0],
                         placements: vec![Placement {
@@ -1258,6 +1335,7 @@ mod tests {
                 script: String::new(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "art".into(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![Placement {

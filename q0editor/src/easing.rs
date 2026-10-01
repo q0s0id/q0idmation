@@ -1152,6 +1152,7 @@ mod tests {
         project.q0rgs[0].layers[0].placements[0].tween = Tween::Linear { to_frame: 6 };
         project.q0rgs[0].layers.push(q0s_format::v2::Layer {
             layer_id: 2,
+            timeline_frame_count: None,
             name: "second".to_string(),
             explicit_keyframes: Vec::new(),
             placements: vec![
@@ -1194,6 +1195,7 @@ mod tests {
             .layers
             .push(q0s_format::v2::Layer {
                 layer_id: 2,
+                timeline_frame_count: None,
                 name: "second".to_string(),
                 explicit_keyframes: Vec::new(),
                 placements: vec![

@@ -10,6 +10,7 @@ pub mod brush;
 pub mod easing;
 pub mod export;
 pub mod file_io;
+pub mod hotkeys;
 pub mod l10n;
 pub mod library_transfer;
 pub mod panels;
@@ -28,6 +29,7 @@ mod text_fonts;
 pub mod text_tool;
 pub mod theme;
 pub mod timeline_edit;
+mod ui;
 
 pub mod tools;
 

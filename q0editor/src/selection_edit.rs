@@ -118,7 +118,7 @@ pub fn paste_offset_for_target(payload: &ClipboardPayload, target_center: Vec2) 
         })
 }
 
-fn selected_object_placements(project: &ProjectV2, selection: &Selection) -> Vec<Placement> {
+pub fn selected_object_refs(project: &ProjectV2, selection: &Selection) -> Vec<PlacementRef> {
     let refs: Vec<PlacementRef> = match selection {
         Selection::Placement {
             q0rg_id,
@@ -134,7 +134,35 @@ fn selected_object_placements(project: &ProjectV2, selection: &Selection) -> Vec
         Selection::RawArea { objects, .. } => objects.clone(),
         _ => Vec::new(),
     };
-    refs.into_iter()
+    let mut refs: Vec<_> = refs
+        .into_iter()
+        .filter(|reference| placement_clone(project, *reference).is_some())
+        .collect();
+    refs.sort_by_key(|reference| {
+        let q0rg_order = project
+            .q0rgs
+            .iter()
+            .position(|q0rg| q0rg.q0rg_id == reference.q0rg_id)
+            .unwrap_or(usize::MAX);
+        let layer_order = project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == reference.q0rg_id)
+            .and_then(|q0rg| {
+                q0rg.layers
+                    .iter()
+                    .position(|layer| layer.layer_id == reference.layer_id)
+            })
+            .unwrap_or(usize::MAX);
+        (q0rg_order, layer_order, reference.placement_idx)
+    });
+    refs.dedup();
+    refs
+}
+
+fn selected_object_placements(project: &ProjectV2, selection: &Selection) -> Vec<Placement> {
+    selected_object_refs(project, selection)
+        .into_iter()
         .filter_map(|reference| placement_clone(project, reference))
         .collect()
 }
@@ -399,12 +427,27 @@ pub fn paste_payload(
     payload: &ClipboardPayload,
     offset: Vec2,
 ) -> PasteResult {
+    paste_payload_with_depth(project, q0rg_id, layer_id, frame, payload, offset, &[])
+}
+
+pub fn paste_payload_with_depth(
+    project: &mut ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    frame: u16,
+    payload: &ClipboardPayload,
+    offset: Vec2,
+    source_depths: &[usize],
+) -> PasteResult {
     let mut result = PasteResult::default();
-    if crate::tools::materialize_layer_keyframe_for_edit(project, q0rg_id, layer_id, frame)
-        .is_none()
-    {
+    let Some(materialized) =
+        crate::tools::materialize_layer_keyframe_for_edit(project, q0rg_id, layer_id, frame)
+    else {
         return result;
-    }
+    };
+    let preserve_depth =
+        source_depths.len() == payload.placements.len() && !source_depths.is_empty();
+    let mut active_indices: Vec<usize> = materialized.values().copied().collect();
 
     for source in &payload.raw_vectors {
         let asset_id = next_asset_id(project);
@@ -440,7 +483,7 @@ pub fn paste_payload(
             continue;
         };
         let placement_idx = layer.placements.len();
-        layer.placements.push(Placement {
+        layer.push_placement(Placement {
             instance_id: 0,
             frame,
             target: Target::Asset(asset_id),
@@ -483,7 +526,8 @@ pub fn paste_payload(
     let mut next_instance_id = 1_u32;
     let mut instance_remap = HashMap::<u32, u32>::new();
     let mut pasted_objects = Vec::with_capacity(payload.placements.len());
-    for source in &payload.placements {
+    let mut pasted_depths = Vec::with_capacity(payload.placements.len());
+    for (index, source) in payload.placements.iter().enumerate() {
         let mut placement = source.clone();
         if placement.instance_id != 0 {
             let fresh = match instance_remap.get(&placement.instance_id).copied() {
@@ -508,6 +552,9 @@ pub fn paste_payload(
         placement.transform.tx += offset.x;
         placement.transform.ty += offset.y;
         pasted_objects.push(placement);
+        if preserve_depth {
+            pasted_depths.push(source_depths[index]);
+        }
     }
 
     if let Some(layer) = project
@@ -520,13 +567,64 @@ pub fn paste_payload(
                 .find(|layer| layer.layer_id == layer_id)
         })
     {
-        for placement in pasted_objects {
-            let placement_idx = layer.placements.len();
-            layer.placements.push(placement);
+        let mut tail_inserted = 0_usize;
+        for (object_index, placement) in pasted_objects.into_iter().enumerate() {
+            let insertion_idx = if preserve_depth && !active_indices.is_empty() {
+                let depth = pasted_depths[object_index];
+                if depth < active_indices.len() {
+                    active_indices[depth]
+                } else {
+                    let after_active = active_indices
+                        .last()
+                        .copied()
+                        .unwrap_or(layer.placements.len())
+                        .saturating_add(1);
+                    after_active.saturating_add(tail_inserted)
+                }
+            } else {
+                layer.placements.len()
+            };
+            if preserve_depth
+                && !active_indices.is_empty()
+                && pasted_depths[object_index] >= active_indices.len()
+            {
+                tail_inserted += 1;
+            }
+            let insertion_idx = insertion_idx.min(layer.placements.len());
+            layer.placements.insert(insertion_idx, placement);
+            for active_idx in &mut active_indices {
+                if *active_idx >= insertion_idx {
+                    *active_idx += 1;
+                }
+            }
+            for reference in &mut result.raw_placements {
+                if reference.q0rg_id == q0rg_id
+                    && reference.layer_id == layer_id
+                    && reference.placement_idx >= insertion_idx
+                {
+                    reference.placement_idx += 1;
+                }
+            }
+            for reference in &mut result.raw_paths {
+                if reference.q0rg_id == q0rg_id
+                    && reference.layer_id == layer_id
+                    && reference.placement_idx >= insertion_idx
+                {
+                    reference.placement_idx += 1;
+                }
+            }
+            for reference in &mut result.objects {
+                if reference.q0rg_id == q0rg_id
+                    && reference.layer_id == layer_id
+                    && reference.placement_idx >= insertion_idx
+                {
+                    reference.placement_idx += 1;
+                }
+            }
             result.objects.push(PlacementRef {
                 q0rg_id,
                 layer_id,
-                placement_idx,
+                placement_idx: insertion_idx,
             });
         }
     }
@@ -1034,6 +1132,7 @@ mod tests {
                 script: String::new(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "Layer 1".into(),
                     explicit_keyframes: vec![0],
                     placements: vec![Placement {
@@ -1115,6 +1214,7 @@ mod tests {
             script: String::new(),
             layers: vec![Layer {
                 layer_id: 1,
+                timeline_frame_count: None,
                 name: "Child Layer".into(),
                 explicit_keyframes: vec![0],
                 placements: vec![Placement {
@@ -1127,7 +1227,7 @@ mod tests {
                 }],
             }],
         });
-        project.q0rgs[0].layers[0].placements.push(Placement {
+        project.q0rgs[0].layers[0].push_placement(Placement {
             instance_id: 42,
             frame: 0,
             target: Target::Q0rg(2),

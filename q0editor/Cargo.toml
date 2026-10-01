@@ -13,6 +13,7 @@ default = ["appearance-mask-eraser"]
 appearance-mask-eraser = []
 
 [dependencies]
+base64 = "0.22"
 q0credits = { path = "../q0credits" }
 q0glblend = { path = "../q0glblend" }
 eframe = "0.27"

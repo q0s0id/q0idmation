@@ -66,7 +66,7 @@ fn seed_simple_shape(app: &mut EditorApp) -> u16 {
         .iter_mut()
         .find(|l| l.layer_id == layer_id)
         .unwrap();
-    layer.placements.push(Placement {
+    layer.push_placement(Placement {
         instance_id: 0,
         frame: 0,
         target: Target::Asset(asset_id),
@@ -804,6 +804,7 @@ fn place_q0rg_instance_adds_placement_at_stage_center() {
         script: String::new(),
         layers: vec![q0s_format::v2::Layer {
             layer_id: 1,
+            timeline_frame_count: None,
             name: "Layer 1".to_string(),
             explicit_keyframes: Vec::new(),
             placements: Vec::new(),
@@ -843,6 +844,7 @@ fn place_q0rg_instance_rejects_indirect_cycle() {
         script: String::new(),
         layers: vec![q0s_format::v2::Layer {
             layer_id: 1,
+            timeline_frame_count: None,
             name: "Layer 1".to_string(),
             explicit_keyframes: Vec::new(),
             placements: vec![Placement {
@@ -891,6 +893,7 @@ fn enter_then_breadcrumb_jump_returns_to_root() {
         script: String::new(),
         layers: vec![q0s_format::v2::Layer {
             layer_id: 1,
+            timeline_frame_count: None,
             name: "Layer 1".to_string(),
             explicit_keyframes: Vec::new(),
             placements: Vec::new(),
@@ -1312,6 +1315,7 @@ fn seed_mixed_raw_area(app: &mut EditorApp) -> (u16, u16, usize, usize) {
         script: String::new(),
         layers: vec![q0s_format::v2::Layer {
             layer_id: 1,
+            timeline_frame_count: None,
             name: "Layer 1".to_string(),
             explicit_keyframes: Vec::new(),
             placements: vec![Placement {
@@ -1339,7 +1343,7 @@ fn seed_mixed_raw_area(app: &mut EditorApp) -> (u16, u16, usize, usize) {
         .find(|layer| layer.layer_id == layer_id)
         .unwrap();
     let raw_idx = layer.placements.len();
-    layer.placements.push(Placement {
+    layer.push_placement(Placement {
         instance_id: 0,
         frame: 0,
         target: Target::Asset(raw_asset_id),
@@ -1348,7 +1352,7 @@ fn seed_mixed_raw_area(app: &mut EditorApp) -> (u16, u16, usize, usize) {
         fx: Default::default(),
     });
     let object_idx = layer.placements.len();
-    layer.placements.push(Placement {
+    layer.push_placement(Placement {
         instance_id: 0,
         frame: 0,
         target: Target::Q0rg(child_q0rg_id),

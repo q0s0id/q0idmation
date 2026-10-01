@@ -38,6 +38,24 @@ pub struct GpuCallbackTiming {
     pub cpu_samples: u64,
     pub cpu_total_ns: u64,
     pub cpu_max_ns: u64,
+    pub cpu_max_region_width: i32,
+    pub cpu_max_region_height: i32,
+    pub cpu_max_blur_passes: u64,
+    pub cpu_max_glow_passes: u64,
+    pub cpu_max_primitive_count: u64,
+    pub cpu_max_vertex_count: u64,
+    pub cpu_max_index_count: u64,
+    pub cpu_max_target_setup_ns: u64,
+    pub cpu_max_raster_ns: u64,
+    pub cpu_max_raster_clear_ns: u64,
+    pub cpu_max_raster_upload_ns: u64,
+    pub cpu_max_raster_draw_ns: u64,
+    pub cpu_max_raster_resolve_ns: u64,
+    pub cpu_max_raster_other_ns: u64,
+    pub cpu_max_filter_ns: u64,
+    pub cpu_max_composite_ns: u64,
+    pub filtered_cache_hits: u64,
+    pub filtered_cache_misses: u64,
 }
 
 /// Timer queries sample one of every sixteen filtered vector-group callbacks.
@@ -91,12 +109,72 @@ fn record_gpu_filter_sample_drop() {
     });
 }
 
-fn record_gpu_filter_callback_cpu(ns: u64) {
+fn record_gpu_filter_callback_cpu(
+    ns: u64,
+    region: CallbackRegion,
+    fx: VectorGroupFx,
+    primitive_count: u64,
+    vertex_count: u64,
+    index_count: u64,
+    target_setup_ns: u64,
+    raster_ns: u64,
+    raster_clear_ns: u64,
+    raster_upload_ns: u64,
+    raster_draw_ns: u64,
+    raster_resolve_ns: u64,
+    filter_ns: u64,
+    composite_ns: u64,
+) {
     GPU_CALLBACK_TIMING.with(|diagnostics| {
         let mut diagnostics = diagnostics.borrow_mut();
         diagnostics.cpu_samples = diagnostics.cpu_samples.saturating_add(1);
         diagnostics.cpu_total_ns = diagnostics.cpu_total_ns.saturating_add(ns);
-        diagnostics.cpu_max_ns = diagnostics.cpu_max_ns.max(ns);
+        if ns > diagnostics.cpu_max_ns {
+            diagnostics.cpu_max_ns = ns;
+            diagnostics.cpu_max_region_width = region.width;
+            diagnostics.cpu_max_region_height = region.height;
+            diagnostics.cpu_max_blur_passes = if fx.has_blur() {
+                u64::from(fx.blur_quality.clamp(1, 15)).saturating_mul(2)
+            } else {
+                0
+            };
+            diagnostics.cpu_max_glow_passes = if fx.has_glow() {
+                u64::from(fx.glow_quality.clamp(1, 15)).saturating_mul(2)
+            } else {
+                0
+            };
+            diagnostics.cpu_max_primitive_count = primitive_count;
+            diagnostics.cpu_max_vertex_count = vertex_count;
+            diagnostics.cpu_max_index_count = index_count;
+            diagnostics.cpu_max_target_setup_ns = target_setup_ns;
+            diagnostics.cpu_max_raster_ns = raster_ns;
+            diagnostics.cpu_max_raster_clear_ns = raster_clear_ns;
+            diagnostics.cpu_max_raster_upload_ns = raster_upload_ns;
+            diagnostics.cpu_max_raster_draw_ns = raster_draw_ns;
+            diagnostics.cpu_max_raster_resolve_ns = raster_resolve_ns;
+            diagnostics.cpu_max_raster_other_ns = raster_ns.saturating_sub(
+                raster_clear_ns
+                    .saturating_add(raster_upload_ns)
+                    .saturating_add(raster_draw_ns)
+                    .saturating_add(raster_resolve_ns),
+            );
+            diagnostics.cpu_max_filter_ns = filter_ns;
+            diagnostics.cpu_max_composite_ns = composite_ns;
+        }
+    });
+}
+
+fn record_gpu_filter_cache_hit() {
+    GPU_CALLBACK_TIMING.with(|diagnostics| {
+        let mut diagnostics = diagnostics.borrow_mut();
+        diagnostics.filtered_cache_hits = diagnostics.filtered_cache_hits.saturating_add(1);
+    });
+}
+
+fn record_gpu_filter_cache_miss() {
+    GPU_CALLBACK_TIMING.with(|diagnostics| {
+        let mut diagnostics = diagnostics.borrow_mut();
+        diagnostics.filtered_cache_misses = diagnostics.filtered_cache_misses.saturating_add(1);
     });
 }
 
@@ -209,6 +287,28 @@ struct CachedSolidMeshBuffers {
     ebo: glow::Buffer,
     index_count: i32,
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+struct CachedFilteredGroup {
+    texture: glow::Texture,
+    framebuffer: glow::Framebuffer,
+    width: i32,
+    height: i32,
+    bytes: usize,
+    last_used: u64,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+const FILTERED_GROUP_CACHE_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+
+#[cfg(not(target_arch = "wasm32"))]
+const FILTERED_GROUP_CACHE_MAX_ENTRIES: usize = 512;
+
+#[cfg(not(target_arch = "wasm32"))]
+const FILTERED_GROUP_CACHE_MAX_SIGNATURE_WORDS: usize = 32 * 1024;
+
+#[cfg(not(target_arch = "wasm32"))]
+const FILTERED_GROUP_CACHE_PENDING_BUDGET_WORDS: usize = 128 * 1024;
 
 #[cfg(not(target_arch = "wasm32"))]
 struct GpuFilterTimerSlot {
@@ -332,6 +432,7 @@ struct GlResources {
     group_vao: glow::VertexArray,
     group_vbo: glow::Buffer,
     group_ebo: glow::Buffer,
+    group_vertex_data: Vec<f32>,
     group_texture: glow::Texture,
     group_fbo: glow::Framebuffer,
     group_msaa_fbo: glow::Framebuffer,
@@ -374,6 +475,11 @@ struct GlResources {
     gradient_screen_offset_uniform: Option<glow::UniformLocation>,
     gradient_offscreen_uniform: Option<glow::UniformLocation>,
     gradient_buffers: HashMap<usize, CachedSolidMeshBuffers>,
+    gradient_stop_data: Vec<f32>,
+    mask_apply_program: glow::Program,
+    mask_apply_source_uniform: Option<glow::UniformLocation>,
+    mask_apply_mask_uniform: Option<glow::UniformLocation>,
+    mask_apply_size_uniform: Option<glow::UniformLocation>,
     filter_program: glow::Program,
     filter_source_uniform: Option<glow::UniformLocation>,
     filter_uv_max_uniform: Option<glow::UniformLocation>,
@@ -390,6 +496,11 @@ struct GlResources {
     filter_fbos: [glow::Framebuffer; 3],
     filter_size: (i32, i32),
     gpu_filter_timer: GpuFilterTimer,
+    filtered_group_cache: HashMap<Vec<u64>, CachedFilteredGroup>,
+    filtered_group_cache_bytes: usize,
+    filtered_group_cache_clock: u64,
+    filtered_group_pending: HashMap<Vec<u64>, usize>,
+    filtered_group_pending_words: usize,
 }
 
 /// Paint an egui texture with a q0s placement blend mode without rasterising
@@ -733,6 +844,15 @@ pub enum VectorGroupPrimitive {
     },
 }
 
+/// One independently blended placement inside a timeline layer that is clipped
+/// by a vector mask. Each placement is masked before it is composited so layer
+/// overlap and blend modes keep their normal ordering.
+pub struct VectorMaskedPlacement {
+    pub primitives: Vec<VectorGroupPrimitive>,
+    pub blend_mode: BlendMode,
+    pub opacity: f32,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct VectorGroupFx {
     pub blur_radius_points: [f32; 2],
@@ -816,6 +936,162 @@ fn vector_group_rect(primitives: &[VectorGroupPrimitive]) -> Option<Rect> {
     (any && min.x < max.x && min.y < max.y).then(|| Rect::from_min_max(min, max).expand(1.0))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn push_signature_f32(signature: &mut Vec<u64>, value: f32) {
+    signature.push(u64::from(value.to_bits()));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn push_mesh_signature(signature: &mut Vec<u64>, mesh: &Mesh) -> bool {
+    signature.push(mesh.vertices.len() as u64);
+    signature.push(mesh.indices.len() as u64);
+    for vertex in &mesh.vertices {
+        push_signature_f32(signature, vertex.pos.x);
+        push_signature_f32(signature, vertex.pos.y);
+        push_signature_f32(signature, vertex.uv.x);
+        push_signature_f32(signature, vertex.uv.y);
+        let [r, g, b, a] = vertex.color.to_array();
+        signature.push(u64::from(u32::from_le_bytes([r, g, b, a])));
+        if signature.len() > FILTERED_GROUP_CACHE_MAX_SIGNATURE_WORDS {
+            return false;
+        }
+    }
+    for index in &mesh.indices {
+        signature.push(u64::from(*index));
+        if signature.len() > FILTERED_GROUP_CACHE_MAX_SIGNATURE_WORDS {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn filtered_group_signature(
+    primitives: &[VectorGroupPrimitive],
+    mode: i32,
+    fixed_opaque: bool,
+    opacity: f32,
+    fx: VectorGroupFx,
+    region: CallbackRegion,
+    pixels_per_point: f32,
+    screen_size_px: [u32; 2],
+) -> Option<Vec<u64>> {
+    if !fx.has_blur() && !fx.has_glow() {
+        return None;
+    }
+
+    let mut signature = Vec::with_capacity(64);
+    signature.extend([
+        primitives.len() as u64,
+        mode as u64,
+        u64::from(fixed_opaque),
+    ]);
+    push_signature_f32(&mut signature, opacity);
+    for value in fx.blur_radius_points {
+        push_signature_f32(&mut signature, value);
+    }
+    signature.push(u64::from(fx.blur_quality));
+    for value in fx.glow_radius_points {
+        push_signature_f32(&mut signature, value);
+    }
+    signature.push(u64::from(fx.glow_quality));
+    signature.extend(fx.glow_color.to_array().map(u64::from));
+    push_signature_f32(&mut signature, fx.glow_strength);
+    signature.extend([
+        region.left as u64,
+        region.bottom as u64,
+        region.width as u64,
+        region.height as u64,
+        u64::from(screen_size_px[0]),
+        u64::from(screen_size_px[1]),
+    ]);
+    push_signature_f32(&mut signature, pixels_per_point);
+    for value in region.source_uv_min.into_iter().chain(region.source_uv_max) {
+        push_signature_f32(&mut signature, value);
+    }
+
+    for primitive in primitives {
+        match primitive {
+            VectorGroupPrimitive::Solid(mesh) => {
+                signature.push(0);
+                if !push_mesh_signature(&mut signature, mesh) {
+                    return None;
+                }
+            }
+            // Bitmap content can change behind a stable TextureId. Keep this path
+            // uncached until texture updates can participate in cache validation.
+            VectorGroupPrimitive::Textured(_) => return None,
+            VectorGroupPrimitive::Gradient { mesh, paint } => {
+                signature.push(2);
+                if !push_mesh_signature(&mut signature, mesh) {
+                    return None;
+                }
+                let transform = paint.transform;
+                push_signature_f32(&mut signature, transform.source_origin.x);
+                push_signature_f32(&mut signature, transform.source_origin.y);
+                push_signature_f32(&mut signature, transform.target_origin.x);
+                push_signature_f32(&mut signature, transform.target_origin.y);
+                for value in transform.linear {
+                    push_signature_f32(&mut signature, value);
+                }
+                signature.push(u64::from(transform.fixed_screen_offset));
+                for value in [
+                    paint.source_bounds.left(),
+                    paint.source_bounds.top(),
+                    paint.source_bounds.right(),
+                    paint.source_bounds.bottom(),
+                ] {
+                    push_signature_f32(&mut signature, value);
+                }
+                for value in paint.gradient_inverse {
+                    push_signature_f32(&mut signature, value);
+                }
+                signature.push(match paint.kind {
+                    GradientKind::Linear => 0,
+                    GradientKind::Radial => 1,
+                });
+                signature.extend(paint.tint.to_array().map(u64::from));
+                signature.push(paint.stops.len() as u64);
+                for stop in paint.stops.iter() {
+                    push_signature_f32(&mut signature, stop.position);
+                    signature.extend([
+                        u64::from(stop.color.r),
+                        u64::from(stop.color.g),
+                        u64::from(stop.color.b),
+                        u64::from(stop.color.a),
+                    ]);
+                }
+            }
+        }
+        if signature.len() > FILTERED_GROUP_CACHE_MAX_SIGNATURE_WORDS {
+            return None;
+        }
+    }
+    Some(signature)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn vector_group_mesh_counts(primitives: &[VectorGroupPrimitive]) -> (u64, u64, u64) {
+    let mut primitive_count = 0_u64;
+    let mut vertex_count = 0_u64;
+    let mut index_count = 0_u64;
+    for primitive in primitives {
+        let mesh = match primitive {
+            VectorGroupPrimitive::Solid(mesh) => mesh,
+            VectorGroupPrimitive::Textured(mesh) | VectorGroupPrimitive::Gradient { mesh, .. } => {
+                mesh.as_ref()
+            }
+        };
+        if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+            continue;
+        }
+        primitive_count = primitive_count.saturating_add(1);
+        vertex_count = vertex_count.saturating_add(mesh.vertices.len() as u64);
+        index_count = index_count.saturating_add(mesh.indices.len() as u64);
+    }
+    (primitive_count, vertex_count, index_count)
+}
+
 /// Composite an ordered vector display-object group on the GPU. Solid meshes and
 /// analytic gradients stay vector; opacity is applied once after child overlap.
 pub fn paint_vector_group_on_opaque_backdrop(
@@ -843,6 +1119,115 @@ pub fn paint_vector_group_fx_on_opaque_backdrop(
     opacity: f32,
     fx: VectorGroupFx,
 ) {
+    paint_vector_group_fx_impl(painter, primitives, blend_mode, opacity, fx, false);
+}
+
+/// Reuse an exact filtered vector result while the stage is idle. The caller
+/// disables this during playback and active transforms so changing frames do
+/// not fill the cache with one-use entries.
+pub fn paint_vector_group_fx_cached_on_opaque_backdrop(
+    painter: &Painter,
+    primitives: Vec<VectorGroupPrimitive>,
+    blend_mode: BlendMode,
+    opacity: f32,
+    fx: VectorGroupFx,
+) {
+    paint_vector_group_fx_impl(painter, primitives, blend_mode, opacity, fx, true);
+}
+
+/// Render mask and placement geometry into transient GPU targets, apply the
+/// mask alpha in a shader, then composite each placement in timeline order.
+/// Neither the artwork nor the mask is read back to the CPU or stored as a
+/// bitmap asset.
+pub fn paint_vector_masked_placements_on_opaque_backdrop(
+    painter: &Painter,
+    masks: Vec<Vec<VectorGroupPrimitive>>,
+    placements: Vec<VectorMaskedPlacement>,
+) {
+    if masks.is_empty() || masks.iter().any(Vec::is_empty) || placements.is_empty() {
+        return;
+    }
+    let Some(mut rect) = placements
+        .iter()
+        .filter_map(|placement| vector_group_rect(&placement.primitives))
+        .reduce(|a, b| a.union(b))
+    else {
+        return;
+    };
+    rect = rect.expand(1.0);
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        // The browser renderer has no glow callback backend yet. Keep the
+        // vector groups available there; native desktop uses the GPU mask pass.
+        let _ = masks;
+        for placement in placements {
+            paint_vector_group_on_opaque_backdrop(
+                painter,
+                placement.primitives,
+                placement.blend_mode,
+                placement.opacity,
+            );
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let masks = Arc::new(masks);
+        let placements = Arc::new(placements);
+        let callback = egui_glow::CallbackFn::new(move |info, glow_painter| {
+            let Some(region) = callback_region(
+                info.viewport,
+                info.clip_rect,
+                info.pixels_per_point,
+                info.screen_size_px,
+            ) else {
+                return;
+            };
+            let gl = glow_painter.gl();
+            let context_key = Arc::as_ptr(gl) as usize;
+            GL_RESOURCES.with(|resources| {
+                let mut resources = resources.borrow_mut();
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    resources.entry(context_key)
+                {
+                    let Ok(created) = (unsafe { GlResources::new(gl) }) else {
+                        return;
+                    };
+                    entry.insert(created);
+                }
+                let Some(resources) = resources.get_mut(&context_key) else {
+                    return;
+                };
+                unsafe {
+                    resources.paint_vector_masked_placements(
+                        glow_painter,
+                        gl,
+                        masks.as_slice(),
+                        placements.as_slice(),
+                        region,
+                        info.pixels_per_point,
+                        info.screen_size_px,
+                    );
+                }
+            });
+        });
+        record_paint_callback(painter, rect, None);
+        painter.add(Shape::Callback(PaintCallback {
+            rect,
+            callback: Arc::new(callback),
+        }));
+    }
+}
+
+fn paint_vector_group_fx_impl(
+    painter: &Painter,
+    primitives: Vec<VectorGroupPrimitive>,
+    blend_mode: BlendMode,
+    opacity: f32,
+    fx: VectorGroupFx,
+    cache_active: bool,
+) {
     let opacity = opacity.clamp(0.0, 1.0);
     if primitives.is_empty() || opacity <= 1.0e-6 {
         return;
@@ -868,6 +1253,7 @@ pub fn paint_vector_group_fx_on_opaque_backdrop(
     #[cfg(target_arch = "wasm32")]
     {
         let _ = fx;
+        let _ = cache_active;
         for primitive in primitives {
             match primitive {
                 VectorGroupPrimitive::Solid(mut mesh) => {
@@ -952,6 +1338,7 @@ pub fn paint_vector_group_fx_on_opaque_backdrop(
                         region,
                         info.pixels_per_point,
                         info.screen_size_px,
+                        cache_active,
                     );
                 }
             });
@@ -1204,9 +1591,11 @@ fn grown_target_capacity(current: (i32, i32), needed: (i32, i32)) -> (i32, i32) 
     (grow(current.0, needed.0), grow(current.1, needed.1))
 }
 #[cfg(not(target_arch = "wasm32"))]
-fn gaussian_box_radii(support_radius_px: f32, passes: usize) -> Vec<i32> {
-    if support_radius_px <= 0.5 || passes == 0 {
-        return vec![0; passes.max(1)];
+fn gaussian_box_radii(support_radius_px: f32, passes: usize) -> ([i32; 15], usize) {
+    let passes = passes.clamp(1, 15);
+    let mut radii = [0; 15];
+    if support_radius_px <= 0.5 {
+        return (radii, passes);
     }
     let sigma = (support_radius_px / 3.5).max(0.45);
     let passes_f = passes as f32;
@@ -1223,12 +1612,11 @@ fn gaussian_box_radii(support_radius_px: f32, passes: usize) -> Vec<i32> {
         - 3.0 * passes_f;
     let denominator = (-4 * lower - 4) as f32;
     let lower_count = (numerator / denominator).round().clamp(0.0, passes_f) as usize;
-    (0..passes)
-        .map(|index| {
-            let width = if index < lower_count { lower } else { upper };
-            ((width - 1) / 2).clamp(0, 128)
-        })
-        .collect()
+    for (index, radius) in radii.iter_mut().take(passes).enumerate() {
+        let width = if index < lower_count { lower } else { upper };
+        *radius = ((width - 1) / 2).clamp(0, 128);
+    }
+    (radii, passes)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1356,6 +1744,10 @@ impl GlResources {
         let gradient_screen_offset_uniform =
             gl.get_uniform_location(gradient_program, "u_screen_offset");
         let gradient_offscreen_uniform = gl.get_uniform_location(gradient_program, "u_offscreen");
+        let mask_apply_program = create_mask_apply_program(gl)?;
+        let mask_apply_source_uniform = gl.get_uniform_location(mask_apply_program, "u_source");
+        let mask_apply_mask_uniform = gl.get_uniform_location(mask_apply_program, "u_mask");
+        let mask_apply_size_uniform = gl.get_uniform_location(mask_apply_program, "u_texture_size");
         let filter_program = create_filter_program(gl)?;
         let filter_source_uniform = gl.get_uniform_location(filter_program, "u_source");
         let filter_uv_max_uniform = gl.get_uniform_location(filter_program, "u_uv_max");
@@ -1400,6 +1792,7 @@ impl GlResources {
             group_vao,
             group_vbo,
             group_ebo,
+            group_vertex_data: Vec::new(),
             group_texture,
             group_fbo,
             group_msaa_fbo,
@@ -1442,6 +1835,11 @@ impl GlResources {
             gradient_screen_offset_uniform,
             gradient_offscreen_uniform,
             gradient_buffers: HashMap::new(),
+            gradient_stop_data: vec![0.0; 256 * 2 * 4],
+            mask_apply_program,
+            mask_apply_source_uniform,
+            mask_apply_mask_uniform,
+            mask_apply_size_uniform,
             filter_program,
             filter_source_uniform,
             filter_uv_max_uniform,
@@ -1458,6 +1856,11 @@ impl GlResources {
             filter_fbos,
             filter_size: (0, 0),
             gpu_filter_timer,
+            filtered_group_cache: HashMap::new(),
+            filtered_group_cache_bytes: 0,
+            filtered_group_cache_clock: 0,
+            filtered_group_pending: HashMap::new(),
+            filtered_group_pending_words: 0,
         })
     }
 
@@ -1816,7 +2219,7 @@ impl GlResources {
         // Stop data is a tiny 256x2 floating-point data table, not a spatial
         // gradient bitmap. The fragment shader still evaluates the field at the
         // exact screen fragment, so zoom never reveals texels or requires a reraster.
-        let mut stop_data = vec![0.0f32; 256 * 2 * 4];
+        let stop_data = &mut self.gradient_stop_data;
         let stop_count = paint.stops.len().min(256);
         for (index, stop) in paint.stops.iter().take(stop_count).enumerate() {
             let position = index * 4;
@@ -1976,17 +2379,17 @@ impl GlResources {
         pixels_per_point: f32,
     ) -> glow::Texture {
         let passes = usize::from(quality.clamp(1, 15));
-        let radii_x = gaussian_box_radii(radius_points[0].max(0.0) * pixels_per_point, passes);
-        let radii_y = gaussian_box_radii(radius_points[1].max(0.0) * pixels_per_point, passes);
+        let (radii_x, _) = gaussian_box_radii(radius_points[0].max(0.0) * pixels_per_point, passes);
+        let (radii_y, _) = gaussian_box_radii(radius_points[1].max(0.0) * pixels_per_point, passes);
         let mut current = source;
-        for (radius_x, radius_y) in radii_x.into_iter().zip(radii_y) {
+        for index in 0..passes {
             self.run_filter_pass(
                 gl,
                 current,
                 self.filter_fbos[0],
                 region,
                 [1.0, 0.0],
-                radius_x,
+                radii_x[index],
             );
             current = self.filter_textures[0];
             self.run_filter_pass(
@@ -1995,7 +2398,7 @@ impl GlResources {
                 self.filter_fbos[1],
                 region,
                 [0.0, 1.0],
-                radius_y,
+                radii_y[index],
             );
             current = self.filter_textures[1];
         }
@@ -2070,6 +2473,143 @@ impl GlResources {
         );
         gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
     }
+
+    unsafe fn store_filtered_group(
+        &mut self,
+        gl: &glow::Context,
+        signature: Vec<u64>,
+        source_framebuffer: glow::Framebuffer,
+        region: CallbackRegion,
+        read_framebuffer: Option<glow::Framebuffer>,
+        draw_framebuffer: Option<glow::Framebuffer>,
+    ) {
+        if region.width <= 0 || region.height <= 0 {
+            return;
+        }
+        let Some(bytes) = (region.width as usize)
+            .checked_mul(region.height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+        else {
+            return;
+        };
+        if bytes > FILTERED_GROUP_CACHE_BUDGET_BYTES {
+            return;
+        }
+
+        if let Some(previous) = self.filtered_group_cache.remove(&signature) {
+            self.filtered_group_cache_bytes = self
+                .filtered_group_cache_bytes
+                .saturating_sub(previous.bytes);
+            gl.delete_framebuffer(previous.framebuffer);
+            gl.delete_texture(previous.texture);
+        }
+
+        while self.filtered_group_cache.len() >= FILTERED_GROUP_CACHE_MAX_ENTRIES
+            || self.filtered_group_cache_bytes.saturating_add(bytes)
+                > FILTERED_GROUP_CACHE_BUDGET_BYTES
+        {
+            let Some(oldest_signature) = self
+                .filtered_group_cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(signature, _)| signature.clone())
+            else {
+                break;
+            };
+            if let Some(oldest) = self.filtered_group_cache.remove(&oldest_signature) {
+                self.filtered_group_cache_bytes =
+                    self.filtered_group_cache_bytes.saturating_sub(oldest.bytes);
+                gl.delete_framebuffer(oldest.framebuffer);
+                gl.delete_texture(oldest.texture);
+            }
+        }
+
+        let Ok(texture) = gl.create_texture() else {
+            return;
+        };
+        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MIN_FILTER,
+            glow::LINEAR as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MAG_FILTER,
+            glow::LINEAR as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_WRAP_S,
+            glow::CLAMP_TO_EDGE as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_WRAP_T,
+            glow::CLAMP_TO_EDGE as i32,
+        );
+        gl.tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            glow::RGBA8 as i32,
+            region.width,
+            region.height,
+            0,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            None,
+        );
+
+        let Ok(framebuffer) = gl.create_framebuffer() else {
+            gl.delete_texture(texture);
+            return;
+        };
+        gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(framebuffer));
+        gl.framebuffer_texture_2d(
+            glow::DRAW_FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT0,
+            glow::TEXTURE_2D,
+            Some(texture),
+            0,
+        );
+        if gl.check_framebuffer_status(glow::DRAW_FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE {
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, read_framebuffer);
+            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, draw_framebuffer);
+            gl.delete_framebuffer(framebuffer);
+            gl.delete_texture(texture);
+            return;
+        }
+        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(source_framebuffer));
+        gl.blit_framebuffer(
+            0,
+            0,
+            region.width,
+            region.height,
+            0,
+            0,
+            region.width,
+            region.height,
+            glow::COLOR_BUFFER_BIT,
+            glow::NEAREST,
+        );
+        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, read_framebuffer);
+        gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, draw_framebuffer);
+
+        self.filtered_group_cache_clock = self.filtered_group_cache_clock.wrapping_add(1);
+        self.filtered_group_cache_bytes = self.filtered_group_cache_bytes.saturating_add(bytes);
+        self.filtered_group_cache.insert(
+            signature,
+            CachedFilteredGroup {
+                texture,
+                framebuffer,
+                width: region.width,
+                height: region.height,
+                bytes,
+                last_used: self.filtered_group_cache_clock,
+            },
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     unsafe fn paint_vector_group(
         &mut self,
@@ -2083,10 +2623,106 @@ impl GlResources {
         region: CallbackRegion,
         pixels_per_point: f32,
         screen_size_px: [u32; 2],
+        cache_active: bool,
     ) {
         self.gpu_filter_timer.poll_one(gl);
         let filtered = fx.has_blur() || fx.has_glow();
         let callback_cpu_started = filtered.then(std::time::Instant::now);
+        let cache_signature = cache_active
+            .then(|| {
+                filtered_group_signature(
+                    primitives,
+                    mode,
+                    fixed_opaque,
+                    opacity,
+                    fx,
+                    region,
+                    pixels_per_point,
+                    screen_size_px,
+                )
+            })
+            .flatten();
+
+        let mut cache_store_signature = None;
+        if let Some(signature) = cache_signature.as_ref() {
+            self.filtered_group_cache_clock = self.filtered_group_cache_clock.wrapping_add(1);
+            let cached = self.filtered_group_cache.get_mut(signature).map(|entry| {
+                entry.last_used = self.filtered_group_cache_clock;
+                (entry.texture, entry.width, entry.height)
+            });
+            if let Some((texture, width, height)) = cached {
+                record_gpu_filter_cache_hit();
+                let (primitive_count, vertex_count, index_count) =
+                    vector_group_mesh_counts(primitives);
+                let composite_started = std::time::Instant::now();
+                let cached_region = CallbackRegion {
+                    source_uv_min: [0.0, 0.0],
+                    source_uv_max: [
+                        region.width as f32 / width as f32,
+                        region.height as f32 / height as f32,
+                    ],
+                    ..region
+                };
+                if fixed_opaque {
+                    self.paint_opaque_fixed(gl, texture, mode, cached_region, false, opacity);
+                } else {
+                    self.paint(gl, texture, mode, cached_region, false, opacity);
+                }
+                if let Some(started) = callback_cpu_started {
+                    let nanoseconds = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+                    let composite_ns = composite_started
+                        .elapsed()
+                        .as_nanos()
+                        .min(u128::from(u64::MAX)) as u64;
+                    record_gpu_filter_callback_cpu(
+                        nanoseconds,
+                        region,
+                        fx,
+                        primitive_count,
+                        vertex_count,
+                        index_count,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        composite_ns,
+                    );
+                }
+                return;
+            }
+            record_gpu_filter_cache_miss();
+            if let Some(words) = self.filtered_group_pending.remove(signature) {
+                self.filtered_group_pending_words =
+                    self.filtered_group_pending_words.saturating_sub(words);
+                cache_store_signature = Some(signature.clone());
+            } else {
+                while self.filtered_group_pending.len() >= FILTERED_GROUP_CACHE_MAX_ENTRIES
+                    || self
+                        .filtered_group_pending_words
+                        .saturating_add(signature.len())
+                        > FILTERED_GROUP_CACHE_PENDING_BUDGET_WORDS
+                {
+                    let Some(oldest) = self.filtered_group_pending.keys().next().cloned() else {
+                        break;
+                    };
+                    if let Some(words) = self.filtered_group_pending.remove(&oldest) {
+                        self.filtered_group_pending_words =
+                            self.filtered_group_pending_words.saturating_sub(words);
+                    }
+                }
+                if signature.len() <= FILTERED_GROUP_CACHE_PENDING_BUDGET_WORDS {
+                    self.filtered_group_pending_words = self
+                        .filtered_group_pending_words
+                        .saturating_add(signature.len());
+                    self.filtered_group_pending
+                        .insert(signature.clone(), signature.len());
+                }
+            }
+        }
+
         let gpu_timer_query = self.gpu_filter_timer.begin_sample(gl, filtered);
 
         let read_binding = gl.get_parameter_i32(glow::READ_FRAMEBUFFER_BINDING);
@@ -2094,18 +2730,32 @@ impl GlResources {
         let read_framebuffer = native_framebuffer(read_binding);
         let draw_framebuffer = native_framebuffer(draw_binding);
 
+        let target_setup_started = std::time::Instant::now();
         self.ensure_group_targets(gl, region.width, region.height);
         if fx.has_blur() || fx.has_glow() {
             self.ensure_filter_targets(gl, self.group_size.0, self.group_size.1);
         }
+        let target_setup_ns = target_setup_started
+            .elapsed()
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64;
+
+        let mut primitive_count = 0_u64;
+        let mut vertex_count = 0_u64;
+        let mut index_count = 0_u64;
+        let mut raster_upload_ns = 0_u64;
+        let mut raster_draw_ns = 0_u64;
+        let raster_started = std::time::Instant::now();
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.group_msaa_fbo));
         gl.viewport(0, 0, region.width, region.height);
         gl.disable(glow::SCISSOR_TEST);
         gl.disable(glow::DEPTH_TEST);
         gl.disable(glow::CULL_FACE);
         gl.color_mask(true, true, true, true);
+        let clear_started = std::time::Instant::now();
         gl.clear_color(0.0, 0.0, 0.0, 0.0);
         gl.clear(glow::COLOR_BUFFER_BIT);
+        let raster_clear_ns = clear_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         gl.enable(glow::BLEND);
         gl.blend_equation_separate(glow::FUNC_ADD, glow::FUNC_ADD);
         gl.blend_func_separate(
@@ -2132,6 +2782,9 @@ impl GlResources {
                     if mesh.indices.is_empty() || mesh.vertices.is_empty() {
                         continue;
                     }
+                    primitive_count = primitive_count.saturating_add(1);
+                    vertex_count = vertex_count.saturating_add(mesh.vertices.len() as u64);
+                    index_count = index_count.saturating_add(mesh.indices.len() as u64);
                     gl.use_program(Some(self.group_program));
                     gl.bind_vertex_array(Some(self.group_vao));
                     gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.group_vbo));
@@ -2151,10 +2804,12 @@ impl GlResources {
                         region.width as f32,
                         region.height as f32,
                     );
-                    let mut packed = Vec::with_capacity(mesh.vertices.len() * 6);
+                    self.group_vertex_data.clear();
+                    self.group_vertex_data
+                        .reserve(mesh.vertices.len().saturating_mul(6));
                     for vertex in &mesh.vertices {
                         let [r, g, b, a] = vertex.color.to_array();
-                        packed.extend_from_slice(&[
+                        self.group_vertex_data.extend_from_slice(&[
                             vertex.pos.x,
                             vertex.pos.y,
                             f32::from(r) / 255.0,
@@ -2164,24 +2819,35 @@ impl GlResources {
                         ]);
                     }
                     let vertex_bytes = std::slice::from_raw_parts(
-                        packed.as_ptr().cast::<u8>(),
-                        packed.len() * std::mem::size_of::<f32>(),
+                        self.group_vertex_data.as_ptr().cast::<u8>(),
+                        self.group_vertex_data.len() * std::mem::size_of::<f32>(),
                     );
                     let index_bytes = std::slice::from_raw_parts(
                         mesh.indices.as_ptr().cast::<u8>(),
                         mesh.indices.len() * std::mem::size_of::<u32>(),
                     );
+                    let upload_started = std::time::Instant::now();
                     gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, vertex_bytes, glow::STREAM_DRAW);
                     gl.buffer_data_u8_slice(
                         glow::ELEMENT_ARRAY_BUFFER,
                         index_bytes,
                         glow::STREAM_DRAW,
                     );
+                    raster_upload_ns = raster_upload_ns.saturating_add(
+                        upload_started
+                            .elapsed()
+                            .as_nanos()
+                            .min(u128::from(u64::MAX)) as u64,
+                    );
+                    let draw_started = std::time::Instant::now();
                     gl.draw_elements(
                         glow::TRIANGLES,
                         mesh.indices.len() as i32,
                         glow::UNSIGNED_INT,
                         0,
+                    );
+                    raster_draw_ns = raster_draw_ns.saturating_add(
+                        draw_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
                     );
                 }
                 VectorGroupPrimitive::Textured(mesh) => {
@@ -2191,6 +2857,9 @@ impl GlResources {
                     let Some(texture) = glow_painter.texture(mesh.texture_id) else {
                         continue;
                     };
+                    primitive_count = primitive_count.saturating_add(1);
+                    vertex_count = vertex_count.saturating_add(mesh.vertices.len() as u64);
+                    index_count = index_count.saturating_add(mesh.indices.len() as u64);
                     gl.use_program(Some(self.group_textured_program));
                     gl.bind_vertex_array(Some(self.group_vao));
                     gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.group_vbo));
@@ -2212,10 +2881,12 @@ impl GlResources {
                         region.width as f32,
                         region.height as f32,
                     );
-                    let mut packed = Vec::with_capacity(mesh.vertices.len() * 8);
+                    self.group_vertex_data.clear();
+                    self.group_vertex_data
+                        .reserve(mesh.vertices.len().saturating_mul(8));
                     for vertex in &mesh.vertices {
                         let [r, g, b, a] = vertex.color.to_array();
-                        packed.extend_from_slice(&[
+                        self.group_vertex_data.extend_from_slice(&[
                             vertex.pos.x,
                             vertex.pos.y,
                             vertex.uv.x,
@@ -2227,18 +2898,25 @@ impl GlResources {
                         ]);
                     }
                     let vertex_bytes = std::slice::from_raw_parts(
-                        packed.as_ptr().cast::<u8>(),
-                        packed.len() * std::mem::size_of::<f32>(),
+                        self.group_vertex_data.as_ptr().cast::<u8>(),
+                        self.group_vertex_data.len() * std::mem::size_of::<f32>(),
                     );
                     let index_bytes = std::slice::from_raw_parts(
                         mesh.indices.as_ptr().cast::<u8>(),
                         mesh.indices.len() * std::mem::size_of::<u32>(),
                     );
+                    let upload_started = std::time::Instant::now();
                     gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, vertex_bytes, glow::STREAM_DRAW);
                     gl.buffer_data_u8_slice(
                         glow::ELEMENT_ARRAY_BUFFER,
                         index_bytes,
                         glow::STREAM_DRAW,
+                    );
+                    raster_upload_ns = raster_upload_ns.saturating_add(
+                        upload_started
+                            .elapsed()
+                            .as_nanos()
+                            .min(u128::from(u64::MAX)) as u64,
                     );
                     gl.active_texture(glow::TEXTURE0);
                     gl.bind_texture(glow::TEXTURE_2D, Some(texture));
@@ -2247,11 +2925,15 @@ impl GlResources {
                         self.group_textured_srgb_uniform.as_ref(),
                         i32::from(self.source_srgb),
                     );
+                    let draw_started = std::time::Instant::now();
                     gl.draw_elements(
                         glow::TRIANGLES,
                         mesh.indices.len() as i32,
                         glow::UNSIGNED_INT,
                         0,
+                    );
+                    raster_draw_ns = raster_draw_ns.saturating_add(
+                        draw_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
                     );
                 }
                 VectorGroupPrimitive::Gradient { mesh, paint } => {
@@ -2259,7 +2941,11 @@ impl GlResources {
                     {
                         continue;
                     }
+                    primitive_count = primitive_count.saturating_add(1);
+                    vertex_count = vertex_count.saturating_add(mesh.vertices.len() as u64);
+                    index_count = index_count.saturating_add(mesh.indices.len() as u64);
                     let key = Arc::as_ptr(mesh) as usize;
+                    let gradient_buffer_started = std::time::Instant::now();
                     let reusable = self
                         .gradient_buffers
                         .get(&key)
@@ -2317,11 +3003,17 @@ impl GlResources {
                             },
                         );
                     }
+                    raster_upload_ns = raster_upload_ns.saturating_add(
+                        gradient_buffer_started
+                            .elapsed()
+                            .as_nanos()
+                            .min(u128::from(u64::MAX)) as u64,
+                    );
                     let cached = self
                         .gradient_buffers
                         .get(&key)
                         .expect("group gradient buffers");
-                    let mut stop_data = vec![0.0f32; 256 * 2 * 4];
+                    let stop_data = &mut self.gradient_stop_data;
                     let stop_count = paint.stops.len().min(256);
                     for (index, stop) in paint.stops.iter().take(stop_count).enumerate() {
                         let position = index * 4;
@@ -2338,6 +3030,7 @@ impl GlResources {
                     );
                     gl.active_texture(glow::TEXTURE0);
                     gl.bind_texture(glow::TEXTURE_2D, Some(self.gradient_stop_texture));
+                    let stop_upload_started = std::time::Instant::now();
                     gl.tex_sub_image_2d(
                         glow::TEXTURE_2D,
                         0,
@@ -2348,6 +3041,12 @@ impl GlResources {
                         glow::RGBA,
                         glow::FLOAT,
                         glow::PixelUnpackData::Slice(stop_bytes),
+                    );
+                    raster_upload_ns = raster_upload_ns.saturating_add(
+                        stop_upload_started
+                            .elapsed()
+                            .as_nanos()
+                            .min(u128::from(u64::MAX)) as u64,
                     );
                     gl.use_program(Some(self.gradient_program));
                     gl.bind_vertex_array(Some(self.gradient_vao));
@@ -2413,11 +3112,16 @@ impl GlResources {
                         f32::from(tb) / 255.0,
                         f32::from(ta) / 255.0,
                     );
+                    let draw_started = std::time::Instant::now();
                     gl.draw_elements(glow::TRIANGLES, cached.index_count, glow::UNSIGNED_INT, 0);
+                    raster_draw_ns = raster_draw_ns.saturating_add(
+                        draw_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                    );
                 }
             }
         }
 
+        let resolve_started = std::time::Instant::now();
         gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.group_msaa_fbo));
         gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.group_fbo));
         gl.blit_framebuffer(
@@ -2432,12 +3136,22 @@ impl GlResources {
             glow::COLOR_BUFFER_BIT,
             glow::NEAREST,
         );
+        let raster_resolve_ns = resolve_started
+            .elapsed()
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64;
+        let raster_ns = raster_started
+            .elapsed()
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64;
 
         let mut source_texture = self.group_texture;
         let mut source_size = self.group_size;
+        let mut source_framebuffer = self.group_fbo;
         let has_glow = fx.has_glow();
         let has_blur = fx.has_blur();
 
+        let filter_started = std::time::Instant::now();
         if has_glow {
             let glow_result = self.blur_group_texture(
                 gl,
@@ -2463,6 +3177,7 @@ impl GlResources {
                 pixels_per_point,
             );
             source_size = self.filter_size;
+            source_framebuffer = self.filter_fbos[1];
         }
 
         if has_glow {
@@ -2482,6 +3197,7 @@ impl GlResources {
                 );
                 source_texture = self.group_texture;
                 source_size = self.group_size;
+                source_framebuffer = self.group_fbo;
             } else {
                 self.combine_body_and_glow(
                     gl,
@@ -2493,9 +3209,25 @@ impl GlResources {
                 );
                 source_texture = self.filter_textures[0];
                 source_size = self.filter_size;
+                source_framebuffer = self.filter_fbos[0];
             }
         }
+        let filter_ns = filter_started
+            .elapsed()
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64;
 
+        let composite_started = std::time::Instant::now();
+        if let Some(signature) = cache_store_signature {
+            self.store_filtered_group(
+                gl,
+                signature,
+                source_framebuffer,
+                region,
+                read_framebuffer,
+                draw_framebuffer,
+            );
+        }
         gl.bind_framebuffer(glow::READ_FRAMEBUFFER, read_framebuffer);
         gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, draw_framebuffer);
 
@@ -2517,8 +3249,207 @@ impl GlResources {
         }
         if let Some(started) = callback_cpu_started {
             let nanoseconds = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-            record_gpu_filter_callback_cpu(nanoseconds);
+            let composite_ns = composite_started
+                .elapsed()
+                .as_nanos()
+                .min(u128::from(u64::MAX)) as u64;
+            record_gpu_filter_callback_cpu(
+                nanoseconds,
+                region,
+                fx,
+                primitive_count,
+                vertex_count,
+                index_count,
+                target_setup_ns,
+                raster_ns,
+                raster_clear_ns,
+                raster_upload_ns,
+                raster_draw_ns,
+                raster_resolve_ns,
+                filter_ns,
+                composite_ns,
+            );
         }
+    }
+
+    unsafe fn paint_primitives_into_filter_slot(
+        &mut self,
+        glow_painter: &egui_glow::Painter,
+        gl: &glow::Context,
+        primitives: &[VectorGroupPrimitive],
+        slot: usize,
+        region: CallbackRegion,
+        pixels_per_point: f32,
+        screen_size_px: [u32; 2],
+    ) {
+        let framebuffer = self.filter_fbos[slot];
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
+        gl.enable(glow::SCISSOR_TEST);
+        gl.scissor(region.left, region.bottom, region.width, region.height);
+        gl.color_mask(true, true, true, true);
+        gl.clear_color(0.0, 0.0, 0.0, 0.0);
+        gl.clear(glow::COLOR_BUFFER_BIT);
+        gl.disable(glow::SCISSOR_TEST);
+        self.paint_vector_group(
+            glow_painter,
+            gl,
+            primitives,
+            blend_mode_tag(BlendMode::Normal),
+            true,
+            1.0,
+            VectorGroupFx::default(),
+            region,
+            pixels_per_point,
+            screen_size_px,
+            false,
+        );
+    }
+
+    unsafe fn multiply_mask_textures(
+        &self,
+        gl: &glow::Context,
+        source: glow::Texture,
+        mask: glow::Texture,
+        destination_slot: usize,
+        region: CallbackRegion,
+    ) {
+        gl.bind_framebuffer(
+            glow::DRAW_FRAMEBUFFER,
+            Some(self.filter_fbos[destination_slot]),
+        );
+        gl.viewport(region.left, region.bottom, region.width, region.height);
+        gl.enable(glow::SCISSOR_TEST);
+        gl.scissor(region.left, region.bottom, region.width, region.height);
+        gl.disable(glow::BLEND);
+        gl.use_program(Some(self.mask_apply_program));
+        gl.bind_vertex_array(Some(self.vao));
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(source));
+        gl.uniform_1_i32(self.mask_apply_source_uniform.as_ref(), 0);
+        gl.active_texture(glow::TEXTURE1);
+        gl.bind_texture(glow::TEXTURE_2D, Some(mask));
+        gl.uniform_1_i32(self.mask_apply_mask_uniform.as_ref(), 1);
+        gl.uniform_2_f32(
+            self.mask_apply_size_uniform.as_ref(),
+            self.filter_size.0 as f32,
+            self.filter_size.1 as f32,
+        );
+        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+        gl.disable(glow::SCISSOR_TEST);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn paint_vector_masked_placements(
+        &mut self,
+        glow_painter: &egui_glow::Painter,
+        gl: &glow::Context,
+        masks: &[Vec<VectorGroupPrimitive>],
+        placements: &[VectorMaskedPlacement],
+        region: CallbackRegion,
+        pixels_per_point: f32,
+        screen_size_px: [u32; 2],
+    ) {
+        let read_framebuffer =
+            native_framebuffer(gl.get_parameter_i32(glow::READ_FRAMEBUFFER_BINDING));
+        let draw_framebuffer =
+            native_framebuffer(gl.get_parameter_i32(glow::DRAW_FRAMEBUFFER_BINDING));
+        self.ensure_group_targets(gl, region.width, region.height);
+        self.ensure_filter_targets(
+            gl,
+            screen_size_px[0].max(1) as i32,
+            screen_size_px[1].max(1) as i32,
+        );
+
+        self.paint_primitives_into_filter_slot(
+            glow_painter,
+            gl,
+            &masks[0],
+            0,
+            region,
+            pixels_per_point,
+            screen_size_px,
+        );
+        let mut combined_mask_slot = 0;
+        for mask_primitives in masks.iter().skip(1) {
+            self.paint_primitives_into_filter_slot(
+                glow_painter,
+                gl,
+                mask_primitives,
+                1,
+                region,
+                pixels_per_point,
+                screen_size_px,
+            );
+            let destination_slot = if combined_mask_slot == 0 { 2 } else { 0 };
+            self.multiply_mask_textures(
+                gl,
+                self.filter_textures[combined_mask_slot],
+                self.filter_textures[1],
+                destination_slot,
+                region,
+            );
+            combined_mask_slot = destination_slot;
+        }
+
+        let output_slot = if combined_mask_slot == 0 { 2 } else { 0 };
+        for placement in placements {
+            if placement.primitives.is_empty() || placement.opacity <= 1.0e-6 {
+                continue;
+            }
+            self.paint_primitives_into_filter_slot(
+                glow_painter,
+                gl,
+                &placement.primitives,
+                1,
+                region,
+                pixels_per_point,
+                screen_size_px,
+            );
+            self.multiply_mask_textures(
+                gl,
+                self.filter_textures[1],
+                self.filter_textures[combined_mask_slot],
+                output_slot,
+                region,
+            );
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, read_framebuffer);
+            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, draw_framebuffer);
+            let filtered_region = CallbackRegion {
+                source_uv_min: [
+                    region.left as f32 / self.filter_size.0 as f32,
+                    (region.bottom + region.height) as f32 / self.filter_size.1 as f32,
+                ],
+                source_uv_max: [
+                    (region.left + region.width) as f32 / self.filter_size.0 as f32,
+                    region.bottom as f32 / self.filter_size.1 as f32,
+                ],
+                ..region
+            };
+            let mode = blend_mode_tag(placement.blend_mode);
+            if placement.blend_mode == BlendMode::Normal
+                || uses_opaque_fixed_path(placement.blend_mode, true)
+            {
+                self.paint_opaque_fixed(
+                    gl,
+                    self.filter_textures[output_slot],
+                    mode,
+                    filtered_region,
+                    false,
+                    placement.opacity,
+                );
+            } else {
+                self.paint(
+                    gl,
+                    self.filter_textures[output_slot],
+                    mode,
+                    filtered_region,
+                    false,
+                    placement.opacity,
+                );
+            }
+        }
+        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, read_framebuffer);
+        gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, draw_framebuffer);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2581,10 +3512,12 @@ impl GlResources {
             if mesh.indices.is_empty() || mesh.vertices.is_empty() {
                 continue;
             }
-            let mut packed = Vec::with_capacity(mesh.vertices.len() * 6);
+            self.group_vertex_data.clear();
+            self.group_vertex_data
+                .reserve(mesh.vertices.len().saturating_mul(6));
             for vertex in &mesh.vertices {
                 let [r, g, b, a] = vertex.color.to_array();
-                packed.extend_from_slice(&[
+                self.group_vertex_data.extend_from_slice(&[
                     vertex.pos.x,
                     vertex.pos.y,
                     f32::from(r) / 255.0,
@@ -2594,8 +3527,8 @@ impl GlResources {
                 ]);
             }
             let vertex_bytes = std::slice::from_raw_parts(
-                packed.as_ptr().cast::<u8>(),
-                packed.len() * std::mem::size_of::<f32>(),
+                self.group_vertex_data.as_ptr().cast::<u8>(),
+                self.group_vertex_data.len() * std::mem::size_of::<f32>(),
             );
             let index_bytes = std::slice::from_raw_parts(
                 mesh.indices.as_ptr().cast::<u8>(),
@@ -3241,16 +4174,57 @@ out vec4 out_color;
 void main() {
     vec2 center = v_uv * u_uv_max;
     vec4 sum = vec4(0.0);
-    float count = 0.0;
-    for (int i = -128; i <= 128; ++i) {
-        if (abs(i) > u_radius) continue;
-        vec2 uv = center + u_direction * float(i) * u_texel;
-        if (uv.x >= 0.0 && uv.y >= 0.0 && uv.x <= u_uv_max.x && uv.y <= u_uv_max.y) {
-            sum += texture(u_source, uv);
+    for (int i = -u_radius; i <= u_radius; i += 2) {
+        vec2 first_uv = center + u_direction * float(i) * u_texel;
+        bool first_valid = first_uv.x >= 0.0 && first_uv.y >= 0.0
+            && first_uv.x <= u_uv_max.x && first_uv.y <= u_uv_max.y;
+        int second_offset = i + 1;
+        if (second_offset <= u_radius) {
+            vec2 second_uv = center + u_direction * float(second_offset) * u_texel;
+            bool second_valid = second_uv.x >= 0.0 && second_uv.y >= 0.0
+                && second_uv.x <= u_uv_max.x && second_uv.y <= u_uv_max.y;
+            if (first_valid && second_valid) {
+                // linear filtering at the midpoint combines two adjacent texels.
+                // doubling it avoids a second texture read for the same pair.
+                vec2 pair_uv = center + u_direction * (float(i) + 0.5) * u_texel;
+                sum += texture(u_source, pair_uv) * 2.0;
+            } else {
+                if (first_valid) sum += texture(u_source, first_uv);
+                if (second_valid) sum += texture(u_source, second_uv);
+            }
+        } else if (first_valid) {
+            sum += texture(u_source, first_uv);
         }
-        count += 1.0;
     }
-    out_color = count > 0.0 ? sum / count : vec4(0.0);
+    float count = float(u_radius * 2 + 1);
+    out_color = sum / count;
+}
+"#;
+    create_fullscreen_program(gl, VERTEX, FRAGMENT)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn create_mask_apply_program(gl: &glow::Context) -> Result<glow::Program, String> {
+    const VERTEX: &str = r#"#version 140
+void main() {
+    vec2 p;
+    if (gl_VertexID == 0) p = vec2(-1.0, -1.0);
+    else if (gl_VertexID == 1) p = vec2(1.0, -1.0);
+    else if (gl_VertexID == 2) p = vec2(-1.0, 1.0);
+    else p = vec2(1.0, 1.0);
+    gl_Position = vec4(p, 0.0, 1.0);
+}
+"#;
+    const FRAGMENT: &str = r#"#version 140
+uniform sampler2D u_source;
+uniform sampler2D u_mask;
+uniform vec2 u_texture_size;
+out vec4 out_color;
+void main() {
+    vec2 uv = gl_FragCoord.xy / u_texture_size;
+    vec4 content = texture(u_source, uv);
+    float mask_alpha = texture(u_mask, uv).a;
+    out_color = content * mask_alpha;
 }
 "#;
     create_fullscreen_program(gl, VERTEX, FRAGMENT)

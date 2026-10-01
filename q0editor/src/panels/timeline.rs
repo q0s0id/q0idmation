@@ -5,11 +5,14 @@ use egui::{
 };
 
 use crate::app::{Action, EditorApp, LayerDropTarget};
+use crate::hotkeys::ShortcutCommand;
 use crate::settings::Theme;
 use crate::state::{
     CameraFrameDrag, CameraTimelineSelection, FrameLabelEdit, LayerRename, LibraryDragPayload,
-    Selection, TimelineFrameDrag, TimelineLayerDrag, TimelineLayerSelection, TimelineSelection,
+    Selection, TimelineFrameDrag, TimelineLayerDrag, TimelineLayerSelection,
+    TimelineRigKeySelection, TimelineSelection,
 };
+use crate::ui::{icon_button, icon_button_enabled, icon_toggle, Icon};
 
 const FRAME_W: f32 = 12.0;
 const ROW_H: f32 = 26.0;
@@ -59,6 +62,7 @@ enum LayerMoveIcon {
     Outdent,
 }
 
+#[cfg(test)]
 fn layer_move_icon_segments(icon: LayerMoveIcon, rect: Rect) -> Vec<[egui::Pos2; 2]> {
     let center = rect.center();
     let left = center.x - 4.0;
@@ -96,23 +100,16 @@ fn layer_move_icon_button(
     icon: LayerMoveIcon,
     hover_text: &'static str,
 ) -> egui::Response {
-    // Do not use `Button::new("")` here. The editor's custom font fallback can
-    // still create a missing-glyph square for an empty galley. Allocate and
-    // paint the entire control ourselves so these icons contain zero text.
-    let (rect, response) = ui.allocate_exact_size(vec2(22.0, 18.0), Sense::click());
-    let visuals = ui.style().interact(&response);
-    let painted_rect = rect.expand(visuals.expansion);
-    ui.painter()
-        .rect_filled(painted_rect, visuals.rounding, visuals.bg_fill);
-    ui.painter()
-        .rect_stroke(painted_rect, visuals.rounding, visuals.bg_stroke);
-
-    let stroke = Stroke::new(1.6_f32, visuals.fg_stroke.color);
-    let icon_rect = Rect::from_center_size(rect.center(), vec2(14.0, 14.0));
-    for segment in layer_move_icon_segments(icon, icon_rect) {
-        ui.painter().line_segment(segment, stroke);
-    }
-    response.on_hover_text(hover_text)
+    icon_button(
+        ui,
+        match icon {
+            LayerMoveIcon::Up => Icon::Up,
+            LayerMoveIcon::Down => Icon::Down,
+            LayerMoveIcon::Indent => Icon::Indent,
+            LayerMoveIcon::Outdent => Icon::Outdent,
+        },
+        hover_text,
+    )
 }
 
 pub(crate) fn visible_layer_indices(
@@ -127,17 +124,22 @@ pub(crate) fn visible_layer_indices(
         .enumerate()
         .rev()
         .filter(|(_, layer)| {
-            let mut parent = project.layer_parent_folder(q0rg.q0rg_id, layer.layer_id);
-            let mut depth = 0usize;
-            while let Some(parent_id) = parent {
-                if project.layer_metadata(q0rg.q0rg_id, parent_id).collapsed {
+            // A group's collapsed state hides its descendants, not its own row.
+            // Start from this layer's containing groups so a collapsed mask
+            // remains visible while its masked layers are hidden.
+            let mut pending = Vec::new();
+            pending.extend(project.layer_parent_folder(q0rg.q0rg_id, layer.layer_id));
+            pending.extend(project.layer_mask_sources(q0rg.q0rg_id, layer.layer_id));
+            let mut visited = std::collections::HashSet::new();
+            while let Some(group_id) = pending.pop() {
+                if !visited.insert(group_id) {
+                    continue;
+                }
+                if project.layer_metadata(q0rg.q0rg_id, group_id).collapsed {
                     return false;
                 }
-                depth += 1;
-                if depth > q0s_format::v2::MAX_LAYER_FOLDER_NESTING_DEPTH {
-                    return false;
-                }
-                parent = project.layer_parent_folder(q0rg.q0rg_id, parent_id);
+                pending.extend(project.layer_parent_folder(q0rg.q0rg_id, group_id));
+                pending.extend(project.layer_mask_sources(q0rg.q0rg_id, group_id));
             }
             true
         })
@@ -211,6 +213,7 @@ fn frame_selection_contains(
             ..=selection.anchor_frame.max(selection.focus_frame))
             .contains(&frame)
 }
+#[cfg(test)]
 fn rig_key_frames(
     project: &q0s_format::v2::ProjectV2,
     q0rg_id: u16,
@@ -238,8 +241,46 @@ fn rig_key_frames(
         .collect()
 }
 
+#[derive(Debug, Clone)]
+struct RigTimelineTrack {
+    layer_id: u16,
+    layer_name: String,
+    frames: BTreeSet<u16>,
+}
+
+fn rig_timeline_tracks(
+    project: &q0s_format::v2::ProjectV2,
+    q0rg_id: u16,
+    visible_layer_indices: &[usize],
+) -> Vec<RigTimelineTrack> {
+    let Some(q0rg) = project.q0rgs.iter().find(|q0rg| q0rg.q0rg_id == q0rg_id) else {
+        return Vec::new();
+    };
+    visible_layer_indices
+        .iter()
+        .filter_map(|index| q0rg.layers.get(*index))
+        .filter(|layer| {
+            !project.layer_is_folder(q0rg_id, layer.layer_id)
+                && crate::timeline_edit::rig_layer_has_track(project, q0rg_id, layer.layer_id)
+        })
+        .map(|layer| RigTimelineTrack {
+            layer_id: layer.layer_id,
+            layer_name: layer.name.clone(),
+            frames: crate::timeline_edit::rig_key_frames_for_layer(
+                project,
+                q0rg_id,
+                layer.layer_id,
+            ),
+        })
+        .collect()
+}
+
 pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     let theme = app.settings.theme.clone();
+    let label_width = f32::from(app.settings.timeline_layer_width).clamp(
+        112.0,
+        (ui.available_width() * 0.65).clamp(LAYER_LABEL_W, 520.0),
+    );
     transport_bar(app, &theme, ui);
     ui.separator();
 
@@ -256,17 +297,15 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
 
     let q0rg_id = app.state.project.q0rgs[q0rg_idx].q0rg_id;
     let frame_count = app.state.project.q0rgs[q0rg_idx].frame_count;
-    let rig_key_frames = rig_key_frames(
-        &app.state.project,
-        q0rg_id,
-        app.session.rig_selected_control,
-    );
     // Model order is back-to-front for rendering. The timeline displays the
     // conventional front-to-back order, so rows are collected in reverse.
     // Folder children live immediately before their folder in model order;
     // reverse traversal therefore shows the folder row before its children.
     let visible_layer_indices = visible_layer_indices(&app.state.project, q0rg_idx);
     let layer_count = visible_layer_indices.len();
+    let rig_tracks = rig_timeline_tracks(&app.state.project, q0rg_id, &visible_layer_indices);
+    let rig_track_count = rig_tracks.len();
+    let timeline_row_count = layer_count + rig_track_count;
     let layer_ids: Vec<u16> = visible_layer_indices
         .iter()
         .map(|index| app.state.project.q0rgs[q0rg_idx].layers[*index].layer_id)
@@ -288,23 +327,66 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         .auto_shrink([false, false])
         .max_height(ui.available_height())
         .show(ui, |ui| {
-            let total_w = LAYER_LABEL_W + (visible_frames as f32) * FRAME_W;
-            let total_h = ROW_H * (layer_count as f32 + camera_row_count as f32 + 1.0);
+            let total_w = label_width + (visible_frames as f32) * FRAME_W;
+            let total_h = ROW_H * (timeline_row_count as f32 + camera_row_count as f32 + 1.0);
             let (rect, response) = ui.allocate_exact_size(
                 vec2(total_w.max(ui.available_width()), total_h),
                 Sense::click_and_drag(),
             );
             let painter = ui.painter_at(rect);
             let clip = painter.clip_rect();
+            let splitter_rect = Rect::from_min_max(
+                pos2(rect.min.x + label_width - 3.0, rect.top()),
+                pos2(rect.min.x + label_width + 3.0, rect.bottom()),
+            )
+            .intersect(clip);
+            let splitter = ui
+                .interact(
+                    splitter_rect,
+                    ui.id().with("timeline_layer_splitter"),
+                    Sense::click_and_drag(),
+                )
+                .on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
+                .on_hover_text("Drag to resize layer names; double-click to reset");
+            if splitter.dragged() {
+                let delta = ui.input(|input| input.pointer.delta().x);
+                app.settings.timeline_layer_width =
+                    (label_width + delta).clamp(112.0, 520.0).round() as u16;
+            }
+            if splitter.double_clicked() {
+                app.settings.timeline_layer_width = LAYER_LABEL_W as u16;
+            }
+            if splitter.drag_stopped() || splitter.double_clicked() {
+                app.settings.save();
+            }
             let frame_slots =
-                visible_frame_slots(&painter, rect.min.x + LAYER_LABEL_W, visible_frames);
-            let row_slots = visible_slots(
-                rect.min.y + ROW_H * (camera_row_count as f32 + 1.0),
+                visible_frame_slots(&painter, rect.min.x + label_width, visible_frames);
+            let layer_rows_y = rect.min.y + ROW_H * (camera_row_count as f32 + 1.0);
+            let layer_row_slots =
+                visible_slots(layer_rows_y, ROW_H, layer_count, clip.top(), clip.bottom());
+            let rig_rows_y = layer_rows_y + ROW_H * layer_count as f32;
+            let rig_row_slots = visible_slots(
+                rig_rows_y,
                 ROW_H,
-                layer_count,
+                rig_track_count,
                 clip.top(),
                 clip.bottom(),
             );
+
+            if let Some((target_q0rg_id, target_layer_id)) = app.session.timeline_scroll_to_layer {
+                if target_q0rg_id != q0rg_id {
+                    app.session.timeline_scroll_to_layer = None;
+                } else if let Some(row_index) = visible_layer_indices.iter().position(|index| {
+                    app.state.project.q0rgs[q0rg_idx].layers[*index].layer_id == target_layer_id
+                }) {
+                    let row_y =
+                        rect.min.y + ROW_H * (row_index as f32 + camera_row_count as f32 + 1.0);
+                    let target_rect =
+                        Rect::from_min_size(pos2(rect.min.x, row_y), vec2(rect.width(), ROW_H));
+                    ui.scroll_to_rect(target_rect, Some(egui::Align::Center));
+                    app.session.timeline_scroll_to_layer = None;
+                }
+            }
 
             // Timeline base panel РІР‚вЂќ same as the editor's window colour
             // so it visually merges with the surrounding chrome.
@@ -313,6 +395,41 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             // Header (frame numbers + second markers)
             let header_rect = Rect::from_min_size(rect.min, vec2(rect.width(), ROW_H));
             painter.rect_filled(header_rect, 0.0, theme.timeline_header.to_color32());
+            let drawable_layer_ids: Vec<_> = app.state.project.q0rgs[q0rg_idx]
+                .layers
+                .iter()
+                .filter(|layer| !app.state.project.layer_is_folder(q0rg_id, layer.layer_id))
+                .map(|layer| layer.layer_id)
+                .collect();
+            let all_layers_locked = !drawable_layer_ids.is_empty()
+                && drawable_layer_ids
+                    .iter()
+                    .all(|layer_id| app.state.project.layer_is_locked(q0rg_id, *layer_id));
+            let lock_all_rect = Rect::from_center_size(
+                pos2(rect.min.x + label_width - 13.0, rect.min.y + ROW_H * 0.5),
+                vec2(18.0, 18.0),
+            );
+            draw_lock_icon(
+                &painter,
+                lock_all_rect.shrink(3.0),
+                all_layers_locked,
+                theme.text.to_color32(),
+            );
+            if ui
+                .interact(
+                    lock_all_rect,
+                    egui::Id::new(("timeline_lock_all", q0rg_id)),
+                    Sense::click(),
+                )
+                .on_hover_text(if all_layers_locked {
+                    "Unlock all layers"
+                } else {
+                    "Lock all layers"
+                })
+                .clicked()
+            {
+                app.queue(Action::ToggleAllLayerLocks(q0rg_id));
+            }
             // Bottom edge of header
             painter.line_segment(
                 [
@@ -323,7 +440,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             );
             let fps = app.state.project.meta.fps as u32;
             for f in frame_slots.clone() {
-                let x = rect.min.x + LAYER_LABEL_W + (f as f32) * FRAME_W;
+                let x = rect.min.x + label_width + (f as f32) * FRAME_W;
                 let frame_one_based = f + 1;
                 let beyond = f >= frame_count;
                 // Tick lines РІР‚вЂќ every 5th frame full-height, others only in
@@ -372,7 +489,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 if key.q0rg_id != q0rg_id || !frame_slots.contains(&key.frame) {
                     continue;
                 }
-                let x = rect.min.x + LAYER_LABEL_W + key.frame as f32 * FRAME_W + 1.0;
+                let x = rect.min.x + label_width + key.frame as f32 * FRAME_W + 1.0;
                 let y = rect.min.y + 2.0;
                 let color = theme.accent.to_color32();
                 painter.line_segment([pos2(x, y), pos2(x, y + 9.0)], Stroke::new(1.3_f32, color));
@@ -388,34 +505,10 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 )
                 .on_hover_text(format!("{label}\nframe {}", u32::from(key.frame) + 1));
             }
-            // Rig keys live at q0rg scope rather than on one artwork layer. A
-            // compact diamond in the frame header makes their timing visible
-            // without inventing a fake layer row. When a rig control is selected,
-            // only that control's keys are shown.
-            for frame in &rig_key_frames {
-                if *frame >= frame_count || !frame_slots.contains(frame) {
-                    continue;
-                }
-                let center = pos2(
-                    rect.min.x + LAYER_LABEL_W + (*frame as f32 + 0.5) * FRAME_W,
-                    rect.min.y + ROW_H - 4.5,
-                );
-                let radius = 3.0_f32;
-                painter.add(egui::Shape::convex_polygon(
-                    vec![
-                        pos2(center.x, center.y - radius),
-                        pos2(center.x + radius, center.y),
-                        pos2(center.x, center.y + radius),
-                        pos2(center.x - radius, center.y),
-                    ],
-                    theme.accent.to_color32(),
-                    Stroke::new(0.8_f32, theme.stroke_dark.to_color32()),
-                ));
-            }
             // End-of-q0rg marker: dashed amber bar at the right edge of the
             // last real frame so the user can see exactly where `frame_count`
             // ends without confusing it with the solid theme-coloured playhead.
-            let edge_x = rect.min.x + LAYER_LABEL_W + (frame_count as f32) * FRAME_W;
+            let edge_x = rect.min.x + label_width + (frame_count as f32) * FRAME_W;
             let edge_color = Color32::from_rgb(0xC8, 0x95, 0x30);
             let mut y = rect.min.y + ((clip.top() - rect.min.y).max(0.0) / 7.0).floor() * 7.0;
             while edge_x >= clip.left()
@@ -439,6 +532,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     rect.min.y + ROW_H,
                     frame_count,
                     visible_frames,
+                    label_width,
                 );
             }
 
@@ -447,17 +541,23 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             let mut click_frame: Option<u16> = None;
             let mut click_label_layer: Option<u16> = None;
             let mut open_frame_script: Option<(u16, u16, u16)> = None;
-            let mut started_layer_drag: Option<u16> = None;
+            let mut started_layer_drag: Option<(u16, TimelineLayerSelection)> = None;
             for (li, layer_index) in visible_layer_indices
                 .iter()
                 .copied()
                 .enumerate()
-                .take(row_slots.end)
-                .skip(row_slots.start)
+                .take(layer_row_slots.end)
+                .skip(layer_row_slots.start)
             {
                 let layer = &app.state.project.q0rgs[q0rg_idx].layers[layer_index];
+                let row_layer_id = layer.layer_id;
+                let layer_frame_count = layer
+                    .timeline_frame_count
+                    .unwrap_or(frame_count)
+                    .min(frame_count);
                 let metadata = app.state.project.layer_metadata(q0rg_id, layer.layer_id);
                 let is_folder = metadata.kind == q0s_format::v2::LayerKind::Folder;
+                let is_mask = metadata.kind == q0s_format::v2::LayerKind::Mask;
                 let effective_visible = app.state.project.layer_is_visible(q0rg_id, layer.layer_id);
                 let effective_locked = app.state.project.layer_is_locked(q0rg_id, layer.layer_id);
                 let row_y = rect.min.y + ROW_H * (li as f32 + camera_row_count as f32 + 1.0);
@@ -479,9 +579,9 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 draw_empty_cells(
                     &painter,
                     &theme,
-                    rect.min.x + LAYER_LABEL_W,
+                    rect.min.x + label_width,
                     row_y,
-                    frame_count,
+                    layer_frame_count,
                     visible_frames,
                     is_current_layer,
                 );
@@ -489,7 +589,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 // Label (left-side fixed column) РІР‚вЂќ pull tones from the
                 // panel/window pair so any theme reads as a coherent strip.
                 let label_rect =
-                    Rect::from_min_size(pos2(rect.min.x, row_y), vec2(LAYER_LABEL_W, ROW_H));
+                    Rect::from_min_size(pos2(rect.min.x, row_y), vec2(label_width, ROW_H));
                 let label_bg = if is_current_layer {
                     theme.panel.to_color32()
                 } else if li % 2 == 0 {
@@ -514,7 +614,18 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     app.state
                         .project
                         .layer_folder_depth(q0rg_id, layer.layer_id) as f32;
-                let hierarchy_indent = folder_depth * 14.0;
+                let hierarchy_indent = (folder_depth * 14.0
+                    + if !app
+                        .state
+                        .project
+                        .layer_mask_sources(q0rg_id, layer.layer_id)
+                        .is_empty()
+                    {
+                        14.0
+                    } else {
+                        0.0
+                    })
+                .min((label_width - if is_mask { 100.0 } else { 78.0 }).max(0.0));
                 let icon_rect = Rect::from_center_size(
                     label_rect.left_center() + vec2(11.0 + hierarchy_indent, 0.0),
                     vec2(13.0, 13.0),
@@ -522,7 +633,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 draw_layer_icon(
                     &painter,
                     icon_rect,
-                    is_folder,
+                    metadata.kind,
                     metadata.collapsed,
                     theme.text.to_color32(),
                     theme.accent.to_color32(),
@@ -532,27 +643,111 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     label_rect.right_center() - vec2(31.0, 0.0),
                     vec2(18.0, ROW_H),
                 );
+                let outline_rect = Rect::from_center_size(
+                    label_rect.right_center() - vec2(49.0, 0.0),
+                    vec2(18.0, ROW_H),
+                );
                 let lock_rect = Rect::from_center_size(
                     label_rect.right_center() - vec2(13.0, 0.0),
                     vec2(18.0, ROW_H),
                 );
-                let layer_label = truncate_label(&layer.name, 13);
+                let mask_art_rect = Rect::from_center_size(
+                    label_rect.right_center() - vec2(72.0, 0.0),
+                    vec2(18.0, ROW_H),
+                );
+                let mask_art_hidden = app.session.hidden_mask_art_layers.contains(&(
+                    app.active_project_tab_id().unwrap_or(0),
+                    q0rg_id,
+                    layer.layer_id,
+                ));
+                let mask_art_response = is_mask.then(|| {
+                    ui.interact(
+                        mask_art_rect,
+                        egui::Id::new(("mask-art-visibility", q0rg_id, layer.layer_id)),
+                        egui::Sense::click(),
+                    )
+                    .on_hover_text(if mask_art_hidden {
+                        "Show mask artwork and unmasked contents for editing"
+                    } else {
+                        "Hide mask artwork and preview clipping; contents stay editable"
+                    })
+                });
                 let label_color = if effective_visible {
                     theme.text.to_color32()
                 } else {
                     theme.text.to_color32().gamma_multiply(0.45)
                 };
-                painter.text(
-                    label_rect.left_center() + vec2(22.0 + indent, 0.0),
-                    Align2::LEFT_CENTER,
-                    layer_label,
-                    FontId::proportional(11.0),
-                    label_color,
+                let name_rect = Rect::from_min_max(
+                    label_rect.left_top() + vec2(22.0 + indent, 0.0),
+                    pos2(
+                        if is_mask {
+                            mask_art_rect.left()
+                        } else {
+                            outline_rect.left()
+                        } - 3.0,
+                        label_rect.bottom(),
+                    ),
                 );
+                if label_width > 120.0 {
+                    crate::ui::clipped_label(
+                        &painter,
+                        name_rect,
+                        &layer.name,
+                        FontId::proportional(11.0),
+                        label_color,
+                    );
+                }
+                ui.interact(
+                    name_rect.intersect(label_rect),
+                    ui.id().with(("layer_name_hint", row_layer_id)),
+                    Sense::hover(),
+                )
+                .on_hover_text(&layer.name);
+                for (control, hint) in [
+                    (
+                        visibility_rect,
+                        if is_mask {
+                            "Show or hide mask and all its contents"
+                        } else {
+                            "Show or hide layer"
+                        },
+                    ),
+                    (outline_rect, "Toggle outline for this layer"),
+                    (lock_rect, "Lock or unlock this layer"),
+                ] {
+                    ui.interact(
+                        control,
+                        ui.id().with((
+                            "layer_control_hint",
+                            row_layer_id,
+                            control.center().x.to_bits(),
+                        )),
+                        Sense::hover(),
+                    )
+                    .on_hover_text(hint);
+                }
                 draw_visibility_icon(
                     &painter,
                     visibility_rect.shrink2(vec2(2.0, 4.0)),
                     effective_visible,
+                    theme.text.to_color32(),
+                );
+                if is_mask {
+                    draw_mask_art_visibility_icon(
+                        &painter,
+                        mask_art_rect.shrink2(vec2(2.0, 4.0)),
+                        !mask_art_hidden,
+                        theme.text.to_color32(),
+                    );
+                }
+                let outline_enabled = app
+                    .session
+                    .outline_layers
+                    .contains(&(q0rg_id, layer.layer_id));
+                draw_outline_icon(
+                    &painter,
+                    outline_rect.shrink2(vec2(4.0, 5.0)),
+                    outline_enabled,
                     theme.text.to_color32(),
                 );
                 draw_lock_icon(
@@ -563,8 +758,8 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 );
                 painter.line_segment(
                     [
-                        pos2(rect.min.x + LAYER_LABEL_W, row_y),
-                        pos2(rect.min.x + LAYER_LABEL_W, row_y + ROW_H),
+                        pos2(rect.min.x + label_width, row_y),
+                        pos2(rect.min.x + label_width, row_y + ROW_H),
                     ],
                     Stroke::new(1.0_f32, theme.stroke_dark.to_color32()),
                 );
@@ -586,7 +781,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         &painter,
                         &theme,
                         layer,
-                        rect.min.x + LAYER_LABEL_W,
+                        rect.min.x + label_width,
                         row_y,
                         frame_count,
                         is_current_layer,
@@ -599,9 +794,9 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         q0rg_id,
                         layer,
                         AudioWaveformLayout {
-                            base_x: rect.min.x + LAYER_LABEL_W,
+                            base_x: rect.min.x + label_width,
                             row_y,
-                            frame_count,
+                            frame_count: layer_frame_count,
                         },
                     );
                     draw_frame_script_markers(
@@ -611,14 +806,14 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         q0rg_id,
                         layer.layer_id,
                         AudioWaveformLayout {
-                            base_x: rect.min.x + LAYER_LABEL_W,
+                            base_x: rect.min.x + label_width,
                             row_y,
-                            frame_count,
+                            frame_count: layer_frame_count,
                         },
                     );
                 } else {
                     let folder_strip = Rect::from_min_size(
-                        pos2(rect.min.x + LAYER_LABEL_W, row_y + CELL_PAD_Y),
+                        pos2(rect.min.x + label_width, row_y + CELL_PAD_Y),
                         vec2((visible_frames as f32) * FRAME_W, ROW_H - CELL_PAD_Y * 2.0),
                     );
                     painter.rect_filled(
@@ -631,7 +826,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 if !is_folder && response.double_clicked() {
                     if let Some(pos) = response.interact_pointer_pos() {
                         if row_rect.contains(pos) && !label_rect.contains(pos) {
-                            let rel_x = pos.x - (rect.min.x + LAYER_LABEL_W);
+                            let rel_x = pos.x - (rect.min.x + label_width);
                             if rel_x >= 0.0 {
                                 let frame = (rel_x / FRAME_W).floor() as u16;
                                 if frame < frame_count
@@ -654,13 +849,35 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 // Frame-strip drags keep their existing rectangular selection
                 // behaviour and never accidentally reorder a layer.
                 if let Some(pos) = response.interact_pointer_pos() {
-                    let state_control = visibility_rect.contains(pos) || lock_rect.contains(pos);
+                    let state_control = visibility_rect.contains(pos)
+                        || outline_rect.contains(pos)
+                        || lock_rect.contains(pos)
+                        || (is_mask && mask_art_rect.contains(pos));
                     if label_rect.contains(pos)
                         && !state_control
                         && response.drag_started_by(PointerButton::Primary)
                     {
-                        started_layer_drag = Some(layer.layer_id);
+                        let selection = app
+                            .session
+                            .timeline_layer_selection
+                            .filter(|selection| {
+                                layer_selection_contains(
+                                    Some(*selection),
+                                    &layer_ids,
+                                    layer.layer_id,
+                                )
+                            })
+                            .unwrap_or_else(|| TimelineLayerSelection::single(layer.layer_id));
+                        started_layer_drag = Some((layer.layer_id, selection));
                     }
+                }
+
+                if mask_art_response
+                    .as_ref()
+                    .is_some_and(|mask_response| mask_response.clicked())
+                {
+                    app.queue(Action::ToggleMaskArtworkVisibility(q0rg_id, layer.layer_id));
+                    continue;
                 }
 
                 // Click in row РІвЂ вЂ™ set current_layer + current_frame
@@ -674,6 +891,10 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                             app.queue(Action::ToggleLayerLock(q0rg_id, layer.layer_id));
                             continue;
                         }
+                        if outline_rect.contains(pos) && !is_folder {
+                            app.queue(Action::ToggleLayerOutline(q0rg_id, layer.layer_id));
+                            continue;
+                        }
                         if label_rect.contains(pos) {
                             click_label_layer = Some(layer.layer_id);
                         }
@@ -681,21 +902,149 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         if is_folder {
                             click_frame = None;
                             app.session.timeline_selection = None;
-                            if label_rect.contains(pos) && pos.x <= label_rect.left() + 22.0 {
-                                app.queue(Action::ToggleLayerFolder(q0rg_id, layer.layer_id));
+                            app.session.timeline_cell_selection = None;
+                            if label_rect.contains(pos) && icon_rect.contains(pos) {
+                                app.queue(Action::ToggleLayerFolder(q0rg_id, row_layer_id));
                             }
                         } else {
-                            let rel_x = pos.x - (rect.min.x + LAYER_LABEL_W);
+                            if is_mask && icon_rect.contains(pos) {
+                                app.queue(Action::ToggleLayerFolder(q0rg_id, row_layer_id));
+                                click_frame = None;
+                            }
+                            let rel_x = pos.x - (rect.min.x + label_width);
                             if rel_x >= 0.0 {
                                 let f = (rel_x / FRAME_W).floor() as i32;
                                 if f >= 0 && f < visible_frames as i32 {
                                     click_frame = Some(f as u16);
                                 }
                             } else if response.double_clicked() {
-                                begin_layer_rename(app, q0rg_id, layer.layer_id);
+                                begin_layer_rename(app, q0rg_id, row_layer_id);
                             }
                         }
                     }
+                }
+            }
+
+            // Rig tracks are dedicated sublayers after the artwork rows. They
+            // only exist for layers with an actual rig binding or deformer.
+            for (track_index, track) in rig_tracks
+                .iter()
+                .enumerate()
+                .take(rig_row_slots.end)
+                .skip(rig_row_slots.start)
+            {
+                let row_y = rig_rows_y + ROW_H * track_index as f32;
+                let row_rect =
+                    Rect::from_min_size(pos2(rect.min.x, row_y), vec2(rect.width(), ROW_H));
+                let label_rect =
+                    Rect::from_min_size(pos2(rect.min.x, row_y), vec2(label_width, ROW_H));
+                let selection = app.session.timeline_rig_key_selection.filter(|selection| {
+                    selection.q0rg_id == q0rg_id && selection.layer_id == track.layer_id
+                });
+                let selected_track = selection.is_some();
+                painter.rect_filled(row_rect, 0.0, theme.empty_beyond.to_color32());
+                draw_empty_cells(
+                    &painter,
+                    &theme,
+                    rect.min.x + label_width,
+                    row_y,
+                    frame_count,
+                    visible_frames,
+                    selected_track,
+                );
+                painter.rect_filled(
+                    label_rect,
+                    0.0,
+                    blend(
+                        theme.panel.to_color32(),
+                        theme.accent.to_color32(),
+                        if selected_track { 0.22 } else { 0.08 },
+                    ),
+                );
+                let icon_center = label_rect.left_center() + vec2(11.0, 0.0);
+                painter.line_segment(
+                    [icon_center + vec2(-3.0, 3.0), icon_center + vec2(3.0, -3.0)],
+                    Stroke::new(1.4_f32, theme.accent.to_color32()),
+                );
+                painter.circle_filled(
+                    icon_center + vec2(-3.0, 3.0),
+                    2.1,
+                    theme.accent.to_color32(),
+                );
+                painter.circle_filled(
+                    icon_center + vec2(3.0, -3.0),
+                    2.1,
+                    theme.accent.to_color32(),
+                );
+                painter.text(
+                    label_rect.left_center() + vec2(22.0, 0.0),
+                    Align2::LEFT_CENTER,
+                    format!("rig: {}", truncate_label(&track.layer_name, 21)),
+                    FontId::proportional(10.0),
+                    theme.accent.to_color32(),
+                );
+                painter.line_segment(
+                    [
+                        pos2(rect.min.x + label_width, row_y),
+                        pos2(rect.min.x + label_width, row_y + ROW_H),
+                    ],
+                    Stroke::new(1.0_f32, theme.stroke_dark.to_color32()),
+                );
+                painter.line_segment(
+                    [
+                        pos2(rect.min.x, row_y + ROW_H),
+                        pos2(rect.max.x, row_y + ROW_H),
+                    ],
+                    Stroke::new(1.0_f32, theme.stroke_dark.to_color32()),
+                );
+                if let Some(selection) = selection {
+                    let selected_rect = Rect::from_min_size(
+                        pos2(
+                            rect.min.x + label_width + f32::from(selection.frame) * FRAME_W,
+                            row_y + CELL_PAD_Y,
+                        ),
+                        vec2(FRAME_W, ROW_H - CELL_PAD_Y * 2.0),
+                    );
+                    painter.rect_stroke(
+                        selected_rect,
+                        1.0,
+                        Stroke::new(1.0_f32, theme.accent.to_color32()),
+                    );
+                }
+                for frame in &track.frames {
+                    if *frame >= frame_count || !frame_slots.contains(frame) {
+                        continue;
+                    }
+                    let center = pos2(
+                        rect.min.x + label_width + (f32::from(*frame) + 0.5) * FRAME_W,
+                        row_y + ROW_H * 0.5,
+                    );
+                    let radius = 4.0_f32;
+                    let fill = if selection.is_some_and(|selection| selection.frame == *frame) {
+                        theme.keyframe.to_color32()
+                    } else {
+                        theme.accent.to_color32()
+                    };
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![
+                            pos2(center.x, center.y - radius),
+                            pos2(center.x + radius, center.y),
+                            pos2(center.x, center.y + radius),
+                            pos2(center.x - radius, center.y),
+                        ],
+                        fill,
+                        Stroke::new(0.8_f32, theme.stroke_dark.to_color32()),
+                    ));
+                    ui.interact(
+                        Rect::from_center_size(center, vec2(FRAME_W, ROW_H)),
+                        egui::Id::new(("rig_timeline_key", q0rg_id, track.layer_id, frame)),
+                        Sense::hover(),
+                    )
+                    .on_hover_text(format!(
+                        "rig key on {}\nframe {}",
+                        track.layer_name,
+                        u32::from(*frame) + 1
+                    ));
                 }
             }
 
@@ -703,12 +1052,11 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 app.queue(Action::OpenFrameScriptEditor(q0rg_id, layer_id, frame));
             }
 
-            if let Some(layer_id) = started_layer_drag {
-                app.session.timeline_layer_drag = Some(TimelineLayerDrag { q0rg_id, layer_id });
+            if let Some((layer_id, selection)) = started_layer_drag {
+                app.session.timeline_layer_drag = Some(TimelineLayerDrag { q0rg_id, selection });
                 app.session.current_layer_id = layer_id;
                 app.session.timeline_selection = None;
-                app.session.timeline_layer_selection =
-                    Some(TimelineLayerSelection::single(layer_id));
+                app.session.timeline_layer_selection = Some(selection);
                 app.session.selection = Selection::None;
             }
 
@@ -717,6 +1065,13 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 .timeline_layer_drag
                 .filter(|drag| drag.q0rg_id == q0rg_id)
                 .and_then(|drag| {
+                    let dragged_layer_ids = layer_ids
+                        .iter()
+                        .copied()
+                        .filter(|layer_id| {
+                            layer_selection_contains(Some(drag.selection), &layer_ids, *layer_id)
+                        })
+                        .collect::<Vec<_>>();
                     ui.input(|input| input.pointer.latest_pos())
                         .and_then(|pos| {
                             layer_drop_target_at(
@@ -725,7 +1080,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                                 rect,
                                 pos,
                                 &layer_ids,
-                                drag.layer_id,
+                                &dragged_layer_ids,
                             )
                         })
                 });
@@ -738,6 +1093,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     rect,
                     &layer_ids,
                     target,
+                    label_width,
                 );
             }
 
@@ -745,13 +1101,14 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             let library_drop_cell =
                 ui.input(|input| input.pointer.latest_pos())
                     .and_then(|position| {
-                        timeline_cell_at(
+                        timeline_cell_at_with_label_width(
                             rect,
                             position,
                             frame_count,
                             &layer_ids,
                             &folder_layer_ids,
                             camera_row_count,
+                            label_width,
                         )
                     });
             if library_payload.is_some() {
@@ -762,7 +1119,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     {
                         let cell = Rect::from_min_size(
                             pos2(
-                                rect.min.x + LAYER_LABEL_W + frame as f32 * FRAME_W,
+                                rect.min.x + label_width + frame as f32 * FRAME_W,
                                 rect.min.y + ROW_H * (row as f32 + camera_row_count as f32 + 1.0),
                             ),
                             vec2(FRAME_W, ROW_H),
@@ -795,14 +1152,27 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 &theme,
                 app.session.timeline_selection,
                 &layer_ids,
-                rect.min.x + LAYER_LABEL_W,
+                rect.min.x + label_width,
                 rect.min.y + ROW_H * (camera_row_count as f32 + 1.0),
                 visible_frames,
             );
+            if let Some((selected_q0rg, cells)) = app.session.timeline_cell_selection.as_ref() {
+                if *selected_q0rg == q0rg_id {
+                    draw_timeline_cell_selection(
+                        &painter,
+                        &theme,
+                        cells,
+                        &layer_ids,
+                        rect.min.x + label_width,
+                        rect.min.y + ROW_H * (camera_row_count as f32 + 1.0),
+                        visible_frames,
+                    );
+                }
+            }
 
             // Playhead
             let playhead_x =
-                rect.min.x + LAYER_LABEL_W + (app.session.timeline_frame() as f32 + 0.5) * FRAME_W;
+                rect.min.x + label_width + (app.session.timeline_frame() as f32 + 0.5) * FRAME_W;
             painter.line_segment(
                 [
                     pos2(playhead_x, rect.min.y),
@@ -817,7 +1187,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     && header_rect.contains(pos)
                     && (response.clicked() || response.dragged())
                 {
-                    let rel_x = pos.x - (rect.min.x + LAYER_LABEL_W);
+                    let rel_x = pos.x - (rect.min.x + label_width);
                     if rel_x >= 0.0 {
                         let f = (rel_x / FRAME_W).floor() as i32;
                         if f >= 0 && f < visible_frames as i32 {
@@ -835,22 +1205,57 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             });
             let camera_pointer_frame = response.interact_pointer_pos().and_then(|pos| {
                 let row = camera_row_rect?;
-                if !row.contains(pos) || pos.x < rect.min.x + LAYER_LABEL_W {
+                if !row.contains(pos) || pos.x < rect.min.x + label_width {
                     return None;
                 }
-                let frame = ((pos.x - (rect.min.x + LAYER_LABEL_W)) / FRAME_W).floor() as i32;
+                let frame = ((pos.x - (rect.min.x + label_width)) / FRAME_W).floor() as i32;
                 (frame >= 0 && frame < i32::from(visible_frames)).then_some(frame as u16)
             });
             let pointer_on_camera_row = response
                 .interact_pointer_pos()
                 .zip(camera_row_rect)
                 .is_some_and(|(pos, row)| row.contains(pos));
+            let rig_track_pointer_row = response.interact_pointer_pos().and_then(|pos| {
+                let relative_y = pos.y - rig_rows_y;
+                (relative_y >= 0.0 && relative_y < ROW_H * rig_track_count as f32)
+                    .then_some((relative_y / ROW_H).floor() as usize)
+                    .filter(|index| *index < rig_track_count)
+            });
+            let rig_track_pointer_cell = response.interact_pointer_pos().and_then(|pos| {
+                let track_index = rig_track_pointer_row?;
+                let relative_x = pos.x - (rect.min.x + label_width);
+                if relative_x < 0.0 {
+                    return None;
+                }
+                let frame = (relative_x / FRAME_W).floor() as i32;
+                (frame >= 0 && frame < i32::from(visible_frames))
+                    .then_some((track_index, frame as u16))
+            });
+            let rig_drop_cell = ui
+                .input(|input| input.pointer.latest_pos())
+                .and_then(|pos| {
+                    let relative_y = pos.y - rig_rows_y;
+                    if relative_y < 0.0 || relative_y >= ROW_H * rig_track_count as f32 {
+                        return None;
+                    }
+                    let track_index = (relative_y / ROW_H).floor() as usize;
+                    let relative_x = pos.x - (rect.min.x + label_width);
+                    if relative_x < 0.0 || track_index >= rig_track_count {
+                        return None;
+                    }
+                    let frame = (relative_x / FRAME_W).floor() as i32;
+                    (frame >= 0 && frame < i32::from(visible_frames))
+                        .then_some((rig_tracks[track_index].layer_id, frame as u16))
+                });
 
             if camera_row_enabled && pointer_on_camera_row && response.clicked() {
                 app.session.camera_track_selected = true;
                 app.session.timeline_selection = None;
+                app.session.timeline_cell_selection = None;
                 app.session.timeline_layer_selection = None;
                 app.session.timeline_frame_drag = None;
+                app.session.timeline_rig_key_selection = None;
+                app.session.timeline_rig_key_drag = None;
                 app.session.selection = Selection::None;
                 if let Some(frame) = camera_pointer_frame {
                     let extend = ui.input(|input| input.modifiers.shift);
@@ -871,6 +1276,98 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 }
             }
 
+            if let (Some(track_index), Some((cell_track_index, frame))) =
+                (rig_track_pointer_row, rig_track_pointer_cell)
+            {
+                if track_index == cell_track_index && response.clicked() {
+                    let track = &rig_tracks[track_index];
+                    app.session.current_layer_id = track.layer_id;
+                    app.session.camera_track_selected = false;
+                    app.session.camera_timeline_selection = None;
+                    app.session.timeline_selection = None;
+                    app.session.timeline_cell_selection = None;
+                    app.session.timeline_layer_selection = None;
+                    app.session.timeline_frame_drag = None;
+                    app.session.camera_frame_drag = None;
+                    app.session.selection = Selection::None;
+                    app.session.timeline_rig_key_selection = Some(TimelineRigKeySelection {
+                        q0rg_id,
+                        layer_id: track.layer_id,
+                        frame,
+                    });
+                    app.session.set_timeline_frame(frame, frame_count);
+                }
+            } else if let Some(track_index) = rig_track_pointer_row.filter(|_| response.clicked()) {
+                let track = &rig_tracks[track_index];
+                app.session.current_layer_id = track.layer_id;
+                app.session.camera_track_selected = false;
+                app.session.camera_timeline_selection = None;
+                app.session.timeline_selection = None;
+                app.session.timeline_cell_selection = None;
+                app.session.timeline_layer_selection = None;
+                app.session.timeline_frame_drag = None;
+                app.session.camera_frame_drag = None;
+                app.session.selection = Selection::None;
+                app.session.timeline_rig_key_selection = Some(TimelineRigKeySelection {
+                    q0rg_id,
+                    layer_id: track.layer_id,
+                    frame: app.session.timeline_frame(),
+                });
+            }
+            if response.clicked() && rig_track_pointer_row.is_none() {
+                app.session.timeline_rig_key_selection = None;
+                app.session.timeline_rig_key_drag = None;
+            }
+
+            if let Some((track_index, frame)) = rig_track_pointer_cell {
+                let track = &rig_tracks[track_index];
+                if response.drag_started_by(PointerButton::Primary) && track.frames.contains(&frame)
+                {
+                    let selection = TimelineRigKeySelection {
+                        q0rg_id,
+                        layer_id: track.layer_id,
+                        frame,
+                    };
+                    app.session.timeline_rig_key_selection = Some(selection);
+                    app.session.timeline_rig_key_drag = Some(selection);
+                    app.session.current_layer_id = track.layer_id;
+                    app.session.camera_track_selected = false;
+                    app.session.timeline_selection = None;
+                    app.session.timeline_cell_selection = None;
+                    app.session.timeline_layer_selection = None;
+                    app.session.selection = Selection::None;
+                    app.session.set_timeline_frame(frame, frame_count);
+                }
+            }
+
+            if let (Some(drag), Some((target_layer_id, target_frame))) =
+                (app.session.timeline_rig_key_drag, rig_drop_cell)
+            {
+                if drag.q0rg_id == q0rg_id && drag.layer_id == target_layer_id {
+                    let track_index = rig_tracks
+                        .iter()
+                        .position(|track| track.layer_id == target_layer_id)
+                        .unwrap_or_default();
+                    let preview = Rect::from_min_size(
+                        pos2(
+                            rect.min.x + label_width + f32::from(target_frame) * FRAME_W,
+                            rig_rows_y + ROW_H * track_index as f32 + CELL_PAD_Y,
+                        ),
+                        vec2(FRAME_W, ROW_H - CELL_PAD_Y * 2.0),
+                    );
+                    painter.rect_filled(
+                        preview,
+                        1.0,
+                        theme.accent.to_color32().gamma_multiply(0.22),
+                    );
+                    painter.rect_stroke(
+                        preview,
+                        1.0,
+                        Stroke::new(1.5_f32, theme.accent.to_color32()),
+                    );
+                }
+            }
+
             if camera_row_enabled
                 && app.session.timeline_layer_drag.is_none()
                 && library_payload.is_none()
@@ -879,8 +1376,11 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     if response.drag_started_by(PointerButton::Primary) {
                         app.session.camera_track_selected = true;
                         app.session.timeline_selection = None;
+                        app.session.timeline_cell_selection = None;
                         app.session.timeline_layer_selection = None;
                         app.session.timeline_frame_drag = None;
+                        app.session.timeline_rig_key_selection = None;
+                        app.session.timeline_rig_key_drag = None;
                         app.session.selection = Selection::None;
                         let existing = app.session.camera_timeline_selection;
                         let inside_existing = existing.is_some_and(|selection| {
@@ -923,7 +1423,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     .saturating_add(1);
                 let preview = Rect::from_min_size(
                     pos2(
-                        rect.min.x + LAYER_LABEL_W + f32::from(target_frame) * FRAME_W,
+                        rect.min.x + label_width + f32::from(target_frame) * FRAME_W,
                         rect.min.y + ROW_H + CELL_PAD_Y,
                     ),
                     vec2(f32::from(width) * FRAME_W, ROW_H - CELL_PAD_Y * 2.0),
@@ -941,6 +1441,8 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 app.session.camera_track_selected = false;
                 app.session.camera_timeline_selection = None;
                 app.session.camera_frame_drag = None;
+                app.session.timeline_rig_key_selection = None;
+                app.session.timeline_rig_key_drag = None;
             }
             if let Some(layer_id) = click_label_layer {
                 let extend = ui.input(|input| input.modifiers.shift);
@@ -956,7 +1458,13 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     Some(TimelineLayerSelection::single(layer_id))
                 };
                 app.session.timeline_selection = None;
-                app.session.selection = Selection::None;
+                app.session.timeline_cell_selection = None;
+                app.session.selection = symbols_on_layer_at_frame(
+                    &app.state.project,
+                    q0rg_id,
+                    layer_id,
+                    app.session.current_frame,
+                );
             }
             if let Some(f) = click_frame {
                 app.session.set_timeline_frame(f, frame_count);
@@ -964,31 +1472,74 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             if let (Some(layer_id), Some(frame)) = (click_layer, click_frame) {
                 app.session.selection = Selection::None;
                 app.session.timeline_layer_selection = None;
-                let extend = ui.input(|input| input.modifiers.shift);
-                app.session.timeline_selection = if extend {
-                    app.session
-                        .timeline_selection
-                        .map(|mut selection| {
-                            selection.focus_layer_id = layer_id;
-                            selection.focus_frame = frame;
-                            selection
-                        })
-                        .or_else(|| Some(TimelineSelection::single(layer_id, frame)))
+                app.session.current_layer_id = layer_id;
+                let (toggle_cell, extend) = ui.input(|input| {
+                    (
+                        input.modifiers.ctrl || input.modifiers.command,
+                        input.modifiers.shift,
+                    )
+                });
+                if toggle_cell {
+                    let mut cells = app
+                        .session
+                        .timeline_cell_selection
+                        .take()
+                        .filter(|(selected_q0rg, _)| *selected_q0rg == q0rg_id)
+                        .map(|(_, cells)| cells)
+                        .unwrap_or_else(|| {
+                            app.session
+                                .timeline_selection
+                                .and_then(|selection| {
+                                    timeline_selection_bounds(selection, &layer_ids, frame_count)
+                                })
+                                .map(|(first_layer, last_layer, first_frame, last_frame)| {
+                                    (first_layer..=last_layer)
+                                        .flat_map(|layer_index| {
+                                            let selected_layer = layer_ids[layer_index];
+                                            (first_frame..=last_frame).map(move |selected_frame| {
+                                                (selected_layer, selected_frame)
+                                            })
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default()
+                        });
+                    if let Some(index) = cells.iter().position(|cell| *cell == (layer_id, frame)) {
+                        cells.remove(index);
+                    } else {
+                        cells.push((layer_id, frame));
+                    }
+                    app.session.timeline_selection = None;
+                    app.session.timeline_cell_selection =
+                        (!cells.is_empty()).then_some((q0rg_id, cells));
                 } else {
-                    Some(TimelineSelection::single(layer_id, frame))
-                };
+                    app.session.timeline_cell_selection = None;
+                    app.session.timeline_selection = if extend {
+                        app.session
+                            .timeline_selection
+                            .map(|mut selection| {
+                                selection.focus_layer_id = layer_id;
+                                selection.focus_frame = frame;
+                                selection
+                            })
+                            .or_else(|| Some(TimelineSelection::single(layer_id, frame)))
+                    } else {
+                        Some(TimelineSelection::single(layer_id, frame))
+                    };
+                }
             }
 
             let frame_drop_cell =
                 ui.input(|input| input.pointer.latest_pos())
                     .and_then(|position| {
-                        timeline_cell_at(
+                        timeline_cell_at_with_label_width(
                             rect,
                             position,
                             visible_frames,
                             &layer_ids,
                             &folder_layer_ids,
                             camera_row_count,
+                            label_width,
                         )
                     });
 
@@ -997,6 +1548,9 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     if response.drag_started() {
                         app.session.selection = Selection::None;
                         app.session.timeline_layer_selection = None;
+                        app.session.timeline_cell_selection = None;
+                        app.session.timeline_rig_key_selection = None;
+                        app.session.timeline_rig_key_drag = None;
                         if let Some(selection) =
                             app.session.timeline_selection.filter(|selection| {
                                 frame_selection_contains(*selection, &layer_ids, layer_id, frame)
@@ -1051,7 +1605,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                             .unwrap_or(1);
                         let preview = Rect::from_min_size(
                             pos2(
-                                rect.min.x + LAYER_LABEL_W + target_frame as f32 * FRAME_W,
+                                rect.min.x + label_width + target_frame as f32 * FRAME_W,
                                 rect.min.y
                                     + ROW_H * (target_row as f32 + camera_row_count as f32 + 1.0),
                             ),
@@ -1073,10 +1627,34 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             }
 
             if response.drag_stopped_by(PointerButton::Primary) {
+                if let Some(drag) = app.session.timeline_rig_key_drag.take() {
+                    if drag.q0rg_id == q0rg_id {
+                        if let Some((target_layer_id, target_frame)) = rig_drop_cell {
+                            if target_layer_id == drag.layer_id {
+                                app.queue(Action::MoveRigTimelineKey(drag, target_frame));
+                            }
+                        }
+                    }
+                }
                 if let Some(drag) = app.session.timeline_layer_drag.take() {
                     if drag.q0rg_id == q0rg_id {
                         if let Some(target) = layer_drop_preview {
-                            app.queue(Action::DropLayer(q0rg_id, drag.layer_id, target));
+                            let dragged_layer_ids = layer_ids
+                                .iter()
+                                .copied()
+                                .filter(|layer_id| {
+                                    layer_selection_contains(
+                                        Some(drag.selection),
+                                        &layer_ids,
+                                        *layer_id,
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            if dragged_layer_ids.len() > 1 {
+                                app.queue(Action::DropLayers(q0rg_id, dragged_layer_ids, target));
+                            } else if let Some(layer_id) = dragged_layer_ids.first().copied() {
+                                app.queue(Action::DropLayer(q0rg_id, layer_id, target));
+                            }
                         }
                     }
                 }
@@ -1099,30 +1677,57 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             } else if !ui.input(|input| input.pointer.primary_down()) {
                 app.session.timeline_layer_drag = None;
                 app.session.timeline_frame_drag = None;
+                app.session.timeline_rig_key_drag = None;
                 app.session.camera_frame_drag = None;
             }
             // Right-click on a frame cell: position the playhead there first,
             // then open the context menu so its actions act on the *clicked*
             // frame, not whatever was previously selected.
             let secondary_on_camera = response.secondary_clicked() && pointer_on_camera_row;
+            let secondary_on_rig = response.secondary_clicked() && rig_track_pointer_row.is_some();
+            if response.secondary_clicked() && !secondary_on_rig {
+                app.session.timeline_rig_key_selection = None;
+                app.session.timeline_rig_key_drag = None;
+            }
             if response.secondary_clicked() {
                 if let Some(pos) = response.interact_pointer_pos() {
-                    let rel_x = pos.x - (rect.min.x + LAYER_LABEL_W);
-                    if rel_x >= 0.0 {
-                        let f = (rel_x / FRAME_W).floor() as i32;
-                        if f >= 0 && f < visible_frames as i32 {
-                            app.session.set_timeline_frame(f as u16, frame_count);
-                        }
+                    let rel_x = pos.x - (rect.min.x + label_width);
+                    let clicked_frame = if rel_x >= 0.0 {
+                        let frame = (rel_x / FRAME_W).floor() as i32;
+                        (frame >= 0 && frame < visible_frames as i32).then_some(frame as u16)
+                    } else {
+                        None
+                    };
+                    if let Some(frame) = clicked_frame {
+                        app.session.set_timeline_frame(frame, frame_count);
                     }
                     if secondary_on_camera {
                         app.session.camera_track_selected = true;
                         app.session.timeline_selection = None;
+                        app.session.timeline_cell_selection = None;
                         app.session.timeline_layer_selection = None;
+                        app.session.timeline_rig_key_selection = None;
                         app.session.selection = Selection::None;
                         if let Some(frame) = camera_pointer_frame {
                             app.session.camera_timeline_selection =
                                 Some(CameraTimelineSelection::single(frame));
                         }
+                    } else if secondary_on_rig {
+                        let track = &rig_tracks[rig_track_pointer_row.expect("rig row was hit")];
+                        let frame = clicked_frame.unwrap_or_else(|| app.session.timeline_frame());
+                        app.session.current_layer_id = track.layer_id;
+                        app.session.camera_track_selected = false;
+                        app.session.camera_timeline_selection = None;
+                        app.session.timeline_selection = None;
+                        app.session.timeline_cell_selection = None;
+                        app.session.timeline_layer_selection = None;
+                        app.session.timeline_rig_key_selection = Some(TimelineRigKeySelection {
+                            q0rg_id,
+                            layer_id: track.layer_id,
+                            frame,
+                        });
+                        app.session.selection = Selection::None;
+                        app.session.set_timeline_frame(frame, frame_count);
                     } else {
                         // Identify which ordinary layer row was clicked.
                         let row_idx = ((pos.y - rect.min.y) / ROW_H).floor() as i32
@@ -1134,28 +1739,57 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                                 app.session.current_layer_id = layer.layer_id;
                                 app.session.camera_track_selected = false;
                                 app.session.camera_timeline_selection = None;
+                                app.session.timeline_rig_key_selection = None;
                                 app.session.selection = Selection::None;
-                                let clicked_label = pos.x < rect.min.x + LAYER_LABEL_W;
+                                let clicked_label = pos.x < rect.min.x + label_width;
                                 if clicked_label
                                     || app.state.project.layer_is_folder(q0rg_id, layer.layer_id)
                                 {
                                     app.session.timeline_selection = None;
+                                    app.session.timeline_cell_selection = None;
                                     app.session.timeline_layer_selection =
                                         Some(TimelineLayerSelection::single(layer.layer_id));
                                 } else {
                                     app.session.timeline_layer_selection = None;
-                                    app.session.timeline_selection =
-                                        Some(TimelineSelection::single(
-                                            layer.layer_id,
-                                            app.session.timeline_frame(),
-                                        ));
+                                    let frame = clicked_frame
+                                        .unwrap_or_else(|| app.session.timeline_frame());
+                                    let keep_cell_selection =
+                                        app.session.timeline_cell_selection.as_ref().is_some_and(
+                                            |(selected_q0rg, cells)| {
+                                                *selected_q0rg == q0rg_id
+                                                    && cells.contains(&(layer.layer_id, frame))
+                                            },
+                                        );
+                                    let keep_range_selection =
+                                        app.session.timeline_selection.is_some_and(|selection| {
+                                            frame_selection_contains(
+                                                selection,
+                                                &layer_ids,
+                                                layer.layer_id,
+                                                frame,
+                                            )
+                                        });
+                                    if !keep_cell_selection && !keep_range_selection {
+                                        app.session.timeline_cell_selection = None;
+                                        app.session.timeline_selection =
+                                            Some(TimelineSelection::single(layer.layer_id, frame));
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-            if !secondary_on_camera {
+            if splitter.hovered() || splitter.dragged() {
+                painter.rect_filled(
+                    splitter_rect.shrink2(vec2(1.0, 0.0)),
+                    1.0,
+                    theme.accent.to_color32().gamma_multiply(0.65),
+                );
+            }
+            if secondary_on_rig {
+                response.context_menu(|ui| rig_timeline_context_menu(app, ui));
+            } else if !secondary_on_camera {
                 response.context_menu(|ui| timeline_context_menu(app, ui));
             }
         });
@@ -1191,6 +1825,28 @@ fn layer_parent_for_drop_lane(
     None
 }
 
+fn mask_layer_above(
+    project: &q0s_format::v2::ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+) -> Option<u16> {
+    let q0rg = project.q0rgs.iter().find(|q0rg| q0rg.q0rg_id == q0rg_id)?;
+    let parent = project.layer_parent_folder(q0rg_id, layer_id);
+    let siblings = q0rg
+        .layers
+        .iter()
+        .rev()
+        .filter(|layer| project.layer_parent_folder(q0rg_id, layer.layer_id) == parent)
+        .map(|layer| layer.layer_id)
+        .collect::<Vec<_>>();
+    let index = siblings
+        .iter()
+        .position(|candidate| *candidate == layer_id)?;
+    let above = *siblings.get(index.checked_sub(1)?)?;
+    (project.layer_metadata(q0rg_id, above).kind == q0s_format::v2::LayerKind::Mask)
+        .then_some(above)
+}
+
 fn layer_child_at_drop_parent(
     project: &q0s_format::v2::ProjectV2,
     q0rg_id: u16,
@@ -1217,7 +1873,7 @@ fn layer_drop_target_at(
     rect: Rect,
     pos: egui::Pos2,
     visible_layer_ids: &[u16],
-    dragged_layer_id: u16,
+    dragged_layer_ids: &[u16],
 ) -> Option<LayerDropTarget> {
     if !rect.expand(6.0).contains(pos) {
         return None;
@@ -1230,25 +1886,36 @@ fn layer_drop_target_at(
         usize::from(q0rg_id == project.meta.entry_q0rg_id && project.runtime.camera.enabled);
     let first_row_y = rect.min.y + ROW_H * (camera_rows as f32 + 1.0);
     let raw_row = ((pos.y - first_row_y) / ROW_H).floor() as isize;
-    let row_index = raw_row.clamp(0, row_count as isize - 1) as usize;
-    let target_id = visible_layer_ids[row_index];
-    let target_metadata = project.layer_metadata(q0rg_id, target_id);
-    let dragged_metadata = project.layer_metadata(q0rg_id, dragged_layer_id);
-    if project.layer_is_descendant_of(q0rg_id, target_id, dragged_layer_id) {
+    if raw_row >= row_count as isize {
         return None;
     }
+    let row_index = raw_row.max(0) as usize;
+    let target_id = visible_layer_ids[row_index];
+    if dragged_layer_ids.is_empty()
+        || dragged_layer_ids.iter().any(|dragged_layer_id| {
+            target_id == *dragged_layer_id
+                || project.layer_is_descendant_of(q0rg_id, target_id, *dragged_layer_id)
+        })
+    {
+        return None;
+    }
+    let target_metadata = project.layer_metadata(q0rg_id, target_id);
 
     let row_y = first_row_y + row_index as f32 * ROW_H;
     let row_fraction = ((pos.y - row_y) / ROW_H).clamp(0.0, 1.0);
     let requested_parent =
         layer_parent_for_drop_lane(project, q0rg_id, target_id, pos.x, rect.min.x);
 
-    if target_metadata.kind == q0s_format::v2::LayerKind::Folder {
-        if target_id == dragged_layer_id && (0.25..=0.75).contains(&row_fraction) {
-            return None;
-        }
+    if matches!(
+        target_metadata.kind,
+        q0s_format::v2::LayerKind::Folder | q0s_format::v2::LayerKind::Mask
+    ) {
         if (0.25..=0.75).contains(&row_fraction) {
-            return Some(LayerDropTarget::IntoFolder(target_id));
+            return Some(match target_metadata.kind {
+                q0s_format::v2::LayerKind::Folder => LayerDropTarget::IntoFolder(target_id),
+                q0s_format::v2::LayerKind::Mask => LayerDropTarget::IntoMask(target_id),
+                q0s_format::v2::LayerKind::Normal => return None,
+            });
         }
         return Some(if row_fraction < 0.5 {
             LayerDropTarget::Before {
@@ -1263,9 +1930,6 @@ fn layer_drop_target_at(
         });
     }
 
-    if target_id == dragged_layer_id && requested_parent == dragged_metadata.parent_folder_id {
-        return None;
-    }
     Some(if row_fraction < 0.5 {
         LayerDropTarget::Before {
             layer_id: target_id,
@@ -1287,12 +1951,13 @@ fn draw_layer_drop_preview(
     rect: Rect,
     visible_layer_ids: &[u16],
     target: LayerDropTarget,
+    label_width: f32,
 ) {
     let accent = theme.accent.to_color32();
     let camera_rows =
         usize::from(q0rg_id == project.meta.entry_q0rg_id && project.runtime.camera.enabled);
     match target {
-        LayerDropTarget::IntoFolder(folder_id) => {
+        LayerDropTarget::IntoFolder(folder_id) | LayerDropTarget::IntoMask(folder_id) => {
             let Some(index) = visible_layer_ids
                 .iter()
                 .position(|layer_id| *layer_id == folder_id)
@@ -1302,7 +1967,7 @@ fn draw_layer_drop_preview(
             let row_y = rect.min.y + ROW_H * (index as f32 + camera_rows as f32 + 1.0);
             let highlight = Rect::from_min_size(
                 pos2(rect.min.x + 1.0, row_y + 1.0),
-                vec2(LAYER_LABEL_W - 2.0, ROW_H - 2.0),
+                vec2(label_width - 2.0, ROW_H - 2.0),
             );
             painter.rect_filled(
                 highlight,
@@ -1311,6 +1976,7 @@ fn draw_layer_drop_preview(
             );
             painter.rect_stroke(highlight, 2.0, Stroke::new(1.5_f32, accent));
         }
+        LayerDropTarget::OutOfMask => return,
         LayerDropTarget::Before {
             layer_id,
             parent_folder_id,
@@ -1362,7 +2028,7 @@ fn draw_layer_drop_preview(
                 })
                 .unwrap_or(0.0);
             let x0 = rect.min.x + 4.0 + indent;
-            let x1 = rect.min.x + LAYER_LABEL_W - 4.0;
+            let x1 = rect.min.x + label_width - 4.0;
             painter.line_segment([pos2(x0, y), pos2(x1, y)], Stroke::new(2.0_f32, accent));
             painter.add(egui::Shape::convex_polygon(
                 vec![
@@ -1378,6 +2044,14 @@ fn draw_layer_drop_preview(
 }
 
 fn timeline_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
+    if app.session.timeline_layer_selection.is_some() {
+        timeline_layer_context_menu(app, ui);
+    } else {
+        timeline_frame_context_menu(app, ui);
+    }
+}
+
+fn timeline_layer_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
     let q0rg_id = app.session.current_q0rg_id;
     let layer_id = app.session.current_layer_id;
     let metadata = app.state.project.layer_metadata(q0rg_id, layer_id);
@@ -1392,27 +2066,6 @@ fn timeline_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
         .unwrap_or("Layer");
     ui.label(egui::RichText::new(layer_name).strong().small());
     ui.separator();
-    frame_label_context_menu(app, ui);
-    ui.separator();
-    if ui.button("Cut  (Ctrl+X)").clicked() {
-        app.queue(Action::CutSelection);
-        ui.close_menu();
-    }
-    if ui.button("Copy  (Ctrl+C)").clicked() {
-        app.queue(Action::CopySelection);
-        ui.close_menu();
-    }
-    if ui
-        .add_enabled(
-            app.session.clipboard.is_some(),
-            egui::Button::new("Paste  (Ctrl+V)"),
-        )
-        .clicked()
-    {
-        app.queue(Action::Paste);
-        ui.close_menu();
-    }
-    ui.separator();
     if ui.button("Rename layer").clicked() {
         begin_layer_rename(app, q0rg_id, layer_id);
         ui.close_menu();
@@ -1425,14 +2078,24 @@ fn timeline_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
         app.queue(Action::MoveLayer(q0rg_id, layer_id, 1));
         ui.close_menu();
     }
-    if metadata.kind == q0s_format::v2::LayerKind::Folder
-        && ui
-            .button(if metadata.collapsed {
+    if matches!(
+        metadata.kind,
+        q0s_format::v2::LayerKind::Folder | q0s_format::v2::LayerKind::Mask
+    ) && ui
+        .button(if metadata.collapsed {
+            if metadata.kind == q0s_format::v2::LayerKind::Mask {
+                "Show masked layers"
+            } else {
                 "Expand folder"
+            }
+        } else {
+            if metadata.kind == q0s_format::v2::LayerKind::Mask {
+                "Hide masked layers"
             } else {
                 "Collapse folder"
-            })
-            .clicked()
+            }
+        })
+        .clicked()
     {
         app.queue(Action::ToggleLayerFolder(q0rg_id, layer_id));
         ui.close_menu();
@@ -1445,6 +2108,25 @@ fn timeline_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
     } else if ui.button("Move into folder above").clicked() {
         app.queue(Action::IndentLayer(q0rg_id, layer_id));
         ui.close_menu();
+    }
+    if metadata.mask_layer_id.is_some() {
+        if ui.button("Move out of mask").clicked() {
+            app.queue(Action::DropLayer(
+                q0rg_id,
+                layer_id,
+                LayerDropTarget::OutOfMask,
+            ));
+            ui.close_menu();
+        }
+    } else if let Some(mask_id) = mask_layer_above(&app.state.project, q0rg_id, layer_id) {
+        if ui.button("Move into mask above").clicked() {
+            app.queue(Action::DropLayer(
+                q0rg_id,
+                layer_id,
+                LayerDropTarget::IntoMask(mask_id),
+            ));
+            ui.close_menu();
+        }
     }
     if ui.button("Delete layer").clicked() {
         app.queue(Action::DeleteLayer(q0rg_id, layer_id));
@@ -1460,9 +2142,58 @@ fn timeline_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
         );
         return;
     }
+}
 
-    let frame = app.session.timeline_frame() + 1;
+fn timeline_frame_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
+    let q0rg_id = app.session.current_q0rg_id;
+    let layer_id = app.session.current_layer_id;
+    let layer_name = app
+        .state
+        .project
+        .q0rgs
+        .iter()
+        .find(|q| q.q0rg_id == q0rg_id)
+        .and_then(|q| q.layers.iter().find(|layer| layer.layer_id == layer_id))
+        .map(|layer| layer.name.as_str())
+        .unwrap_or("Layer");
+    ui.label(egui::RichText::new(layer_name).strong().small());
     ui.separator();
+    frame_label_context_menu(app, ui);
+    ui.separator();
+    if ui
+        .add(crate::ui::shortcut_button(
+            &app.settings.hotkeys,
+            ShortcutCommand::Cut,
+            "Cut",
+        ))
+        .clicked()
+    {
+        app.queue(Action::CutSelection);
+        ui.close_menu();
+    }
+    if ui
+        .add(crate::ui::shortcut_button(
+            &app.settings.hotkeys,
+            ShortcutCommand::Copy,
+            "Copy",
+        ))
+        .clicked()
+    {
+        app.queue(Action::CopySelection);
+        ui.close_menu();
+    }
+    if ui
+        .add_enabled(
+            app.has_clipboard(),
+            crate::ui::shortcut_button(&app.settings.hotkeys, ShortcutCommand::Paste, "Paste"),
+        )
+        .clicked()
+    {
+        app.queue(Action::Paste);
+        ui.close_menu();
+    }
+    ui.separator();
+    let frame = app.session.timeline_frame() + 1;
     ui.label(
         egui::RichText::new(format!("Frame {frame}"))
             .strong()
@@ -1494,31 +2225,143 @@ fn timeline_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
         ui.close_menu();
     }
     ui.separator();
-    if ui.button("Insert Frame  (F5)").clicked() {
+    if ui
+        .add(crate::ui::shortcut_button(
+            &app.settings.hotkeys,
+            ShortcutCommand::InsertFrame,
+            "Insert frame",
+        ))
+        .clicked()
+    {
         app.queue(Action::InsertFrame);
         ui.close_menu();
     }
-    if ui.button("Insert Keyframe  (F6)").clicked() {
+    if ui
+        .add(crate::ui::shortcut_button(
+            &app.settings.hotkeys,
+            ShortcutCommand::InsertKeyframe,
+            "Insert keyframe",
+        ))
+        .clicked()
+    {
         app.queue(Action::InsertKeyframe);
         ui.close_menu();
     }
-    if ui.button("Insert Blank Keyframe  (F7)").clicked() {
+    if ui
+        .add(crate::ui::shortcut_button(
+            &app.settings.hotkeys,
+            ShortcutCommand::InsertBlankKeyframe,
+            "Insert blank keyframe",
+        ))
+        .clicked()
+    {
         app.queue(Action::InsertBlankKeyframe);
         ui.close_menu();
     }
-    if ui.button("Clear Keyframe(s)  (Shift+F6)").clicked() {
+    if ui
+        .add(crate::ui::shortcut_button(
+            &app.settings.hotkeys,
+            ShortcutCommand::ClearKeyframe,
+            "Clear keyframes",
+        ))
+        .clicked()
+    {
         app.queue(Action::ClearKeyframe);
         ui.close_menu();
     }
-    if ui.button("Remove Selected Frame(s)  (Shift+F5)").clicked() {
-        app.queue(Action::RemoveFrame);
+    if ui
+        .add(crate::ui::shortcut_button(
+            &app.settings.hotkeys,
+            ShortcutCommand::RemoveFrame,
+            "Remove selected frames",
+        ))
+        .on_hover_text(
+            "Shorten the selected layers and close their gaps; other layers keep their frames",
+        )
+        .clicked()
+    {
+        app.queue(Action::RemoveSelectedTimelineFrames);
         ui.close_menu();
     }
     ui.separator();
-    if ui.button("Create Motion Tween  (Ctrl+Alt+T)").clicked() {
+    if ui
+        .add(crate::ui::shortcut_button(
+            &app.settings.hotkeys,
+            ShortcutCommand::MotionTween,
+            "Create motion tween",
+        ))
+        .clicked()
+    {
         app.queue(Action::CreateMotionTween);
         ui.close_menu();
     }
+}
+
+fn rig_timeline_context_menu(app: &mut EditorApp, ui: &mut Ui) {
+    let Some(selection) = app.session.timeline_rig_key_selection else {
+        return;
+    };
+    let layer_name = app
+        .state
+        .project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == selection.q0rg_id)
+        .and_then(|q0rg| {
+            q0rg.layers
+                .iter()
+                .find(|layer| layer.layer_id == selection.layer_id)
+        })
+        .map(|layer| layer.name.as_str())
+        .unwrap_or("layer");
+    let has_key = crate::timeline_edit::rig_key_frames_for_layer(
+        &app.state.project,
+        selection.q0rg_id,
+        selection.layer_id,
+    )
+    .contains(&selection.frame);
+    ui.label(
+        egui::RichText::new(format!("rig: {layer_name}"))
+            .strong()
+            .small(),
+    );
+    ui.separator();
+    ui.label(
+        egui::RichText::new(format!("frame {}", u32::from(selection.frame) + 1))
+            .strong()
+            .small(),
+    );
+    if ui
+        .add(crate::ui::shortcut_button(
+            &app.settings.hotkeys,
+            ShortcutCommand::InsertKeyframe,
+            "Insert / update rig key",
+        ))
+        .clicked()
+    {
+        app.queue(Action::InsertKeyframe);
+        ui.close_menu();
+    }
+    if ui
+        .add_enabled(
+            has_key,
+            crate::ui::shortcut_button(
+                &app.settings.hotkeys,
+                ShortcutCommand::Delete,
+                "Delete rig key",
+            ),
+        )
+        .clicked()
+    {
+        app.queue(Action::DeleteSelection);
+        ui.close_menu();
+    }
+    ui.separator();
+    ui.label(
+        egui::RichText::new("drag a diamond to move the rig key")
+            .small()
+            .italics(),
+    );
 }
 
 fn draw_camera_layer_row(
@@ -1529,6 +2372,7 @@ fn draw_camera_layer_row(
     row_y: f32,
     frame_count: u16,
     visible_frames: u16,
+    label_width: f32,
 ) {
     let selected = app.session.camera_track_selected;
     let row_rect = Rect::from_min_size(pos2(rect.min.x, row_y), vec2(rect.width(), ROW_H));
@@ -1536,14 +2380,14 @@ fn draw_camera_layer_row(
     draw_empty_cells(
         painter,
         theme,
-        rect.min.x + LAYER_LABEL_W,
+        rect.min.x + label_width,
         row_y,
         frame_count,
         visible_frames,
         selected,
     );
 
-    let label_rect = Rect::from_min_size(pos2(rect.min.x, row_y), vec2(LAYER_LABEL_W, ROW_H));
+    let label_rect = Rect::from_min_size(pos2(rect.min.x, row_y), vec2(label_width, ROW_H));
     let base_label = if selected {
         theme.panel.to_color32()
     } else {
@@ -1571,7 +2415,7 @@ fn draw_camera_layer_row(
     draw_layer_icon(
         painter,
         icon_rect,
-        false,
+        q0s_format::v2::LayerKind::Normal,
         false,
         theme.text.to_color32(),
         theme.accent.to_color32(),
@@ -1585,8 +2429,8 @@ fn draw_camera_layer_row(
     );
     painter.line_segment(
         [
-            pos2(rect.min.x + LAYER_LABEL_W, row_y),
-            pos2(rect.min.x + LAYER_LABEL_W, row_y + ROW_H),
+            pos2(rect.min.x + label_width, row_y),
+            pos2(rect.min.x + label_width, row_y + ROW_H),
         ],
         Stroke::new(1.0_f32, theme.stroke_dark.to_color32()),
     );
@@ -1602,7 +2446,7 @@ fn draw_camera_layer_row(
         painter,
         theme,
         &app.state.project.runtime.camera,
-        rect.min.x + LAYER_LABEL_W,
+        rect.min.x + label_width,
         row_y,
         frame_count,
         selected,
@@ -1618,11 +2462,11 @@ fn draw_camera_layer_row(
             let fill = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 54);
             let selected_rect = Rect::from_min_max(
                 pos2(
-                    rect.min.x + LAYER_LABEL_W + f32::from(first) * FRAME_W,
+                    rect.min.x + label_width + f32::from(first) * FRAME_W,
                     row_y + CELL_PAD_Y,
                 ),
                 pos2(
-                    rect.min.x + LAYER_LABEL_W + (f32::from(last) + 1.0) * FRAME_W,
+                    rect.min.x + label_width + (f32::from(last) + 1.0) * FRAME_W,
                     row_y + ROW_H - CELL_PAD_Y,
                 ),
             );
@@ -1756,42 +2600,14 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
         let camera_enabled = app.state.project.runtime.camera.enabled;
         let camera_response = ui
             .add_enabled_ui(camera_available, |ui| {
-                let (rect, response) = ui.allocate_exact_size(vec2(28.0, 20.0), Sense::click());
-                let visuals = ui.style().interact(&response);
-                let fill = if camera_enabled {
-                    theme.accent.to_color32().gamma_multiply(0.22)
-                } else {
-                    visuals.bg_fill
-                };
-                ui.painter()
-                    .rect_filled(rect.expand(visuals.expansion), visuals.rounding, fill);
-                ui.painter().rect_stroke(
-                    rect.expand(visuals.expansion),
-                    visuals.rounding,
-                    visuals.bg_stroke,
-                );
-                let color = if camera_enabled {
-                    theme.accent.to_color32()
-                } else {
-                    visuals.fg_stroke.color
-                };
-                let body = Rect::from_center_size(rect.center() - vec2(2.0, 0.0), vec2(13.0, 9.0));
-                ui.painter()
-                    .rect_stroke(body, 1.5, Stroke::new(1.4_f32, color));
-                ui.painter().add(egui::Shape::convex_polygon(
-                    vec![
-                        pos2(body.right(), body.top() + 2.0),
-                        pos2(body.right() + 5.0, body.top()),
-                        pos2(body.right() + 5.0, body.bottom()),
-                        pos2(body.right(), body.bottom() - 2.0),
-                    ],
-                    color,
-                    Stroke::NONE,
-                ));
-                response
+                icon_toggle(
+                    ui,
+                    Icon::Camera,
+                    "Enable or disable the project camera track",
+                    camera_enabled,
+                )
             })
-            .inner
-            .on_hover_text("Enable the project camera track");
+            .inner;
         if camera_response.clicked() {
             let before = app.state.project.clone();
             app.state.project.runtime.camera.enabled = !camera_enabled;
@@ -1808,20 +2624,66 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
             };
         }
         ui.separator();
-        let play_label = if app.session.playing { "Pause" } else { "Play" };
-        if ui.button(play_label).clicked() {
+        let play_label = app.settings.hotkeys.hint(
+            ShortcutCommand::PlaybackToggle,
+            if app.session.playing { "Pause" } else { "Play" },
+        );
+        if icon_toggle(
+            ui,
+            if app.session.playing {
+                Icon::Pause
+            } else {
+                Icon::Play
+            },
+            &play_label,
+            app.session.playing,
+        )
+        .clicked()
+        {
             app.queue(Action::TogglePlay);
         }
-        if ui.button("|<").on_hover_text("First frame").clicked() {
+        if icon_button(
+            ui,
+            Icon::First,
+            &app.settings
+                .hotkeys
+                .hint(ShortcutCommand::FirstFrame, "First frame"),
+        )
+        .clicked()
+        {
             app.queue(Action::FirstFrame);
         }
-        if ui.button("<").on_hover_text("Previous frame").clicked() {
+        if icon_button(
+            ui,
+            Icon::Previous,
+            &app.settings
+                .hotkeys
+                .hint(ShortcutCommand::PreviousFrame, "Previous frame"),
+        )
+        .clicked()
+        {
             app.queue(Action::PreviousFrame);
         }
-        if ui.button(">").on_hover_text("Next frame").clicked() {
+        if icon_button(
+            ui,
+            Icon::Next,
+            &app.settings
+                .hotkeys
+                .hint(ShortcutCommand::NextFrame, "Next frame"),
+        )
+        .clicked()
+        {
             app.queue(Action::NextFrame);
         }
-        if ui.button(">|").on_hover_text("Last frame").clicked() {
+        if icon_button(
+            ui,
+            Icon::Last,
+            &app.settings
+                .hotkeys
+                .hint(ShortcutCommand::LastFrame, "Last frame"),
+        )
+        .clicked()
+        {
             app.queue(Action::LastFrame);
         }
         ui.separator();
@@ -1838,7 +2700,13 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
             .saturating_sub(1);
         let mut displayed_frame = u32::from(app.session.timeline_frame()) + 1;
         if ui
-            .add(egui::Slider::new(&mut displayed_frame, 1..=u32::from(max) + 1).text("frame"))
+            .add(
+                egui::DragValue::new(&mut displayed_frame)
+                    .clamp_range(1..=u32::from(max) + 1)
+                    .prefix("frame ")
+                    .speed(0.25),
+            )
+            .on_hover_text("Current frame; drag or type a frame number")
             .changed()
         {
             app.session
@@ -1886,13 +2754,13 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
         // Onion skin: toggle (SelectableLabel highlights when on) + before/
         // after spinners (visible only while it's on so the bar stays compact
         // otherwise).
-        if ui
-            .add(egui::SelectableLabel::new(
-                app.session.onion.enabled,
-                "Onion",
-            ))
-            .on_hover_text("Show ghost copies of neighbouring frames (toggle)")
-            .clicked()
+        if icon_toggle(
+            ui,
+            Icon::Onion,
+            "Onion skin: show neighbouring frames on the active layer",
+            app.session.onion.enabled,
+        )
+        .clicked()
         {
             app.session.onion.enabled = !app.session.onion.enabled;
         }
@@ -1928,7 +2796,31 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
     });
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().button_padding = vec2(8.0, 4.0);
-        let can_delete = app.session.timeline_selection.is_some()
+        let selected_rig_key_exists = app
+            .session
+            .timeline_rig_key_selection
+            .filter(|selection| selection.q0rg_id == app.session.current_q0rg_id)
+            .is_some_and(|selection| {
+                crate::timeline_edit::rig_key_frames_for_layer(
+                    &app.state.project,
+                    selection.q0rg_id,
+                    selection.layer_id,
+                )
+                .contains(&selection.frame)
+            });
+        let has_selected_frame_cells = app.session.timeline_selection.is_some()
+            || app
+                .session
+                .timeline_cell_selection
+                .as_ref()
+                .is_some_and(|(_, cells)| !cells.is_empty());
+        let can_delete = selected_rig_key_exists
+            || app.session.timeline_selection.is_some()
+            || app
+                .session
+                .timeline_cell_selection
+                .as_ref()
+                .is_some_and(|(_, cells)| !cells.is_empty())
             || (app.camera_track_is_selected()
                 && app
                     .state
@@ -1937,25 +2829,51 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
                     .camera
                     .has_keyframe(app.session.current_frame))
             || super::menu::selection_can_be_deleted(&app.session.selection);
-        if ui
-            .add_enabled(can_delete, egui::Button::new("Delete"))
-            .on_hover_text("Delete selection (Del)")
-            .clicked()
+        let delete_hint = if has_selected_frame_cells {
+            app.settings.hotkeys.hint(
+                ShortcutCommand::RemoveFrame,
+                "Remove selected frames from these layers",
+            )
+        } else {
+            app.settings
+                .hotkeys
+                .hint(ShortcutCommand::Delete, "Delete selection")
+        };
+        if icon_button_enabled(
+            ui,
+            can_delete,
+            if has_selected_frame_cells {
+                Icon::RemoveFrames
+            } else {
+                Icon::Delete
+            },
+            &delete_hint,
+        )
+        .clicked()
         {
-            app.queue(Action::DeleteSelection);
+            if has_selected_frame_cells {
+                app.queue(Action::RemoveSelectedTimelineFrames);
+            } else {
+                app.queue(Action::DeleteSelection);
+            }
         }
-        if ui.button("+ Layer").clicked() {
+        ui.separator();
+        if icon_button(ui, Icon::Layer, "Add layer").clicked() {
             app.queue(Action::AddLayer);
         }
-        if ui
-            .button("+ Folder")
-            .on_hover_text("Create layer folder")
-            .clicked()
-        {
+        if icon_button(ui, Icon::Folder, "Add layer folder").clicked() {
             app.queue(Action::AddLayerFolder);
+        }
+        if icon_button(ui, Icon::Mask, "Add a mask for the selected layer").clicked() {
+            app.queue(Action::AddLayerMask);
         }
         let q0rg_id = app.session.current_q0rg_id;
         let layer_id = app.session.current_layer_id;
+        let rig_track_selected = app
+            .session
+            .timeline_rig_key_selection
+            .is_some_and(|selection| selection.q0rg_id == q0rg_id)
+            && matches!(&app.session.selection, Selection::None);
         if layer_move_icon_button(ui, LayerMoveIcon::Up, "Move layer up").clicked() {
             app.queue(Action::MoveLayer(q0rg_id, layer_id, -1));
         }
@@ -1971,55 +2889,80 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
         {
             app.queue(Action::OutdentLayer(q0rg_id, layer_id));
         }
-        if ui.button("+ q0rg").clicked() {
+        if icon_button(ui, Icon::Symbol, "Create q0rg symbol").clicked() {
             app.queue(Action::AddQ0rg);
         }
-        if ui
-            .button("+ Frame")
-            .on_hover_text("Insert frame (F5)")
-            .clicked()
+        ui.separator();
+        if icon_button(
+            ui,
+            Icon::Frame,
+            &app.settings
+                .hotkeys
+                .hint(ShortcutCommand::InsertFrame, "Insert hold frame"),
+        )
+        .clicked()
         {
             app.queue(Action::InsertFrame);
         }
-        let keyframes_enabled = app.camera_track_is_selected()
+        let keyframes_enabled = rig_track_selected
+            || app.camera_track_is_selected()
             || app.session.timeline_selection.is_some()
             || !app
                 .state
                 .project
                 .layer_is_folder(app.session.current_q0rg_id, app.session.current_layer_id);
-        if ui
-            .add_enabled(keyframes_enabled, egui::Button::new("+ Keyframe"))
-            .on_hover_text("Insert keyframe (F6)")
-            .clicked()
+        if icon_button_enabled(
+            ui,
+            keyframes_enabled,
+            Icon::Keyframe,
+            &app.settings.hotkeys.hint(
+                ShortcutCommand::InsertKeyframe,
+                if rig_track_selected {
+                    "Insert or update rig key"
+                } else {
+                    "Insert keyframe"
+                },
+            ),
+        )
+        .clicked()
         {
             app.queue(Action::InsertKeyframe);
         }
-        if ui
-            .add_enabled(
-                keyframes_enabled && !app.camera_track_is_selected(),
-                egui::Button::new("+ Blank Key"),
-            )
-            .on_hover_text("Insert blank keyframe (F7)")
-            .clicked()
+        if icon_button_enabled(
+            ui,
+            keyframes_enabled && !app.camera_track_is_selected() && !rig_track_selected,
+            Icon::BlankKeyframe,
+            &app.settings.hotkeys.hint(
+                ShortcutCommand::InsertBlankKeyframe,
+                "Insert blank keyframe",
+            ),
+        )
+        .clicked()
         {
             app.queue(Action::InsertBlankKeyframe);
         }
-        if ui
-            .button("- Frame")
-            .on_hover_text("Remove selected frame(s) and close the time gap (Shift+F5)")
-            .clicked()
+        if icon_button(
+            ui,
+            Icon::RemoveColumns,
+            "Remove time columns across all layers and close the gap",
+        )
+        .clicked()
         {
             app.queue(Action::RemoveFrame);
         }
         let can_tween = (app.session.timeline_selection.is_some()
             || app.camera_track_is_selected())
             && app.session.pending_timeline_frame.is_none();
-        if ui
-            .add_enabled(can_tween, egui::Button::new("Tween"))
-            .on_hover_text(
-                "Create a motion tween from a non-keyframe cell between two keyframes (Ctrl+Alt+T)",
-            )
-            .clicked()
+        if icon_button_enabled(
+            ui,
+            can_tween,
+            Icon::Tween,
+            &app.settings.hotkeys.hint(
+                ShortcutCommand::MotionTween,
+                "Create motion tween between keyframes",
+            ),
+        )
+        .clicked()
         {
             app.queue(Action::CreateMotionTween);
         }
@@ -2069,7 +3012,10 @@ fn render_layer_rename_dialog(app: &mut EditorApp, ctx: &egui::Context) {
                 response.request_focus();
                 rename.focus_requested = false;
             }
-            if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+            if (response.has_focus() || response.lost_focus())
+                && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                && !rename.draft.trim().is_empty()
+            {
                 submit = true;
             }
             if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
@@ -2087,7 +3033,7 @@ fn render_layer_rename_dialog(app: &mut EditorApp, ctx: &egui::Context) {
                 }
             });
         });
-    if submit && !rename.draft.trim().is_empty() {
+    if submit && open && !cancel && !rename.draft.trim().is_empty() {
         app.queue(Action::RenameLayer(
             rename.q0rg_id,
             rename.layer_id,
@@ -2212,7 +3158,7 @@ fn render_frame_label_dialog(app: &mut EditorApp, ctx: &egui::Context) {
                 }
             });
         });
-    if submit {
+    if submit && open && !cancel {
         app.queue(Action::SetFrameLabel(
             edit.q0rg_id,
             edit.frame,
@@ -2270,6 +3216,65 @@ fn draw_visibility_icon(painter: &egui::Painter, rect: Rect, visible: bool, colo
     }
 }
 
+fn draw_mask_art_visibility_icon(
+    painter: &egui::Painter,
+    rect: Rect,
+    visible: bool,
+    color: Color32,
+) {
+    let center = rect.center();
+    // A square stencil with a solid diamond has a different silhouette from
+    // the ordinary eye. The diagonal slash means "preview clipping".
+    let square = Rect::from_center_size(center, vec2(11.0, 11.0));
+    let stroke = Stroke::new(1.3_f32, color);
+    painter.rect_stroke(square, 1.0, stroke);
+    let points = vec![
+        center - vec2(0.0, 3.1),
+        center + vec2(3.1, 0.0),
+        center + vec2(0.0, 3.1),
+        center - vec2(3.1, 0.0),
+    ];
+    if visible {
+        painter.add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
+    } else {
+        painter.add(egui::Shape::closed_line(
+            points,
+            Stroke::new(0.9_f32, color.gamma_multiply(0.4)),
+        ));
+        painter.line_segment(
+            [
+                square.left_bottom() + vec2(-1.0, 1.0),
+                square.right_top() + vec2(1.0, -1.0),
+            ],
+            Stroke::new(1.9_f32, color),
+        );
+    }
+}
+
+fn draw_outline_icon(painter: &egui::Painter, rect: Rect, enabled: bool, color: Color32) {
+    let stroke_color = if enabled {
+        color
+    } else {
+        color.gamma_multiply(0.42)
+    };
+    let stroke = Stroke::new(1.15_f32, stroke_color);
+    let corner = (rect.width().min(rect.height()) * 0.34).clamp(2.5, 3.5);
+    let min = rect.min;
+    let max = rect.max;
+    for (x, y, sx, sy) in [
+        (min.x, min.y, 1.0, 1.0),
+        (max.x, min.y, -1.0, 1.0),
+        (max.x, max.y, -1.0, -1.0),
+        (min.x, max.y, 1.0, -1.0),
+    ] {
+        painter.line_segment([pos2(x, y), pos2(x + sx * corner, y)], stroke);
+        painter.line_segment([pos2(x, y), pos2(x, y + sy * corner)], stroke);
+    }
+    if enabled {
+        painter.circle_filled(rect.center(), 1.15, stroke_color);
+    }
+}
+
 fn draw_lock_icon(painter: &egui::Painter, rect: Rect, locked: bool, color: Color32) {
     let center = rect.center();
     let active = color;
@@ -2313,12 +3318,12 @@ fn draw_lock_icon(painter: &egui::Painter, rect: Rect, locked: bool, color: Colo
 fn draw_layer_icon(
     painter: &egui::Painter,
     rect: Rect,
-    is_folder: bool,
+    kind: q0s_format::v2::LayerKind,
     collapsed: bool,
     foreground: Color32,
     accent: Color32,
 ) {
-    if is_folder {
+    if kind == q0s_format::v2::LayerKind::Folder {
         let body = Rect::from_min_max(pos2(rect.left(), rect.top() + 3.0), rect.right_bottom());
         let tab = Rect::from_min_max(
             rect.left_top(),
@@ -2343,6 +3348,46 @@ fn draw_layer_icon(
                 pos2(center.x - 2.5, center.y - 1.5),
                 pos2(center.x, center.y + 2.0),
                 pos2(center.x + 2.5, center.y - 1.5),
+            ]
+        };
+        painter.add(egui::Shape::convex_polygon(
+            arrow.to_vec(),
+            foreground,
+            Stroke::NONE,
+        ));
+    } else if kind == q0s_format::v2::LayerKind::Mask {
+        let frame = rect.shrink2(vec2(1.0, 2.0));
+        painter.rect_stroke(frame, 1.0, Stroke::new(1.1_f32, accent));
+        let points = [
+            pos2(frame.left() + 1.0, frame.bottom() - 1.0),
+            pos2(frame.left() + 1.0, frame.top() + 2.0),
+            pos2(frame.right() - 1.0, frame.top() + 2.0),
+            pos2(frame.center().x, frame.bottom() - 1.0),
+        ];
+        painter.add(egui::Shape::convex_polygon(
+            points.to_vec(),
+            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 50),
+            Stroke::new(1.0_f32, foreground),
+        ));
+        painter.line_segment(
+            [
+                pos2(frame.left() + 2.0, frame.bottom() - 1.0),
+                pos2(frame.right() - 1.0, frame.bottom() - 1.0),
+            ],
+            Stroke::new(1.0_f32, accent),
+        );
+        let arrow_center = pos2(frame.right() - 3.0, frame.bottom() - 2.5);
+        let arrow = if collapsed {
+            [
+                pos2(arrow_center.x - 1.0, arrow_center.y - 1.5),
+                pos2(arrow_center.x + 1.0, arrow_center.y),
+                pos2(arrow_center.x - 1.0, arrow_center.y + 1.5),
+            ]
+        } else {
+            [
+                pos2(arrow_center.x - 1.5, arrow_center.y - 1.0),
+                pos2(arrow_center.x, arrow_center.y + 1.0),
+                pos2(arrow_center.x + 1.5, arrow_center.y - 1.0),
             ]
         };
         painter.add(egui::Shape::convex_polygon(
@@ -2526,8 +3571,12 @@ fn draw_layer_spans(
     frame_count: u16,
     is_current_layer: bool,
 ) {
-    let keyframes = visible_keyframes(layer, frame_count);
-    let frame_slots = visible_frame_slots(painter, base_x, frame_count);
+    let layer_frame_count = layer
+        .timeline_frame_count
+        .unwrap_or(frame_count)
+        .min(frame_count);
+    let keyframes = visible_keyframes(layer, layer_frame_count);
+    let frame_slots = visible_frame_slots(painter, base_x, layer_frame_count);
     if frame_slots.is_empty() {
         return;
     }
@@ -2544,11 +3593,13 @@ fn draw_layer_spans(
     let stroke_dark = theme.stroke_dark.to_color32();
 
     for (position, keyframe) in keyframes.iter().copied().enumerate() {
+        // This row can end before the q0rg. Keep the final hold inside that
+        // layer's own timeline so cells after it remain beyond cells.
         let span_end = keyframes
             .get(position + 1)
             .copied()
             .map(|next| next.saturating_sub(1))
-            .unwrap_or_else(|| frame_count.saturating_sub(1));
+            .unwrap_or_else(|| layer_frame_count.saturating_sub(1));
         if span_end < frame_slots.start
             || keyframe >= frame_slots.end
             || span_end < keyframe
@@ -2596,7 +3647,7 @@ fn draw_layer_spans(
         if let Some(to_frame) = placement.tween.to_frame() {
             if placement.frame < frame_slots.end
                 && to_frame >= frame_slots.start
-                && to_frame < frame_count
+                && to_frame < layer_frame_count
             {
                 arrows.insert((placement.frame, to_frame));
             }
@@ -2649,6 +3700,54 @@ fn visible_keyframes(layer: &q0s_format::v2::Layer, frame_count: u16) -> Vec<u16
         .collect()
 }
 
+fn symbols_on_layer_at_frame(
+    project: &q0s_format::v2::ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    frame: u16,
+) -> Selection {
+    if !project.layer_is_visible(q0rg_id, layer_id) || project.layer_is_locked(q0rg_id, layer_id) {
+        return Selection::None;
+    }
+
+    let Some(layer) = project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+        .and_then(|q0rg| q0rg.layers.iter().find(|layer| layer.layer_id == layer_id))
+    else {
+        return Selection::None;
+    };
+
+    let placements = q0s_format::raster::active_placement_states_at(layer, frame)
+        .into_iter()
+        .filter_map(|active| {
+            matches!(
+                layer
+                    .placements
+                    .get(active.index)
+                    .map(|placement| placement.target),
+                Some(q0s_format::v2::Target::Q0rg(_))
+            )
+            .then_some(crate::state::PlacementRef {
+                q0rg_id,
+                layer_id,
+                placement_idx: active.index,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    match placements.as_slice() {
+        [] => Selection::None,
+        [only] => Selection::Placement {
+            q0rg_id: only.q0rg_id,
+            layer_id: only.layer_id,
+            placement_idx: only.placement_idx,
+        },
+        _ => Selection::Multi(placements),
+    }
+}
+
 fn keyframe_separator_frames(keyframes: &[u16]) -> impl Iterator<Item = u16> + '_ {
     keyframes.iter().copied().filter(|frame| *frame > 0)
 }
@@ -2681,6 +3780,7 @@ fn timeline_selection_bounds(
     ))
 }
 
+#[cfg(test)]
 fn timeline_cell_at(
     rect: Rect,
     pos: egui::Pos2,
@@ -2689,7 +3789,27 @@ fn timeline_cell_at(
     folder_layer_ids: &[u16],
     camera_row_count: usize,
 ) -> Option<(u16, u16)> {
-    let rel_x = pos.x - (rect.min.x + LAYER_LABEL_W);
+    timeline_cell_at_with_label_width(
+        rect,
+        pos,
+        frame_count,
+        layer_ids,
+        folder_layer_ids,
+        camera_row_count,
+        LAYER_LABEL_W,
+    )
+}
+
+fn timeline_cell_at_with_label_width(
+    rect: Rect,
+    pos: egui::Pos2,
+    frame_count: u16,
+    layer_ids: &[u16],
+    folder_layer_ids: &[u16],
+    camera_row_count: usize,
+    label_width: f32,
+) -> Option<(u16, u16)> {
+    let rel_x = pos.x - (rect.min.x + label_width);
     if rel_x < 0.0 {
         return None;
     }
@@ -2747,6 +3867,37 @@ fn draw_timeline_selection(
         );
         painter.rect_filled(selected, 0.0, fill);
         painter.rect_stroke(selected, 0.0, stroke);
+    }
+}
+
+fn draw_timeline_cell_selection(
+    painter: &egui::Painter,
+    theme: &Theme,
+    cells: &[(u16, u16)],
+    layer_ids: &[u16],
+    base_x: f32,
+    first_row_y: f32,
+    frame_count: u16,
+) {
+    let accent = timeline_selection_color(theme);
+    let fill = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 64);
+    let stroke = Stroke::new(1.25_f32, accent);
+    for &(layer_id, frame) in cells {
+        if frame >= frame_count {
+            continue;
+        }
+        let Some(row) = layer_ids.iter().position(|id| *id == layer_id) else {
+            continue;
+        };
+        let rect = Rect::from_min_size(
+            pos2(
+                base_x + f32::from(frame) * FRAME_W,
+                first_row_y + row as f32 * ROW_H + CELL_PAD_Y,
+            ),
+            vec2(FRAME_W, ROW_H - CELL_PAD_Y * 2.0),
+        );
+        painter.rect_filled(rect, 1.0, fill);
+        painter.rect_stroke(rect, 1.0, stroke);
     }
 }
 
@@ -2821,6 +3972,7 @@ mod tests {
     fn held_span_remains_visible_when_its_keyframe_is_offscreen() {
         let layer = Layer {
             layer_id: 1,
+            timeline_frame_count: None,
             name: "layer".into(),
             explicit_keyframes: vec![],
             placements: vec![placement(0)],
@@ -2898,6 +4050,7 @@ mod tests {
     fn adjacent_keyframes_keep_an_explicit_separator() {
         let layer = Layer {
             layer_id: 1,
+            timeline_frame_count: None,
             name: "layer".into(),
             explicit_keyframes: vec![2],
             placements: vec![placement(0), placement(1)],
@@ -2930,24 +4083,28 @@ mod tests {
         project.q0rgs[0].layers = vec![
             Layer {
                 layer_id: 1,
+                timeline_frame_count: None,
                 name: "low child".into(),
                 explicit_keyframes: Vec::new(),
                 placements: Vec::new(),
             },
             Layer {
                 layer_id: 2,
+                timeline_frame_count: None,
                 name: "high child".into(),
                 explicit_keyframes: Vec::new(),
                 placements: Vec::new(),
             },
             Layer {
                 layer_id: 3,
+                timeline_frame_count: None,
                 name: "folder".into(),
                 explicit_keyframes: Vec::new(),
                 placements: Vec::new(),
             },
             Layer {
                 layer_id: 4,
+                timeline_frame_count: None,
                 name: "front".into(),
                 explicit_keyframes: Vec::new(),
                 placements: Vec::new(),
@@ -2959,6 +4116,7 @@ mod tests {
                 q0s_format::v2::LayerMetadata {
                     kind: q0s_format::v2::LayerKind::Normal,
                     parent_folder_id: Some(3),
+                    mask_layer_id: None,
                     collapsed: false,
                     hidden: false,
                     locked: false,
@@ -2970,6 +4128,7 @@ mod tests {
             q0s_format::v2::LayerMetadata {
                 kind: q0s_format::v2::LayerKind::Folder,
                 parent_folder_id: None,
+                mask_layer_id: None,
                 collapsed: false,
                 hidden: false,
                 locked: false,
@@ -2991,24 +4150,28 @@ mod tests {
         project.q0rgs[0].layers = vec![
             Layer {
                 layer_id: 1,
+                timeline_frame_count: None,
                 name: "leaf".into(),
                 explicit_keyframes: vec![0],
                 placements: Vec::new(),
             },
             Layer {
                 layer_id: 2,
+                timeline_frame_count: None,
                 name: "inner".into(),
                 explicit_keyframes: Vec::new(),
                 placements: Vec::new(),
             },
             Layer {
                 layer_id: 3,
+                timeline_frame_count: None,
                 name: "outer".into(),
                 explicit_keyframes: Vec::new(),
                 placements: Vec::new(),
             },
             Layer {
                 layer_id: 4,
+                timeline_frame_count: None,
                 name: "outside".into(),
                 explicit_keyframes: vec![0],
                 placements: Vec::new(),
@@ -3059,18 +4222,21 @@ mod tests {
         project.q0rgs[0].layers = vec![
             Layer {
                 layer_id: 1,
+                timeline_frame_count: None,
                 name: "leaf".into(),
                 explicit_keyframes: vec![0],
                 placements: Vec::new(),
             },
             Layer {
                 layer_id: 2,
+                timeline_frame_count: None,
                 name: "inner".into(),
                 explicit_keyframes: Vec::new(),
                 placements: Vec::new(),
             },
             Layer {
                 layer_id: 3,
+                timeline_frame_count: None,
                 name: "outer".into(),
                 explicit_keyframes: Vec::new(),
                 placements: Vec::new(),
@@ -3117,18 +4283,21 @@ mod tests {
         project.q0rgs[0].layers = vec![
             Layer {
                 layer_id: 1,
+                timeline_frame_count: None,
                 name: "child".into(),
                 explicit_keyframes: Vec::new(),
                 placements: Vec::new(),
             },
             Layer {
                 layer_id: 2,
+                timeline_frame_count: None,
                 name: "folder".into(),
                 explicit_keyframes: Vec::new(),
                 placements: Vec::new(),
             },
             Layer {
                 layer_id: 3,
+                timeline_frame_count: None,
                 name: "outside".into(),
                 explicit_keyframes: Vec::new(),
                 placements: Vec::new(),
@@ -3139,6 +4308,7 @@ mod tests {
             q0s_format::v2::LayerMetadata {
                 kind: q0s_format::v2::LayerKind::Normal,
                 parent_folder_id: Some(2),
+                mask_layer_id: None,
                 collapsed: false,
                 hidden: false,
                 locked: false,
@@ -3149,6 +4319,7 @@ mod tests {
             q0s_format::v2::LayerMetadata {
                 kind: q0s_format::v2::LayerKind::Folder,
                 parent_folder_id: None,
+                mask_layer_id: None,
                 collapsed: false,
                 hidden: false,
                 locked: false,
@@ -3158,11 +4329,11 @@ mod tests {
         let visible = [3, 2, 1];
 
         assert_eq!(
-            layer_drop_target_at(&project, 1, rect, pos2(50.0, ROW_H * 2.5), &visible, 3,),
+            layer_drop_target_at(&project, 1, rect, pos2(50.0, ROW_H * 2.5), &visible, &[3],),
             Some(LayerDropTarget::IntoFolder(2))
         );
         assert_eq!(
-            layer_drop_target_at(&project, 1, rect, pos2(8.0, ROW_H * 3.75), &visible, 1,),
+            layer_drop_target_at(&project, 1, rect, pos2(8.0, ROW_H * 3.75), &visible, &[1],),
             Some(LayerDropTarget::After {
                 layer_id: 1,
                 parent_folder_id: None,

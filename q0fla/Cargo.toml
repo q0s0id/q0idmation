@@ -9,6 +9,7 @@ homepage.workspace = true
 description = "Adobe Animate FLA/XFL importer for q0idmation."
 
 [dependencies]
+cfb = "0.15"
 q0s-format = { path = "../q0s-format" }
 quick-xml = "0.39.2"
 zip = { version = "0.6.6", default-features = false, features = ["deflate"] }

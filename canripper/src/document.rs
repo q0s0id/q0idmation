@@ -998,6 +998,7 @@ mod tests {
                 script: String::new(),
                 layers: vec![v2::Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "Layer 1".to_string(),
                     explicit_keyframes: vec![0],
                     placements: Vec::new(),

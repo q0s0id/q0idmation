@@ -199,6 +199,20 @@ pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
                 || script.frame != draft.frame
         });
         if !draft.source.trim().is_empty() {
+            if let Some(layer) = app
+                .state
+                .project
+                .q0rgs
+                .iter_mut()
+                .find(|q0rg| q0rg.q0rg_id == draft.q0rg_id)
+                .and_then(|q0rg| {
+                    q0rg.layers
+                        .iter_mut()
+                        .find(|layer| layer.layer_id == draft.layer_id)
+                })
+            {
+                layer.extend_timeline_through(draft.frame);
+            }
             app.state.project.runtime.frame_scripts.push(FrameScript {
                 q0rg_id: draft.q0rg_id,
                 layer_id: draft.layer_id,
@@ -214,7 +228,7 @@ pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
         } else {
             app.session.status = format!("removed empty frame code from frame {}", draft.frame + 1);
         }
-        app.state.dirty = true;
+        app.state.mark_dirty();
         app.session.reset_q0lang_preview();
     }
     if remove {

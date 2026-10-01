@@ -532,6 +532,8 @@ fn raw_path_properties(
 
 fn stage_properties(app: &mut EditorApp, ui: &mut Ui) {
     ui.label(egui::RichText::new("Stage").strong());
+    scene_properties(app, ui);
+    ui.separator();
     let mut dirty = false;
     // Stage controls are drawn on every frame. Keep only the small metadata
     // value eagerly, then clone the full project if an edit actually starts.
@@ -609,6 +611,103 @@ fn stage_properties(app: &mut EditorApp, ui: &mut Ui) {
     }
 }
 
+fn scene_properties(app: &mut EditorApp, ui: &mut Ui) {
+    use crate::ui::{icon_button, icon_button_enabled, Icon};
+    let scenes = app.state.project.scenes();
+    let active_scene_q0rg = app
+        .session
+        .breadcrumb
+        .first()
+        .copied()
+        .unwrap_or(app.session.current_q0rg_id);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Scenes").strong());
+        if icon_button(ui, Icon::Add, "Add scene").clicked() {
+            app.queue(Action::AddScene);
+        }
+    });
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::same(4.0))
+        .show(ui, |ui| {
+            ScrollArea::vertical()
+                .id_source("project_scenes")
+                .max_height(104.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for scene in &scenes {
+                        ui.horizontal(|ui| {
+                            let active = scene.q0rg_id == active_scene_q0rg;
+                            if crate::ui::name_button(
+                                ui,
+                                &scene.name,
+                                active,
+                                (ui.available_width() - 32.0).max(30.0),
+                            )
+                            .on_hover_text("Switch to this scene")
+                            .clicked()
+                            {
+                                app.queue(Action::SwitchScene(scene.scene_id));
+                            }
+                            if icon_button(ui, Icon::Rename, "Rename scene").clicked() {
+                                app.session.scene_rename = Some(crate::state::SceneRename {
+                                    scene_id: scene.scene_id,
+                                    draft: scene.name.clone(),
+                                    focus_requested: true,
+                                });
+                            }
+                        });
+                    }
+                });
+        });
+
+    let mut commit = None;
+    let mut cancel = false;
+    if let Some(rename) = app.session.scene_rename.as_mut() {
+        if scenes.iter().any(|scene| scene.scene_id == rename.scene_id) {
+            ui.horizontal_wrapped(|ui| {
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut rename.draft)
+                        .desired_width((ui.available_width() - 65.0).max(50.0)),
+                );
+                if rename.focus_requested {
+                    response.request_focus();
+                    rename.focus_requested = false;
+                }
+                if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
+                if !rename.draft.trim().is_empty()
+                    && response.lost_focus()
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                {
+                    commit = Some((rename.scene_id, rename.draft.clone()));
+                }
+                if icon_button_enabled(
+                    ui,
+                    !rename.draft.trim().is_empty(),
+                    Icon::Check,
+                    "Save scene name",
+                )
+                .clicked()
+                {
+                    commit = Some((rename.scene_id, rename.draft.clone()));
+                }
+                if icon_button(ui, Icon::Close, "Cancel scene rename").clicked() {
+                    cancel = true;
+                }
+            });
+        } else {
+            cancel = true;
+        }
+    }
+    if cancel {
+        app.session.scene_rename = None;
+    }
+    if let Some((scene_id, name)) = commit {
+        app.queue(Action::RenameScene(scene_id, name));
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolPropertyKind {
     Select,
@@ -659,7 +758,7 @@ fn render_tool_properties(app: &mut EditorApp, ui: &mut Ui) {
         ToolPropertyKind::Select => tool_hint(
             app,
             ui,
-            "Drag the selection to move it. Alt-drag its centre to move the transform anchor.",
+            "Drag artwork to move it; Alt-drag artwork to duplicate. Alt-drag the anchor cross to reposition it.",
         ),
         ToolPropertyKind::Lasso => tool_hint(
             app,
@@ -1577,7 +1676,14 @@ fn edit_gradient(ui: &mut Ui, id: u16, gradient: &mut GradientFill) -> bool {
                     stop.color.a = alpha;
                     changed = true;
                 }
-                if can_remove && ui.small_button("x").clicked() {
+                if crate::ui::icon_button_enabled(
+                    ui,
+                    can_remove,
+                    crate::ui::Icon::Delete,
+                    "Remove gradient stop",
+                )
+                .clicked()
+                {
                     remove = Some(index);
                 }
             });
@@ -1846,16 +1952,16 @@ fn q0rg_properties(app: &mut EditorApp, ui: &mut Ui, id: u16) {
     let symbol_name = app.state.project.q0rgs[q0rg_idx].name.clone();
     ui.label(egui::RichText::new(format!("Symbol: {symbol_name}")).strong());
 
-    let before = app.state.project.clone();
     let mut wants_snapshot = false;
     let mut dirty = false;
     let mut queued_open_q0rg_id: Option<u16> = None;
     let mut requested_frame_count: Option<u16> = None;
+    let mut name_draft = app.state.project.q0rgs[q0rg_idx].name.clone();
     {
         let q0rg = &mut app.state.project.q0rgs[q0rg_idx];
         egui::Grid::new("q0rg_props").num_columns(2).show(ui, |ui| {
             ui.label("Name");
-            let r = ui.text_edit_singleline(&mut q0rg.name);
+            let r = ui.text_edit_singleline(&mut name_draft);
             if r.gained_focus() {
                 wants_snapshot = true;
             }
@@ -1927,9 +2033,10 @@ fn q0rg_properties(app: &mut EditorApp, ui: &mut Ui, id: u16) {
     }
 
     if wants_snapshot {
-        app.history.snapshot(&before);
+        app.history.snapshot(&app.state.project);
     }
     if dirty {
+        app.state.project.q0rgs[q0rg_idx].name = name_draft;
         app.state.mark_dirty();
     }
     if let Some(id) = queued_open_q0rg_id {
@@ -1977,9 +2084,8 @@ fn placement_properties(
     layer_id: u16,
     placement_idx: usize,
 ) {
-    let before = app.state.project.clone();
     let current_frame = app.session.current_frame;
-    let Some((source_frame, target, mut transform, tween, mut fx)) = app
+    let Some((source_frame, target, transform, tween, mut fx)) = app
         .state
         .project
         .q0rgs
@@ -2003,21 +2109,45 @@ fn placement_properties(
         ui.label("Selection is no longer available");
         return;
     };
+    let authored_transform = transform;
+    let (mut transform, rig_bound) = crate::tools::placement_transform_for_edit(
+        &app.state.project,
+        q0rg_id,
+        layer_id,
+        placement_idx,
+        current_frame,
+    )
+    .unwrap_or((transform, false));
 
     let mut wants_snapshot = false;
     let mut transform_dirty = false;
     let mut fx_dirty = false;
     let mut manual_playback_edit = None;
     ui.label(egui::RichText::new("Placement").strong());
-    if source_frame != current_frame {
+    if rig_bound {
         ui.label(
-            egui::RichText::new(format!(
+            egui::RichText::new("transform edits the rig pose; linked bones stay connected")
+                .small()
+                .color(app.settings.theme.text_dim.to_color32()),
+        );
+    }
+    if source_frame != current_frame {
+        let held_message = if rig_bound {
+            format!(
+                "held from frame {}; bone binding stays connected",
+                source_frame + 1
+            )
+        } else {
+            format!(
                 "held from frame {}; editing creates a keyframe at {}",
                 source_frame + 1,
                 current_frame + 1
-            ))
-            .small()
-            .color(app.settings.theme.text_dim.to_color32()),
+            )
+        };
+        ui.label(
+            egui::RichText::new(held_message)
+                .small()
+                .color(app.settings.theme.text_dim.to_color32()),
         );
     }
     egui::Grid::new("placement_props")
@@ -2085,6 +2215,17 @@ fn placement_properties(
             .map(|q0rg| q0rg.frame_count.max(1))
             .unwrap_or(1);
         let max_frame = child_frames - 1;
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Symbol").strong());
+            let can_replace = !app.state.project.layer_is_locked(q0rg_id, layer_id);
+            if ui
+                .add_enabled(can_replace, egui::Button::new("Replace q0rg"))
+                .clicked()
+            {
+                app.open_replace_q0rg_dialog(q0rg_id, layer_id, placement_idx);
+            }
+        });
         ui.separator();
         ui.label(egui::RichText::new("Playback").strong());
         egui::Grid::new("placement_q0rg_playback")
@@ -2231,33 +2372,13 @@ fn placement_properties(
                     .show(ui, |ui| {
                         for frame in 0..child_frames {
                             let selected = frame == selected_frame;
-                            let (rect, response) = ui.allocate_exact_size(
-                                egui::vec2(card_size, card_size),
-                                egui::Sense::click(),
+                            let (response, preview_rect) = crate::ui::preview_card(
+                                ui,
+                                &format!("{}", frame + 1),
+                                selected,
+                                card_size,
                             );
                             let visuals = ui.visuals();
-                            let (fill, stroke) = if selected {
-                                (visuals.selection.bg_fill, visuals.selection.stroke)
-                            } else {
-                                (
-                                    visuals.widgets.inactive.bg_fill,
-                                    visuals.widgets.inactive.fg_stroke,
-                                )
-                            };
-                            let painter = ui.painter_at(rect);
-                            painter.rect_filled(rect, 4.0, fill);
-                            painter.rect_stroke(rect, 4.0, stroke);
-                            painter.text(
-                                egui::pos2(rect.center().x, rect.top() + 4.0),
-                                egui::Align2::CENTER_TOP,
-                                format!("{}", frame + 1),
-                                egui::FontId::proportional(11.0),
-                                visuals.text_color(),
-                            );
-                            let preview_rect = egui::Rect::from_min_max(
-                                rect.min + egui::vec2(3.0, 18.0),
-                                rect.max - egui::vec2(3.0, 3.0),
-                            );
                             if ui.is_rect_visible(preview_rect) {
                                 let preview_painter = ui.painter_at(preview_rect);
                                 crate::panels::library::draw_q0rg_frame_preview_background(
@@ -2276,7 +2397,11 @@ fn placement_properties(
                                 ) {
                                     let preview_view =
                                         placement_frame_preview_view(preview_rect, bounds);
-                                    crate::render::render_stage(
+                                    let render_revision = (
+                                        app.active_project_tab_id().unwrap_or(0),
+                                        app.state.render_revision(),
+                                    );
+                                    crate::render::render_stage_with_revision(
                                         &preview_painter,
                                         &app.state.project,
                                         child_id,
@@ -2284,6 +2409,7 @@ fn placement_properties(
                                         &preview_view,
                                         &mut app.textures,
                                         ui.ctx(),
+                                        render_revision,
                                     );
                                 } else {
                                     preview_painter.text(
@@ -2421,7 +2547,7 @@ fn placement_properties(
                     ui.label("Strength");
                     let response = ui.add(
                         egui::Slider::new(&mut glow.strength, 0.0..=4.0)
-                            .suffix("?")
+                            .suffix("x")
                             .show_value(true),
                     );
                     note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
@@ -2536,7 +2662,7 @@ fn placement_properties(
                     ui.label("Strength");
                     let response = ui.add(
                         egui::Slider::new(&mut shadow.strength, 0.0..=4.0)
-                            .suffix("?")
+                            .suffix("x")
                             .show_value(true),
                     );
                     note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
@@ -2549,7 +2675,11 @@ fn placement_properties(
     let break_apart_fx_block = app.break_apart_fx_block_reason();
     let break_apart = ui.add_enabled(
         app.can_break_apart_selection(),
-        egui::Button::new("Break Apart  (Ctrl+B)"),
+        crate::ui::shortcut_button(
+            &app.settings.hotkeys,
+            crate::hotkeys::ShortcutCommand::BreakApart,
+            "Break Apart",
+        ),
     );
     let break_apart = if let Some(reason) = break_apart_fx_block {
         break_apart.on_hover_text(reason)
@@ -2571,7 +2701,21 @@ fn placement_properties(
         return;
     }
     if wants_snapshot {
-        app.history.snapshot(&before);
+        app.history.snapshot(&app.state.project);
+    }
+    if rig_bound && transform_dirty && !fx_dirty {
+        if crate::tools::set_placement_transform_for_edit(
+            app,
+            q0rg_id,
+            layer_id,
+            placement_idx,
+            transform,
+        ) {
+            app.mark_placement_transforms_changed(&[(q0rg_id, layer_id, placement_idx)]);
+        } else {
+            app.session.status = "could not update the rig-bound transform".to_string();
+        }
+        return;
     }
     if let Some(new_idx) = apply_placement_edit_at_frame(
         app,
@@ -2579,9 +2723,22 @@ fn placement_properties(
         layer_id,
         placement_idx,
         current_frame,
-        transform,
+        if rig_bound {
+            authored_transform
+        } else {
+            transform
+        },
         fx,
     ) {
+        if rig_bound && transform_dirty {
+            if crate::tools::set_placement_transform_for_edit(
+                app, q0rg_id, layer_id, new_idx, transform,
+            ) {
+                app.mark_placement_transforms_changed(&[(q0rg_id, layer_id, new_idx)]);
+            } else {
+                app.session.status = "could not update the rig-bound transform".to_string();
+            }
+        }
         if let Some(playback) = manual_playback_edit {
             propagate_manual_q0rg_playback(
                 &mut app.state.project,
@@ -2598,6 +2755,7 @@ fn placement_properties(
             placement_idx: new_idx,
         };
         app.state.mark_dirty();
+        app.textures.invalidate();
     }
 }
 
@@ -2605,19 +2763,7 @@ fn placement_frame_preview_view(
     rect: egui::Rect,
     bounds: (f32, f32, f32, f32),
 ) -> crate::render::StageView {
-    let width = (bounds.2 - bounds.0).abs().max(1.0);
-    let height = (bounds.3 - bounds.1).abs().max(1.0);
-    let scale = (rect.width() / width).min(rect.height() / height) * 0.82;
-    let center_x = (bounds.0 + bounds.2) * 0.5;
-    let center_y = (bounds.1 + bounds.3) * 0.5;
-    crate::render::StageView {
-        origin: egui::pos2(
-            rect.center().x - center_x * scale,
-            rect.center().y - center_y * scale,
-        ),
-        scale,
-        stage_rect: rect,
-    }
+    crate::panels::library::preview_view(rect, bounds)
 }
 
 fn propagate_manual_q0rg_playback(

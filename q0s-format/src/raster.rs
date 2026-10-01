@@ -18,6 +18,8 @@
 //! controls quality/cost trade-off РІР‚вЂќ players default to `1` (live), the
 //! exporter could use `2`.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::geom::{brush_outline, flatten_path};
 use crate::runtime_scene::RuntimeSceneState;
 use crate::transform::Affine;
@@ -781,6 +783,31 @@ pub fn rasterize_q0rg_frame_scaled_with_rig_overrides(
     bg_rgba: [u8; 4],
     rig_overrides: &crate::rig::RigRuntimeOverrides,
 ) -> Vec<u8> {
+    rasterize_q0rg_frame_with_runtime_state(
+        project,
+        q0rg_id,
+        frame,
+        w,
+        h,
+        ss,
+        bg_rgba,
+        rig_overrides,
+        &RuntimeSceneState::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn rasterize_q0rg_frame_with_runtime_state(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    frame: u16,
+    w: u32,
+    h: u32,
+    ss: u32,
+    bg_rgba: [u8; 4],
+    rig_overrides: &crate::rig::RigRuntimeOverrides,
+    scene_state: &RuntimeSceneState,
+) -> Vec<u8> {
     let stage_w = f32::from(project.meta.stage_width.max(1));
     let stage_h = f32::from(project.meta.stage_height.max(1));
     let root = Affine::from_scale(w as f32 / stage_w, h as f32 / stage_h);
@@ -794,12 +821,17 @@ pub fn rasterize_q0rg_frame_scaled_with_rig_overrides(
         bg_rgba,
         root,
         rig_overrides,
-        &RuntimeSceneState::new(),
+        scene_state,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn rasterize_q0rg_frame_with_root_transform(
+/// Rasterize a q0rg frame into a caller-defined pixel-space transform.
+///
+/// The root transform maps q0rg stage coordinates to output pixels. This is
+/// useful for rendering a viewport crop without first rasterizing the entire
+/// stage at a capped resolution.
+pub fn rasterize_q0rg_frame_with_root_transform(
     project: &ProjectV2,
     q0rg_id: u16,
     frame: u16,
@@ -810,6 +842,50 @@ fn rasterize_q0rg_frame_with_root_transform(
     root: Affine,
     rig_overrides: &crate::rig::RigRuntimeOverrides,
     scene_state: &RuntimeSceneState,
+) -> Vec<u8> {
+    rasterize_q0rg_frame_with_mask_preview(
+        project,
+        q0rg_id,
+        frame,
+        w,
+        h,
+        ss,
+        bg_rgba,
+        root,
+        rig_overrides,
+        scene_state,
+        None,
+    )
+}
+
+/// Editor-only authoring view. Visible mask artwork leaves its children
+/// unclipped; hiding the source artwork previews the actual clipping result.
+/// This is transient and never changes the serialized project or export path.
+#[derive(Clone, Copy)]
+pub struct MaskEditingPreview<'a> {
+    pub q0rg_id: u16,
+    pub hidden_artwork: &'a HashSet<(u16, u16)>,
+}
+
+impl MaskEditingPreview<'_> {
+    fn clips(self, mask_id: u16) -> bool {
+        self.hidden_artwork.contains(&(self.q0rg_id, mask_id))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn rasterize_q0rg_frame_with_mask_preview(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    frame: u16,
+    w: u32,
+    h: u32,
+    ss: u32,
+    bg_rgba: [u8; 4],
+    root: Affine,
+    rig_overrides: &crate::rig::RigRuntimeOverrides,
+    scene_state: &RuntimeSceneState,
+    mask_preview: Option<MaskEditingPreview<'_>>,
 ) -> Vec<u8> {
     let ss = ss.max(1);
     let sw = w.saturating_mul(ss);
@@ -834,6 +910,7 @@ fn rasterize_q0rg_frame_with_root_transform(
         0,
         rig_overrides,
         scene_state,
+        mask_preview.filter(|preview| preview.q0rg_id == q0rg_id),
     );
     if ss == 1 {
         return hi;
@@ -891,6 +968,7 @@ fn render_to_buffer(
     depth: u8,
     rig_overrides: &crate::rig::RigRuntimeOverrides,
     scene_state: &RuntimeSceneState,
+    mask_preview: Option<MaskEditingPreview<'_>>,
 ) {
     if depth > MAX_Q0RG_NESTING_DEPTH {
         return;
@@ -910,59 +988,237 @@ fn render_to_buffer(
             .unwrap_or(&[]);
         crate::rig::evaluate_rig(rig, f32::from(local_frame), overrides)
     });
+    // only rasterize mask layers that are referenced by a visible layer and
+    // have active artwork on this frame. an empty mask clips its target to
+    // nothing, so omitting its all-zero buffer is equivalent and avoids a
+    // full viewport allocation/composite for every placement it masks.
+    let referenced_mask_ids = q
+        .layers
+        .iter()
+        .filter(|layer| project.layer_is_visible(q0rg_id, layer.layer_id))
+        .flat_map(|layer| project.layer_mask_sources(q0rg_id, layer.layer_id))
+        .filter(|mask_id| mask_preview.is_none_or(|preview| preview.clips(*mask_id)))
+        .collect::<HashSet<_>>();
+    let mask_buffers = q
+        .layers
+        .iter()
+        .filter(|layer| referenced_mask_ids.contains(&layer.layer_id))
+        .filter(|layer| {
+            project.layer_metadata(q0rg_id, layer.layer_id).kind == crate::v2::LayerKind::Mask
+        })
+        .filter(|layer| project.layer_is_visible(q0rg_id, layer.layer_id))
+        .filter(|layer| !active_placement_states_at(layer, local_frame).is_empty())
+        .map(|layer| {
+            let mut mask = vec![0u8; buffer.len()];
+            render_layer_contents(
+                project,
+                q0rg_id,
+                layer,
+                local_frame,
+                parent,
+                &mut mask,
+                w,
+                h,
+                depth,
+                rig_overrides,
+                scene_state,
+                rig_pose.as_ref(),
+            );
+            (layer.layer_id, mask)
+        })
+        .collect::<HashMap<_, _>>();
+
     for layer in &q.layers {
         if !project.layer_is_visible(q0rg_id, layer.layer_id) {
             continue;
         }
-        for active in active_placement_states_at(layer, local_frame) {
-            let Some(placement) = layer.placements.get(active.index) else {
+        let metadata = project.layer_metadata(q0rg_id, layer.layer_id);
+        if metadata.kind == crate::v2::LayerKind::Mask
+            && mask_preview.is_none_or(|preview| preview.clips(layer.layer_id))
+        {
+            continue;
+        }
+        let mask_sources = project
+            .layer_mask_sources(q0rg_id, layer.layer_id)
+            .into_iter()
+            .filter(|mask_id| mask_preview.is_none_or(|preview| preview.clips(*mask_id)))
+            .collect::<Vec<_>>();
+        if !mask_sources.is_empty() {
+            let Some(masks) = mask_sources
+                .iter()
+                .map(|mask_layer_id| mask_buffers.get(mask_layer_id).map(Vec::as_slice))
+                .collect::<Option<Vec<_>>>()
+            else {
                 continue;
             };
-            let authored_affine = rig_pose
-                .as_ref()
-                .and_then(|pose| pose.binding_transform(placement.instance_id))
-                .unwrap_or_else(|| Affine::from_transform(active.transform));
-            let key = InstanceKey::new(q0rg_id, placement.instance_id);
-            let local_affine = scene_state.effective_affine(key, authored_affine);
-            let composed = Affine::compose(parent, local_affine);
-            if active.fx.is_identity() {
-                render_placement_target(
-                    project,
-                    q0rg_id,
-                    placement,
-                    active.fx,
-                    local_frame,
-                    composed,
-                    buffer,
-                    w,
-                    h,
-                    depth,
-                    rig_overrides,
-                    scene_state,
-                    crate::rig::rig_for_q0rg(project, q0rg_id),
-                    rig_pose.as_ref(),
-                );
-            } else {
-                let mut source = vec![0u8; buffer.len()];
-                render_placement_target(
-                    project,
-                    q0rg_id,
-                    placement,
-                    active.fx,
-                    local_frame,
-                    composed,
-                    &mut source,
-                    w,
-                    h,
-                    depth,
-                    rig_overrides,
-                    scene_state,
-                    crate::rig::rig_for_q0rg(project, q0rg_id),
-                    rig_pose.as_ref(),
-                );
-                apply_placement_fx(buffer, &source, w, h, active.fx, composed.uniform_scale());
-            }
+            render_masked_layer_contents(
+                project,
+                q0rg_id,
+                layer,
+                local_frame,
+                parent,
+                buffer,
+                w,
+                h,
+                depth,
+                rig_overrides,
+                scene_state,
+                rig_pose.as_ref(),
+                &masks,
+            );
+        } else {
+            render_layer_contents(
+                project,
+                q0rg_id,
+                layer,
+                local_frame,
+                parent,
+                buffer,
+                w,
+                h,
+                depth,
+                rig_overrides,
+                scene_state,
+                rig_pose.as_ref(),
+            );
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_layer_contents(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    layer: &crate::v2::Layer,
+    local_frame: u16,
+    parent: Affine,
+    buffer: &mut [u8],
+    w: u32,
+    h: u32,
+    depth: u8,
+    rig_overrides: &crate::rig::RigRuntimeOverrides,
+    scene_state: &RuntimeSceneState,
+    rig_pose: Option<&crate::rig::RigPose>,
+) {
+    for active in active_placement_states_at(layer, local_frame) {
+        let Some(placement) = layer.placements.get(active.index) else {
+            continue;
+        };
+        let authored_affine = rig_pose
+            .and_then(|pose| pose.binding_transform(placement.instance_id))
+            .unwrap_or_else(|| Affine::from_transform(active.transform));
+        let key = InstanceKey::new(q0rg_id, placement.instance_id);
+        let local_affine = scene_state.effective_affine(key, authored_affine);
+        let composed = Affine::compose(parent, local_affine);
+        if active.fx.is_identity() {
+            render_placement_target(
+                project,
+                q0rg_id,
+                placement,
+                active.fx,
+                local_frame,
+                composed,
+                buffer,
+                w,
+                h,
+                depth,
+                rig_overrides,
+                scene_state,
+                crate::rig::rig_for_q0rg(project, q0rg_id),
+                rig_pose,
+            );
+        } else {
+            let mut source = vec![0u8; buffer.len()];
+            render_placement_target(
+                project,
+                q0rg_id,
+                placement,
+                active.fx,
+                local_frame,
+                composed,
+                &mut source,
+                w,
+                h,
+                depth,
+                rig_overrides,
+                scene_state,
+                crate::rig::rig_for_q0rg(project, q0rg_id),
+                rig_pose,
+            );
+            apply_placement_fx(buffer, &source, w, h, active.fx, composed.uniform_scale());
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_masked_layer_contents(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    layer: &crate::v2::Layer,
+    local_frame: u16,
+    parent: Affine,
+    buffer: &mut [u8],
+    w: u32,
+    h: u32,
+    depth: u8,
+    rig_overrides: &crate::rig::RigRuntimeOverrides,
+    scene_state: &RuntimeSceneState,
+    rig_pose: Option<&crate::rig::RigPose>,
+    masks: &[&[u8]],
+) {
+    let mut source = vec![0u8; buffer.len()];
+    let mut effected = vec![0u8; buffer.len()];
+    for active in active_placement_states_at(layer, local_frame) {
+        let Some(placement) = layer.placements.get(active.index) else {
+            continue;
+        };
+        source.fill(0);
+        let authored_affine = rig_pose
+            .and_then(|pose| pose.binding_transform(placement.instance_id))
+            .unwrap_or_else(|| Affine::from_transform(active.transform));
+        let key = InstanceKey::new(q0rg_id, placement.instance_id);
+        let local_affine = scene_state.effective_affine(key, authored_affine);
+        let composed = Affine::compose(parent, local_affine);
+        render_placement_target(
+            project,
+            q0rg_id,
+            placement,
+            active.fx,
+            local_frame,
+            composed,
+            &mut source,
+            w,
+            h,
+            depth,
+            rig_overrides,
+            scene_state,
+            crate::rig::rig_for_q0rg(project, q0rg_id),
+            rig_pose,
+        );
+        let source_to_composite = if active.fx.is_identity() {
+            &mut source
+        } else {
+            effected.fill(0);
+            let mut isolated_fx = active.fx;
+            isolated_fx.blend_mode = BlendMode::Normal;
+            apply_placement_fx(
+                &mut effected,
+                &source,
+                w,
+                h,
+                isolated_fx,
+                composed.uniform_scale(),
+            );
+            &mut effected
+        };
+        for (pixel_index, pixel) in source_to_composite.chunks_exact_mut(4).enumerate() {
+            let mask_alpha = masks.iter().fold(255u16, |alpha, mask| {
+                let mask_alpha = u16::from(mask[pixel_index * 4 + 3]);
+                (alpha * mask_alpha + 127) / 255
+            });
+            pixel[3] = ((u16::from(pixel[3]) * mask_alpha + 127) / 255) as u8;
+        }
+        composite_rgba_with_blend(buffer, source_to_composite, active.fx.blend_mode, 1.0);
     }
 }
 
@@ -1035,6 +1291,7 @@ fn render_placement_target(
                 depth + 1,
                 rig_overrides,
                 scene_state,
+                None,
             );
         }
         _ => {}
@@ -1427,6 +1684,12 @@ pub fn active_placement_states_at(
     layer: &crate::v2::Layer,
     frame: u16,
 ) -> Vec<ActivePlacementState> {
+    if layer
+        .timeline_frame_count
+        .is_some_and(|frame_count| frame >= frame_count)
+    {
+        return Vec::new();
+    }
     // Hot path: rendering, hover and selection all ask this question repeatedly.
     // Finding the held keyframe does not require allocating/sorting the complete
     // union returned by Layer::keyframe_frames(). A single max scan is exactly
@@ -2540,6 +2803,7 @@ mod resolver_tests {
     fn tween_interpolates_alpha_and_filters_with_the_same_progress() {
         let layer = crate::v2::Layer {
             layer_id: 1,
+            timeline_frame_count: None,
             name: "fx tween".to_string(),
             explicit_keyframes: Vec::new(),
             placements: vec![
@@ -2632,6 +2896,7 @@ mod resolver_tests {
                 script: String::new(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "Art".to_string(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![
@@ -2762,6 +3027,7 @@ mod resolver_tests {
                 script: String::new(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "Art".to_string(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![placement.clone()],
@@ -2863,6 +3129,7 @@ mod resolver_tests {
                 script: String::new(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "Art".to_string(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![placement.clone()],
@@ -3069,6 +3336,7 @@ mod resolver_tests {
     fn raster_resolver_uses_complete_layer_keyframes() {
         let layer = Layer {
             layer_id: 1,
+            timeline_frame_count: None,
             name: "layer".into(),
             explicit_keyframes: Vec::new(),
             placements: vec![
@@ -3097,6 +3365,7 @@ mod resolver_tests {
     fn raster_resolver_stops_at_blank_keyframe() {
         let layer = Layer {
             layer_id: 1,
+            timeline_frame_count: None,
             name: "layer".into(),
             explicit_keyframes: vec![2],
             placements: vec![
@@ -3115,6 +3384,7 @@ mod resolver_tests {
     fn raster_resolver_keeps_duplicate_instances_and_tweens_by_order() {
         let layer = Layer {
             layer_id: 1,
+            timeline_frame_count: None,
             name: "layer".into(),
             explicit_keyframes: Vec::new(),
             placements: vec![
@@ -3207,6 +3477,7 @@ mod resolver_tests {
         };
         let layer = Layer {
             layer_id: 9,
+            timeline_frame_count: None,
             name: "resolver".into(),
             explicit_keyframes: vec![0, 7, 13],
             placements: vec![
@@ -3827,6 +4098,7 @@ mod resolver_tests {
                     script: String::new(),
                     layers: vec![Layer {
                         layer_id: 1,
+                        timeline_frame_count: None,
                         name: "instance".into(),
                         explicit_keyframes: Vec::new(),
                         placements: vec![Placement {
@@ -3852,6 +4124,7 @@ mod resolver_tests {
                     script: String::new(),
                     layers: vec![Layer {
                         layer_id: 1,
+                        timeline_frame_count: None,
                         name: "art".into(),
                         explicit_keyframes: Vec::new(),
                         placements: vec![Placement {
@@ -3917,6 +4190,7 @@ mod resolver_tests {
                 script: String::new(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "art".into(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![placement(0, 1, 0.0, Tween::None)],
@@ -3964,6 +4238,7 @@ mod resolver_tests {
                 script: String::new(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "art".into(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![placement(0, 1, 0.0, Tween::None)],
@@ -4108,6 +4383,7 @@ mod resolver_tests {
                 script: String::new(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "art".into(),
                     explicit_keyframes: vec![0],
                     placements: vec![Placement {
@@ -4213,6 +4489,7 @@ mod resolver_tests {
                 script: String::new(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "child instance".into(),
                     explicit_keyframes: vec![0],
                     placements: vec![Placement {

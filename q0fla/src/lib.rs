@@ -1,3 +1,4 @@
+mod binary_fla;
 mod text_outline;
 mod xfl_content;
 
@@ -81,11 +82,95 @@ pub struct ImportedProject {
     pub report: ImportReport,
 }
 
+pub(crate) fn normalize_folder_layer_order(
+    q0rg: &mut Q0rg,
+    layer_metadata: &std::collections::HashMap<LayerKey, LayerMetadata>,
+) {
+    use std::collections::{HashMap, HashSet};
+
+    let folder_ids: HashSet<u16> = q0rg
+        .layers
+        .iter()
+        .filter(|layer| {
+            layer_metadata
+                .get(&LayerKey::new(q0rg.q0rg_id, layer.layer_id))
+                .is_some_and(|metadata| metadata.kind == LayerKind::Folder)
+        })
+        .map(|layer| layer.layer_id)
+        .collect();
+    let mut children = HashMap::<u16, Vec<u16>>::new();
+    let mut roots = Vec::new();
+    for layer in &q0rg.layers {
+        let parent = layer_metadata
+            .get(&LayerKey::new(q0rg.q0rg_id, layer.layer_id))
+            .and_then(|metadata| metadata.parent_folder_id)
+            .filter(|parent| folder_ids.contains(parent));
+        if let Some(parent) = parent {
+            children.entry(parent).or_default().push(layer.layer_id);
+        } else {
+            roots.push(layer.layer_id);
+        }
+    }
+
+    fn append_subtree(
+        root: u16,
+        children: &HashMap<u16, Vec<u16>>,
+        scheduled: &mut HashSet<u16>,
+        order: &mut Vec<u16>,
+    ) {
+        let mut pending = vec![(root, false)];
+        while let Some((layer_id, expanded)) = pending.pop() {
+            if expanded {
+                order.push(layer_id);
+                continue;
+            }
+            if !scheduled.insert(layer_id) {
+                continue;
+            }
+            pending.push((layer_id, true));
+            if let Some(descendants) = children.get(&layer_id) {
+                for child in descendants.iter().rev() {
+                    if !scheduled.contains(child) {
+                        pending.push((*child, false));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut scheduled = HashSet::new();
+    let mut order = Vec::with_capacity(q0rg.layers.len());
+    for root in roots {
+        append_subtree(root, &children, &mut scheduled, &mut order);
+    }
+    // Preserve malformed cyclic data for the validator to reject cleanly,
+    // without recursing on an untrusted XFL folder graph.
+    for layer in &q0rg.layers {
+        if !scheduled.contains(&layer.layer_id) {
+            append_subtree(layer.layer_id, &children, &mut scheduled, &mut order);
+        }
+    }
+    if order.len() != q0rg.layers.len() {
+        return;
+    }
+
+    let mut by_id: HashMap<u16, Layer> = std::mem::take(&mut q0rg.layers)
+        .into_iter()
+        .map(|layer| (layer.layer_id, layer))
+        .collect();
+    q0rg.layers = order
+        .into_iter()
+        .filter_map(|layer_id| by_id.remove(&layer_id))
+        .collect();
+}
+
 #[derive(Debug, Clone)]
 struct ImportedLayer {
     name: String,
     keyframes: Vec<u16>,
     kind: LayerKind,
+    masked: bool,
+    mask_source_index: Option<usize>,
     parent_index: Option<usize>,
     hidden: bool,
     locked: bool,
@@ -102,9 +187,11 @@ impl ImportedLayer {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| format!("Layer {}", ordinal + 1));
         let layer_type = attr(reader, element, b"layerType")?.unwrap_or_default();
-        let kind = match layer_type.as_str() {
+        let kind = match layer_type.to_ascii_lowercase().as_str() {
             "" | "normal" => LayerKind::Normal,
             "folder" => LayerKind::Folder,
+            "mask" => LayerKind::Mask,
+            "masked" => LayerKind::Normal,
             unsupported => {
                 warnings.push(format!(
                     "layer '{name}' uses Animate layerType='{unsupported}'; imported as a normal layer"
@@ -133,6 +220,8 @@ impl ImportedLayer {
             name,
             keyframes: Vec::new(),
             kind,
+            masked: layer_type.eq_ignore_ascii_case("masked"),
+            mask_source_index: None,
             parent_index,
             hidden,
             locked,
@@ -175,6 +264,13 @@ pub fn import_fla(path: &Path) -> Result<ImportedProject, ImportError> {
         )));
     }
 
+    let mut file = File::open(path)?;
+    let mut signature = [0_u8; 8];
+    let signature_len = file.read(&mut signature)?;
+    if signature_len == signature.len() && signature == binary_fla::OLE2_MAGIC {
+        return binary_fla::import_legacy_fla(path);
+    }
+
     let file = File::open(path)?;
     match zip::ZipArchive::new(file) {
         Ok(archive) => import_fla_archive(path, archive, "fla"),
@@ -185,7 +281,7 @@ pub fn import_fla(path: &Path) -> Result<ImportedProject, ImportError> {
                 import_fla_archive(path, archive, "fla (repaired adobe zip directory)")
             } else {
                 Err(ImportError::Unsupported(
-                    "this is not a readable XFL-based FLA archive (legacy binary FLA is not supported yet)"
+                    "this is neither a readable XFL-based FLA archive nor an ole2 legacy binary FLA"
                         .to_string(),
                 ))
             }
@@ -560,11 +656,24 @@ fn import_dom_document(
             name: "Layer 1".to_string(),
             keyframes: vec![0],
             kind: LayerKind::Normal,
+            masked: false,
+            mask_source_index: None,
             parent_index: None,
             hidden: false,
             locked: false,
         });
         max_frame_end = max_frame_end.max(1);
+    }
+
+    let mut active_mask = None;
+    for (index, layer) in layers.iter_mut().enumerate() {
+        if layer.kind == LayerKind::Mask {
+            active_mask = Some(index);
+        } else if layer.masked {
+            layer.mask_source_index = active_mask;
+        } else {
+            active_mask = None;
+        }
     }
 
     for layer in &mut layers {
@@ -601,6 +710,7 @@ fn import_dom_document(
             .map_err(|_| ImportError::Invalid("layer id overflow".to_string()))?;
         q0_layers.push(Layer {
             layer_id,
+            timeline_frame_count: None,
             name: imported.name.clone(),
             explicit_keyframes: imported.keyframes.clone(),
             placements: Vec::new(),
@@ -633,6 +743,9 @@ fn import_dom_document(
         let metadata = LayerMetadata {
             kind: imported.kind,
             parent_folder_id,
+            mask_layer_id: imported
+                .mask_source_index
+                .and_then(|mask_index| u16::try_from(mask_index + 1).ok()),
             collapsed: false,
             hidden: imported.hidden,
             locked: imported.locked,
@@ -642,7 +755,7 @@ fn import_dom_document(
         }
     }
 
-    let project = ProjectV2 {
+    let mut project = ProjectV2 {
         meta: ProjectMeta {
             name: project_name,
             fps,
@@ -665,6 +778,8 @@ fn import_dom_document(
             layers: q0_layers,
         }],
     };
+
+    normalize_folder_layer_order(&mut project.q0rgs[0], &project.layer_metadata);
 
     q0s_format::v2::validate(&project).map_err(|error| {
         ImportError::Invalid(format!("converted q1s model failed validation: {error}"))

@@ -38,6 +38,7 @@ fn project_with_pixel() -> ProjectV2 {
             script: String::new(),
             layers: vec![Layer {
                 layer_id: 1,
+                timeline_frame_count: None,
                 name: "art".into(),
                 explicit_keyframes: vec![0],
                 placements: vec![Placement {

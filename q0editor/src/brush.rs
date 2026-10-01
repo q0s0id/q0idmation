@@ -2187,7 +2187,7 @@ pub fn commit_brush_region_with_material(
 
     app.session.selection = crate::state::Selection::None;
     app.session.status = format!("Brush merge drawing updated ({} regions)", painted.0.len());
-    app.state.dirty = true;
+    app.state.mark_dirty();
 }
 
 /// Rebuild same-colour fill-only raw graphics after a transform gesture.
@@ -2493,7 +2493,7 @@ fn erase_brush_region_impl(
 
     app.session.selection = crate::state::Selection::None;
     app.session.status = "Raw fill erased".to_string();
-    app.state.dirty = true;
+    app.state.mark_dirty();
     true
 }
 
@@ -2702,7 +2702,7 @@ fn append_raw_fill(
                 .find(|layer| layer.layer_id == layer_id)
         })
     {
-        layer.placements.push(Placement {
+        layer.push_placement(Placement {
             instance_id: 0,
             frame,
             target: Target::Asset(asset_id),
@@ -3024,6 +3024,7 @@ mod tests {
             origin: stage_rect.min,
             scale: 1.0,
             stage_rect,
+            edit_transform: q0s_format::transform::Affine::IDENTITY,
         };
         let q0rg_id = app.session.current_q0rg_id;
         let frame = app.session.current_frame;

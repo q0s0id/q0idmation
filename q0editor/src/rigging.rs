@@ -16,6 +16,7 @@ use q0s_format::v2::{
 use crate::app::EditorApp;
 use crate::render::StageView;
 use crate::state::{RigBoneDrag, RigControlDrag, RigEditMode, RigMode, Selection};
+use crate::ui::{icon_button, icon_button_enabled, Icon};
 
 const CONTROL_HIT_PX: f32 = 10.0;
 const BONE_HIT_PX: f32 = 8.0;
@@ -1620,6 +1621,111 @@ fn set_node_property(
     true
 }
 
+pub(crate) fn set_node_world_transform_from_binding(
+    project: &mut ProjectV2,
+    q0rg_id: u16,
+    node_id: u16,
+    frame: u16,
+    object_world: Affine,
+    auto_key: bool,
+) -> bool {
+    let Some(rig_snapshot) = rig_for_q0rg(project, q0rg_id).cloned() else {
+        return false;
+    };
+    let Some(node) = rig_snapshot
+        .nodes
+        .iter()
+        .find(|node| node.node_id == node_id)
+    else {
+        return false;
+    };
+    let Some(binding) = node.binding else {
+        return false;
+    };
+    let instance_id = binding.instance_id;
+    let Some(binding_inverse) = binding.bind_offset.inverse() else {
+        return false;
+    };
+    let pose = evaluate_rig(&rig_snapshot, f32::from(frame), &[]);
+    let parent_world = node
+        .parent
+        .and_then(|parent| pose.node_world.get(&parent).copied())
+        .unwrap_or(Affine::IDENTITY);
+    let Some(parent_inverse) = parent_world.inverse() else {
+        return false;
+    };
+    let desired_node_world = Affine::compose(object_world, binding_inverse);
+    let desired_node_local = Affine::compose(parent_inverse, desired_node_world);
+    let Some(local_transform) = crate::app::affine_to_transform(desired_node_local) else {
+        return false;
+    };
+
+    if !set_node_property(
+        project,
+        q0rg_id,
+        node_id,
+        frame,
+        RigPropertyRef::NodeTx(node_id),
+        local_transform.tx,
+        auto_key,
+    ) || !set_node_property(
+        project,
+        q0rg_id,
+        node_id,
+        frame,
+        RigPropertyRef::NodeTy(node_id),
+        local_transform.ty,
+        auto_key,
+    ) || !set_node_rotation(
+        project,
+        q0rg_id,
+        node_id,
+        frame,
+        local_transform.rotation,
+        auto_key,
+    ) || !set_node_property(
+        project,
+        q0rg_id,
+        node_id,
+        frame,
+        RigPropertyRef::NodeScaleX(node_id),
+        local_transform.sx,
+        auto_key,
+    ) || !set_node_property(
+        project,
+        q0rg_id,
+        node_id,
+        frame,
+        RigPropertyRef::NodeScaleY(node_id),
+        local_transform.sy,
+        auto_key,
+    ) {
+        return false;
+    }
+
+    let Some(updated_rig) = rig_for_q0rg(project, q0rg_id).cloned() else {
+        return false;
+    };
+    let updated_pose = evaluate_rig(&updated_rig, f32::from(frame), &[]);
+    let Some(updated_node_inverse) = updated_pose
+        .node_world
+        .get(&node_id)
+        .and_then(|world| world.inverse())
+    else {
+        return false;
+    };
+    let bind_offset = Affine::compose(updated_node_inverse, object_world);
+    let Some(binding) = rig_for_q0rg_mut(project, q0rg_id)
+        .and_then(|rig| rig.nodes.iter_mut().find(|node| node.node_id == node_id))
+        .and_then(|node| node.binding.as_mut())
+        .filter(|binding| binding.instance_id == instance_id)
+    else {
+        return false;
+    };
+    binding.bind_offset = bind_offset;
+    true
+}
+
 fn world_delta_to_node_parent_local(
     rig: &RigAsset,
     pose: &q0s_format::rig::RigPose,
@@ -1857,12 +1963,15 @@ fn render_bone_selection(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
         bind = ui.button("Bind selected object").clicked();
         unbind = ui.button("Unbind").clicked();
         add_ik = ui.button("Make 2-bone IK").clicked();
+        delete = ui
+            .button("Delete bone + children")
+            .on_hover_text("Deletes this bone, its child bones, and rig controls attached to them.")
+            .clicked();
     });
     if app.session.rig_mode == RigMode::Pro {
         ui.horizontal_wrapped(|ui| {
             add_rotation = ui.button("+ rotation control").clicked();
             add_position = ui.button("+ position control").clicked();
-            delete = ui.button("Delete bone subtree").clicked();
         });
     }
 
@@ -1929,6 +2038,7 @@ fn render_bone_selection(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
             app.state.mark_dirty();
             app.session.rig_selected_node = None;
             app.session.rig_selected_control = None;
+            app.session.status = "bone and child bones removed".into();
         }
     }
 
@@ -2404,10 +2514,7 @@ fn render_master_driver_editor(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16, c
         ui.group(|ui| {
             ui.horizontal(|ui| {
                 ui.label(rig_property_label(&rig_snapshot, driver.target));
-                delete = ui
-                    .small_button("x")
-                    .on_hover_text("Delete mapping")
-                    .clicked();
+                delete = icon_button(ui, Icon::Delete, "Delete mapping").clicked();
             });
             egui::Grid::new(format!("rig_driver_{}", driver.driver_id))
                 .num_columns(2)
@@ -2646,7 +2753,7 @@ fn render_pose_library(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                     .small_button("Update")
                     .on_hover_text("Replace this pose with the current rig pose")
                     .clicked();
-                delete = ui.small_button("x").on_hover_text("Delete pose").clicked();
+                delete = icon_button(ui, Icon::Delete, "Delete pose").clicked();
             });
         });
         if rename && !name.trim().is_empty() {
@@ -3115,14 +3222,11 @@ fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new(format!(
-                                "#{constraint_id} rotation limit ? bone {node_id}"
+                                "#{constraint_id} rotation limit: bone {node_id}"
                             ))
                             .strong(),
                         );
-                        delete = ui
-                            .small_button("?")
-                            .on_hover_text("Delete constraint")
-                            .clicked();
+                        delete = icon_button(ui, Icon::Delete, "Delete constraint").clicked();
                     });
                     egui::Grid::new(format!("rig_rotation_limit_{constraint_id}"))
                         .num_columns(2)
@@ -3190,10 +3294,7 @@ fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                             egui::RichText::new(format!("#{constraint_id} position limit"))
                                 .strong(),
                         );
-                        delete = ui
-                            .small_button("x")
-                            .on_hover_text("Delete constraint")
-                            .clicked();
+                        delete = icon_button(ui, Icon::Delete, "Delete constraint").clicked();
                     });
                     egui::Grid::new(format!("rig_position_limit_{constraint_id}"))
                         .num_columns(2)
@@ -3286,10 +3387,7 @@ fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                         ui.label(
                             egui::RichText::new(format!("#{constraint_id} aim / look-at")).strong(),
                         );
-                        delete = ui
-                            .small_button("x")
-                            .on_hover_text("Delete constraint")
-                            .clicked();
+                        delete = icon_button(ui, Icon::Delete, "Delete constraint").clicked();
                     });
                     egui::Grid::new(format!("rig_aim_{constraint_id}"))
                         .num_columns(2)
@@ -3398,10 +3496,7 @@ fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                             egui::RichText::new(format!("#{constraint_id} transform / parent"))
                                 .strong(),
                         );
-                        delete = ui
-                            .small_button("x")
-                            .on_hover_text("Delete constraint")
-                            .clicked();
+                        delete = icon_button(ui, Icon::Delete, "Delete constraint").clicked();
                     });
                     egui::Grid::new(format!("rig_transform_constraint_{constraint_id}"))
                         .num_columns(2)
@@ -3508,10 +3603,7 @@ fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                         ui.label(
                             egui::RichText::new(format!("#{constraint_id} distance")).strong(),
                         );
-                        delete = ui
-                            .small_button("x")
-                            .on_hover_text("Delete constraint")
-                            .clicked();
+                        delete = icon_button(ui, Icon::Delete, "Delete constraint").clicked();
                     });
                     egui::Grid::new(format!("rig_distance_{constraint_id}"))
                         .num_columns(2)
@@ -3644,11 +3736,11 @@ fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new(format!(
-                                "#{constraint_id} 2-bone IK ? {root_node} > {mid_node} > {tip_node}"
+                                "#{constraint_id} 2-bone IK: {root_node} > {mid_node} > {tip_node}"
                             ))
                             .strong(),
                         );
-                        delete = ui.small_button("?").on_hover_text("Delete constraint").clicked();
+                        delete = icon_button(ui, Icon::Delete, "Delete constraint").clicked();
                     });
                     ui.horizontal(|ui| {
                         ui.label("FK");
@@ -3671,7 +3763,7 @@ fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                                 egui::DragValue::new(&mut stretch_max)
                                     .speed(0.01)
                                     .clamp_range(1.0..=8.0)
-                                    .suffix("?"),
+                                    .suffix("x"),
                             );
                             snapshot |= response.drag_started() || response.gained_focus();
                             settings_changed |= response.changed();
@@ -4052,7 +4144,7 @@ fn render_pro_pose_metadata(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                             rig_property_label(&snapshot, pair.right)
                         ));
                         ui.label(format!("x{:.2} {:+.2}", pair.multiplier, pair.offset));
-                        delete = ui.small_button("x").clicked();
+                        delete = icon_button(ui, Icon::Delete, "Delete mirror pair").clicked();
                     });
                     if delete {
                         let before = app.state.project.clone();
@@ -4105,7 +4197,7 @@ fn render_pro_pose_metadata(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                     ))
                     .strong(),
                 );
-                delete = ui.small_button("x").clicked();
+                delete = icon_button(ui, Icon::Delete, "Delete pose driver").clicked();
             });
             egui::Grid::new(("pose_driver", driver.driver_id))
                 .num_columns(2)
@@ -4254,7 +4346,7 @@ fn render_pro_variants(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
             ui.horizontal(|ui| {
                 rename = ui.text_edit_singleline(&mut name).changed();
                 ui.label(format!("instance #{}", variant.instance_id));
-                delete = ui.small_button("x").clicked();
+                delete = icon_button(ui, Icon::Delete, "Delete variant set").clicked();
             });
             for (index, choice) in variant.choices.iter().enumerate() {
                 ui.label(format!(
@@ -4459,7 +4551,7 @@ fn render_pro_deformers(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                                             .map(|(_, name)| name.as_str()).unwrap_or("missing bone");
                                         ui.label(name);
                                         changed |= ui.add(egui::Slider::new(&mut weight.weight, 0.001..=1.0).show_value(true)).changed();
-                                        if can_remove && ui.small_button("x").clicked() {
+                                        if icon_button_enabled(ui, can_remove, Icon::Delete, "Remove bone weight").clicked() {
                                             remove_index = Some(index);
                                         }
                                     });
@@ -5155,7 +5247,7 @@ fn nearest_bone(
             let world = *pose.node_world.get(&node.node_id)?;
             let a = world.apply(Vec2::new(0.0, 0.0));
             let b = world.apply(Vec2::new(node.length, 0.0));
-            let distance = point_segment_distance(pointer, a, b) * view.scale;
+            let distance = point_segment_distance(pointer, a, b) * view.effective_scale();
             (distance <= BONE_HIT_PX).then_some((node.node_id, distance))
         })
         .min_by(|a, b| a.1.total_cmp(&b.1))
@@ -5278,23 +5370,17 @@ pub fn paint_stage_overlay(app: &EditorApp, painter: &Painter, view: &StageView)
 }
 
 fn stage_to_screen(point: Vec2, view: &StageView) -> egui::Pos2 {
-    egui::pos2(
-        view.origin.x + point.x * view.scale,
-        view.origin.y + point.y * view.scale,
-    )
+    view.stage_to_screen(point)
 }
 
 fn screen_to_stage(point: egui::Pos2, view: &StageView) -> Vec2 {
-    Vec2::new(
-        (point.x - view.origin.x) / view.scale,
-        (point.y - view.origin.y) / view.scale,
-    )
+    view.screen_to_stage(point)
 }
 
 fn distance_screen(a: Vec2, b: Vec2, view: &StageView) -> f32 {
     let dx = a.x - b.x;
     let dy = a.y - b.y;
-    (dx * dx + dy * dy).sqrt() * view.scale
+    (dx * dx + dy * dy).sqrt() * view.effective_scale()
 }
 
 fn point_segment_distance(point: Vec2, a: Vec2, b: Vec2) -> f32 {
@@ -5352,6 +5438,7 @@ mod tests {
                 script: String::new(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "parts".into(),
                     explicit_keyframes: vec![0],
                     placements: vec![Placement {

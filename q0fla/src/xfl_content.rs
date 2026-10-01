@@ -5,10 +5,11 @@ use flate2::read::ZlibDecoder;
 use q0s_format::geom::CapShape;
 use q0s_format::transform::Affine;
 use q0s_format::v2::{
-    Anchor, Asset, BitmapAsset, BlendMode, BlurFx, Easing, GlowFx, GradientFill, GradientKind,
-    GradientStop, Layer, LayerKey, LayerKind, LayerMetadata, Path as VectorPath, Placement,
-    PlacementFx, ProjectV2, Q0rg, Q0rgPlayback, Q0rgPlaybackMode, Rgba, Stroke, Target,
-    Transform2D, Tween, Vec2, VectorAppearance, VectorAsset, VectorMaterial,
+    Anchor, Asset, BitmapAsset, BlendMode, BlurFx, CameraKey, CameraState, CameraTrack, Easing,
+    GlowFx, GradientFill, GradientKind, GradientStop, Layer, LayerKey, LayerKind, LayerMetadata,
+    Path as VectorPath, Placement, PlacementFx, ProjectScene, ProjectV2, Q0rg, Q0rgPlayback,
+    Q0rgPlaybackMode, Rgba, Stroke, Target, Transform2D, Tween, Vec2, VectorAppearance,
+    VectorAsset, VectorMaterial,
 };
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
@@ -27,6 +28,9 @@ struct RawTimeline {
 struct RawLayer {
     name: String,
     kind: LayerKind,
+    masked: bool,
+    mask_source_index: Option<usize>,
+    is_camera: bool,
     parent_index: Option<usize>,
     hidden: bool,
     locked: bool,
@@ -60,6 +64,7 @@ enum RawElement {
 #[derive(Debug, Clone)]
 struct RawText {
     affine: Affine,
+    offset: Vec2,
     text: String,
     font: String,
     size: f32,
@@ -91,15 +96,15 @@ struct RawBitmapMedia {
 }
 
 #[derive(Debug, Clone)]
-struct RawShape {
-    affine: Affine,
-    fills: HashMap<u16, RawFillStyle>,
-    strokes: HashMap<u16, Stroke>,
-    edges: Vec<RawEdge>,
+pub(crate) struct RawShape {
+    pub(crate) affine: Affine,
+    pub(crate) fills: HashMap<u16, RawFillStyle>,
+    pub(crate) strokes: HashMap<u16, Stroke>,
+    pub(crate) edges: Vec<RawEdge>,
 }
 
 #[derive(Debug, Clone)]
-enum RawFillStyle {
+pub(crate) enum RawFillStyle {
     Solid(Rgba),
     Gradient(GradientFill),
 }
@@ -114,18 +119,18 @@ struct GradientState {
 }
 
 #[derive(Debug, Clone)]
-struct RawEdge {
-    fill0: Option<u16>,
-    fill1: Option<u16>,
-    stroke: Option<u16>,
-    segments: Vec<Segment>,
+pub(crate) struct RawEdge {
+    pub(crate) fill0: Option<u16>,
+    pub(crate) fill1: Option<u16>,
+    pub(crate) stroke: Option<u16>,
+    pub(crate) segments: Vec<Segment>,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Segment {
-    start: Vec2,
-    end: Vec2,
-    control: Option<Vec2>,
+pub(crate) struct Segment {
+    pub(crate) start: Vec2,
+    pub(crate) end: Vec2,
+    pub(crate) control: Option<Vec2>,
 }
 
 impl Segment {
@@ -173,6 +178,7 @@ struct BitmapState {
 struct TextState {
     depth: usize,
     affine: Affine,
+    offset: Vec2,
     text: String,
     font: String,
     size: f32,
@@ -193,39 +199,82 @@ pub(crate) fn enrich_project(
     library_docs: &[(String, Vec<u8>)],
     binary_docs: &[(String, Vec<u8>)],
 ) -> Result<(), ImportError> {
+    let document_scenes = parse_document_timelines(dom_xml)?;
+    if document_scenes.is_empty() {
+        return Err(ImportError::Invalid(
+            "domdocument.xml has no readable scene timelines".to_string(),
+        ));
+    }
+
     let mut symbols = Vec::new();
-    for (_, xml) in library_docs {
+    for (entry_path, xml) in library_docs {
         if let Some(timeline) = parse_timeline(xml, true)? {
             if !timeline.name.trim().is_empty() {
-                symbols.push(timeline);
+                symbols.push((library_item_path(entry_path), timeline));
             }
         }
     }
 
     let mut symbol_ids = HashMap::<String, u16>::new();
-    for symbol in &symbols {
-        if symbol_ids.contains_key(&symbol.name) {
-            continue;
-        }
-        let next = u16::try_from(symbol_ids.len() + 2)
+    let mut symbol_frame_counts_by_id = HashMap::<u16, u16>::new();
+    let mut symbols_by_name = HashMap::<String, Vec<u16>>::new();
+    let mut symbol_ids_by_path = Vec::with_capacity(symbols.len());
+    for (path, symbol) in &symbols {
+        let next = u16::try_from(symbol_ids_by_path.len() + document_scenes.len() + 1)
             .map_err(|_| ImportError::Invalid("too many fla symbols for q0rg ids".to_string()))?;
-        symbol_ids.insert(symbol.name.clone(), next);
+        symbol_ids.insert(normalize_library_reference(path), next);
+        symbols_by_name
+            .entry(normalize_library_reference(&symbol.name))
+            .or_default()
+            .push(next);
+        symbol_ids_by_path.push(next);
+        symbol_frame_counts_by_id.insert(next, symbol.frame_count.max(1));
     }
-
-    let symbol_frame_counts: HashMap<String, u16> = symbols
+    // Bare names remain supported when they uniquely identify a library item;
+    // folder-qualified references always resolve to their own symbol.
+    for (name, ids) in symbols_by_name {
+        if ids.len() == 1 {
+            symbol_ids.entry(name).or_insert(ids[0]);
+        } else {
+            imported.report.warnings.push(format!(
+                "library contains {} symbols named '{}'; folder-qualified references are used",
+                ids.len(),
+                name
+            ));
+        }
+    }
+    let symbol_frame_counts: HashMap<String, u16> = symbol_ids
         .iter()
-        .map(|symbol| (symbol.name.clone(), symbol.frame_count.max(1)))
+        .filter_map(|(name, id)| {
+            symbol_frame_counts_by_id
+                .get(id)
+                .map(|count| (name.clone(), *count))
+        })
         .collect();
-
-    let stage = parse_timeline(dom_xml, false)?.ok_or_else(|| {
-        ImportError::Invalid("domdocument.xml has no readable timeline".to_string())
-    })?;
 
     imported.project.assets.clear();
     imported.project.asset_names.clear();
     imported.project.asset_appearances.clear();
     imported.project.q0rgs.clear();
     imported.project.layer_metadata.clear();
+    imported.project.runtime.scenes.clear();
+    imported.project.runtime.library_folders.clear();
+    imported.project.runtime.library_item_folders.clear();
+    imported.project.runtime.camera = CameraTrack::default();
+    if let Some(entry_scene) = document_scenes.first() {
+        imported.project.runtime.camera =
+            camera_track_from_timeline(entry_scene, &mut imported.report.warnings);
+    }
+    if document_scenes
+        .iter()
+        .skip(1)
+        .any(|scene| scene.layers.iter().any(|layer| layer.is_camera))
+    {
+        imported.report.warnings.push(
+            "camera layers from scenes after the first were not imported because q1s stores one project camera track"
+                .to_string(),
+        );
+    }
 
     let binary_by_name: HashMap<String, &[u8]> = binary_docs
         .iter()
@@ -236,6 +285,15 @@ pub(crate) fn enrich_project(
             )
         })
         .collect();
+    let mut bitmap_folders = HashMap::<String, String>::new();
+    for (entry_path, xml) in library_docs {
+        let Some(folder) = library_folder_from_item_path(&library_item_path(entry_path)) else {
+            continue;
+        };
+        for media in parse_bitmap_media(xml)? {
+            bitmap_folders.insert(normalize_library_reference(&media.name), folder.clone());
+        }
+    }
     let mut bitmap_asset_ids = HashMap::<String, u16>::new();
     let mut next_asset_id = 1u16;
     for media in parse_bitmap_media(dom_xml)? {
@@ -264,7 +322,17 @@ pub(crate) fn enrich_project(
                     .project
                     .asset_names
                     .insert(asset_id, media.name.clone());
-                bitmap_asset_ids.insert(media.name, asset_id);
+                if let Some(folder) = bitmap_folders.get(&normalize_library_reference(&media.name))
+                {
+                    if let Some(folder) = ensure_library_folder_paths(&mut imported.project, folder)
+                    {
+                        imported.project.runtime.library_item_folders.insert(
+                            q0s_format::v2::LibraryItemReference::Asset(asset_id),
+                            folder,
+                        );
+                    }
+                }
+                bitmap_asset_ids.insert(normalize_library_reference(&media.name), asset_id);
             }
             Err(error) => imported.report.warnings.push(format!(
                 "bitmap '{}' could not be decoded from '{}': {error}",
@@ -272,29 +340,36 @@ pub(crate) fn enrich_project(
             )),
         }
     }
-    let stage_built = build_q0rg(
-        &stage,
-        1,
-        "Stage",
-        &symbol_ids,
-        &symbol_frame_counts,
-        &bitmap_asset_ids,
-        &mut imported.project,
-        &mut next_asset_id,
-    )?;
-    imported.project.q0rgs.push(stage_built.q0rg);
-    imported.project.layer_metadata.extend(stage_built.metadata);
-    imported.report.warnings.extend(stage.warnings);
-    imported.report.warnings.extend(stage_built.warnings);
-
-    let mut built_symbol_ids = HashSet::new();
-    for symbol in symbols {
-        let Some(&q0rg_id) = symbol_ids.get(&symbol.name) else {
-            continue;
+    for (index, scene) in document_scenes.into_iter().enumerate() {
+        let scene_id = u16::try_from(index + 1)
+            .map_err(|_| ImportError::Invalid("too many fla scenes".to_string()))?;
+        let scene_name = if scene.name.trim().is_empty() {
+            format!("Scene {}", index + 1)
+        } else {
+            scene.name.trim().to_string()
         };
-        if !built_symbol_ids.insert(q0rg_id) {
-            continue;
-        }
+        let scene_built = build_q0rg(
+            &scene,
+            scene_id,
+            &scene_name,
+            &symbol_ids,
+            &symbol_frame_counts,
+            &bitmap_asset_ids,
+            &mut imported.project,
+            &mut next_asset_id,
+        )?;
+        imported.project.q0rgs.push(scene_built.q0rg);
+        imported.project.layer_metadata.extend(scene_built.metadata);
+        imported.project.runtime.scenes.push(ProjectScene {
+            scene_id,
+            q0rg_id: scene_id,
+            name: scene_name,
+        });
+        imported.report.warnings.extend(scene.warnings);
+        imported.report.warnings.extend(scene_built.warnings);
+    }
+
+    for ((path, symbol), q0rg_id) in symbols.into_iter().zip(symbol_ids_by_path) {
         let symbol_name = symbol.name.clone();
         let built = build_q0rg(
             &symbol,
@@ -308,6 +383,16 @@ pub(crate) fn enrich_project(
         )?;
         imported.project.q0rgs.push(built.q0rg);
         imported.project.layer_metadata.extend(built.metadata);
+        if let Some(folder_path) = library_folder_from_item_path(&path) {
+            if let Some(folder_path) =
+                ensure_library_folder_paths(&mut imported.project, &folder_path)
+            {
+                imported.project.runtime.library_item_folders.insert(
+                    q0s_format::v2::LibraryItemReference::Q0rg(q0rg_id),
+                    folder_path,
+                );
+            }
+        }
         imported.report.warnings.extend(symbol.warnings);
         imported.report.warnings.extend(built.warnings);
     }
@@ -334,6 +419,77 @@ pub(crate) fn enrich_project(
         ImportError::Invalid(format!("enriched q1s model failed validation: {error}"))
     })?;
     Ok(())
+}
+
+fn library_item_path(entry_path: &str) -> String {
+    let normalized = entry_path.replace('\\', "/");
+    let without_library = normalized
+        .get(..8)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("library/"))
+        .map(|_| &normalized[8..])
+        .unwrap_or(normalized.as_str());
+    without_library
+        .get(..without_library.len().saturating_sub(4))
+        .filter(|_| without_library.to_ascii_lowercase().ends_with(".xml"))
+        .unwrap_or(without_library)
+        .to_string()
+}
+
+fn normalize_library_reference(name: &str) -> String {
+    let normalized = name.trim().replace('\\', "/");
+    let without_library = normalized
+        .get(..8)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("library/"))
+        .map(|_| &normalized[8..])
+        .unwrap_or(normalized.as_str());
+    let without_extension = if without_library.to_ascii_lowercase().ends_with(".xml") {
+        &without_library[..without_library.len() - 4]
+    } else {
+        without_library
+    };
+    without_extension
+        .split('/')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("/")
+        .to_lowercase()
+}
+
+fn library_folder_from_item_path(item_path: &str) -> Option<String> {
+    item_path
+        .rsplit_once('/')
+        .and_then(|(folder, _)| normalize_library_folder_path(folder))
+}
+
+fn normalize_library_folder_path(path: &str) -> Option<String> {
+    let segments = path
+        .split('/')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    (!segments.is_empty()).then(|| segments.join("/"))
+}
+
+fn ensure_library_folder_paths(project: &mut ProjectV2, path: &str) -> Option<String> {
+    let path = normalize_library_folder_path(path)?;
+    let mut current = String::new();
+    for segment in path.split('/') {
+        if !current.is_empty() {
+            current.push('/');
+        }
+        current.push_str(segment);
+        if !project
+            .runtime
+            .library_folders
+            .iter()
+            .any(|folder| folder == &current)
+        {
+            project.runtime.library_folders.push(current.clone());
+        }
+    }
+    project.runtime.library_folders.sort();
+    Some(path)
 }
 
 struct BuiltQ0rg {
@@ -385,6 +541,108 @@ fn import_frame_tween(
     }
 }
 
+fn camera_track_from_timeline(timeline: &RawTimeline, warnings: &mut Vec<String>) -> CameraTrack {
+    let camera_layers: Vec<_> = timeline
+        .layers
+        .iter()
+        .filter(|layer| layer.is_camera)
+        .collect();
+    if camera_layers.is_empty() {
+        return CameraTrack::default();
+    }
+    if camera_layers.len() > 1 {
+        warnings.push(format!(
+            "scene '{}' has {} camera layers; only the first one was imported",
+            timeline.name,
+            camera_layers.len()
+        ));
+    }
+
+    let layer = camera_layers[0];
+    let mut keyed_frames = Vec::new();
+    for frame in &layer.frames {
+        let camera_instance = frame.elements.iter().find_map(|element| match element {
+            RawElement::Symbol(instance)
+                if normalize_library_reference(&instance.library_item_name) == "__camera__" =>
+            {
+                Some(instance)
+            }
+            _ => None,
+        });
+        let Some(instance) = camera_instance else {
+            warnings.push(format!(
+                "scene '{}' camera layer '{}' frame {} has no __Camera__ transform and was skipped",
+                timeline.name, layer.name, frame.index
+            ));
+            continue;
+        };
+
+        let affine = instance.affine;
+        let scale_x = affine.a11.hypot(affine.a21);
+        let scale_y = affine.a12.hypot(affine.a22);
+        let determinant = affine.a11 * affine.a22 - affine.a12 * affine.a21;
+        if ![
+            affine.a11,
+            affine.a12,
+            affine.a21,
+            affine.a22,
+            affine.tx,
+            affine.ty,
+            scale_x,
+            scale_y,
+            determinant,
+        ]
+        .into_iter()
+        .all(f32::is_finite)
+            || scale_x <= 1.0e-6
+            || scale_y <= 1.0e-6
+            || determinant <= 1.0e-9
+        {
+            warnings.push(format!(
+                "scene '{}' camera layer '{}' frame {} has an invalid transform and was skipped",
+                timeline.name, layer.name, frame.index
+            ));
+            continue;
+        }
+
+        // Animate stores the transformed camera viewport size in the matrix:
+        // a smaller instance means a tighter view. q1s stores magnification,
+        // so convert the viewport scale to its reciprocal.
+        let viewport_scale = (scale_x + scale_y) * 0.5;
+        let zoom = viewport_scale.recip();
+        if (scale_x - scale_y).abs() > viewport_scale * 0.01 {
+            warnings.push(format!(
+                "scene '{}' camera layer '{}' frame {} has non-uniform scale; camera zoom was approximated",
+                timeline.name, layer.name, frame.index
+            ));
+        }
+        keyed_frames.push((
+            frame,
+            CameraState {
+                center_x: affine.tx,
+                center_y: affine.ty,
+                zoom,
+                rotation: affine.a21.atan2(affine.a11),
+            },
+        ));
+    }
+
+    let mut track = CameraTrack {
+        enabled: !keyed_frames.is_empty(),
+        keys: Vec::with_capacity(keyed_frames.len()),
+    };
+    for (position, (frame, state)) in keyed_frames.iter().enumerate() {
+        let next_frame = keyed_frames.get(position + 1).map(|(next, _)| next.index);
+        let tween = import_frame_tween(frame, next_frame, &timeline.name, &layer.name, warnings);
+        track.keys.push(CameraKey {
+            frame: frame.index,
+            state: *state,
+            tween,
+        });
+    }
+    track
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_q0rg(
     timeline: &RawTimeline,
@@ -401,6 +659,9 @@ fn build_q0rg(
     let mut warnings = Vec::new();
 
     for (original_index, raw_layer) in timeline.layers.iter().enumerate().rev() {
+        if raw_layer.is_camera {
+            continue;
+        }
         let layer_id = u16::try_from(original_index + 1)
             .map_err(|_| ImportError::Invalid("layer id overflow".to_string()))?;
         let mut placements = Vec::new();
@@ -419,7 +680,9 @@ fn build_q0rg(
                 for element in &frame.elements {
                     match element {
                         RawElement::Symbol(instance) => {
-                            if let Some(&target_id) = symbol_ids.get(&instance.library_item_name) {
+                            let reference =
+                                normalize_library_reference(&instance.library_item_name);
+                            if let Some(&target_id) = symbol_ids.get(&reference) {
                                 let transform =
                                     affine_to_transform(instance.affine).ok_or_else(|| {
                                         ImportError::Invalid(format!(
@@ -428,18 +691,31 @@ fn build_q0rg(
                                         ))
                                     })?;
                                 let mut playback = instance.playback;
+                                let frame_count = symbol_frame_counts
+                                    .get(&reference)
+                                    .copied()
+                                    .unwrap_or(1)
+                                    .max(1);
                                 // Make imported loop playback explicit so it follows Flash's
                                 // placement-relative graphic-symbol clock instead of the legacy
                                 // q0rg parent-clock compatibility path.
                                 if playback.mode == Q0rgPlaybackMode::Loop
                                     && playback.last_frame.is_none()
                                 {
-                                    let frame_count = symbol_frame_counts
-                                        .get(&instance.library_item_name)
-                                        .copied()
-                                        .unwrap_or(1)
-                                        .max(1);
                                     playback.last_frame = Some(frame_count - 1);
+                                }
+                                let max_frame = frame_count - 1;
+                                let original_playback = playback;
+                                playback.first_frame = playback.first_frame.min(max_frame);
+                                playback.single_frame = playback.single_frame.min(max_frame);
+                                playback.last_frame = playback
+                                    .last_frame
+                                    .map(|last| last.min(max_frame).max(playback.first_frame));
+                                if playback != original_playback {
+                                    warnings.push(format!(
+                                        "symbol '{}' playback range was adjusted to its {} available frames",
+                                        instance.library_item_name, frame_count
+                                    ));
                                 }
                                 if let Some(mode) = instance.unsupported_blend_mode.as_deref() {
                                     warnings.push(format!(
@@ -470,8 +746,8 @@ fn build_q0rg(
                             }
                         }
                         RawElement::Bitmap(instance) => {
-                            if let Some(&target_id) =
-                                bitmap_asset_ids.get(&instance.library_item_name)
+                            if let Some(&target_id) = bitmap_asset_ids
+                                .get(&normalize_library_reference(&instance.library_item_name))
                             {
                                 let transform =
                                     affine_to_transform(instance.affine).ok_or_else(|| {
@@ -538,6 +814,7 @@ fn build_q0rg(
         }
         layers.push(Layer {
             layer_id,
+            timeline_frame_count: None,
             name: raw_layer.name.clone(),
             explicit_keyframes,
             placements,
@@ -553,6 +830,9 @@ fn build_q0rg(
         let layer_metadata = LayerMetadata {
             kind: raw_layer.kind,
             parent_folder_id,
+            mask_layer_id: raw_layer
+                .mask_source_index
+                .and_then(|mask_index| u16::try_from(mask_index + 1).ok()),
             collapsed: false,
             hidden: raw_layer.hidden,
             locked: raw_layer.locked,
@@ -565,26 +845,30 @@ fn build_q0rg(
     if layers.is_empty() {
         layers.push(Layer {
             layer_id: 1,
+            timeline_frame_count: None,
             name: "Layer 1".to_string(),
             explicit_keyframes: vec![0],
             placements: Vec::new(),
         });
     }
 
+    let mut q0rg = Q0rg {
+        q0rg_id,
+        name: q0rg_name.to_string(),
+        frame_count: timeline.frame_count.max(1),
+        script: String::new(),
+        layers,
+    };
+    crate::normalize_folder_layer_order(&mut q0rg, &metadata);
+
     Ok(BuiltQ0rg {
-        q0rg: Q0rg {
-            q0rg_id,
-            name: q0rg_name.to_string(),
-            frame_count: timeline.frame_count.max(1),
-            script: String::new(),
-            layers,
-        },
+        q0rg,
         metadata,
         warnings,
     })
 }
 
-fn shape_assets(
+pub(crate) fn shape_assets(
     shape: &RawShape,
     owner_name: &str,
     project: &mut ProjectV2,
@@ -639,6 +923,11 @@ fn shape_assets(
             RawFillStyle::Solid(color) => (color, None),
             RawFillStyle::Gradient(mut gradient) => {
                 gradient.transform = Affine::compose(shape.affine, gradient.transform);
+                if regularize_gradient_transform(&mut gradient.transform) {
+                    warnings.push(format!(
+                        "{owner_name}: degenerate fill gradient transform was regularized; gradient colors and stops were retained"
+                    ));
+                }
                 let fallback = gradient
                     .stops
                     .first()
@@ -704,6 +993,115 @@ fn shape_assets(
     Ok(result)
 }
 
+/// Add the smallest practical perpendicular basis needed to make a collapsed
+/// XFL gradient transform invertible. Its color stops and dominant direction
+/// remain intact, while the renderer can safely map points back into gradient
+/// space.
+fn regularize_gradient_transform(transform: &mut Affine) -> bool {
+    const MINIMUM_BASIS: f32 = 1.0e-4;
+    const MINIMUM_DETERMINANT: f32 = 1.0e-9;
+
+    let values = [
+        transform.a11,
+        transform.a12,
+        transform.a21,
+        transform.a22,
+        transform.tx,
+        transform.ty,
+    ];
+    if !values.into_iter().all(f32::is_finite) {
+        return false;
+    }
+
+    let determinant = transform.a11 * transform.a22 - transform.a12 * transform.a21;
+    if determinant.is_finite() && determinant.abs() >= MINIMUM_DETERMINANT {
+        return false;
+    }
+
+    let x_axis_len = transform.a11.hypot(transform.a21);
+    let y_axis_len = transform.a12.hypot(transform.a22);
+    let dominant_len = x_axis_len.max(y_axis_len);
+    if !dominant_len.is_finite() {
+        transform.a11 = MINIMUM_BASIS;
+        transform.a12 = 0.0;
+        transform.a21 = 0.0;
+        transform.a22 = MINIMUM_BASIS;
+        return true;
+    }
+    if dominant_len <= f32::MIN_POSITIVE {
+        transform.a11 = MINIMUM_BASIS;
+        transform.a12 = 0.0;
+        transform.a21 = 0.0;
+        transform.a22 = MINIMUM_BASIS;
+        return true;
+    }
+
+    // Keep the adjustment relative to the surviving basis, while staying well
+    // above q1s' absolute determinant threshold after f32 rounding.
+    let target_det = (dominant_len * 1.0e-6 * dominant_len).max(1.0e-8);
+    let orientation = if determinant.is_sign_negative() {
+        -1.0
+    } else {
+        1.0
+    };
+    let delta = (orientation * target_det - determinant) / dominant_len;
+
+    if target_det.is_finite() && delta.is_finite() {
+        if x_axis_len >= y_axis_len {
+            // The columns are the transformed x and y bases. Nudge the weaker
+            // column perpendicular to the stronger one so its existing component
+            // along the stronger basis is preserved.
+            let perp_x = -transform.a21 / dominant_len;
+            let perp_y = transform.a11 / dominant_len;
+            transform.a12 += perp_x * delta;
+            transform.a22 += perp_y * delta;
+        } else {
+            let perp_x = transform.a22 / dominant_len;
+            let perp_y = -transform.a12 / dominant_len;
+            transform.a11 += perp_x * delta;
+            transform.a21 += perp_y * delta;
+        }
+
+        let regularized_det = transform.a11 * transform.a22 - transform.a12 * transform.a21;
+        if regularized_det.is_finite() && regularized_det.abs() >= MINIMUM_DETERMINANT {
+            return true;
+        }
+    }
+
+    // The small perpendicular adjustment can round away when the surviving
+    // basis is poorly conditioned. Rebuild the weaker axis explicitly while
+    // retaining the dominant direction and the gradient translation.
+    if dominant_len >= MINIMUM_BASIS {
+        let perpendicular_len = (2.0e-9 / dominant_len).max(MINIMUM_BASIS);
+        if perpendicular_len.is_finite() {
+            if x_axis_len >= y_axis_len {
+                let perp_x = -transform.a21 / dominant_len;
+                let perp_y = transform.a11 / dominant_len;
+                transform.a12 = orientation * perp_x * perpendicular_len;
+                transform.a22 = orientation * perp_y * perpendicular_len;
+            } else {
+                let perp_x = transform.a22 / dominant_len;
+                let perp_y = -transform.a12 / dominant_len;
+                transform.a11 = orientation * perp_x * perpendicular_len;
+                transform.a21 = orientation * perp_y * perpendicular_len;
+            }
+
+            let fallback_det = transform.a11 * transform.a22 - transform.a12 * transform.a21;
+            if fallback_det.is_finite() && fallback_det.abs() >= MINIMUM_DETERMINANT {
+                return true;
+            }
+        }
+    }
+
+    // Last resort for zero, non-finite, or extremely tiny bases. This keeps
+    // the imported gradient renderable and satisfies q1s validation.
+    transform.a11 = MINIMUM_BASIS;
+    transform.a12 = 0.0;
+    transform.a21 = 0.0;
+    transform.a22 = MINIMUM_BASIS;
+    true
+}
+
 fn text_asset(
     text: &RawText,
     owner_name: &str,
@@ -722,11 +1120,19 @@ fn text_asset(
                 return Ok(None);
             }
         };
+    let affine = Affine::compose(
+        text.affine,
+        Affine {
+            tx: text.offset.x,
+            ty: text.offset.y,
+            ..Affine::IDENTITY
+        },
+    );
     for path in &mut paths {
         for anchor in &mut path.anchors {
-            anchor.point = text.affine.apply(anchor.point);
-            anchor.in_handle = anchor.in_handle.map(|point| text.affine.apply(point));
-            anchor.out_handle = anchor.out_handle.map(|point| text.affine.apply(point));
+            anchor.point = affine.apply(anchor.point);
+            anchor.in_handle = anchor.in_handle.map(|point| affine.apply(point));
+            anchor.out_handle = anchor.out_handle.map(|point| affine.apply(point));
         }
     }
     if paths.is_empty() {
@@ -758,12 +1164,35 @@ fn allocate_asset_id(next_asset_id: &mut u16) -> Result<u16, ImportError> {
 }
 
 fn parse_timeline(xml: &[u8], symbol_document: bool) -> Result<Option<RawTimeline>, ImportError> {
+    parse_timeline_index(xml, symbol_document, 0)
+}
+
+fn parse_document_timelines(xml: &[u8]) -> Result<Vec<RawTimeline>, ImportError> {
+    let mut timelines = Vec::new();
+    loop {
+        let Some(timeline) = parse_timeline_index(xml, false, timelines.len())? else {
+            break;
+        };
+        timelines.push(timeline);
+        if timelines.len() >= usize::from(u16::MAX) {
+            return Err(ImportError::Invalid("too many fla scenes".to_string()));
+        }
+    }
+    Ok(timelines)
+}
+
+fn parse_timeline_index(
+    xml: &[u8],
+    symbol_document: bool,
+    wanted_timeline: usize,
+) -> Result<Option<RawTimeline>, ImportError> {
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
     let mut depth = 0usize;
     let mut timeline_depth = None;
     let mut saw_timeline = false;
+    let mut timeline_index = 0usize;
     let mut root_name = String::new();
     let mut timeline_name = String::new();
     let mut layers = Vec::new();
@@ -793,9 +1222,12 @@ fn parse_timeline(xml: &[u8], symbol_document: bool) -> Result<Option<RawTimelin
                     root_name = attr(&reader, &element, b"name")?.unwrap_or_default();
                 }
                 if name == b"DOMTimeline" && !saw_timeline {
-                    saw_timeline = true;
-                    timeline_depth = Some(depth);
-                    timeline_name = attr(&reader, &element, b"name")?.unwrap_or_default();
+                    if timeline_index == wanted_timeline {
+                        saw_timeline = true;
+                        timeline_depth = Some(depth);
+                        timeline_name = attr(&reader, &element, b"name")?.unwrap_or_default();
+                    }
+                    timeline_index = timeline_index.saturating_add(1);
                 } else if timeline_depth.is_some() && name == b"DOMLayer" && current_layer.is_none()
                 {
                     current_layer = Some((depth, raw_layer(&reader, &element, layers.len())?));
@@ -840,9 +1272,19 @@ fn parse_timeline(xml: &[u8], symbol_document: bool) -> Result<Option<RawTimelin
                         gradient: None,
                     });
                 } else if current_frame.is_some() && name == b"DOMStaticText" && text.is_none() {
+                    let offset = Vec2::new(
+                        parse_f32_attr(&reader, &element, b"left", 0.0)?,
+                        parse_f32_attr(&reader, &element, b"top", 0.0)?,
+                    );
+                    if !offset.x.is_finite() || !offset.y.is_finite() {
+                        return Err(ImportError::Invalid(
+                            "static text has a non-finite local offset".to_string(),
+                        ));
+                    }
                     text = Some(TextState {
                         depth,
                         affine: Affine::IDENTITY,
+                        offset,
                         text: String::new(),
                         font: "Arial".to_string(),
                         size: 12.0,
@@ -872,7 +1314,7 @@ fn parse_timeline(xml: &[u8], symbol_document: bool) -> Result<Option<RawTimelin
                 } else if name == b"DOMTextAttrs" {
                     if let Some(state) = text.as_mut() {
                         if state.run_count <= 1 {
-                            apply_text_attrs(&reader, &element, state)?;
+                            apply_text_attrs(&reader, &element, state, &mut unsupported)?;
                         }
                     }
                 }
@@ -940,7 +1382,7 @@ fn parse_timeline(xml: &[u8], symbol_document: bool) -> Result<Option<RawTimelin
                 } else if name == b"DOMTextAttrs" {
                     if let Some(state) = text.as_mut() {
                         if state.run_count <= 1 {
-                            apply_text_attrs(&reader, &element, state)?;
+                            apply_text_attrs(&reader, &element, state, &mut unsupported)?;
                         }
                     }
                 } else if name == b"Matrix" {
@@ -1026,6 +1468,7 @@ fn parse_timeline(xml: &[u8], symbol_document: bool) -> Result<Option<RawTimelin
                         if let Some((_, frame)) = current_frame.as_mut() {
                             frame.elements.push(RawElement::Text(RawText {
                                 affine: state.affine,
+                                offset: state.offset,
                                 text: state.text,
                                 font: state.font,
                                 size: state.size,
@@ -1087,15 +1530,30 @@ fn parse_timeline(xml: &[u8], symbol_document: bool) -> Result<Option<RawTimelin
                     groups.pop();
                 }
                 handle_shape_end(name, depth, &mut shape);
-                if name == b"DOMTimeline" && timeline_depth == Some(depth) {
+                let completed_timeline = name == b"DOMTimeline" && timeline_depth == Some(depth);
+                if completed_timeline {
                     timeline_depth = None;
                 }
                 depth = depth.saturating_sub(1);
+                if completed_timeline {
+                    break;
+                }
             }
             Event::Eof => break,
             _ => {}
         }
         buf.clear();
+    }
+
+    let mut active_mask = None;
+    for (index, layer) in layers.iter_mut().enumerate() {
+        if layer.kind == LayerKind::Mask {
+            active_mask = Some(index);
+        } else if layer.masked {
+            layer.mask_source_index = active_mask;
+        } else {
+            active_mask = None;
+        }
     }
 
     if !saw_timeline {
@@ -1108,7 +1566,11 @@ fn parse_timeline(xml: &[u8], symbol_document: bool) -> Result<Option<RawTimelin
         name: if symbol_document {
             root_name
         } else if timeline_name.is_empty() {
-            "Stage".to_string()
+            if wanted_timeline == 0 {
+                "Stage".to_string()
+            } else {
+                format!("Scene {}", wanted_timeline + 1)
+            }
         } else {
             timeline_name
         },
@@ -1152,10 +1614,14 @@ fn raw_layer(
     let name = attr(reader, element, b"name")?
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| format!("Layer {}", ordinal + 1));
-    let kind = match attr(reader, element, b"layerType")?.as_deref() {
-        Some("folder") => LayerKind::Folder,
+    let layer_type = attr(reader, element, b"layerType")?.unwrap_or_default();
+    let kind = match layer_type.to_ascii_lowercase().as_str() {
+        "folder" => LayerKind::Folder,
+        "mask" => LayerKind::Mask,
         _ => LayerKind::Normal,
     };
+    let masked = layer_type.eq_ignore_ascii_case("masked");
+    let is_camera = layer_type.eq_ignore_ascii_case("camera");
     let parent_index = attr(reader, element, b"parentLayerIndex")?
         .map(|value| {
             value
@@ -1174,6 +1640,9 @@ fn raw_layer(
     Ok(RawLayer {
         name,
         kind,
+        masked,
+        mask_source_index: None,
+        is_camera,
         parent_index,
         hidden,
         locked,
@@ -1456,7 +1925,7 @@ fn apply_instance_filter(
                     "inner/knockout/hideObject glow modes are not imported yet".to_string(),
                 );
             }
-            state.instance.glow = Some(parse_glow_filter(reader, element)?);
+            state.instance.glow = Some(parse_glow_filter(reader, element, unsupported)?);
         }
         _ => {}
     }
@@ -1507,6 +1976,7 @@ fn parse_blur_filter(
 fn parse_glow_filter(
     reader: &Reader<&[u8]>,
     element: &BytesStart<'_>,
+    unsupported: &mut HashSet<String>,
 ) -> Result<GlowFx, ImportError> {
     let radius_x = validate_filter_radius(
         "GlowFilter blurX",
@@ -1516,11 +1986,26 @@ fn parse_glow_filter(
         "GlowFilter blurY",
         parse_f32_attr(reader, element, b"blurY", 4.0)?,
     )?;
-    let strength = parse_f32_attr(reader, element, b"strength", 1.0)?;
-    if !strength.is_finite() || !(0.0..=4.0).contains(&strength) {
-        return Err(ImportError::Invalid(format!(
-            "GlowFilter strength must be finite and between 0 and 4, got {strength}"
-        )));
+    let strength_attr = attr(reader, element, b"strength")?;
+    let source_strength = match strength_attr.as_deref() {
+        None => 1.0,
+        Some(raw) => match raw.parse::<f32>() {
+            Ok(value) if value.is_finite() => value,
+            _ => {
+                unsupported.insert(format!(
+                    "invalid GlowFilter strength '{raw}' was replaced with the default"
+                ));
+                1.0
+            }
+        },
+    };
+    // Animate stores strengths above q0s' 0..=4 limit. Keep the project importable
+    // and report whenever a source value has to be clamped to the supported range.
+    let strength = source_strength.clamp(0.0, 4.0);
+    if strength != source_strength {
+        unsupported.insert(format!(
+            "GlowFilter strength {source_strength} was clamped to the q0s range 0..=4"
+        ));
     }
     let alpha = parse_f32_attr(reader, element, b"alpha", 1.0)?;
     if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
@@ -1560,6 +2045,7 @@ fn apply_text_attrs(
     reader: &Reader<&[u8]>,
     element: &BytesStart<'_>,
     state: &mut TextState,
+    unsupported: &mut HashSet<String>,
 ) -> Result<(), ImportError> {
     if let Some(face) = attr(reader, element, b"face")?.filter(|face| !face.trim().is_empty()) {
         state.font = face;
@@ -1568,10 +2054,18 @@ fn apply_text_attrs(
         let size = size
             .parse::<f32>()
             .map_err(|_| ImportError::Invalid(format!("invalid text size '{size}'")))?;
-        if !size.is_finite() || size <= 0.0 {
+        if !size.is_finite() || size < 0.0 {
             return Err(ImportError::Invalid(format!("invalid text size '{size}'")));
         }
-        state.size = size;
+        if size == 0.0 {
+            // Animate emits zero for text runs that inherit their parent's style.
+            // Retain the previous run size (or the default size on the first run).
+            unsupported.insert(
+                "zero text size is treated as inherited from the current text style".to_string(),
+            );
+        } else {
+            state.size = size;
+        }
     }
     if let Some(color) = attr(reader, element, b"fillColor")? {
         state.color = parse_hex_color(&color)?;

@@ -6,8 +6,8 @@ use egui::Context;
 use serde::Deserialize;
 
 const RELEASES_URL: &str =
-    "https://api.github.com/repos/overisneverover-lab/q0idmation/releases?per_page=5";
-const RELEASES_ATOM_URL: &str = "https://github.com/overisneverover-lab/q0idmation/releases.atom";
+    "https://api.github.com/repos/q0s0id/q0idmation/releases?per_page=5";
+const RELEASES_ATOM_URL: &str = "https://github.com/q0s0id/q0idmation/releases.atom";
 const USER_AGENT: &str = "q0editor-release-feed";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

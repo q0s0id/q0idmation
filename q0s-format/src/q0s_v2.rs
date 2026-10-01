@@ -11,8 +11,9 @@
 //! keep playing. Current vector revisions mirror the corresponding q1s body:
 //! v21 frame labels, v22 camera, v23 stage background, v24 q0rg playback, and
 //! v25 native linear/radial RGBA fill gradients, and v26 independent X/Y blur
-//! and glow radii. v27 adds manually keyframed q0rg playback. Older revisions
-//! remain readable.
+//! and glow radii. v27 adds manually keyframed q0rg playback, v28 adds
+//! Animate-style project scenes, v29 library folders, and v30 timeline masks.
+//! Older revisions remain readable.
 
 use crate::error::Error;
 #[cfg(test)]
@@ -48,7 +49,11 @@ pub const Q0S_VERSION_Q0RG_PLAYBACK: u16 = 24;
 pub const Q0S_VERSION_FILL_GRADIENTS: u16 = 25;
 pub const Q0S_VERSION_ANISOTROPIC_FX: u16 = 26;
 pub const Q0S_VERSION_MANUAL_Q0RG_PLAYBACK: u16 = 27;
-pub const Q0S_VERSION_CURRENT: u16 = Q0S_VERSION_MANUAL_Q0RG_PLAYBACK;
+pub const Q0S_VERSION_SCENES: u16 = 28;
+pub const Q0S_VERSION_LIBRARY_FOLDERS: u16 = 29;
+pub const Q0S_VERSION_TIMELINE_MASKS: u16 = 30;
+pub const Q0S_VERSION_LAYER_FRAME_COUNTS: u16 = 31;
+pub const Q0S_VERSION_CURRENT: u16 = Q0S_VERSION_LAYER_FRAME_COUNTS;
 
 /// Serialise a `ProjectV2` as the current vector `.q0s` bytes. Internally we
 /// reuse the current `.q1s` writer and patch the magic+version header in-place
@@ -136,7 +141,19 @@ pub fn parse_q0s_v2(bytes: &[u8]) -> Result<ProjectV2, Error> {
         Q0S_VERSION_ANISOTROPIC_FX => {
             v2::parse_body_after_header(bytes, v2::Q1S_VERSION_ANISOTROPIC_FX)
         }
-        Q0S_VERSION_CURRENT => v2::parse_body_after_header(bytes, v2::Q1S_VERSION_CURRENT),
+        Q0S_VERSION_MANUAL_Q0RG_PLAYBACK => {
+            v2::parse_body_after_header(bytes, v2::Q1S_VERSION_MANUAL_Q0RG_PLAYBACK)
+        }
+        Q0S_VERSION_SCENES => v2::parse_body_after_header(bytes, v2::Q1S_VERSION_SCENES),
+        Q0S_VERSION_LIBRARY_FOLDERS => {
+            v2::parse_body_after_header(bytes, v2::Q1S_VERSION_LIBRARY_FOLDERS)
+        }
+        Q0S_VERSION_TIMELINE_MASKS => {
+            v2::parse_body_after_header(bytes, v2::Q1S_VERSION_TIMELINE_MASKS)
+        }
+        Q0S_VERSION_LAYER_FRAME_COUNTS => {
+            v2::parse_body_after_header(bytes, v2::Q1S_VERSION_LAYER_FRAME_COUNTS)
+        }
         _ => Err(Error::UnsupportedVersion(version)),
     }
 }
@@ -177,6 +194,9 @@ pub fn is_q0s_v2(bytes: &[u8]) -> bool {
             | Q0S_VERSION_Q0RG_PLAYBACK
             | Q0S_VERSION_FILL_GRADIENTS
             | Q0S_VERSION_ANISOTROPIC_FX
+            | Q0S_VERSION_MANUAL_Q0RG_PLAYBACK
+            | Q0S_VERSION_SCENES
+            | Q0S_VERSION_LIBRARY_FOLDERS
             | Q0S_VERSION_CURRENT
     )
 }
@@ -285,6 +305,7 @@ mod tests {
                 script: String::new(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "L".to_string(),
                     explicit_keyframes: vec![1],
                     placements: vec![Placement {
@@ -498,7 +519,7 @@ mod tests {
         project.assets.swap(0, 1);
         project.q0rgs[0].frame_count = 5;
         let layer = &mut project.q0rgs[0].layers[0];
-        layer.placements.push(v2::Placement {
+        layer.push_placement(v2::Placement {
             instance_id: 0,
             frame: 4,
             target: Target::Asset(1),
@@ -552,7 +573,7 @@ mod tests {
         target.frame = 3;
         target.transform.tx = 90.0;
         target.tween = Tween::None;
-        project.q0rgs[0].layers[0].placements.push(target);
+        project.q0rgs[0].layers[0].push_placement(target);
 
         let bytes = write_q0s_v2(&project).expect("write eased q0s");
         assert_eq!(
@@ -804,6 +825,7 @@ mod tests {
         let mut project = small_project();
         project.q0rgs[0].layers.push(Layer {
             layer_id: 9,
+            timeline_frame_count: None,
             name: "Folder".to_string(),
             explicit_keyframes: Vec::new(),
             placements: Vec::new(),
@@ -813,6 +835,7 @@ mod tests {
             v2::LayerMetadata {
                 kind: v2::LayerKind::Normal,
                 parent_folder_id: Some(9),
+                mask_layer_id: None,
                 collapsed: false,
                 hidden: false,
                 locked: false,
@@ -823,6 +846,7 @@ mod tests {
             v2::LayerMetadata {
                 kind: v2::LayerKind::Folder,
                 parent_folder_id: None,
+                mask_layer_id: None,
                 collapsed: true,
                 hidden: false,
                 locked: false,
@@ -847,12 +871,14 @@ mod tests {
         let mut project = small_project();
         project.q0rgs[0].layers.push(Layer {
             layer_id: 8,
+            timeline_frame_count: None,
             name: "inner".into(),
             explicit_keyframes: Vec::new(),
             placements: Vec::new(),
         });
         project.q0rgs[0].layers.push(Layer {
             layer_id: 9,
+            timeline_frame_count: None,
             name: "outer".into(),
             explicit_keyframes: Vec::new(),
             placements: Vec::new(),

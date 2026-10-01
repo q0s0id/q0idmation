@@ -1,7 +1,8 @@
 use crate::error::Error;
 use crate::q1s::Q1Project;
 use crate::v2::{
-    Asset, BitmapAsset, Layer, Placement, ProjectMeta, ProjectV2, Q0rg, Target, Transform2D, Tween,
+    Asset, BitmapAsset, Layer, Placement, ProjectMeta, ProjectScene, ProjectV2, Q0rg, Target,
+    Transform2D, Tween,
 };
 
 pub fn migrate_v1_to_v2(v1: Q1Project) -> Result<ProjectV2, Error> {
@@ -18,12 +19,32 @@ pub fn migrate_v1_to_v2(v1: Q1Project) -> Result<ProjectV2, Error> {
         })
         .collect();
 
+    let scenes = v1
+        .scenes
+        .iter()
+        .enumerate()
+        .map(|(index, scene)| ProjectScene {
+            scene_id: scene.scene_id,
+            q0rg_id: scene.scene_id,
+            name: if scene.name.trim().is_empty() || scene.name.chars().any(char::is_control) {
+                format!("Scene {}", index + 1)
+            } else {
+                scene.name.trim().to_string()
+            },
+        })
+        .collect();
+
     let q0rgs = v1
         .scenes
         .into_iter()
-        .map(|s| Q0rg {
+        .enumerate()
+        .map(|(index, s)| Q0rg {
             q0rg_id: s.scene_id,
-            name: s.name,
+            name: if s.name.trim().is_empty() || s.name.chars().any(char::is_control) {
+                format!("Scene {}", index + 1)
+            } else {
+                s.name.trim().to_string()
+            },
             frame_count: s.frame_count,
             script: String::new(),
             layers: s
@@ -31,6 +52,7 @@ pub fn migrate_v1_to_v2(v1: Q1Project) -> Result<ProjectV2, Error> {
                 .into_iter()
                 .map(|l| Layer {
                     layer_id: l.layer_id,
+                    timeline_frame_count: None,
                     name: l.name,
                     explicit_keyframes: Vec::new(),
                     placements: l
@@ -75,7 +97,10 @@ pub fn migrate_v1_to_v2(v1: Q1Project) -> Result<ProjectV2, Error> {
         asset_appearances: std::collections::HashMap::new(),
         layer_metadata: std::collections::HashMap::new(),
         audio_clips: Vec::new(),
-        runtime: Default::default(),
+        runtime: crate::v2::ProjectRuntimeData {
+            scenes,
+            ..Default::default()
+        },
         q0rgs,
     };
     crate::v2::validate(&project)?;

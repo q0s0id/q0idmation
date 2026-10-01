@@ -82,6 +82,7 @@ fn sample_v2_project() -> ProjectV2 {
                 script: String::new(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "Layer 1".to_string(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![
@@ -123,6 +124,7 @@ fn sample_v2_project() -> ProjectV2 {
                 script: "// spin\n".to_string(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "Layer 1".to_string(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![Placement {
@@ -153,6 +155,7 @@ fn q0rg_chain(edge_count: usize) -> ProjectV2 {
         let layers = if index < edge_count {
             vec![Layer {
                 layer_id: 1,
+                timeline_frame_count: None,
                 name: "Layer".to_string(),
                 explicit_keyframes: Vec::new(),
                 placements: vec![Placement {
@@ -296,24 +299,28 @@ fn layer_folders_and_depth_order_survive_q1s_roundtrip() {
     project.q0rgs[0].layers = vec![
         Layer {
             layer_id: 40,
+            timeline_frame_count: None,
             name: "folder child low".to_string(),
             explicit_keyframes: Vec::new(),
             placements: Vec::new(),
         },
         Layer {
             layer_id: 7,
+            timeline_frame_count: None,
             name: "folder child high".to_string(),
             explicit_keyframes: Vec::new(),
             placements: Vec::new(),
         },
         Layer {
             layer_id: 90,
+            timeline_frame_count: None,
             name: "Folder".to_string(),
             explicit_keyframes: Vec::new(),
             placements: Vec::new(),
         },
         Layer {
             layer_id: 2,
+            timeline_frame_count: None,
             name: "Top level".to_string(),
             explicit_keyframes: Vec::new(),
             placements: Vec::new(),
@@ -385,6 +392,7 @@ fn layer_folder_cannot_hold_keyframes_or_have_noncontiguous_children() {
     let mut project = sample_v2_project();
     project.q0rgs[0].layers.push(Layer {
         layer_id: 9,
+        timeline_frame_count: None,
         name: "Folder".to_string(),
         explicit_keyframes: Vec::new(),
         placements: Vec::new(),
@@ -413,6 +421,7 @@ fn layer_folder_cannot_hold_keyframes_or_have_noncontiguous_children() {
         1,
         Layer {
             layer_id: 8,
+            timeline_frame_count: None,
             name: "interloper".to_string(),
             explicit_keyframes: Vec::new(),
             placements: Vec::new(),
@@ -473,7 +482,7 @@ fn v2_rejects_q0rg_self_reference() {
 fn v2_detects_q0rg_cycle() {
     let mut project = sample_v2_project();
     // q0rg 2 references q0rg 1, while q0rg 1 already references 2 РІвЂ вЂ™ cycle.
-    project.q0rgs[1].layers[0].placements.push(Placement {
+    project.q0rgs[1].layers[0].push_placement(Placement {
         instance_id: 0,
         frame: 0,
         target: Target::Q0rg(1),

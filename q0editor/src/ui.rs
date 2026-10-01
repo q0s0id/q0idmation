@@ -1,0 +1,445 @@
+//! Small, font-independent controls shared by the editor's working panels.
+use egui::{pos2, vec2, Color32, Painter, Rect, Response, Sense, Shape, Stroke, Ui};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Icon {
+    Add,
+    Close,
+    Check,
+    Rename,
+    Delete,
+    Import,
+    Home,
+    Grip,
+    Search,
+    Camera,
+    Play,
+    Pause,
+    First,
+    Previous,
+    Next,
+    Last,
+    Onion,
+    Layer,
+    Folder,
+    Mask,
+    Symbol,
+    Frame,
+    Keyframe,
+    BlankKeyframe,
+    RemoveFrames,
+    RemoveColumns,
+    Tween,
+    Up,
+    Down,
+    Indent,
+    Outdent,
+    Fit,
+    Back,
+}
+
+pub(crate) fn icon_button(ui: &mut Ui, icon: Icon, label: &str) -> Response {
+    icon_button_enabled(ui, true, icon, label)
+}
+
+pub(crate) fn shortcut_button<'a>(
+    hotkeys: &crate::hotkeys::HotkeySettings,
+    command: crate::hotkeys::ShortcutCommand,
+    label: &'a str,
+) -> egui::Button<'a> {
+    let shortcut = if hotkeys.shortcuts(command).is_empty() {
+        String::new()
+    } else {
+        hotkeys.display(command)
+    };
+    egui::Button::new(label).shortcut_text(shortcut)
+}
+
+pub(crate) fn blend(a: Color32, b: Color32, amount: f32) -> Color32 {
+    let channel =
+        |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * amount).round() as u8;
+    Color32::from_rgb(
+        channel(a.r(), b.r()),
+        channel(a.g(), b.g()),
+        channel(a.b(), b.b()),
+    )
+}
+
+pub(crate) fn icon_button_enabled(ui: &mut Ui, enabled: bool, icon: Icon, label: &str) -> Response {
+    ui.add_enabled_ui(enabled, |ui| icon_control(ui, icon, label, false))
+        .inner
+}
+
+pub(crate) fn icon_toggle(ui: &mut Ui, icon: Icon, label: &str, selected: bool) -> Response {
+    icon_control(ui, icon, label, selected)
+}
+
+fn icon_control(ui: &mut Ui, icon: Icon, label: &str, selected: bool) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
+    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, selected, label));
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact_selectable(&response, selected);
+        let fill = if selected {
+            ui.visuals().selection.bg_fill
+        } else {
+            visuals.weak_bg_fill
+        };
+        ui.painter()
+            .rect(rect.shrink(0.5), 4.0, fill, visuals.bg_stroke);
+        let color = if selected {
+            ui.visuals().selection.stroke.color
+        } else {
+            visuals.fg_stroke.color
+        };
+        paint_icon(
+            ui.painter(),
+            Rect::from_center_size(rect.center(), vec2(16.0, 16.0)),
+            icon,
+            color,
+        );
+        if response.has_focus() {
+            ui.painter()
+                .rect_stroke(rect.shrink(0.5), 4.0, ui.visuals().selection.stroke);
+        }
+    }
+    response
+        .on_hover_text(label)
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+pub(crate) fn search_field(ui: &mut Ui, text: &mut String, hint: &str) -> Response {
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(vec2(16.0, 24.0), Sense::hover());
+        paint_icon(
+            ui.painter(),
+            rect.shrink2(vec2(0.0, 4.0)),
+            Icon::Search,
+            ui.visuals().weak_text_color(),
+        );
+        let has_text = !text.is_empty();
+        let width = (ui.available_width() - if has_text { 30.0 } else { 0.0 }).max(40.0);
+        let mut response = ui.add(
+            egui::TextEdit::singleline(text)
+                .hint_text(hint)
+                .desired_width(width),
+        );
+        if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+            text.clear();
+            response.mark_changed();
+            response.surrender_focus();
+        }
+        if has_text && icon_button(ui, Icon::Close, "clear search").clicked() {
+            text.clear();
+            response.mark_changed();
+            response.request_focus();
+        }
+        response
+    })
+    .inner
+}
+
+pub(crate) fn name_button(ui: &mut Ui, text: &str, selected: bool, width: f32) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(width.max(1.0), 26.0), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, selected, text)
+    });
+    if ui.is_rect_visible(rect) {
+        if selected || response.hovered() || response.has_focus() {
+            let fill = if selected {
+                blend(
+                    ui.visuals().panel_fill,
+                    ui.visuals().selection.bg_fill,
+                    0.22,
+                )
+            } else {
+                ui.style().interact(&response).weak_bg_fill
+            };
+            ui.painter().rect_filled(rect, 4.0, fill);
+        }
+        if selected {
+            ui.painter().rect_filled(
+                Rect::from_min_max(rect.left_bottom() - vec2(0.0, 2.0), rect.right_bottom()),
+                1.0,
+                ui.visuals().selection.bg_fill,
+            );
+        }
+        clipped_label(
+            ui.painter(),
+            rect.shrink2(vec2(6.0, 1.0)),
+            text,
+            egui::FontId::proportional(13.0),
+            ui.visuals().text_color(),
+        );
+    }
+    response
+        .on_hover_text(text)
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A shared frame/symbol card; the caller renders artwork into the returned viewport.
+pub(crate) fn preview_card(
+    ui: &mut Ui,
+    label: &str,
+    selected: bool,
+    size: f32,
+) -> (Response, Rect) {
+    let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, selected, label)
+    });
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact_selectable(&response, selected);
+        let fill = if selected {
+            ui.visuals().selection.bg_fill
+        } else {
+            visuals.weak_bg_fill
+        };
+        let stroke = if selected {
+            ui.visuals().selection.stroke
+        } else {
+            visuals.bg_stroke
+        };
+        let color = if selected {
+            ui.visuals().selection.stroke.color
+        } else {
+            visuals.text_color()
+        };
+        let painter = ui.painter_at(rect);
+        painter.rect(rect.shrink(0.5), 4.0, fill, stroke);
+        clipped_label(
+            &painter,
+            Rect::from_min_max(
+                rect.min + vec2(5.0, 2.0),
+                pos2(rect.right() - 5.0, rect.top() + 18.0),
+            ),
+            label,
+            egui::FontId::proportional(11.0),
+            color,
+        );
+    }
+    let preview = Rect::from_min_max(rect.min + vec2(3.0, 19.0), rect.max - vec2(3.0, 3.0));
+    (
+        response
+            .on_hover_text(label)
+            .on_hover_cursor(egui::CursorIcon::PointingHand),
+        preview,
+    )
+}
+
+/// Pixel-based ellipsis: long names use all available room without covering controls.
+pub(crate) fn clipped_label(
+    painter: &Painter,
+    rect: Rect,
+    text: &str,
+    font: egui::FontId,
+    color: Color32,
+) {
+    if rect.width() <= 2.0 {
+        return;
+    }
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
+    job.wrap.max_width = rect.width();
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    let galley = painter.layout_job(job);
+    painter.with_clip_rect(rect).galley(
+        pos2(rect.left(), rect.center().y - galley.size().y * 0.5),
+        galley,
+        color,
+    );
+}
+
+pub(crate) fn paint_icon(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
+    let p = |x: f32, y: f32| {
+        pos2(
+            rect.left() + x * rect.width(),
+            rect.top() + y * rect.height(),
+        )
+    };
+    let r = |x0, y0, x1, y1| Rect::from_min_max(p(x0, y0), p(x1, y1));
+    let stroke = Stroke::new(1.45_f32, color);
+    let line = |a: (f32, f32), b: (f32, f32)| {
+        painter.line_segment([p(a.0, a.1), p(b.0, b.1)], stroke);
+    };
+    let path = |points: &[(f32, f32)]| {
+        painter.add(Shape::line(
+            points.iter().map(|(x, y)| p(*x, *y)).collect(),
+            stroke,
+        ));
+    };
+    let polygon = |points: &[(f32, f32)]| {
+        painter.add(Shape::convex_polygon(
+            points.iter().map(|(x, y)| p(*x, *y)).collect(),
+            color,
+            Stroke::NONE,
+        ));
+    };
+    let plus = || {
+        line((0.72, 0.60), (0.72, 0.96));
+        line((0.54, 0.78), (0.90, 0.78));
+    };
+    match icon {
+        Icon::Add => {
+            line((0.5, 0.15), (0.5, 0.85));
+            line((0.15, 0.5), (0.85, 0.5));
+        }
+        Icon::Close => {
+            line((0.22, 0.22), (0.78, 0.78));
+            line((0.78, 0.22), (0.22, 0.78));
+        }
+        Icon::Check => path(&[(0.13, 0.50), (0.39, 0.76), (0.88, 0.23)]),
+        Icon::Rename => {
+            path(&[
+                (0.13, 0.68),
+                (0.66, 0.15),
+                (0.85, 0.34),
+                (0.32, 0.87),
+                (0.10, 0.90),
+                (0.13, 0.68),
+            ]);
+            line((0.55, 0.26), (0.74, 0.45));
+        }
+        Icon::Delete => {
+            line((0.14, 0.25), (0.86, 0.25));
+            path(&[(0.27, 0.27), (0.31, 0.88), (0.69, 0.88), (0.73, 0.27)]);
+            path(&[(0.36, 0.24), (0.36, 0.10), (0.64, 0.10), (0.64, 0.24)]);
+            line((0.43, 0.40), (0.43, 0.73));
+            line((0.57, 0.40), (0.57, 0.73));
+        }
+        Icon::Import => {
+            path(&[(0.16, 0.60), (0.16, 0.87), (0.84, 0.87), (0.84, 0.60)]);
+            line((0.5, 0.10), (0.5, 0.65));
+            path(&[(0.29, 0.43), (0.5, 0.65), (0.71, 0.43)]);
+        }
+        Icon::Home => {
+            path(&[(0.10, 0.43), (0.50, 0.12), (0.90, 0.43)]);
+            path(&[(0.23, 0.38), (0.23, 0.86), (0.77, 0.86), (0.77, 0.38)]);
+            path(&[(0.42, 0.85), (0.42, 0.58), (0.59, 0.58), (0.59, 0.85)]);
+        }
+        Icon::Grip => {
+            for x in [0.35, 0.65] {
+                for y in [0.24, 0.5, 0.76] {
+                    painter.circle_filled(p(x, y), 1.2, color);
+                }
+            }
+        }
+        Icon::Search => {
+            painter.circle_stroke(p(0.40, 0.40), rect.width() * 0.27, stroke);
+            line((0.60, 0.60), (0.88, 0.88));
+        }
+        Icon::Camera => {
+            painter.rect_stroke(r(0.06, 0.24, 0.65, 0.76), 1.5, stroke);
+            polygon(&[(0.68, 0.36), (0.95, 0.22), (0.95, 0.78), (0.68, 0.64)]);
+        }
+        Icon::Play => polygon(&[(0.26, 0.13), (0.85, 0.5), (0.26, 0.87)]),
+        Icon::Pause => {
+            painter.rect_filled(r(0.24, 0.16, 0.40, 0.84), 1.0, color);
+            painter.rect_filled(r(0.60, 0.16, 0.76, 0.84), 1.0, color);
+        }
+        Icon::Previous | Icon::Back => path(&[(0.68, 0.18), (0.30, 0.50), (0.68, 0.82)]),
+        Icon::Next => path(&[(0.32, 0.18), (0.70, 0.50), (0.32, 0.82)]),
+        Icon::First => {
+            line((0.20, 0.16), (0.20, 0.84));
+            path(&[(0.76, 0.19), (0.38, 0.50), (0.76, 0.81)]);
+        }
+        Icon::Last => {
+            line((0.80, 0.16), (0.80, 0.84));
+            path(&[(0.24, 0.19), (0.62, 0.50), (0.24, 0.81)]);
+        }
+        Icon::Onion => {
+            painter.circle_stroke(
+                p(0.35, 0.5),
+                rect.width() * 0.26,
+                Stroke::new(1.1_f32, color.gamma_multiply(0.5)),
+            );
+            painter.circle_stroke(p(0.64, 0.5), rect.width() * 0.26, stroke);
+        }
+        Icon::Layer => {
+            path(&[
+                (0.14, 0.25),
+                (0.50, 0.10),
+                (0.86, 0.25),
+                (0.50, 0.42),
+                (0.14, 0.25),
+            ]);
+            path(&[(0.14, 0.42), (0.50, 0.59), (0.78, 0.47)]);
+            plus();
+        }
+        Icon::Folder => {
+            path(&[
+                (0.08, 0.75),
+                (0.08, 0.20),
+                (0.36, 0.20),
+                (0.47, 0.35),
+                (0.89, 0.35),
+                (0.89, 0.55),
+            ]);
+            line((0.08, 0.75), (0.41, 0.75));
+            plus();
+        }
+        Icon::Mask => {
+            painter.circle_stroke(p(0.35, 0.39), rect.width() * 0.26, stroke);
+            painter.rect_stroke(r(0.32, 0.25, 0.77, 0.70), 1.0, stroke);
+            plus();
+        }
+        Icon::Symbol => {
+            path(&[
+                (0.44, 0.09),
+                (0.79, 0.39),
+                (0.44, 0.69),
+                (0.09, 0.39),
+                (0.44, 0.09),
+            ]);
+            plus();
+        }
+        Icon::Frame | Icon::Keyframe | Icon::BlankKeyframe => {
+            painter.rect_stroke(r(0.12, 0.16, 0.77, 0.64), 1.0, stroke);
+            if icon == Icon::Keyframe {
+                painter.circle_filled(p(0.36, 0.40), 2.0, color);
+            } else if icon == Icon::BlankKeyframe {
+                painter.circle_stroke(p(0.36, 0.40), 2.0, stroke);
+            } else {
+                line((0.30, 0.46), (0.56, 0.46));
+            }
+            plus();
+        }
+        Icon::RemoveFrames | Icon::RemoveColumns => {
+            painter.rect_stroke(r(0.12, 0.15, 0.88, 0.65), 1.0, stroke);
+            if icon == Icon::RemoveColumns {
+                line((0.38, 0.15), (0.38, 0.65));
+                line((0.63, 0.15), (0.63, 0.65));
+            }
+            line((0.30, 0.86), (0.72, 0.86));
+        }
+        Icon::Tween => {
+            painter.circle_filled(p(0.13, 0.50), 1.9, color);
+            painter.circle_stroke(p(0.88, 0.50), 1.9, stroke);
+            line((0.28, 0.50), (0.70, 0.50));
+            path(&[(0.53, 0.30), (0.73, 0.50), (0.53, 0.70)]);
+        }
+        Icon::Up => {
+            line((0.50, 0.85), (0.50, 0.15));
+            path(&[(0.25, 0.40), (0.50, 0.15), (0.75, 0.40)]);
+        }
+        Icon::Down => {
+            line((0.50, 0.15), (0.50, 0.85));
+            path(&[(0.25, 0.60), (0.50, 0.85), (0.75, 0.60)]);
+        }
+        Icon::Indent => {
+            line((0.10, 0.16), (0.10, 0.84));
+            line((0.24, 0.50), (0.87, 0.50));
+            path(&[(0.63, 0.26), (0.87, 0.50), (0.63, 0.74)]);
+        }
+        Icon::Outdent => {
+            line((0.90, 0.16), (0.90, 0.84));
+            line((0.13, 0.50), (0.76, 0.50));
+            path(&[(0.37, 0.26), (0.13, 0.50), (0.37, 0.74)]);
+        }
+        Icon::Fit => {
+            path(&[(0.12, 0.36), (0.12, 0.12), (0.36, 0.12)]);
+            path(&[(0.64, 0.12), (0.88, 0.12), (0.88, 0.36)]);
+            path(&[(0.88, 0.64), (0.88, 0.88), (0.64, 0.88)]);
+            path(&[(0.36, 0.88), (0.12, 0.88), (0.12, 0.64)]);
+        }
+    }
+}

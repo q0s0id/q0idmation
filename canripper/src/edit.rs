@@ -409,6 +409,7 @@ mod tests {
                 script: "old q0rg".into(),
                 layers: vec![v2::Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "Layer".into(),
                     explicit_keyframes: vec![0],
                     placements: vec![v2::Placement {

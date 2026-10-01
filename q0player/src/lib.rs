@@ -1578,6 +1578,7 @@ mod tests {
                 script: script.to_string(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "layer 1".to_string(),
                     explicit_keyframes: Vec::new(),
                     placements: Vec::new(),
@@ -1728,6 +1729,7 @@ mod tests {
                     script: String::new(),
                     layers: vec![Layer {
                         layer_id: 1,
+                        timeline_frame_count: None,
                         name: "player".into(),
                         explicit_keyframes: vec![0],
                         placements: vec![Placement {
@@ -1751,6 +1753,7 @@ mod tests {
                     script: String::new(),
                     layers: vec![Layer {
                         layer_id: 2,
+                        timeline_frame_count: None,
                         name: "body".into(),
                         explicit_keyframes: vec![0],
                         placements: vec![Placement {
@@ -1890,6 +1893,7 @@ pb func update current_vy {
                 script: String::new(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "audio".to_string(),
                     explicit_keyframes: Vec::new(),
                     placements: Vec::new(),
@@ -2121,6 +2125,7 @@ pb func update current_vy {
                 script: script.into(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "art".into(),
                     explicit_keyframes: vec![0],
                     placements: vec![VPlacement {
@@ -2245,6 +2250,7 @@ pb func update current_vy {
 
         let scene_layer = || Layer {
             layer_id: 1,
+            timeline_frame_count: None,
             name: "logic".into(),
             explicit_keyframes: vec![0],
             placements: Vec::new(),
@@ -2965,6 +2971,7 @@ pb func update current_vy {
                 script: script.into(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "art".into(),
                     explicit_keyframes: vec![0],
                     placements: vec![VPlacement {
@@ -3162,6 +3169,7 @@ pb func update current_vy {
                 script: script.into(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "art".into(),
                     explicit_keyframes: vec![0],
                     placements: vec![VPlacement {

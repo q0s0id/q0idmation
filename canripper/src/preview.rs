@@ -750,6 +750,7 @@ mod tests {
             script: String::new(),
             layers: vec![Layer {
                 layer_id: 1,
+                timeline_frame_count: None,
                 name: "child".to_string(),
                 explicit_keyframes: vec![0],
                 placements: vec![Placement {
@@ -769,6 +770,7 @@ mod tests {
             script: String::new(),
             layers: vec![Layer {
                 layer_id: 2,
+                timeline_frame_count: None,
                 name: "parent".to_string(),
                 explicit_keyframes: vec![0],
                 placements: vec![Placement {

@@ -26,6 +26,7 @@
 //!           v8 eased: [1] easing kind + payload
 //!         v14+: placement FX: [1] sparse flags + optional alpha/blend/blur/glow/shadow payloads
 //!       v4+: [2] explicit_keyframe_count, explicit_keyframes[]: [2] frame
+//!       v32+: [2] layer_frame_count after every layer's keyframe list
 //!   v6 layer metadata: [2] entry_count, then entries:
 //!     [2] q0rg_id, [2] layer_id, [1] kind, [1] parent flag, [2 if present] parent id, [1] collapsed
 //!     v12 appends [1] hidden, [1] locked to every metadata entry
@@ -49,6 +50,7 @@
 //! v27 stores independent horizontal/vertical blur and glow radii. Older
 //! revisions decode isotropic placement effects into matching X/Y radii.
 //! v28 adds manually keyframed q0rg playback.
+//! v29 stores the ordered Animate-style scene list and each scene's root q0rg.
 //! Writing always uses `Q1S_VERSION_CURRENT`.
 
 use crate::transform::Affine;
@@ -102,7 +104,14 @@ pub const Q1S_VERSION_ANISOTROPIC_FX: u16 = 27;
 /// manually selected nested-q0rg frames can be authored independently over
 /// the parent animation timeline.
 pub const Q1S_VERSION_MANUAL_Q0RG_PLAYBACK: u16 = 28;
-pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_MANUAL_Q0RG_PLAYBACK;
+/// Named document scenes and their timeline roots.
+pub const Q1S_VERSION_SCENES: u16 = 29;
+pub const Q1S_VERSION_LIBRARY_FOLDERS: u16 = 30;
+/// Timeline mask layers and their masked-layer references.
+pub const Q1S_VERSION_TIMELINE_MASKS: u16 = 31;
+/// Independent timeline lengths for layers, including empty hold-frame spans.
+pub const Q1S_VERSION_LAYER_FRAME_COUNTS: u16 = 32;
+pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_LAYER_FRAME_COUNTS;
 /// Kept as an alias so external code that imported the v2-era constant keeps
 /// compiling. It now means "the current write-out version".
 pub const Q1S_V2_VERSION: u16 = Q1S_VERSION_CURRENT;
@@ -130,6 +139,7 @@ const EASING_KIND_PRESET: u8 = 1;
 const EASING_KIND_CUBIC_BEZIER: u8 = 2;
 const LAYER_KIND_NORMAL: u8 = 0;
 const LAYER_KIND_FOLDER: u8 = 1;
+const LAYER_KIND_MASK: u8 = 2;
 const VECTOR_MATERIAL_SOLID: u8 = 0;
 const VECTOR_MATERIAL_SOFT_HALO: u8 = 1;
 const PLACEMENT_FX_OPACITY: u8 = 1 << 0;
@@ -1245,6 +1255,10 @@ pub struct Placement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Layer {
     pub layer_id: u16,
+    /// `None` inherits the owning q0rg's shared duration. `Some(n)` stores a
+    /// layer-local duration, so trailing held or empty cells can be removed
+    /// without changing other layers or manufacturing a blank keyframe.
+    pub timeline_frame_count: Option<u16>,
     pub name: String,
     /// Explicit keyframe markers. Placement frames are keyframes implicitly;
     /// this list is what lets a layer contain a real keyframe with no content.
@@ -1279,10 +1293,26 @@ impl Layer {
     }
 
     pub fn ensure_explicit_keyframe(&mut self, frame: u16) {
+        self.extend_timeline_through(frame);
         if !self.explicit_keyframes.contains(&frame) {
             self.explicit_keyframes.push(frame);
             self.explicit_keyframes.sort_unstable();
         }
+    }
+
+    pub fn extend_timeline_through(&mut self, frame: u16) {
+        let needed = frame.saturating_add(1);
+        if let Some(frame_count) = &mut self.timeline_frame_count {
+            *frame_count = (*frame_count).max(needed);
+        }
+    }
+
+    pub fn push_placement(&mut self, placement: Placement) {
+        self.extend_timeline_through(placement.frame);
+        if let Some(to_frame) = placement.tween.to_frame() {
+            self.extend_timeline_through(to_frame);
+        }
+        self.placements.push(placement);
     }
 
     pub fn remove_keyframe(&mut self, frame: u16) -> usize {
@@ -1311,12 +1341,17 @@ pub enum LayerKind {
     #[default]
     Normal,
     Folder,
+    Mask,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LayerMetadata {
     pub kind: LayerKind,
     pub parent_folder_id: Option<u16>,
+    /// Mask layer whose alpha clips this layer. The mask layer itself is a
+    /// regular keyed layer with `kind == Mask`; masked children retain their
+    /// own independent keyframes and placements.
+    pub mask_layer_id: Option<u16>,
     pub collapsed: bool,
     /// Hidden layers are omitted from editor rendering and exported playback.
     /// Missing legacy metadata defaults to visible (`false`).
@@ -1440,6 +1475,15 @@ pub struct CameraTrack {
     pub keys: Vec<CameraKey>,
 }
 
+/// A top-level Animate-style scene. Each scene owns one root q0rg timeline;
+/// nested q0rgs remain reusable symbols and are not listed here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectScene {
+    pub scene_id: u16,
+    pub q0rg_id: u16,
+    pub name: String,
+}
+
 impl CameraTrack {
     pub fn has_keyframe(&self, frame: u16) -> bool {
         self.keys.iter().any(|key| key.frame == frame)
@@ -1457,6 +1501,31 @@ pub struct ProjectRuntimeData {
     /// camera animation can never mutate object coordinates or become selectable
     /// artwork.
     pub camera: CameraTrack,
+    /// Ordered top-level scenes. Empty means a legacy single-scene project,
+    /// whose scene is inferred from `meta.entry_q0rg_id`.
+    pub scenes: Vec<ProjectScene>,
+    /// Nested library folder paths, stored as slash-separated paths.
+    pub library_folders: Vec<String>,
+    /// Library item placement within a folder. Missing entries belong to root.
+    pub library_item_folders: HashMap<LibraryItemReference, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum LibraryItemReference {
+    Q0rg(u16),
+    Asset(u16),
+}
+
+fn valid_library_folder_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains('\\')
+        && path.split('/').all(|part| {
+            !part.is_empty()
+                && part.trim() == part
+                && part != "."
+                && part != ".."
+                && !part.chars().any(char::is_control)
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1530,6 +1599,31 @@ pub struct ProjectV2 {
 }
 
 impl ProjectV2 {
+    /// Return the explicit ordered scene list, or infer the implicit scene used
+    /// by project revisions that predate the scene table.
+    pub fn scenes(&self) -> Vec<ProjectScene> {
+        if !self.runtime.scenes.is_empty() {
+            return self.runtime.scenes.clone();
+        }
+        self.q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == self.meta.entry_q0rg_id)
+            .map(|q0rg| {
+                let scene_name =
+                    if q0rg.name.trim().is_empty() || q0rg.name.chars().any(char::is_control) {
+                        "Stage".to_string()
+                    } else {
+                        q0rg.name.clone()
+                    };
+                vec![ProjectScene {
+                    scene_id: q0rg.q0rg_id,
+                    q0rg_id: q0rg.q0rg_id,
+                    name: scene_name,
+                }]
+            })
+            .unwrap_or_default()
+    }
+
     pub fn default_camera_state(&self) -> CameraState {
         CameraState::identity_for_stage(self.meta.stage_width, self.meta.stage_height)
     }
@@ -1635,8 +1729,13 @@ pub(crate) fn canonicalized_for_wire(project: &ProjectV2) -> ProjectV2 {
         .frame_scripts
         .sort_by_key(|script| (script.q0rg_id, script.frame, script.layer_id));
     canonical.q0rgs.sort_by_key(|q0rg| q0rg.q0rg_id);
+    canonical.runtime.scenes = canonical.scenes();
+    canonical.runtime.library_folders.sort();
     for q0rg in &mut canonical.q0rgs {
         for layer in &mut q0rg.layers {
+            if layer.timeline_frame_count == Some(q0rg.frame_count) {
+                layer.timeline_frame_count = None;
+            }
             layer.placements.sort_by_key(|placement| placement.frame);
             layer.explicit_keyframes.sort_unstable();
         }
@@ -1757,6 +1856,10 @@ pub fn wire_equivalent(left: &ProjectV2, right: &ProjectV2) -> bool {
             right_runtime
                 .frame_scripts
                 .sort_by_key(|script| (script.q0rg_id, script.frame, script.layer_id));
+            left_runtime.scenes = left.scenes();
+            right_runtime.scenes = right.scenes();
+            left_runtime.library_folders.sort();
+            right_runtime.library_folders.sort();
             left_runtime != right_runtime
         }
         || left.assets.len() != right.assets.len()
@@ -1789,6 +1892,12 @@ pub fn wire_equivalent(left: &ProjectV2, right: &ProjectV2) -> bool {
 
         for (left_layer, right_layer) in left_q0rg.layers.iter().zip(&right_q0rg.layers) {
             if left_layer.layer_id != right_layer.layer_id
+                || left_layer
+                    .timeline_frame_count
+                    .unwrap_or(left_q0rg.frame_count)
+                    != right_layer
+                        .timeline_frame_count
+                        .unwrap_or(right_q0rg.frame_count)
                 || left_layer.name != right_layer.name
                 || left_layer.placements.len() != right_layer.placements.len()
                 || left_layer.explicit_keyframes.len() != right_layer.explicit_keyframes.len()
@@ -1826,6 +1935,38 @@ impl ProjectV2 {
 
     pub fn layer_is_folder(&self, q0rg_id: u16, layer_id: u16) -> bool {
         self.layer_metadata(q0rg_id, layer_id).kind == LayerKind::Folder
+    }
+
+    pub fn layer_is_group(&self, q0rg_id: u16, layer_id: u16) -> bool {
+        matches!(
+            self.layer_metadata(q0rg_id, layer_id).kind,
+            LayerKind::Folder | LayerKind::Mask
+        )
+    }
+
+    pub fn layer_mask_source(&self, q0rg_id: u16, layer_id: u16) -> Option<u16> {
+        self.layer_mask_sources(q0rg_id, layer_id).first().copied()
+    }
+
+    pub fn layer_mask_sources(&self, q0rg_id: u16, layer_id: u16) -> Vec<u16> {
+        let mut pending = vec![layer_id];
+        let mut visited = HashSet::new();
+        let mut sources = Vec::new();
+        let mut seen_sources = HashSet::new();
+        while let Some(id) = pending.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            let metadata = self.layer_metadata(q0rg_id, id);
+            if let Some(mask_layer_id) = metadata.mask_layer_id {
+                if seen_sources.insert(mask_layer_id) {
+                    sources.push(mask_layer_id);
+                    pending.push(mask_layer_id);
+                }
+            }
+            pending.extend(metadata.parent_folder_id);
+        }
+        sources
     }
 
     pub fn layer_parent_folder(&self, q0rg_id: u16, layer_id: u16) -> Option<u16> {
@@ -1870,37 +2011,42 @@ impl ProjectV2 {
     }
 
     /// Whether artwork on this layer should be rendered. Hidden state inherits
-    /// through every containing folder without overwriting descendant flags.
+    /// through containing folders and the source layer of a mask.
     pub fn layer_is_visible(&self, q0rg_id: u16, layer_id: u16) -> bool {
-        let mut current = Some(layer_id);
+        let mut pending = vec![layer_id];
         let mut visited = HashSet::new();
-        while let Some(id) = current {
-            if !visited.insert(id) || visited.len() > MAX_LAYER_FOLDER_NESTING_DEPTH + 1 {
+        while let Some(id) = pending.pop() {
+            if !visited.insert(id)
+                || visited.len() > MAX_LAYER_FOLDER_NESTING_DEPTH as usize * 2 + 2
+            {
                 return false;
             }
             let metadata = self.layer_metadata(q0rg_id, id);
             if metadata.hidden {
                 return false;
             }
-            current = metadata.parent_folder_id;
+            pending.extend(metadata.parent_folder_id);
+            pending.extend(metadata.mask_layer_id);
         }
         true
     }
 
     /// Whether artwork on this layer is protected from editing. Lock state
-    /// inherits through every containing folder while preserving local flags.
+    /// inherits through containing folders while preserving local flags.
     pub fn layer_is_locked(&self, q0rg_id: u16, layer_id: u16) -> bool {
-        let mut current = Some(layer_id);
+        let mut pending = vec![layer_id];
         let mut visited = HashSet::new();
-        while let Some(id) = current {
-            if !visited.insert(id) || visited.len() > MAX_LAYER_FOLDER_NESTING_DEPTH + 1 {
+        while let Some(id) = pending.pop() {
+            if !visited.insert(id)
+                || visited.len() > MAX_LAYER_FOLDER_NESTING_DEPTH as usize * 2 + 2
+            {
                 return true;
             }
             let metadata = self.layer_metadata(q0rg_id, id);
             if metadata.locked {
                 return true;
             }
-            current = metadata.parent_folder_id;
+            pending.extend(metadata.parent_folder_id);
         }
         false
     }
@@ -2786,6 +2932,17 @@ fn validate_project_runtime(project: &ProjectV2) -> Result<(), Error> {
         {
             return Err(Error::Validation("frame script references a missing layer"));
         }
+        let layer_frame_count = q0rg
+            .layers
+            .iter()
+            .find(|layer| layer.layer_id == script.layer_id)
+            .map(|layer| layer.timeline_frame_count.unwrap_or(q0rg.frame_count))
+            .unwrap_or(q0rg.frame_count);
+        if script.frame >= layer_frame_count {
+            return Err(Error::Validation(
+                "frame script is outside the layer timeline",
+            ));
+        }
         if project.layer_is_folder(script.q0rg_id, script.layer_id) {
             return Err(Error::Validation(
                 "frame script cannot live on a folder row",
@@ -2828,6 +2985,86 @@ fn validate_project_runtime(project: &ProjectV2) -> Result<(), Error> {
         if !names_by_q0rg.insert((key.q0rg_id, name.clone())) {
             return Err(Error::Validation(
                 "runtime instance names must be unique within a q0rg",
+            ));
+        }
+    }
+
+    if !project.runtime.scenes.is_empty() {
+        let mut scene_ids = HashSet::new();
+        let mut scene_q0rg_ids = HashSet::new();
+        for scene in &project.runtime.scenes {
+            if !scene_ids.insert(scene.scene_id) {
+                return Err(Error::Validation("scene ids must be unique"));
+            }
+            if !scene_q0rg_ids.insert(scene.q0rg_id) {
+                return Err(Error::Validation("a q0rg can belong to only one scene"));
+            }
+            if scene.name.trim().is_empty()
+                || scene.name.trim() != scene.name
+                || scene.name.chars().any(char::is_control)
+            {
+                return Err(Error::Validation(
+                    "scene name must be non-empty, trimmed, and contain no control characters",
+                ));
+            }
+            if scene.name.len() > usize::from(u16::MAX) {
+                return Err(Error::Overflow("scene name exceeds u16 string length"));
+            }
+            if !project
+                .q0rgs
+                .iter()
+                .any(|q0rg| q0rg.q0rg_id == scene.q0rg_id)
+            {
+                return Err(Error::Validation("scene references a missing q0rg"));
+            }
+        }
+        if !scene_q0rg_ids.contains(&project.meta.entry_q0rg_id) {
+            return Err(Error::Validation(
+                "entry q0rg must belong to a project scene",
+            ));
+        }
+    }
+
+    let mut library_folders = HashSet::with_capacity(project.runtime.library_folders.len());
+    for path in &project.runtime.library_folders {
+        if !valid_library_folder_path(path) {
+            return Err(Error::Validation(
+                "library folder path must contain trimmed, non-empty segments",
+            ));
+        }
+        if path.len() > usize::from(u16::MAX) {
+            return Err(Error::Overflow(
+                "library folder path exceeds u16 string length",
+            ));
+        }
+        if !library_folders.insert(path.as_str()) {
+            return Err(Error::Validation("library folder paths must be unique"));
+        }
+    }
+    for path in &project.runtime.library_folders {
+        let mut parent = path.as_str();
+        while let Some((ancestor, _)) = parent.rsplit_once('/') {
+            if !library_folders.contains(ancestor) {
+                return Err(Error::Validation(
+                    "nested library folders must include their parent folders",
+                ));
+            }
+            parent = ancestor;
+        }
+    }
+    for (item, path) in &project.runtime.library_item_folders {
+        if !library_folders.contains(path.as_str()) {
+            return Err(Error::Validation(
+                "library item references a missing library folder",
+            ));
+        }
+        let exists = match item {
+            LibraryItemReference::Q0rg(id) => project.q0rgs.iter().any(|q0rg| q0rg.q0rg_id == *id),
+            LibraryItemReference::Asset(id) => project.assets.iter().any(|asset| asset.id() == *id),
+        };
+        if !exists {
+            return Err(Error::Validation(
+                "library folder references a missing library item",
             ));
         }
     }
@@ -3145,11 +3382,17 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
             if !layer_ids.insert(layer.layer_id) {
                 return Err(Error::Validation("layer_id must be unique within q0rg"));
             }
+            let layer_frame_count = layer.timeline_frame_count.unwrap_or(q0rg.frame_count);
+            if layer_frame_count > q0rg.frame_count {
+                return Err(Error::Validation(
+                    "layer timeline frame_count exceeds q0rg frame_count",
+                ));
+            }
             let mut explicit_keyframes = HashSet::new();
             for &frame in &layer.explicit_keyframes {
-                if frame >= q0rg.frame_count {
+                if frame >= q0rg.frame_count || frame >= layer_frame_count {
                     return Err(Error::Validation(
-                        "explicit keyframe is out of q0rg frame_count bounds",
+                        "explicit keyframe is out of layer frame_count bounds",
                     ));
                 }
                 if !explicit_keyframes.insert(frame) {
@@ -3176,9 +3419,9 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
                         ));
                     }
                 }
-                if p.frame >= q0rg.frame_count {
+                if p.frame >= q0rg.frame_count || p.frame >= layer_frame_count {
                     return Err(Error::Validation(
-                        "placement frame is out of q0rg frame_count bounds",
+                        "placement frame is out of layer frame_count bounds",
                     ));
                 }
                 if !p.transform.tx.is_finite() || !p.transform.ty.is_finite() {
@@ -3306,9 +3549,9 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
                     if to_frame <= p.frame {
                         return Err(Error::Validation("tween to_frame must be > frame"));
                     }
-                    if to_frame >= q0rg.frame_count {
+                    if to_frame >= q0rg.frame_count || to_frame >= layer_frame_count {
                         return Err(Error::Validation(
-                            "tween to_frame is out of q0rg frame_count bounds",
+                            "tween to_frame is out of layer frame_count bounds",
                         ));
                     }
                     if !p.tween.easing().is_valid() {
@@ -3424,11 +3667,21 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
                     return Err(Error::Validation("ordinary layer cannot be collapsed"));
                 }
             }
+            LayerKind::Mask => {}
         }
         if let Some(parent_id) = metadata.parent_folder_id {
             let parent = project.layer_metadata(key.q0rg_id, parent_id);
             if parent.kind != LayerKind::Folder {
                 return Err(Error::Validation("layer parent must reference a folder"));
+            }
+        }
+        if let Some(mask_layer_id) = metadata.mask_layer_id {
+            if mask_layer_id == key.layer_id
+                || project.layer_metadata(key.q0rg_id, mask_layer_id).kind != LayerKind::Mask
+            {
+                return Err(Error::Validation(
+                    "layer mask reference must point to a different mask layer",
+                ));
             }
         }
     }
@@ -3440,6 +3693,36 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
             .enumerate()
             .map(|(index, layer)| (layer.layer_id, index))
             .collect::<HashMap<_, _>>();
+
+        let mut dependency_state = HashMap::<u16, u8>::new();
+        for layer in &q0rg.layers {
+            if dependency_state.get(&layer.layer_id) == Some(&2) {
+                continue;
+            }
+            let mut pending = vec![(layer.layer_id, false)];
+            while let Some((layer_id, leaving)) = pending.pop() {
+                if leaving {
+                    dependency_state.insert(layer_id, 2);
+                    continue;
+                }
+                match dependency_state.get(&layer_id).copied() {
+                    Some(1) => {
+                        return Err(Error::Validation("layer mask dependencies form a cycle"));
+                    }
+                    Some(2) => continue,
+                    _ => {}
+                }
+                dependency_state.insert(layer_id, 1);
+                pending.push((layer_id, true));
+                let metadata = project.layer_metadata(q0rg.q0rg_id, layer_id);
+                if let Some(mask_layer_id) = metadata.mask_layer_id {
+                    pending.push((mask_layer_id, false));
+                }
+                if let Some(parent_folder_id) = metadata.parent_folder_id {
+                    pending.push((parent_folder_id, false));
+                }
+            }
+        }
 
         for (index, layer) in q0rg.layers.iter().enumerate() {
             let mut current_id = layer.layer_id;
@@ -3702,7 +3985,11 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
         && version != Q1S_VERSION_Q0RG_PLAYBACK
         && version != Q1S_VERSION_FILL_GRADIENTS
         && version != Q1S_VERSION_ANISOTROPIC_FX
-        && version != Q1S_VERSION_CURRENT
+        && version != Q1S_VERSION_MANUAL_Q0RG_PLAYBACK
+        && version != Q1S_VERSION_SCENES
+        && version != Q1S_VERSION_LIBRARY_FOLDERS
+        && version != Q1S_VERSION_TIMELINE_MASKS
+        && version != Q1S_VERSION_LAYER_FRAME_COUNTS
     {
         return Err(Error::UnsupportedVersion(version));
     }
@@ -3728,6 +4015,29 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
     {
         return Err(Error::Validation(
             "legacy q1s versions cannot store layer visibility or locks",
+        ));
+    }
+    if version < Q1S_VERSION_TIMELINE_MASKS
+        && project
+            .layer_metadata
+            .values()
+            .any(|metadata| metadata.kind == LayerKind::Mask || metadata.mask_layer_id.is_some())
+    {
+        return Err(Error::Validation(
+            "legacy q1s versions cannot store timeline masks",
+        ));
+    }
+    if version < Q1S_VERSION_LAYER_FRAME_COUNTS
+        && project.q0rgs.iter().any(|q0rg| {
+            q0rg.layers.iter().any(|layer| {
+                layer
+                    .timeline_frame_count
+                    .is_some_and(|frame_count| frame_count != q0rg.frame_count)
+            })
+        })
+    {
+        return Err(Error::Validation(
+            "legacy q1s versions cannot store layer timeline lengths",
         ));
     }
     if version < Q1S_VERSION_PLACEMENT_FX
@@ -3785,7 +4095,11 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
             "q1s v19 cannot store timeline audio clips",
         ));
     }
-    if version < Q1S_VERSION_PROJECT_RUNTIME && project.runtime != ProjectRuntimeData::default() {
+    let mut runtime_without_scenes = project.runtime.clone();
+    runtime_without_scenes.scenes.clear();
+    if version < Q1S_VERSION_PROJECT_RUNTIME
+        && runtime_without_scenes != ProjectRuntimeData::default()
+    {
         return Err(Error::Validation(
             "q1s v20 cannot store project runtime metadata",
         ));
@@ -3798,6 +4112,33 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
     if version < Q1S_VERSION_CAMERA_TRACK && project.runtime.camera != CameraTrack::default() {
         return Err(Error::Validation(
             "q1s v22 and earlier cannot store camera animation",
+        ));
+    }
+    if version < Q1S_VERSION_SCENES {
+        let scenes = project.scenes();
+        let explicit_scenes = !project.runtime.scenes.is_empty();
+        if scenes.len() > 1
+            || scenes.first().is_some_and(|scene| {
+                scene.q0rg_id != project.meta.entry_q0rg_id
+                    || (explicit_scenes
+                        && project
+                            .q0rgs
+                            .iter()
+                            .find(|q0rg| q0rg.q0rg_id == scene.q0rg_id)
+                            .is_none_or(|q0rg| q0rg.name != scene.name))
+            })
+        {
+            return Err(Error::Validation(
+                "legacy q1s versions cannot store multiple or separately named scenes",
+            ));
+        }
+    }
+    if version < Q1S_VERSION_LIBRARY_FOLDERS
+        && (!project.runtime.library_folders.is_empty()
+            || !project.runtime.library_item_folders.is_empty())
+    {
+        return Err(Error::Validation(
+            "legacy q1s versions cannot store library folders",
         ));
     }
     if version < Q1S_VERSION_RIGGING
@@ -4015,6 +4356,7 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
             out.push(match value.kind {
                 LayerKind::Normal => LAYER_KIND_NORMAL,
                 LayerKind::Folder => LAYER_KIND_FOLDER,
+                LayerKind::Mask => LAYER_KIND_MASK,
             });
             match value.parent_folder_id {
                 Some(parent_id) => {
@@ -4027,6 +4369,15 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
             if version >= Q1S_VERSION_LAYER_STATE {
                 out.push(u8::from(value.hidden));
                 out.push(u8::from(value.locked));
+            }
+            if version >= Q1S_VERSION_TIMELINE_MASKS {
+                match value.mask_layer_id {
+                    Some(mask_layer_id) => {
+                        out.push(1);
+                        out.extend_from_slice(&mask_layer_id.to_le_bytes());
+                    }
+                    None => out.push(0),
+                }
             }
         }
     }
@@ -4234,6 +4585,49 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
                     write_easing(&mut out, easing);
                 }
             }
+        }
+    }
+    if version >= Q1S_VERSION_SCENES {
+        let scenes = project.scenes();
+        let count =
+            u16::try_from(scenes.len()).map_err(|_| Error::Overflow("scene count exceeds u16"))?;
+        out.extend_from_slice(&count.to_le_bytes());
+        for scene in scenes {
+            out.extend_from_slice(&scene.scene_id.to_le_bytes());
+            out.extend_from_slice(&scene.q0rg_id.to_le_bytes());
+            write_string_u16(&mut out, &scene.name)?;
+        }
+    }
+    if version >= Q1S_VERSION_LIBRARY_FOLDERS {
+        let count = u16::try_from(project.runtime.library_folders.len())
+            .map_err(|_| Error::Overflow("library folder count exceeds u16"))?;
+        out.extend_from_slice(&count.to_le_bytes());
+        let mut folders = project.runtime.library_folders.iter().collect::<Vec<_>>();
+        folders.sort();
+        for path in folders {
+            write_string_u16(&mut out, path)?;
+        }
+        let count = u16::try_from(project.runtime.library_item_folders.len())
+            .map_err(|_| Error::Overflow("library item folder count exceeds u16"))?;
+        out.extend_from_slice(&count.to_le_bytes());
+        let mut items = project
+            .runtime
+            .library_item_folders
+            .iter()
+            .collect::<Vec<_>>();
+        items.sort_by_key(|(item, _)| **item);
+        for (item, path) in items {
+            match item {
+                LibraryItemReference::Q0rg(id) => {
+                    out.push(0);
+                    out.extend_from_slice(&id.to_le_bytes());
+                }
+                LibraryItemReference::Asset(id) => {
+                    out.push(1);
+                    out.extend_from_slice(&id.to_le_bytes());
+                }
+            }
+            write_string_u16(&mut out, path)?;
         }
     }
     Ok(out)
@@ -5072,6 +5466,14 @@ fn write_q0rg(out: &mut Vec<u8>, q0rg: &Q0rg, version: u16) -> Result<(), Error>
                 out.extend_from_slice(&frame.to_le_bytes());
             }
         }
+        if version >= Q1S_VERSION_LAYER_FRAME_COUNTS {
+            out.extend_from_slice(
+                &layer
+                    .timeline_frame_count
+                    .unwrap_or(q0rg.frame_count)
+                    .to_le_bytes(),
+            );
+        }
     }
     Ok(())
 }
@@ -5113,7 +5515,11 @@ pub fn parse(bytes: &[u8]) -> Result<ProjectV2, Error> {
         && version != Q1S_VERSION_Q0RG_PLAYBACK
         && version != Q1S_VERSION_FILL_GRADIENTS
         && version != Q1S_VERSION_ANISOTROPIC_FX
-        && version != Q1S_VERSION_CURRENT
+        && version != Q1S_VERSION_MANUAL_Q0RG_PLAYBACK
+        && version != Q1S_VERSION_SCENES
+        && version != Q1S_VERSION_LIBRARY_FOLDERS
+        && version != Q1S_VERSION_TIMELINE_MASKS
+        && version != Q1S_VERSION_LAYER_FRAME_COUNTS
     {
         return Err(Error::UnsupportedVersion(version));
     }
@@ -5182,6 +5588,7 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
             let kind = match c.read_u8()? {
                 LAYER_KIND_NORMAL => LayerKind::Normal,
                 LAYER_KIND_FOLDER => LayerKind::Folder,
+                LAYER_KIND_MASK if version >= Q1S_VERSION_TIMELINE_MASKS => LayerKind::Mask,
                 _ => return Err(Error::Validation("invalid layer metadata kind")),
             };
             let parent_folder_id = match c.read_u8()? {
@@ -5209,12 +5616,22 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
             } else {
                 (false, false)
             };
+            let mask_layer_id = if version >= Q1S_VERSION_TIMELINE_MASKS {
+                match c.read_u8()? {
+                    0 => None,
+                    1 => Some(c.read_u16()?),
+                    _ => return Err(Error::Validation("invalid layer mask flag")),
+                }
+            } else {
+                None
+            };
             if layer_metadata
                 .insert(
                     key,
                     LayerMetadata {
                         kind,
                         parent_folder_id,
+                        mask_layer_id,
                         collapsed,
                         hidden,
                         locked,
@@ -5457,6 +5874,42 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
                 state,
                 tween,
             });
+        }
+    }
+    if version >= Q1S_VERSION_SCENES {
+        let count = c.read_u16()?;
+        if count == 0 {
+            return Err(Error::Validation("at least one project scene is required"));
+        }
+        runtime.scenes.reserve(usize::from(count));
+        for _ in 0..count {
+            runtime.scenes.push(ProjectScene {
+                scene_id: c.read_u16()?,
+                q0rg_id: c.read_u16()?,
+                name: c.read_string_u16()?,
+            });
+        }
+    }
+    if version >= Q1S_VERSION_LIBRARY_FOLDERS {
+        let count = c.read_u16()?;
+        runtime.library_folders.reserve(usize::from(count));
+        for _ in 0..count {
+            runtime.library_folders.push(c.read_string_u16()?);
+        }
+        let count = c.read_u16()?;
+        runtime.library_item_folders.reserve(usize::from(count));
+        for _ in 0..count {
+            let kind = c.read_u8()?;
+            let id = c.read_u16()?;
+            let item = match kind {
+                0 => LibraryItemReference::Q0rg(id),
+                1 => LibraryItemReference::Asset(id),
+                _ => return Err(Error::Validation("invalid library item reference kind")),
+            };
+            let path = c.read_string_u16()?;
+            if runtime.library_item_folders.insert(item, path).is_some() {
+                return Err(Error::Validation("duplicate library item folder entry"));
+            }
         }
     }
     c.finish()?;
@@ -6115,8 +6568,15 @@ fn parse_q0rg(c: &mut Cursor, version: u16) -> Result<Q0rg, Error> {
         } else {
             Vec::new()
         };
+        let timeline_frame_count = if version >= Q1S_VERSION_LAYER_FRAME_COUNTS {
+            let layer_frame_count = c.read_u16()?;
+            (layer_frame_count != frame_count).then_some(layer_frame_count)
+        } else {
+            None
+        };
         layers.push(Layer {
             layer_id,
+            timeline_frame_count,
             name: layer_name,
             explicit_keyframes,
             placements,
@@ -6208,6 +6668,7 @@ mod compatibility_tests {
                 script: String::new(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "Layer".to_string(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![Placement {
@@ -6298,6 +6759,7 @@ mod compatibility_tests {
             script: String::new(),
             layers: vec![Layer {
                 layer_id: 1,
+                timeline_frame_count: None,
                 name: "Child layer".to_string(),
                 explicit_keyframes: vec![0],
                 placements: Vec::new(),
@@ -6422,7 +6884,7 @@ mod compatibility_tests {
         project.assets.swap(0, 1);
         project.q0rgs[0].frame_count = 4;
         let layer = &mut project.q0rgs[0].layers[0];
-        layer.placements.push(Placement {
+        layer.push_placement(Placement {
             instance_id: 0,
             frame: 3,
             target: Target::Asset(1),
@@ -6526,6 +6988,7 @@ mod compatibility_tests {
             LayerMetadata {
                 kind: LayerKind::Folder,
                 parent_folder_id: None,
+                mask_layer_id: None,
                 collapsed: true,
                 hidden: false,
                 locked: false,
@@ -6596,7 +7059,7 @@ mod compatibility_tests {
         let mut target = project.q0rgs[0].layers[0].placements[0].clone();
         target.frame = 2;
         target.tween = Tween::None;
-        project.q0rgs[0].layers[0].placements.push(target);
+        project.q0rgs[0].layers[0].push_placement(target);
 
         assert_eq!(
             write_version(&project, Q1S_VERSION_Q0V_ASSETS)
@@ -6990,6 +7453,7 @@ mod compatibility_tests {
         let mut project = legacy_project();
         project.q0rgs[0].layers.push(Layer {
             layer_id: 9,
+            timeline_frame_count: None,
             name: "Folder".to_string(),
             explicit_keyframes: Vec::new(),
             placements: Vec::new(),
@@ -7031,18 +7495,21 @@ mod compatibility_tests {
         project.q0rgs[0].layers = vec![
             Layer {
                 layer_id: 1,
+                timeline_frame_count: None,
                 name: "leaf".into(),
                 explicit_keyframes: vec![0],
                 placements: project.q0rgs[0].layers[0].placements.clone(),
             },
             Layer {
                 layer_id: 8,
+                timeline_frame_count: None,
                 name: "inner".into(),
                 explicit_keyframes: Vec::new(),
                 placements: Vec::new(),
             },
             Layer {
                 layer_id: 9,
+                timeline_frame_count: None,
                 name: "outer".into(),
                 explicit_keyframes: Vec::new(),
                 placements: Vec::new(),
@@ -7100,12 +7567,14 @@ mod compatibility_tests {
         let mut project = legacy_project();
         project.q0rgs[0].layers.push(Layer {
             layer_id: 8,
+            timeline_frame_count: None,
             name: "folder a".into(),
             explicit_keyframes: Vec::new(),
             placements: Vec::new(),
         });
         project.q0rgs[0].layers.push(Layer {
             layer_id: 9,
+            timeline_frame_count: None,
             name: "folder b".into(),
             explicit_keyframes: Vec::new(),
             placements: Vec::new(),
@@ -7136,18 +7605,21 @@ mod compatibility_tests {
             project.q0rgs[0].layers[0].clone(),
             Layer {
                 layer_id: 7,
+                timeline_frame_count: None,
                 name: "unrelated".into(),
                 explicit_keyframes: vec![0],
                 placements: Vec::new(),
             },
             Layer {
                 layer_id: 8,
+                timeline_frame_count: None,
                 name: "inner".into(),
                 explicit_keyframes: Vec::new(),
                 placements: Vec::new(),
             },
             Layer {
                 layer_id: 9,
+                timeline_frame_count: None,
                 name: "outer".into(),
                 explicit_keyframes: Vec::new(),
                 placements: Vec::new(),
@@ -7626,7 +8098,7 @@ mod compatibility_tests {
     }
 
     fn add_test_bend_deformer(project: &mut ProjectV2) {
-        project.q0rgs[0].layers[0].placements.push(Placement {
+        project.q0rgs[0].layers[0].push_placement(Placement {
             instance_id: 2,
             frame: 0,
             target: Target::Asset(1),
@@ -7888,12 +8360,13 @@ mod compatibility_tests {
             script: String::new(),
             layers: vec![Layer {
                 layer_id: 2,
+                timeline_frame_count: None,
                 name: "child".into(),
                 explicit_keyframes: vec![0],
                 placements: Vec::new(),
             }],
         });
-        project.q0rgs[1].layers[0].placements.push(Placement {
+        project.q0rgs[1].layers[0].push_placement(Placement {
             instance_id: 99,
             frame: 0,
             target: Target::Q0rg(1),

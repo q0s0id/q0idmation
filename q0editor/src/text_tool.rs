@@ -392,11 +392,8 @@ pub(crate) fn render_canvas(
     let Some(mut draft) = app.session.text_editor.take() else {
         return false;
     };
-    let scale = view.scale * draft.transform.uniform_scale().max(0.01);
-    let mut origin = egui::pos2(
-        view.origin.x + draft.origin.x * view.scale,
-        view.origin.y + draft.origin.y * view.scale,
-    );
+    let scale = view.effective_scale() * draft.transform.uniform_scale().max(0.01);
+    let mut origin = view.stage_to_screen(draft.origin);
     let family = canvas_font(ui.ctx(), &draft.font);
     let metrics = ui
         .ctx()
@@ -880,7 +877,7 @@ fn commit(app: &mut EditorApp, draft: &TextDraft) -> Result<(), String> {
             .and_then(|q| q.layers.iter_mut().find(|l| l.layer_id == layer_id))
             .ok_or("Drawing layer no longer exists")?;
         let placement_idx = layer.placements.len();
-        layer.placements.push(Placement {
+        layer.push_placement(Placement {
             instance_id: 0,
             frame,
             target: Target::Asset(asset_id),
@@ -1061,6 +1058,7 @@ mod tests {
                             origin: egui::Pos2::ZERO,
                             scale: 1.0,
                             stage_rect: rect,
+                            edit_transform: q0s_format::transform::Affine::IDENTITY,
                         };
                         if !render_canvas(app, ui, &view) {
                             handle_stage(

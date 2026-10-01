@@ -89,6 +89,85 @@ fn collect_transfer_closure(
     Ok(TransferClosure { q0rgs, assets })
 }
 
+/// Keep just the library dependency closure needed by copied placements.
+/// This lets the editor clipboard survive a project-tab switch without holding
+/// a second copy of every unrelated bitmap and video in the source project.
+pub fn snapshot_library_items(
+    source: &ProjectV2,
+    roots: &[LibraryItem],
+) -> Result<ProjectV2, String> {
+    let mut q0rg_ids = BTreeSet::new();
+    let mut asset_ids = BTreeSet::new();
+    for &root in roots {
+        let closure = collect_transfer_closure(source, root)?;
+        q0rg_ids.extend(closure.q0rgs);
+        asset_ids.extend(closure.assets);
+    }
+
+    let mut snapshot = ProjectV2 {
+        meta: source.meta.clone(),
+        assets: source
+            .assets
+            .iter()
+            .filter(|asset| asset_ids.contains(&asset.id()))
+            .cloned()
+            .collect(),
+        asset_names: source
+            .asset_names
+            .iter()
+            .filter(|(id, _)| asset_ids.contains(id))
+            .map(|(id, name)| (*id, name.clone()))
+            .collect(),
+        asset_appearances: source
+            .asset_appearances
+            .iter()
+            .filter(|(id, _)| asset_ids.contains(id))
+            .map(|(id, appearance)| (*id, appearance.clone()))
+            .collect(),
+        layer_metadata: source
+            .layer_metadata
+            .iter()
+            .filter(|(key, _)| q0rg_ids.contains(&key.q0rg_id))
+            .map(|(key, metadata)| (*key, *metadata))
+            .collect(),
+        audio_clips: source
+            .audio_clips
+            .iter()
+            .filter(|clip| q0rg_ids.contains(&clip.q0rg_id))
+            .copied()
+            .collect(),
+        runtime: Default::default(),
+        q0rgs: source
+            .q0rgs
+            .iter()
+            .filter(|q0rg| q0rg_ids.contains(&q0rg.q0rg_id))
+            .cloned()
+            .collect(),
+    };
+    snapshot.runtime.frame_scripts = source
+        .runtime
+        .frame_scripts
+        .iter()
+        .filter(|script| q0rg_ids.contains(&script.q0rg_id))
+        .cloned()
+        .collect();
+    snapshot.runtime.instance_names = source
+        .runtime
+        .instance_names
+        .iter()
+        .filter(|(key, _)| q0rg_ids.contains(&key.q0rg_id))
+        .map(|(key, name)| (*key, name.clone()))
+        .collect();
+    snapshot.runtime.frame_labels = source
+        .runtime
+        .frame_labels
+        .iter()
+        .filter(|(key, _)| q0rg_ids.contains(&key.q0rg_id))
+        .map(|(key, name)| (*key, name.clone()))
+        .collect();
+    Ok(snapshot)
+}
+
 fn allocate_ids(
     used: impl Iterator<Item = u16>,
     source_ids: &BTreeSet<u16>,
@@ -341,6 +420,7 @@ mod tests {
             script: String::new(),
             layers: vec![Layer {
                 layer_id: 7,
+                timeline_frame_count: None,
                 name: "child layer".into(),
                 explicit_keyframes: Vec::new(),
                 placements: vec![Placement {
@@ -360,6 +440,7 @@ mod tests {
             script: String::new(),
             layers: vec![Layer {
                 layer_id: 8,
+                timeline_frame_count: None,
                 name: "root layer".into(),
                 explicit_keyframes: Vec::new(),
                 placements: vec![

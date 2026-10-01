@@ -32,10 +32,12 @@ pub enum PerfSpan {
     SelectionStageMeshBuild,
     SelectionScreenMeshBuild,
     SelectionPaintSplit,
+    FlaImport,
+    HistoryTransition,
 }
 
 impl PerfSpan {
-    pub const COUNT: usize = 23;
+    pub const COUNT: usize = 25;
     pub const ALL: [Self; Self::COUNT] = [
         Self::Frame,
         Self::AppStartup,
@@ -60,6 +62,8 @@ impl PerfSpan {
         Self::SelectionStageMeshBuild,
         Self::SelectionScreenMeshBuild,
         Self::SelectionPaintSplit,
+        Self::FlaImport,
+        Self::HistoryTransition,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -87,6 +91,8 @@ impl PerfSpan {
             Self::SelectionStageMeshBuild => "selection.stage-mesh-build",
             Self::SelectionScreenMeshBuild => "selection.screen-mesh-build",
             Self::SelectionPaintSplit => "selection.paint-split",
+            Self::FlaImport => "io.fla-import",
+            Self::HistoryTransition => "history.undo-redo",
         }
     }
 }
@@ -135,6 +141,11 @@ pub struct ScenePerfContext {
     pub tool: &'static str,
     pub q0rg_visits: u64,
     pub active_placements: u64,
+    pub vector_instances_batched: u64,
+    pub vector_batches: u64,
+    pub vector_vertices: u64,
+    pub vector_indices: u64,
+    pub vector_fallbacks: u64,
     pub gpu_callbacks: u64,
     pub filtered_callbacks: u64,
     pub blur_passes: u64,
@@ -150,6 +161,24 @@ pub struct ScenePerfContext {
     pub gpu_filter_cpu_callbacks: u64,
     pub gpu_filter_cpu_total_ns: u64,
     pub gpu_filter_cpu_max_ns: u64,
+    pub gpu_filter_cpu_max_region_width: i32,
+    pub gpu_filter_cpu_max_region_height: i32,
+    pub gpu_filter_cpu_max_blur_passes: u64,
+    pub gpu_filter_cpu_max_glow_passes: u64,
+    pub gpu_filter_cpu_max_primitive_count: u64,
+    pub gpu_filter_cpu_max_vertex_count: u64,
+    pub gpu_filter_cpu_max_index_count: u64,
+    pub gpu_filter_cpu_max_target_setup_ns: u64,
+    pub gpu_filter_cpu_max_raster_ns: u64,
+    pub gpu_filter_cpu_max_raster_clear_ns: u64,
+    pub gpu_filter_cpu_max_raster_upload_ns: u64,
+    pub gpu_filter_cpu_max_raster_draw_ns: u64,
+    pub gpu_filter_cpu_max_raster_resolve_ns: u64,
+    pub gpu_filter_cpu_max_raster_other_ns: u64,
+    pub gpu_filter_cpu_max_filter_ns: u64,
+    pub gpu_filter_cpu_max_composite_ns: u64,
+    pub gpu_filter_cache_hits: u64,
+    pub gpu_filter_cache_misses: u64,
 }
 
 impl Default for ScenePerfContext {
@@ -166,6 +195,11 @@ impl Default for ScenePerfContext {
             tool: "unknown",
             q0rg_visits: 0,
             active_placements: 0,
+            vector_instances_batched: 0,
+            vector_batches: 0,
+            vector_vertices: 0,
+            vector_indices: 0,
+            vector_fallbacks: 0,
             gpu_callbacks: 0,
             filtered_callbacks: 0,
             blur_passes: 0,
@@ -181,6 +215,24 @@ impl Default for ScenePerfContext {
             gpu_filter_cpu_callbacks: 0,
             gpu_filter_cpu_total_ns: 0,
             gpu_filter_cpu_max_ns: 0,
+            gpu_filter_cpu_max_region_width: 0,
+            gpu_filter_cpu_max_region_height: 0,
+            gpu_filter_cpu_max_blur_passes: 0,
+            gpu_filter_cpu_max_glow_passes: 0,
+            gpu_filter_cpu_max_primitive_count: 0,
+            gpu_filter_cpu_max_vertex_count: 0,
+            gpu_filter_cpu_max_index_count: 0,
+            gpu_filter_cpu_max_target_setup_ns: 0,
+            gpu_filter_cpu_max_raster_ns: 0,
+            gpu_filter_cpu_max_raster_clear_ns: 0,
+            gpu_filter_cpu_max_raster_upload_ns: 0,
+            gpu_filter_cpu_max_raster_draw_ns: 0,
+            gpu_filter_cpu_max_raster_resolve_ns: 0,
+            gpu_filter_cpu_max_raster_other_ns: 0,
+            gpu_filter_cpu_max_filter_ns: 0,
+            gpu_filter_cpu_max_composite_ns: 0,
+            gpu_filter_cache_hits: 0,
+            gpu_filter_cache_misses: 0,
         }
     }
 }
@@ -215,6 +267,13 @@ struct PerfFrame {
     metrics: [PerfMetric; PerfSpan::COUNT],
     counters: [u64; PerfCounter::COUNT],
     scene: Option<ScenePerfContext>,
+    slow_action: Option<SlowActionPerf>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SlowActionPerf {
+    label: &'static str,
+    duration_ns: u64,
 }
 
 pub struct PerfLog {
@@ -223,6 +282,7 @@ pub struct PerfLog {
     current_metrics: [PerfMetric; PerfSpan::COUNT],
     current_counters: [u64; PerfCounter::COUNT],
     current_scene: Option<ScenePerfContext>,
+    current_slow_action: Option<SlowActionPerf>,
     history: VecDeque<PerfFrame>,
 }
 
@@ -234,6 +294,7 @@ impl Default for PerfLog {
             current_metrics: [PerfMetric::default(); PerfSpan::COUNT],
             current_counters: [0; PerfCounter::COUNT],
             current_scene: None,
+            current_slow_action: None,
             history: VecDeque::with_capacity(HISTORY_FRAMES),
         }
     }
@@ -249,6 +310,7 @@ impl PerfLog {
         self.current_metrics = [PerfMetric::default(); PerfSpan::COUNT];
         self.current_counters = [0; PerfCounter::COUNT];
         self.current_scene = None;
+        self.current_slow_action = None;
         self.frame_started = Some(Instant::now());
     }
 
@@ -265,6 +327,7 @@ impl PerfLog {
             metrics: self.current_metrics,
             counters: self.current_counters,
             scene: self.current_scene,
+            slow_action: self.current_slow_action,
         });
         self.next_frame_index = self.next_frame_index.wrapping_add(1);
     }
@@ -276,6 +339,16 @@ impl PerfLog {
     pub fn add_counter(&mut self, counter: PerfCounter, amount: u64) {
         let slot = &mut self.current_counters[counter as usize];
         *slot = slot.saturating_add(amount);
+    }
+
+    pub fn record_action(&mut self, label: &'static str, duration: Duration) {
+        let duration_ns = duration.as_nanos().min(u128::from(u64::MAX)) as u64;
+        if self
+            .current_slow_action
+            .is_none_or(|current| duration_ns > current.duration_ns)
+        {
+            self.current_slow_action = Some(SlowActionPerf { label, duration_ns });
+        }
     }
 
     pub fn set_counter_max(&mut self, counter: PerfCounter, value: u64) {
@@ -304,7 +377,7 @@ impl PerfLog {
         out.push_str(&format!("selection={}\n", selection_summary(selection)));
         if let Some(scene) = frames.last().and_then(|frame| frame.scene) {
             out.push_str(&format!(
-                "latest_scene zoom={:.2}x view_scale={:.3} pan=({:.1},{:.1}) pointer_over_stage={} cursor_stage={:?} q0rg={} frame={} tool={} q0rg_visits={} active_placements={} gpu_callbacks={} filtered_callbacks={} blur_passes={} glow_passes={} filter_work={:.3}Mpp max_region={:.3}Mpx gpu_timer_initialized={} gpu_timer_supported={} gpu_samples={} gpu_avg={:.3}ms gpu_max={:.3}ms gpu_estimate={:.3}ms gpu_cpu_callbacks={} gpu_cpu_avg={:.3}ms gpu_cpu_max={:.3}ms gpu_dropped={}\n",
+                "latest_scene zoom={:.2}x view_scale={:.3} pan=({:.1},{:.1}) pointer_over_stage={} cursor_stage={:?} q0rg={} frame={} tool={} q0rg_visits={} active_placements={} vector_items={} vector_batches={} vector_vertices={} vector_indices={} vector_fallbacks={} gpu_callbacks={} filtered_callbacks={} blur_passes={} glow_passes={} filter_work={:.3}Mpp max_region={:.3}Mpx gpu_timer_initialized={} gpu_timer_supported={} gpu_samples={} gpu_avg={:.3}ms gpu_max={:.3}ms gpu_estimate={:.3}ms gpu_cpu_callbacks={} gpu_cpu_avg={:.3}ms gpu_cpu_max={:.3}ms gpu_cache_hits={} gpu_cache_misses={} gpu_dropped={}\n",
                 scene.zoom,
                 scene.view_scale,
                 scene.pan_x,
@@ -316,6 +389,11 @@ impl PerfLog {
                 scene.tool,
                 scene.q0rg_visits,
                 scene.active_placements,
+                scene.vector_instances_batched,
+                scene.vector_batches,
+                scene.vector_vertices,
+                scene.vector_indices,
+                scene.vector_fallbacks,
                 scene.gpu_callbacks,
                 scene.filtered_callbacks,
                 scene.blur_passes,
@@ -336,6 +414,8 @@ impl PerfLog {
                     scene.gpu_filter_cpu_callbacks,
                 ),
                 scene.gpu_filter_cpu_max_ns as f64 / 1_000_000.0,
+                scene.gpu_filter_cache_hits,
+                scene.gpu_filter_cache_misses,
                 scene.gpu_filter_dropped_samples,
             ));
         }
@@ -389,6 +469,17 @@ impl PerfLog {
         for frame in worst.into_iter().take(12) {
             append_frame_line(&mut out, frame);
         }
+        if let Some(action) = frames
+            .iter()
+            .filter_map(|frame| frame.slow_action)
+            .max_by_key(|action| action.duration_ns)
+        {
+            out.push_str(&format!(
+                "\nslowest action across captured frames={} duration={:.3}ms\n",
+                action.label,
+                action.duration_ns as f64 / 1_000_000.0,
+            ));
+        }
 
         let scene_frames: Vec<ScenePerfContext> =
             frames.iter().filter_map(|frame| frame.scene).collect();
@@ -431,6 +522,14 @@ impl PerfLog {
                 .map(|scene| scene.gpu_filter_cpu_max_ns)
                 .max()
                 .unwrap_or(0);
+            let cache_hits: u64 = scene_frames
+                .iter()
+                .map(|scene| scene.gpu_filter_cache_hits)
+                .sum();
+            let cache_misses: u64 = scene_frames
+                .iter()
+                .map(|scene| scene.gpu_filter_cache_misses)
+                .sum();
             let timer_status = scene_frames
                 .iter()
                 .rev()
@@ -445,7 +544,7 @@ impl PerfLog {
                 .unwrap_or("not initialized");
             out.push_str("\ngpu filter timing summary\n");
             out.push_str(&format!(
-                "timer={} samples={} avg_sample={:.3}ms max_sample={:.3}ms estimated_filter_gpu_ms_per_measured_frame avg={:.3} p95={:.3} max={:.3} measured_frames={} dropped={} cpu_callbacks={} avg_callback_cpu={:.3}ms max_callback_cpu={:.3}ms\n",
+                "timer={} samples={} avg_sample={:.3}ms max_sample={:.3}ms estimated_filter_gpu_ms_per_measured_frame avg={:.3} p95={:.3} max={:.3} measured_frames={} dropped={} cpu_callbacks={} avg_callback_cpu={:.3}ms max_callback_cpu={:.3}ms cache_hits={} cache_misses={}\n",
                 timer_status,
                 gpu_samples,
                 average_ns_ms(gpu_total_ns, gpu_samples),
@@ -458,7 +557,34 @@ impl PerfLog {
                 cpu_callbacks,
                 average_ns_ms(cpu_total_ns, cpu_callbacks),
                 cpu_max_ns as f64 / 1_000_000.0,
+                cache_hits,
+                cache_misses,
             ));
+            if let Some(slowest) = scene_frames
+                .iter()
+                .max_by_key(|scene| scene.gpu_filter_cpu_max_ns)
+                .filter(|scene| scene.gpu_filter_cpu_max_ns > 0)
+            {
+                out.push_str(&format!(
+                    "slowest_callback region={}x{} blur_passes={} glow_passes={} primitives={} vertices={} indices={} target_setup={:.3}ms raster={:.3}ms raster_clear={:.3}ms raster_upload={:.3}ms raster_draw={:.3}ms raster_resolve={:.3}ms raster_other={:.3}ms filters={:.3}ms composite={:.3}ms\n",
+                    slowest.gpu_filter_cpu_max_region_width,
+                    slowest.gpu_filter_cpu_max_region_height,
+                    slowest.gpu_filter_cpu_max_blur_passes,
+                    slowest.gpu_filter_cpu_max_glow_passes,
+                    slowest.gpu_filter_cpu_max_primitive_count,
+                    slowest.gpu_filter_cpu_max_vertex_count,
+                    slowest.gpu_filter_cpu_max_index_count,
+                    slowest.gpu_filter_cpu_max_target_setup_ns as f64 / 1_000_000.0,
+                    slowest.gpu_filter_cpu_max_raster_ns as f64 / 1_000_000.0,
+                    slowest.gpu_filter_cpu_max_raster_clear_ns as f64 / 1_000_000.0,
+                    slowest.gpu_filter_cpu_max_raster_upload_ns as f64 / 1_000_000.0,
+                    slowest.gpu_filter_cpu_max_raster_draw_ns as f64 / 1_000_000.0,
+                    slowest.gpu_filter_cpu_max_raster_resolve_ns as f64 / 1_000_000.0,
+                    slowest.gpu_filter_cpu_max_raster_other_ns as f64 / 1_000_000.0,
+                    slowest.gpu_filter_cpu_max_filter_ns as f64 / 1_000_000.0,
+                    slowest.gpu_filter_cpu_max_composite_ns as f64 / 1_000_000.0,
+                ));
+            }
         }
 
         out.push_str("\nrecent frame timeline (oldest -> newest)\n");
@@ -493,7 +619,7 @@ fn append_frame_line(out: &mut String, frame: &PerfFrame) {
     let c = |counter: PerfCounter| frame.counters[counter as usize];
     let scene = frame.scene.unwrap_or_default();
     out.push_str(&format!(
-        "#{:<6} frame={:>9.3} startup={:>8.3} ingress={:>8.3} prelude={:>8.3} menu={:>8.3} timeline={:>8.3} toolbar={:>8.3} properties={:>8.3} aux={:>8.3} dialogs={:>8.3} actions={:>8.3} library={:>8.3} stage={:>8.3} scene={:>8.3} tools={:>8.3} place_hit={:>8.3} zoom={:>5.2}x scale={:>6.3} pan=({:>6.1},{:>6.1}) pointer={} cursor={:?} q0rg={} at={} qvis={} active={} gpu={} fx_gpu={} blur_p={} glow_p={} filter_mpp={:>8.3} max_region_mpx={:>6.3} gpu_samples={} gpu_avg={:>7.3} gpu_max={:>7.3} gpu_est={:>7.3} gpu_cpu={:>7.3} gpu_drop={} sel={:>8.3} transform={:>8.3} body={:>8.3}/{} rawhover={:>8.3}/{} stage_mesh={:>9.3} screen_mesh={:>9.3} mesh_v={} mesh_i={} cache_miss={} gpu_cb={} paths={}\n",
+        "#{:<6} frame={:>9.3} startup={:>8.3} ingress={:>8.3} prelude={:>8.3} menu={:>8.3} timeline={:>8.3} toolbar={:>8.3} properties={:>8.3} aux={:>8.3} dialogs={:>8.3} actions={:>8.3} library={:>8.3} stage={:>8.3} scene={:>8.3} tools={:>8.3} place_hit={:>8.3} zoom={:>5.2}x scale={:>6.3} pan=({:>6.1},{:>6.1}) pointer={} cursor={:?} q0rg={} at={} qvis={} active={} vector_items={} vector_batches={} vector_vertices={} vector_indices={} vector_fallbacks={} gpu={} fx_gpu={} blur_p={} glow_p={} filter_mpp={:>8.3} max_region_mpx={:>6.3} gpu_samples={} gpu_avg={:>7.3} gpu_max={:>7.3} gpu_est={:>7.3} gpu_cpu={:>7.3} gpu_cpu_max={:>7.3} gpu_cache={}/{} gpu_drop={} sel={:>8.3} transform={:>8.3} body={:>8.3}/{} rawhover={:>8.3}/{} stage_mesh={:>9.3} screen_mesh={:>9.3} mesh_v={} mesh_i={} cache_miss={} gpu_cb={} paths={} fla_import={:>8.3} history={:>8.3} slow_action={} action_ms={:.3}\n",
         frame.index,
         m(PerfSpan::Frame),
         m(PerfSpan::AppStartup),
@@ -521,6 +647,11 @@ fn append_frame_line(out: &mut String, frame: &PerfFrame) {
         scene.frame,
         scene.q0rg_visits,
         scene.active_placements,
+        scene.vector_instances_batched,
+        scene.vector_batches,
+        scene.vector_vertices,
+        scene.vector_indices,
+        scene.vector_fallbacks,
         scene.gpu_callbacks,
         scene.filtered_callbacks,
         scene.blur_passes,
@@ -537,6 +668,9 @@ fn append_frame_line(out: &mut String, frame: &PerfFrame) {
             scene.gpu_filter_cpu_total_ns,
             scene.gpu_filter_cpu_callbacks,
         ),
+        scene.gpu_filter_cpu_max_ns as f64 / 1_000_000.0,
+        scene.gpu_filter_cache_hits,
+        scene.gpu_filter_cache_misses,
         scene.gpu_filter_dropped_samples,
         m(PerfSpan::SelectionOverlay),
         m(PerfSpan::SelectionTransformBounds),
@@ -551,6 +685,13 @@ fn append_frame_line(out: &mut String, frame: &PerfFrame) {
         c(PerfCounter::SelectionPaintCacheMisses),
         c(PerfCounter::SelectionGpuCallbacks),
         c(PerfCounter::SelectionPathCount),
+        m(PerfSpan::FlaImport),
+        m(PerfSpan::HistoryTransition),
+        frame.slow_action.map(|action| action.label).unwrap_or("none"),
+        frame
+            .slow_action
+            .map(|action| action.duration_ns as f64 / 1_000_000.0)
+            .unwrap_or(0.0),
     ));
 }
 
@@ -652,6 +793,11 @@ mod tests {
             tool: "Select",
             q0rg_visits: 5,
             active_placements: 143,
+            vector_instances_batched: 120,
+            vector_batches: 8,
+            vector_vertices: 96_000,
+            vector_indices: 144_000,
+            vector_fallbacks: 3,
             gpu_callbacks: 27,
             filtered_callbacks: 19,
             blur_passes: 48,
@@ -667,6 +813,9 @@ mod tests {
             gpu_filter_cpu_callbacks: 19,
             gpu_filter_cpu_total_ns: 950_000,
             gpu_filter_cpu_max_ns: 90_000,
+            gpu_filter_cache_hits: 3,
+            gpu_filter_cache_misses: 8,
+            ..ScenePerfContext::default()
         });
         log.finish_frame();
 
@@ -682,6 +831,7 @@ mod tests {
         assert!(text.contains("gpu_work_note=callback counts and filter pixel-work are estimates"));
         assert!(text.contains("qvis=5 active=143 gpu=27 fx_gpu=19 blur_p=48 glow_p=4"));
         assert!(text.contains("filter_mpp=   2.000 max_region_mpx= 0.750"));
+        assert!(text.contains("gpu_cache_hits=3 gpu_cache_misses=8"));
     }
 
     #[test]

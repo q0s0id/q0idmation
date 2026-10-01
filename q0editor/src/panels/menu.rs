@@ -1,7 +1,8 @@
-use egui::{Key, Modifiers, Ui};
+use egui::{Key, Ui};
 use std::path::{Path, PathBuf};
 
 use crate::app::{Action, EditorApp};
+use crate::hotkeys::{HotkeySettings, ShortcutChord, ShortcutCommand, ShortcutKey};
 
 pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     egui::menu::bar(ui, |ui| {
@@ -13,11 +14,23 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 }
                 ui.separator();
             }
-            if shortcut_button(ui, "New", "Ctrl+N").clicked() {
+            if shortcut_button(
+                ui,
+                "New",
+                app.settings.hotkeys.display(ShortcutCommand::NewProject),
+            )
+            .clicked()
+            {
                 app.queue(Action::NewProject);
                 ui.close_menu();
             }
-            if shortcut_button(ui, "Open...", "Ctrl+O").clicked() {
+            if shortcut_button(
+                ui,
+                "Open...",
+                app.settings.hotkeys.display(ShortcutCommand::OpenProject),
+            )
+            .clicked()
+            {
                 app.queue(Action::OpenProject);
                 ui.close_menu();
             }
@@ -52,7 +65,10 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             if ui
                 .add_enabled(
                     app.has_active_document() && !app.home_visible(),
-                    shortcut_button_widget("Save", "Ctrl+S"),
+                    shortcut_button_widget(
+                        "Save",
+                        app.settings.hotkeys.display(ShortcutCommand::SaveProject),
+                    ),
                 )
                 .clicked()
             {
@@ -62,7 +78,10 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             if ui
                 .add_enabled(
                     app.has_active_document() && !app.home_visible(),
-                    shortcut_button_widget("Save As...", "Ctrl+Shift+S"),
+                    shortcut_button_widget(
+                        "Save As...",
+                        app.settings.hotkeys.display(ShortcutCommand::SaveProjectAs),
+                    ),
                 )
                 .clicked()
             {
@@ -73,7 +92,10 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             if ui
                 .add_enabled(
                     app.has_active_project() && !app.home_visible(),
-                    shortcut_button_widget("Export...", "Ctrl+E"),
+                    shortcut_button_widget(
+                        "Export...",
+                        app.settings.hotkeys.display(ShortcutCommand::Export),
+                    ),
                 )
                 .clicked()
             {
@@ -92,14 +114,26 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 let can_undo = app.history.can_undo();
                 let can_redo = app.history.can_redo();
                 if ui
-                    .add_enabled(can_undo, shortcut_button_widget("Undo", "Ctrl+Z"))
+                    .add_enabled(
+                        can_undo,
+                        shortcut_button_widget(
+                            "Undo",
+                            app.settings.hotkeys.display(ShortcutCommand::Undo),
+                        ),
+                    )
                     .clicked()
                 {
                     app.queue(Action::Undo);
                     ui.close_menu();
                 }
                 if ui
-                    .add_enabled(can_redo, shortcut_button_widget("Redo", "Ctrl+Y"))
+                    .add_enabled(
+                        can_redo,
+                        shortcut_button_widget(
+                            "Redo",
+                            app.settings.hotkeys.display(ShortcutCommand::Redo),
+                        ),
+                    )
                     .clicked()
                 {
                     app.queue(Action::Redo);
@@ -111,23 +145,41 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     || crate::selection_edit::selection_can_clip(&app.session.selection);
                 let can_delete = app.session.timeline_selection.is_some()
                     || selection_can_be_deleted(&app.session.selection);
-                let has_clip = app.session.clipboard.is_some();
+                let has_clip = app.has_clipboard();
                 if ui
-                    .add_enabled(can_clip, shortcut_button_widget("Cut", "Ctrl+X"))
+                    .add_enabled(
+                        can_clip,
+                        shortcut_button_widget(
+                            "Cut",
+                            app.settings.hotkeys.display(ShortcutCommand::Cut),
+                        ),
+                    )
                     .clicked()
                 {
                     app.queue(Action::CutSelection);
                     ui.close_menu();
                 }
                 if ui
-                    .add_enabled(can_clip, shortcut_button_widget("Copy", "Ctrl+C"))
+                    .add_enabled(
+                        can_clip,
+                        shortcut_button_widget(
+                            "Copy",
+                            app.settings.hotkeys.display(ShortcutCommand::Copy),
+                        ),
+                    )
                     .clicked()
                 {
                     app.queue(Action::CopySelection);
                     ui.close_menu();
                 }
                 if ui
-                    .add_enabled(has_clip, shortcut_button_widget("Paste", "Ctrl+V"))
+                    .add_enabled(
+                        has_clip,
+                        shortcut_button_widget(
+                            "Paste",
+                            app.settings.hotkeys.display(ShortcutCommand::Paste),
+                        ),
+                    )
                     .clicked()
                 {
                     app.queue(Action::Paste);
@@ -136,7 +188,10 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 if ui
                     .add_enabled(
                         has_clip,
-                        shortcut_button_widget("Paste in Place", "Ctrl+Shift+V"),
+                        shortcut_button_widget(
+                            "Paste in Place",
+                            app.settings.hotkeys.display(ShortcutCommand::PasteInPlace),
+                        ),
                     )
                     .clicked()
                 {
@@ -144,7 +199,13 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     ui.close_menu();
                 }
                 if ui
-                    .add_enabled(can_clip, shortcut_button_widget("Duplicate", "Ctrl+D"))
+                    .add_enabled(
+                        can_clip,
+                        shortcut_button_widget(
+                            "Duplicate",
+                            app.settings.hotkeys.display(ShortcutCommand::Duplicate),
+                        ),
+                    )
                     .clicked()
                 {
                     app.queue(Action::DuplicateSelection);
@@ -152,7 +213,13 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 }
                 ui.separator();
                 if ui
-                    .add_enabled(can_delete, shortcut_button_widget("Delete", "Del"))
+                    .add_enabled(
+                        can_delete,
+                        shortcut_button_widget(
+                            "Delete",
+                            app.settings.hotkeys.display(ShortcutCommand::Delete),
+                        ),
+                    )
                     .clicked()
                 {
                     app.queue(Action::DeleteSelection);
@@ -165,7 +232,12 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 if ui
                     .add_enabled(
                         can_convert,
-                        shortcut_button_widget("Convert to Symbol", "Ctrl+G"),
+                        shortcut_button_widget(
+                            "Convert to Symbol",
+                            app.settings
+                                .hotkeys
+                                .display(ShortcutCommand::ConvertToSymbol),
+                        ),
                     )
                     .clicked()
                 {
@@ -175,7 +247,10 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 if ui
                     .add_enabled(
                         app.can_break_apart_selection(),
-                        shortcut_button_widget("Break Apart", "Ctrl+B"),
+                        shortcut_button_widget(
+                            "Break Apart",
+                            app.settings.hotkeys.display(ShortcutCommand::BreakApart),
+                        ),
                     )
                     .clicked()
                 {
@@ -185,20 +260,51 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             });
 
             ui.menu_button("View", |ui| {
-                if shortcut_button(ui, "Zoom In", "Ctrl+=").clicked() {
+                if shortcut_button(
+                    ui,
+                    "Zoom In",
+                    app.settings.hotkeys.display(ShortcutCommand::ZoomIn),
+                )
+                .clicked()
+                {
                     app.queue(Action::ZoomIn);
                     ui.close_menu();
                 }
-                if shortcut_button(ui, "Zoom Out", "Ctrl+-").clicked() {
+                if shortcut_button(
+                    ui,
+                    "Zoom Out",
+                    app.settings.hotkeys.display(ShortcutCommand::ZoomOut),
+                )
+                .clicked()
+                {
                     app.queue(Action::ZoomOut);
                     ui.close_menu();
                 }
-                if shortcut_button(ui, "Reset Zoom", "Ctrl+0").clicked() {
+                if shortcut_button(
+                    ui,
+                    "Reset Zoom",
+                    app.settings.hotkeys.display(ShortcutCommand::ZoomReset),
+                )
+                .clicked()
+                {
                     app.queue(Action::ZoomReset);
                     ui.close_menu();
                 }
                 ui.separator();
-                if shortcut_button(ui, "Script Editor (q0lang)...", "F9").clicked() {
+                if ui
+                    .selectable_label(app.session.outline_mode, "outline mode")
+                    .clicked()
+                {
+                    app.queue(Action::ToggleOutlineMode);
+                    ui.close_menu();
+                }
+                if shortcut_button(
+                    ui,
+                    "Script Editor (q0lang)...",
+                    app.settings.hotkeys.display(ShortcutCommand::ScriptEditor),
+                )
+                .clicked()
+                {
                     app.queue(Action::OpenQ0langEditor(None));
                     ui.close_menu();
                 }
@@ -311,24 +417,16 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     });
 }
 
-fn shortcut_button(ui: &mut Ui, label: &str, accel: &str) -> egui::Response {
+fn shortcut_button(ui: &mut Ui, label: &str, accel: String) -> egui::Response {
     ui.add(shortcut_button_widget(label, accel))
 }
 
-fn shortcut_button_widget<'a>(label: &'a str, accel: &'a str) -> impl egui::Widget + 'a {
-    move |ui: &mut Ui| {
-        ui.horizontal(|ui| {
-            let resp = ui.button(label);
-            ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new(accel)
-                    .color(crate::theme::text_dim())
-                    .small(),
-            );
-            resp
-        })
-        .inner
-    }
+fn shortcut_button_widget<'a>(label: &'a str, accel: String) -> impl egui::Widget + 'a {
+    egui::Button::new(label).shortcut_text(if accel == "Unassigned" {
+        String::new()
+    } else {
+        accel
+    })
 }
 
 fn truncate_label(text: &str, max_chars: usize) -> String {
@@ -422,58 +520,196 @@ fn status_is_error(status: &str) -> bool {
     .any(|needle| status.contains(needle))
 }
 
-fn consume_performance_snapshot_shortcut(input: &mut egui::InputState) -> bool {
-    input.consume_key(Modifiers::NONE, Key::F4)
-}
-
 /// egui-winit converts native Ctrl+X/C/V into Cut/Copy/Paste events and returns
 /// before emitting Event::Key for the pressed key. Handle that real native
-/// path explicitly; the key-based fallback below is retained for other backends
-/// and for synthetic callers.
-fn consume_native_clipboard_shortcut(input: &mut egui::InputState) -> Option<Action> {
-    let paste_in_place = input.modifiers.shift;
-    let mut shortcut = None;
+/// path explicitly, resolving the user's current mapping from the chord.
+fn consume_native_clipboard_shortcuts(
+    input: &mut egui::InputState,
+    settings: &HotkeySettings,
+) -> (Vec<ShortcutCommand>, bool) {
+    let modifiers = input.modifiers;
+    let mut commands = Vec::new();
+    let mut consumed_native_event = false;
     input.events.retain(|event| {
-        let action = match event {
-            egui::Event::Cut => Some(Action::CutSelection),
-            egui::Event::Copy => Some(Action::CopySelection),
-            egui::Event::Paste(_) => Some(if paste_in_place {
-                Action::PasteInPlace
-            } else {
-                Action::Paste
-            }),
+        let key = match event {
+            egui::Event::Cut => Some(Key::X),
+            egui::Event::Copy => Some(Key::C),
+            egui::Event::Paste(_) => Some(Key::V),
             _ => None,
         };
-        if let Some(action) = action {
-            if shortcut.is_none() {
-                shortcut = Some(action);
+        if let Some(key) = key {
+            consumed_native_event = true;
+            if let Some(chord) = ShortcutChord::from_modifiers(key, modifiers) {
+                if let Some(command) = settings.command_for(chord) {
+                    commands.push(command);
+                }
             }
             false
         } else {
             true
         }
     });
-    shortcut
+    (commands, consumed_native_event)
+}
+
+fn consume_shortcut(
+    input: &mut egui::InputState,
+    settings: &HotkeySettings,
+    command: ShortcutCommand,
+    typing: bool,
+    skip_native_clipboard_keys: bool,
+) -> bool {
+    settings.shortcuts(command).into_iter().any(|shortcut| {
+        if skip_native_clipboard_keys
+            && matches!(
+                shortcut.key,
+                ShortcutKey::X | ShortcutKey::C | ShortcutKey::V
+            )
+        {
+            return false;
+        }
+        let function_key = matches!(
+            shortcut.key,
+            ShortcutKey::F1
+                | ShortcutKey::F2
+                | ShortcutKey::F3
+                | ShortcutKey::F4
+                | ShortcutKey::F5
+                | ShortcutKey::F6
+                | ShortcutKey::F7
+                | ShortcutKey::F8
+                | ShortcutKey::F9
+                | ShortcutKey::F10
+                | ShortcutKey::F11
+                | ShortcutKey::F12
+        );
+        if typing && !shortcut.command && !shortcut.alt && !function_key {
+            return false;
+        }
+        let pressed = input.modifiers;
+        let plus_key_allows_shift =
+            matches!(shortcut.key, ShortcutKey::Plus | ShortcutKey::Equals) && !shortcut.shift;
+        if pressed.command != shortcut.command
+            || pressed.alt != shortcut.alt
+            || (pressed.shift != shortcut.shift && !(plus_key_allows_shift && pressed.shift))
+        {
+            return false;
+        }
+        input.consume_key(shortcut.modifiers(), shortcut.key.to_egui())
+    })
+}
+
+fn action_for_shortcut(command: ShortcutCommand) -> Option<Action> {
+    use ShortcutCommand as C;
+    Some(match command {
+        C::NextTab => Action::CycleDocumentTab(1),
+        C::PreviousTab => Action::CycleDocumentTab(-1),
+        C::NewProject => Action::NewProject,
+        C::OpenProject => Action::OpenProject,
+        C::SaveProject => Action::SaveProject,
+        C::SaveProjectAs => Action::SaveProjectAs,
+        C::Export => Action::OpenQ0Enc,
+        C::Undo => Action::Undo,
+        C::Redo => Action::Redo,
+        C::Cut => Action::CutSelection,
+        C::Copy => Action::CopySelection,
+        C::Paste => Action::Paste,
+        C::PasteInPlace => Action::PasteInPlace,
+        C::Duplicate => Action::DuplicateSelection,
+        C::Delete => Action::DeleteSelection,
+        C::ConvertToSymbol => Action::ConvertSelectionToQ0rg,
+        C::BreakApart => Action::BreakApartSelection,
+        C::FlipHorizontal => Action::FlipHorizontal,
+        C::FlipVertical => Action::FlipVertical,
+        C::ZoomIn => Action::ZoomIn,
+        C::ZoomOut => Action::ZoomOut,
+        C::ZoomReset => Action::ZoomReset,
+        C::ScriptEditor => Action::OpenQ0langEditor(None),
+        C::PlaybackToggle => Action::TogglePlay,
+        C::ToggleTimeline => Action::ToggleTimeline,
+        C::FirstFrame => Action::FirstFrame,
+        C::LastFrame => Action::LastFrame,
+        C::PreviousFrame => Action::PreviousFrame,
+        C::NextFrame => Action::NextFrame,
+        C::InsertFrame => Action::InsertFrame,
+        C::RemoveFrame => Action::RemoveSelectedTimelineFrames,
+        C::InsertKeyframe => Action::InsertKeyframe,
+        C::ClearKeyframe => Action::ClearKeyframe,
+        C::InsertBlankKeyframe => Action::InsertBlankKeyframe,
+        C::MotionTween => Action::CreateMotionTween,
+        C::ToolSelect => Action::SelectTool(crate::state::Tool::Select),
+        C::ToolLasso => Action::SelectTool(crate::state::Tool::Lasso),
+        C::ToolSubselect => Action::SelectTool(crate::state::Tool::Subselect),
+        C::ToolHand => Action::SelectTool(crate::state::Tool::Hand),
+        C::ToolPen => Action::SelectTool(crate::state::Tool::Pen),
+        C::ToolPencil => Action::SelectTool(crate::state::Tool::Pencil),
+        C::ToolBrush => Action::SelectTool(crate::state::Tool::Brush),
+        C::ToolEraser => Action::SelectTool(crate::state::Tool::Eraser),
+        C::ToolLine => Action::SelectTool(crate::state::Tool::Line),
+        C::ToolRectangle => Action::SelectTool(crate::state::Tool::Rectangle),
+        C::ToolOval => Action::SelectTool(crate::state::Tool::Oval),
+        C::ToolBucket => Action::SelectTool(crate::state::Tool::Bucket),
+        C::ToolEyedropper => Action::SelectTool(crate::state::Tool::Eyedropper),
+        C::ToolText => Action::SelectTool(crate::state::Tool::Text),
+        C::PerformanceSnapshot | C::ClearSelection => return None,
+    })
+}
+
+fn dispatch_shortcut(
+    app: &mut EditorApp,
+    ctx: &egui::Context,
+    command: ShortcutCommand,
+    can_clip: bool,
+    came_from_native_clipboard: bool,
+) {
+    match command {
+        ShortcutCommand::PerformanceSnapshot => app.copy_performance_snapshot(ctx),
+        ShortcutCommand::ClearSelection => {
+            if matches!(app.session.tool_state, crate::state::ToolState::Idle) {
+                app.session.selection = crate::state::Selection::None;
+                app.session.timeline_selection = None;
+                app.session.status = "selection cleared".to_string();
+            }
+        }
+        _ => {
+            if let Some(action) = action_for_shortcut(command) {
+                if came_from_native_clipboard
+                    && can_clip
+                    && matches!(action, Action::CopySelection | Action::CutSelection)
+                {
+                    // egui-winit only emits Event::Paste when the system clipboard
+                    // contains non-empty text. Keep a harmless marker there so an
+                    // internal artwork copy/cut can always be pasted with Ctrl+V.
+                    ctx.output_mut(|output| output.copied_text = "q0editor artwork".to_string());
+                }
+                app.queue(action);
+            }
+        }
+    }
 }
 
 pub fn handle_home_shortcuts(app: &mut EditorApp, ctx: &egui::Context) {
-    let mut copy_perf = false;
+    if app.session.shortcut_capture.is_some() {
+        return;
+    }
+    let typing = ctx.wants_keyboard_input();
+    let settings = &app.settings.hotkeys;
+    let mut commands = Vec::new();
     ctx.input_mut(|input| {
-        copy_perf |= consume_performance_snapshot_shortcut(input);
-        if input.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Tab) {
-            app.queue(Action::CycleDocumentTab(-1));
-        } else if input.consume_key(Modifiers::COMMAND, Key::Tab) {
-            app.queue(Action::CycleDocumentTab(1));
-        }
-        if input.consume_key(Modifiers::COMMAND, Key::N) {
-            app.queue(Action::NewProject);
-        }
-        if input.consume_key(Modifiers::COMMAND, Key::O) {
-            app.queue(Action::OpenProject);
+        for command in [
+            ShortcutCommand::PerformanceSnapshot,
+            ShortcutCommand::NextTab,
+            ShortcutCommand::PreviousTab,
+            ShortcutCommand::NewProject,
+            ShortcutCommand::OpenProject,
+        ] {
+            if consume_shortcut(input, settings, command, typing, false) {
+                commands.push(command);
+            }
         }
     });
-    if copy_perf {
-        app.copy_performance_snapshot(ctx);
+    for command in commands {
+        dispatch_shortcut(app, ctx, command, false, false);
     }
 }
 
@@ -483,175 +719,108 @@ pub fn handle_global_shortcuts(app: &mut EditorApp, ctx: &egui::Context) {
     let can_clip = app.session.timeline_selection.is_some()
         || app.session.timeline_layer_selection.is_some()
         || crate::selection_edit::selection_can_clip(&app.session.selection);
-    let mut copy_perf = false;
-    let mut arm_native_artwork_clipboard = false;
+    if app.session.shortcut_capture.is_some() {
+        return;
+    }
+    let settings = &app.settings.hotkeys;
+    let mut commands = Vec::new();
+    let mut native_commands = Vec::new();
     ctx.input_mut(|i| {
-        copy_perf |= consume_performance_snapshot_shortcut(i);
-        if i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Tab) {
-            app.queue(Action::CycleDocumentTab(-1));
-        } else if i.consume_key(Modifiers::COMMAND, Key::Tab) {
-            app.queue(Action::CycleDocumentTab(1));
-        }
-        if i.consume_key(Modifiers::COMMAND, Key::N) {
-            app.queue(Action::NewProject);
-        }
-        if i.consume_key(Modifiers::COMMAND, Key::O) {
-            app.queue(Action::OpenProject);
-        }
-        if i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::S) {
-            app.queue(Action::SaveProjectAs);
-        } else if i.consume_key(Modifiers::COMMAND, Key::S) {
-            app.queue(Action::SaveProject);
-        }
+        let (native, had_native_clipboard_event) = if !typing && !code_document {
+            consume_native_clipboard_shortcuts(i, settings)
+        } else {
+            (Vec::new(), false)
+        };
+        commands.extend(native.iter().copied());
+        // Retain which commands came through the native clipboard event so
+        // internal artwork copy/cut can repopulate egui's text clipboard.
+        native_commands = native;
+        let mut test = |command| {
+            if consume_shortcut(i, settings, command, typing, had_native_clipboard_event) {
+                commands.push(command);
+            }
+        };
+
+        test(ShortcutCommand::PerformanceSnapshot);
+        test(ShortcutCommand::NextTab);
+        test(ShortcutCommand::PreviousTab);
+        test(ShortcutCommand::NewProject);
+        test(ShortcutCommand::OpenProject);
+        test(ShortcutCommand::SaveProjectAs);
+        test(ShortcutCommand::SaveProject);
         if code_document {
             return;
         }
+
         if !typing {
-            if i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z)
-                || i.consume_key(Modifiers::COMMAND, Key::Y)
-            {
-                app.queue(Action::Redo);
-            } else if i.consume_key(Modifiers::COMMAND, Key::Z) {
-                app.queue(Action::Undo);
-            }
-            if i.consume_key(Modifiers::COMMAND, Key::G) {
-                app.queue(Action::ConvertSelectionToQ0rg);
-            }
-            if i.consume_key(Modifiers::COMMAND, Key::B) {
-                app.queue(Action::BreakApartSelection);
-            }
+            test(ShortcutCommand::Undo);
+            test(ShortcutCommand::Redo);
+            test(ShortcutCommand::ConvertToSymbol);
+            test(ShortcutCommand::BreakApart);
+            test(ShortcutCommand::FlipHorizontal);
+            test(ShortcutCommand::FlipVertical);
+            test(ShortcutCommand::Cut);
+            test(ShortcutCommand::Copy);
+            test(ShortcutCommand::Paste);
+            test(ShortcutCommand::PasteInPlace);
+            test(ShortcutCommand::Duplicate);
+            test(ShortcutCommand::Delete);
         }
-        if i.consume_key(Modifiers::COMMAND, Key::E) {
-            app.queue(Action::OpenQ0Enc);
-        }
+        test(ShortcutCommand::Export);
+        test(ShortcutCommand::ZoomIn);
+        test(ShortcutCommand::ZoomOut);
+        test(ShortcutCommand::ZoomReset);
         if !typing {
-            if let Some(action) = consume_native_clipboard_shortcut(i) {
-                if can_clip && matches!(action, Action::CopySelection | Action::CutSelection) {
-                    // egui-winit only emits Event::Paste when the system clipboard
-                    // contains non-empty text. Keep a harmless marker there so an
-                    // internal artwork copy/cut can always be pasted with Ctrl+V.
-                    arm_native_artwork_clipboard = true;
-                }
-                app.queue(action);
-            } else {
-                if i.consume_key(Modifiers::COMMAND, Key::X) {
-                    app.queue(Action::CutSelection);
-                }
-                if i.consume_key(Modifiers::COMMAND, Key::C) {
-                    app.queue(Action::CopySelection);
-                }
-                if i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::V) {
-                    app.queue(Action::PasteInPlace);
-                } else if i.consume_key(Modifiers::COMMAND, Key::V) {
-                    app.queue(Action::Paste);
-                }
-            }
-            if i.consume_key(Modifiers::COMMAND, Key::D) {
-                app.queue(Action::DuplicateSelection);
-            }
+            test(ShortcutCommand::PlaybackToggle);
+            test(ShortcutCommand::FirstFrame);
+            test(ShortcutCommand::LastFrame);
+            test(ShortcutCommand::PreviousFrame);
+            test(ShortcutCommand::NextFrame);
+            test(ShortcutCommand::ClearSelection);
         }
-        // Zoom: Ctrl+= and Ctrl++ (some keyboards send Plus, others Equals).
-        if i.consume_key(Modifiers::COMMAND, Key::Plus)
-            || i.consume_key(Modifiers::COMMAND, Key::Equals)
-        {
-            app.queue(Action::ZoomIn);
-        }
-        if i.consume_key(Modifiers::COMMAND, Key::Minus) {
-            app.queue(Action::ZoomOut);
-        }
-        if i.consume_key(Modifiers::COMMAND, Key::Num0) {
-            app.queue(Action::ZoomReset);
-        }
-        if !typing
-            && (i.consume_key(Modifiers::NONE, Key::Delete)
-                || i.consume_key(Modifiers::NONE, Key::Backspace))
-        {
-            app.queue(Action::DeleteSelection);
-        }
-        // Space is reserved for the temporary hand tool over the stage.
-        if !typing && i.consume_key(Modifiers::NONE, Key::Enter) {
-            app.queue(Action::TogglePlay);
-        }
-        if !typing && i.consume_key(Modifiers::NONE, Key::Home) {
-            app.queue(Action::FirstFrame);
-        }
-        if !typing && i.consume_key(Modifiers::NONE, Key::End) {
-            app.queue(Action::LastFrame);
-        }
-        if !typing && i.consume_key(Modifiers::NONE, Key::ArrowLeft) {
-            app.queue(Action::PreviousFrame);
-        }
-        if !typing && i.consume_key(Modifiers::NONE, Key::ArrowRight) {
-            app.queue(Action::NextFrame);
-        }
-        if !typing
-            && matches!(app.session.tool_state, crate::state::ToolState::Idle)
-            && i.consume_key(Modifiers::NONE, Key::Escape)
-        {
-            app.session.selection = crate::state::Selection::None;
-            app.session.timeline_selection = None;
-            app.session.status = "selection cleared".to_string();
-        }
-        if i.consume_key(Modifiers::SHIFT, Key::F5) {
-            app.queue(Action::RemoveFrame);
-        } else if i.consume_key(Modifiers::NONE, Key::F5) {
-            app.queue(Action::InsertFrame);
-        }
-        if i.consume_key(Modifiers::SHIFT, Key::F6) {
-            app.queue(Action::ClearKeyframe);
-        } else if i.consume_key(Modifiers::NONE, Key::F6) {
-            app.queue(Action::InsertKeyframe);
-        }
-        if i.consume_key(Modifiers::NONE, Key::F7) {
-            app.queue(Action::InsertBlankKeyframe);
-        }
-        // F9 вЂ” open the q0lang script editor for the current q0rg.
-        // Active even while typing (TextEdit doesn't claim F9), so it
-        // works whether the user is in a panel input or focused on the
-        // canvas.
-        if i.consume_key(Modifiers::NONE, Key::F9) {
-            app.queue(Action::OpenQ0langEditor(None));
-        }
-        if i.consume_key(Modifiers::COMMAND | Modifiers::ALT, Key::T) {
-            app.queue(Action::CreateMotionTween);
-        }
-        // Tool letter shortcuts only when no widget is capturing keyboard.
+        test(ShortcutCommand::InsertFrame);
+        test(ShortcutCommand::RemoveFrame);
+        test(ShortcutCommand::InsertKeyframe);
+        test(ShortcutCommand::ClearKeyframe);
+        test(ShortcutCommand::InsertBlankKeyframe);
+        test(ShortcutCommand::ScriptEditor);
+        test(ShortcutCommand::MotionTween);
         if !typing {
-            for tool in crate::state::Tool::ALL {
-                let key = match tool.glyph() {
-                    "V" => Key::V,
-                    "Q" => Key::Q,
-                    "H" => Key::H,
-                    "A" => Key::A,
-                    "P" => Key::P,
-                    "Y" => Key::Y,
-                    "B" => Key::B,
-                    "E" => Key::E,
-                    "N" => Key::N,
-                    "R" => Key::R,
-                    "O" => Key::O,
-                    "K" => Key::K,
-                    "I" => Key::I,
-                    "T" => Key::T,
-                    _ => continue,
-                };
-                if i.consume_key(Modifiers::NONE, key) {
-                    app.queue(Action::SelectTool(tool));
-                }
+            for command in [
+                ShortcutCommand::ToolSelect,
+                ShortcutCommand::ToolLasso,
+                ShortcutCommand::ToolSubselect,
+                ShortcutCommand::ToolHand,
+                ShortcutCommand::ToolPen,
+                ShortcutCommand::ToolPencil,
+                ShortcutCommand::ToolBrush,
+                ShortcutCommand::ToolEraser,
+                ShortcutCommand::ToolLine,
+                ShortcutCommand::ToolRectangle,
+                ShortcutCommand::ToolOval,
+                ShortcutCommand::ToolBucket,
+                ShortcutCommand::ToolEyedropper,
+                ShortcutCommand::ToolText,
+            ] {
+                test(command);
             }
         }
     });
-    if copy_perf {
-        app.copy_performance_snapshot(ctx);
-    }
-    if arm_native_artwork_clipboard {
-        ctx.output_mut(|output| output.copied_text = "q0editor artwork".to_string());
+    for command in commands {
+        dispatch_shortcut(
+            app,
+            ctx,
+            command,
+            can_clip,
+            native_commands.contains(&command),
+        );
     }
 }
 
 #[cfg(test)]
 mod shortcut_tests {
     use super::*;
+    use egui::Modifiers;
     use std::time::Duration;
 
     fn raw_clipboard_square(min: f32, max: f32) -> crate::state::ClipboardPayload {

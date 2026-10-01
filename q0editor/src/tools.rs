@@ -146,7 +146,7 @@ pub fn handle(
 /// Paint transient tool UI only after the project scene has been rendered.
 /// Keeping model mutation in `handle` and visual overlays here ensures both
 /// the artwork and its selection/transform UI observe the same frame state.
-pub fn draw_overlay(app: &EditorApp, response: &Response, painter: &Painter, view: &StageView) {
+pub fn draw_overlay(app: &mut EditorApp, response: &Response, painter: &Painter, view: &StageView) {
     draw_in_progress_overlay(app, painter, view);
     if app.session.viewport.hand_active || app.session.viewport.panning {
         return;
@@ -482,7 +482,7 @@ fn invalidate_path_asset(app: &mut EditorApp, path: PathRef) {
 
 fn subselect(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: &StageView) {
     let shift_down = response.ctx.input(|input| input.modifiers.shift);
-    let scale = view.scale.abs().max(0.001);
+    let scale = view.effective_scale().abs().max(0.001);
     let anchor_radius = SUBSELECT_ANCHOR_RADIUS_PX / scale;
     let handle_radius = SUBSELECT_HANDLE_RADIUS_PX / scale;
 
@@ -624,7 +624,7 @@ fn subselect(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, vie
                         &start_path,
                         delta,
                     ) {
-                        app.state.dirty = true;
+                        app.state.mark_artwork_dirty();
                         invalidate_path_asset(app, path);
                         app.session.selection = Selection::SubselectPoints {
                             path,
@@ -656,7 +656,7 @@ fn subselect(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, vie
                         &start_path,
                         point,
                     ) {
-                        app.state.dirty = true;
+                        app.state.mark_artwork_dirty();
                         invalidate_path_asset(app, path);
                     }
                 }
@@ -699,7 +699,7 @@ fn subselect(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, vie
                     }
                     if merged_selection.is_some() {
                         app.textures.invalidate_asset(asset_id);
-                        app.state.dirty = true;
+                        app.state.mark_dirty();
                     }
                 }
                 let indices = merged_selection.unwrap_or(anchor_indices);
@@ -899,7 +899,7 @@ fn resize_cursor_for_handle(handle: Handle) -> egui::CursorIcon {
 }
 
 fn selected_transform_hit(
-    app: &EditorApp,
+    app: &mut EditorApp,
     view: &StageView,
     cursor_screen: Pos2,
 ) -> Option<TransformHit> {
@@ -910,7 +910,7 @@ fn selected_transform_hit(
             | Selection::Multi(_)
             | Selection::RawParts { .. }
     ) {
-        if let Some(bounds) = selection_transform_bounds(app) {
+        if let Some(bounds) = selection_transform_bounds_scoped(app) {
             if let Some(hit) = hit_test_raw_transform(bounds, view, cursor_screen) {
                 return Some(hit);
             }
@@ -929,13 +929,28 @@ fn selected_transform_hit(
         placement_idx,
     } = app.session.selection.clone()
     {
-        if let Some((_, local_bbox, transform)) = drag_start_data(
-            &app.state.project,
-            q0rg_id,
-            layer_id,
-            placement_idx,
-            app.session.current_frame,
-        ) {
+        let revision = (
+            app.active_project_tab_id().unwrap_or(0),
+            app.state.render_revision(),
+        );
+        let frame = app.session.current_frame;
+        let project = &app.state.project;
+        let bounds = app.textures.take_placement_bounds_cache(project, revision);
+        let mut geometry = SelectionOverlayGeometry::with_bounds(bounds);
+        let placement_frame = geometry.placement_local_visual_frame_scoped(
+            project,
+            &mut app.textures,
+            revision,
+            PlacementRef {
+                q0rg_id,
+                layer_id,
+                placement_idx,
+            },
+            frame,
+        );
+        app.textures
+            .store_placement_bounds_cache(geometry.bounds, revision);
+        if let Some((Some(local_bbox), _, _rig_bound, transform)) = placement_frame {
             if let Some(hit) =
                 hit_test_placement_transform(local_bbox, transform, view, cursor_screen)
             {
@@ -953,7 +968,7 @@ fn select_cursor(
 ) -> Option<egui::CursorIcon> {
     use egui::CursorIcon;
     let cursor_screen = response.hover_pos()?;
-    let hit_slop = HitSlop::for_scale(view.scale);
+    let hit_slop = HitSlop::for_scale(view.effective_scale());
 
     if response.ctx.input(|i| i.modifiers.alt) && selected_pivot_hit(app, view, cursor_screen) {
         return Some(CursorIcon::Move);
@@ -968,18 +983,23 @@ fn select_cursor(
     // by the shared drawing Placement's bounding box. Display objects (q0rg,
     // bitmap, transformed vector instances) keep normal object hit-testing.
     let cursor_stage = screen_to_stage(cursor_screen, view);
+    let render_revision = (
+        app.active_project_tab_id().unwrap_or(0),
+        app.state.render_revision(),
+    );
     let selected_body_hit = selected_raw_body_contains_point_with_slop(app, cursor_stage, hit_slop);
     let raw_hover_hit = if selected_body_hit {
         false
     } else {
         let hover_started = std::time::Instant::now();
-        let hit = hit_test_raw_hover_cached_with_slop(
+        let hit = hit_test_raw_hover_scoped(
             &app.state.project,
             &mut app.textures,
             app.session.current_q0rg_id,
             app.session.current_frame,
             cursor_stage,
             hit_slop,
+            render_revision,
         );
         app.perf
             .record(crate::perf::PerfSpan::RawHoverHit, hover_started.elapsed());
@@ -989,13 +1009,14 @@ fn select_cursor(
         false
     } else {
         let started = std::time::Instant::now();
-        let hit = hit_test_selectable_placement_with_slop_cached(
+        let hit = hit_test_selectable_placement_with_slop_scoped(
             &app.state.project,
             &mut app.textures,
             app.session.current_q0rg_id,
             app.session.current_frame,
             cursor_stage,
             hit_slop,
+            render_revision,
         )
         .is_some();
         app.perf.record(
@@ -1012,17 +1033,11 @@ fn select_cursor(
 }
 
 fn screen_to_stage(pos: Pos2, view: &StageView) -> Vec2 {
-    Vec2::new(
-        (pos.x - view.origin.x) / view.scale,
-        (pos.y - view.origin.y) / view.scale,
-    )
+    view.screen_to_stage(pos)
 }
 
 fn stage_to_screen(p: Vec2, view: &StageView) -> Pos2 {
-    pos2(
-        view.origin.x + p.x * view.scale,
-        view.origin.y + p.y * view.scale,
-    )
+    view.stage_to_screen(p)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1100,8 +1115,13 @@ fn placement_ref_world_bounds(
         .iter()
         .find(|layer| layer.layer_id == reference.layer_id)?;
     let placement = layer.placements.get(reference.placement_idx)?;
-    let transform =
-        crate::render::active_transform_for_placement(layer, reference.placement_idx, frame)?;
+    let (transform, _) = placement_transform_for_edit(
+        project,
+        reference.q0rg_id,
+        reference.layer_id,
+        reference.placement_idx,
+        frame,
+    )?;
     let mut visual = placement.clone();
     visual.transform = transform;
     placement_bbox(project, &visual)
@@ -1118,6 +1138,171 @@ fn placement_refs_world_bounds(
             placement_ref_world_bounds(project, reference, frame),
         )
     })
+}
+
+struct SelectionOverlayGeometry {
+    bounds: crate::render::PlacementBoundsCache,
+    active_transforms:
+        std::collections::HashMap<(u16, u16), std::collections::HashMap<usize, Transform2D>>,
+}
+
+impl SelectionOverlayGeometry {
+    fn new(project: &ProjectV2) -> Self {
+        Self {
+            bounds: crate::render::PlacementBoundsCache::new(project),
+            active_transforms: std::collections::HashMap::new(),
+        }
+    }
+
+    fn with_bounds(bounds: crate::render::PlacementBoundsCache) -> Self {
+        Self {
+            bounds,
+            active_transforms: std::collections::HashMap::new(),
+        }
+    }
+
+    fn active_transform_scoped(
+        &mut self,
+        project: &ProjectV2,
+        textures: &mut TextureCache,
+        revision: (u64, u64),
+        q0rg_id: u16,
+        layer_id: u16,
+        placement_idx: usize,
+        frame: u16,
+    ) -> Option<Transform2D> {
+        let key = (q0rg_id, layer_id);
+        if !self.active_transforms.contains_key(&key) {
+            let transforms = {
+                let layer = self.bounds.layer(project, q0rg_id, layer_id)?;
+                textures
+                    .scoped_active_placement_states_at(project, revision, q0rg_id, layer, frame)
+                    .into_iter()
+                    .map(|state| (state.index, state.transform))
+                    .collect()
+            };
+            self.active_transforms.insert(key, transforms);
+        }
+        self.active_transforms
+            .get(&key)?
+            .get(&placement_idx)
+            .copied()
+    }
+
+    fn placement_world_bounds(
+        &mut self,
+        project: &ProjectV2,
+        reference: PlacementRef,
+        frame: u16,
+    ) -> Option<(f32, f32, f32, f32)> {
+        let (transform, _) = placement_transform_for_edit(
+            project,
+            reference.q0rg_id,
+            reference.layer_id,
+            reference.placement_idx,
+            frame,
+        )?;
+        let placement = self
+            .bounds
+            .layer(project, reference.q0rg_id, reference.layer_id)?
+            .placements
+            .get(reference.placement_idx)?;
+        let mut visual = placement.clone();
+        visual.transform = transform;
+        self.bounds.placement_bbox(project, &visual)
+    }
+
+    fn placement_refs_world_bounds(
+        &mut self,
+        project: &ProjectV2,
+        references: &[PlacementRef],
+        frame: u16,
+    ) -> Option<(f32, f32, f32, f32)> {
+        references.iter().copied().fold(None, |bounds, reference| {
+            union_bounds(
+                bounds,
+                self.placement_world_bounds(project, reference, frame),
+            )
+        })
+    }
+
+    fn placement_world_bounds_scoped(
+        &mut self,
+        project: &ProjectV2,
+        textures: &mut TextureCache,
+        revision: (u64, u64),
+        reference: PlacementRef,
+        frame: u16,
+    ) -> Option<(f32, f32, f32, f32)> {
+        let (_, visual_affine, _, _) = self
+            .placement_local_visual_frame_scoped(project, textures, revision, reference, frame)?;
+        let transform = crate::app::affine_to_transform(visual_affine)?;
+        let placement = self
+            .bounds
+            .layer(project, reference.q0rg_id, reference.layer_id)?
+            .placements
+            .get(reference.placement_idx)?;
+        let mut visual = placement.clone();
+        visual.transform = transform;
+        self.bounds.placement_bbox(project, &visual)
+    }
+
+    fn placement_local_visual_frame_scoped(
+        &mut self,
+        project: &ProjectV2,
+        textures: &mut TextureCache,
+        revision: (u64, u64),
+        reference: PlacementRef,
+        frame: u16,
+    ) -> Option<(Option<(f32, f32, f32, f32)>, Affine, bool, Transform2D)> {
+        let transform = self.active_transform_scoped(
+            project,
+            textures,
+            revision,
+            reference.q0rg_id,
+            reference.layer_id,
+            reference.placement_idx,
+            frame,
+        )?;
+        let (target, instance_id) = {
+            let placement = self
+                .bounds
+                .layer(project, reference.q0rg_id, reference.layer_id)?
+                .placements
+                .get(reference.placement_idx)?;
+            (placement.target, placement.instance_id)
+        };
+        let local_bounds = self.bounds.target_local_bbox(project, target);
+        let local_frame = self.bounds.q0rg(project, reference.q0rg_id).map(|q0rg| {
+            if q0rg.frame_count > 0 {
+                frame % q0rg.frame_count
+            } else {
+                0
+            }
+        })?;
+        let rig_transform = textures
+            .scoped_rig_pose(project, revision, reference.q0rg_id, local_frame)
+            .and_then(|pose| pose.binding_transform(instance_id));
+        let rig_bound = rig_transform.is_some();
+        let visual_affine = rig_transform.unwrap_or_else(|| Affine::from_transform(transform));
+        Some((local_bounds, visual_affine, rig_bound, transform))
+    }
+
+    fn placement_refs_world_bounds_scoped(
+        &mut self,
+        project: &ProjectV2,
+        textures: &mut TextureCache,
+        revision: (u64, u64),
+        references: &[PlacementRef],
+        frame: u16,
+    ) -> Option<(f32, f32, f32, f32)> {
+        references.iter().copied().fold(None, |bounds, reference| {
+            union_bounds(
+                bounds,
+                self.placement_world_bounds_scoped(project, textures, revision, reference, frame),
+            )
+        })
+    }
 }
 
 fn selection_transform_bounds(app: &EditorApp) -> Option<(f32, f32, f32, f32)> {
@@ -1185,9 +1370,8 @@ fn selection_transform_bounds(app: &EditorApp) -> Option<(f32, f32, f32, f32)> {
             raw_path_refs_ui_bounds(&app.state.project, paths),
             placement_refs_world_bounds(&app.state.project, objects, app.session.current_frame),
         ),
-        Selection::Multi(objects) => {
-            placement_refs_world_bounds(&app.state.project, objects, app.session.current_frame)
-        }
+        Selection::Multi(objects) => SelectionOverlayGeometry::new(&app.state.project)
+            .placement_refs_world_bounds(&app.state.project, objects, app.session.current_frame),
         Selection::None
         | Selection::Asset(_)
         | Selection::Q0rg(_)
@@ -1195,6 +1379,30 @@ fn selection_transform_bounds(app: &EditorApp) -> Option<(f32, f32, f32, f32)> {
         | Selection::SubselectPoints { .. }
         | Selection::StrokeSegment(_) => None,
     }
+}
+
+fn selection_transform_bounds_scoped(app: &mut EditorApp) -> Option<(f32, f32, f32, f32)> {
+    let Selection::Multi(references) = app.session.selection.clone() else {
+        return selection_transform_bounds(app);
+    };
+    let revision = (
+        app.active_project_tab_id().unwrap_or(0),
+        app.state.render_revision(),
+    );
+    let frame = app.session.current_frame;
+    let project = &app.state.project;
+    let bounds = app.textures.take_placement_bounds_cache(project, revision);
+    let mut geometry = SelectionOverlayGeometry::with_bounds(bounds);
+    let result = geometry.placement_refs_world_bounds_scoped(
+        project,
+        &mut app.textures,
+        revision,
+        &references,
+        frame,
+    );
+    app.textures
+        .store_placement_bounds_cache(geometry.bounds, revision);
+    result
 }
 
 fn selection_default_pivot(app: &EditorApp) -> Option<Vec2> {
@@ -1207,7 +1415,7 @@ fn selection_default_pivot(app: &EditorApp) -> Option<Vec2> {
         placement_idx,
     } = app.session.selection
     {
-        let (_, local_bbox, transform) = drag_start_data(
+        let (_, local_bbox, transform, _) = drag_start_data(
             &app.state.project,
             q0rg_id,
             layer_id,
@@ -1240,8 +1448,22 @@ fn set_selection_transform_pivot(app: &mut EditorApp, point: Vec2) {
     });
 }
 
-fn selected_pivot_hit(app: &EditorApp, view: &StageView, cursor_screen: Pos2) -> bool {
-    selection_transform_pivot(app).is_some_and(|pivot| {
+fn selected_pivot_hit(app: &mut EditorApp, view: &StageView, cursor_screen: Pos2) -> bool {
+    let explicit_pivot = app
+        .session
+        .transform_pivot
+        .as_ref()
+        .filter(|pivot| pivot.selection == app.session.selection)
+        .map(|pivot| pivot.point);
+    let pivot = explicit_pivot.or_else(|| {
+        if matches!(app.session.selection, Selection::Multi(_)) {
+            selection_transform_bounds_scoped(app)
+                .map(|bounds| Vec2::new((bounds.0 + bounds.2) * 0.5, (bounds.1 + bounds.3) * 0.5))
+        } else {
+            selection_transform_pivot(app)
+        }
+    });
+    pivot.is_some_and(|pivot| {
         screen_distance_sq(stage_to_screen(pivot, view), cursor_screen)
             <= PIVOT_HIT_RADIUS_PX * PIVOT_HIT_RADIUS_PX
     })
@@ -1359,7 +1581,7 @@ fn pencil_freehand(
         let samples = raw_freehand_points(ctx, response, view);
         if let ToolState::FreehandDrawing { points } = &mut app.session.tool_state {
             for point in samples {
-                append_freehand_point(points, point, view.scale);
+                append_freehand_point(points, point, view.effective_scale());
             }
         }
     }
@@ -1369,7 +1591,7 @@ fn pencil_freehand(
             std::mem::replace(&mut app.session.tool_state, ToolState::Idle)
         {
             if let Some(point) = cursor {
-                append_freehand_point(&mut points, point, view.scale);
+                append_freehand_point(&mut points, point, view.effective_scale());
             }
             if points.len() >= 2 {
                 commit_path(
@@ -1481,7 +1703,7 @@ fn advanced_input_samples(
 }
 
 fn advanced_brush(app: &mut EditorApp, response: &Response, view: &StageView, ctx: &Context) {
-    let settings = advanced_brush_settings_for_view(app, view.scale);
+    let settings = advanced_brush_settings_for_view(app, view.effective_scale());
     if response.drag_started_by(PointerButton::Primary) {
         if let Some(screen) = response.interact_pointer_pos() {
             let time = ctx.input(|input| input.time);
@@ -1706,7 +1928,7 @@ fn sync_classic_brush_preview_for_view(
 }
 
 fn classic_brush(app: &mut EditorApp, response: &Response, view: &StageView, ctx: &Context) {
-    let settings = brush_settings_for_view(app, view.scale);
+    let settings = brush_settings_for_view(app, view.effective_scale());
     let preview_color = Color32::from_rgba_unmultiplied(
         app.session.brush.color.r,
         app.session.brush.color.g,
@@ -1731,7 +1953,7 @@ fn classic_brush(app: &mut EditorApp, response: &Response, view: &StageView, ctx
                     let contour = classic_prerender_nib_outline(
                         settings.nib,
                         stage_to_screen(position, view),
-                        size * view.scale,
+                        size * view.effective_scale(),
                     );
                     app.textures
                         .raster_classic_brush_preview(&[contour], preview_color);
@@ -1772,9 +1994,9 @@ fn classic_brush(app: &mut EditorApp, response: &Response, view: &StageView, ctx
                         settings.nib,
                         (
                             stage_to_screen(start_position, view),
-                            start_size * view.scale,
+                            start_size * view.effective_scale(),
                         ),
-                        (stage_to_screen(end_position, view), end_size * view.scale),
+                        (stage_to_screen(end_position, view), end_size * view.effective_scale()),
                     ));
                 }
             }
@@ -2564,7 +2786,7 @@ fn lasso(
         let samples = raw_freehand_points(ctx, response, view);
         if let ToolState::LassoDrawing { points } = &mut app.session.tool_state {
             for point in samples {
-                append_freehand_point(points, point, view.scale);
+                append_freehand_point(points, point, view.effective_scale());
             }
         }
     }
@@ -2573,7 +2795,7 @@ fn lasso(
             std::mem::replace(&mut app.session.tool_state, ToolState::Idle)
         {
             if let Some(point) = pointer {
-                append_freehand_point(&mut points, point, view.scale);
+                append_freehand_point(&mut points, point, view.effective_scale());
             }
             let selected = lasso_selection(
                 &app.state.project,
@@ -2691,6 +2913,41 @@ fn remap_group_references_for_edit(
         objects.iter().copied().map(remap).collect::<Option<_>>()?;
     prepare_writable_raw_references(project, &mapped_paths, &mapped_raw, frame);
     Some((mapped_paths, mapped_raw, mapped_objects))
+}
+
+fn remap_object_refs_for_group_transform(
+    project: &mut ProjectV2,
+    objects: &[PlacementRef],
+    frame: u16,
+) -> Option<Vec<PlacementRef>> {
+    let mut mapped = objects.to_vec();
+    let mut keyframe_layers = std::collections::BTreeSet::new();
+    for reference in objects {
+        let (_, rig_bound) = placement_transform_for_edit(
+            project,
+            reference.q0rg_id,
+            reference.layer_id,
+            reference.placement_idx,
+            frame,
+        )?;
+        if !rig_bound {
+            keyframe_layers.insert((reference.q0rg_id, reference.layer_id));
+        }
+    }
+    let refs_to_materialize: Vec<_> = objects
+        .iter()
+        .copied()
+        .filter(|reference| keyframe_layers.contains(&(reference.q0rg_id, reference.layer_id)))
+        .collect();
+    if refs_to_materialize.is_empty() {
+        return Some(mapped);
+    }
+    let keyframed = materialize_placement_refs_for_edit(project, &refs_to_materialize, frame)?;
+    for (source, destination) in refs_to_materialize.iter().zip(keyframed) {
+        let index = objects.iter().position(|reference| reference == source)?;
+        mapped[index] = destination;
+    }
+    Some(mapped)
 }
 
 fn cut_raw_areas_for_drag_prepared(
@@ -3034,7 +3291,7 @@ fn cut_raw_areas_for_drag_prepared(
             }
         }
         app.textures.invalidate_asset(asset_id);
-        app.state.dirty = true;
+        app.state.mark_dirty();
     }
     for (r, asset_id, selected, remainder, appearance_enabled, whole_visual) in jobs {
         #[cfg(not(feature = "appearance-mask-eraser"))]
@@ -3205,7 +3462,7 @@ fn cut_raw_areas_for_drag_prepared(
         );
     }
     if !refs.is_empty() {
-        app.state.dirty = true;
+        app.state.mark_dirty();
     }
     if appearance_changed {
         app.textures.invalidate();
@@ -3255,17 +3512,19 @@ struct GroupTransformData<'a> {
     start_pivot: Vec2,
 }
 
-fn placement_ref_transform(project: &ProjectV2, reference: PlacementRef) -> Option<Transform2D> {
-    project
-        .q0rgs
-        .iter()
-        .find(|q0rg| q0rg.q0rg_id == reference.q0rg_id)?
-        .layers
-        .iter()
-        .find(|layer| layer.layer_id == reference.layer_id)?
-        .placements
-        .get(reference.placement_idx)
-        .map(|placement| placement.transform)
+fn placement_ref_transform(
+    project: &ProjectV2,
+    reference: PlacementRef,
+    frame: u16,
+) -> Option<Transform2D> {
+    placement_transform_for_edit(
+        project,
+        reference.q0rg_id,
+        reference.layer_id,
+        reference.placement_idx,
+        frame,
+    )
+    .map(|(transform, _)| transform)
 }
 
 fn selection_from_group_parts(paths: Vec<PathRef>, objects: Vec<PlacementRef>) -> Selection {
@@ -3374,6 +3633,62 @@ fn raw_style_selection_parts(selection: &Selection) -> Option<RawStyleSelectionP
 }
 
 fn add_selection_hit(current: &Selection, clicked: Selection) -> Selection {
+    if let Selection::Placement {
+        q0rg_id,
+        layer_id,
+        placement_idx,
+    } = &clicked
+    {
+        let clicked_object = PlacementRef {
+            q0rg_id: *q0rg_id,
+            layer_id: *layer_id,
+            placement_idx: *placement_idx,
+        };
+        if let Some((paths, mut objects)) = concrete_selection_parts(current) {
+            if objects.contains(&clicked_object) {
+                objects.retain(|reference| *reference != clicked_object);
+                return selection_from_group_parts(paths, objects);
+            }
+        }
+        if let Some((fills, strokes, segments, mut objects)) = raw_style_selection_parts(current) {
+            if objects.contains(&clicked_object) {
+                objects.retain(|reference| *reference != clicked_object);
+                if fills.is_empty() && strokes.is_empty() && segments.is_empty() {
+                    return selection_from_group_parts(Vec::new(), objects);
+                }
+                return Selection::RawParts {
+                    fills,
+                    strokes,
+                    stroke_segments: segments,
+                    objects,
+                };
+            }
+        }
+        if let Selection::RawArea {
+            placements,
+            objects,
+            bounds_min,
+            bounds_max,
+            clip_polygon,
+        } = current
+        {
+            if objects.contains(&clicked_object) {
+                let mut objects = objects.clone();
+                objects.retain(|reference| *reference != clicked_object);
+                if placements.is_empty() && objects.is_empty() {
+                    return Selection::None;
+                }
+                return Selection::RawArea {
+                    placements: placements.clone(),
+                    objects,
+                    bounds_min: *bounds_min,
+                    bounds_max: *bounds_max,
+                    clip_polygon: clip_polygon.clone(),
+                };
+            }
+        }
+    }
+
     // Once either side distinguishes fill from outline, keep those channels
     // separate. In particular the same PathRef is allowed in both vectors: that
     // means the user Shift-selected both the paint and its outline.
@@ -3447,7 +3762,43 @@ fn begin_group_transform(
     intent: GroupTransformIntent,
     start_cursor: Vec2,
 ) -> bool {
-    let Some(bounds) = selection_transform_bounds(app) else {
+    begin_group_transform_inner(app, selection, intent, start_cursor, true)
+}
+
+pub(crate) fn begin_alt_duplicate_drag(app: &mut EditorApp, start_cursor: Vec2) -> bool {
+    let selection = app.session.selection.clone();
+    match selection {
+        Selection::Placement {
+            q0rg_id,
+            layer_id,
+            placement_idx,
+        } => begin_dragging_placement_inner(
+            app,
+            q0rg_id,
+            layer_id,
+            placement_idx,
+            start_cursor,
+            "Dragging copy",
+            false,
+        ),
+        selection => begin_group_transform_inner(
+            app,
+            selection,
+            GroupTransformIntent::Move,
+            start_cursor,
+            false,
+        ),
+    }
+}
+
+fn begin_group_transform_inner(
+    app: &mut EditorApp,
+    selection: Selection,
+    intent: GroupTransformIntent,
+    start_cursor: Vec2,
+    snapshot_before_edit: bool,
+) -> bool {
+    let Some(bounds) = selection_transform_bounds_scoped(app) else {
         return false;
     };
     if !raw_selection_supports_axis_resize(bounds) {
@@ -3488,7 +3839,9 @@ fn begin_group_transform(
         ),
         _ => return false,
     };
-    app.history.snapshot(&app.state.project);
+    if snapshot_before_edit {
+        app.history.snapshot(&app.state.project);
+    }
     let (mut paths, raw_placements, objects) =
         if let Some((fills, strokes, stroke_segments)) = raw_style_parts {
             let Some(paths) =
@@ -3498,13 +3851,23 @@ fn begin_group_transform(
             };
             (paths, Vec::new(), Vec::new())
         } else {
-            let Some(mapped) = remap_group_references_for_edit(
-                &mut app.state.project,
-                &paths,
-                &raw_placements,
-                &objects,
-                app.session.current_frame,
-            ) else {
+            let mapped = if paths.is_empty() && raw_placements.is_empty() {
+                remap_object_refs_for_group_transform(
+                    &mut app.state.project,
+                    &objects,
+                    app.session.current_frame,
+                )
+                .map(|objects| (paths.clone(), raw_placements.clone(), objects))
+            } else {
+                remap_group_references_for_edit(
+                    &mut app.state.project,
+                    &paths,
+                    &raw_placements,
+                    &objects,
+                    app.session.current_frame,
+                )
+            };
+            let Some(mapped) = mapped else {
                 return false;
             };
             mapped
@@ -3542,7 +3905,9 @@ fn begin_group_transform(
     let start_transforms: Vec<Transform2D> = objects
         .iter()
         .copied()
-        .filter_map(|reference| placement_ref_transform(&app.state.project, reference))
+        .filter_map(|reference| {
+            placement_ref_transform(&app.state.project, reference, app.session.current_frame)
+        })
         .collect();
     if start_paths.len() != paths.len() || start_transforms.len() != objects.len() {
         return false;
@@ -3715,31 +4080,243 @@ fn apply_group_transform(
     };
     let mut changed = set_raw_refs_live_transform(&mut app.state.project, data.refs, transform);
     sync_live_raw_stroke_scale(app, data.refs, transform);
-    for (reference, source) in data
+    let mut object_updates: Vec<_> = data
         .objects
         .iter()
         .copied()
         .zip(data.start_transforms.iter().copied())
-    {
+        .collect();
+    object_updates.sort_by_key(|(reference, _)| {
+        (
+            reference.q0rg_id,
+            placement_rig_hierarchy_depth(&app.state.project, *reference),
+            reference.layer_id,
+            reference.placement_idx,
+        )
+    });
+    for (reference, source) in object_updates {
         let composed = Affine::compose(transform, Affine::from_transform(source));
         let Some(next) = crate::app::affine_to_transform(composed) else {
             continue;
         };
-        if let Some(placement) = placement_mut(
+        changed |= set_placement_transform_for_edit(
             app,
             reference.q0rg_id,
             reference.layer_id,
             reference.placement_idx,
-        ) {
-            placement.transform = next;
-            changed = true;
-        }
+            next,
+        );
     }
     if changed {
-        app.state.dirty = true;
+        let mut locators: Vec<_> = data
+            .refs
+            .iter()
+            .map(|reference| {
+                (
+                    reference.q0rg_id,
+                    reference.layer_id,
+                    reference.placement_idx,
+                )
+            })
+            .chain(data.objects.iter().map(|reference| {
+                (
+                    reference.q0rg_id,
+                    reference.layer_id,
+                    reference.placement_idx,
+                )
+            }))
+            .collect();
+        locators.sort_unstable();
+        locators.dedup();
+        app.mark_placement_transforms_changed(&locators);
         set_selection_transform_pivot(app, transform.apply(data.start_pivot));
     }
     changed
+}
+
+pub(crate) fn flip_selected_placements(app: &mut EditorApp, horizontal: bool) -> bool {
+    if !app.has_active_project() || app.home_visible() || app.active_document_is_q0lang() {
+        return false;
+    }
+    if app.session.pending_timeline_frame.is_some() {
+        app.session.status =
+            "create the future frame with F5, F6, or F7 before flipping artwork".to_string();
+        return false;
+    }
+
+    let previous_selection = app.session.selection.clone();
+    let mut references = match &previous_selection {
+        Selection::Placement {
+            q0rg_id,
+            layer_id,
+            placement_idx,
+        } => vec![PlacementRef {
+            q0rg_id: *q0rg_id,
+            layer_id: *layer_id,
+            placement_idx: *placement_idx,
+        }],
+        Selection::Multi(references) => references.clone(),
+        _ => {
+            app.session.status = "select one or more whole objects to flip".to_string();
+            return false;
+        }
+    };
+    references.sort_by_key(|reference| {
+        (
+            reference.q0rg_id,
+            reference.layer_id,
+            reference.placement_idx,
+        )
+    });
+    references.dedup();
+    let Some(first) = references.first() else {
+        app.session.status = "select one or more whole objects to flip".to_string();
+        return false;
+    };
+    if references
+        .iter()
+        .any(|reference| reference.q0rg_id != first.q0rg_id)
+    {
+        app.session.status = "flip objects from the same symbol together".to_string();
+        return false;
+    }
+    if references.iter().any(|reference| {
+        app.state
+            .project
+            .layer_is_locked(reference.q0rg_id, reference.layer_id)
+    }) {
+        app.session.status = "layer is locked".to_string();
+        return false;
+    }
+
+    let frame = app.session.current_frame;
+    let Some((min_x, min_y, max_x, max_y)) =
+        placement_refs_world_bounds(&app.state.project, &references, frame)
+    else {
+        app.session.status = "selected objects are not on this frame".to_string();
+        return false;
+    };
+    let pivot = app
+        .session
+        .transform_pivot
+        .as_ref()
+        .filter(|pivot| pivot.selection == previous_selection)
+        .map(|pivot| pivot.point)
+        .unwrap_or_else(|| Vec2::new((min_x + max_x) * 0.5, (min_y + max_y) * 0.5));
+    let reflection = if horizontal {
+        Affine {
+            a11: -1.0,
+            tx: pivot.x * 2.0,
+            ..Affine::IDENTITY
+        }
+    } else {
+        Affine {
+            a22: -1.0,
+            ty: pivot.y * 2.0,
+            ..Affine::IDENTITY
+        }
+    };
+    let Some(transform_data) = references
+        .iter()
+        .map(|reference| {
+            let (current, rig_bound) = placement_transform_for_edit(
+                &app.state.project,
+                reference.q0rg_id,
+                reference.layer_id,
+                reference.placement_idx,
+                frame,
+            )?;
+            let transformed = crate::app::affine_to_transform(Affine::compose(
+                reflection,
+                Affine::from_transform(current),
+            ))?;
+            Some((transformed, rig_bound))
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        app.session.status = "a selected object has a degenerate transform".to_string();
+        return false;
+    };
+
+    app.history.snapshot(&app.state.project);
+    let keyframe_layers: std::collections::BTreeSet<_> = references
+        .iter()
+        .zip(&transform_data)
+        .filter_map(|(reference, (_, rig_bound))| {
+            (!*rig_bound).then_some((reference.q0rg_id, reference.layer_id))
+        })
+        .collect();
+    let refs_to_materialize: Vec<_> = references
+        .iter()
+        .copied()
+        .filter(|reference| keyframe_layers.contains(&(reference.q0rg_id, reference.layer_id)))
+        .collect();
+    let mut mapped = references.clone();
+    if !refs_to_materialize.is_empty() {
+        let Some(keyframed) = materialize_placement_refs_for_edit(
+            &mut app.state.project,
+            &refs_to_materialize,
+            frame,
+        ) else {
+            app.session.status = "could not create a keyframe for the flip".to_string();
+            return false;
+        };
+        for (source, destination) in refs_to_materialize.iter().zip(keyframed) {
+            let Some(index) = references.iter().position(|reference| reference == source) else {
+                app.session.status = "selected object changed before flipping".to_string();
+                return false;
+            };
+            mapped[index] = destination;
+        }
+    }
+    let mut transform_updates: Vec<_> = mapped
+        .iter()
+        .copied()
+        .zip(transform_data.iter().map(|(transform, _)| *transform))
+        .collect();
+    transform_updates.sort_by_key(|(reference, _)| {
+        (
+            reference.q0rg_id,
+            placement_rig_hierarchy_depth(&app.state.project, *reference),
+            reference.layer_id,
+            reference.placement_idx,
+        )
+    });
+    for (reference, transform) in transform_updates {
+        if !set_placement_transform_for_edit(
+            app,
+            reference.q0rg_id,
+            reference.layer_id,
+            reference.placement_idx,
+            transform,
+        ) {
+            app.session.status = "selected object changed before flipping".to_string();
+            return false;
+        }
+    }
+
+    let mut locators: Vec<_> = mapped
+        .iter()
+        .map(|reference| {
+            (
+                reference.q0rg_id,
+                reference.layer_id,
+                reference.placement_idx,
+            )
+        })
+        .collect();
+    locators.sort_unstable();
+    locators.dedup();
+    app.session.selection = selection_from_group_parts(Vec::new(), mapped);
+    app.mark_placement_transforms_changed(&locators);
+    set_selection_transform_pivot(app, pivot);
+    app.session.status = if horizontal {
+        "flipped horizontally"
+    } else {
+        "flipped vertically"
+    }
+    .to_string();
+    true
 }
 
 fn begin_transforming_raw_area(
@@ -3895,6 +4472,10 @@ where
     for asset_id in removed {
         project.asset_names.remove(&asset_id);
         project.asset_appearances.remove(&asset_id);
+        project
+            .runtime
+            .library_item_folders
+            .remove(&q0s_format::v2::LibraryItemReference::Asset(asset_id));
     }
 }
 
@@ -3955,7 +4536,7 @@ fn eraser_settings(app: &EditorApp, view_scale: f32) -> crate::brush::BrushSetti
 /// once per gesture. Open strokes and display objects keep their legacy
 /// fallback semantics when no raw fill was touched.
 fn eraser(app: &mut EditorApp, response: &Response, view: &StageView, ctx: &Context) {
-    let settings = eraser_settings(app, view.scale);
+    let settings = eraser_settings(app, view.effective_scale());
     let (preview_fill, preview_outline) = eraser_preview_colors();
     let drag_started = response.drag_started_by(PointerButton::Primary);
     let dragged = response.dragged_by(PointerButton::Primary);
@@ -3977,9 +4558,9 @@ fn eraser(app: &mut EditorApp, response: &Response, view: &StageView, ctx: &Cont
             };
             if let Some((position, size)) = initial {
                 let center = stage_to_screen(position, view);
-                let body = classic_prerender_nib_outline(settings.nib, center, size * view.scale);
+                let body = classic_prerender_nib_outline(settings.nib, center, size * view.effective_scale());
                 let outline =
-                    classic_prerender_nib_outline(settings.nib, center, size * view.scale + 2.0);
+                    classic_prerender_nib_outline(settings.nib, center, size * view.effective_scale() + 2.0);
                 raster_classic_preview_contours(
                     app,
                     &[body],
@@ -4056,9 +4637,9 @@ fn eraser(app: &mut EditorApp, response: &Response, view: &StageView, ctx: &Cont
                     };
                     let start = (
                         stage_to_screen(start_position, view),
-                        start_size * view.scale,
+                        start_size * view.effective_scale(),
                     );
-                    let end = (stage_to_screen(end_position, view), end_size * view.scale);
+                    let end = (stage_to_screen(end_position, view), end_size * view.effective_scale());
                     body_tail.push(classic_prerender_segment_contour(settings.nib, start, end));
                     outline_tail.push(classic_prerender_segment_contour(
                         settings.nib,
@@ -4162,7 +4743,7 @@ fn erase_fallback_at(app: &mut EditorApp, point: Vec2, eraser_radius: f32) {
             remove_assets_and_metadata(&mut app.state.project, [hit.asset_id]);
         }
         app.session.selection = Selection::None;
-        app.state.dirty = true;
+        app.state.mark_dirty();
         app.session.status = if asset_emptied {
             "Drawing cleared".to_string()
         } else {
@@ -4192,7 +4773,7 @@ fn erase_fallback_at(app: &mut EditorApp, point: Vec2, eraser_radius: f32) {
         if placement_idx < layer.placements.len() {
             layer.placements.remove(placement_idx);
             app.session.selection = Selection::None;
-            app.state.dirty = true;
+            app.state.mark_dirty();
             app.session.status = "Instance erased".to_string();
         }
     }
@@ -4427,7 +5008,7 @@ pub(crate) fn draw_brush_size_preview(app: &mut EditorApp, painter: &Painter, vi
     match app.session.brush_mode {
         crate::advanced_brush::BrushMode::Classic => {
             let settings = app.session.brush;
-            let (outer, inner) = classic_preview_diameters_px(settings, view.scale, preview);
+            let (outer, inner) = classic_preview_diameters_px(settings, view.effective_scale(), preview);
             draw_nib_cursor_outline(&painter, center, settings.nib, outer);
             if let Some(inner) = inner {
                 let points =
@@ -4440,7 +5021,7 @@ pub(crate) fn draw_brush_size_preview(app: &mut EditorApp, painter: &Painter, vi
         }
         crate::advanced_brush::BrushMode::Advanced => {
             let settings = app.session.advanced_brush.sanitized();
-            let (outer, inner) = advanced_preview_diameters_px(settings, view.scale, preview);
+            let (outer, inner) = advanced_preview_diameters_px(settings, view.effective_scale(), preview);
             draw_nib_cursor_points(
                 &painter,
                 advanced_nib_outline_points(
@@ -4479,10 +5060,10 @@ fn draw_brush_cursor(app: &EditorApp, painter: &Painter, view: &StageView) {
     }
     match app.session.brush_mode {
         crate::advanced_brush::BrushMode::Classic => {
-            let size_px = brush_cursor_radius_px(app.session.brush, view.scale) * 2.0 + 2.5;
+            let size_px = brush_cursor_radius_px(app.session.brush, view.effective_scale()) * 2.0 + 2.5;
             draw_nib_cursor_outline(painter, center, app.session.brush.nib, size_px);
             if let ToolState::BrushDrawing { stroke } = &app.session.tool_state {
-                if let Some(current_size_px) = classic_dynamic_cursor_size_px(stroke, view.scale) {
+                if let Some(current_size_px) = classic_dynamic_cursor_size_px(stroke, view.effective_scale()) {
                     draw_nib_cursor_accent_outline(
                         painter,
                         center,
@@ -4494,12 +5075,12 @@ fn draw_brush_cursor(app: &EditorApp, painter: &Painter, view: &StageView) {
             }
         }
         crate::advanced_brush::BrushMode::Advanced => {
-            let settings = advanced_brush_settings_for_view(app, view.scale);
+            let settings = advanced_brush_settings_for_view(app, view.effective_scale());
             draw_nib_cursor_points(
                 painter,
                 advanced_nib_outline_points(
                     center,
-                    settings.size * view.scale + 2.5,
+                    settings.size * view.effective_scale() + 2.5,
                     settings.roundness,
                     settings.angle_degrees,
                 ),
@@ -4520,12 +5101,12 @@ fn draw_eraser_cursor(app: &EditorApp, painter: &Painter, view: &StageView) {
     if !painter.clip_rect().contains(center) {
         return;
     }
-    let settings = eraser_settings(app, view.scale);
+    let settings = eraser_settings(app, view.effective_scale());
     draw_nib_cursor_outline(
         painter,
         center,
         settings.nib,
-        settings.size * view.scale + 2.0,
+        settings.size * view.effective_scale() + 2.0,
     );
 }
 
@@ -4596,7 +5177,7 @@ fn draw_nib_cursor_points(painter: &Painter, points: Vec<Pos2>) {
     }
 }
 fn active_custom_transform_cursor(
-    app: &EditorApp,
+    app: &mut EditorApp,
     response: &Response,
     view: &StageView,
 ) -> Option<CustomTransformCursor> {
@@ -4618,7 +5199,7 @@ fn active_custom_transform_cursor(
 }
 
 fn draw_transform_cursor(
-    app: &EditorApp,
+    app: &mut EditorApp,
     response: &Response,
     painter: &Painter,
     view: &StageView,
@@ -4735,29 +5316,36 @@ fn begin_dragging_placement(
     start_cursor: Vec2,
     status: &str,
 ) -> bool {
+    begin_dragging_placement_inner(
+        app,
+        q0rg_id,
+        layer_id,
+        placement_idx,
+        start_cursor,
+        status,
+        true,
+    )
+}
+
+fn begin_dragging_placement_inner(
+    app: &mut EditorApp,
+    q0rg_id: u16,
+    layer_id: u16,
+    placement_idx: usize,
+    start_cursor: Vec2,
+    status: &str,
+    snapshot_before_edit: bool,
+) -> bool {
     let previous_selection = app.session.selection.clone();
-    let rig_bound = app
-        .state
-        .project
-        .q0rgs
-        .iter()
-        .find(|q| q.q0rg_id == q0rg_id)
-        .and_then(|q| q.layers.iter().find(|layer| layer.layer_id == layer_id))
-        .and_then(|layer| {
-            active_visual_affine_for_placement(
-                &app.state.project,
-                q0rg_id,
-                layer,
-                placement_idx,
-                app.session.current_frame,
-            )
-        })
-        .is_some_and(|(_, bound)| bound);
-    if rig_bound {
-        app.session.status =
-            "rig-bound object: pose/move it with the Rig tool or edit its binding".into();
+    let Some((transform, rig_bound)) = placement_transform_for_edit(
+        &app.state.project,
+        q0rg_id,
+        layer_id,
+        placement_idx,
+        app.session.current_frame,
+    ) else {
         return false;
-    }
+    };
     let custom_pivot = app
         .session
         .transform_pivot
@@ -4776,25 +5364,22 @@ fn begin_dragging_placement(
             )
         })
         .map(|pivot| pivot.point);
-    let Some(transform) = placement_transform(
-        &app.state.project,
-        q0rg_id,
-        layer_id,
-        placement_idx,
-        app.session.current_frame,
-    ) else {
-        return false;
-    };
-
-    app.history.snapshot(&app.state.project);
-    let Some(placement_idx) = materialize_placement_keyframe_for_edit(
-        &mut app.state.project,
-        q0rg_id,
-        layer_id,
-        placement_idx,
-        app.session.current_frame,
-    ) else {
-        return false;
+    if snapshot_before_edit {
+        app.history.snapshot(&app.state.project);
+    }
+    let placement_idx = if rig_bound {
+        placement_idx
+    } else {
+        let Some(placement_idx) = materialize_placement_keyframe_for_edit(
+            &mut app.state.project,
+            q0rg_id,
+            layer_id,
+            placement_idx,
+            app.session.current_frame,
+        ) else {
+            return false;
+        };
+        placement_idx
     };
     app.session.selection = Selection::Placement {
         q0rg_id,
@@ -4815,7 +5400,11 @@ fn begin_dragging_placement(
         cursor_offset,
         pivot_cursor_offset,
     };
-    app.session.status = status.to_string();
+    app.session.status = if rig_bound {
+        format!("{status}; bone binding stays connected")
+    } else {
+        status.to_string()
+    };
     true
 }
 
@@ -4827,7 +5416,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
             input.modifiers.alt,
         )
     });
-    let hit_slop = HitSlop::for_scale(view.scale);
+    let hit_slop = HitSlop::for_scale(view.effective_scale());
     // Double-click a q0rg-instance placement to enter that q0rg (Flash semantics).
     if response.double_clicked_by(PointerButton::Primary) {
         if let Some(p) = cursor {
@@ -4848,7 +5437,26 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                     .and_then(|l| l.placements.get(idx))
                     .map(|pl| pl.target)
                 {
-                    app.queue(crate::app::Action::EnterQ0rg(child));
+                    app.queue(crate::app::Action::EnterQ0rgInPlace {
+                        q0rg_id: child,
+                        layer_id,
+                        placement_idx: idx,
+                    });
+                    return;
+                }
+            }
+            if !app.session.edit_in_place.is_empty() {
+                let outside = crate::render::q0rg_frame_bbox(
+                    &app.state.project,
+                    app.session.current_q0rg_id,
+                    app.session.current_frame,
+                )
+                .map(|(min_x, min_y, max_x, max_y)| {
+                    p.x < min_x || p.y < min_y || p.x > max_x || p.y > max_y
+                })
+                .unwrap_or(true);
+                if outside {
+                    app.queue(crate::app::Action::ExitQ0rg);
                     return;
                 }
             }
@@ -4912,6 +5520,9 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 hit_slop,
             ) {
                 Some((layer_id, idx)) => {
+                    app.session.current_layer_id = layer_id;
+                    app.session.timeline_scroll_to_layer =
+                        Some((app.session.current_q0rg_id, layer_id));
                     let clicked = Selection::Placement {
                         q0rg_id: app.session.current_q0rg_id,
                         layer_id,
@@ -4957,6 +5568,30 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                     return;
                 }
             }
+            if alt_down {
+                let selected_objects = crate::selection_edit::selected_object_refs(
+                    &app.state.project,
+                    &app.session.selection,
+                );
+                let hit_is_selected = hit_test_selectable_placement_with_slop(
+                    &app.state.project,
+                    app.session.current_q0rg_id,
+                    app.session.current_frame,
+                    p,
+                    hit_slop,
+                )
+                .is_some_and(|(layer_id, placement_idx)| {
+                    selected_objects.contains(&PlacementRef {
+                        q0rg_id: app.session.current_q0rg_id,
+                        layer_id,
+                        placement_idx,
+                    })
+                });
+                if hit_is_selected {
+                    app.queue(crate::app::Action::AltDragDuplicateSelection(p));
+                    return;
+                }
+            }
             let group_selection = match &app.session.selection {
                 Selection::RawArea { objects, .. } if !objects.is_empty() => {
                     Some(app.session.selection.clone())
@@ -4970,7 +5605,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 _ => None,
             };
             if let (Some(selection), Some(screen_pos)) = (group_selection, cursor_screen) {
-                if let Some(bounds) = selection_transform_bounds(app) {
+                if let Some(bounds) = selection_transform_bounds_scoped(app) {
                     if let Some(hit) = hit_test_raw_transform(bounds, view, screen_pos) {
                         if begin_group_transform(app, selection, GroupTransformIntent::Hit(hit), p)
                         {
@@ -5049,7 +5684,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 _ => None,
             };
             if let Some(selection) = group_selection {
-                if let Some(bounds) = selection_transform_bounds(app) {
+                if let Some(bounds) = selection_transform_bounds_scoped(app) {
                     if p.x >= bounds.0
                         && p.x <= bounds.2
                         && p.y >= bounds.1
@@ -5223,7 +5858,8 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 Some(screen_pos),
             ) = (app.session.selection.clone(), cursor_screen)
             {
-                if let Some((world_bbox, local_bbox, start_t)) = drag_start_data(
+                app.session.current_layer_id = layer_id;
+                if let Some((world_bbox, local_bbox, start_t, rig_bound)) = drag_start_data(
                     &app.state.project,
                     q0rg_id,
                     layer_id,
@@ -5240,14 +5876,19 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                                 .map(|inverse| inverse.apply(point))
                         });
                         app.history.snapshot(&app.state.project);
-                        let Some(placement_idx) = materialize_placement_keyframe_for_edit(
-                            &mut app.state.project,
-                            q0rg_id,
-                            layer_id,
-                            placement_idx,
-                            app.session.current_frame,
-                        ) else {
-                            return;
+                        let placement_idx = if rig_bound {
+                            placement_idx
+                        } else {
+                            let Some(placement_idx) = materialize_placement_keyframe_for_edit(
+                                &mut app.state.project,
+                                q0rg_id,
+                                layer_id,
+                                placement_idx,
+                                app.session.current_frame,
+                            ) else {
+                                return;
+                            };
+                            placement_idx
                         };
                         app.session.selection = Selection::Placement {
                             q0rg_id,
@@ -5403,6 +6044,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 hit_slop,
             ) {
                 let q0rg_id = app.session.current_q0rg_id;
+                app.session.current_layer_id = layer_id;
                 let previous_selection = app.session.selection.clone();
                 let custom_pivot = app
                     .session
@@ -5427,7 +6069,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                     layer_id,
                     placement_idx: idx,
                 };
-                if let Some(t) = placement_transform(
+                if let Some((t, rig_bound)) = placement_transform_for_edit(
                     &app.state.project,
                     q0rg_id,
                     layer_id,
@@ -5435,14 +6077,19 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                     app.session.current_frame,
                 ) {
                     app.history.snapshot(&app.state.project);
-                    let Some(placement_idx) = materialize_placement_keyframe_for_edit(
-                        &mut app.state.project,
-                        q0rg_id,
-                        layer_id,
-                        idx,
-                        app.session.current_frame,
-                    ) else {
-                        return;
+                    let placement_idx = if rig_bound {
+                        idx
+                    } else {
+                        let Some(placement_idx) = materialize_placement_keyframe_for_edit(
+                            &mut app.state.project,
+                            q0rg_id,
+                            layer_id,
+                            idx,
+                            app.session.current_frame,
+                        ) else {
+                            return;
+                        };
+                        placement_idx
                     };
                     app.session.selection = Selection::Placement {
                         q0rg_id,
@@ -5463,7 +6110,11 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                         cursor_offset,
                         pivot_cursor_offset,
                     };
-                    app.session.status = "Object keyframed and selected".to_string();
+                    app.session.status = if rig_bound {
+                        "rigged object selected; transforms keep its bone binding".to_string()
+                    } else {
+                        "object keyframed and selected".to_string()
+                    };
                 }
             } else {
                 // 4. An empty stage starts a rubber-band marquee. Selection is
@@ -5492,14 +6143,30 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                         shift_down,
                     );
                     let constrained = Vec2::new(start_cursor.x + delta.x, start_cursor.y + delta.y);
-                    let mut moved = false;
-                    if let Some(pl) = placement_mut(app, q0rg_id, layer_id, placement_idx) {
-                        pl.transform.tx = constrained.x + cursor_offset.x;
-                        pl.transform.ty = constrained.y + cursor_offset.y;
-                        moved = true;
-                    }
+                    let moved = placement_transform_for_edit(
+                        &app.state.project,
+                        q0rg_id,
+                        layer_id,
+                        placement_idx,
+                        app.session.current_frame,
+                    )
+                    .is_some_and(|(mut transform, _)| {
+                        transform.tx = constrained.x + cursor_offset.x;
+                        transform.ty = constrained.y + cursor_offset.y;
+                        set_placement_transform_for_edit(
+                            app,
+                            q0rg_id,
+                            layer_id,
+                            placement_idx,
+                            transform,
+                        )
+                    });
                     if moved {
-                        app.state.dirty = true;
+                        app.mark_placement_transforms_changed(&[(
+                            q0rg_id,
+                            layer_id,
+                            placement_idx,
+                        )]);
                         if let Some(offset) = pivot_cursor_offset {
                             set_selection_transform_pivot(
                                 app,
@@ -5531,7 +6198,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                         &start_path,
                         delta,
                     ) {
-                        app.state.dirty = true;
+                        app.state.mark_artwork_dirty();
                         if let Some(asset_id) = raw_placement_asset_id(
                             &app.state.project,
                             q0rg_id,
@@ -5561,7 +6228,17 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                     };
                     if set_raw_refs_live_transform(&mut app.state.project, &refs, transform) {
                         sync_live_raw_stroke_scale(app, &refs, transform);
-                        app.state.dirty = true;
+                        let locators: Vec<_> = refs
+                            .iter()
+                            .map(|reference| {
+                                (
+                                    reference.q0rg_id,
+                                    reference.layer_id,
+                                    reference.placement_idx,
+                                )
+                            })
+                            .collect();
+                        app.mark_placement_transforms_changed(&locators);
                         if let Some(pivot) = start_pivot {
                             set_selection_transform_pivot(
                                 app,
@@ -5591,7 +6268,17 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                     ) {
                         if set_raw_refs_live_transform(&mut app.state.project, &refs, transform) {
                             sync_live_raw_stroke_scale(app, &refs, transform);
-                            app.state.dirty = true;
+                            let locators: Vec<_> = refs
+                                .iter()
+                                .map(|reference| {
+                                    (
+                                        reference.q0rg_id,
+                                        reference.layer_id,
+                                        reference.placement_idx,
+                                    )
+                                })
+                                .collect();
+                            app.mark_placement_transforms_changed(&locators);
                             set_selection_transform_pivot(app, transform.apply(start_pivot));
                         }
                     }
@@ -5616,7 +6303,17 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                     ) {
                         if set_raw_refs_live_transform(&mut app.state.project, &refs, transform) {
                             sync_live_raw_stroke_scale(app, &refs, transform);
-                            app.state.dirty = true;
+                            let locators: Vec<_> = refs
+                                .iter()
+                                .map(|reference| {
+                                    (
+                                        reference.q0rg_id,
+                                        reference.layer_id,
+                                        reference.placement_idx,
+                                    )
+                                })
+                                .collect();
+                            app.mark_placement_transforms_changed(&locators);
                         }
                     }
                 }
@@ -5643,7 +6340,17 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                     ) {
                         if set_raw_refs_live_transform(&mut app.state.project, &refs, transform) {
                             sync_live_raw_stroke_scale(app, &refs, transform);
-                            app.state.dirty = true;
+                            let locators: Vec<_> = refs
+                                .iter()
+                                .map(|reference| {
+                                    (
+                                        reference.q0rg_id,
+                                        reference.layer_id,
+                                        reference.placement_idx,
+                                    )
+                                })
+                                .collect();
+                            app.mark_placement_transforms_changed(&locators);
                             set_selection_transform_pivot(app, transform.apply(start_pivot));
                         }
                     }
@@ -5669,7 +6376,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                         &start_path,
                         delta,
                     ) {
-                        app.state.dirty = true;
+                        app.state.mark_artwork_dirty();
                         if let Some(asset_id) = raw_placement_asset_id(
                             &app.state.project,
                             path.q0rg_id,
@@ -5704,28 +6411,37 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 pivot_local,
             } => {
                 if let Some(p) = cursor {
-                    let mut next_pivot = None;
-                    let mut changed = false;
-                    if let Some(pl) = placement_mut(app, q0rg_id, layer_id, placement_idx) {
-                        if apply_handle_drag(
-                            &mut pl.transform,
-                            start_transform,
-                            start_local_bbox,
-                            handle,
-                            p,
-                            pivot_local,
-                            ScaleDragModifiers {
-                                ignore_pivot: ctrl_down,
-                                lock_aspect: shift_down && handle.is_corner(),
-                            },
-                        ) {
-                            changed = true;
-                            next_pivot = pivot_local
-                                .map(|local| Affine::from_transform(pl.transform).apply(local));
-                        }
-                    }
+                    let mut next_transform = start_transform;
+                    let changed = apply_handle_drag(
+                        &mut next_transform,
+                        start_transform,
+                        start_local_bbox,
+                        handle,
+                        p,
+                        pivot_local,
+                        ScaleDragModifiers {
+                            ignore_pivot: ctrl_down,
+                            lock_aspect: shift_down && handle.is_corner(),
+                        },
+                    ) && set_placement_transform_for_edit(
+                        app,
+                        q0rg_id,
+                        layer_id,
+                        placement_idx,
+                        next_transform,
+                    );
+                    let next_pivot = changed
+                        .then(|| {
+                            pivot_local
+                                .map(|local| Affine::from_transform(next_transform).apply(local))
+                        })
+                        .flatten();
                     if changed {
-                        app.state.dirty = true;
+                        app.mark_placement_transforms_changed(&[(
+                            q0rg_id,
+                            layer_id,
+                            placement_idx,
+                        )]);
                         if let Some(pivot) = next_pivot {
                             set_selection_transform_pivot(app, pivot);
                         }
@@ -5746,14 +6462,24 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                         (p.y - center_world.y).atan2(p.x - center_world.x) - start_angle,
                         shift_down,
                     );
-                    if let Some(pl) = placement_mut(app, q0rg_id, layer_id, placement_idx) {
-                        pl.transform = rotate_placement_about_local_point(
-                            start_transform,
-                            center_local,
-                            center_world,
-                            delta,
-                        );
-                        app.state.dirty = true;
+                    let next_transform = rotate_placement_about_local_point(
+                        start_transform,
+                        center_local,
+                        center_world,
+                        delta,
+                    );
+                    if set_placement_transform_for_edit(
+                        app,
+                        q0rg_id,
+                        layer_id,
+                        placement_idx,
+                        next_transform,
+                    ) {
+                        app.mark_placement_transforms_changed(&[(
+                            q0rg_id,
+                            layer_id,
+                            placement_idx,
+                        )]);
                     }
                 }
             }
@@ -5776,13 +6502,19 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                         p,
                         pivot_local,
                     ) {
-                        let mut changed = false;
-                        if let Some(pl) = placement_mut(app, q0rg_id, layer_id, placement_idx) {
-                            pl.transform = next;
-                            changed = true;
-                        }
+                        let changed = set_placement_transform_for_edit(
+                            app,
+                            q0rg_id,
+                            layer_id,
+                            placement_idx,
+                            next,
+                        );
                         if changed {
-                            app.state.dirty = true;
+                            app.mark_placement_transforms_changed(&[(
+                                q0rg_id,
+                                layer_id,
+                                placement_idx,
+                            )]);
                             if let Some(local) = pivot_local {
                                 set_selection_transform_pivot(
                                     app,
@@ -5867,7 +6599,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
         let raw_assets = raw_edit_assets(&app.state.project, &finished_state);
         if let Some(refs) = live_raw_transform_refs(&finished_state) {
             if bake_raw_refs_live_transform(app, refs) {
-                app.state.dirty = true;
+                app.state.mark_dirty();
             }
         }
         let finished_drag = matches!(
@@ -5923,7 +6655,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
             })
             .unwrap_or(Selection::None);
             app.session.status = "Touching raw fills merged".to_string();
-            app.state.dirty = true;
+            app.state.mark_dirty();
         }
         if finished_drag {
             app.session.tool_state = ToolState::Idle;
@@ -6320,6 +7052,7 @@ fn hit_test_raw_hover_cached(
     hit_test_raw_hover_cached_with_slop(project, textures, q0rg_id, frame, cursor, HitSlop::ONE_X)
 }
 
+#[cfg(test)]
 fn hit_test_raw_hover_cached_with_slop(
     project: &ProjectV2,
     textures: &mut TextureCache,
@@ -6393,6 +7126,100 @@ fn hit_test_raw_hover_cached_with_slop(
         }
         false
     }
+}
+
+fn hit_test_raw_hover_scoped(
+    project: &ProjectV2,
+    textures: &mut TextureCache,
+    q0rg_id: u16,
+    frame: u16,
+    cursor: Vec2,
+    slop: HitSlop,
+    revision: (u64, u64),
+) -> bool {
+    textures.with_placement_bounds_cache(project, revision, |bounds, textures| {
+        let Some(q0rg) = bounds.q0rg(project, q0rg_id) else {
+            return false;
+        };
+        for layer in q0rg.layers.iter().rev() {
+            if !project.layer_is_visible(q0rg_id, layer.layer_id)
+                || project.layer_is_locked(q0rg_id, layer.layer_id)
+            {
+                continue;
+            }
+            for active in textures
+                .scoped_active_placement_states_at(project, revision, q0rg_id, layer, frame)
+                .into_iter()
+                .rev()
+            {
+                let Some(placement) = layer.placements.get(active.index) else {
+                    continue;
+                };
+                if !is_raw_graphics_placement_cached(project, placement, bounds) {
+                    continue;
+                }
+                let Target::Asset(asset_id) = placement.target else {
+                    continue;
+                };
+                let Some(Asset::Vector(vector)) = bounds.asset(project, asset_id) else {
+                    continue;
+                };
+                let appearance = project.asset_appearances.get(&asset_id);
+                #[cfg(feature = "appearance-mask-eraser")]
+                {
+                    if vector.fill.is_some()
+                        && interactive_visible_fill_hit_cached(
+                            vector, appearance, cursor, slop.edge, textures,
+                        )
+                    {
+                        return true;
+                    }
+                    let geometry = textures.appearance_hit_geometry(vector, appearance);
+                    let stroke_radius = vector
+                        .stroke
+                        .as_ref()
+                        .map(|stroke| stroke.width.max(1.0) * 0.5 + slop.stroke)
+                        .unwrap_or(slop.stroke);
+                    for path in geometry.strokes.iter().rev() {
+                        if let Some((min_x, min_y, max_x, max_y)) = path.bounds {
+                            if cursor.x < min_x - stroke_radius
+                                || cursor.x > max_x + stroke_radius
+                                || cursor.y < min_y - stroke_radius
+                                || cursor.y > max_y + stroke_radius
+                            {
+                                continue;
+                            }
+                        }
+                        if nearest_segment_distance(&path.points, cursor) <= stroke_radius {
+                            return true;
+                        }
+                    }
+                }
+                #[cfg(not(feature = "appearance-mask-eraser"))]
+                {
+                    if vector.fill.is_some()
+                        && interactive_visible_fill_hit(vector, appearance, cursor, slop.edge)
+                    {
+                        return true;
+                    }
+                    let stroke_radius = vector
+                        .stroke
+                        .as_ref()
+                        .map(|stroke| stroke.width.max(1.0) * 0.5 + slop.stroke)
+                        .unwrap_or(slop.stroke);
+                    for path in vector.paths.iter().rev() {
+                        let points = flatten_path(path);
+                        if points.len() >= 2
+                            && nearest_segment_distance(&points, cursor) <= stroke_radius
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7123,7 +7950,7 @@ pub(crate) fn materialize_raw_paths_as_placements(
     if placements.is_empty() {
         return None;
     }
-    app.state.dirty = true;
+    app.state.mark_dirty();
     app.textures.invalidate_assets(touched_assets);
     #[cfg(feature = "appearance-mask-eraser")]
     for (asset_id, path_count, remainder_asset_id, seed) in render_seeds {
@@ -7442,7 +8269,7 @@ pub(crate) fn materialize_raw_style_parts_with_segments(
     if selected_refs.is_empty() {
         return None;
     }
-    app.state.dirty = true;
+    app.state.mark_dirty();
     app.textures.invalidate_assets(touched_assets);
     Some(selected_refs)
 }
@@ -8557,7 +9384,7 @@ fn isolate_partial_appearance_raw_refs(app: &mut EditorApp, refs: Vec<PathRef>) 
             })
             .collect();
         app.textures.invalidate_asset(asset_id);
-        app.state.dirty = true;
+        app.state.mark_dirty();
         remapped
     }
 }
@@ -9356,7 +10183,7 @@ pub(crate) fn set_selected_stroke_width(app: &mut EditorApp, width: f32) -> bool
         app.textures.invalidate_assets(asset_ids);
         app.session.selection = selection_from_group_parts(refs, Vec::new());
         app.session.stroke_width = width;
-        app.state.dirty = true;
+        app.state.mark_dirty();
     }
     changed
 }
@@ -9757,7 +10584,7 @@ fn replace_raw_path_points_translated(
 }
 
 type Aabb = (f32, f32, f32, f32);
-type DragStartData = (Aabb, Aabb, Transform2D);
+type DragStartData = (Aabb, Aabb, Transform2D, bool);
 
 /// Pull together the snapshot data needed at drag-start: world AABB, local
 /// AABB, and the transform itself.  Returns None if any of these can't be
@@ -9775,21 +10602,13 @@ fn drag_start_data(
         .find(|q| q.q0rg_id == q0rg_id)
         .and_then(|q| q.layers.iter().find(|l| l.layer_id == layer_id))?;
     let pl = layer.placements.get(placement_idx)?;
-    let (_, rig_bound) =
-        active_visual_affine_for_placement(project, q0rg_id, layer, placement_idx, frame)?;
-    if rig_bound {
-        // A rig binding owns the displayed matrix. Ordinary free-transform would
-        // edit the hidden placement key and appear to do nothing, so the Select
-        // tool deliberately withholds transform handles for bound objects.
-        return None;
-    }
-    let active_transform =
-        crate::render::active_transform_for_placement(layer, placement_idx, frame)?;
+    let (active_transform, rig_bound) =
+        placement_transform_for_edit(project, q0rg_id, layer_id, placement_idx, frame)?;
     let mut visual = pl.clone();
     visual.transform = active_transform;
     let world = placement_bbox(project, &visual)?;
     let local = placement_local_bbox(project, &visual)?;
-    Some((world, local, active_transform))
+    Some((world, local, active_transform, rig_bound))
 }
 
 /// Materialize the complete visible layer state at `frame` before an edit.
@@ -9875,7 +10694,7 @@ pub(crate) fn materialize_layer_keyframe_for_edit(
     let insert_at = layer.placements.len();
     for (offset, (source_index, placement)) in clones.into_iter().enumerate() {
         let new_index = insert_at + offset;
-        layer.placements.push(placement);
+        layer.push_placement(placement);
         mapping.insert(source_index, new_index);
     }
     Some(mapping)
@@ -10707,10 +11526,11 @@ fn commit_vector_path(app: &mut EditorApp, new_path: VPath, mode: DrawingMode) {
             .find(|a| a.id() == asset_id)
         {
             v.paths.push(new_path);
+            let path_count = v.paths.len();
             app.textures.invalidate_asset(asset_id);
-            app.state.dirty = true;
+            app.state.mark_dirty();
             app.session.status = match mode {
-                DrawingMode::Merge => format!("Shape updated ({} paths)", v.paths.len()),
+                DrawingMode::Merge => format!("Shape updated ({} paths)", path_count),
                 DrawingMode::Object => unreachable!(),
             };
             return;
@@ -10734,7 +11554,7 @@ fn commit_vector_path(app: &mut EditorApp, new_path: VPath, mode: DrawingMode) {
         .find(|q| q.q0rg_id == q0rg_id)
     {
         if let Some(layer) = q.layers.iter_mut().find(|l| l.layer_id == layer_id) {
-            layer.placements.push(Placement {
+            layer.push_placement(Placement {
                 instance_id: 0,
                 frame,
                 target: Target::Asset(asset_id),
@@ -10742,7 +11562,7 @@ fn commit_vector_path(app: &mut EditorApp, new_path: VPath, mode: DrawingMode) {
                 tween: Tween::None,
                 fx: Default::default(),
             });
-            app.state.dirty = true;
+            app.state.mark_dirty();
             app.session.status = match mode {
                 DrawingMode::Object => "New object".to_string(),
                 DrawingMode::Merge => "New drawing".to_string(),
@@ -10850,19 +11670,115 @@ fn next_asset_id(project: &ProjectV2) -> u16 {
         .max(1)
 }
 
-fn placement_transform(
+pub(crate) fn placement_transform_for_edit(
     project: &ProjectV2,
     q0rg_id: u16,
     layer_id: u16,
-    idx: usize,
+    placement_idx: usize,
     frame: u16,
-) -> Option<Transform2D> {
-    project
+) -> Option<(Transform2D, bool)> {
+    let layer = project
         .q0rgs
         .iter()
-        .find(|q| q.q0rg_id == q0rg_id)
-        .and_then(|q| q.layers.iter().find(|l| l.layer_id == layer_id))
-        .and_then(|layer| crate::render::active_transform_for_placement(layer, idx, frame))
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)?
+        .layers
+        .iter()
+        .find(|layer| layer.layer_id == layer_id)?;
+    let (visual_affine, rig_bound) =
+        active_visual_affine_for_placement(project, q0rg_id, layer, placement_idx, frame)?;
+    let transform = if rig_bound {
+        crate::app::affine_to_transform(visual_affine)?
+    } else {
+        crate::render::active_transform_for_placement(layer, placement_idx, frame)?
+    };
+    Some((transform, rig_bound))
+}
+
+fn placement_rig_hierarchy_depth(project: &ProjectV2, reference: PlacementRef) -> usize {
+    let Some(instance_id) = project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == reference.q0rg_id)
+        .and_then(|q0rg| {
+            q0rg.layers
+                .iter()
+                .find(|layer| layer.layer_id == reference.layer_id)
+        })
+        .and_then(|layer| layer.placements.get(reference.placement_idx))
+        .map(|placement| placement.instance_id)
+    else {
+        return 0;
+    };
+    let Some(rig) = q0s_format::rig::rig_for_q0rg(project, reference.q0rg_id) else {
+        return 0;
+    };
+    let Some(mut node) = rig.nodes.iter().find(|node| {
+        node.binding
+            .is_some_and(|binding| binding.instance_id == instance_id)
+    }) else {
+        return 0;
+    };
+    let mut depth = 0;
+    for _ in 0..rig.nodes.len() {
+        let Some(parent_id) = node.parent else {
+            break;
+        };
+        let Some(parent) = rig.nodes.iter().find(|node| node.node_id == parent_id) else {
+            break;
+        };
+        depth += 1;
+        node = parent;
+    }
+    depth
+}
+
+pub(crate) fn set_placement_transform_for_edit(
+    app: &mut EditorApp,
+    q0rg_id: u16,
+    layer_id: u16,
+    placement_idx: usize,
+    transform: Transform2D,
+) -> bool {
+    let Some(instance_id) = app
+        .state
+        .project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+        .and_then(|q0rg| q0rg.layers.iter().find(|layer| layer.layer_id == layer_id))
+        .and_then(|layer| layer.placements.get(placement_idx))
+        .map(|placement| placement.instance_id)
+    else {
+        return false;
+    };
+
+    if instance_id != 0 {
+        let node_id = q0s_format::rig::rig_for_q0rg(&app.state.project, q0rg_id).and_then(|rig| {
+            rig.nodes.iter().find_map(|node| {
+                node.binding
+                    .filter(|binding| binding.instance_id == instance_id)
+                    .map(|_| node.node_id)
+            })
+        });
+        if let Some(node_id) = node_id {
+            let frame = app.session.current_frame;
+            let auto_key = app.session.rig_auto_key;
+            return crate::rigging::set_node_world_transform_from_binding(
+                &mut app.state.project,
+                q0rg_id,
+                node_id,
+                frame,
+                Affine::from_transform(transform),
+                auto_key,
+            );
+        }
+    }
+
+    let Some(placement) = placement_mut(app, q0rg_id, layer_id, placement_idx) else {
+        return false;
+    };
+    placement.transform = transform;
+    true
 }
 
 pub fn hit_test_placement_pub(
@@ -10996,7 +11912,7 @@ fn collect_placements_in_rect(
         {
             continue;
         }
-        for (idx, transform) in crate::render::active_placements_at(layer, frame)
+        for (idx, visual_affine, _, _) in active_visual_states(project, q0rg_id, layer, frame)
             .into_iter()
             .rev()
         {
@@ -11009,6 +11925,9 @@ fn collect_placements_in_rect(
             if is_raw_graphics_placement(project, placement) {
                 continue;
             }
+            let Some(transform) = crate::app::affine_to_transform(visual_affine) else {
+                continue;
+            };
             let mut visual = placement.clone();
             visual.transform = transform;
             let Some(bbox) = placement_bbox(project, &visual) else {
@@ -11222,12 +12141,34 @@ fn is_raw_graphics_placement(project: &ProjectV2, placement: &Placement) -> bool
     )
 }
 
+fn is_raw_graphics_placement_cached(
+    project: &ProjectV2,
+    placement: &Placement,
+    bounds: &crate::render::PlacementBoundsCache,
+) -> bool {
+    if placement.transform != Transform2D::IDENTITY || !matches!(placement.tween, Tween::None) {
+        return false;
+    }
+    if let Target::Asset(asset_id) = placement.target {
+        if project
+            .asset_names
+            .get(&asset_id)
+            .is_some_and(|name| crate::text_tool::decode_source(name).is_some())
+        {
+            return false;
+        }
+        return matches!(bounds.asset(project, asset_id), Some(Asset::Vector(_)));
+    }
+    false
+}
+
 /// Object hit-test used by the Selection tool. q0rg instances, bitmaps and
 /// transformed vector instances retain their placement bbox/handles; raw
 /// graphics are reachable only through fill/path hit-testing.
 fn asset_visible_body_contains_point(
     project: &ProjectV2,
     asset_id: u16,
+    asset: &Asset,
     transform: Affine,
     point: Vec2,
     edge_tolerance: f32,
@@ -11238,9 +12179,6 @@ fn asset_visible_body_contains_point(
     };
     let local = inverse.apply(point);
     let tolerance = edge_tolerance / transform.uniform_scale().max(0.05);
-    let Some(asset) = project.assets.iter().find(|asset| asset.id() == asset_id) else {
-        return false;
-    };
     match asset {
         Asset::Vector(vector) => {
             let appearance = project.asset_appearances.get(&asset_id);
@@ -11396,12 +12334,22 @@ fn q0rg_visible_body_contains_point(
     point: Vec2,
     edge_tolerance: f32,
     mut textures: Option<&mut TextureCache>,
+    bounds_cache: &mut crate::render::PlacementBoundsCache,
+    revision: Option<(u64, u64)>,
     depth: u8,
 ) -> bool {
     if depth > 8 {
         return false;
     }
-    let Some(q0rg) = project.q0rgs.iter().find(|q0rg| q0rg.q0rg_id == q0rg_id) else {
+    if bounds_cache.q0rg_body_bounds_are_static(project, q0rg_id) {
+        let Some(bounds) = bounds_cache.target_local_bbox(project, Target::Q0rg(q0rg_id)) else {
+            return false;
+        };
+        if !affine_local_bbox_contains(bounds, parent, point) {
+            return false;
+        }
+    }
+    let Some(q0rg) = bounds_cache.q0rg(project, q0rg_id) else {
         return false;
     };
     let local_frame = if q0rg.frame_count > 0 {
@@ -11409,30 +12357,58 @@ fn q0rg_visible_body_contains_point(
     } else {
         0
     };
-    let rig_pose = q0s_format::rig::rig_for_q0rg(project, q0rg_id)
-        .map(|rig| q0s_format::rig::evaluate_rig(rig, f32::from(local_frame), &[]));
+    let rig_pose = match (textures.as_deref_mut(), revision) {
+        (Some(textures), Some(revision)) => {
+            textures.scoped_rig_pose(project, revision, q0rg_id, local_frame)
+        }
+        _ => q0s_format::rig::rig_for_q0rg(project, q0rg_id).map(|rig| {
+            std::rc::Rc::new(q0s_format::rig::evaluate_rig(
+                rig,
+                f32::from(local_frame),
+                &[],
+            ))
+        }),
+    };
     for layer in q0rg.layers.iter().rev() {
         if !project.layer_is_visible(q0rg_id, layer.layer_id) {
             continue;
         }
-        for (index, visual_affine, _, resolved_fx) in
-            active_visual_states_with_rig_pose(layer, local_frame, rig_pose.as_ref())
-                .into_iter()
-                .rev()
-        {
+        let active_states = match (textures.as_deref_mut(), revision) {
+            (Some(textures), Some(revision)) => textures.scoped_active_placement_states_at(
+                project,
+                revision,
+                q0rg_id,
+                layer,
+                local_frame,
+            ),
+            _ => q0s_format::raster::active_placement_states_at(layer, local_frame),
+        };
+        for active in active_states.into_iter().rev() {
+            let index = active.index;
             let Some(placement) = layer.placements.get(index) else {
                 continue;
             };
+            let resolved_fx = active.fx;
+            let visual_affine = rig_pose
+                .as_ref()
+                .and_then(|pose| pose.binding_transform(placement.instance_id))
+                .unwrap_or_else(|| Affine::from_transform(active.transform));
             let composed = Affine::compose(parent, visual_affine);
             let hit = match placement.target {
-                Target::Asset(asset_id) => asset_visible_body_contains_point(
-                    project,
-                    asset_id,
-                    composed,
-                    point,
-                    edge_tolerance,
-                    textures.as_deref_mut(),
-                ),
+                Target::Asset(asset_id) => {
+                    let Some(asset) = bounds_cache.asset(project, asset_id) else {
+                        continue;
+                    };
+                    asset_visible_body_contains_point(
+                        project,
+                        asset_id,
+                        asset,
+                        composed,
+                        point,
+                        edge_tolerance,
+                        textures.as_deref_mut(),
+                    )
+                }
                 Target::Q0rg(child_id) if child_id != q0rg_id => {
                     let child_frame = q0s_format::v2::resolve_q0rg_playback_frame(
                         project,
@@ -11449,6 +12425,8 @@ fn q0rg_visible_body_contains_point(
                         point,
                         edge_tolerance,
                         textures.as_deref_mut(),
+                        bounds_cache,
+                        revision,
                         depth + 1,
                     )
                 }
@@ -11472,6 +12450,8 @@ fn selectable_placement_body_contains_point(
     point: Vec2,
     slop: HitSlop,
     textures: Option<&mut TextureCache>,
+    bounds_cache: &mut crate::render::PlacementBoundsCache,
+    revision: Option<(u64, u64)>,
 ) -> bool {
     match placement.target {
         Target::Q0rg(child_id) => {
@@ -11490,12 +12470,15 @@ fn selectable_placement_body_contains_point(
                 point,
                 slop.edge,
                 textures,
+                bounds_cache,
+                revision,
                 1,
             )
         }
         // Display-object vectors/media keep oriented local-bounds semantics, but
         // the bounds follow the resolved rig affine rather than the stale placement key.
-        Target::Asset(_) => placement_local_bbox(project, placement)
+        Target::Asset(_) => bounds_cache
+            .target_local_bbox(project, placement.target)
             .is_some_and(|bbox| affine_local_bbox_contains(bbox, visual_affine, point)),
     }
 }
@@ -11515,9 +12498,10 @@ fn hit_test_selectable_placement_with_slop(
     p: Vec2,
     slop: HitSlop,
 ) -> Option<(u16, usize)> {
-    hit_test_selectable_placement_with_slop_impl(project, q0rg_id, frame, p, slop, None)
+    hit_test_selectable_placement_with_slop_impl(project, q0rg_id, frame, p, slop, None, None)
 }
 
+#[cfg(test)]
 fn hit_test_selectable_placement_with_slop_cached(
     project: &ProjectV2,
     textures: &mut TextureCache,
@@ -11526,7 +12510,35 @@ fn hit_test_selectable_placement_with_slop_cached(
     p: Vec2,
     slop: HitSlop,
 ) -> Option<(u16, usize)> {
-    hit_test_selectable_placement_with_slop_impl(project, q0rg_id, frame, p, slop, Some(textures))
+    hit_test_selectable_placement_with_slop_impl(
+        project,
+        q0rg_id,
+        frame,
+        p,
+        slop,
+        Some(textures),
+        None,
+    )
+}
+
+fn hit_test_selectable_placement_with_slop_scoped(
+    project: &ProjectV2,
+    textures: &mut TextureCache,
+    q0rg_id: u16,
+    frame: u16,
+    p: Vec2,
+    slop: HitSlop,
+    revision: (u64, u64),
+) -> Option<(u16, usize)> {
+    hit_test_selectable_placement_with_slop_impl(
+        project,
+        q0rg_id,
+        frame,
+        p,
+        slop,
+        Some(textures),
+        Some(revision),
+    )
 }
 
 fn hit_test_selectable_placement_with_slop_impl(
@@ -11536,27 +12548,84 @@ fn hit_test_selectable_placement_with_slop_impl(
     p: Vec2,
     slop: HitSlop,
     mut textures: Option<&mut TextureCache>,
+    revision: Option<(u64, u64)>,
 ) -> Option<(u16, usize)> {
-    let q = project.q0rgs.iter().find(|q| q.q0rg_id == q0rg_id)?;
-    let rig_pose = q0s_format::rig::rig_for_q0rg(project, q0rg_id)
-        .map(|rig| q0s_format::rig::evaluate_rig(rig, f32::from(frame), &[]));
+    if let (Some(textures), Some(revision)) = (textures.as_deref_mut(), revision) {
+        return textures.with_placement_bounds_cache(
+            project,
+            revision,
+            |bounds_cache, textures| {
+                hit_test_selectable_placement_with_bounds(
+                    project,
+                    q0rg_id,
+                    frame,
+                    p,
+                    slop,
+                    Some(textures),
+                    Some(revision),
+                    bounds_cache,
+                )
+            },
+        );
+    }
+    let mut bounds_cache = crate::render::PlacementBoundsCache::new(project);
+    hit_test_selectable_placement_with_bounds(
+        project,
+        q0rg_id,
+        frame,
+        p,
+        slop,
+        textures,
+        revision,
+        &mut bounds_cache,
+    )
+}
+
+fn hit_test_selectable_placement_with_bounds(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    frame: u16,
+    p: Vec2,
+    slop: HitSlop,
+    mut textures: Option<&mut TextureCache>,
+    revision: Option<(u64, u64)>,
+    bounds_cache: &mut crate::render::PlacementBoundsCache,
+) -> Option<(u16, usize)> {
+    let Some(q) = bounds_cache.q0rg(project, q0rg_id) else {
+        return None;
+    };
+    let rig_pose = match (textures.as_deref_mut(), revision) {
+        (Some(textures), Some(revision)) => {
+            textures.scoped_rig_pose(project, revision, q0rg_id, frame)
+        }
+        _ => q0s_format::rig::rig_for_q0rg(project, q0rg_id)
+            .map(|rig| std::rc::Rc::new(q0s_format::rig::evaluate_rig(rig, f32::from(frame), &[]))),
+    };
     for layer in q.layers.iter().rev() {
         if !project.layer_is_visible(q0rg_id, layer.layer_id)
             || project.layer_is_locked(q0rg_id, layer.layer_id)
         {
             continue;
         }
-        for (idx, visual_affine, _, resolved_fx) in
-            active_visual_states_with_rig_pose(layer, frame, rig_pose.as_ref())
-                .into_iter()
-                .rev()
-        {
+        let active_states = match (textures.as_deref_mut(), revision) {
+            (Some(textures), Some(revision)) => {
+                textures.scoped_active_placement_states_at(project, revision, q0rg_id, layer, frame)
+            }
+            _ => q0s_format::raster::active_placement_states_at(layer, frame),
+        };
+        for active in active_states.into_iter().rev() {
+            let idx = active.index;
             let Some(placement) = layer.placements.get(idx) else {
                 continue;
             };
-            if is_raw_graphics_placement(project, placement) {
+            let resolved_fx = active.fx;
+            if is_raw_graphics_placement_cached(project, placement, bounds_cache) {
                 continue;
             }
+            let visual_affine = rig_pose
+                .as_ref()
+                .and_then(|pose| pose.binding_transform(placement.instance_id))
+                .unwrap_or_else(|| Affine::from_transform(active.transform));
             if selectable_placement_body_contains_point(
                 project,
                 placement,
@@ -11566,6 +12635,8 @@ fn hit_test_selectable_placement_with_slop_impl(
                 p,
                 slop,
                 textures.as_deref_mut(),
+                bounds_cache,
+                revision,
             ) {
                 return Some((layer.layer_id, idx));
             }
@@ -11629,7 +12700,7 @@ fn classic_prerender_contours(
         .map(|(position, size)| {
             (
                 stage_to_screen(*position, view),
-                size.max(0.1) * view.scale + expansion_px * 2.0,
+                size.max(0.1) * view.effective_scale() + expansion_px * 2.0,
             )
         })
         .collect();
@@ -11667,8 +12738,8 @@ fn append_advanced_preview_surface(
 
     for dab in dabs {
         let center = stage_to_screen(dab.center, view);
-        let major = (dab.major_radius + expansion).max(0.05) * view.scale;
-        let minor = (dab.minor_radius + expansion).max(0.05) * view.scale;
+        let major = (dab.major_radius + expansion).max(0.05) * view.effective_scale();
+        let minor = (dab.minor_radius + expansion).max(0.05) * view.effective_scale();
         let cos_a = dab.angle_radians.cos();
         let sin_a = dab.angle_radians.sin();
         let ring: [u32; SEGMENTS] = std::array::from_fn(|index| {
@@ -11829,7 +12900,7 @@ fn draw_in_progress_overlay(app: &EditorApp, painter: &Painter, view: &StageView
                     closed: false,
                     fill: Color32::TRANSPARENT,
                     stroke: Stroke::new(
-                        app.session.stroke_width.max(0.5) * view.scale,
+                        app.session.stroke_width.max(0.5) * view.effective_scale(),
                         stroke_color,
                     ),
                 }));
@@ -11870,7 +12941,7 @@ fn draw_in_progress_overlay(app: &EditorApp, painter: &Painter, view: &StageView
                         closed: path.closed,
                         fill,
                         stroke: Stroke::new(
-                            app.session.stroke_width.max(0.5) * view.scale,
+                            app.session.stroke_width.max(0.5) * view.effective_scale(),
                             Color32::from_rgba_unmultiplied(
                                 app.session.stroke_color.r,
                                 app.session.stroke_color.g,
@@ -11912,46 +12983,94 @@ fn draw_in_progress_overlay(app: &EditorApp, painter: &Painter, view: &StageView
 
 /// Draw selection bounds using the current theme accent.
 pub fn draw_selection_overlay(app: &mut EditorApp, painter: &Painter, view: &StageView) {
-    draw_selection_content_overlay(app, painter, view);
     let transform_started = std::time::Instant::now();
-    draw_group_transform_frame(app, painter, view);
-    draw_transform_pivot_overlay(app, painter, view);
+    let revision = (
+        app.active_project_tab_id().unwrap_or(0),
+        app.state.render_revision(),
+    );
+    let selection = app.session.selection.clone();
+    let mut geometry = matches!(
+        &selection,
+        Selection::Multi(_) | Selection::Placement { .. }
+    )
+    .then(|| {
+        let bounds = app
+            .textures
+            .take_placement_bounds_cache(&app.state.project, revision);
+        SelectionOverlayGeometry::with_bounds(bounds)
+    });
+    let selection_bounds = match selection {
+        Selection::Multi(references) => geometry.as_mut().and_then(|geometry| {
+            geometry.placement_refs_world_bounds_scoped(
+                &app.state.project,
+                &mut app.textures,
+                revision,
+                &references,
+                app.session.current_frame,
+            )
+        }),
+        Selection::Placement {
+            q0rg_id,
+            layer_id,
+            placement_idx,
+        } => geometry.as_mut().and_then(|geometry| {
+            geometry.placement_world_bounds_scoped(
+                &app.state.project,
+                &mut app.textures,
+                revision,
+                PlacementRef {
+                    q0rg_id,
+                    layer_id,
+                    placement_idx,
+                },
+                app.session.current_frame,
+            )
+        }),
+        _ => selection_transform_bounds(app),
+    };
+    let bounds_elapsed = transform_started.elapsed();
+    let mut placement_pivot = None;
+    draw_selection_content_overlay(
+        app,
+        painter,
+        view,
+        geometry.as_mut(),
+        revision,
+        &mut placement_pivot,
+    );
+    let transform_started = std::time::Instant::now();
+    draw_group_transform_frame(app, painter, view, selection_bounds);
+    draw_transform_pivot_overlay(app, painter, view, selection_bounds, placement_pivot);
+    if let Some(geometry) = geometry {
+        app.textures
+            .store_placement_bounds_cache(geometry.bounds, revision);
+    }
     app.perf.record(
         crate::perf::PerfSpan::SelectionTransformBounds,
-        transform_started.elapsed(),
+        bounds_elapsed + transform_started.elapsed(),
     );
 }
 
-fn draw_selection_content_overlay(app: &mut EditorApp, painter: &Painter, view: &StageView) {
+fn draw_selection_content_overlay(
+    app: &mut EditorApp,
+    painter: &Painter,
+    view: &StageView,
+    mut geometry: Option<&mut SelectionOverlayGeometry>,
+    revision: (u64, u64),
+    placement_pivot: &mut Option<Vec2>,
+) {
     let accent = selection_color(app);
     if let Selection::Multi(refs) = &app.session.selection {
         for r in refs {
-            let Some(q) = app
-                .state
-                .project
-                .q0rgs
-                .iter()
-                .find(|q| q.q0rg_id == r.q0rg_id)
-            else {
-                continue;
-            };
-            let Some(layer) = q.layers.iter().find(|l| l.layer_id == r.layer_id) else {
-                continue;
-            };
-            let Some(p) = layer.placements.get(r.placement_idx) else {
-                continue;
-            };
-            let Some(transform) = crate::render::active_transform_for_placement(
-                layer,
-                r.placement_idx,
-                app.session.current_frame,
-            ) else {
-                continue;
-            };
-            let mut visual = p.clone();
-            visual.transform = transform;
-            let Some((min_x, min_y, max_x, max_y)) = placement_bbox(&app.state.project, &visual)
-            else {
+            let Some((min_x, min_y, max_x, max_y)) = geometry.as_deref_mut().and_then(|geometry| {
+                geometry.placement_world_bounds_scoped(
+                    &app.state.project,
+                    &mut app.textures,
+                    revision,
+                    *r,
+                    app.session.current_frame,
+                )
+            }) else {
                 continue;
             };
             let mut rect = egui::Rect::from_min_max(
@@ -11986,49 +13105,7 @@ fn draw_selection_content_overlay(app: &mut EditorApp, painter: &Painter, view: 
             clip_polygon.as_deref(),
             objects.is_empty(),
         );
-        for reference in &objects {
-            let Some(layer) = app
-                .state
-                .project
-                .q0rgs
-                .iter()
-                .find(|q0rg| q0rg.q0rg_id == reference.q0rg_id)
-                .and_then(|q0rg| {
-                    q0rg.layers
-                        .iter()
-                        .find(|layer| layer.layer_id == reference.layer_id)
-                })
-            else {
-                continue;
-            };
-            let Some(placement) = layer.placements.get(reference.placement_idx) else {
-                continue;
-            };
-            let Some(transform) = crate::render::active_transform_for_placement(
-                layer,
-                reference.placement_idx,
-                app.session.current_frame,
-            ) else {
-                continue;
-            };
-            let mut visual = placement.clone();
-            visual.transform = transform;
-            let Some((min_x, min_y, max_x, max_y)) = placement_bbox(&app.state.project, &visual)
-            else {
-                continue;
-            };
-            let rect = egui::Rect::from_min_max(
-                stage_to_screen(Vec2::new(min_x, min_y), view),
-                stage_to_screen(Vec2::new(max_x, max_y), view),
-            )
-            .expand(2.0);
-            painter.rect_stroke(
-                rect,
-                0.0,
-                Stroke::new(2.0_f32, Color32::from_black_alpha(180)),
-            );
-            painter.rect_stroke(rect, 0.0, Stroke::new(1.0_f32, accent));
-        }
+        draw_object_reference_outlines(app, painter, view, &objects);
         return;
     }
     if let Selection::StrokeSegment(segment) = app.session.selection {
@@ -12134,39 +13211,28 @@ fn draw_selection_content_overlay(app: &mut EditorApp, painter: &Painter, view: 
         placement_idx,
     } = app.session.selection
     {
-        let Some(q) = app
-            .state
-            .project
-            .q0rgs
-            .iter()
-            .find(|q| q.q0rg_id == q0rg_id)
+        let reference = PlacementRef {
+            q0rg_id,
+            layer_id,
+            placement_idx,
+        };
+        let current_frame = app.session.current_frame;
+        let project = &app.state.project;
+        let textures = &mut app.textures;
+        let Some((local_bbox, visual_affine, rig_bound, active_transform)) =
+            geometry.as_deref_mut().and_then(|geometry| {
+                geometry.placement_local_visual_frame_scoped(
+                    project,
+                    textures,
+                    revision,
+                    reference,
+                    current_frame,
+                )
+            })
         else {
             return;
         };
-        let Some(layer) = q.layers.iter().find(|l| l.layer_id == layer_id) else {
-            return;
-        };
-        let Some(p) = layer.placements.get(placement_idx) else {
-            return;
-        };
-        let Some(active_transform) = crate::render::active_transform_for_placement(
-            layer,
-            placement_idx,
-            app.session.current_frame,
-        ) else {
-            return;
-        };
-        let (visual_affine, rig_bound) = active_visual_affine_for_placement(
-            &app.state.project,
-            q0rg_id,
-            layer,
-            placement_idx,
-            app.session.current_frame,
-        )
-        .unwrap_or((Affine::from_transform(active_transform), false));
-        let mut visual = p.clone();
-        visual.transform = active_transform;
-        let Some(local_bbox) = placement_local_bbox(&app.state.project, &visual) else {
+        let Some(local_bbox) = local_bbox else {
             // Empty q0rg (no children with bbox): show a tiny marker at the
             // resolved placement origin so rigged objects never leave their outline behind.
             let center = stage_to_screen(Vec2::new(visual_affine.tx, visual_affine.ty), view);
@@ -12174,6 +13240,13 @@ fn draw_selection_content_overlay(app: &mut EditorApp, painter: &Painter, view: 
             painter.circle_stroke(center, 8.0, Stroke::new(1.0_f32, accent));
             return;
         };
+        if !rig_bound {
+            let local_center = Vec2::new(
+                (local_bbox.0 + local_bbox.2) * 0.5,
+                (local_bbox.1 + local_bbox.3) * 0.5,
+            );
+            *placement_pivot = Some(Affine::from_transform(active_transform).apply(local_center));
+        }
         let frame = affine_transform_frame(local_bbox, visual_affine);
         let outline: Vec<Pos2> = frame
             .corners
@@ -12197,7 +13270,7 @@ fn draw_selection_content_overlay(app: &mut EditorApp, painter: &Painter, view: 
             stroke: Stroke::new(1.5_f32, accent),
         }));
 
-        if !rig_bound && supports_axis_resize(active_transform) {
+        if rig_bound || supports_axis_resize(active_transform) {
             for (_, world) in frame_handle_positions(frame) {
                 let point = stage_to_screen(world, view);
                 let handle = egui::Rect::from_center_size(point, egui::vec2(9.0, 9.0));
@@ -12233,8 +13306,10 @@ fn draw_object_reference_outlines(
         let Some(placement) = layer.placements.get(reference.placement_idx) else {
             continue;
         };
-        let Some(transform) = crate::render::active_transform_for_placement(
-            layer,
+        let Some((transform, _)) = placement_transform_for_edit(
+            &app.state.project,
+            reference.q0rg_id,
+            reference.layer_id,
             reference.placement_idx,
             app.session.current_frame,
         ) else {
@@ -12259,7 +13334,12 @@ fn draw_object_reference_outlines(
     }
 }
 
-fn draw_group_transform_frame(app: &EditorApp, painter: &Painter, view: &StageView) {
+fn draw_group_transform_frame(
+    app: &EditorApp,
+    painter: &Painter,
+    view: &StageView,
+    bounds: Option<(f32, f32, f32, f32)>,
+) {
     let needs_group_frame = match &app.session.selection {
         Selection::RawArea { objects, .. } => !objects.is_empty(),
         Selection::Mixed { .. } | Selection::Multi(_) => true,
@@ -12268,7 +13348,7 @@ fn draw_group_transform_frame(app: &EditorApp, painter: &Painter, view: &StageVi
     if !needs_group_frame {
         return;
     }
-    let Some(bounds) = selection_transform_bounds(app) else {
+    let Some(bounds) = bounds else {
         return;
     };
     let rect = egui::Rect::from_min_max(
@@ -12278,11 +13358,28 @@ fn draw_group_transform_frame(app: &EditorApp, painter: &Painter, view: &StageVi
     draw_flash_selection_box(painter, rect, selection_color(app));
 }
 
-fn draw_transform_pivot_overlay(app: &EditorApp, painter: &Painter, view: &StageView) {
-    if app.session.current_tool != Tool::Select || selection_transform_bounds(app).is_none() {
+fn draw_transform_pivot_overlay(
+    app: &EditorApp,
+    painter: &Painter,
+    view: &StageView,
+    selection_bounds: Option<(f32, f32, f32, f32)>,
+    placement_pivot: Option<Vec2>,
+) {
+    if app.session.current_tool != Tool::Select || selection_bounds.is_none() {
         return;
     }
-    let Some(pivot) = selection_transform_pivot(app) else {
+    let pivot = app
+        .session
+        .transform_pivot
+        .as_ref()
+        .filter(|pivot| pivot.selection == app.session.selection)
+        .map(|pivot| pivot.point)
+        .or_else(|| match &app.session.selection {
+            Selection::Placement { .. } => placement_pivot,
+            _ => selection_bounds
+                .map(|bounds| Vec2::new((bounds.0 + bounds.2) * 0.5, (bounds.1 + bounds.3) * 0.5)),
+        });
+    let Some(pivot) = pivot else {
         return;
     };
     let point = stage_to_screen(pivot, view);
@@ -12579,6 +13676,14 @@ fn draw_appearance_selection_overlay(
     // the scene renderer. Their geometry is camera-invariant; zoom/pan and live
     // transforms are applied by the native cached-mesh affine callback.
     let reference_scale = 1.0_f32;
+    let view_transform_bits = [
+        view.edit_transform.a11.to_bits(),
+        view.edit_transform.a12.to_bits(),
+        view.edit_transform.a21.to_bits(),
+        view.edit_transform.a22.to_bits(),
+        view.edit_transform.tx.to_bits(),
+        view.edit_transform.ty.to_bits(),
+    ];
     let reference_key = SelectionPaintKey {
         asset_id: vector.asset_id,
         path_indices: path_indices.clone(),
@@ -12586,6 +13691,7 @@ fn draw_appearance_selection_overlay(
         placement_transform_bits: identity_bits,
         view_origin_bits: [0.0_f32.to_bits(), 0.0_f32.to_bits()],
         view_scale_bits: reference_scale.to_bits(),
+        view_transform_bits: [1.0_f32.to_bits(), 0, 0, 1.0_f32.to_bits(), 0, 0],
         accent_rgba: [accent.r(), accent.g(), accent.b(), accent.a()],
         texture_id: texture.id(),
     };
@@ -12602,7 +13708,8 @@ fn draw_appearance_selection_overlay(
             cache_transform.ty.to_bits(),
         ],
         view_origin_bits: [0.0_f32.to_bits(), 0.0_f32.to_bits()],
-        view_scale_bits: selection_zoom_cache_bucket(view.scale).to_bits(),
+        view_scale_bits: selection_zoom_cache_bucket(view.effective_scale()).to_bits(),
+        view_transform_bits,
         accent_rgba: [accent.r(), accent.g(), accent.b(), accent.a()],
         texture_id: texture.id(),
     };
@@ -12746,7 +13853,7 @@ fn draw_appearance_selection_overlay(
                     view_scale: if affine_reprojectable {
                         reference_scale
                     } else {
-                        view.scale
+                        view.effective_scale()
                     },
                 },
             );
@@ -12764,18 +13871,18 @@ fn draw_appearance_selection_overlay(
 
     if cached.affine_reprojectable {
         let reference_scale = cached.view_scale.abs().max(1.0e-6);
-        let screen_per_reference = view.scale / reference_scale;
+        let reference_to_stage = Affine::from_uniform_scale(1.0 / reference_scale);
+        let screen_transform = Affine::compose(
+            Affine::compose(view.screen_transform(), placement_transform),
+            reference_to_stage,
+        );
         let linear = [
-            placement_transform.a11 * screen_per_reference,
-            placement_transform.a12 * screen_per_reference,
-            placement_transform.a21 * screen_per_reference,
-            placement_transform.a22 * screen_per_reference,
+            screen_transform.a11,
+            screen_transform.a12,
+            screen_transform.a21,
+            screen_transform.a22,
         ];
-        let target_origin = view.origin
-            + egui::vec2(
-                placement_transform.tx * view.scale,
-                placement_transform.ty * view.scale,
-            );
+        let target_origin = pos2(screen_transform.tx, screen_transform.ty);
         for mesh in &cached.meshes {
             let screen_uv_tile = (mesh.texture_id == texture.id()).then_some(stipple_tile);
             q0glblend::paint_cached_mesh_affine(
@@ -12809,15 +13916,13 @@ fn draw_appearance_selection_overlay(
     }
 
     let placement_delta = if pure_translation {
-        egui::vec2(
-            placement_transform.tx * view.scale,
-            placement_transform.ty * view.scale,
-        )
+        view.stage_to_screen(Vec2::new(placement_transform.tx, placement_transform.ty))
+            - view.stage_to_screen(Vec2::new(0.0, 0.0))
     } else {
         egui::Vec2::ZERO
     };
     let ratio = if cached.view_scale.abs() > 1.0e-6 {
-        view.scale / cached.view_scale
+        view.effective_scale() / cached.view_scale
     } else {
         1.0
     };
@@ -13527,7 +14632,7 @@ fn eyedropper(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, vi
     let Some(cursor) = cursor else {
         return;
     };
-    let tolerance = 4.0 / view.scale.max(0.001);
+    let tolerance = 4.0 / view.effective_scale().max(0.001);
     let sampled = sample_paint_in_q0rg(
         &app.state.project,
         app.session.current_q0rg_id,
@@ -13959,7 +15064,7 @@ fn recolour_bucket_target(app: &mut EditorApp, target: BucketTarget, color: Rgba
         }
     }
 
-    app.state.dirty = true;
+    app.state.mark_dirty();
     app.session.selection = Selection::None;
     app.session.status = "Region filled".to_string();
     app.textures.invalidate();
@@ -14042,7 +15147,7 @@ fn fill_empty_bucket_region(
         return false;
     }
 
-    app.state.dirty = true;
+    app.state.mark_dirty();
     app.session.selection = Selection::None;
     app.session.status = "Region filled".to_string();
     app.textures.invalidate_asset(new_asset_id);
@@ -14676,6 +15781,7 @@ mod tests {
             origin: Pos2::ZERO,
             scale: 1.0,
             stage_rect: rect,
+            edit_transform: q0s_format::transform::Affine::IDENTITY,
         };
         let output = ctx.run(
             egui::RawInput {
@@ -14733,6 +15839,7 @@ mod tests {
             origin: Pos2::ZERO,
             scale: 1.0,
             stage_rect: rect,
+            edit_transform: q0s_format::transform::Affine::IDENTITY,
         };
         let output = ctx.run(
             egui::RawInput {
@@ -14960,7 +16067,7 @@ mod tests {
         }));
         let layer = &mut project.q0rgs[0].layers[0];
         for asset_id in [fill_id, stroke_id] {
-            layer.placements.push(Placement {
+            layer.push_placement(Placement {
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(asset_id),
@@ -15132,6 +16239,7 @@ mod tests {
             script: String::new(),
             layers: vec![Layer {
                 layer_id: 1,
+                timeline_frame_count: None,
                 name: "art".into(),
                 explicit_keyframes: Vec::new(),
                 placements: vec![
@@ -15154,7 +16262,7 @@ mod tests {
                 ],
             }],
         });
-        project.q0rgs[0].layers[0].placements.push(Placement {
+        project.q0rgs[0].layers[0].push_placement(Placement {
             instance_id: 0,
             frame: 0,
             target: Target::Q0rg(2),
@@ -15215,6 +16323,7 @@ mod tests {
             script: String::new(),
             layers: vec![Layer {
                 layer_id: 1,
+                timeline_frame_count: None,
                 name: "art".into(),
                 explicit_keyframes: Vec::new(),
                 placements: vec![Placement {
@@ -15227,7 +16336,7 @@ mod tests {
                 }],
             }],
         });
-        project.q0rgs[0].layers[0].placements.push(Placement {
+        project.q0rgs[0].layers[0].push_placement(Placement {
             instance_id: 0,
             frame: 0,
             target: Target::Q0rg(2),
@@ -15327,6 +16436,7 @@ mod tests {
                                 origin: Pos2::ZERO,
                                 scale: 1.0,
                                 stage_rect: rect,
+                                edit_transform: q0s_format::transform::Affine::IDENTITY,
                             };
                             crate::render::render_stage(
                                 ui.painter(),
@@ -15441,7 +16551,7 @@ mod tests {
                 rgba: vec![255; 400],
             }));
         for (x, y) in [(10.0, 10.0), (100.0, 100.0)] {
-            project.q0rgs[0].layers[0].placements.push(Placement {
+            project.q0rgs[0].layers[0].push_placement(Placement {
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(1),
@@ -15497,6 +16607,7 @@ mod tests {
             script: String::new(),
             layers: vec![Layer {
                 layer_id: 1,
+                timeline_frame_count: None,
                 name: "Layer".into(),
                 explicit_keyframes: vec![],
                 placements: vec![Placement {
@@ -15509,7 +16620,7 @@ mod tests {
                 }],
             }],
         });
-        project.q0rgs[0].layers[0].placements.push(Placement {
+        project.q0rgs[0].layers[0].push_placement(Placement {
             instance_id: 0,
             frame: 0,
             target: Target::Q0rg(2),
@@ -15558,7 +16669,7 @@ mod tests {
             }),
             stroke: None,
         }));
-        project.q0rgs[0].layers[0].placements.push(Placement {
+        project.q0rgs[0].layers[0].push_placement(Placement {
             instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
@@ -15824,7 +16935,7 @@ mod tests {
             fill: None,
             stroke: Some(blue_stroke()),
         }));
-        project.q0rgs[0].layers[0].placements.push(Placement {
+        project.q0rgs[0].layers[0].push_placement(Placement {
             instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
@@ -15922,7 +17033,7 @@ mod tests {
             fill: None,
             stroke: Some(blue_stroke()),
         }));
-        project.q0rgs[0].layers[0].placements.push(Placement {
+        project.q0rgs[0].layers[0].push_placement(Placement {
             instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
@@ -17523,6 +18634,7 @@ mod tests {
                 script: String::new(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "L1".into(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![Placement {
@@ -17586,6 +18698,7 @@ mod tests {
                     script: String::new(),
                     layers: vec![Layer {
                         layer_id: 1,
+                        timeline_frame_count: None,
                         name: "Layer".into(),
                         explicit_keyframes: Vec::new(),
                         placements: vec![Placement {
@@ -17605,6 +18718,7 @@ mod tests {
                     script: String::new(),
                     layers: vec![Layer {
                         layer_id: 1,
+                        timeline_frame_count: None,
                         name: "Artwork".into(),
                         explicit_keyframes: Vec::new(),
                         placements: vec![Placement {
@@ -17690,6 +18804,7 @@ mod tests {
                 script: String::new(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "Layer".into(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![
@@ -17864,6 +18979,7 @@ mod tests {
             origin: Pos2::ZERO,
             scale: 1.0,
             stage_rect: rect,
+            edit_transform: q0s_format::transform::Affine::IDENTITY,
         };
         let output = ctx.run(
             egui::RawInput {
@@ -17912,6 +19028,7 @@ mod tests {
             origin: Pos2::ZERO,
             scale: 1.0,
             stage_rect: egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(800.0, 600.0)),
+            edit_transform: q0s_format::transform::Affine::IDENTITY,
         };
         let contours =
             classic_prerender_contours(&dabs, crate::brush::BrushNib::Horizontal, &view, 0.0);
@@ -17932,11 +19049,13 @@ mod tests {
             origin: Pos2::new(100.0, 80.0),
             scale: 1.0,
             stage_rect: egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(800.0, 600.0)),
+            edit_transform: q0s_format::transform::Affine::IDENTITY,
         };
         let second = StageView {
             origin: Pos2::new(170.0, 140.0),
             scale: 2.0,
             stage_rect: first.stage_rect,
+            edit_transform: q0s_format::transform::Affine::IDENTITY,
         };
         let a = classic_prerender_contours(&dabs, crate::brush::BrushNib::Circle, &first, 0.0);
         let b = classic_prerender_contours(&dabs, crate::brush::BrushNib::Circle, &second, 0.0);
@@ -18004,6 +19123,7 @@ mod tests {
             origin: Pos2::ZERO,
             scale: 1.0,
             stage_rect: egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(300.0, 180.0)),
+            edit_transform: q0s_format::transform::Affine::IDENTITY,
         };
         let contours = classic_prerender_contours(&dabs, settings.nib, &view, 0.0);
         let committed = crate::brush::brush_finish(stroke, settings);
@@ -18043,6 +19163,7 @@ mod tests {
             origin: Pos2::ZERO,
             scale: 1.0,
             stage_rect: egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(800.0, 600.0)),
+            edit_transform: q0s_format::transform::Affine::IDENTITY,
         };
         let mesh = advanced_preview_mesh(&dabs, &view, settings);
         assert!(
@@ -18110,6 +19231,7 @@ mod tests {
             origin: Pos2::ZERO,
             scale: 1.0,
             stage_rect: egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(300.0, 300.0)),
+            edit_transform: q0s_format::transform::Affine::IDENTITY,
         };
         let mesh = advanced_preview_mesh(&dabs, &view, settings);
         for dab in &dabs {
@@ -18574,6 +19696,7 @@ mod tests {
                 script: String::new(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "Layer".into(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![Placement {
@@ -18733,6 +19856,7 @@ mod tests {
                 script: String::new(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "Layer".into(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![
@@ -18915,6 +20039,7 @@ mod tests {
                 script: String::new(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "Layer".into(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![Placement {
@@ -19047,6 +20172,7 @@ mod tests {
                 script: String::new(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "Layer".into(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![Placement {
@@ -19206,7 +20332,7 @@ mod tests {
                 cap: q0s_format::geom::CapShape::Round,
             }),
         }));
-        project.q0rgs[0].layers[0].placements.push(Placement {
+        project.q0rgs[0].layers[0].push_placement(Placement {
             instance_id: 0,
             frame: 0,
             target: Target::Asset(77),
@@ -19743,7 +20869,7 @@ mod tests {
             }),
             stroke: None,
         }));
-        project.q0rgs[0].layers[0].placements.push(Placement {
+        project.q0rgs[0].layers[0].push_placement(Placement {
             instance_id: 0,
             frame: 0,
             target: Target::Asset(2),
@@ -19925,6 +21051,7 @@ mod tests {
             origin: Pos2::ZERO,
             scale: 1.0,
             stage_rect: egui::Rect::from_min_max(Pos2::new(-20.0, -20.0), Pos2::new(50.0, 50.0)),
+            edit_transform: q0s_format::transform::Affine::IDENTITY,
         };
         let mut cache = TextureCache::default();
         let contours =
@@ -20440,6 +21567,7 @@ mod tests {
                 script: String::new(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "Layer".into(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![Placement {
@@ -20532,6 +21660,7 @@ mod tests {
                     script: String::new(),
                     layers: vec![Layer {
                         layer_id: 1,
+                        timeline_frame_count: None,
                         name: "Layer".into(),
                         explicit_keyframes: Vec::new(),
                         placements: vec![Placement {
@@ -20551,6 +21680,7 @@ mod tests {
                     script: String::new(),
                     layers: vec![Layer {
                         layer_id: 1,
+                        timeline_frame_count: None,
                         name: "Artwork".into(),
                         explicit_keyframes: Vec::new(),
                         placements: vec![Placement {
@@ -20664,7 +21794,7 @@ mod tests {
         let mut project = project_with_held_display_object();
         let layer = &mut project.q0rgs[0].layers[0];
         layer.placements[0].tween = Tween::Linear { to_frame: 10 };
-        layer.placements.push(Placement {
+        layer.push_placement(Placement {
             instance_id: 0,
             frame: 10,
             target: Target::Q0rg(2),
@@ -20692,6 +21822,7 @@ mod tests {
             origin: Pos2::ZERO,
             scale: 1.0,
             stage_rect: egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(200.0, 100.0)),
+            edit_transform: q0s_format::transform::Affine::IDENTITY,
         };
         let bounds = (0.0, 0.0, 100.0, 10.0);
         assert_eq!(
@@ -20920,6 +22051,7 @@ mod tests {
             origin: Pos2::ZERO,
             scale: 1.0,
             stage_rect: egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(400.0, 400.0)),
+            edit_transform: q0s_format::transform::Affine::IDENTITY,
         };
         let transform = Transform2D {
             tx: 180.0,
@@ -21051,6 +22183,7 @@ mod tests {
                 origin: Pos2::ZERO,
                 scale: 0.005,
                 stage_rect: egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(100.0, 100.0)),
+                edit_transform: q0s_format::transform::Affine::IDENTITY,
             };
             let adaptive = crate::render::adaptive_selection_bezier_screen_path_for_test(
                 &path,
@@ -21085,6 +22218,7 @@ mod tests {
             origin: Pos2::new(20.0, 20.0),
             scale: 2.0,
             stage_rect: rect,
+            edit_transform: q0s_format::transform::Affine::IDENTITY,
         };
         let paint = |app: &mut EditorApp, id: &'static str| {
             let _ = ctx.run(
@@ -21144,6 +22278,7 @@ mod tests {
             origin: Pos2::new(20.0, 20.0),
             scale: 2.0,
             stage_rect: rect,
+            edit_transform: q0s_format::transform::Affine::IDENTITY,
         };
         for _ in 0..2 {
             let _ = ctx.run(
@@ -21175,6 +22310,7 @@ mod tests {
             origin: Pos2::new(27.0, 14.0),
             scale: 2.01,
             stage_rect: rect,
+            edit_transform: q0s_format::transform::Affine::IDENTITY,
         };
         let _ = ctx.run(
             egui::RawInput {
@@ -21199,6 +22335,7 @@ mod tests {
             origin: nearby_camera.origin,
             scale: 3.0,
             stage_rect: rect,
+            edit_transform: q0s_format::transform::Affine::IDENTITY,
         };
         let _ = ctx.run(
             egui::RawInput {
@@ -21331,6 +22468,7 @@ mod tests {
                     origin: Pos2::new(30.0, 20.0),
                     scale,
                     stage_rect: rect,
+                    edit_transform: q0s_format::transform::Affine::IDENTITY,
                 },
                 id as u32,
             );
@@ -21362,6 +22500,7 @@ mod tests {
                     origin: Pos2::new(30.0, 20.0),
                     scale: 1.0,
                     stage_rect: rect,
+                    edit_transform: q0s_format::transform::Affine::IDENTITY,
                 },
                 100 + id as u32,
             );
@@ -21387,11 +22526,13 @@ mod tests {
             origin: Pos2::ZERO,
             scale: 1.0,
             stage_rect: egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(100.0, 100.0)),
+            edit_transform: q0s_format::transform::Affine::IDENTITY,
         };
         let view_b = StageView {
             origin: Pos2::new(1000.0, 500.0),
             scale: 12.0,
             stage_rect: egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(8000.0, 6000.0)),
+            edit_transform: q0s_format::transform::Affine::IDENTITY,
         };
         let mut cache = TextureCache::default();
         let a = appearance_selection_body_contours(vector, appearance, None, &view_a, &mut cache);
@@ -21495,6 +22636,7 @@ mod tests {
                 script: String::new(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "L".into(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![Placement {
@@ -22007,6 +23149,7 @@ mod tests {
         app.state.project.q0rgs[0].layers = vec![
             Layer {
                 layer_id: 1,
+                timeline_frame_count: None,
                 name: "active".into(),
                 explicit_keyframes: Vec::new(),
                 placements: vec![Placement {
@@ -22020,6 +23163,7 @@ mod tests {
             },
             Layer {
                 layer_id: 2,
+                timeline_frame_count: None,
                 name: "other".into(),
                 explicit_keyframes: Vec::new(),
                 placements: vec![Placement {
@@ -22405,6 +23549,7 @@ mod tests {
                 script: String::new(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "Layer".into(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![Placement {
@@ -22503,6 +23648,7 @@ mod tests {
                 script: String::new(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "Layer".into(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![
@@ -22659,6 +23805,7 @@ mod tests {
                     script: String::new(),
                     layers: vec![Layer {
                         layer_id: 1,
+                        timeline_frame_count: None,
                         name: "Layer".into(),
                         explicit_keyframes: Vec::new(),
                         placements: vec![
@@ -22692,6 +23839,7 @@ mod tests {
                     script: String::new(),
                     layers: vec![Layer {
                         layer_id: 1,
+                        timeline_frame_count: None,
                         name: "Layer".into(),
                         explicit_keyframes: Vec::new(),
                         placements: vec![Placement {
@@ -22728,6 +23876,7 @@ mod tests {
             origin: pos2(0.0, 0.0),
             scale: 1.0,
             stage_rect: egui::Rect::from_min_max(pos2(-200.0, -200.0), pos2(300.0, 300.0)),
+            edit_transform: q0s_format::transform::Affine::IDENTITY,
         };
         let frame = axis_aligned_transform_frame((0.0, 0.0, 100.0, 100.0));
         assert_eq!(
@@ -23025,6 +24174,7 @@ mod tests {
             origin: Pos2::new(20.0, 20.0),
             scale: 1.0,
             stage_rect: rect,
+            edit_transform: q0s_format::transform::Affine::IDENTITY,
         };
         let _ = ctx.run(
             egui::RawInput {
@@ -23235,7 +24385,7 @@ mod tests {
             placement_idx: refs[0].placement_idx,
         };
         assert_eq!(
-            placement_ref_transform(&app.state.project, placement),
+            placement_ref_transform(&app.state.project, placement, app.session.current_frame),
             Some(Transform2D::IDENTITY)
         );
         let neighbor_after = app
@@ -23519,6 +24669,7 @@ mod tests {
                 layer_id: refs[0].layer_id,
                 placement_idx: refs[0].placement_idx,
             },
+            app.session.current_frame,
         )
         .expect("live raw placement");
         assert!((live_raw_transform.tx - 10.0).abs() < 1.0e-4);
@@ -23544,6 +24695,7 @@ mod tests {
                 layer_id: refs[0].layer_id,
                 placement_idx: refs[0].placement_idx,
             },
+            app.session.current_frame,
         )
         .expect("baked raw placement");
         assert_eq!(baked_transform, Transform2D::IDENTITY);
@@ -23563,7 +24715,9 @@ mod tests {
             (moved_path.anchors[0].point.y - (start_paths[0].anchors[0].point.y + 5.0)).abs()
                 < 1.0e-4
         );
-        let moved_object = placement_ref_transform(&app.state.project, objects[0]).expect("object");
+        let moved_object =
+            placement_ref_transform(&app.state.project, objects[0], app.session.current_frame)
+                .expect("object");
         assert!((moved_object.tx - (start_transforms[0].tx + 10.0)).abs() < 1.0e-4);
         assert!((moved_object.ty - (start_transforms[0].ty + 5.0)).abs() < 1.0e-4);
     }
@@ -23688,6 +24842,7 @@ mod tests {
                 script: String::new(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "objects".into(),
                     explicit_keyframes: vec![0],
                     placements: vec![Placement {
@@ -23715,10 +24870,7 @@ mod tests {
             None,
             "the old placement key must not leave a ghost hitbox behind"
         );
-        assert!(
-            drag_start_data(&project, 1, 1, 0, 0).is_none(),
-            "ordinary free-transform is intentionally withheld while a rig owns the displayed matrix"
-        );
+        assert!(drag_start_data(&project, 1, 1, 0, 0).is_some_and(|(_, _, _, rig_bound)| rig_bound));
     }
 
     #[cfg(feature = "appearance-mask-eraser")]
@@ -23781,6 +24933,7 @@ mod tests {
             origin: Pos2::new(20.0, 20.0),
             scale: 1.5,
             stage_rect: rect,
+            edit_transform: q0s_format::transform::Affine::IDENTITY,
         };
         let output = ctx.run(
             egui::RawInput {

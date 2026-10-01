@@ -59,7 +59,7 @@ fn commit_stroke(app: &mut EditorApp, anchors: Vec<Anchor>, closed: bool) -> u16
         .iter_mut()
         .find(|l| l.layer_id == layer_id)
         .expect("layer");
-    layer.placements.push(Placement {
+    layer.push_placement(Placement {
         instance_id: 0,
         frame,
         target: Target::Asset(asset_id),

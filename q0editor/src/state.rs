@@ -1,11 +1,12 @@
 use std::path::PathBuf;
-use std::time::Instant;
+use std::{collections::HashSet, time::Instant};
 
 pub use q0s_format::geom::CapShape;
 use q0s_format::transform::Affine;
 use q0s_format::v2::{
-    Anchor, Layer, LayerMetadata, Path as VPath, Placement, ProjectMeta, ProjectV2, Q0rg, Rgba,
-    RigChannel, RigPoseBlendMode, Target, Transform2D, Vec2, VectorAppearance, VectorAsset,
+    Anchor, Layer, LayerMetadata, Path as VPath, Placement, ProjectMeta, ProjectScene, ProjectV2,
+    Q0rg, Rgba, RigChannel, RigPoseBlendMode, Target, Transform2D, Vec2, VectorAppearance,
+    VectorAsset,
 };
 
 use crate::advanced_brush::{AdvancedBrushSettings, AdvancedBrushStroke, BrushMode};
@@ -48,10 +49,17 @@ pub struct FrameLabelEdit {
     pub focus_requested: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneRename {
+    pub scene_id: u16,
+    pub draft: String,
+    pub focus_requested: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimelineLayerDrag {
     pub q0rg_id: u16,
-    pub layer_id: u16,
+    pub selection: TimelineLayerSelection,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -64,6 +72,13 @@ pub struct AppearanceTransformSnapshot {
 pub struct TimelineFrameDrag {
     pub q0rg_id: u16,
     pub selection: TimelineSelection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimelineRigKeySelection {
+    pub q0rg_id: u16,
+    pub layer_id: u16,
+    pub frame: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,6 +343,9 @@ pub struct TimelineFrameClipboardRow {
     /// Original layer. Paste uses this only to distinguish a temporal copy on
     /// the same track from a spatial copy into another layer.
     pub source_layer_id: u16,
+    /// Relative frame offsets that were actually selected. Ordinary range
+    /// selections store every offset; ctrl-selected cells can stay sparse.
+    pub selected_frames: Vec<u16>,
     pub explicit_keyframes: Vec<u16>,
     pub placements: Vec<Placement>,
     /// Frame scripts are timeline data, not display objects. Frames are stored
@@ -442,6 +460,13 @@ pub struct ProjectState {
     pub project: ProjectV2,
     pub file_path: Option<PathBuf>,
     pub dirty: bool,
+    /// Advances whenever edits can affect rendered or cached project data.
+    pub(crate) revision: u64,
+    /// Advances when render caches need a full compatibility check. Live
+    /// artwork transforms update their affected cache entries directly.
+    pub(crate) render_revision: u64,
+    /// Advances when library rows (names, kinds, uses, or item count) can change.
+    pub(crate) library_revision: u64,
 }
 
 impl ProjectState {
@@ -450,6 +475,9 @@ impl ProjectState {
             project: default_project(),
             file_path: None,
             dirty: false,
+            revision: 0,
+            render_revision: 0,
+            library_revision: 0,
         }
     }
 
@@ -457,10 +485,34 @@ impl ProjectState {
         self.project = project;
         self.file_path = path;
         self.dirty = false;
+        self.revision = self.revision.wrapping_add(1);
+        self.render_revision = self.render_revision.wrapping_add(1);
+        self.library_revision = self.library_revision.wrapping_add(1);
     }
 
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
+        self.render_revision = self.render_revision.wrapping_add(1);
+        self.library_revision = self.library_revision.wrapping_add(1);
+    }
+
+    /// Mark artwork-only edits without rebuilding the library's row model.
+    pub fn mark_artwork_dirty(&mut self) {
+        self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn render_revision(&self) -> u64 {
+        self.render_revision
+    }
+
+    pub fn library_revision(&self) -> u64 {
+        self.library_revision
     }
 
     pub fn title(&self) -> String {
@@ -805,8 +857,20 @@ pub struct Session {
     pub pending_timeline_frame: Option<u16>,
     /// Rectangular frame-cell selection in the timeline, separate from stage selection.
     pub timeline_selection: Option<TimelineSelection>,
+    /// Individually ctrl-selected frame cells. The q0rg id keeps selections
+    /// from a previously open scene from appearing in the current timeline.
+    pub timeline_cell_selection: Option<(u16, Vec<(u16, u16)>)>,
+    /// View-only Animate-style wireframe display for the active stage.
+    pub outline_mode: bool,
+    /// Per-layer wireframe display, keyed by q0rg and layer id.
+    pub outline_layers: HashSet<(u16, u16)>,
+    /// Editor-only mask-source visibility. Hiding a source keeps its clipping
+    /// effect active and leaves the source layer editable.
+    pub hidden_mask_art_layers: HashSet<(u64, u16, u16)>,
     /// Selected layer rows for layer clipboard operations.
     pub timeline_layer_selection: Option<TimelineLayerSelection>,
+    /// One-shot timeline scroll request from selecting a stage object.
+    pub timeline_scroll_to_layer: Option<(u16, u16)>,
     /// Project-level camera track selection. Kept separate from layer ids so
     /// the camera never becomes selectable artwork.
     pub camera_track_selected: bool,
@@ -818,6 +882,10 @@ pub struct Session {
     pub selection: Selection,
     pub transform_pivot: Option<TransformPivot>,
     pub breadcrumb: Vec<u16>,
+    /// Parent-chain context for Animate-style Edit In Place. Each entry maps
+    /// one active q0rg into document-stage coordinates and remembers the frame
+    /// and instance through which it was opened.
+    pub edit_in_place: Vec<EditInPlaceContext>,
     /// Transient Library-panel filter and sort state.
     pub library_search: String,
     pub library_sort_ascending: bool,
@@ -828,8 +896,11 @@ pub struct Session {
     pub text_canvas_click_consumed: bool,
     pub layer_rename: Option<LayerRename>,
     pub frame_label_edit: Option<FrameLabelEdit>,
+    pub scene_rename: Option<SceneRename>,
     pub timeline_layer_drag: Option<TimelineLayerDrag>,
     pub timeline_frame_drag: Option<TimelineFrameDrag>,
+    pub timeline_rig_key_selection: Option<TimelineRigKeySelection>,
+    pub timeline_rig_key_drag: Option<TimelineRigKeySelection>,
     pub camera_frame_drag: Option<CameraFrameDrag>,
     pub playing: bool,
     pub last_tick: Instant,
@@ -879,6 +950,9 @@ pub struct Session {
     pub show_credits: bool,
     pub credits_opened_at: Instant,
     pub show_settings: bool,
+    pub show_shortcuts: bool,
+    pub shortcut_capture: Option<crate::hotkeys::ShortcutCommand>,
+    pub shortcut_feedback: Option<String>,
     pub easing_editor: Option<crate::easing::EasingEditorState>,
     pub tween_warning: Option<String>,
     pub viewport: Viewport,
@@ -906,6 +980,16 @@ pub struct Session {
     /// Selection and inline rename state for the linked project graph panel.
     pub project_graph_selected: Option<u16>,
     pub project_graph_rename: Option<(u16, String)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EditInPlaceContext {
+    pub parent_q0rg_id: u16,
+    pub parent_frame: u16,
+    pub layer_id: u16,
+    pub placement_idx: usize,
+    pub parent_to_stage: Affine,
+    pub child_to_stage: Affine,
 }
 
 impl Session {
@@ -937,7 +1021,12 @@ impl Session {
             current_frame: 0,
             pending_timeline_frame: None,
             timeline_selection: None,
+            timeline_cell_selection: None,
+            outline_mode: false,
+            outline_layers: HashSet::new(),
+            hidden_mask_art_layers: HashSet::new(),
             timeline_layer_selection: None,
+            timeline_scroll_to_layer: None,
             camera_track_selected: false,
             camera_timeline_selection: None,
             current_tool: Tool::Select,
@@ -945,6 +1034,7 @@ impl Session {
             selection: Selection::None,
             transform_pivot: None,
             breadcrumb: Vec::new(),
+            edit_in_place: Vec::new(),
             library_search: String::new(),
             library_sort_ascending: true,
             text_editor: None,
@@ -954,8 +1044,11 @@ impl Session {
             library_rename: None,
             layer_rename: None,
             frame_label_edit: None,
+            scene_rename: None,
             timeline_layer_drag: None,
             timeline_frame_drag: None,
+            timeline_rig_key_selection: None,
+            timeline_rig_key_drag: None,
             camera_frame_drag: None,
             playing: false,
             last_tick: Instant::now(),
@@ -998,6 +1091,9 @@ impl Session {
             show_credits: false,
             credits_opened_at: Instant::now(),
             show_settings: false,
+            show_shortcuts: false,
+            shortcut_capture: None,
+            shortcut_feedback: None,
             easing_editor: None,
             tween_warning: None,
             viewport: Viewport::identity(),
@@ -1075,6 +1171,7 @@ impl Session {
             if previous_q0rg_id != self.current_q0rg_id {
                 self.pending_timeline_frame = None;
                 self.timeline_selection = None;
+                self.timeline_cell_selection = None;
                 self.timeline_layer_selection = None;
                 self.camera_track_selected = false;
                 self.camera_timeline_selection = None;
@@ -1099,8 +1196,31 @@ impl Session {
                     self.timeline_selection = None;
                 }
             }
+            let mut clear_cell_selection = false;
+            if let Some((selected_q0rg_id, cells)) = &mut self.timeline_cell_selection {
+                if *selected_q0rg_id != self.current_q0rg_id {
+                    clear_cell_selection = true;
+                } else {
+                    let selectable_last = self
+                        .pending_timeline_frame
+                        .unwrap_or_else(|| q.frame_count.saturating_sub(1))
+                        .max(q.frame_count.saturating_sub(1));
+                    cells.retain(|(layer_id, frame)| {
+                        *frame <= selectable_last
+                            && q.layers.iter().any(|layer| {
+                                layer.layer_id == *layer_id
+                                    && !project.layer_is_folder(q.q0rg_id, *layer_id)
+                            })
+                    });
+                    clear_cell_selection = cells.is_empty();
+                }
+            }
+            if clear_cell_selection {
+                self.timeline_cell_selection = None;
+            }
         } else {
             self.timeline_selection = None;
+            self.timeline_cell_selection = None;
             self.pending_timeline_frame = None;
             self.camera_track_selected = false;
         }
@@ -1153,7 +1273,11 @@ impl Session {
                     .is_some_and(|q0rg| {
                         q0rg.layers
                             .iter()
-                            .any(|layer| layer.layer_id == drag.layer_id)
+                            .any(|layer| layer.layer_id == drag.selection.anchor_layer_id)
+                            && q0rg
+                                .layers
+                                .iter()
+                                .any(|layer| layer.layer_id == drag.selection.focus_layer_id)
                     })
         }) {
             self.timeline_layer_drag = None;
@@ -2029,18 +2153,32 @@ impl History {
         self.redo.clear();
     }
 
-    /// Pop the latest "before"; push `current` onto the redo stack.
-    pub fn pop_undo(&mut self, current: &ProjectV2) -> Option<ProjectV2> {
-        let prior = self.undo.pop()?;
-        self.redo.push(current.clone());
-        Some(prior)
+    /// Pop the latest "before"; move `current` onto the redo stack.
+    pub fn pop_undo(
+        &mut self,
+        current: ProjectV2,
+        reconcile: impl FnOnce(&ProjectV2, &ProjectV2),
+    ) -> Result<ProjectV2, ProjectV2> {
+        let Some(prior) = self.undo.pop() else {
+            return Err(current);
+        };
+        reconcile(&current, &prior);
+        self.redo.push(current);
+        Ok(prior)
     }
 
-    /// Pop the latest "after" off redo; push `current` back onto undo.
-    pub fn pop_redo(&mut self, current: &ProjectV2) -> Option<ProjectV2> {
-        let next = self.redo.pop()?;
-        self.undo.push(current.clone());
-        Some(next)
+    /// Pop the latest "after" off redo; move `current` back onto undo.
+    pub fn pop_redo(
+        &mut self,
+        current: ProjectV2,
+        reconcile: impl FnOnce(&ProjectV2, &ProjectV2),
+    ) -> Result<ProjectV2, ProjectV2> {
+        let Some(next) = self.redo.pop() else {
+            return Err(current);
+        };
+        reconcile(&current, &next);
+        self.undo.push(current);
+        Ok(next)
     }
 }
 
@@ -2073,7 +2211,14 @@ pub fn default_project() -> ProjectV2 {
         asset_appearances: std::collections::HashMap::new(),
         layer_metadata: std::collections::HashMap::new(),
         audio_clips: Vec::new(),
-        runtime: Default::default(),
+        runtime: q0s_format::v2::ProjectRuntimeData {
+            scenes: vec![ProjectScene {
+                scene_id: 1,
+                q0rg_id: 1,
+                name: "Stage".to_string(),
+            }],
+            ..Default::default()
+        },
         q0rgs: vec![Q0rg {
             q0rg_id: 1,
             name: "Stage".to_string(),
@@ -2081,6 +2226,7 @@ pub fn default_project() -> ProjectV2 {
             script: String::new(),
             layers: vec![Layer {
                 layer_id: 1,
+                timeline_frame_count: None,
                 name: "Layer 1".to_string(),
                 explicit_keyframes: vec![0],
                 placements: Vec::new(),
@@ -2091,7 +2237,9 @@ pub fn default_project() -> ProjectV2 {
 
 #[cfg(test)]
 mod default_project_tests {
-    use super::{default_project, History, DEFAULT_STAGE_HEIGHT, DEFAULT_STAGE_WIDTH};
+    use super::{
+        default_project, History, ProjectState, DEFAULT_STAGE_HEIGHT, DEFAULT_STAGE_WIDTH,
+    };
     use q0s_format::v2::{Asset, Placement, Target, Transform2D, Tween, VectorAsset};
 
     #[test]
@@ -2118,6 +2266,20 @@ mod default_project_tests {
     }
 
     #[test]
+    fn artwork_motion_skips_structural_cache_revisions() {
+        let mut state = ProjectState::new_default();
+        state.mark_artwork_dirty();
+        assert_eq!(state.revision(), 1);
+        assert_eq!(state.render_revision(), 0);
+        assert_eq!(state.library_revision(), 0);
+
+        state.mark_dirty();
+        assert_eq!(state.revision(), 2);
+        assert_eq!(state.render_revision(), 1);
+        assert_eq!(state.library_revision(), 1);
+    }
+
+    #[test]
     fn undo_redo_preserves_rig_structure_and_instance_identity() {
         let mut before = default_project();
         before.assets.push(Asset::Vector(VectorAsset {
@@ -2126,7 +2288,7 @@ mod default_project_tests {
             fill: None,
             stroke: None,
         }));
-        before.q0rgs[0].layers[0].placements.push(Placement {
+        before.q0rgs[0].layers[0].push_placement(Placement {
             instance_id: 41,
             frame: 0,
             target: Target::Asset(7),
@@ -2158,13 +2320,13 @@ mod default_project_tests {
         history.snapshot(&before);
         let mut after = before.clone();
         crate::rigging::set_node_rotation(&mut after, 1, bone, 6, 0.75, true);
-        let undone = history.pop_undo(&after).expect("undo snapshot");
+        let undone = history.pop_undo(after, |_, _| {}).expect("undo snapshot");
         assert_eq!(undone, before);
         assert_eq!(
             undone.q0rgs[0].layers[0].placements[0].instance_id,
             stable_id
         );
-        let redone = history.pop_redo(&undone).expect("redo snapshot");
+        let redone = history.pop_redo(undone, |_, _| {}).expect("redo snapshot");
         assert_eq!(redone, after);
         assert_eq!(
             redone.q0rgs[0].layers[0].placements[0].instance_id,

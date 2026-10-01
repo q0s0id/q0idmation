@@ -304,6 +304,7 @@ mod tests {
                 script: String::new(),
                 layers: vec![Layer {
                     layer_id: 1,
+                    timeline_frame_count: None,
                     name: "L".to_string(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![Placement {

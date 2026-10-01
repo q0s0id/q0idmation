@@ -905,7 +905,10 @@ pub fn erase_visible_region(app: &mut EditorApp, region: MultiPolygon<f64>) -> b
         return false;
     };
 
-    let mut hit_asset_ids = BTreeSet::new();
+    let Some(region_bounds) = geo::BoundingRect::bounding_rect(&region) else {
+        return false;
+    };
+    let mut cuts_by_asset = std::collections::BTreeMap::new();
     for (placement_idx, _) in crate::render::active_placements_at(layer, frame) {
         let Some(placement) = layer.placements.get(placement_idx) else {
             continue;
@@ -931,12 +934,34 @@ pub fn erase_visible_region(app: &mut EditorApp, region: MultiPolygon<f64>) -> b
         if vector.fill.is_none() || vector.stroke.is_some() {
             continue;
         }
+        if cuts_by_asset.contains_key(&asset_id) {
+            continue;
+        }
+        let Some((min_x, min_y, max_x, max_y)) =
+            asset_visible_material_bounds_fast(&app.state.project, asset_id)
+        else {
+            continue;
+        };
+        if f64::from(max_x) < region_bounds.min().x
+            || f64::from(min_x) > region_bounds.max().x
+            || f64::from(max_y) < region_bounds.min().y
+            || f64::from(min_y) > region_bounds.max().y
+        {
+            continue;
+        }
         let visible_support = visible_material_surface_for_vector(vector, Some(appearance));
-        if !visible_support.intersection(&region).0.is_empty() {
-            hit_asset_ids.insert(asset_id);
+        let visible_cut = visible_support.intersection(&region);
+        if !visible_cut.0.is_empty() {
+            let Some(inverse_field) = appearance.field_transform.inverse() else {
+                continue;
+            };
+            let canonical_cut = transform_surface(&visible_cut, inverse_field);
+            if !canonical_cut.0.is_empty() {
+                cuts_by_asset.insert(asset_id, canonical_cut);
+            }
         }
     }
-    if hit_asset_ids.is_empty() {
+    if cuts_by_asset.is_empty() {
         return false;
     }
 
@@ -951,16 +976,18 @@ pub fn erase_visible_region(app: &mut EditorApp, region: MultiPolygon<f64>) -> b
     {
         return false;
     }
+    let writable_asset_ids = cuts_by_asset.keys().copied().collect::<BTreeSet<_>>();
     let writable = crate::brush::prepare_writable_raw_assets(
         &mut app.state.project,
         q0rg_id,
         layer_id,
         frame,
-        &hit_asset_ids,
+        &writable_asset_ids,
     );
 
     let mut changed = false;
-    for original_asset_id in hit_asset_ids {
+    let mut changed_asset_ids = BTreeSet::new();
+    for (original_asset_id, canonical_cut) in cuts_by_asset {
         let asset_id = writable
             .get(&original_asset_id)
             .copied()
@@ -968,24 +995,6 @@ pub fn erase_visible_region(app: &mut EditorApp, region: MultiPolygon<f64>) -> b
         let Some(appearance) = app.state.project.asset_appearances.get(&asset_id).cloned() else {
             continue;
         };
-        let Some(Asset::Vector(vector)) = app
-            .state
-            .project
-            .assets
-            .iter()
-            .find(|asset| asset.id() == asset_id)
-        else {
-            continue;
-        };
-        let support = visible_material_surface_for_vector(vector, Some(&appearance));
-        let visible_cut = support.intersection(&region);
-        if visible_cut.0.is_empty() {
-            continue;
-        }
-        let Some(inverse_field) = appearance.field_transform.inverse() else {
-            continue;
-        };
-        let canonical_cut = transform_surface(&visible_cut, inverse_field);
         let old_mask = mask_paths_to_coverage(&appearance.erase_mask);
         let new_mask = if old_mask.0.is_empty() {
             canonical_cut
@@ -996,16 +1005,21 @@ pub fn erase_visible_region(app: &mut EditorApp, region: MultiPolygon<f64>) -> b
         if new_paths != appearance.erase_mask {
             if let Some(entry) = app.state.project.asset_appearances.get_mut(&asset_id) {
                 entry.erase_mask = new_paths;
+                changed_asset_ids.insert(asset_id);
                 changed = true;
             }
         }
     }
 
     if changed {
-        app.textures.invalidate();
+        // Erasing changes only these appearance masks. Clearing the complete
+        // render cache here made every successive eraser click rebuild all
+        // project geometry and previews, which is especially costly on large
+        // imported FLA documents.
+        app.textures.invalidate_assets(changed_asset_ids);
         app.session.selection = crate::state::Selection::None;
         app.session.status = "Appearance mask erased".to_string();
-        app.state.dirty = true;
+        app.state.mark_dirty();
     }
     changed
 }

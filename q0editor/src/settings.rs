@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
 use egui::{Color32, Rounding, Stroke};
 use q0theme::{BuiltinTheme, BUILTIN_THEMES, Q0S_SIGNATURE_ID};
 use serde::{Deserialize, Serialize};
@@ -15,12 +16,14 @@ use serde::{Deserialize, Serialize};
 use crate::advanced_brush::{AdvancedBrushSettings, BrushMode};
 use crate::brush::{BrushNib, BrushSettings};
 use crate::easing::EasingPreset;
+use crate::hotkeys::HotkeySettings;
 use crate::l10n::Language;
 use q0s_format::geom::CapShape;
 use q0s_format::v2::Rgba;
 
 const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
-const MAX_THEME_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_THEME_BYTES: u64 = 96 * 1024 * 1024;
+const MAX_THEME_BACKDROP_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ColorRgb {
@@ -84,6 +87,12 @@ pub struct Theme {
     /// content. Default matches Flash CS3 dark grey.
     #[serde(default = "default_canvas_bg")]
     pub canvas_bg: ColorRgb,
+    /// Optional image behind the stage. The path is local settings state;
+    /// q7s packages embed the image bytes so themes can be shared.
+    #[serde(default)]
+    pub canvas_background_image: Option<PathBuf>,
+    #[serde(default)]
+    pub canvas_background_darkening: u8,
     #[serde(default = "default_stage_border")]
     pub stage_border: ColorRgb,
     /// Overlay used outside the current symbol bounds while editing inside a q0rg.
@@ -289,6 +298,8 @@ impl Default for Theme {
             text_dim: q0theme::default_theme().text_dim.into(),
             stroke_dark: q0theme::default_theme().stroke_dark.into(),
             canvas_bg: default_canvas_bg(),
+            canvas_background_image: None,
+            canvas_background_darkening: 0,
             stage_border: default_stage_border(),
             symbol_edit_mask: default_symbol_edit_mask(),
             library_preview_light: default_library_preview_light(),
@@ -583,16 +594,55 @@ struct Q7sFile {
     kind: String,
     name: String,
     theme: Theme,
+    #[serde(default)]
+    canvas_backdrop: Option<Q7sCanvasBackdrop>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Q7sCanvasBackdrop {
+    extension: String,
+    data_base64: String,
 }
 
 impl Theme {
     pub fn write_q7s(&self, path: &Path, name: &str) -> std::io::Result<()> {
+        let canvas_backdrop = self
+            .canvas_background_image
+            .as_deref()
+            .map(|image_path| -> std::io::Result<Q7sCanvasBackdrop> {
+                let extension = image_path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(str::to_ascii_lowercase)
+                    .filter(|extension| {
+                        matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "webp")
+                    })
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "canvas backdrop must be a png, jpg, jpeg, or webp image",
+                        )
+                    })?;
+                let bytes = read_limited(image_path, MAX_THEME_BACKDROP_BYTES, "canvas backdrop")?;
+                crate::bitmap_import::decode_bitmap_bytes(&bytes, u16::MAX).map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+                })?;
+                Ok(Q7sCanvasBackdrop {
+                    extension,
+                    data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                })
+            })
+            .transpose()?;
+        let mut theme = self.clone();
+        theme.canvas_background_image = None;
+        theme.canvas_background_darkening = theme.canvas_background_darkening.min(100);
         let file = Q7sFile {
             magic: Q7S_MAGIC.to_string(),
             version: 1,
             kind: Q7S_KIND.to_string(),
             name: name.to_string(),
-            theme: self.clone(),
+            theme,
+            canvas_backdrop,
         };
         let bytes = serde_json::to_vec_pretty(&file)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -621,8 +671,48 @@ impl Theme {
                 format!("unsupported q7s version {}", parsed.version),
             ));
         }
-        Ok((parsed.name, parsed.theme))
+        let mut theme = parsed.theme;
+        theme.canvas_background_darkening = theme.canvas_background_darkening.min(100);
+        if let Some(backdrop) = parsed.canvas_backdrop {
+            if !matches!(backdrop.extension.as_str(), "png" | "jpg" | "jpeg" | "webp") {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "q7s canvas backdrop has an unsupported image extension",
+                ));
+            }
+            let bytes = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                backdrop.data_base64,
+            )
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            if bytes.len() as u64 > MAX_THEME_BACKDROP_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "q7s canvas backdrop exceeds the image size limit",
+                ));
+            }
+            crate::bitmap_import::decode_bitmap_bytes(&bytes, u16::MAX).map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+            })?;
+            let image_path = store_q7s_backdrop(&bytes, &backdrop.extension)?;
+            theme.canvas_background_image = Some(image_path);
+        }
+        Ok((parsed.name, theme))
     }
+}
+
+fn store_q7s_backdrop(bytes: &[u8], extension: &str) -> std::io::Result<PathBuf> {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    let directory = Settings::path()
+        .and_then(|path| path.parent().map(|parent| parent.join("theme-backdrops")))
+        .unwrap_or_else(|| std::env::temp_dir().join("q0editor-theme-backdrops"));
+    std::fs::create_dir_all(&directory)?;
+    let path = directory.join(format!("canvas-{:016x}.{extension}", hasher.finish()));
+    crate::file_io::write_bytes_atomic(&path, bytes)?;
+    Ok(path)
 }
 
 // ---------------- Editor settings ----------------
@@ -969,6 +1059,21 @@ pub struct Settings {
     /// PNG sequence ergonomics preference.
     #[serde(default = "default_png_sequence_create_subfolder")]
     pub png_sequence_create_subfolder: bool,
+    /// Keyboard shortcut overrides shared by every project.
+    #[serde(default)]
+    pub hotkeys: HotkeySettings,
+    /// Width of the timeline's layer-name column, independent of project data.
+    #[serde(default = "default_timeline_layer_width")]
+    pub timeline_layer_width: u16,
+    /// Defaults carried into the next New Project dialog.
+    #[serde(default = "default_new_project_width")]
+    pub new_project_width: u16,
+    #[serde(default = "default_new_project_height")]
+    pub new_project_height: u16,
+    #[serde(default = "default_new_project_fps")]
+    pub new_project_fps: u16,
+    #[serde(default = "default_new_project_frame_count")]
+    pub new_project_frame_count: u16,
 }
 
 fn default_q0lang_font_name() -> String {
@@ -985,6 +1090,21 @@ fn default_q0lang_tab_width() -> u8 {
 }
 fn default_png_sequence_create_subfolder() -> bool {
     true
+}
+fn default_new_project_width() -> u16 {
+    crate::state::DEFAULT_STAGE_WIDTH
+}
+fn default_timeline_layer_width() -> u16 {
+    174
+}
+fn default_new_project_height() -> u16 {
+    crate::state::DEFAULT_STAGE_HEIGHT
+}
+fn default_new_project_fps() -> u16 {
+    24
+}
+fn default_new_project_frame_count() -> u16 {
+    24
 }
 
 impl Default for Settings {
@@ -1005,6 +1125,12 @@ impl Default for Settings {
             recent_projects: Vec::new(),
             last_export_directory: None,
             png_sequence_create_subfolder: default_png_sequence_create_subfolder(),
+            hotkeys: HotkeySettings::default(),
+            timeline_layer_width: default_timeline_layer_width(),
+            new_project_width: default_new_project_width(),
+            new_project_height: default_new_project_height(),
+            new_project_fps: default_new_project_fps(),
+            new_project_frame_count: default_new_project_frame_count(),
         }
     }
 }
@@ -1055,12 +1181,20 @@ impl Settings {
         }
         settings.q0lang_font_size.0 = settings.q0lang_font_size.0.clamp(8.0, 72.0);
         settings.q0lang_tab_width = settings.q0lang_tab_width.clamp(1, 8);
+        settings.new_project_width = settings.new_project_width.clamp(1, 8192);
+        settings.new_project_height = settings.new_project_height.clamp(1, 8192);
+        settings.new_project_fps = settings.new_project_fps.clamp(1, 240);
+        settings.new_project_frame_count = settings.new_project_frame_count.max(1);
+        settings.timeline_layer_width = settings.timeline_layer_width.clamp(112, 520);
+        settings.theme.canvas_background_darkening =
+            settings.theme.canvas_background_darkening.min(100);
         // The experimental Glow checkbox used to live on Classic. Migrate it
         // once into Advanced instead of keeping a raster material inside the
         // Flash-style classic engine.
         migrate_legacy_brush_glow(&mut settings);
         sanitize_advanced_brush_presets(&mut settings.advanced_brush_presets);
         crate::easing::sanitize_library(&mut settings.easing_presets);
+        settings.hotkeys.sanitize();
         settings.prune_recent();
         settings
     }

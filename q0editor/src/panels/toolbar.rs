@@ -69,7 +69,11 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 app.settings.theme.panel.to_color32(),
                 app.settings.theme.accent.to_color32(),
             )
-            .on_hover_text(format!("{} ({})", tool.label(), tool.glyph()));
+            .on_hover_text(
+                tool_shortcut(tool)
+                    .map(|command| app.settings.hotkeys.hint(command, tool.label()))
+                    .unwrap_or_else(|| tool.label().to_string()),
+            );
             if response.clicked() {
                 app.queue(Action::SelectTool(tool));
             }
@@ -77,6 +81,27 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         ui.add_space(8.0);
         ui.separator();
     });
+}
+
+fn tool_shortcut(tool: Tool) -> Option<crate::hotkeys::ShortcutCommand> {
+    use crate::hotkeys::ShortcutCommand as C;
+    Some(match tool {
+        Tool::Select => C::ToolSelect,
+        Tool::Lasso => C::ToolLasso,
+        Tool::Subselect => C::ToolSubselect,
+        Tool::Hand => C::ToolHand,
+        Tool::Pen => C::ToolPen,
+        Tool::Pencil => C::ToolPencil,
+        Tool::Brush => C::ToolBrush,
+        Tool::Eraser => C::ToolEraser,
+        Tool::Line => C::ToolLine,
+        Tool::Rectangle => C::ToolRectangle,
+        Tool::Oval => C::ToolOval,
+        Tool::Bucket => C::ToolBucket,
+        Tool::Eyedropper => C::ToolEyedropper,
+        Tool::Text => C::ToolText,
+        Tool::Rig => return None,
+    })
 }
 
 fn tool_button(

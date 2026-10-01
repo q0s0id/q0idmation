@@ -1,4 +1,4 @@
-use std::collections::{hash_map::DefaultHasher, HashMap};
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -9,13 +9,10 @@ use egui::{
 use q0s_format::v2::{Asset, Placement, ProjectV2, Rgba, Target, Transform2D, Tween};
 
 use crate::app::{Action, EditorApp, LibrarySelection, LibrarySource, ProjectLibrarySummary};
-use crate::render::{
-    active_placements_at, placement_bbox, q0rg_frame_bbox, render_asset_preview, render_stage,
-    StageView,
-};
+use crate::render::{active_placements_at, placement_bbox, q0rg_frame_bbox, StageView};
 use crate::state::{LibraryDragPayload, LibraryItem, LibraryRename, Selection};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum LibraryKey {
     Q0rg(u16),
     Asset(u16),
@@ -66,12 +63,35 @@ struct LibraryRow {
     kind: &'static str,
     uses: usize,
     detail: String,
+    folder: Option<String>,
 }
+
+const LIBRARY_ROOT_FILTER: &str = "\0root";
 
 #[derive(Debug, Clone)]
 pub(crate) struct LibraryCache {
     key: u64,
     rows: Arc<Vec<LibraryRow>>,
+    item_keys: HashSet<(u64, LibraryKey)>,
+    audio_only_items: HashSet<(u64, LibraryKey)>,
+    preview_bounds: Option<(LibraryPreviewBoundsKey, Option<(f32, f32, f32, f32)>)>,
+    preview_backgrounds: HashMap<LibraryPreviewBackgroundKey, (PreviewBackground, String)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LibraryPreviewBoundsKey {
+    tab_id: u64,
+    item: LibraryKey,
+    frame: u16,
+    project_revision: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct LibraryPreviewBackgroundKey {
+    tab_id: u64,
+    item: LibraryKey,
+    frame: u16,
+    library_revision: u64,
 }
 
 impl Default for LibraryCache {
@@ -79,10 +99,15 @@ impl Default for LibraryCache {
         Self {
             key: u64::MAX,
             rows: Arc::new(Vec::new()),
+            item_keys: HashSet::new(),
+            audio_only_items: HashSet::new(),
+            preview_bounds: None,
+            preview_backgrounds: HashMap::new(),
         }
     }
 }
 
+#[cfg(test)]
 fn hash_library_project(project: &ProjectV2, hasher: &mut impl Hasher) {
     project.meta.entry_q0rg_id.hash(hasher);
     project.q0rgs.len().hash(hasher);
@@ -151,35 +176,35 @@ fn library_rows_cache_key(
     }
     app.library_search.hash(&mut hasher);
     app.library_sort_ascending.hash(&mut hasher);
+    app.library_sort_by_uses.hash(&mut hasher);
     for library in libraries {
         if matches!(source, LibrarySource::Project(tab_id) if tab_id != library.tab_id) {
             continue;
         }
         library.tab_id.hash(&mut hasher);
         library.label.hash(&mut hasher);
-        let Some(project) = app.project_for_document_tab(library.tab_id) else {
+        let Some(revision) = app.project_library_revision_for_tab(library.tab_id) else {
             continue;
         };
-        hash_library_project(project, &mut hasher);
+        revision.hash(&mut hasher);
     }
     hasher.finish()
 }
 
 pub fn render(app: &mut EditorApp, ui: &mut Ui) {
+    use crate::ui::{icon_button, icon_button_enabled, Icon};
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Library").size(15.0).strong());
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui
-                .small_button("+")
-                .on_hover_text("Create q0rg symbol")
-                .clicked()
-            {
+            if icon_button(ui, Icon::Symbol, "Create q0rg symbol").clicked() {
                 app.queue(Action::AddQ0rg);
             }
-            if ui
-                .small_button("Import")
-                .on_hover_text("Import PNG, JPEG, WebP, WAV, MP3, OGG, FLAC, MP4 or q0v")
-                .clicked()
+            if icon_button(
+                ui,
+                Icon::Import,
+                "Import images, audio or video into the library",
+            )
+            .clicked()
             {
                 app.queue(Action::ImportMedia);
             }
@@ -204,6 +229,8 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     .map(|lib| LibrarySource::Project(lib.tab_id))
             });
         app.library_selection = None;
+        app.library_multi_selection.clear();
+        app.library_selection_anchor = None;
     }
 
     if libraries.is_empty() {
@@ -227,6 +254,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     let mut requested_source = source;
     egui::ComboBox::from_id_source("library_project_picker")
         .width(ui.available_width())
+        .wrap(true)
         .selected_text(selected_source_text)
         .show_ui(ui, |ui| {
             ui.selectable_value(&mut requested_source, LibrarySource::All, "All libraries");
@@ -242,9 +270,159 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     if requested_source != source {
         app.library_source = Some(requested_source);
         app.library_selection = None;
+        app.library_multi_selection.clear();
+        app.library_selection_anchor = None;
     }
     let source = app.library_source.unwrap_or(requested_source);
     let showing_all = matches!(source, LibrarySource::All);
+    let folder_paths = match source {
+        LibrarySource::Project(tab_id) => app
+            .project_for_document_tab(tab_id)
+            .map(|project| project.runtime.library_folders.clone())
+            .unwrap_or_default(),
+        LibrarySource::All => Vec::new(),
+    };
+    if !app.library_folder_filter.is_empty()
+        && app.library_folder_filter != LIBRARY_ROOT_FILTER
+        && !folder_paths.contains(&app.library_folder_filter)
+    {
+        app.library_folder_filter.clear();
+    }
+    if !showing_all {
+        let selected_folder = app.library_folder_filter.clone();
+        let selected_text = if selected_folder.is_empty() {
+            "All folders".to_string()
+        } else if selected_folder == LIBRARY_ROOT_FILTER {
+            "Unfoldered".to_string()
+        } else {
+            selected_folder.clone()
+        };
+        let can_manage_folders =
+            matches!(source, LibrarySource::Project(tab_id) if Some(tab_id) == active_tab);
+        ui.horizontal(|ui| {
+            ui.label("Folder");
+            egui::ComboBox::from_id_source("library_folder_picker")
+                .width(ui.available_width())
+                .wrap(true)
+                .selected_text(selected_text)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut app.library_folder_filter,
+                        String::new(),
+                        "All folders",
+                    );
+                    ui.selectable_value(
+                        &mut app.library_folder_filter,
+                        LIBRARY_ROOT_FILTER.to_string(),
+                        "Unfoldered",
+                    );
+                    for folder in &folder_paths {
+                        let depth = folder.matches('/').count();
+                        let label = format!("{}folder: {folder}", "  ".repeat(depth));
+                        ui.selectable_value(&mut app.library_folder_filter, folder.clone(), label);
+                    }
+                });
+        });
+        ui.horizontal_wrapped(|ui| {
+            if icon_button_enabled(
+                ui,
+                can_manage_folders,
+                Icon::Folder,
+                "Create library folder",
+            )
+            .clicked()
+            {
+                let parent = if selected_folder.is_empty() || selected_folder == LIBRARY_ROOT_FILTER
+                {
+                    None
+                } else {
+                    Some(selected_folder.clone())
+                };
+                app.library_folder_draft = Some(crate::app::LibraryFolderDraft {
+                    parent,
+                    rename_path: None,
+                    name: String::new(),
+                });
+            }
+            let rename_selected = can_manage_folders
+                && !selected_folder.is_empty()
+                && selected_folder != LIBRARY_ROOT_FILTER;
+            if icon_button_enabled(ui, rename_selected, Icon::Rename, "Rename selected folder")
+                .clicked()
+            {
+                let current_name = selected_folder
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&selected_folder);
+                app.library_folder_draft = Some(crate::app::LibraryFolderDraft {
+                    parent: selected_folder
+                        .rsplit_once('/')
+                        .map(|(parent, _)| parent.to_string()),
+                    rename_path: Some(selected_folder.clone()),
+                    name: current_name.to_string(),
+                });
+            }
+            if icon_button_enabled(
+                ui,
+                rename_selected,
+                Icon::Delete,
+                "Remove folder and move its items to the parent folder",
+            )
+            .clicked()
+            {
+                app.queue(Action::DeleteLibraryFolder(selected_folder));
+                app.library_folder_filter.clear();
+            }
+        });
+    }
+    if let Some(draft) = app.library_folder_draft.as_mut() {
+        let mut submit = false;
+        let mut cancel = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(if draft.rename_path.is_some() {
+                "Rename folder"
+            } else {
+                "New folder"
+            });
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut draft.name)
+                    .hint_text("folder name")
+                    .desired_width(125.0),
+            );
+            if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                submit = true;
+            }
+            if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                cancel = true;
+            }
+            let valid = !draft.name.trim().is_empty() && !draft.name.contains(['/', '\\']);
+            if icon_button_enabled(ui, valid, Icon::Check, "Save folder name").clicked() {
+                submit = true;
+            }
+            if icon_button(ui, Icon::Close, "Cancel folder name").clicked() {
+                cancel = true;
+            }
+        });
+        if submit {
+            let name = draft.name.trim().to_string();
+            if !name.is_empty() && !name.contains('/') && !name.contains('\\') {
+                let new_path = draft
+                    .parent
+                    .as_ref()
+                    .map(|parent| format!("{parent}/{name}"))
+                    .unwrap_or_else(|| name.clone());
+                if let Some(old_path) = draft.rename_path.clone() {
+                    app.queue(Action::RenameLibraryFolder(old_path, new_path.clone()));
+                } else {
+                    app.queue(Action::CreateLibraryFolder(new_path.clone()));
+                }
+                app.library_folder_filter = new_path;
+                app.library_folder_draft = None;
+            }
+        } else if cancel {
+            app.library_folder_draft = None;
+        }
+    }
 
     let cache_key = library_rows_cache_key(app, source, &libraries);
     if app.library_cache.key != cache_key {
@@ -255,25 +433,91 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 row.name.to_lowercase().contains(&needle)
                     || row.kind.to_lowercase().contains(&needle)
                     || row.detail.to_lowercase().contains(&needle)
+                    || row
+                        .folder
+                        .as_deref()
+                        .is_some_and(|folder| folder.to_lowercase().contains(&needle))
                     || row.library_label.to_lowercase().contains(&needle)
             });
         }
-        rows.sort_by_cached_key(|row| (row.name.to_lowercase(), row.library_label.to_lowercase()));
-        if !app.library_sort_ascending {
+        if app.library_sort_by_uses {
+            rows.sort_by(|left, right| {
+                left.folder
+                    .as_deref()
+                    .unwrap_or("")
+                    .to_lowercase()
+                    .cmp(&right.folder.as_deref().unwrap_or("").to_lowercase())
+                    .then_with(|| {
+                        if app.library_sort_ascending {
+                            left.uses.cmp(&right.uses)
+                        } else {
+                            right.uses.cmp(&left.uses)
+                        }
+                    })
+                    .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            });
+        } else {
+            rows.sort_by_cached_key(|row| {
+                (
+                    row.folder.as_deref().unwrap_or("").to_lowercase(),
+                    row.name.to_lowercase(),
+                    row.library_label.to_lowercase(),
+                )
+            });
+        }
+        if !app.library_sort_by_uses && !app.library_sort_ascending {
             rows.reverse();
         }
+        let item_keys = rows.iter().map(|row| (row.tab_id, row.key)).collect();
+        let audio_only_items = rows
+            .iter()
+            .filter(|row| row.kind == "audio")
+            .map(|row| (row.tab_id, row.key))
+            .collect();
         app.library_cache = LibraryCache {
             key: cache_key,
+            item_keys,
+            audio_only_items,
+            preview_bounds: None,
+            preview_backgrounds: HashMap::new(),
             rows: Arc::new(rows),
         };
     }
-    let rows = Arc::clone(&app.library_cache.rows);
-    if app.library_selection.is_some_and(|selection| {
-        !rows
-            .iter()
+    let all_rows = Arc::clone(&app.library_cache.rows);
+    let rows = match app.library_folder_filter.as_str() {
+        "" => all_rows,
+        LIBRARY_ROOT_FILTER => Arc::new(
+            all_rows
+                .iter()
+                .filter(|row| row.folder.is_none())
+                .cloned()
+                .collect(),
+        ),
+        folder => Arc::new(
+            all_rows
+                .iter()
+                .filter(|row| {
+                    row.folder.as_deref().is_some_and(|item_folder| {
+                        item_folder == folder || item_folder.starts_with(&format!("{folder}/"))
+                    })
+                })
+                .cloned()
+                .collect(),
+        ),
+    };
+    app.library_multi_selection.retain(|selection| {
+        rows.iter()
             .any(|row| row.tab_id == selection.tab_id && row.key == key_for_item(selection.item))
-    }) {
-        app.library_selection = None;
+            && app
+                .library_cache
+                .item_keys
+                .contains(&(selection.tab_id, key_for_item(selection.item)))
+    });
+    if app
+        .library_selection
+        .is_some_and(|selection| !app.library_multi_selection.contains(&selection))
+    {
+        app.library_selection = app.library_multi_selection.last().copied();
     }
 
     draw_preview(app, ui, app.library_selection);
@@ -282,30 +526,44 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
 
     let selected_active_item = app
         .library_selection
-        .filter(|selection| Some(selection.tab_id) == active_tab)
+        .filter(|selection| {
+            Some(selection.tab_id) == active_tab && app.library_multi_selection.len() <= 1
+        })
         .map(|selection| selection.item);
+    let selected_audio_only = app.library_selection.is_some_and(|selection| {
+        app.library_cache
+            .audio_only_items
+            .contains(&(selection.tab_id, key_for_item(selection.item)))
+    });
     let mut place_selected: Option<LibraryItem> = None;
     let mut enter_selected = None;
     let mut rename_selected = None;
     let mut delete_selected = None;
-    ui.horizontal(|ui| {
+    let mut delete_multi_selected = false;
+    ui.horizontal_wrapped(|ui| {
         ui.label(
             egui::RichText::new(format!("Items: {}", rows.len()))
                 .small()
                 .color(app.settings.theme.text_dim.to_color32()),
         );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if let Some(item) = selected_active_item {
-                let can_place = !matches!(item, LibraryItem::Q0rg(id) if id == app.session.current_q0rg_id)
-                    && !crate::audio::library_item_is_audio_only(&app.state.project, item);
+                if app.library_multi_selection.len() > 1 {
+                    if ui
+                        .button(format!("Delete {} selected", app.library_multi_selection.len()))
+                        .clicked()
+                    {
+                        delete_multi_selected = true;
+                    }
+                } else if let Some(item) = selected_active_item {
+                    let can_place = !matches!(item, LibraryItem::Q0rg(id) if id == app.session.current_q0rg_id)
+                    && !selected_audio_only;
                 if ui
                     .add_enabled(can_place, egui::Button::new("Place").small())
                     .clicked()
                 {
                     place_selected = Some(item);
                 }
-                if can_rename_item(app, item)
-                    && ui.button("Rename").on_hover_text("Rename (F2)").clicked()
+                if icon_button_enabled(ui, can_rename_item(app, item), Icon::Rename, "Rename library item (F2)").clicked()
                 {
                     rename_selected = Some(item);
                 }
@@ -313,9 +571,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     item,
                     LibraryItem::Q0rg(id) if id == app.state.project.meta.entry_q0rg_id
                 );
-                if ui
-                    .add_enabled(can_delete, egui::Button::new("Delete").small())
-                    .on_hover_text("Delete library item")
+                if icon_button_enabled(ui, can_delete, Icon::Delete, "Delete library item")
                     .clicked()
                 {
                     delete_selected = Some(item);
@@ -332,14 +588,10 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         });
     });
 
-    ui.add(
-        egui::TextEdit::singleline(&mut app.library_search)
-            .hint_text("Search library...")
-            .desired_width(f32::INFINITY),
-    );
+    crate::ui::search_field(ui, &mut app.library_search, "Search library...");
 
     ui.add_space(3.0);
-    let columns = if showing_all { 5 } else { 4 };
+    let columns = if showing_all { 6 } else { 5 };
     egui::Grid::new("library_header")
         .num_columns(columns)
         .min_col_width(28.0)
@@ -348,7 +600,13 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             if ui
                 .selectable_label(
                     false,
-                    if app.library_sort_ascending {
+                    if app.library_sort_by_uses {
+                        if app.library_sort_ascending {
+                            "Uses ↑"
+                        } else {
+                            "Uses ↓"
+                        }
+                    } else if app.library_sort_ascending {
                         "Name A-Z"
                     } else {
                         "Name Z-A"
@@ -356,11 +614,28 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 )
                 .clicked()
             {
-                app.library_sort_ascending = !app.library_sort_ascending;
+                if app.library_sort_by_uses {
+                    app.library_sort_by_uses = false;
+                    app.library_sort_ascending = true;
+                } else {
+                    app.library_sort_ascending = !app.library_sort_ascending;
+                }
             }
             ui.label("Type");
-            ui.label("Uses");
+            if ui
+                .selectable_label(app.library_sort_by_uses, "Uses")
+                .on_hover_text("Sort by use count, then by name")
+                .clicked()
+            {
+                if app.library_sort_by_uses {
+                    app.library_sort_ascending = !app.library_sort_ascending;
+                } else {
+                    app.library_sort_by_uses = true;
+                    app.library_sort_ascending = false;
+                }
+            }
             ui.label("ID");
+            ui.label("Folder");
             if showing_all {
                 ui.label("Library");
             }
@@ -380,10 +655,14 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         );
     }
 
-    let mut selected = None;
+    let mut selected: Option<(LibrarySelection, usize, bool, bool, bool)> = None;
     let mut enter: Option<(u64, u16)> = None;
     let mut rename = None;
     let mut delete = None;
+    let active_folder_paths = active_tab
+        .and_then(|tab_id| app.project_for_document_tab(tab_id))
+        .map(|project| project.runtime.library_folders.clone())
+        .unwrap_or_default();
     // Only instantiate widgets for rows intersecting the viewport. A large FLA can
     // contain tens of thousands of library items; building every egui row every
     // frame is pure off-screen work.
@@ -398,11 +677,14 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 .min_col_width(28.0)
                 .spacing([8.0, 2.0])
                 .show(ui, |ui| {
-                    for row in &rows[visible_rows] {
+                    for row_index in visible_rows.clone() {
+                        let row = &rows[row_index];
                         let payload = item_for_key(row.key);
-                        let is_selected = app.library_selection.is_some_and(|selection| {
-                            selection.tab_id == row.tab_id && selection.item == payload
-                        });
+                        let row_selection = LibrarySelection {
+                            tab_id: row.tab_id,
+                            item: payload,
+                        };
+                        let is_selected = app.library_multi_selection.contains(&row_selection);
                         let row_is_active = Some(row.tab_id) == active_tab;
                         let drag_payload = LibraryDragPayload {
                             source_tab_id: row.tab_id,
@@ -428,7 +710,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                                 app.settings.theme.accent.to_color32(),
                             );
                         }
-                        let audio_only = app.library_drag_item_is_audio_only(drag_payload);
+                        let audio_only = row.kind == "audio";
                         let drag_hint = if audio_only {
                             if row_is_active {
                                 "Drag onto timeline to place"
@@ -441,8 +723,11 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                             "Drag onto stage to copy into current project"
                         };
                         let response = response.on_hover_text(format!(
-                            "{}\n{}\n{}\n{drag_hint}",
-                            row.name, row.detail, row.library_label
+                            "{}\n{}\n{}\nFolder: {}\n{drag_hint}",
+                            row.name,
+                            row.detail,
+                            row.library_label,
+                            row.folder.as_deref().unwrap_or("Unfoldered")
                         ));
                         if row_is_active {
                             response.clone().context_menu(|ui| {
@@ -459,13 +744,33 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                                     delete = Some(payload);
                                     ui.close_menu();
                                 }
+                                ui.menu_button("Move to folder", |ui| {
+                                    if ui.button("Unfoldered").clicked() {
+                                        app.queue(Action::MoveLibraryItemToFolder(payload, None));
+                                        ui.close_menu();
+                                    }
+                                    for folder in &active_folder_paths {
+                                        if ui.button(folder).clicked() {
+                                            app.queue(Action::MoveLibraryItemToFolder(
+                                                payload,
+                                                Some(folder.clone()),
+                                            ));
+                                            ui.close_menu();
+                                        }
+                                    }
+                                });
                             });
                         }
                         if response.clicked() || response.drag_started() {
-                            selected = Some(LibrarySelection {
-                                tab_id: row.tab_id,
-                                item: payload,
-                            });
+                            let (control, shift) =
+                                ui.input(|input| (input.modifiers.command, input.modifiers.shift));
+                            selected = Some((
+                                row_selection,
+                                row_index,
+                                control,
+                                shift,
+                                response.drag_started(),
+                            ));
                         }
                         if response.double_clicked() {
                             if let LibraryKey::Q0rg(id) = row.key {
@@ -477,6 +782,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         ui.label(match row.key {
                             LibraryKey::Q0rg(id) | LibraryKey::Asset(id) => id.to_string(),
                         });
+                        ui.label(row.folder.as_deref().unwrap_or("—"));
                         if showing_all {
                             ui.label(&row.library_label);
                         }
@@ -485,13 +791,82 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 });
         });
 
-    if let Some(selection) = selected {
-        app.library_selection = Some(selection);
-        if Some(selection.tab_id) == active_tab {
-            app.session.selection = match selection.item {
-                LibraryItem::Q0rg(id) => Selection::Q0rg(id),
-                LibraryItem::Asset(id) => Selection::Asset(id),
-            };
+    if let Some((selection, row_index, control, shift, dragging)) = selected {
+        if dragging {
+            app.library_multi_selection = vec![selection];
+            app.library_selection = Some(selection);
+            app.library_selection_anchor = Some(selection);
+        } else if shift {
+            let anchor = app
+                .library_selection_anchor
+                .filter(|anchor| anchor.tab_id == selection.tab_id);
+            let anchor_index = anchor.and_then(|anchor| {
+                rows.iter().position(|row| {
+                    row.tab_id == anchor.tab_id && row.key == key_for_item(anchor.item)
+                })
+            });
+            if let Some(anchor_index) = anchor_index {
+                let start = anchor_index.min(row_index);
+                let end = anchor_index
+                    .max(row_index)
+                    .min(rows.len().saturating_sub(1));
+                app.library_multi_selection = rows[start..=end]
+                    .iter()
+                    .filter(|row| row.tab_id == selection.tab_id)
+                    .map(|row| LibrarySelection {
+                        tab_id: row.tab_id,
+                        item: item_for_key(row.key),
+                    })
+                    .collect();
+                app.library_selection = Some(selection);
+            } else {
+                app.library_multi_selection = vec![selection];
+                app.library_selection = Some(selection);
+                app.library_selection_anchor = Some(selection);
+            }
+        } else if control {
+            if app
+                .library_multi_selection
+                .iter()
+                .any(|selected| selected.tab_id != selection.tab_id)
+            {
+                app.library_multi_selection.clear();
+                app.library_selection_anchor = Some(selection);
+            }
+            if let Some(index) = app
+                .library_multi_selection
+                .iter()
+                .position(|item| *item == selection)
+            {
+                app.library_multi_selection.remove(index);
+                app.library_selection = app.library_multi_selection.last().copied();
+            } else {
+                app.library_multi_selection.push(selection);
+                app.library_selection = Some(selection);
+            }
+            if app
+                .library_selection_anchor
+                .map_or(true, |anchor| anchor.tab_id != selection.tab_id)
+            {
+                app.library_selection_anchor = Some(selection);
+            }
+        } else {
+            app.library_multi_selection = vec![selection];
+            app.library_selection = Some(selection);
+            app.library_selection_anchor = Some(selection);
+        }
+
+        if app.library_multi_selection.len() == 1 {
+            if let Some(selection) = app.library_multi_selection.first().copied() {
+                if Some(selection.tab_id) == active_tab {
+                    app.session.selection = match selection.item {
+                        LibraryItem::Q0rg(id) => Selection::Q0rg(id),
+                        LibraryItem::Asset(id) => Selection::Asset(id),
+                    };
+                }
+            }
+        } else {
+            app.session.selection = Selection::None;
         }
     }
     if let Some(item) = place_selected {
@@ -510,13 +885,24 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         app.queue(Action::EnterQ0rg(id));
     }
     if ui.input(|input| input.key_pressed(egui::Key::F2)) {
-        rename_selected = selected_library_item(app).filter(|item| can_rename_item(app, *item));
+        if app.library_multi_selection.len() <= 1 {
+            rename_selected = selected_library_item(app).filter(|item| can_rename_item(app, *item));
+        }
     }
     if let Some(item) = rename.or(rename_selected) {
         begin_rename(app, item);
     }
     if let Some(item) = delete.or(delete_selected) {
         app.queue(Action::DeleteLibraryItem(item));
+    }
+    if delete_multi_selected {
+        let items = app
+            .library_multi_selection
+            .iter()
+            .filter(|selection| Some(selection.tab_id) == active_tab)
+            .map(|selection| selection.item)
+            .collect();
+        app.queue(Action::DeleteLibraryItems(items));
     }
     render_rename_dialog(app, ui.ctx());
 }
@@ -538,6 +924,15 @@ fn item_for_key(key: LibraryKey) -> LibraryItem {
         LibraryKey::Q0rg(id) => LibraryItem::Q0rg(id),
         LibraryKey::Asset(id) => LibraryItem::Asset(id),
     }
+}
+
+pub(crate) fn library_drag_item_is_audio_only(
+    app: &EditorApp,
+    payload: LibraryDragPayload,
+) -> bool {
+    app.library_cache
+        .audio_only_items
+        .contains(&(payload.source_tab_id, key_for_item(payload.item)))
 }
 
 fn can_rename_item(app: &EditorApp, item: LibraryItem) -> bool {
@@ -636,7 +1031,10 @@ fn render_rename_dialog(app: &mut EditorApp, ctx: &egui::Context) {
                 response.request_focus();
                 rename.focus_requested = false;
             }
-            if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+            if (response.has_focus() || response.lost_focus())
+                && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                && !rename.draft.trim().is_empty()
+            {
                 submit = true;
             }
             if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
@@ -653,7 +1051,7 @@ fn render_rename_dialog(app: &mut EditorApp, ctx: &egui::Context) {
             });
         });
 
-    if submit && !rename.draft.trim().is_empty() {
+    if submit && open && !cancel && !rename.draft.trim().is_empty() {
         app.queue(Action::RenameLibraryItem(rename.item, rename.draft));
     } else if open && !cancel {
         app.session.library_rename = Some(rename);
@@ -948,6 +1346,11 @@ fn collect_rows_for_project(
             kind: "q0rg",
             uses,
             detail: format!("{} frames / {} layers", q0rg.frame_count, q0rg.layers.len()),
+            folder: project
+                .runtime
+                .library_item_folders
+                .get(&q0s_format::v2::LibraryItemReference::Q0rg(q0rg.q0rg_id))
+                .cloned(),
         });
     }
     for asset in &project.assets {
@@ -1049,6 +1452,11 @@ fn collect_rows_for_project(
             kind,
             uses,
             detail,
+            folder: project
+                .runtime
+                .library_item_folders
+                .get(&q0s_format::v2::LibraryItemReference::Asset(id))
+                .cloned(),
         });
     }
     rows
@@ -1078,98 +1486,131 @@ fn draw_preview(app: &mut EditorApp, ui: &mut Ui, selection: Option<LibrarySelec
         return;
     };
     let key = key_for_item(selection.item);
+    let frame = match key {
+        LibraryKey::Q0rg(id) => app.project_library_preview_frame(selection.tab_id, id),
+        LibraryKey::Asset(_) => 0,
+    };
+    let bounds_key = LibraryPreviewBoundsKey {
+        tab_id: selection.tab_id,
+        item: key,
+        frame,
+        project_revision: app.project_revision_for_tab(selection.tab_id).unwrap_or(0),
+    };
+    let cached_bounds = app
+        .library_cache
+        .preview_bounds
+        .filter(|(cached_key, _)| *cached_key == bounds_key)
+        .map(|(_, bounds)| bounds);
+    let background_key = LibraryPreviewBackgroundKey {
+        tab_id: selection.tab_id,
+        item: key,
+        frame,
+        library_revision: app
+            .project_library_revision_for_tab(selection.tab_id)
+            .unwrap_or(0),
+    };
+    let cached_background = app
+        .library_cache
+        .preview_backgrounds
+        .get(&background_key)
+        .cloned();
     let ctx = ui.ctx().clone();
-    let _ = app.with_project_library_view_mut(selection.tab_id, |project, session, textures| {
-        let frame = match key {
-            LibraryKey::Q0rg(id) if id == session.current_q0rg_id => session.current_frame,
-            _ => 0,
-        };
-        let background = preview_background_for_key(project, key, frame);
-        let label = match key {
-            LibraryKey::Q0rg(id) => project
-                .q0rgs
-                .iter()
-                .find(|q0rg| q0rg.q0rg_id == id)
-                .map(|q0rg| q0rg.name.as_str())
-                .unwrap_or("Missing q0rg"),
-            LibraryKey::Asset(id) => project
-                .assets
-                .iter()
-                .find(|asset| asset.id() == id)
-                .map(|asset| match asset {
-                    Asset::Vector(_) => project
-                        .asset_names
-                        .get(&id)
-                        .map(String::as_str)
-                        .unwrap_or("Vector asset"),
-                    Asset::Bitmap(_) => "Bitmap asset",
-                    Asset::Q0v(_) => project
-                        .asset_names
-                        .get(&id)
-                        .map(String::as_str)
-                        .unwrap_or("Video asset"),
-                    Asset::Rig(_) => "Rig metadata",
-                })
-                .unwrap_or("Missing asset"),
-        };
-        painter.text(
-            rect.left_top() + vec2(7.0, 6.0),
-            egui::Align2::LEFT_TOP,
-            label,
-            FontId::proportional(11.0),
-            text_dim,
-        );
-
-        let content_rect =
-            Rect::from_min_max(rect.min + vec2(8.0, 23.0), rect.max - vec2(8.0, 8.0));
-        draw_preview_background(
-            &painter,
-            content_rect,
-            background,
-            preview_light,
-            preview_dark,
-        );
-        painter.rect_stroke(
-            content_rect,
-            0.0,
-            Stroke::new(1.0_f32, border.gamma_multiply(0.8)),
-        );
-        let bbox = match key {
-            LibraryKey::Q0rg(id) => q0rg_frame_bbox(project, id, frame),
-            LibraryKey::Asset(id) => placement_bbox(
-                project,
-                &Placement {
-                    instance_id: 0,
-                    frame: 0,
-                    target: Target::Asset(id),
-                    transform: Transform2D::IDENTITY,
-                    tween: Tween::None,
-                    fx: Default::default(),
-                },
-            ),
-        };
-
-        let Some(bounds) = bbox else {
-            painter.rect_filled(content_rect, 4.0, window_fill);
+    let preview = app.with_project_library_view_mut(
+        selection.tab_id,
+        |project, _session, textures, render_revision| {
+            let (background, label) = cached_background.unwrap_or_else(|| {
+                (
+                    preview_background_for_key(project, key, frame),
+                    preview_label_for_key(project, key),
+                )
+            });
             painter.text(
-                content_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "No artwork yet",
-                FontId::proportional(12.0),
+                rect.left_top() + vec2(7.0, 6.0),
+                egui::Align2::LEFT_TOP,
+                label.clone(),
+                FontId::proportional(11.0),
                 text_dim,
             );
-            return;
-        };
-        let view = preview_view(content_rect, bounds);
-        match key {
-            LibraryKey::Q0rg(id) => {
-                render_stage(&painter, project, id, frame, &view, textures, &ctx)
+
+            let content_rect =
+                Rect::from_min_max(rect.min + vec2(8.0, 23.0), rect.max - vec2(8.0, 8.0));
+            draw_preview_background(
+                &painter,
+                content_rect,
+                background,
+                preview_light,
+                preview_dark,
+            );
+            painter.rect_stroke(
+                content_rect,
+                0.0,
+                Stroke::new(1.0_f32, border.gamma_multiply(0.8)),
+            );
+            let bbox = cached_bounds.unwrap_or_else(|| match key {
+                LibraryKey::Q0rg(id) => q0rg_frame_bbox(project, id, frame),
+                LibraryKey::Asset(id) => placement_bbox(
+                    project,
+                    &Placement {
+                        instance_id: 0,
+                        frame: 0,
+                        target: Target::Asset(id),
+                        transform: Transform2D::IDENTITY,
+                        tween: Tween::None,
+                        fx: Default::default(),
+                    },
+                ),
+            });
+
+            let Some(bounds) = bbox else {
+                painter.rect_filled(content_rect, 4.0, window_fill);
+                painter.text(
+                    content_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "No artwork yet",
+                    FontId::proportional(12.0),
+                    text_dim,
+                );
+                return (bounds_key, bbox, background_key, background, label);
+            };
+            let view = preview_view(content_rect, bounds);
+            match key {
+                LibraryKey::Q0rg(id) => crate::render::render_stage_with_revision(
+                    &painter,
+                    project,
+                    id,
+                    frame,
+                    &view,
+                    textures,
+                    &ctx,
+                    (selection.tab_id, render_revision),
+                ),
+                LibraryKey::Asset(id) => crate::render::render_asset_preview_with_revision(
+                    &painter,
+                    project,
+                    id,
+                    &view,
+                    textures,
+                    &ctx,
+                    Some((selection.tab_id, render_revision)),
+                ),
             }
-            LibraryKey::Asset(id) => {
-                render_asset_preview(&painter, project, id, &view, textures, &ctx)
-            }
+            (bounds_key, bbox, background_key, background, label)
+        },
+    );
+    if let Some((bounds_key, bounds, background_key, background, label)) = preview {
+        app.library_cache.preview_bounds = Some((bounds_key, bounds));
+        if app.library_cache.preview_backgrounds.len() >= 256
+            && !app
+                .library_cache
+                .preview_backgrounds
+                .contains_key(&background_key)
+        {
+            app.library_cache.preview_backgrounds.clear();
         }
-    });
+        app.library_cache
+            .preview_backgrounds
+            .insert(background_key, (background, label));
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1243,6 +1684,36 @@ fn preview_background_for_key(
         LibraryKey::Q0rg(id) => collect_q0rg_color_stats(project, id, frame, 0, &mut stats),
     }
     stats.background()
+}
+
+fn preview_label_for_key(project: &ProjectV2, key: LibraryKey) -> String {
+    match key {
+        LibraryKey::Q0rg(id) => project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == id)
+            .map(|q0rg| q0rg.name.clone())
+            .unwrap_or_else(|| "Missing q0rg".to_string()),
+        LibraryKey::Asset(id) => project
+            .assets
+            .iter()
+            .find(|asset| asset.id() == id)
+            .map(|asset| match asset {
+                Asset::Vector(_) => project
+                    .asset_names
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| "Vector asset".to_string()),
+                Asset::Bitmap(_) => "Bitmap asset".to_string(),
+                Asset::Q0v(_) => project
+                    .asset_names
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| "Video asset".to_string()),
+                Asset::Rig(_) => "Rig metadata".to_string(),
+            })
+            .unwrap_or_else(|| "Missing asset".to_string()),
+    }
 }
 
 fn collect_q0rg_color_stats(
@@ -1390,7 +1861,7 @@ pub(crate) fn draw_q0rg_frame_preview_background(
     draw_preview_background(painter, rect, background, light, dark);
 }
 
-fn preview_view(rect: Rect, bounds: (f32, f32, f32, f32)) -> StageView {
+pub(crate) fn preview_view(rect: Rect, bounds: (f32, f32, f32, f32)) -> StageView {
     let width = (bounds.2 - bounds.0).abs().max(1.0);
     let height = (bounds.3 - bounds.1).abs().max(1.0);
     let scale = (rect.width() / width).min(rect.height() / height) * 0.82;
@@ -1403,6 +1874,7 @@ fn preview_view(rect: Rect, bounds: (f32, f32, f32, f32)) -> StageView {
         ),
         scale,
         stage_rect: rect,
+        edit_transform: q0s_format::transform::Affine::IDENTITY,
     }
 }
 
@@ -1453,6 +1925,7 @@ mod tests {
             script: String::new(),
             layers: vec![q0s_format::v2::Layer {
                 layer_id: 1,
+                timeline_frame_count: None,
                 name: "child layer".into(),
                 explicit_keyframes: Vec::new(),
                 placements: Vec::new(),
