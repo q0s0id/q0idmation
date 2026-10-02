@@ -101,7 +101,7 @@ fn extract_q_project(project: &ProjectV2, output: &Path) -> Result<usize, String
             }
             Asset::Q0v(media) => {
                 let path = assets_dir.join(format!("{id:05}_{friendly}.q0v"));
-                fs::write(&path, &media.bytes)
+                fs::write(&path, media.bytes.as_slice())
                     .map_err(|error| format!("write {}: {error}", path.display()))?;
                 files += 1;
             }

@@ -17,6 +17,144 @@ fn q0rg_index(project: &ProjectV2, q0rg_id: u16) -> Option<usize> {
         .position(|q0rg| q0rg.q0rg_id == q0rg_id)
 }
 
+/// Folder rows summarize descendants; they never own independent hold frames.
+pub(crate) fn layer_frame_counts(project: &ProjectV2, q0rg_id: u16) -> HashMap<u16, u16> {
+    let Some(index) = q0rg_index(project, q0rg_id) else {
+        return HashMap::new();
+    };
+    let q0rg = &project.q0rgs[index];
+    let mut lengths = HashMap::<u16, u16>::new();
+    // Valid model order puts descendants before their folder, so nested folder
+    // lengths propagate upward in one pass, including collapsed/hidden layers.
+    for layer in &q0rg.layers {
+        let length = if project.layer_is_folder(q0rg_id, layer.layer_id) {
+            lengths.get(&layer.layer_id).copied().unwrap_or(0)
+        } else {
+            layer
+                .timeline_frame_count
+                .unwrap_or(q0rg.frame_count)
+                .min(q0rg.frame_count)
+        };
+        lengths.insert(layer.layer_id, length);
+        if let Some(parent) = project.layer_parent_folder(q0rg_id, layer.layer_id) {
+            let parent_length = lengths.entry(parent).or_default();
+            *parent_length = (*parent_length).max(length);
+        }
+    }
+    lengths
+}
+
+/// Reconcile stored folder spans and remove a shared tail no real track owns.
+pub(crate) fn sync_folder_timelines(project: &mut ProjectV2, q0rg_id: u16) -> bool {
+    let Some(index) = q0rg_index(project, q0rg_id) else {
+        return false;
+    };
+    let lengths = layer_frame_counts(project, q0rg_id);
+    let folders = project.q0rgs[index]
+        .layers
+        .iter()
+        .filter(|layer| project.layer_is_folder(q0rg_id, layer.layer_id))
+        .map(|layer| layer.layer_id)
+        .collect::<HashSet<_>>();
+    let old_count = project.q0rgs[index].frame_count;
+    let mut new_count = project.q0rgs[index]
+        .layers
+        .iter()
+        .filter(|layer| !folders.contains(&layer.layer_id))
+        .filter_map(|layer| lengths.get(&layer.layer_id).copied())
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    for key in project
+        .runtime
+        .frame_labels
+        .keys()
+        .filter(|key| key.q0rg_id == q0rg_id)
+    {
+        new_count = new_count.max(key.frame.saturating_add(1));
+    }
+    for script in project
+        .runtime
+        .frame_scripts
+        .iter()
+        .filter(|script| script.q0rg_id == q0rg_id)
+    {
+        new_count = new_count.max(script.frame.saturating_add(1));
+    }
+    for clip in project
+        .audio_clips
+        .iter()
+        .filter(|clip| clip.q0rg_id == q0rg_id)
+    {
+        new_count = new_count.max(
+            q0s_format::v2::audio_clip_end_frame(project, *clip)
+                .unwrap_or_else(|| clip.start_frame.saturating_add(1)),
+        );
+    }
+    if q0rg_id == project.meta.entry_q0rg_id {
+        for key in &project.runtime.camera.keys {
+            new_count = new_count.max(key.frame.saturating_add(1));
+            if let Some(end) = key.tween.to_frame() {
+                new_count = new_count.max(end.saturating_add(1));
+            }
+        }
+    }
+    if let Some(rig) = q0s_format::rig::rig_for_q0rg(project, q0rg_id) {
+        for key in rig.channels.iter().flat_map(|channel| &channel.keys) {
+            new_count = new_count.max(key.frame.saturating_add(1));
+        }
+    }
+    new_count = new_count.min(old_count);
+    let mut changed = new_count != old_count;
+    let q0rg = &mut project.q0rgs[index];
+    q0rg.frame_count = new_count;
+    for layer in &mut q0rg.layers {
+        let length = lengths
+            .get(&layer.layer_id)
+            .copied()
+            .unwrap_or(0)
+            .min(new_count);
+        let stored = (length < new_count).then_some(length);
+        changed |= layer.timeline_frame_count != stored;
+        layer.timeline_frame_count = stored;
+    }
+    if new_count < old_count {
+        // References into a shortened symbol must remain valid when saving.
+        let last = new_count.saturating_sub(1);
+        for placement in project
+            .q0rgs
+            .iter_mut()
+            .flat_map(|q| &mut q.layers)
+            .flat_map(|layer| &mut layer.placements)
+            .filter(|placement| placement.target == q0s_format::v2::Target::Q0rg(q0rg_id))
+        {
+            let playback = &mut placement.fx.q0rg_playback;
+            playback.first_frame = playback.first_frame.min(last);
+            playback.single_frame = playback.single_frame.min(last);
+            playback.last_frame = playback.last_frame.map(|frame| frame.min(last));
+        }
+    }
+    changed
+}
+
+pub(crate) fn sync_project_folder_timelines(project: &mut ProjectV2) -> bool {
+    let ids = project
+        .q0rgs
+        .iter()
+        .filter(|q| {
+            q.layers
+                .iter()
+                .any(|layer| project.layer_is_folder(q.q0rg_id, layer.layer_id))
+        })
+        .map(|q| q.q0rg_id)
+        .collect::<Vec<_>>();
+    let mut changed = false;
+    for id in ids {
+        changed |= sync_folder_timelines(project, id);
+    }
+    changed
+}
+
 fn used_instance_ids(project: &ProjectV2) -> HashSet<u32> {
     project
         .q0rgs
@@ -180,6 +318,12 @@ fn layers_for_property(
         | Property::NodeTy(node_id)
         | Property::NodeRotation(node_id)
         | Property::NodeScaleX(node_id)
+        | Property::BindingA11(node_id)
+        | Property::BindingA12(node_id)
+        | Property::BindingA21(node_id)
+        | Property::BindingA22(node_id)
+        | Property::BindingTx(node_id)
+        | Property::BindingTy(node_id)
         | Property::NodeScaleY(node_id) => layers_for_node(project, q0rg_id, rig, node_id),
         Property::ControlX(control_id)
         | Property::ControlY(control_id)
@@ -285,7 +429,7 @@ pub fn insert_rig_key_for_layer(
     let Some(rig_snapshot) = q0s_format::rig::rig_for_q0rg(project, q0rg_id).cloned() else {
         return false;
     };
-    let values = q0s_format::rig::capture_pose_values(&rig_snapshot, f32::from(frame))
+    let values = q0s_format::rig::capture_timeline_pose_values(&rig_snapshot, f32::from(frame))
         .into_iter()
         .filter(|value| {
             layers_for_property(project, q0rg_id, &rig_snapshot, value.property).contains(&layer_id)
@@ -307,13 +451,7 @@ pub fn insert_rig_key_for_layer(
         return false;
     };
     for (property, value) in values {
-        q0s_format::rig::upsert_channel_key(
-            rig,
-            property,
-            frame,
-            value,
-            q0s_format::v2::Easing::Linear,
-        );
+        q0s_format::rig::upsert_pose_key(rig, property, frame, value);
     }
     true
 }
@@ -793,6 +931,21 @@ pub fn clear_frames(
     Some(removed)
 }
 
+/// Resolve the state to inherit when creating a keyframe. Beyond cells stay
+/// invisible during playback, but an F6 extension inherits the last existing
+/// cell of a shortened layer. A real blank key still stops that inheritance.
+pub(crate) fn keyframe_source_states_at(
+    layer: &Layer,
+    frame: u16,
+) -> Vec<q0s_format::raster::ActivePlacementState> {
+    let source_frame = match layer.timeline_frame_count {
+        Some(0) => return Vec::new(),
+        Some(frame_count) => frame.min(frame_count - 1),
+        None => frame,
+    };
+    q0s_format::raster::active_placement_states_at(layer, source_frame)
+}
+
 /// Convert every selected non-key cell into a real keyframe using the exact
 /// visible state from the original timeline. When a new key splits an incoming
 /// tween, retarget that tween to the first inserted key so metadata and the
@@ -802,68 +955,8 @@ pub fn materialize_selected_keyframes(
     q0rg_id: u16,
     selection: TimelineSelection,
 ) -> Option<usize> {
-    let (layer_ids, first_frame, last_frame) = selected_frame_bounds(project, q0rg_id, selection)?;
-    let q0rg = project.q0rgs.iter().find(|q0rg| q0rg.q0rg_id == q0rg_id)?;
-    let mut insertions = Vec::<(u16, u16, Vec<q0s_format::v2::Placement>)>::new();
-    let mut tween_retargets = HashMap::<(u16, usize), u16>::new();
-
-    for layer_id in layer_ids {
-        let layer = q0rg
-            .layers
-            .iter()
-            .find(|layer| layer.layer_id == layer_id)?;
-        for frame in first_frame..=last_frame {
-            if layer.has_keyframe(frame) {
-                continue;
-            }
-            let mut placements = Vec::new();
-            for (placement_idx, transform) in crate::render::active_placements_at(layer, frame) {
-                let source = layer.placements.get(placement_idx)?;
-                if source
-                    .tween
-                    .to_frame()
-                    .is_some_and(|to_frame| source.frame < frame && frame <= to_frame)
-                {
-                    tween_retargets
-                        .entry((layer_id, placement_idx))
-                        .and_modify(|target| *target = (*target).min(frame))
-                        .or_insert(frame);
-                }
-                let mut placement = source.clone();
-                placement.frame = frame;
-                placement.transform = transform;
-                placement.tween = Tween::None;
-                placements.push(placement);
-            }
-            insertions.push((layer_id, frame, placements));
-        }
-    }
-
-    let q0rg_index = q0rg_index(project, q0rg_id)?;
-    let q0rg = &mut project.q0rgs[q0rg_index];
-    for ((layer_id, placement_idx), target_frame) in tween_retargets {
-        let layer = q0rg
-            .layers
-            .iter_mut()
-            .find(|layer| layer.layer_id == layer_id)?;
-        let placement = layer.placements.get_mut(placement_idx)?;
-        placement.tween = placement.tween.with_to_frame(target_frame);
-    }
-    let created = insertions.len();
-    for (layer_id, frame, placements) in insertions {
-        let layer = q0rg
-            .layers
-            .iter_mut()
-            .find(|layer| layer.layer_id == layer_id)?;
-        if placements.is_empty() {
-            layer.ensure_explicit_keyframe(frame);
-        } else {
-            for placement in placements {
-                layer.push_placement(placement);
-            }
-        }
-    }
-    Some(created)
+    let cells = selected_frame_cells_including_virtual(project, q0rg_id, selection)?;
+    materialize_keyframes_at_cells(project, q0rg_id, &cells)
 }
 
 /// Materialize real keyframes at the selected cells only. Unlike a rectangular
@@ -874,6 +967,12 @@ pub fn materialize_keyframes_at_cells(
     q0rg_id: u16,
     cells: &[(u16, u16)],
 ) -> Option<usize> {
+    let mut audio_created = 0;
+    for (layer_id, frame) in cells.iter().copied().collect::<BTreeSet<_>>() {
+        audio_created += usize::from(crate::audio::keyframe_audio(
+            project, q0rg_id, layer_id, frame, true,
+        ));
+    }
     let q0rg_index = q0rg_index(project, q0rg_id)?;
     let q0rg = &project.q0rgs[q0rg_index];
     if q0rg.frame_count == 0 {
@@ -887,7 +986,7 @@ pub fn materialize_keyframes_at_cells(
         })
     });
     if selected.is_empty() {
-        return Some(0);
+        return Some(audio_created);
     }
 
     let mut max_frame_by_layer = BTreeMap::<u16, u16>::new();
@@ -911,7 +1010,7 @@ pub fn materialize_keyframes_at_cells(
             .or_insert(frame);
 
         let mut cell_insertions = Vec::new();
-        for state in q0s_format::raster::active_placement_states_at(layer, frame) {
+        for state in keyframe_source_states_at(layer, frame) {
             let source = layer.placements.get(state.index)?;
             if source.frame == frame {
                 continue;
@@ -929,6 +1028,7 @@ pub fn materialize_keyframes_at_cells(
             let mut placement = source.clone();
             placement.frame = frame;
             placement.transform = state.transform;
+            placement.fx = state.fx;
             placement.tween = Tween::None;
             cell_insertions.push((state.index, placement));
         }
@@ -944,7 +1044,7 @@ pub fn materialize_keyframes_at_cells(
     }
 
     if max_frame_by_layer.is_empty() {
-        return Some(0);
+        return Some(audio_created);
     }
     if max_frame_by_layer
         .values()
@@ -992,7 +1092,7 @@ pub fn materialize_keyframes_at_cells(
             .find(|layer| layer.layer_id == layer_id)?
             .ensure_explicit_keyframe(frame);
     }
-    Some(created_cells)
+    Some(created_cells + audio_created)
 }
 
 /// Demote selected keyframes back to ordinary held frames. Frame zero is the
@@ -1544,7 +1644,7 @@ pub fn remove_selected_frame_columns(
 
 /// Remove selected frame cells from only their own layers. Later content on
 /// each affected layer shifts left by the number of removed cells before it;
-/// the q0rg's shared frame count and every unselected layer stay unchanged.
+/// every unselected layer stays unchanged. The shared tail follows real tracks.
 pub fn remove_selected_frame_cells(
     project: &mut ProjectV2,
     q0rg_id: u16,
@@ -1661,6 +1761,7 @@ pub fn remove_selected_frame_cells(
         layer.timeline_frame_count = (new_layer_length < frame_count).then_some(new_layer_length);
     }
 
+    sync_folder_timelines(project, q0rg_id);
     Some(removed_by_layer.values().map(BTreeSet::len).sum())
 }
 
@@ -2048,6 +2149,9 @@ pub fn remove_layers(
     }
     let removed = ids.iter().copied().collect::<HashSet<_>>();
     project
+        .audio_clips
+        .retain(|clip| clip.q0rg_id != q0rg_id || !removed.contains(&clip.layer_id));
+    project
         .runtime
         .frame_scripts
         .retain(|script| script.q0rg_id != q0rg_id || !removed.contains(&script.layer_id));
@@ -2083,6 +2187,18 @@ pub fn remove_layers(
                 node.binding = None;
             }
         }
+        let unbound = rig
+            .nodes
+            .iter()
+            .filter(|node| node.binding.is_none())
+            .map(|node| node.node_id)
+            .collect::<HashSet<_>>();
+        rig.channels.retain(|channel| {
+            channel
+                .property
+                .binding_node_id()
+                .is_none_or(|node_id| !unbound.contains(&node_id))
+        });
     }
 
     let has_drawable = project.q0rgs[q0rg_index]
@@ -2100,12 +2216,13 @@ pub fn remove_layers(
             .max(1);
         project.q0rgs[q0rg_index].layers.push(Layer {
             layer_id: next_id,
-            timeline_frame_count: None,
+            timeline_frame_count: Some(1),
             name: format!("Layer {next_id}"),
             explicit_keyframes: vec![0],
             placements: Vec::new(),
         });
     }
+    sync_folder_timelines(project, q0rg_id);
     Some(removed.len())
 }
 

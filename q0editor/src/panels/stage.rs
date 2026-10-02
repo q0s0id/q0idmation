@@ -13,6 +13,144 @@ pub const ZOOM_MAX: f32 = 32.0;
 const ZOOM_WHEEL_FACTOR: f32 = 0.0015;
 const SYMBOL_EDIT_MASK_ALPHA: u8 = 48;
 
+pub(crate) fn render_animation_preview(app: &mut EditorApp, ctx: &egui::Context) {
+    if !app.session.show_animation_preview {
+        app.session.animation_preview_playing = false;
+        if app.animation_preview_revision.take().is_some() {
+            app.animation_preview_textures = Default::default();
+        }
+        return;
+    }
+    let root = app.state.project.meta.entry_q0rg_id;
+    let frame_count = app
+        .state
+        .project
+        .q0rgs
+        .iter()
+        .find(|q| q.q0rg_id == root)
+        .map(|q| q.frame_count.max(1))
+        .unwrap_or(1);
+    let (loop_start, loop_end) = app
+        .session
+        .preview_loop_ranges
+        .get(&root)
+        .filter(|range| range.0)
+        .map(|range| {
+            let start = range.1.min(frame_count - 1);
+            (start, range.2.max(start).min(frame_count - 1))
+        })
+        .unwrap_or((0, frame_count - 1));
+    app.session.animation_preview_frame = app.session.animation_preview_frame.min(frame_count - 1);
+    if app.session.animation_preview_playing {
+        let interval =
+            std::time::Duration::from_secs_f64(1.0 / f64::from(app.state.project.meta.fps.max(1)));
+        let elapsed = app.session.animation_preview_tick.elapsed();
+        let steps = elapsed.as_nanos() / interval.as_nanos().max(1);
+        if steps > 0 {
+            let current = app.session.animation_preview_frame;
+            let current = if current < loop_start || current > loop_end {
+                loop_start
+            } else {
+                current
+            };
+            app.session.animation_preview_frame = loop_start
+                + ((u128::from(current - loop_start) + steps)
+                    % u128::from(loop_end - loop_start + 1)) as u16;
+            app.session.animation_preview_tick = std::time::Instant::now()
+                - std::time::Duration::from_nanos(
+                    (elapsed.as_nanos() % interval.as_nanos().max(1)) as u64,
+                );
+        }
+        ctx.request_repaint_after(interval);
+    }
+    let mut open = true;
+    egui::Window::new("Animation Preview")
+        .id(egui::Id::new("animation_camera_preview"))
+        .open(&mut open)
+        .default_size(vec2(560.0, 390.0))
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui
+                    .button(if app.session.animation_preview_playing {
+                        "Pause"
+                    } else {
+                        "Play"
+                    })
+                    .clicked()
+                {
+                    app.session.animation_preview_playing = !app.session.animation_preview_playing;
+                    if app.session.animation_preview_playing
+                        && (app.session.animation_preview_frame < loop_start
+                            || app.session.animation_preview_frame > loop_end)
+                    {
+                        app.session.animation_preview_frame = loop_start;
+                    }
+                    app.session.animation_preview_tick = std::time::Instant::now();
+                }
+                if ui.button("Start").clicked() {
+                    app.session.animation_preview_frame = loop_start;
+                }
+                let mut display_frame = app.session.animation_preview_frame + 1;
+                if ui
+                    .add(egui::Slider::new(&mut display_frame, 1..=frame_count).text("Frame"))
+                    .changed()
+                {
+                    app.session.animation_preview_frame = display_frame - 1;
+                    app.session.animation_preview_tick = std::time::Instant::now();
+                }
+            });
+            let width = f32::from(app.state.project.meta.stage_width).max(1.0);
+            let height = f32::from(app.state.project.meta.stage_height).max(1.0);
+            let available = ui.available_size();
+            let scale = (available.x.max(1.0) / width).min(available.y.max(1.0) / height);
+            let (rect, _) =
+                ui.allocate_exact_size(vec2(width * scale, height * scale), Sense::hover());
+            let painter = ui.painter_at(rect);
+            let bg = app.state.project.meta.background_color;
+            painter.rect_filled(
+                rect,
+                0.0,
+                Color32::from_rgba_unmultiplied(bg.r, bg.g, bg.b, bg.a),
+            );
+            let frame = app.session.animation_preview_frame;
+            let view = StageView {
+                origin: rect.min,
+                scale,
+                stage_rect: rect,
+                edit_transform: if app.state.project.runtime.camera.enabled {
+                    app.state.project.camera_affine_at(frame)
+                } else {
+                    q0s_format::transform::Affine::IDENTITY
+                },
+            };
+            let revision = (
+                app.active_project_tab_id().unwrap_or(0),
+                app.state.revision(),
+            );
+            if app.animation_preview_revision != Some(revision) {
+                app.animation_preview_textures.invalidate();
+                app.animation_preview_revision = Some(revision);
+            }
+            let pass = StageRenderPass::new_with_revision(
+                &app.state.project,
+                &mut app.animation_preview_textures,
+                Some(revision),
+            );
+            pass.render(
+                &painter,
+                root,
+                frame,
+                &view,
+                &mut app.animation_preview_textures,
+                ctx,
+            );
+        });
+    if !open {
+        app.session.show_animation_preview = false;
+        app.session.animation_preview_playing = false;
+    }
+}
+
 pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     let stage_started = std::time::Instant::now();
     breadcrumb_bar(app, ui);
@@ -239,7 +377,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     if app.session.outline_mode {
         crate::render::render_stage_outline(
             &painter,
-            &app.state.project,
+            &render_pass,
             q0rg_id,
             frame,
             &view,
@@ -249,7 +387,79 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         // Onion skin: render `before` past frames + `after` upcoming frames with
         // a colour-tinted alpha behind the live frame. Past frames get a cool
         // (blueish) tint, upcoming a warm (orange) tint — Flash convention.
+        let onion_split = if app.session.onion.enabled && !app.session.onion.all_unlocked_layers {
+            app.state
+                .project
+                .q0rgs
+                .iter()
+                .find(|q| q.q0rg_id == q0rg_id)
+                .and_then(|q| {
+                    q.layers
+                        .iter()
+                        .position(|layer| {
+                            layer.layer_id == app.session.current_layer_id
+                                && app.state.project.layer_is_visible(q0rg_id, layer.layer_id)
+                                && !app.state.project.layer_is_locked(q0rg_id, layer.layer_id)
+                                && !app.state.project.layer_is_folder(q0rg_id, layer.layer_id)
+                        })
+                        .map(|index| {
+                            let below: std::collections::HashSet<_> = q.layers[..index]
+                                .iter()
+                                .map(|layer| layer.layer_id)
+                                .collect();
+                            let above: std::collections::HashSet<_> = q.layers[index..]
+                                .iter()
+                                .map(|layer| layer.layer_id)
+                                .collect();
+                            (below, above)
+                        })
+                })
+        } else {
+            None
+        };
+        if let Some((_, above)) = &onion_split {
+            let excluded: std::collections::HashSet<_> =
+                above.union(&outlined_layers).copied().collect();
+            render_pass.render_tinted_excluding_layers(
+                &painter,
+                q0rg_id,
+                frame,
+                &view,
+                &mut app.textures,
+                ui.ctx(),
+                Color32::WHITE,
+                &excluded,
+            );
+        }
         if app.session.onion.enabled {
+            let excluded_layers: std::collections::HashSet<_> = app
+                .state
+                .project
+                .q0rgs
+                .iter()
+                .find(|q| q.q0rg_id == q0rg_id)
+                .into_iter()
+                .flat_map(|q| &q.layers)
+                .filter(|layer| {
+                    app.state.project.layer_is_locked(q0rg_id, layer.layer_id)
+                        || (!app.session.onion.all_unlocked_layers
+                            && layer.layer_id != app.session.current_layer_id)
+                })
+                .map(|layer| layer.layer_id)
+                .collect();
+            let has_onion_layers = app
+                .state
+                .project
+                .q0rgs
+                .iter()
+                .find(|q| q.q0rg_id == q0rg_id)
+                .is_some_and(|q| {
+                    q.layers.iter().any(|layer| {
+                        !excluded_layers.contains(&layer.layer_id)
+                            && !app.state.project.layer_is_folder(q0rg_id, layer.layer_id)
+                            && app.state.project.layer_is_visible(q0rg_id, layer.layer_id)
+                    })
+                });
             let frame_count = app
                 .state
                 .project
@@ -258,7 +468,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 .find(|q| q.q0rg_id == q0rg_id)
                 .map(|q| q.frame_count)
                 .unwrap_or(0);
-            if frame_count > 0 {
+            if frame_count > 0 && has_onion_layers {
                 for offset in (-(app.session.onion.before as i32)
                     ..=(app.session.onion.after as i32))
                     .filter(|o| *o != 0)
@@ -274,21 +484,45 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         app.settings.theme.onion_past.to_color32(),
                         app.settings.theme.onion_future.to_color32(),
                     );
-                    render_pass.render_tinted_on_layer(
+                    render_pass.render_tinted_excluding_layers(
                         &painter,
                         q0rg_id,
-                        app.session.current_layer_id,
                         target as u16,
                         &view,
                         &mut app.textures,
                         ui.ctx(),
                         tint,
+                        &excluded_layers,
                     );
                 }
             }
         }
 
-        if outlined_layers.is_empty() {
+        if let Some((below, _)) = &onion_split {
+            let excluded: std::collections::HashSet<_> =
+                below.union(&outlined_layers).copied().collect();
+            render_pass.render_tinted_excluding_layers(
+                &painter,
+                q0rg_id,
+                frame,
+                &view,
+                &mut app.textures,
+                ui.ctx(),
+                Color32::WHITE,
+                &excluded,
+            );
+            if !outlined_layers.is_empty() {
+                crate::render::render_stage_outline_layers(
+                    &painter,
+                    &render_pass,
+                    q0rg_id,
+                    frame,
+                    &view,
+                    &outlined_layers,
+                    &app.textures.hidden_mask_art_layers,
+                );
+            }
+        } else if outlined_layers.is_empty() {
             render_pass.render(&painter, q0rg_id, frame, &view, &mut app.textures, ui.ctx());
         } else {
             render_pass.render_tinted_excluding_layers(
@@ -303,7 +537,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             );
             crate::render::render_stage_outline_layers(
                 &painter,
-                &app.state.project,
+                &render_pass,
                 q0rg_id,
                 frame,
                 &view,
@@ -1029,16 +1263,11 @@ fn stage_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
             app.queue(Action::CutSelection);
             ui.close_menu();
         }
-        let copy_label = if selected_q0rg_placement.is_some() {
-            "Copy Symbol"
-        } else {
-            "Copy"
-        };
         if ui
             .add(crate::ui::shortcut_button(
                 &app.settings.hotkeys,
                 crate::hotkeys::ShortcutCommand::Copy,
-                copy_label,
+                "Copy",
             ))
             .clicked()
         {
@@ -1113,17 +1342,35 @@ fn stage_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
             app.queue(Action::BreakApartSelection);
             ui.close_menu();
         }
-        let spread_between_layers_enabled = matches!(
-            &app.session.selection,
-            Selection::Multi(objects) if objects.len() > 1
-        );
+        let spread_objects =
+            crate::selection_edit::selected_object_refs(&app.state.project, &app.session.selection);
+        let spread_between_keyframes_enabled = spread_objects.first().is_some_and(|first| {
+            spread_objects.iter().all(|reference| {
+                reference.q0rg_id == first.q0rg_id && reference.layer_id == first.layer_id
+            }) && !app
+                .state
+                .project
+                .layer_is_locked(first.q0rg_id, first.layer_id)
+                && !app
+                    .state
+                    .project
+                    .layer_is_folder(first.q0rg_id, first.layer_id)
+        });
+        let spread_between_layers_enabled = spread_between_keyframes_enabled
+            && spread_objects.first().is_some_and(|first| {
+                app.state
+                    .project
+                    .layer_metadata(first.q0rg_id, first.layer_id)
+                    .kind
+                    == q0s_format::v2::LayerKind::Normal
+            });
         if ui
             .add_enabled(
                 spread_between_layers_enabled,
                 egui::Button::new("Spread between layers"),
             )
             .on_hover_text(
-                "Split the selected q0rg depth tracks onto symbol-named layers; select every object on that layer",
+                "Move selected depth tracks onto named layers; a lone object names its existing layer",
             )
             .clicked()
         {
@@ -1132,11 +1379,11 @@ fn stage_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
         }
         if ui
             .add_enabled(
-                spread_between_layers_enabled,
+                spread_between_keyframes_enabled,
                 egui::Button::new("Spread between keyframes"),
             )
             .on_hover_text(
-                "Create consecutive keyframes in z-order; later keys shift right to make room",
+                "Create consecutive keyframes in depth order; unselected objects stay present and later keys on this layer shift right",
             )
             .clicked()
         {
@@ -1170,6 +1417,38 @@ fn stage_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
             }
             ui.separator();
             if let Some((q0rg_id, layer_id, placement_idx)) = selected_q0rg_placement {
+                if ui.button("Edit In Place").clicked() {
+                    if let Some(q0s_format::v2::Target::Q0rg(child)) = app
+                        .state
+                        .project
+                        .q0rgs
+                        .iter()
+                        .find(|q| q.q0rg_id == q0rg_id)
+                        .and_then(|q| q.layers.iter().find(|l| l.layer_id == layer_id))
+                        .and_then(|l| l.placements.get(placement_idx))
+                        .map(|p| p.target)
+                    {
+                        app.queue(Action::EnterQ0rgInPlace {
+                            q0rg_id: child,
+                            layer_id,
+                            placement_idx,
+                        });
+                    }
+                    ui.close_menu();
+                }
+                if ui
+                    .add_enabled(
+                        !app.state.project.layer_is_locked(q0rg_id, layer_id),
+                        egui::Button::new("Duplicate Symbol"),
+                    )
+                    .on_hover_text(
+                        "Create an independent library symbol and use it on this keyframe",
+                    )
+                    .clicked()
+                {
+                    app.queue(Action::DuplicateSymbol(q0rg_id, layer_id, placement_idx));
+                    ui.close_menu();
+                }
                 if ui.button("Replace q0rg").clicked() {
                     app.open_replace_q0rg_dialog(q0rg_id, layer_id, placement_idx);
                     ui.close_menu();
@@ -1192,6 +1471,30 @@ fn stage_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
             }
             if ui.button("Send to Back").clicked() {
                 app.queue(Action::SendToBack);
+                ui.close_menu();
+            }
+            if ui
+                .add(crate::ui::shortcut_button(
+                    &app.settings.hotkeys,
+                    crate::hotkeys::ShortcutCommand::BringForward,
+                    "Bring Forward",
+                ))
+                .on_hover_text("Move one step forward in the layer's drawing order")
+                .clicked()
+            {
+                app.queue(Action::BringForward);
+                ui.close_menu();
+            }
+            if ui
+                .add(crate::ui::shortcut_button(
+                    &app.settings.hotkeys,
+                    crate::hotkeys::ShortcutCommand::SendBackward,
+                    "Send Backward",
+                ))
+                .on_hover_text("Move one step backward in the layer's drawing order")
+                .clicked()
+            {
+                app.queue(Action::SendBackward);
                 ui.close_menu();
             }
         }

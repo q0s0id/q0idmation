@@ -26,6 +26,8 @@ pub enum ShortcutCommand {
     BreakApart,
     FlipHorizontal,
     FlipVertical,
+    BringForward,
+    SendBackward,
     ZoomIn,
     ZoomOut,
     ZoomReset,
@@ -57,6 +59,7 @@ pub enum ShortcutCommand {
     ToolBucket,
     ToolEyedropper,
     ToolText,
+    ToolRig,
 }
 
 impl ShortcutCommand {
@@ -81,6 +84,8 @@ impl ShortcutCommand {
         Self::BreakApart,
         Self::FlipHorizontal,
         Self::FlipVertical,
+        Self::BringForward,
+        Self::SendBackward,
         Self::ZoomIn,
         Self::ZoomOut,
         Self::ZoomReset,
@@ -112,6 +117,7 @@ impl ShortcutCommand {
         Self::ToolBucket,
         Self::ToolEyedropper,
         Self::ToolText,
+        Self::ToolRig,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -136,6 +142,8 @@ impl ShortcutCommand {
             Self::BreakApart => "Break apart",
             Self::FlipHorizontal => "flip horizontally",
             Self::FlipVertical => "flip vertically",
+            Self::BringForward => "Bring forward one step",
+            Self::SendBackward => "Send backward one step",
             Self::ZoomIn => "Zoom in",
             Self::ZoomOut => "Zoom out",
             Self::ZoomReset => "Reset zoom",
@@ -167,6 +175,7 @@ impl ShortcutCommand {
             Self::ToolBucket => "Bucket tool",
             Self::ToolEyedropper => "Eyedropper tool",
             Self::ToolText => "Text tool",
+            Self::ToolRig => "Rig tool",
         }
     }
 
@@ -197,6 +206,8 @@ impl ShortcutCommand {
             C::BreakApart => vec![ShortcutChord::cmd(K::B)],
             C::FlipHorizontal => vec![ShortcutChord::shift(K::H)],
             C::FlipVertical => vec![ShortcutChord::shift(K::V)],
+            C::BringForward => vec![ShortcutChord::cmd(K::ArrowUp)],
+            C::SendBackward => vec![ShortcutChord::cmd(K::ArrowDown)],
             C::ZoomIn => vec![ShortcutChord::cmd(K::Plus), ShortcutChord::cmd(K::Equals)],
             C::ZoomOut => vec![ShortcutChord::cmd(K::Minus)],
             C::ZoomReset => vec![ShortcutChord::cmd(K::Num0)],
@@ -228,6 +239,7 @@ impl ShortcutCommand {
             C::ToolBucket => vec![ShortcutChord::key(K::K)],
             C::ToolEyedropper => vec![ShortcutChord::key(K::I)],
             C::ToolText => vec![ShortcutChord::key(K::T)],
+            C::ToolRig => vec![ShortcutChord::key(K::G)],
         }
     }
 

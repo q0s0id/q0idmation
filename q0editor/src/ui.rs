@@ -1,6 +1,132 @@
 //! Small, font-independent controls shared by the editor's working panels.
 use egui::{pos2, vec2, Color32, Painter, Rect, Response, Sense, Shape, Stroke, Ui};
 
+const ICON_CONTROL_SIZE: f32 = 26.0;
+
+pub(crate) fn hidden_palette_note_trigger(ui: &Ui, label: &Response) {
+    // A deliberately obscure gesture on an existing, otherwise inert label.
+    // The counter and reveal live only in this UI session, never in a project.
+    let chord = ui.input(|input| {
+        let modifiers = input.modifiers;
+        modifiers.ctrl && modifiers.alt && modifiers.shift
+    });
+    if !chord {
+        return;
+    }
+    if label.interact(Sense::click()).secondary_clicked() {
+        ui.ctx().data_mut(|data| {
+            let id = egui::Id::new("palette_border_note_knocks");
+            let knocks = data.get_temp::<u8>(id).unwrap_or(0) + 1;
+            if knocks >= 7 {
+                data.insert_temp(id, 0_u8);
+                data.insert_temp(egui::Id::new("palette_border_note_open"), true);
+            } else {
+                data.insert_temp(id, knocks);
+            }
+        });
+    }
+}
+
+pub(crate) fn hidden_palette_note(ctx: &egui::Context, settings_open: bool, accent: Color32) {
+    let id = egui::Id::new("palette_border_note_open");
+    if !settings_open {
+        ctx.data_mut(|data| {
+            data.remove::<bool>(id);
+            data.remove::<u8>(egui::Id::new("palette_border_note_knocks"));
+        });
+        return;
+    }
+    let mut open = ctx.data(|data| data.get_temp::<bool>(id).unwrap_or(false));
+    if !open {
+        return;
+    }
+    egui::Window::new(" ")
+        .id(egui::Id::new("palette_border_note_inline_window"))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .default_width(300.0)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.add_space(12.0);
+            let text_color = ui.visuals().text_color();
+            let text = ui.painter().layout_no_wrap(
+                "I love you, Walibite".to_string(),
+                egui::FontId::proportional(22.0),
+                text_color,
+            );
+            let width = text.size().x + 8.0 + 18.0;
+            let (row, _) = ui.allocate_exact_size(
+                vec2(ui.available_width().max(width), text.size().y.max(24.0)),
+                Sense::hover(),
+            );
+            let text_pos = pos2(
+                row.center().x - width * 0.5,
+                row.center().y - text.size().y * 0.5,
+            );
+            let heart = Rect::from_min_size(
+                pos2(text_pos.x + text.size().x + 8.0, row.center().y - 9.0),
+                vec2(18.0, 18.0),
+            );
+            ui.painter().galley(text_pos, text, text_color);
+            paint_note_heart(ui.painter(), heart, accent);
+            ui.add_space(12.0);
+        });
+    ctx.data_mut(|data| data.insert_temp(id, open));
+}
+
+fn paint_note_heart(painter: &Painter, rect: Rect, color: Color32) {
+    // Rounded notch and tip keep the silhouette smooth and avoid acute stroke
+    // joins. The small heart remains vector geometry at every display scale.
+    const CURVES: [[(f32, f32); 4]; 7] = [
+        [(10.0, 4.1), (9.75, 4.1), (9.5, 4.0), (9.35, 3.7)],
+        [(9.35, 3.7), (6.7, 0.1), (1.0, 0.6), (1.0, 5.3)],
+        [(1.0, 5.3), (1.0, 9.0), (5.8, 12.7), (9.1, 15.6)],
+        [(9.1, 15.6), (9.6, 16.1), (10.4, 16.1), (10.9, 15.6)],
+        [(10.9, 15.6), (14.2, 12.7), (19.0, 9.0), (19.0, 5.3)],
+        [(19.0, 5.3), (19.0, 0.6), (13.3, 0.1), (10.65, 3.7)],
+        [(10.65, 3.7), (10.5, 4.0), (10.25, 4.1), (10.0, 4.1)],
+    ];
+    let scale = rect.width() / 22.0;
+    let point = |(x, y): (f32, f32)| rect.center() + vec2(x - 10.0, y - 8.0) * scale;
+    let mut contour = Vec::new();
+    for controls in CURVES {
+        let curve = egui::epaint::CubicBezierShape::from_points_stroke(
+            controls.map(point),
+            false,
+            Color32::TRANSPARENT,
+            Stroke::NONE,
+        );
+        let points = curve.flatten(Some(0.03));
+        contour.extend(points.into_iter().skip(usize::from(!contour.is_empty())));
+    }
+    contour.pop(); // The final point repeats the first one.
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(point((10.0, 8.0)), color);
+    for position in &contour {
+        mesh.colored_vertex(*position, color);
+    }
+    let count = contour.len() as u32;
+    for index in 0..count {
+        mesh.add_triangle(0, index + 1, (index + 1) % count + 1);
+    }
+    painter.add(Shape::mesh(mesh));
+    painter.add(Shape::closed_line(contour, Stroke::new(0.65_f32, color)));
+}
+
+/// Keep a dock's assigned size independent of its contents' minimum size.
+/// egui panels otherwise persist an overflowing child's size as the next panel
+/// size, which can cause a small overflow to grow the panel on every frame.
+pub(crate) fn panel_contents<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    let available = ui.available_rect_before_wrap();
+    let rect = Rect::from_min_size(available.min, available.size().max(egui::Vec2::ZERO));
+    let mut content = ui.child_ui_with_id_source(rect, *ui.layout(), "panel_contents");
+    content.set_clip_rect(ui.clip_rect().intersect(rect));
+    let result = add_contents(&mut content);
+    ui.advance_cursor_after_rect(rect);
+    result
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Icon {
     Add,
@@ -75,7 +201,8 @@ pub(crate) fn icon_toggle(ui: &mut Ui, icon: Icon, label: &str, selected: bool) 
 }
 
 fn icon_control(ui: &mut Ui, icon: Icon, label: &str, selected: bool) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(ICON_CONTROL_SIZE, ICON_CONTROL_SIZE), Sense::click());
     response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, selected, label));
     if ui.is_rect_visible(rect) {
         let visuals = ui.style().interact_selectable(&response, selected);
@@ -117,9 +244,18 @@ pub(crate) fn search_field(ui: &mut Ui, text: &mut String, hint: &str) -> Respon
             ui.visuals().weak_text_color(),
         );
         let has_text = !text.is_empty();
-        let width = (ui.available_width() - if has_text { 30.0 } else { 0.0 }).max(40.0);
+        let clear_width = if has_text {
+            ICON_CONTROL_SIZE + ui.spacing().item_spacing.x
+        } else {
+            0.0
+        };
+        // TextEdit's desired_width excludes its margins. Reserve those as well
+        // as the trailing button and gap so the entire row fits its viewport.
+        let margin = egui::Margin::symmetric(4.0, 2.0);
+        let width = (ui.available_width() - clear_width - margin.sum().x).max(24.0);
         let mut response = ui.add(
             egui::TextEdit::singleline(text)
+                .margin(margin)
                 .hint_text(hint)
                 .desired_width(width),
         );

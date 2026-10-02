@@ -234,7 +234,7 @@ fn asset_stage_bounds(
         },
         Asset::Vector(vector) => vector_local_visual_bounds(project, vector)?,
         Asset::Q0v(video) => {
-            let media = q0video::q0v::Q0vFile::parse(video.bytes.clone()).ok()?;
+            let media = q0video::q0v::Q0vFile::parse(video.bytes.as_ref().clone()).ok()?;
             StageBounds {
                 min_x: 0.0,
                 min_y: 0.0,
@@ -630,6 +630,7 @@ pub fn rasterize_placement_outer_fx_scaled_cropped(
         audio_gain: fx.audio_gain,
         audio_muted: fx.audio_muted,
         q0rg_playback: fx.q0rg_playback,
+        tint: fx.tint,
     };
     let fx_bounds = bounds_with_placement_fx(
         target_bounds,
@@ -864,12 +865,16 @@ pub fn rasterize_q0rg_frame_with_root_transform(
 #[derive(Clone, Copy)]
 pub struct MaskEditingPreview<'a> {
     pub q0rg_id: u16,
-    pub hidden_artwork: &'a HashSet<(u16, u16)>,
+    /// None uses playback mask visibility; Some enables mask artwork editing.
+    pub hidden_artwork: Option<&'a HashSet<(u16, u16)>>,
+    /// Filter root artwork only. Mask sources still contribute clipping alpha.
+    pub excluded_layers: Option<&'a HashSet<u16>>,
 }
 
 impl MaskEditingPreview<'_> {
     fn clips(self, mask_id: u16) -> bool {
-        self.hidden_artwork.contains(&(self.q0rg_id, mask_id))
+        self.hidden_artwork
+            .is_none_or(|hidden| hidden.contains(&(self.q0rg_id, mask_id)))
     }
 }
 
@@ -989,15 +994,21 @@ fn render_to_buffer(
         crate::rig::evaluate_rig(rig, f32::from(local_frame), overrides)
     });
     // only rasterize mask layers that are referenced by a visible layer and
-    // have active artwork on this frame. an empty mask clips its target to
-    // nothing, so omitting its all-zero buffer is equivalent and avoids a
-    // full viewport allocation/composite for every placement it masks.
+    // have active artwork on this frame. blank mask frames disable clipping,
+    // including holds of a blank keyframe and cells beyond the mask's duration.
     let referenced_mask_ids = q
         .layers
         .iter()
         .filter(|layer| project.layer_is_visible(q0rg_id, layer.layer_id))
         .flat_map(|layer| project.layer_mask_sources(q0rg_id, layer.layer_id))
         .filter(|mask_id| mask_preview.is_none_or(|preview| preview.clips(*mask_id)))
+        .collect::<HashSet<_>>();
+    let blank_mask_ids = q
+        .layers
+        .iter()
+        .filter(|layer| referenced_mask_ids.contains(&layer.layer_id))
+        .filter(|layer| active_placement_states_at(layer, local_frame).is_empty())
+        .map(|layer| layer.layer_id)
         .collect::<HashSet<_>>();
     let mask_buffers = q
         .layers
@@ -1007,7 +1018,7 @@ fn render_to_buffer(
             project.layer_metadata(q0rg_id, layer.layer_id).kind == crate::v2::LayerKind::Mask
         })
         .filter(|layer| project.layer_is_visible(q0rg_id, layer.layer_id))
-        .filter(|layer| !active_placement_states_at(layer, local_frame).is_empty())
+        .filter(|layer| !blank_mask_ids.contains(&layer.layer_id))
         .map(|layer| {
             let mut mask = vec![0u8; buffer.len()];
             render_layer_contents(
@@ -1029,6 +1040,13 @@ fn render_to_buffer(
         .collect::<HashMap<_, _>>();
 
     for layer in &q.layers {
+        if mask_preview.is_some_and(|preview| {
+            preview
+                .excluded_layers
+                .is_some_and(|excluded| excluded.contains(&layer.layer_id))
+        }) {
+            continue;
+        }
         if !project.layer_is_visible(q0rg_id, layer.layer_id) {
             continue;
         }
@@ -1042,6 +1060,7 @@ fn render_to_buffer(
             .layer_mask_sources(q0rg_id, layer.layer_id)
             .into_iter()
             .filter(|mask_id| mask_preview.is_none_or(|preview| preview.clips(*mask_id)))
+            .filter(|mask_id| !blank_mask_ids.contains(mask_id))
             .collect::<Vec<_>>();
         if !mask_sources.is_empty() {
             let Some(masks) = mask_sources
@@ -1548,6 +1567,7 @@ fn placement_fx_in_pixels(fx: PlacementFx, scale: f32) -> PlacementFx {
         audio_gain: fx.audio_gain,
         audio_muted: fx.audio_muted,
         q0rg_playback: fx.q0rg_playback,
+        tint: fx.tint,
     }
 }
 
@@ -1572,6 +1592,27 @@ fn apply_placement_fx_full(
     height: u32,
     fx: PlacementFx,
 ) {
+    // Tint changes RGB only. Keep source coverage and holes exactly intact.
+    let tinted_source;
+    let source = if let Some(tint) = fx.tint.filter(|tint| tint.amount > 1.0e-6) {
+        let amount = tint.amount.clamp(0.0, 1.0);
+        let mut tinted = source.to_vec();
+        for pixel in tinted.chunks_exact_mut(4) {
+            for (channel, color) in
+                pixel[..3]
+                    .iter_mut()
+                    .zip([tint.color.r, tint.color.g, tint.color.b])
+            {
+                *channel = (f32::from(*channel) * (1.0 - amount) + f32::from(color) * amount)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+            }
+        }
+        tinted_source = tinted;
+        tinted_source.as_slice()
+    } else {
+        source
+    };
     let source_alpha = alpha_channel(source);
     let mut group = vec![0u8; source.len()];
 
@@ -1887,7 +1928,7 @@ fn rasterize_asset(
             context.height,
         ),
         Asset::Q0v(v) => {
-            let Ok(media) = q0video::q0v::Q0vFile::parse(v.bytes.clone()) else {
+            let Ok(media) = q0video::q0v::Q0vFile::parse(v.bytes.as_ref().clone()) else {
                 return;
             };
             let Some(frame_index) = media.spec.video_frame_for_host_frame(

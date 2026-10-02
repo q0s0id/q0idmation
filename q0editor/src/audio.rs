@@ -111,7 +111,8 @@ pub fn transcode_audio_to_q0v(path: &Path) -> Result<Vec<u8>, String> {
     if bytes.len() > MAX_IMPORTED_Q0V_BYTES {
         return Err("audio import exceeds the 240 MiB project media limit".to_string());
     }
-    let parsed = q0video::q0v::Q0vFile::parse(bytes.clone())?;
+    q0video::q0v::validate_bytes(&bytes)?;
+    let parsed = q0video::q0v::probe_header(&bytes)?;
     if parsed.spec != spec || parsed.audio_samples_per_channel != u64::from(timeline_frames) {
         return Err("audio q0v parse-back changed the stream specification".to_string());
     }
@@ -249,6 +250,104 @@ pub fn waveform_from_q0v_bytes(bytes: &[u8]) -> Option<AudioWaveform> {
     Some(builder.waveform)
 }
 
+pub struct AudioWaveformCache {
+    source: std::sync::Weak<Vec<u8>>,
+    waveform: AudioWaveform,
+    receiver: Option<std::sync::mpsc::Receiver<Option<AudioWaveform>>>,
+}
+
+impl AudioWaveformCache {
+    pub fn new(bytes: std::sync::Arc<Vec<u8>>) -> Option<Self> {
+        let source = std::sync::Arc::downgrade(&bytes);
+        let builder = AudioWaveformBuilder::new(&bytes)?;
+        let waveform = AudioWaveform {
+            bins: Vec::new(),
+            ..builder.waveform().clone()
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("q0editor-audio-waveform".into())
+            .spawn(move || {
+                let _ = sender.send(waveform_from_q0v_bytes(&bytes));
+            })
+            .ok()?;
+        Some(Self {
+            source,
+            waveform,
+            receiver: Some(receiver),
+        })
+    }
+
+    pub fn matches_source(&self, bytes: &std::sync::Arc<Vec<u8>>) -> bool {
+        std::ptr::eq(self.source.as_ptr(), std::sync::Arc::as_ptr(bytes))
+    }
+
+    pub fn source_alive(&self) -> bool {
+        self.source.strong_count() != 0
+    }
+
+    pub fn poll(&mut self) -> (&AudioWaveform, bool) {
+        if let Some(receiver) = &self.receiver {
+            match receiver.try_recv() {
+                Ok(waveform) => {
+                    if let Some(waveform) = waveform {
+                        self.waveform = waveform;
+                    }
+                    self.receiver = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.receiver = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        (&self.waveform, self.receiver.is_none())
+    }
+}
+
+/// Split at a timeline key. F6 preserves the source position in the new clip;
+/// a blank key stops the left clip without discarding the source recording.
+pub fn keyframe_audio(
+    project: &mut ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    frame: u16,
+    continue_audio: bool,
+) -> bool {
+    let Some(reference) = audio_clip_at_frame(project, q0rg_id, layer_id, frame) else {
+        return false;
+    };
+    let source = project.audio_clips[reference.clip_idx];
+    if frame == source.start_frame {
+        if continue_audio {
+            return false;
+        }
+        project.audio_clips.remove(reference.clip_idx);
+    } else {
+        let elapsed = u64::from(frame) * u64::from(EDITOR_AUDIO_SAMPLE_RATE)
+            / u64::from(project.meta.fps.max(1))
+            - u64::from(source.start_frame) * u64::from(EDITOR_AUDIO_SAMPLE_RATE)
+                / u64::from(project.meta.fps.max(1));
+        let left = &mut project.audio_clips[reference.clip_idx];
+        left.duration_frames = Some(frame - source.start_frame);
+        if continue_audio {
+            left.fade_out_ms = 0;
+            let mut right = source;
+            right.start_frame = frame;
+            right.source_offset_samples = right.source_offset_samples.saturating_add(elapsed);
+            right.duration_frames = Some(reference.end_frame_exclusive - frame);
+            right.fade_in_ms = 0;
+            project.audio_clips.push(right);
+        }
+    }
+    if let Some(layer) = project
+        .q0rgs
+        .iter_mut()
+        .find(|q| q.q0rg_id == q0rg_id)
+        .and_then(|q| q.layers.iter_mut().find(|l| l.layer_id == layer_id))
+    {
+        layer.ensure_explicit_keyframe(frame);
+    }
+    true
+}
 pub fn audio_clip_ref(project: &ProjectV2, clip_idx: usize) -> Option<AudioClipRef> {
     let clip = *project.audio_clips.get(clip_idx)?;
     let end_frame_exclusive = q0s_format::v2::audio_clip_end_frame(project, clip)?;
@@ -307,36 +406,16 @@ pub fn visual_content_conflicts_with_audio_range(
     let Some(layer) = project
         .q0rgs
         .iter()
-        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
-        .and_then(|q0rg| q0rg.layers.iter().find(|layer| layer.layer_id == layer_id))
+        .find(|q| q.q0rg_id == q0rg_id)
+        .and_then(|q| q.layers.iter().find(|l| l.layer_id == layer_id))
     else {
         return true;
     };
-    if layer
-        .keyframe_frames()
-        .into_iter()
-        .any(|frame| (start_frame..end_frame_exclusive).contains(&frame))
-    {
-        return true;
-    }
-    if let Some(previous_key) = layer
-        .keyframe_frames()
-        .into_iter()
-        .filter(|frame| *frame < start_frame)
-        .max()
-    {
-        if layer
-            .placements
-            .iter()
-            .any(|placement| placement.frame == previous_key)
-        {
-            return true;
-        }
-    }
     layer
         .placements
         .iter()
-        .any(|placement| (start_frame..end_frame_exclusive).contains(&placement.frame))
+        .any(|p| (start_frame..end_frame_exclusive).contains(&p.frame))
+        || !q0s_format::raster::active_placement_states_at(layer, start_frame).is_empty()
 }
 
 /// Convert the short-lived v19 editor representation where audio was stored as
@@ -374,6 +453,7 @@ pub fn migrate_legacy_audio_placements(project: &mut ProjectV2) -> usize {
                     asset_id,
                     gain: placement.fx.audio_gain.clamp(0.0, 4.0),
                     muted: placement.fx.audio_muted,
+                    ..Default::default()
                 });
             }
             layer.placements = visual;
@@ -476,11 +556,21 @@ fn audio_view_duration_at_editor_rate(view: q0video::q0v::Q0vAudioView<'_>) -> u
         .div_ceil(u64::from(view.spec.audio_sample_rate.max(1)))
 }
 
-fn mix_timeline_audio_chunk(
+pub(crate) fn mix_timeline_audio_chunk(
     project: &ProjectV2,
     q0rg_id: u16,
     start_sample_frame: u64,
     sample_frames: usize,
+) -> Option<Vec<f32>> {
+    mix_timeline_audio_chunk_inner(project, q0rg_id, start_sample_frame, sample_frames, false)
+}
+
+fn mix_timeline_audio_chunk_inner(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    start_sample_frame: u64,
+    sample_frames: usize,
+    looped: bool,
 ) -> Option<Vec<f32>> {
     let q0rg = project.q0rgs.iter().find(|q0rg| q0rg.q0rg_id == q0rg_id)?;
     let host_fps = u64::from(project.meta.fps.max(1));
@@ -517,24 +607,59 @@ fn mix_timeline_audio_chunk(
             .saturating_mul(u64::from(EDITOR_AUDIO_SAMPLE_RATE))
             / host_fps;
         let clip_end = clip_start
-            .saturating_add(audio_view_duration_at_editor_rate(view))
+            .saturating_add(
+                audio_view_duration_at_editor_rate(view).saturating_sub(clip.source_offset_samples),
+            )
             .min(boundary_sample)
             .min(total_sample_frames);
         if clip_end <= clip_start {
             continue;
         }
-        let gain = clip.gain.clamp(0.0, 4.0);
-        for output_frame in 0..sample_frames {
-            let timeline_frame =
-                start_sample_frame.saturating_add(output_frame as u64) % total_sample_frames;
+        let chunk_end = start_sample_frame.saturating_add(sample_frames as u64);
+        let (first, last) = if looped {
+            let overlaps = sample_frames as u64 >= total_sample_frames
+                || (start_sample_frame < clip_end
+                    && clip_start < chunk_end.min(total_sample_frames))
+                || (chunk_end > total_sample_frames
+                    && clip_start < chunk_end % total_sample_frames);
+            if !overlaps {
+                continue;
+            }
+            (0, sample_frames)
+        } else {
+            (
+                clip_start
+                    .saturating_sub(start_sample_frame)
+                    .min(sample_frames as u64) as usize,
+                clip_end
+                    .saturating_sub(start_sample_frame)
+                    .min(sample_frames as u64) as usize,
+            )
+        };
+        for output_frame in first..last {
+            let sample = start_sample_frame.saturating_add(output_frame as u64);
+            let timeline_frame = if looped {
+                sample % total_sample_frames
+            } else {
+                sample
+            };
             if timeline_frame < clip_start || timeline_frame >= clip_end {
                 continue;
             }
             let local_frame = timeline_frame - clip_start;
             let base = output_frame * usize::from(EDITOR_AUDIO_CHANNELS);
             for channel in 0..EDITOR_AUDIO_CHANNELS {
-                output[base + usize::from(channel)] +=
-                    sample_audio_view_at_editor_frame(view, local_frame, channel) * gain;
+                output[base + usize::from(channel)] += sample_audio_view_at_editor_frame(
+                    view,
+                    local_frame + clip.source_offset_samples,
+                    channel,
+                ) * q0s_format::v2::audio_clip_channel_gain(
+                    *clip,
+                    local_frame,
+                    clip_end - clip_start,
+                    EDITOR_AUDIO_SAMPLE_RATE,
+                    channel,
+                );
             }
         }
     }
@@ -554,6 +679,7 @@ pub struct EditorAudioPlayback {
     q0rg_id: Option<u16>,
     next_sample_frame: u64,
     total_sample_frames: u64,
+    last_scrub: Option<std::time::Instant>,
 }
 
 impl EditorAudioPlayback {
@@ -567,6 +693,7 @@ impl EditorAudioPlayback {
             q0rg_id: None,
             next_sample_frame: 0,
             total_sample_frames: 0,
+            last_scrub: None,
         })
     }
 
@@ -612,9 +739,13 @@ impl EditorAudioPlayback {
             return;
         }
         let start = self.next_sample_frame;
-        let Some(samples) =
-            mix_timeline_audio_chunk(project, q0rg_id, start, PLAYBACK_CHUNK_SAMPLE_FRAMES)
-        else {
+        let Some(samples) = mix_timeline_audio_chunk_inner(
+            project,
+            q0rg_id,
+            start,
+            PLAYBACK_CHUNK_SAMPLE_FRAMES,
+            true,
+        ) else {
             return;
         };
         let Some(sink) = self.sink.as_ref() else {
@@ -627,6 +758,47 @@ impl EditorAudioPlayback {
         ));
         self.next_sample_frame =
             start.saturating_add(PLAYBACK_CHUNK_SAMPLE_FRAMES as u64) % self.total_sample_frames;
+    }
+
+    pub fn scrub(&mut self, project: &ProjectV2, q0rg_id: u16, frame: u16) -> Result<(), String> {
+        let now = std::time::Instant::now();
+        if self
+            .last_scrub
+            .is_some_and(|last| now.duration_since(last).as_millis() < 30)
+        {
+            return Ok(());
+        }
+        self.stop();
+        self.last_scrub = Some(now);
+        let start = u64::from(frame) * u64::from(EDITOR_AUDIO_SAMPLE_RATE)
+            / u64::from(project.meta.fps.max(1));
+        let frames = (EDITOR_AUDIO_SAMPLE_RATE as usize / usize::from(project.meta.fps.max(1)))
+            .clamp(
+                EDITOR_AUDIO_SAMPLE_RATE as usize / 40,
+                EDITOR_AUDIO_SAMPLE_RATE as usize / 12,
+            );
+        let Some(mut samples) = mix_timeline_audio_chunk(project, q0rg_id, start, frames) else {
+            return Ok(());
+        };
+        // Tiny ramps avoid clicks when replacing snippets during a scrub.
+        let ramp = (EDITOR_AUDIO_SAMPLE_RATE as usize / 500)
+            .min(frames / 2)
+            .max(1);
+        for i in 0..frames {
+            let envelope = (i as f32 / ramp as f32).min(1.0)
+                * ((frames - 1 - i) as f32 / ramp as f32).min(1.0);
+            for channel in 0..usize::from(EDITOR_AUDIO_CHANNELS) {
+                samples[i * usize::from(EDITOR_AUDIO_CHANNELS) + channel] *= envelope;
+            }
+        }
+        let sink = Sink::try_new(&self.handle).map_err(|e| format!("audio scrub: {e}"))?;
+        sink.append(rodio::buffer::SamplesBuffer::new(
+            EDITOR_AUDIO_CHANNELS,
+            EDITOR_AUDIO_SAMPLE_RATE,
+            samples,
+        ));
+        self.sink = Some(sink);
+        Ok(())
     }
 
     pub fn set_playing(&self, playing: bool) {
@@ -688,7 +860,10 @@ mod tests {
                 },
                 entry_q0rg_id: 1,
             },
-            assets: vec![Asset::Q0v(Q0vAsset { asset_id: 7, bytes })],
+            assets: vec![Asset::Q0v(Q0vAsset {
+                asset_id: 7,
+                bytes: bytes.into(),
+            })],
             asset_names: HashMap::new(),
             asset_appearances: HashMap::new(),
             layer_metadata: HashMap::new(),
@@ -699,6 +874,7 @@ mod tests {
                 asset_id: 7,
                 gain: 1.0,
                 muted: false,
+                ..Default::default()
             }],
             runtime: Default::default(),
             q0rgs: vec![Q0rg {

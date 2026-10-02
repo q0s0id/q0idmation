@@ -1,5 +1,8 @@
 use std::path::PathBuf;
-use std::{collections::HashSet, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
 
 pub use q0s_format::geom::CapShape;
 use q0s_format::transform::Affine;
@@ -481,10 +484,11 @@ impl ProjectState {
         }
     }
 
-    pub fn replace(&mut self, project: ProjectV2, path: Option<PathBuf>) {
+    pub fn replace(&mut self, mut project: ProjectV2, path: Option<PathBuf>) {
+        let repaired = crate::timeline_edit::sync_project_folder_timelines(&mut project);
         self.project = project;
         self.file_path = path;
-        self.dirty = false;
+        self.dirty = repaired;
         self.revision = self.revision.wrapping_add(1);
         self.render_revision = self.render_revision.wrapping_add(1);
         self.library_revision = self.library_revision.wrapping_add(1);
@@ -695,6 +699,13 @@ pub enum ToolState {
         handle: AnchorHandleKind,
         start_path: VPath,
     },
+    DraggingCurve {
+        path: PathRef,
+        segment_idx: usize,
+        t: f32,
+        start_cursor: Vec2,
+        start_path: VPath,
+    },
     /// Active while the user drags a transform handle around the selection.
     /// `start_*` snapshots are captured on drag-start so each frame's update
     /// can be computed from the original geometry, not the previous tick.
@@ -771,6 +782,7 @@ impl ToolState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OnionSettings {
     pub enabled: bool,
+    pub all_unlocked_layers: bool,
     pub before: u8,
     pub after: u8,
 }
@@ -779,6 +791,7 @@ impl Default for OnionSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            all_unlocked_layers: false,
             before: 2,
             after: 2,
         }
@@ -871,6 +884,7 @@ pub struct Session {
     pub timeline_layer_selection: Option<TimelineLayerSelection>,
     /// One-shot timeline scroll request from selecting a stage object.
     pub timeline_scroll_to_layer: Option<(u16, u16)>,
+    pub timeline_scroll_to_frame: Option<(u16, u16)>,
     /// Project-level camera track selection. Kept separate from layer ids so
     /// the camera never becomes selectable artwork.
     pub camera_track_selected: bool,
@@ -881,6 +895,14 @@ pub struct Session {
     pub tool_state: ToolState,
     pub selection: Selection,
     pub transform_pivot: Option<TransformPivot>,
+    pub marquee_base_selection: Option<Selection>,
+    pub symbol_edit_click: Option<(u16, Option<(u16, usize)>, f64, egui::Pos2)>,
+    pub timeline_horizontal_scroll: f32,
+    pub preview_loop_ranges: HashMap<u16, (bool, u16, u16)>,
+    pub show_animation_preview: bool,
+    pub animation_preview_frame: u16,
+    pub animation_preview_playing: bool,
+    pub animation_preview_tick: Instant,
     pub breadcrumb: Vec<u16>,
     /// Parent-chain context for Animate-style Edit In Place. Each entry maps
     /// one active q0rg into document-stage coordinates and remembers the frame
@@ -911,6 +933,7 @@ pub struct Session {
     pub preview_script_diagnostics: Vec<q0s_format::q0lang::runtime::RuntimeDiagnostic>,
     pub preview_frame_script_entries: u64,
     pub preview_audio_resync_needed: bool,
+    pub audio_scrubbing: bool,
     pub status: String,
     pub stroke_color: Rgba,
     pub stroke_width: f32,
@@ -993,6 +1016,34 @@ pub struct EditInPlaceContext {
 }
 
 impl Session {
+    pub fn timeline_history_position(&self) -> TimelineHistoryPosition {
+        TimelineHistoryPosition {
+            q0rg_id: self.current_q0rg_id,
+            layer_id: self.current_layer_id,
+            frame: self.current_frame,
+            camera_track_selected: self.camera_track_selected,
+        }
+    }
+
+    pub fn restore_timeline_history_position(&mut self, position: TimelineHistoryPosition) {
+        // Undo does not enter a different symbol or replace its edit-in-place context.
+        if self.current_q0rg_id != position.q0rg_id {
+            return;
+        }
+        self.current_q0rg_id = position.q0rg_id;
+        self.current_layer_id = position.layer_id;
+        self.current_frame = position.frame;
+        self.camera_track_selected = position.camera_track_selected;
+        self.pending_timeline_frame = None;
+        self.timeline_selection =
+            Some(TimelineSelection::single(position.layer_id, position.frame));
+        self.timeline_cell_selection = None;
+        self.timeline_layer_selection = None;
+        self.camera_timeline_selection = None;
+        self.timeline_scroll_to_layer = Some((position.q0rg_id, position.layer_id));
+        self.timeline_scroll_to_frame = Some((position.q0rg_id, position.frame));
+    }
+
     pub fn reset_q0lang_preview(&mut self) {
         self.preview_q0lang_runtime = q0s_format::q0lang::runtime::Runtime::new();
         self.preview_q0lang_initialized = false;
@@ -1027,12 +1078,21 @@ impl Session {
             hidden_mask_art_layers: HashSet::new(),
             timeline_layer_selection: None,
             timeline_scroll_to_layer: None,
+            timeline_scroll_to_frame: None,
             camera_track_selected: false,
             camera_timeline_selection: None,
             current_tool: Tool::Select,
             tool_state: ToolState::Idle,
             selection: Selection::None,
             transform_pivot: None,
+            marquee_base_selection: None,
+            symbol_edit_click: None,
+            timeline_horizontal_scroll: 0.0,
+            preview_loop_ranges: HashMap::new(),
+            show_animation_preview: false,
+            animation_preview_frame: 0,
+            animation_preview_playing: false,
+            animation_preview_tick: Instant::now(),
             breadcrumb: Vec::new(),
             edit_in_place: Vec::new(),
             library_search: String::new(),
@@ -1057,6 +1117,7 @@ impl Session {
             preview_script_diagnostics: Vec::new(),
             preview_frame_script_entries: 0,
             preview_audio_resync_needed: false,
+            audio_scrubbing: true,
             status: "ready".to_string(),
             stroke_color: Rgba {
                 r: 0,
@@ -2116,9 +2177,23 @@ fn collapse_mixed_selection(paths: Vec<PathRef>, objects: Vec<PlacementRef>) -> 
 /// avoid unbounded memory growth on long sessions.
 const HISTORY_CAP: usize = 64;
 
+#[derive(Clone, Copy)]
+pub struct TimelineHistoryPosition {
+    pub q0rg_id: u16,
+    pub layer_id: u16,
+    pub frame: u16,
+    pub camera_track_selected: bool,
+}
+
+struct HistoryEntry {
+    project: ProjectV2,
+    timeline_position: Option<TimelineHistoryPosition>,
+}
+
 pub struct History {
-    undo: Vec<ProjectV2>,
-    redo: Vec<ProjectV2>,
+    undo: Vec<HistoryEntry>,
+    redo: Vec<HistoryEntry>,
+    snapshot_revision: u64,
 }
 
 impl History {
@@ -2126,6 +2201,7 @@ impl History {
         Self {
             undo: Vec::new(),
             redo: Vec::new(),
+            snapshot_revision: 0,
         }
     }
 
@@ -2137,16 +2213,48 @@ impl History {
         !self.redo.is_empty()
     }
 
+    pub fn snapshot_revision(&self) -> u64 {
+        self.snapshot_revision
+    }
+
+    pub fn undo_timeline_position(&self) -> Option<TimelineHistoryPosition> {
+        self.undo.last().and_then(|entry| entry.timeline_position)
+    }
+
+    pub fn redo_timeline_position(&self) -> Option<TimelineHistoryPosition> {
+        self.redo.last().and_then(|entry| entry.timeline_position)
+    }
+
+    pub fn set_undo_timeline_position(&mut self, position: TimelineHistoryPosition) {
+        if let Some(entry) = self.undo.last_mut() {
+            entry.timeline_position = Some(position);
+        }
+    }
+
+    pub fn set_redo_timeline_position(&mut self, position: TimelineHistoryPosition) {
+        if let Some(entry) = self.redo.last_mut() {
+            entry.timeline_position = Some(position);
+        }
+    }
+
     /// Record the project's CURRENT state as the "before" of the upcoming change.
     /// Clears any redo branch (standard undo semantics). Skips pushing if the
     /// current state already matches the top of the stack Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ this lets callers
     /// safely snapshot on every `.changed()` from a DragValue without bloating
     /// the stack with duplicates of the same intermediate value.
     pub fn snapshot(&mut self, current: &ProjectV2) {
-        if self.undo.last() == Some(current) {
+        if self
+            .undo
+            .last()
+            .is_some_and(|entry| &entry.project == current)
+        {
             return;
         }
-        self.undo.push(current.clone());
+        self.undo.push(HistoryEntry {
+            project: current.clone(),
+            timeline_position: None,
+        });
+        self.snapshot_revision = self.snapshot_revision.wrapping_add(1);
         if self.undo.len() > HISTORY_CAP {
             self.undo.remove(0);
         }
@@ -2162,9 +2270,12 @@ impl History {
         let Some(prior) = self.undo.pop() else {
             return Err(current);
         };
-        reconcile(&current, &prior);
-        self.redo.push(current);
-        Ok(prior)
+        reconcile(&current, &prior.project);
+        self.redo.push(HistoryEntry {
+            project: current,
+            timeline_position: None,
+        });
+        Ok(prior.project)
     }
 
     /// Pop the latest "after" off redo; move `current` back onto undo.
@@ -2176,9 +2287,12 @@ impl History {
         let Some(next) = self.redo.pop() else {
             return Err(current);
         };
-        reconcile(&current, &next);
-        self.undo.push(current);
-        Ok(next)
+        reconcile(&current, &next.project);
+        self.undo.push(HistoryEntry {
+            project: current,
+            timeline_position: None,
+        });
+        Ok(next.project)
     }
 }
 

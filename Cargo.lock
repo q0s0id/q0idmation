@@ -747,7 +747,7 @@ dependencies = [
 
 [[package]]
 name = "canripper"
-version = "0.1.0-beta.4.1"
+version = "0.1.0-beta.4.2"
 dependencies = [
  "eframe",
  "egui",
@@ -3074,14 +3074,14 @@ checksum = "3eb8486b569e12e2c32ad3e204dbaba5e4b5b216e9367044f25f1dba42341773"
 
 [[package]]
 name = "q0credits"
-version = "0.1.0-beta.4.1"
+version = "0.1.0-beta.4.2"
 dependencies = [
  "egui",
 ]
 
 [[package]]
 name = "q0editor"
-version = "0.1.0-beta.4.1"
+version = "0.1.0-beta.4.2"
 dependencies = [
  "base64",
  "clipboard-win",
@@ -3113,7 +3113,7 @@ dependencies = [
 
 [[package]]
 name = "q0fla"
-version = "0.1.0-beta.4.1"
+version = "0.1.0-beta.4.2"
 dependencies = [
  "cfb",
  "flate2",
@@ -3125,7 +3125,7 @@ dependencies = [
 
 [[package]]
 name = "q0glblend"
-version = "0.1.0-beta.4.1"
+version = "0.1.0-beta.4.2"
 dependencies = [
  "egui",
  "egui_glow",
@@ -3135,11 +3135,11 @@ dependencies = [
 
 [[package]]
 name = "q0icon"
-version = "0.1.0-beta.4.1"
+version = "0.1.0-beta.4.2"
 
 [[package]]
 name = "q0player"
-version = "0.1.0-beta.4.1"
+version = "0.1.0-beta.4.2"
 dependencies = [
  "dirs",
  "eframe",
@@ -3163,7 +3163,7 @@ dependencies = [
 
 [[package]]
 name = "q0s-format"
-version = "0.1.0-beta.4.1"
+version = "0.1.0-beta.4.2"
 dependencies = [
  "q0video",
  "q0vm",
@@ -3171,14 +3171,14 @@ dependencies = [
 
 [[package]]
 name = "q0shell"
-version = "0.1.0-beta.4.1"
+version = "0.1.0-beta.4.2"
 dependencies = [
  "q0s-format",
 ]
 
 [[package]]
 name = "q0term"
-version = "0.1.0-beta.4.1"
+version = "0.1.0-beta.4.2"
 dependencies = [
  "eframe",
  "egui",
@@ -3187,11 +3187,11 @@ dependencies = [
 
 [[package]]
 name = "q0theme"
-version = "0.1.0-beta.4.1"
+version = "0.1.0-beta.4.2"
 
 [[package]]
 name = "q0video"
-version = "0.1.0-beta.4.1"
+version = "0.1.0-beta.4.2"
 dependencies = [
  "image",
  "windows 0.58.0",
@@ -3199,7 +3199,7 @@ dependencies = [
 
 [[package]]
 name = "q0vm"
-version = "0.1.0-beta.4.1"
+version = "0.1.0-beta.4.2"
 
 [[package]]
 name = "quick-xml"

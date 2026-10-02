@@ -203,10 +203,8 @@ pub fn paint_v2_frame_with_runtime_overrides(
                 rig_overrides,
                 scene_state,
             );
-            let image = ColorImage::from_rgba_unmultiplied(
-                [width as usize, height as usize],
-                &rgba,
-            );
+            let image =
+                ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba);
             let texture = ctx.load_texture(
                 format!("masked-player-q0rg-{q0rg_id}-frame-{frame}"),
                 image,
@@ -235,6 +233,7 @@ pub fn paint_v2_frame_with_runtime_overrides(
             cache,
             rig_overrides,
             scene_state,
+            q0glblend::ColorTransform::default(),
         );
     }
 }
@@ -253,12 +252,15 @@ fn q0rg_contains_mask(
     };
     q0rg.layers.iter().any(|layer| {
         project.layer_metadata(q0rg_id, layer.layer_id).kind == q0s_format::v2::LayerKind::Mask
-            || layer.placements.iter().any(|placement| match placement.target {
-                Target::Q0rg(child_id) => {
-                    q0rg_contains_mask(project, child_id, visited, depth + 1)
-                }
-                Target::Asset(_) => false,
-            })
+            || layer
+                .placements
+                .iter()
+                .any(|placement| match placement.target {
+                    Target::Q0rg(child_id) => {
+                        q0rg_contains_mask(project, child_id, visited, depth + 1)
+                    }
+                    Target::Asset(_) => false,
+                })
     })
 }
 
@@ -314,6 +316,7 @@ fn paint_fx_placement(
     fx: PlacementFx,
     view: &StageView,
     cache: &mut TextureCache,
+    inherited_color: q0glblend::ColorTransform,
 ) {
     let stage_w = project.meta.stage_width.max(1) as f32;
     let stage_h = project.meta.stage_height.max(1) as f32;
@@ -374,6 +377,24 @@ fn paint_fx_placement(
     let y0 = stage_rect.top() + y as f32 / height as f32 * stage_rect.height();
     let x1 = stage_rect.left() + (x + crop_width) as f32 / width as f32 * stage_rect.width();
     let y1 = stage_rect.top() + (y + crop_height) as f32 / height as f32 * stage_rect.height();
+    if !inherited_color.is_identity() {
+        let mut mesh = Mesh::with_texture(cached.texture.id());
+        mesh.add_rect_with_uv(
+            Rect::from_min_max(pos2(x0, y0), pos2(x1, y1)),
+            Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+        q0glblend::paint_vector_group_on_opaque_backdrop(
+            painter,
+            vec![q0glblend::VectorGroupPrimitive::Textured {
+                mesh: std::sync::Arc::new(mesh),
+                color_transform: inherited_color,
+            }],
+            cached.blend_mode,
+            1.0,
+        );
+        return;
+    }
     q0glblend::paint_texture(
         painter,
         Rect::from_min_max(pos2(x0, y0), pos2(x1, y1)),
@@ -395,6 +416,7 @@ fn paint_q0rg(
     cache: &mut TextureCache,
     rig_overrides: &q0s_format::rig::RigRuntimeOverrides,
     scene_state: &RuntimeSceneState,
+    inherited_color: q0glblend::ColorTransform,
 ) {
     if depth > Q0RG_RECURSION_LIMIT {
         return;
@@ -432,7 +454,15 @@ fn paint_q0rg(
             // as authored/rig transforms, so the crisp GUI renderer and the
             // shared raster renderer cannot disagree about where an instance is.
             let composed = Affine::compose(parent, local_affine);
-            if !active.fx.is_identity() {
+            let mut visual_fx = active.fx;
+            visual_fx.tint = None;
+            let color_transform = active
+                .fx
+                .tint
+                .map(q0glblend::ColorTransform::tint)
+                .unwrap_or_default()
+                .then(inherited_color);
+            if !visual_fx.is_identity() {
                 paint_fx_placement(
                     painter,
                     ctx,
@@ -446,6 +476,7 @@ fn paint_q0rg(
                     active.fx,
                     view,
                     cache,
+                    inherited_color,
                 );
                 continue;
             }
@@ -462,6 +493,7 @@ fn paint_q0rg(
                             cache,
                             local_frame.saturating_sub(placement.frame),
                             project.meta.fps,
+                            color_transform,
                         );
                     }
                 }
@@ -485,6 +517,7 @@ fn paint_q0rg(
                         cache,
                         rig_overrides,
                         scene_state,
+                        color_transform,
                     );
                 }
                 _ => {}
@@ -504,6 +537,7 @@ fn paint_asset(
     cache: &mut TextureCache,
     elapsed_host_frames: u16,
     host_fps: u16,
+    color_transform: q0glblend::ColorTransform,
 ) {
     match asset {
         Asset::Bitmap(b) => {
@@ -547,13 +581,13 @@ fn paint_asset(
                 });
             }
             mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
-            painter.add(Shape::Mesh(mesh));
+            q0glblend::paint_mesh_color(painter, mesh, color_transform);
         }
         Asset::Q0v(v) => {
             if let std::collections::hash_map::Entry::Vacant(entry) =
                 cache.q0v_media.entry(v.asset_id)
             {
-                let Ok(media) = q0video::q0v::Q0vFile::parse(v.bytes.clone()) else {
+                let Ok(media) = q0video::q0v::Q0vFile::parse(v.bytes.as_ref().clone()) else {
                     return;
                 };
                 entry.insert(media);
@@ -614,7 +648,7 @@ fn paint_asset(
                 });
             }
             mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
-            painter.add(Shape::Mesh(mesh));
+            q0glblend::paint_mesh_color(painter, mesh, color_transform);
         }
         Asset::Rig(_) => {}
         Asset::Vector(v) => {
@@ -636,16 +670,20 @@ fn paint_asset(
                 .collect();
             if let Some(appearance) = appearance {
                 if let Some(gradient) = appearance.fill_gradient.as_ref() {
-                    paint_complex_gradient(
+                    paint_complex_gradient_color(
                         painter,
                         &local_contours,
                         gradient,
                         appearance.field_transform,
                         transform,
                         view,
+                        color_transform,
                     );
                 } else {
-                    let fill_color = v.fill.map(rgba_to_color32).unwrap_or(Color32::TRANSPARENT);
+                    let fill_color = v
+                        .fill
+                        .map(|color| color_transform.apply(rgba_to_color32(color)))
+                        .unwrap_or(Color32::TRANSPARENT);
                     if fill_color != Color32::TRANSPARENT {
                         let contours: Vec<Vec<Pos2>> = local_contours
                             .iter()
@@ -665,7 +703,10 @@ fn paint_asset(
                     }
                 }
             } else {
-                let fill_color = v.fill.map(rgba_to_color32).unwrap_or(Color32::TRANSPARENT);
+                let fill_color = v
+                    .fill
+                    .map(|color| color_transform.apply(rgba_to_color32(color)))
+                    .unwrap_or(Color32::TRANSPARENT);
                 if fill_color != Color32::TRANSPARENT {
                     let contours: Vec<Vec<Pos2>> = local_contours
                         .iter()
@@ -716,7 +757,7 @@ fn paint_asset(
                         path.closed,
                         stroke.color,
                     ) {
-                        painter.add(Shape::Mesh(mesh));
+                        q0glblend::paint_mesh_color(painter, mesh, color_transform);
                     }
                 }
                 // Round caps via end-circles — egui's stroke is butt by
@@ -728,7 +769,7 @@ fn paint_asset(
                         && matches!(s.cap, q0s_format::geom::CapShape::Round)
                     {
                         let r = s.width.max(0.5) * parent_scale * view.scale * 0.5;
-                        let col = rgba_to_color32(s.color);
+                        let col = color_transform.apply(rgba_to_color32(s.color));
                         if let Some(p) = polyline_screen.first() {
                             painter.circle_filled(*p, r, col);
                         }
@@ -742,13 +783,14 @@ fn paint_asset(
     }
 }
 
-fn paint_complex_gradient(
+fn paint_complex_gradient_color(
     painter: &Painter,
     contours: &[Vec<Pos2>],
     gradient: &GradientFill,
     field_transform: Affine,
     transform: Affine,
     view: &StageView,
+    color_transform: q0glblend::ColorTransform,
 ) {
     let mut effective = gradient.clone();
     effective.transform = Affine::compose(field_transform, gradient.transform);
@@ -775,7 +817,7 @@ fn paint_complex_gradient(
         emit_gradient_triangle(&mut mesh, local, gradient, transform, view, 0);
     }
     if !mesh.indices.is_empty() {
-        painter.add(Shape::Mesh(mesh));
+        q0glblend::paint_mesh_color(painter, mesh, color_transform);
     }
 }
 

@@ -92,6 +92,10 @@ pub(crate) struct PlayerAudioClip {
     pub(crate) end_sample_frame: u64,
     pub(crate) media: Arc<Q0vFile>,
     pub(crate) gain: f32,
+    pub(crate) source_offset_samples: u64,
+    pub(crate) pan: f32,
+    pub(crate) fade_in_ms: u32,
+    pub(crate) fade_out_ms: u32,
 }
 
 #[derive(Clone)]
@@ -160,6 +164,10 @@ fn build_q0v_audio_timeline(media: Arc<Q0vFile>) -> Option<PlayerAudioTimeline> 
             end_sample_frame,
             media,
             gain: 1.0,
+            source_offset_samples: 0,
+            pan: 0.0,
+            fade_in_ms: 0,
+            fade_out_ms: 0,
         }],
         total_sample_frames,
         start_sample_frame: 0,
@@ -192,7 +200,7 @@ fn build_project_audio_timeline(project: &ProjectV2) -> Option<PlayerAudioTimeli
             let Asset::Q0v(asset) = asset else {
                 continue;
             };
-            let parsed = Arc::new(Q0vFile::parse(asset.bytes.clone()).ok()?);
+            let parsed = Arc::new(Q0vFile::parse(asset.bytes.as_ref().clone()).ok()?);
             parsed_by_asset.insert(clip.asset_id, Arc::clone(&parsed));
             parsed
         };
@@ -207,7 +215,9 @@ fn build_project_audio_timeline(project: &ProjectV2) -> Option<PlayerAudioTimeli
             .saturating_mul(u64::from(PLAYER_AUDIO_SAMPLE_RATE))
             / host_fps;
         let end_sample_frame = start_sample_frame
-            .saturating_add(source_duration_at_player_rate(&media))
+            .saturating_add(
+                source_duration_at_player_rate(&media).saturating_sub(clip.source_offset_samples),
+            )
             .min(boundary_sample_frame)
             .min(total_sample_frames);
         if end_sample_frame > start_sample_frame {
@@ -216,6 +226,10 @@ fn build_project_audio_timeline(project: &ProjectV2) -> Option<PlayerAudioTimeli
                 end_sample_frame,
                 media,
                 gain: clip.gain.clamp(0.0, 4.0),
+                source_offset_samples: clip.source_offset_samples,
+                pan: clip.pan,
+                fade_in_ms: clip.fade_in_ms,
+                fade_out_ms: clip.fade_out_ms,
             });
         }
     }
@@ -249,7 +263,9 @@ pub(crate) fn sample_audio_timeline(
             continue;
         }
         let local_output_frame = sample_frame - clip.start_sample_frame;
-        let source_numerator = local_output_frame.saturating_mul(source_rate);
+        let source_numerator = local_output_frame
+            .saturating_add(clip.source_offset_samples)
+            .saturating_mul(source_rate);
         let source_index = (source_numerator / u64::from(PLAYER_AUDIO_SAMPLE_RATE)) as usize;
         let next_index = source_index.saturating_add(1).min(source_frames - 1);
         let fraction = (source_numerator % u64::from(PLAYER_AUDIO_SAMPLE_RATE)) as f32
@@ -265,7 +281,21 @@ pub(crate) fn sample_audio_timeline(
         };
         let a = read(source_index);
         let b = read(next_index);
-        mixed += (a + (b - a) * fraction) * clip.gain;
+        let settings = q0s_format::v2::AudioClip {
+            gain: clip.gain,
+            pan: clip.pan,
+            fade_in_ms: clip.fade_in_ms,
+            fade_out_ms: clip.fade_out_ms,
+            ..Default::default()
+        };
+        let gain = q0s_format::v2::audio_clip_channel_gain(
+            settings,
+            local_output_frame,
+            clip.end_sample_frame - clip.start_sample_frame,
+            PLAYER_AUDIO_SAMPLE_RATE,
+            output_channel,
+        );
+        mixed += (a + (b - a) * fraction) * gain;
     }
     mixed.clamp(-1.0, 1.0)
 }
@@ -1872,7 +1902,7 @@ pb func update current_vy {
             },
             assets: vec![Asset::Q0v(Q0vAsset {
                 asset_id: 77,
-                bytes: audio_bytes,
+                bytes: (audio_bytes).into(),
             })],
             asset_names: std::collections::HashMap::new(),
             asset_appearances: std::collections::HashMap::new(),
@@ -1884,6 +1914,7 @@ pb func update current_vy {
                 asset_id: 77,
                 gain: 0.5,
                 muted,
+                ..Default::default()
             }],
             runtime: Default::default(),
             q0rgs: vec![Q0rg {

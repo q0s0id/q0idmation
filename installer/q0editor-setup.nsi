@@ -90,6 +90,7 @@ Section "q0editor (required)" SecEditor
   File "${APP_BINARY_DIR}\${APP_EXE}"
   File "assets\q0editor.ico"
   File "LICENSE.txt"
+  File "..\q0fla\THIRD_PARTY_LICENSES.md"
 
   ; Preserve a valid foreign per-user default before taking ownership. On an
   ; upgrade, keep the original backup instead of replacing it with ourselves.
@@ -194,6 +195,7 @@ q0editor_uninstall_association_done:
   Delete "$INSTDIR\${APP_EXE}"
   Delete "$INSTDIR\q0editor.ico"
   Delete "$INSTDIR\LICENSE.txt"
+  Delete "$INSTDIR\THIRD_PARTY_LICENSES.md"
   Delete "$INSTDIR\Uninstall.exe"
   RMDir  "$INSTDIR"
   RMDir  "$LOCALAPPDATA\Programs\q0idmation"

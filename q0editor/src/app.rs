@@ -63,7 +63,7 @@ fn valid_library_folder_path(path: &str) -> bool {
         })
 }
 
-fn remapped_keyframe_placement_index(
+pub(crate) fn remapped_keyframe_placement_index(
     before: &ProjectV2,
     after: &ProjectV2,
     q0rg_id: u16,
@@ -91,7 +91,7 @@ fn remapped_keyframe_placement_index(
         return placement_idx;
     };
 
-    if let Some(active) = q0s_format::raster::active_placement_states_at(before_layer, frame)
+    if let Some(active) = crate::timeline_edit::keyframe_source_states_at(before_layer, frame)
         .into_iter()
         .find(|state| state.index == placement_idx)
     {
@@ -137,13 +137,29 @@ fn remapped_keyframe_placement_index(
         .unwrap_or(placement_idx)
 }
 
+fn rebind_transform_pivot(
+    pivot: &mut Option<crate::state::TransformPivot>,
+    previous_selection: &Selection,
+    selection: &Selection,
+) {
+    // Only carry the pivot when the same artwork was deliberately remapped.
+    // An unrelated selection must never inherit another object's pivot.
+    if let Some(pivot) = pivot.as_mut().filter(|pivot| {
+        pivot.selection == *previous_selection && !matches!(selection, Selection::None)
+    }) {
+        pivot.selection = selection.clone();
+    }
+}
+
 fn remap_selection_after_keyframes(
     before: &ProjectV2,
     after: &ProjectV2,
     selection: &mut Selection,
+    pivot: &mut Option<crate::state::TransformPivot>,
     q0rg_id: u16,
     frame_by_layer: &std::collections::BTreeMap<u16, u16>,
 ) {
+    let previous_selection = selection.clone();
     let remap_index = |reference_q0rg: u16, reference_layer: u16, placement_idx: usize| {
         if reference_q0rg != q0rg_id {
             return placement_idx;
@@ -176,7 +192,7 @@ fn remap_selection_after_keyframes(
         );
     };
 
-    match selection {
+    match &mut *selection {
         Selection::Placement {
             q0rg_id,
             layer_id,
@@ -221,6 +237,7 @@ fn remap_selection_after_keyframes(
         Selection::Multi(objects) => objects.iter_mut().for_each(remap_placement),
         Selection::None | Selection::Asset(_) | Selection::Q0rg(_) => {}
     }
+    rebind_transform_pivot(pivot, &previous_selection, selection);
 }
 
 pub struct EditorApp {
@@ -228,6 +245,8 @@ pub struct EditorApp {
     pub session: Session,
     pub history: History,
     pub textures: TextureCache,
+    pub(crate) animation_preview_textures: TextureCache,
+    pub(crate) animation_preview_revision: Option<(u64, u64)>,
     /// Persistent theme, drawing, and script-editor settings.
     /// `<config>/q0editor/settings.json`.
     pub settings: crate::settings::Settings,
@@ -546,6 +565,8 @@ pub enum Action {
     ToggleLayerOutline(u16, u16),
     ToggleMaskArtworkVisibility(u16, u16),
     ToggleAllLayerLocks(u16),
+    ToggleAllLayerVisibility(u16),
+    ToggleAllLayerOutlines(u16),
     DeleteLayer(u16, u16),
     AddQ0rg,
     AddScene,
@@ -588,9 +609,12 @@ pub enum Action {
     Paste,
     PasteInPlace,
     DuplicateSelection,
+    DuplicateSymbol(u16, u16, usize),
     AltDragDuplicateSelection(q0s_format::v2::Vec2),
     BringToFront,
     SendToBack,
+    BringForward,
+    SendBackward,
     SpreadBetweenLayers,
     SpreadBetweenKeyframes,
     FlipHorizontal,
@@ -671,6 +695,8 @@ impl Action {
             Self::ToggleLayerOutline(..) => "toggle-layer-outline",
             Self::ToggleMaskArtworkVisibility(..) => "toggle-mask-artwork-visibility",
             Self::ToggleAllLayerLocks(_) => "toggle-all-layer-locks",
+            Self::ToggleAllLayerVisibility(_) => "toggle-all-layer-visibility",
+            Self::ToggleAllLayerOutlines(_) => "toggle-all-layer-outlines",
             Self::DeleteLayer(..) => "delete-layer",
             Self::AddQ0rg => "add-q0rg",
             Self::AddScene => "add-scene",
@@ -709,9 +735,12 @@ impl Action {
             Self::Paste => "paste",
             Self::PasteInPlace => "paste-in-place",
             Self::DuplicateSelection => "duplicate-selection",
+            Self::DuplicateSymbol(..) => "duplicate-symbol",
             Self::AltDragDuplicateSelection(_) => "alt-drag-duplicate-selection",
             Self::BringToFront => "bring-to-front",
             Self::SendToBack => "send-to-back",
+            Self::BringForward => "bring-forward",
+            Self::SendBackward => "send-backward",
             Self::SpreadBetweenLayers => "spread-between-layers",
             Self::SpreadBetweenKeyframes => "spread-between-keyframes",
             Self::FlipHorizontal => "flip-horizontal",
@@ -925,6 +954,8 @@ impl Default for EditorApp {
             session,
             history: History::new(),
             textures: TextureCache::default(),
+            animation_preview_textures: TextureCache::default(),
+            animation_preview_revision: None,
             settings,
             q0enc,
             q0fla_open: false,
@@ -1361,9 +1392,10 @@ impl EditorApp {
 
     fn workspace_for_project(
         &self,
-        project: q0s_format::v2::ProjectV2,
+        mut project: q0s_format::v2::ProjectV2,
         file_path: Option<PathBuf>,
     ) -> ProjectWorkspace {
+        let repaired = crate::timeline_edit::sync_project_folder_timelines(&mut project);
         let mut session = Session::for_project(&project);
         session.brush_cap = self.settings.brush_cap.into();
         session.brush = self.settings.brush.to_runtime();
@@ -1378,7 +1410,7 @@ impl EditorApp {
             state: ProjectState {
                 project,
                 file_path,
-                dirty: false,
+                dirty: repaired,
                 revision: 0,
                 render_revision: 0,
                 library_revision: 0,
@@ -2335,6 +2367,61 @@ impl EditorApp {
     }
 
     fn handle(&mut self, ctx: &Context, action: Action) {
+        let timeline_edit = matches!(
+            &action,
+            Action::InsertFrame
+                | Action::InsertKeyframe
+                | Action::InsertBlankKeyframe
+                | Action::RemoveFrame
+                | Action::RemoveSelectedTimelineFrames
+                | Action::ClearKeyframe
+                | Action::MoveTimelineFrames(..)
+                | Action::MoveCameraFrames(..)
+                | Action::MoveRigTimelineKey(..)
+                | Action::SetQ0rgFrameCount(..)
+                | Action::SpreadBetweenKeyframes
+        ) || (matches!(
+            &action,
+            Action::DeleteSelection
+                | Action::CutSelection
+                | Action::Paste
+                | Action::PasteInPlace
+                | Action::DuplicateSelection
+        ) && (self.session.timeline_selection.is_some()
+            || self.session.timeline_cell_selection.is_some()
+            || self.session.camera_timeline_selection.is_some()));
+        let before = self.session.timeline_history_position();
+        let old_frame_count = self
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q| q.q0rg_id == self.session.current_q0rg_id)
+            .map(|q| q.frame_count);
+        let history_revision = self.history.snapshot_revision();
+        self.handle_inner(ctx, action);
+        if timeline_edit && self.history.snapshot_revision() != history_revision {
+            if crate::timeline_edit::sync_folder_timelines(
+                &mut self.state.project,
+                self.session.current_q0rg_id,
+            ) {
+                self.state.mark_dirty();
+            }
+            let frame_count = self
+                .state
+                .project
+                .q0rgs
+                .iter()
+                .find(|q| q.q0rg_id == self.session.current_q0rg_id)
+                .map(|q| q.frame_count);
+            if frame_count < old_frame_count {
+                self.session.reconcile_with(&self.state.project);
+            }
+            self.history.set_undo_timeline_position(before);
+        }
+    }
+
+    fn handle_inner(&mut self, ctx: &Context, action: Action) {
         if self.media_import_job.is_some()
             && matches!(
                 &action,
@@ -2504,12 +2591,20 @@ impl EditorApp {
             }
             Action::Undo => {
                 let history_started = Instant::now();
+                let timeline_position = self.history.undo_timeline_position();
+                let before = self.session.timeline_history_position();
                 let current = std::mem::replace(&mut self.state.project, default_project());
                 let session = &mut self.session;
                 match self.history.pop_undo(current, |from, to| {
+                    if let Some(position) = timeline_position {
+                        session.restore_timeline_history_position(position);
+                    }
                     session.reconcile_after_history(from, to)
                 }) {
                     Ok(prior) => {
+                        if timeline_position.is_some() {
+                            self.history.set_redo_timeline_position(before);
+                        }
                         self.state.project = prior;
                         self.textures.invalidate();
                         self.state.mark_dirty();
@@ -2527,12 +2622,20 @@ impl EditorApp {
             }
             Action::Redo => {
                 let history_started = Instant::now();
+                let timeline_position = self.history.redo_timeline_position();
+                let before = self.session.timeline_history_position();
                 let current = std::mem::replace(&mut self.state.project, default_project());
                 let session = &mut self.session;
                 match self.history.pop_redo(current, |from, to| {
+                    if let Some(position) = timeline_position {
+                        session.restore_timeline_history_position(position);
+                    }
                     session.reconcile_after_history(from, to)
                 }) {
                     Ok(next) => {
+                        if timeline_position.is_some() {
+                            self.history.set_undo_timeline_position(before);
+                        }
                         self.state.project = next;
                         self.textures.invalidate();
                         self.state.mark_dirty();
@@ -2577,6 +2680,25 @@ impl EditorApp {
                 self.session.playing = wants_play;
                 self.session.last_tick = Instant::now();
                 if wants_play {
+                    if let Some(&(true, start, end)) = self
+                        .session
+                        .preview_loop_ranges
+                        .get(&self.session.current_q0rg_id)
+                    {
+                        let total = self
+                            .state
+                            .project
+                            .q0rgs
+                            .iter()
+                            .find(|q| q.q0rg_id == self.session.current_q0rg_id)
+                            .map(|q| q.frame_count.max(1))
+                            .unwrap_or(1);
+                        let start = start.min(total - 1);
+                        let end = end.max(start).min(total - 1);
+                        if self.session.current_frame < start || self.session.current_frame > end {
+                            self.session.current_frame = start;
+                        }
+                    }
                     self.initialize_preview_q0lang_if_needed();
                     self.session.preview_audio_resync_needed = false;
                     if self.session.playing {
@@ -3190,6 +3312,71 @@ impl EditorApp {
                     "mask preview enabled; source artwork hidden"
                 } else {
                     "mask editing enabled; source and contents shown"
+                }
+                .to_string();
+            }
+            Action::ToggleAllLayerVisibility(q0rg_id) => {
+                let Some(q0rg) = self
+                    .state
+                    .project
+                    .q0rgs
+                    .iter()
+                    .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+                else {
+                    return;
+                };
+                let hide = q0rg.layers.iter().any(|layer| {
+                    !self.state.project.layer_is_folder(q0rg_id, layer.layer_id)
+                        && self.state.project.layer_is_visible(q0rg_id, layer.layer_id)
+                });
+                self.history.snapshot(&self.state.project);
+                for layer in &q0rg.layers {
+                    let key = LayerKey::new(q0rg_id, layer.layer_id);
+                    let mut metadata = self.state.project.layer_metadata(q0rg_id, layer.layer_id);
+                    metadata.hidden = hide;
+                    self.state.project.layer_metadata.insert(key, metadata);
+                }
+                self.session.selection = Selection::None;
+                self.state.mark_dirty();
+                self.session.status = if hide {
+                    "all layers hidden"
+                } else {
+                    "all layers shown"
+                }
+                .to_string();
+            }
+            Action::ToggleAllLayerOutlines(q0rg_id) => {
+                let Some(q0rg) = self
+                    .state
+                    .project
+                    .q0rgs
+                    .iter()
+                    .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+                else {
+                    return;
+                };
+                let layer_ids: Vec<_> = q0rg
+                    .layers
+                    .iter()
+                    .filter(|layer| !self.state.project.layer_is_folder(q0rg_id, layer.layer_id))
+                    .map(|layer| layer.layer_id)
+                    .collect();
+                if layer_ids.is_empty() {
+                    return;
+                }
+                let enable = layer_ids
+                    .iter()
+                    .any(|id| !self.session.outline_layers.contains(&(q0rg_id, *id)));
+                self.session.outline_layers.retain(|(id, _)| *id != q0rg_id);
+                if enable {
+                    self.session
+                        .outline_layers
+                        .extend(layer_ids.into_iter().map(|id| (q0rg_id, id)));
+                }
+                self.session.status = if enable {
+                    "all layer outlines enabled"
+                } else {
+                    "all layer outlines disabled"
                 }
                 .to_string();
             }
@@ -3862,11 +4049,13 @@ impl EditorApp {
                 placement_idx,
             } => {
                 self.enter_q0rg_in_place(q0rg_id, layer_id, placement_idx);
+                self.session.symbol_edit_click = None;
             }
             Action::BreadcrumbJumpTo(depth) => {
                 self.breadcrumb_jump_to(depth);
             }
             Action::ExitQ0rg => {
+                self.session.symbol_edit_click = None;
                 if !self.session.breadcrumb.is_empty() {
                     let parent = self.session.breadcrumb.pop().unwrap();
                     let edit_context = self.session.edit_in_place.pop();
@@ -4390,6 +4579,9 @@ impl EditorApp {
                     }
                 }
             }
+            Action::DuplicateSymbol(q0rg_id, layer_id, placement_idx) => {
+                self.duplicate_symbol_instance(q0rg_id, layer_id, placement_idx);
+            }
             Action::AltDragDuplicateSelection(start_cursor) => {
                 if self.current_layer_is_folder() {
                     self.session.status = "folders cannot contain artwork".to_string();
@@ -4421,11 +4613,13 @@ impl EditorApp {
                 }
             }
             Action::BringToFront => {
-                self.reorder_selection(true);
+                self.reorder_selection(true, false);
             }
             Action::SendToBack => {
-                self.reorder_selection(false);
+                self.reorder_selection(false, false);
             }
+            Action::BringForward => self.reorder_selection(true, true),
+            Action::SendBackward => self.reorder_selection(false, true),
             Action::SpreadBetweenLayers => self.spread_selected_objects_between_layers(),
             Action::SpreadBetweenKeyframes => self.spread_selected_objects_between_keyframes(),
             Action::FlipHorizontal => {
@@ -4612,12 +4806,12 @@ impl EditorApp {
             self.session.status = "layer is locked".to_string();
             return;
         }
-        let Selection::Multi(references) = self.session.selection.clone() else {
-            self.session.status = "select multiple objects on one layer first".to_string();
-            return;
-        };
-        if references.len() < 2 {
-            self.session.status = "select multiple objects on one layer first".to_string();
+        let references = crate::selection_edit::selected_object_refs(
+            &self.state.project,
+            &self.session.selection,
+        );
+        if references.is_empty() {
+            self.session.status = "select objects on one layer first".to_string();
             return;
         }
         let first = references[0];
@@ -4631,80 +4825,145 @@ impl EditorApp {
         let q0rg_id = first.q0rg_id;
         let layer_id = first.layer_id;
         let frame = self.session.current_frame;
-        let Some((source_index, source, metadata, depth_count, selected_depths, selected_names)) =
-            self.state
-                .project
-                .q0rgs
-                .iter()
-                .find(|q0rg| q0rg.q0rg_id == q0rg_id)
-                .and_then(|q0rg| {
-                    let source_index = q0rg
-                        .layers
-                        .iter()
-                        .position(|layer| layer.layer_id == layer_id)?;
-                    let source = &q0rg.layers[source_index];
-                    let metadata = self.state.project.layer_metadata(q0rg_id, layer_id);
-                    if metadata.kind == LayerKind::Folder {
-                        return None;
-                    }
-                    let active = q0s_format::raster::active_placement_states_at(source, frame);
-                    let selected_indices: std::collections::HashSet<usize> = references
-                        .iter()
-                        .map(|reference| reference.placement_idx)
-                        .collect();
-                    let active_indices: std::collections::HashSet<usize> =
-                        active.iter().map(|placement| placement.index).collect();
-                    if active.len() != references.len()
-                        || selected_indices.len() != references.len()
-                        || selected_indices != active_indices
-                    {
-                        return None;
-                    }
-                    let selected_names = active
-                        .iter()
-                        .map(|placement| {
-                            let placement = source.placements.get(placement.index)?;
-                            let q0rg_id = match placement.target {
-                                Target::Q0rg(q0rg_id) => q0rg_id,
-                                Target::Asset(_) => return None,
-                            };
-                            self.state
+        let Some((
+            source_index,
+            source,
+            metadata,
+            depth_count,
+            selected_depths,
+            selected_names,
+            single_object,
+        )) = self
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+            .and_then(|q0rg| {
+                let source_index = q0rg
+                    .layers
+                    .iter()
+                    .position(|layer| layer.layer_id == layer_id)?;
+                let source = &q0rg.layers[source_index];
+                let metadata = self.state.project.layer_metadata(q0rg_id, layer_id);
+                if metadata.kind != LayerKind::Normal {
+                    return None;
+                }
+                let active = q0s_format::raster::active_placement_states_at(source, frame);
+                let selected_indices: std::collections::HashSet<usize> = references
+                    .iter()
+                    .map(|reference| reference.placement_idx)
+                    .collect();
+                let active_indices: std::collections::HashSet<usize> =
+                    active.iter().map(|placement| placement.index).collect();
+                if selected_indices.len() != references.len()
+                    || !selected_indices.is_subset(&active_indices)
+                {
+                    return None;
+                }
+                let selected_names = active
+                    .iter()
+                    .filter(|placement| selected_indices.contains(&placement.index))
+                    .map(|placement| {
+                        let placement = source.placements.get(placement.index)?;
+                        Some(match placement.target {
+                            Target::Q0rg(q0rg_id) => self
+                                .state
                                 .project
                                 .q0rgs
                                 .iter()
-                                .find(|q0rg| q0rg.q0rg_id == q0rg_id)
-                                .map(|q0rg| q0rg.name.clone())
+                                .find(|q0rg| q0rg.q0rg_id == q0rg_id)?
+                                .name
+                                .clone(),
+                            Target::Asset(_) => source.name.clone(),
                         })
-                        .collect::<Option<Vec<_>>>()?;
-                    let mut counts = std::collections::HashMap::<u16, usize>::new();
-                    let mut depth_count = 0usize;
-                    for placement in &source.placements {
-                        let count = counts.entry(placement.frame).or_default();
-                        *count += 1;
-                        depth_count = depth_count.max(*count);
-                    }
-                    if depth_count < 2 {
-                        return None;
-                    }
-                    let selected_depths = active
-                        .iter()
-                        .enumerate()
-                        .map(|(depth, placement)| (depth, placement.index))
-                        .collect::<Vec<_>>();
-                    Some((
-                        source_index,
-                        source,
-                        metadata,
-                        depth_count,
-                        selected_depths,
-                        selected_names,
-                    ))
-                })
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                let mut counts = std::collections::HashMap::<u16, usize>::new();
+                let mut depth_count = 0usize;
+                for placement in &source.placements {
+                    let count = counts.entry(placement.frame).or_default();
+                    *count += 1;
+                    depth_count = depth_count.max(*count);
+                }
+                let selected_depths = active
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, placement)| selected_indices.contains(&placement.index))
+                    .map(|(depth, placement)| (depth, placement.index))
+                    .collect::<Vec<_>>();
+                Some((
+                    source_index,
+                    source,
+                    metadata,
+                    depth_count,
+                    selected_depths,
+                    selected_names,
+                    active.len() == 1,
+                ))
+            })
         else {
             self.session.status =
-                "select every object currently on one unlocked layer to preserve depth".to_string();
+                "select objects currently visible on one normal unlocked layer".to_string();
             return;
         };
+
+        if single_object {
+            let name = selected_names[0].clone();
+            if source.name == name {
+                self.session.status = "object is already on its own named layer".to_string();
+                return;
+            }
+            self.history.snapshot(&self.state.project);
+            self.state
+                .project
+                .q0rgs
+                .iter_mut()
+                .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+                .and_then(|q0rg| {
+                    q0rg.layers
+                        .iter_mut()
+                        .find(|layer| layer.layer_id == layer_id)
+                })
+                .expect("spread source layer exists")
+                .name = name;
+            self.state.mark_dirty();
+            self.session.status = "named layer after its object".to_string();
+            return;
+        }
+
+        // Selected depths each get their own track. Keep contiguous unselected
+        // depths together, splitting a remainder only where needed so that a
+        // selected middle object never jumps above/below neighbouring artwork.
+        let selected_ranks = selected_depths
+            .iter()
+            .map(|(depth, _)| *depth)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut groups = Vec::<Vec<usize>>::new();
+        for depth in 0..depth_count {
+            if !selected_ranks.contains(&depth)
+                && groups
+                    .last()
+                    .is_some_and(|group| !selected_ranks.contains(&group[0]))
+            {
+                groups
+                    .last_mut()
+                    .expect("remainder group exists")
+                    .push(depth);
+            } else {
+                groups.push(vec![depth]);
+            }
+        }
+        let source_group = groups
+            .iter()
+            .position(|group| !selected_ranks.contains(&group[0]))
+            .unwrap_or(0);
+        let mut group_by_depth = vec![0usize; depth_count];
+        for (group_index, group) in groups.iter().enumerate() {
+            for depth in group {
+                group_by_depth[*depth] = group_index;
+            }
+        }
 
         let max_layer_id = self
             .state
@@ -4714,45 +4973,46 @@ impl EditorApp {
             .find(|q0rg| q0rg.q0rg_id == q0rg_id)
             .and_then(|q0rg| q0rg.layers.iter().map(|layer| layer.layer_id).max())
             .unwrap_or(0);
-        if u32::from(max_layer_id) + u32::try_from(depth_count - 1).unwrap_or(u32::MAX)
-            > u32::from(u16::MAX)
+        if u16::try_from(groups.len() - 1)
+            .ok()
+            .and_then(|extra| max_layer_id.checked_add(extra))
+            .is_none()
         {
             self.session.status =
                 "not enough layer ids available to spread these objects".to_string();
             return;
         }
 
-        let mut placements_by_depth = vec![Vec::<Placement>::new(); depth_count];
+        let mut placements_by_depth = vec![Vec::<Placement>::new(); groups.len()];
         let mut depth_by_frame = std::collections::HashMap::<u16, usize>::new();
         for placement in &source.placements {
             let depth = depth_by_frame.entry(placement.frame).or_default();
-            placements_by_depth[*depth].push(placement.clone());
+            placements_by_depth[group_by_depth[*depth]].push(placement.clone());
             *depth += 1;
         }
         let source_keyframes = source.keyframe_frames();
         let base_name = source.name.clone();
-        let mut depth_names = selected_names;
-        for depth in depth_names.len()..depth_count {
-            depth_names.push(if depth == 0 {
-                base_name.clone()
-            } else {
-                format!("{base_name} {}", depth + 1)
-            });
-        }
-        let mut new_layers = Vec::with_capacity(depth_count);
-        let mut new_ids = Vec::with_capacity(depth_count);
+        let names_by_depth = selected_depths
+            .iter()
+            .zip(selected_names)
+            .map(|((depth, _), name)| (*depth, name))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut new_layers = Vec::with_capacity(groups.len());
+        let mut new_ids = Vec::with_capacity(groups.len());
+        let mut allocated = 0u16;
         let mut used_names = std::collections::HashSet::new();
         for (depth, placements) in placements_by_depth.into_iter().enumerate() {
-            let new_id = if depth == 0 {
+            let new_id = if depth == source_group {
                 layer_id
             } else {
-                max_layer_id + depth as u16
+                allocated += 1;
+                max_layer_id + allocated
             };
             new_ids.push(new_id);
-            let base_layer_name = depth_names
-                .get(depth)
+            let base_layer_name = names_by_depth
+                .get(&groups[depth][0])
                 .cloned()
-                .unwrap_or_else(|| format!("{base_name} {}", depth + 1));
+                .unwrap_or_else(|| base_name.clone());
             let mut layer_name = base_layer_name.clone();
             let mut suffix = 2usize;
             while !used_names.insert(layer_name.to_lowercase()) {
@@ -4770,7 +5030,7 @@ impl EditorApp {
             explicit_keyframes.dedup();
             new_layers.push(Layer {
                 layer_id: new_id,
-                timeline_frame_count: None,
+                timeline_frame_count: source.timeline_frame_count,
                 name: layer_name,
                 explicit_keyframes,
                 placements,
@@ -4781,14 +5041,15 @@ impl EditorApp {
             .iter()
             .filter_map(|(depth, source_placement_idx)| {
                 let source_placement = source.placements.get(*source_placement_idx)?;
+                let group = group_by_depth[*depth];
                 let placement_idx = new_layers
-                    .get(*depth)?
+                    .get(group)?
                     .placements
                     .iter()
                     .position(|placement| placement.frame == source_placement.frame)?;
                 Some(PlacementRef {
                     q0rg_id,
-                    layer_id: *new_ids.get(*depth)?,
+                    layer_id: *new_ids.get(group)?,
                     placement_idx,
                 })
             })
@@ -4810,14 +5071,28 @@ impl EditorApp {
             return;
         };
         q0rg.layers.splice(source_index..=source_index, new_layers);
-        for new_id in new_ids.iter().copied().skip(1) {
+        for new_id in new_ids.iter().copied().filter(|new_id| *new_id != layer_id) {
             self.state
                 .project
                 .layer_metadata
                 .insert(LayerKey::new(q0rg_id, new_id), metadata);
         }
-        self.session.current_layer_id = layer_id;
-        self.session.selection = Selection::Multi(selected_after_spread);
+        self.session.current_layer_id = selected_after_spread[0].layer_id;
+        self.session.timeline_selection = Some(TimelineSelection::single(
+            self.session.current_layer_id,
+            frame,
+        ));
+        self.session.timeline_cell_selection = None;
+        self.session.selection = if selected_after_spread.len() == 1 {
+            let reference = selected_after_spread[0];
+            Selection::Placement {
+                q0rg_id,
+                layer_id: reference.layer_id,
+                placement_idx: reference.placement_idx,
+            }
+        } else {
+            Selection::Multi(selected_after_spread)
+        };
         self.state.mark_dirty();
         self.textures.invalidate();
         self.session.status = format!("spread {} depth levels between layers", new_ids.len());
@@ -4828,26 +5103,26 @@ impl EditorApp {
             self.session.status = "layer is locked".to_string();
             return;
         }
-        let Selection::Multi(references) = self.session.selection.clone() else {
-            self.session.status = "select multiple q0rg objects on one layer first".to_string();
-            return;
-        };
-        if references.len() < 2 {
-            self.session.status = "select multiple q0rg objects on one layer first".to_string();
+        let references = crate::selection_edit::selected_object_refs(
+            &self.state.project,
+            &self.session.selection,
+        );
+        if references.is_empty() {
+            self.session.status = "select objects on one layer first".to_string();
             return;
         }
         let first = references[0];
         if references.iter().any(|reference| {
             reference.q0rg_id != first.q0rg_id || reference.layer_id != first.layer_id
         }) {
-            self.session.status = "spread requires q0rg objects from one layer".to_string();
+            self.session.status = "spread requires objects from one layer".to_string();
             return;
         }
 
         let q0rg_id = first.q0rg_id;
         let layer_id = first.layer_id;
         let frame = self.session.current_frame;
-        let Some((mut placements, frame_count)) = self
+        let Some((mut placements, background, layer_frame_count, frame_count, has_keyframe)) = self
             .state
             .project
             .q0rgs
@@ -4870,34 +5145,47 @@ impl EditorApp {
                     .iter()
                     .map(|placement| placement.index)
                     .collect::<std::collections::HashSet<_>>();
-                if active.len() != references.len()
-                    || selected_indices.len() != references.len()
-                    || selected_indices != active_indices
+                if selected_indices.len() != references.len()
+                    || !selected_indices.is_subset(&active_indices)
                 {
                     return None;
                 }
-                let placements = active
-                    .into_iter()
-                    .map(|active| {
-                        let source = layer.placements.get(active.index)?;
-                        matches!(source.target, Target::Q0rg(_)).then_some(Placement {
-                            instance_id: source.instance_id,
-                            frame,
-                            target: source.target,
-                            transform: active.transform,
-                            tween: Tween::None,
-                            fx: active.fx,
-                        })
-                    })
-                    .collect::<Option<Vec<_>>>()?;
-                Some((placements, q0rg.frame_count))
+                let mut placements = Vec::new();
+                let mut background = Vec::new();
+                for (depth, active) in active.into_iter().enumerate() {
+                    let source = layer.placements.get(active.index)?;
+                    let placement = Placement {
+                        instance_id: source.instance_id,
+                        frame,
+                        target: source.target,
+                        transform: active.transform,
+                        tween: Tween::None,
+                        fx: active.fx,
+                    };
+                    if selected_indices.contains(&active.index) {
+                        placements.push((depth, placement));
+                    } else {
+                        background.push((depth, placement));
+                    }
+                }
+                Some((
+                    placements,
+                    background,
+                    layer.timeline_frame_count.unwrap_or(q0rg.frame_count),
+                    q0rg.frame_count,
+                    layer.has_keyframe(frame),
+                ))
             })
         else {
             self.session.status =
-                "select every q0rg object currently on one unlocked layer to preserve depth"
-                    .to_string();
+                "select objects currently visible on one normal unlocked layer".to_string();
             return;
         };
+
+        if placements.len() == 1 && has_keyframe {
+            self.session.status = "selected object is already on this keyframe".to_string();
+            return;
+        }
 
         let extra_frames = match u16::try_from(placements.len().saturating_sub(1)) {
             Ok(extra) => extra,
@@ -4906,10 +5194,11 @@ impl EditorApp {
                 return;
             }
         };
-        let Some(new_frame_count) = frame_count.checked_add(extra_frames) else {
+        let Some(new_layer_frame_count) = layer_frame_count.checked_add(extra_frames) else {
             self.session.status = "not enough timeline space to create keyframes".into();
             return;
         };
+        let new_frame_count = frame_count.max(new_layer_frame_count);
         let Some(last_frame) = frame.checked_add(extra_frames) else {
             self.session.status = "not enough timeline space to create keyframes".into();
             return;
@@ -4949,27 +5238,19 @@ impl EditorApp {
                 }
             }
         }
-        let insertion_frame = frame + 1;
-        if insertion_frame < frame_count {
-            for _ in 0..extra_frames {
-                if crate::timeline_edit::insert_hold_frame_before(
-                    &mut updated,
-                    q0rg_id,
-                    layer_id,
-                    insertion_frame,
-                )
-                .is_none()
-                {
-                    self.session.status = "could not make room for the new keyframes".into();
-                    return;
-                }
+        // Make consecutive cells on this row. The row-aware F5 operation
+        // preserves every other layer's duration even at the shared tail.
+        for _ in 0..extra_frames {
+            if crate::timeline_edit::insert_hold_frames_after_selected_cells(
+                &mut updated,
+                q0rg_id,
+                &[(layer_id, frame)],
+            )
+            .is_none()
+            {
+                self.session.status = "could not make room for the new keyframes".into();
+                return;
             }
-        } else if let Some(q0rg) = updated
-            .q0rgs
-            .iter_mut()
-            .find(|q0rg| q0rg.q0rg_id == q0rg_id)
-        {
-            q0rg.frame_count = new_frame_count;
         }
 
         let Some(layer) = updated
@@ -4987,12 +5268,22 @@ impl EditorApp {
         layer
             .placements
             .retain(|placement| placement.frame != frame);
-        let first_placement_idx = layer.placements.len();
-        for (offset, mut placement) in placements.drain(..).enumerate() {
+        let mut first_placement_idx = layer.placements.len();
+        for (offset, (selected_depth, placement)) in placements.drain(..).enumerate() {
             let keyframe = frame + offset as u16;
-            placement.frame = keyframe;
             layer.ensure_explicit_keyframe(keyframe);
-            layer.push_placement(placement);
+            // Unselected objects remain on every generated key, in their
+            // original depth order relative to that key's selected object.
+            let mut contents = background.clone();
+            contents.push((selected_depth, placement));
+            contents.sort_by_key(|(depth, _)| *depth);
+            for (depth, mut placement) in contents {
+                placement.frame = keyframe;
+                if offset == 0 && depth == selected_depth {
+                    first_placement_idx = layer.placements.len();
+                }
+                layer.push_placement(placement);
+            }
         }
 
         self.history.snapshot(&before);
@@ -5000,6 +5291,7 @@ impl EditorApp {
         self.session.current_layer_id = layer_id;
         self.session.current_frame = frame;
         self.session.timeline_selection = Some(TimelineSelection::single(layer_id, frame));
+        self.session.timeline_cell_selection = None;
         self.session.selection = Selection::Placement {
             q0rg_id,
             layer_id,
@@ -5008,53 +5300,147 @@ impl EditorApp {
         self.state.mark_dirty();
         self.textures.invalidate();
         self.session.status = format!(
-            "spread {} q0rg objects across keyframes {}–{}",
+            "spread {} objects across keyframes {}–{}",
             extra_frames + 1,
             frame + 1,
             last_frame + 1
         );
     }
 
-    fn reorder_selection(&mut self, to_front: bool) {
+    fn reorder_selection(&mut self, to_front: bool, one_step: bool) {
         if self.selection_touches_locked_layer() {
             self.session.status = "layer is locked".to_string();
             return;
         }
-        if let Selection::Placement {
-            q0rg_id,
-            layer_id,
-            placement_idx,
-        } = self.session.selection.clone()
-        {
-            self.history.snapshot(&self.state.project);
-            if let Some(q) = self
+        if !matches!(
+            self.session.selection,
+            Selection::Placement { .. } | Selection::Multi(_)
+        ) {
+            self.session.status = "select objects to change their drawing order".to_string();
+            return;
+        }
+        let selection_before = self.session.selection.clone();
+        let refs =
+            crate::selection_edit::selected_object_refs(&self.state.project, &selection_before);
+        let frame = self.session.current_frame;
+        let make_orders = |project: &ProjectV2, refs: &[PlacementRef]| {
+            let mut orders = Vec::new();
+            for q0rg in &project.q0rgs {
+                for layer in &q0rg.layers {
+                    let selected: std::collections::HashSet<_> = refs
+                        .iter()
+                        .filter(|r| r.q0rg_id == q0rg.q0rg_id && r.layer_id == layer.layer_id)
+                        .map(|r| r.placement_idx)
+                        .collect();
+                    if selected.is_empty() {
+                        continue;
+                    }
+                    let slots: Vec<_> = crate::render::active_placements_at(layer, frame)
+                        .into_iter()
+                        .map(|(index, _)| index)
+                        .collect();
+                    let mut order = slots.clone();
+                    if one_step {
+                        if to_front {
+                            for index in (0..order.len().saturating_sub(1)).rev() {
+                                if selected.contains(&order[index])
+                                    && !selected.contains(&order[index + 1])
+                                {
+                                    order.swap(index, index + 1);
+                                }
+                            }
+                        } else {
+                            for index in 1..order.len() {
+                                if selected.contains(&order[index])
+                                    && !selected.contains(&order[index - 1])
+                                {
+                                    order.swap(index, index - 1);
+                                }
+                            }
+                        }
+                    } else {
+                        order.sort_by_key(|index| selected.contains(index) == to_front);
+                    }
+                    if order != slots {
+                        orders.push((q0rg.q0rg_id, layer.layer_id, slots, order));
+                    }
+                }
+            }
+            orders
+        };
+        if make_orders(&self.state.project, &refs).is_empty() {
+            self.session.status =
+                "objects are already at the edge of the drawing order".to_string();
+            return;
+        }
+        self.history.snapshot(&self.state.project);
+        let Some(mut refs) = crate::tools::materialize_placement_refs_for_edit(
+            &mut self.state.project,
+            &refs,
+            frame,
+        ) else {
+            self.session.status = "could not change drawing order".to_string();
+            return;
+        };
+        let orders = make_orders(&self.state.project, &refs);
+        for (q0rg_id, layer_id, slots, order) in orders {
+            let layer = self
                 .state
                 .project
                 .q0rgs
                 .iter_mut()
                 .find(|q| q.q0rg_id == q0rg_id)
+                .unwrap()
+                .layers
+                .iter_mut()
+                .find(|l| l.layer_id == layer_id)
+                .unwrap();
+            let placements: Vec<_> = order
+                .iter()
+                .map(|index| layer.placements[*index].clone())
+                .collect();
+            for reference in refs
+                .iter_mut()
+                .filter(|r| r.q0rg_id == q0rg_id && r.layer_id == layer_id)
             {
-                if let Some(layer) = q.layers.iter_mut().find(|l| l.layer_id == layer_id) {
-                    if placement_idx < layer.placements.len() {
-                        let item = layer.placements.remove(placement_idx);
-                        let new_idx = if to_front { layer.placements.len() } else { 0 };
-                        layer.placements.insert(new_idx, item);
-                        self.session.selection = Selection::Placement {
-                            q0rg_id,
-                            layer_id,
-                            placement_idx: new_idx,
-                        };
-                        self.state.mark_dirty();
-                        self.session.status = if to_front {
-                            "brought to front"
-                        } else {
-                            "sent to back"
-                        }
-                        .to_string();
-                    }
+                if let Some(position) = order
+                    .iter()
+                    .position(|index| *index == reference.placement_idx)
+                {
+                    reference.placement_idx = slots[position];
                 }
             }
+            for (slot, placement) in slots.into_iter().zip(placements) {
+                layer.placements[slot] = placement;
+            }
         }
+        let refs = crate::selection_edit::selected_object_refs(
+            &self.state.project,
+            &Selection::Multi(refs),
+        );
+        self.session.selection = if refs.len() == 1 {
+            Selection::Placement {
+                q0rg_id: refs[0].q0rg_id,
+                layer_id: refs[0].layer_id,
+                placement_idx: refs[0].placement_idx,
+            }
+        } else {
+            Selection::Multi(refs)
+        };
+        rebind_transform_pivot(
+            &mut self.session.transform_pivot,
+            &selection_before,
+            &self.session.selection,
+        );
+        self.state.mark_dirty();
+        self.textures.invalidate();
+        self.session.status = match (to_front, one_step) {
+            (true, true) => "brought forward one step",
+            (false, true) => "sent backward one step",
+            (true, false) => "brought to front",
+            (false, false) => "sent to back",
+        }
+        .to_string();
     }
 
     fn current_layer_is_folder(&self) -> bool {
@@ -5159,7 +5545,7 @@ impl EditorApp {
         })
     }
 
-    fn selection_touches_locked_layer(&self) -> bool {
+    pub(crate) fn selection_touches_locked_layer(&self) -> bool {
         let locked =
             |q0rg_id: u16, layer_id: u16| self.state.project.layer_is_locked(q0rg_id, layer_id);
         match &self.session.selection {
@@ -5459,13 +5845,14 @@ impl EditorApp {
                 .max(1);
             self.state.project.q0rgs[q0rg_index].layers.push(Layer {
                 layer_id: next_id,
-                timeline_frame_count: None,
+                timeline_frame_count: Some(1),
                 name: format!("Layer {next_id}"),
                 explicit_keyframes: vec![0],
                 placements: Vec::new(),
             });
         }
         self.session.layer_rename = None;
+        crate::timeline_edit::sync_folder_timelines(&mut self.state.project, q0rg_id);
         self.session.reconcile_with(&self.state.project);
         self.state.mark_dirty();
         self.textures.invalidate();
@@ -6181,272 +6568,200 @@ impl EditorApp {
     /// before; the new outer placement uses IDENTITY transform and points
     /// at the new q0rg, so dragging it moves the whole group as one unit.
     fn convert_selection_to_q0rg(&mut self) {
+        let selection_before = self.session.selection.clone();
+        if !matches!(
+            selection_before,
+            Selection::Placement { .. }
+                | Selection::Multi(_)
+                | Selection::Path { .. }
+                | Selection::Paths(_)
+                | Selection::RawArea { .. }
+        ) {
+            self.session.status = "Convert to Symbol: select graphics or objects first".to_string();
+            return;
+        }
         if self.selection_touches_locked_layer() {
             self.session.status = "locked artwork cannot be converted".to_string();
             return;
         }
-        if let Selection::RawArea {
-            placements,
-            objects,
-            bounds_min,
-            bounds_max,
-            clip_polygon,
-        } = self.session.selection.clone()
-        {
-            let payload = crate::selection_edit::capture_clipboard(
-                &self.state.project,
-                &self.session.selection,
-            );
-            if payload.is_empty() {
-                self.session.status = "Convert to Symbol: selection is empty".to_string();
-                return;
-            }
-            self.history.snapshot(&self.state.project);
-            let _ = crate::selection_edit::remove_raw_area_and_objects(
-                &mut self.state.project,
-                &placements,
-                &objects,
-                bounds_min,
-                bounds_max,
-                clip_polygon.as_deref(),
-                self.session.current_frame,
-            );
-
-            let new_q0rg_id = self
-                .state
-                .project
-                .q0rgs
-                .iter()
-                .map(|q0rg| q0rg.q0rg_id)
-                .max()
-                .unwrap_or(0)
-                .saturating_add(1)
-                .max(1);
-            let symbol_name =
-                unique_symbol_name(&self.state.project, &format!("Symbol {new_q0rg_id}"), None);
-            self.state.project.q0rgs.push(Q0rg {
-                q0rg_id: new_q0rg_id,
-                name: symbol_name,
-                frame_count: 1,
-                script: String::new(),
-                layers: vec![Layer {
-                    layer_id: 1,
-                    timeline_frame_count: None,
-                    name: "Layer 1".to_string(),
-                    explicit_keyframes: Vec::new(),
-                    placements: Vec::new(),
-                }],
-            });
-            crate::selection_edit::paste_payload(
-                &mut self.state.project,
-                new_q0rg_id,
-                1,
-                0,
-                &payload,
-                q0s_format::v2::Vec2::new(0.0, 0.0),
-            );
-
-            let parent_q0rg_id = self.session.current_q0rg_id;
-            let layer_id = self.session.current_layer_id;
-            let frame = self.session.current_frame;
-            let mut outer_idx = None;
-            if let Some(layer) = self
-                .state
-                .project
-                .q0rgs
-                .iter_mut()
-                .find(|q0rg| q0rg.q0rg_id == parent_q0rg_id)
-                .and_then(|q0rg| {
-                    q0rg.layers
-                        .iter_mut()
-                        .find(|layer| layer.layer_id == layer_id)
-                })
-            {
-                outer_idx = Some(layer.placements.len());
-                layer.push_placement(Placement {
-                    instance_id: 0,
-                    frame,
-                    target: Target::Q0rg(new_q0rg_id),
-                    transform: Transform2D::IDENTITY,
-                    tween: Tween::None,
-                    fx: Default::default(),
-                });
-            }
-            if let Some(placement_idx) = outer_idx {
-                self.session.selection = Selection::Placement {
-                    q0rg_id: parent_q0rg_id,
-                    layer_id,
-                    placement_idx,
-                };
-            } else {
-                self.session.selection = Selection::None;
-            }
-            self.state.mark_dirty();
-            self.textures.invalidate();
-            self.session.status = format!("Symbol {new_q0rg_id} created from mixed selection");
+        let Some(new_q0rg_id) = self
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .map(|q0rg| q0rg.q0rg_id)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+        else {
+            self.session.status = "no free symbol ids".to_string();
             return;
-        }
-        // A connected raw fill/path is not a display-object placement, but it
-        // is still valid artwork for Convert to Symbol. Materialise only the
-        // selected contours into temporary standalone placements; neighbouring
-        // raw graphics remain in their original drawing surface.
-        let raw_refs = match self.session.selection.clone() {
+        };
+        let frame = self.session.current_frame;
+        let raw_refs = match &self.session.selection {
             Selection::Path {
                 q0rg_id,
                 layer_id,
                 placement_idx,
                 path_idx,
             } => Some(vec![crate::state::PathRef {
-                q0rg_id,
-                layer_id,
-                placement_idx,
-                path_idx,
+                q0rg_id: *q0rg_id,
+                layer_id: *layer_id,
+                placement_idx: *placement_idx,
+                path_idx: *path_idx,
             }]),
-            Selection::Paths(refs) if !refs.is_empty() => Some(refs),
+            Selection::Paths(refs) if !refs.is_empty() => Some(refs.clone()),
             _ => None,
         };
-        let mut raw_materialized = false;
+        let area = match &self.session.selection {
+            Selection::RawArea {
+                placements,
+                objects,
+                bounds_min,
+                bounds_max,
+                clip_polygon,
+            } => Some((
+                placements.clone(),
+                objects.clone(),
+                *bounds_min,
+                *bounds_max,
+                clip_polygon.clone(),
+            )),
+            _ => None,
+        };
+        let mut refs = if let Some((raw, objects, ..)) = &area {
+            raw.iter().chain(objects).copied().collect()
+        } else {
+            crate::selection_edit::selected_object_refs(
+                &self.state.project,
+                &self.session.selection,
+            )
+        };
+        if refs.is_empty() && raw_refs.is_none() {
+            self.session.status = "Convert to Symbol: select graphics or objects first".to_string();
+            return;
+        }
+        self.history.snapshot(&self.state.project);
         if let Some(raw_refs) = raw_refs {
-            self.history.snapshot(&self.state.project);
-            let Some(placements) =
+            let Some(materialized) =
                 crate::tools::materialize_raw_paths_as_placements(self, &raw_refs)
             else {
                 self.session.status =
                     "Convert to Symbol: raw selection is no longer available".to_string();
                 return;
             };
-            self.session.selection = match placements.len() {
-                0 => Selection::None,
-                1 => Selection::Placement {
-                    q0rg_id: placements[0].q0rg_id,
-                    layer_id: placements[0].layer_id,
-                    placement_idx: placements[0].placement_idx,
-                },
-                _ => Selection::Multi(placements),
-            };
-            raw_materialized = true;
+            refs = materialized;
         }
-
-        // Normalise selection Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†РІР‚С›РЎС›Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р Р†РІР‚С›РЎС›Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†РІР‚С›РЎС›Р В Р’В Р вЂ™Р’В Р В Р’В Р Р†Р вЂљР’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†Р вЂљРЎвЂќР В Р’В Р В Р вЂ№Р В Р Р‹Р Р†Р вЂљРЎвЂќ list of refs. Bail early on irrelevant
-        // selection states with a clear status message instead of silently
-        // doing nothing.
-        let refs: Vec<crate::state::PlacementRef> = match &self.session.selection {
-            Selection::Placement {
-                q0rg_id,
-                layer_id,
-                placement_idx,
-            } => vec![crate::state::PlacementRef {
-                q0rg_id: *q0rg_id,
-                layer_id: *layer_id,
-                placement_idx: *placement_idx,
-            }],
-            Selection::Multi(items) if !items.is_empty() => items.clone(),
-            _ => {
-                self.session.status =
-                    "Convert to Symbol: select graphics or one or more objects first".to_string();
-                return;
-            }
+        // Bake the entire affected layer key on a hold before moving anything.
+        // The old key and the unselected siblings keep their contents and depth.
+        let Some(materialized) = crate::tools::materialize_placement_refs_for_edit(
+            &mut self.state.project,
+            &refs,
+            frame,
+        ) else {
+            self.session.status = "Convert to Symbol: selection is no longer available".to_string();
+            return;
         };
-
-        // All refs must live in the same q0rg (we only ever populate a
-        // marquee on `current_q0rg_id`, so this is just defensive).
-        let parent_q0rg_id = refs[0].q0rg_id;
-        if !refs.iter().all(|r| r.q0rg_id == parent_q0rg_id) {
+        let area = area.map(|(raw, objects, min, max, clip)| {
+            let raw_count = raw.len();
+            debug_assert_eq!(materialized.len(), raw_count + objects.len());
+            (
+                materialized[..raw_count].to_vec(),
+                materialized[raw_count..].to_vec(),
+                min,
+                max,
+                clip,
+            )
+        });
+        // Selection order and numeric layer ids are not drawing order.
+        let refs = crate::selection_edit::selected_object_refs(
+            &self.state.project,
+            &Selection::Multi(materialized),
+        );
+        let Some(anchor) = refs.last().copied() else {
+            self.session.status = "Convert to Symbol: selection is empty".to_string();
+            return;
+        };
+        let parent_q0rg_id = anchor.q0rg_id;
+        if refs
+            .iter()
+            .any(|reference| reference.q0rg_id != parent_q0rg_id)
+        {
             self.session.status = "Select objects from one symbol before converting".to_string();
             return;
         }
-
-        // Resolve every ref to a (layer_id, original_placement) pair.
-        // Drop dangling refs silently Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р’В Р Р†Р вЂљР’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р РЋРІвЂћСћР В Р’В Р В Р вЂ№Р В Р вЂ Р Р†Р вЂљРЎвЂєР РЋРЎвЂєР В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†РІР‚С›РЎС›Р В Р’В Р вЂ™Р’В Р В Р’В Р В РІР‚в„–Р В Р’В Р В Р вЂ№Р В Р Р‹Р Р†РІР‚С›РЎС› happens if the project mutated
-        // since marquee finalised but before convert ran.
-        let mut resolved: Vec<(u16, Placement)> = Vec::new();
-        if let Some(q) = self
+        let parent = self
             .state
             .project
             .q0rgs
             .iter()
-            .find(|q| q.q0rg_id == parent_q0rg_id)
-        {
-            for r in &refs {
-                if let Some(layer) = q.layers.iter().find(|l| l.layer_id == r.layer_id) {
-                    if let Some(p) = layer.placements.get(r.placement_idx) {
-                        resolved.push((r.layer_id, p.clone()));
+            .find(|q0rg| q0rg.q0rg_id == parent_q0rg_id)
+            .unwrap();
+        let anchor_layer = parent
+            .layers
+            .iter()
+            .find(|layer| layer.layer_id == anchor.layer_id)
+            .unwrap();
+        // Everything after the highest selected placement remains untouched.
+        // Counting that tail also handles partially retained raw placements.
+        let trailing_placements = anchor_layer.placements.len() - anchor.placement_idx - 1;
+        let mut new_layers = Vec::new();
+        let mut area_payloads = Vec::new();
+        for layer in &parent.layers {
+            let mine: Vec<_> = refs
+                .iter()
+                .filter(|reference| reference.layer_id == layer.layer_id)
+                .collect();
+            if mine.is_empty() {
+                continue;
+            }
+            let layer_id = new_layers.len() as u16 + 1;
+            let mut placements = Vec::new();
+            for reference in mine {
+                if let Some((raw, objects, min, max, clip)) = &area {
+                    // Capture each depth separately; one combined clipboard puts
+                    // all raw graphics below all symbols and loses interleaving.
+                    let whole_object = objects.contains(reference);
+                    let selection = Selection::RawArea {
+                        placements: if !whole_object && raw.contains(reference) {
+                            vec![*reference]
+                        } else {
+                            Vec::new()
+                        },
+                        objects: if whole_object {
+                            vec![*reference]
+                        } else {
+                            Vec::new()
+                        },
+                        bounds_min: *min,
+                        bounds_max: *max,
+                        clip_polygon: clip.clone(),
+                    };
+                    let payload =
+                        crate::selection_edit::capture_clipboard(&self.state.project, &selection);
+                    if !payload.is_empty() {
+                        area_payloads.push((layer_id, payload));
                     }
+                } else {
+                    let mut placement = layer.placements[reference.placement_idx].clone();
+                    placement.instance_id = 0;
+                    placement.frame = 0;
+                    placement.tween = Tween::None;
+                    placements.push(placement);
                 }
             }
-        }
-        if resolved.is_empty() {
-            self.session.status = "Convert: nothing to convert".to_string();
-            return;
-        }
-
-        if !raw_materialized {
-            self.history.snapshot(&self.state.project);
-        }
-
-        // Group resolved placements by their original layer so we can
-        // recreate the same layer stack inside the new q0rg, preserving
-        // z-order. Capture layer names from the original q0rg too.
-        let mut groups: std::collections::BTreeMap<u16, (String, Vec<Placement>)> =
-            std::collections::BTreeMap::new();
-        if let Some(q) = self
-            .state
-            .project
-            .q0rgs
-            .iter()
-            .find(|q| q.q0rg_id == parent_q0rg_id)
-        {
-            // Walk q.layers in their actual order and only collect ones
-            // that have at least one selected placement Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р’В Р Р†Р вЂљР’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р РЋРІвЂћСћР В Р’В Р В Р вЂ№Р В Р вЂ Р Р†Р вЂљРЎвЂєР РЋРЎвЂєР В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†РІР‚С›РЎС›Р В Р’В Р вЂ™Р’В Р В Р’В Р В РІР‚в„–Р В Р’В Р В Р вЂ№Р В Р Р‹Р Р†РІР‚С›РЎС› keeps stable
-            // ordering whether selection came from marquee (which iterates
-            // top-down) or single-click.
-            for layer in &q.layers {
-                let mine: Vec<Placement> = resolved
-                    .iter()
-                    .filter(|(lid, _)| *lid == layer.layer_id)
-                    .map(|(_, p)| Placement {
-                        // Pinned to frame 0 inside the new q0rg Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р’В Р Р†Р вЂљР’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р РЋРІвЂћСћР В Р’В Р В Р вЂ№Р В Р вЂ Р Р†Р вЂљРЎвЂєР РЋРЎвЂєР В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†РІР‚С›РЎС›Р В Р’В Р вЂ™Р’В Р В Р’В Р В РІР‚в„–Р В Р’В Р В Р вЂ№Р В Р Р‹Р Р†РІР‚С›РЎС› single
-                        // keyframe, no implicit time-shift. Rotation/scale/
-                        // skew stay so the rendering is unchanged.
-                        instance_id: 0,
-                        frame: 0,
-                        target: p.target,
-                        transform: p.transform,
-                        tween: Tween::None,
-                        fx: Default::default(),
-                    })
-                    .collect();
-                if !mine.is_empty() {
-                    groups.insert(layer.layer_id, (layer.name.clone(), mine));
-                }
-            }
-        }
-
-        let new_q0rg_id = self
-            .state
-            .project
-            .q0rgs
-            .iter()
-            .map(|q| q.q0rg_id)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1)
-            .max(1);
-
-        // New q0rg: same layer count + names as the affected source layers,
-        // re-numbered to dense 1..=N so the inner ids don't collide with
-        // anything else.
-        let new_layers: Vec<Layer> = groups
-            .into_values()
-            .enumerate()
-            .map(|(i, (name, placements))| Layer {
-                layer_id: (i as u16).saturating_add(1).max(1),
+            new_layers.push(Layer {
+                layer_id,
                 timeline_frame_count: None,
-                name,
+                name: layer.name.clone(),
                 explicit_keyframes: Vec::new(),
                 placements,
-            })
-            .collect();
+            });
+        }
+        if area.is_some() && area_payloads.is_empty() {
+            self.session.status = "Convert to Symbol: selection is empty".to_string();
+            return;
+        }
         let symbol_name =
             unique_symbol_name(&self.state.project, &format!("Symbol {new_q0rg_id}"), None);
         self.state.project.q0rgs.push(Q0rg {
@@ -6456,78 +6771,88 @@ impl EditorApp {
             script: String::new(),
             layers: new_layers,
         });
-
-        // Now delete the original placements from their source layers.
-        // Sort by index *desc* so removals don't shift earlier indices.
-        let mut sorted = refs.clone();
-        sorted.sort_by(|a, b| {
-            a.layer_id
-                .cmp(&b.layer_id)
-                .then(b.placement_idx.cmp(&a.placement_idx))
-        });
-        if let Some(q) = self
-            .state
-            .project
-            .q0rgs
-            .iter_mut()
-            .find(|q| q.q0rg_id == parent_q0rg_id)
-        {
-            for r in sorted {
-                if let Some(layer) = q.layers.iter_mut().find(|l| l.layer_id == r.layer_id) {
-                    if r.placement_idx < layer.placements.len() {
-                        layer.placements.remove(r.placement_idx);
-                    }
+        for (layer_id, payload) in area_payloads {
+            crate::selection_edit::paste_payload(
+                &mut self.state.project,
+                new_q0rg_id,
+                layer_id,
+                0,
+                &payload,
+                q0s_format::v2::Vec2::new(0.0, 0.0),
+            );
+        }
+        if let Some((raw, objects, min, max, clip)) = &area {
+            crate::selection_edit::remove_raw_area_and_objects(
+                &mut self.state.project,
+                raw,
+                objects,
+                *min,
+                *max,
+                clip.as_deref(),
+                frame,
+            );
+        } else {
+            let parent = self
+                .state
+                .project
+                .q0rgs
+                .iter_mut()
+                .find(|q0rg| q0rg.q0rg_id == parent_q0rg_id)
+                .unwrap();
+            for layer in &mut parent.layers {
+                for reference in refs
+                    .iter()
+                    .rev()
+                    .filter(|reference| reference.layer_id == layer.layer_id)
+                {
+                    layer.placements.remove(reference.placement_idx);
+                }
+                if refs
+                    .iter()
+                    .any(|reference| reference.layer_id == layer.layer_id)
+                {
+                    layer.ensure_explicit_keyframe(frame);
                 }
             }
         }
-
-        // Insert one outer placement in the user's *current* layer pointing
-        // at the new q0rg Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р’В Р Р†Р вЂљР’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р РЋРІвЂћСћР В Р’В Р В Р вЂ№Р В Р вЂ Р Р†Р вЂљРЎвЂєР РЋРЎвЂєР В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†РІР‚С›РЎС›Р В Р’В Р вЂ™Р’В Р В Р’В Р В РІР‚в„–Р В Р’В Р В Р вЂ№Р В Р Р‹Р Р†РІР‚С›РЎС› IDENTITY transform because each inner placement
-        // already carries its full stage-space transform.
-        let target_layer_id = self.session.current_layer_id;
-        let frame = self.session.current_frame;
-        let mut new_outer_idx: Option<usize> = None;
-        if let Some(q) = self
+        let layer = self
             .state
             .project
             .q0rgs
             .iter_mut()
-            .find(|q| q.q0rg_id == parent_q0rg_id)
-        {
-            // Fall back to the first layer if `current_layer_id` is gone.
-            let resolved_layer_id = q
-                .layers
-                .iter()
-                .find(|l| l.layer_id == target_layer_id)
-                .or_else(|| q.layers.first())
-                .map(|l| l.layer_id);
-            let layer =
-                resolved_layer_id.and_then(|id| q.layers.iter_mut().find(|l| l.layer_id == id));
-            if let Some(layer) = layer {
-                let idx = layer.placements.len();
-                layer.push_placement(Placement {
-                    instance_id: 0,
-                    frame,
-                    target: Target::Q0rg(new_q0rg_id),
-                    transform: Transform2D::IDENTITY,
-                    tween: Tween::None,
-                    fx: Default::default(),
-                });
-                new_outer_idx = Some(idx);
-                self.session.current_layer_id = layer.layer_id;
-            }
-        }
-
-        if let Some(idx) = new_outer_idx {
-            self.session.selection = Selection::Placement {
-                q0rg_id: parent_q0rg_id,
-                layer_id: self.session.current_layer_id,
-                placement_idx: idx,
-            };
-        } else {
-            self.session.selection = Selection::None;
-        }
+            .find(|q0rg| q0rg.q0rg_id == parent_q0rg_id)
+            .unwrap()
+            .layers
+            .iter_mut()
+            .find(|layer| layer.layer_id == anchor.layer_id)
+            .unwrap();
+        let placement_idx = layer.placements.len().saturating_sub(trailing_placements);
+        layer.extend_timeline_through(frame);
+        layer.placements.insert(
+            placement_idx,
+            Placement {
+                instance_id: 0,
+                frame,
+                target: Target::Q0rg(new_q0rg_id),
+                transform: Transform2D::IDENTITY,
+                tween: Tween::None,
+                fx: Default::default(),
+            },
+        );
+        self.session.current_layer_id = anchor.layer_id;
+        self.session.timeline_scroll_to_layer = Some((parent_q0rg_id, anchor.layer_id));
+        self.session.selection = Selection::Placement {
+            q0rg_id: parent_q0rg_id,
+            layer_id: anchor.layer_id,
+            placement_idx,
+        };
+        rebind_transform_pivot(
+            &mut self.session.transform_pivot,
+            &selection_before,
+            &self.session.selection,
+        );
         self.state.mark_dirty();
+        self.textures.invalidate();
         self.session.status = format!(
             "Symbol {new_q0rg_id} created from {} object{}",
             refs.len(),
@@ -6833,7 +7158,11 @@ impl EditorApp {
                 .name("q0editor-q0v-import".to_string())
                 .spawn(move || {
                     let result = std::fs::read(&worker_path)
-                        .map_err(|error| format!("q0v import failed: {error}"));
+                        .map_err(|error| format!("q0v import failed: {error}"))
+                        .and_then(|bytes| {
+                            q0video::q0v::validate_bytes(&bytes)?;
+                            Ok(bytes)
+                        });
                     let _ = sender.send(result);
                 })
             {
@@ -6937,7 +7266,7 @@ impl EditorApp {
             );
             return;
         }
-        let media = match q0video::q0v::Q0vFile::parse(bytes.clone()) {
+        let media = match q0video::q0v::probe_header(&bytes) {
             Ok(media) => media,
             Err(error) => {
                 self.session.status = format!("q0v import failed: {error}");
@@ -6970,17 +7299,17 @@ impl EditorApp {
             .to_string();
 
         self.history.snapshot(&self.state.project);
-        self.state
-            .project
-            .assets
-            .push(Asset::Q0v(Q0vAsset { asset_id, bytes }));
+        self.state.project.assets.push(Asset::Q0v(Q0vAsset {
+            asset_id,
+            bytes: bytes.into(),
+        }));
         self.state
             .project
             .asset_names
             .insert(asset_id, name.clone());
         self.state.mark_dirty();
         self.session.selection = Selection::Asset(asset_id);
-        self.textures.invalidate();
+        self.textures.invalidate_asset(asset_id);
         self.session.status = if media.spec.audio && !media.spec.video {
             let seconds = media.audio_samples_per_channel as f64
                 / f64::from(media.spec.audio_sample_rate.max(1));
@@ -7546,7 +7875,37 @@ impl EditorApp {
             };
             return;
         }
-        let end_exclusive = end_exclusive as u16;
+        let mut end_exclusive = end_exclusive as u16;
+        if audio_only {
+            let Some(layer) = self.state.project.q0rgs[q0rg_index]
+                .layers
+                .iter()
+                .find(|layer| layer.layer_id == target_layer_id)
+            else {
+                self.session.status = "target audio layer is no longer available".to_string();
+                return;
+            };
+            if let Some(next) = layer
+                .keyframe_frames()
+                .into_iter()
+                .filter(|key| *key > frame)
+                .chain(
+                    self.state
+                        .project
+                        .audio_clips
+                        .iter()
+                        .filter(|clip| {
+                            clip.q0rg_id == q0rg_id
+                                && clip.layer_id == target_layer_id
+                                && clip.start_frame > frame
+                        })
+                        .map(|clip| clip.start_frame),
+                )
+                .min()
+            {
+                end_exclusive = end_exclusive.min(next);
+            }
+        }
         let old_frame_count = self.state.project.q0rgs[q0rg_index].frame_count;
         let new_frame_count = old_frame_count.max(end_exclusive);
         if audio_only {
@@ -7581,9 +7940,8 @@ impl EditorApp {
             else {
                 return;
             };
-            layer
-                .explicit_keyframes
-                .retain(|key| !(frame..end_exclusive).contains(key));
+            layer.ensure_explicit_keyframe(frame);
+            layer.extend_timeline_through(end_exclusive.saturating_sub(1));
             self.state.project.audio_clips.push(AudioClip {
                 q0rg_id,
                 layer_id: target_layer_id,
@@ -7591,6 +7949,7 @@ impl EditorApp {
                 asset_id,
                 gain: 1.0,
                 muted: false,
+                ..Default::default()
             });
             self.session.current_layer_id = target_layer_id;
             self.session.current_frame = frame;
@@ -7604,7 +7963,7 @@ impl EditorApp {
                 "placed audio on layer {} at frame {} ({} project frames)",
                 target_layer_id,
                 frame + 1,
-                duration_frames
+                end_exclusive - frame
             );
             return;
         }
@@ -8346,6 +8705,14 @@ impl EditorApp {
         }
 
         self.session.current_layer_id = active_layer_id;
+        let frame_count = self
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q| q.q0rg_id == q0rg_id)
+            .map_or(1, |q| q.frame_count);
+        let first_frame = first_frame.min(frame_count.saturating_sub(1));
         self.session.set_timeline_frame(first_frame, frame_count);
         self.session.pending_timeline_frame = None;
         self.session.timeline_selection =
@@ -8835,10 +9202,6 @@ impl EditorApp {
             self.session.status = "locked timeline frames cannot be changed".to_string();
             return;
         }
-        if self.timeline_selection_touches_audio(selection) {
-            self.session.status = "audio frames cannot contain visual keyframes".to_string();
-            return;
-        }
         let before = self.state.project.clone();
         match crate::timeline_edit::materialize_selected_keyframes(
             &mut self.state.project,
@@ -8862,13 +9225,57 @@ impl EditorApp {
     }
 
     fn blank_timeline_selection(&mut self) {
-        if self
-            .session
-            .timeline_selection
-            .is_some_and(|selection| self.timeline_selection_touches_audio(selection))
-        {
-            self.session.status = "audio frames cannot contain blank keyframes".to_string();
-            return;
+        if let Some(selection) = self.session.timeline_selection {
+            if self.timeline_selection_touches_audio(selection) {
+                if self.timeline_selection_touches_locked_layer(selection) {
+                    self.session.status = "unlock selected layers before cutting audio".into();
+                    return;
+                }
+                let cells = crate::timeline_edit::selected_frame_cells_including_virtual(
+                    &self.state.project,
+                    self.session.current_q0rg_id,
+                    selection,
+                )
+                .unwrap_or_default();
+                self.history.snapshot(&self.state.project);
+                let mut changed = false;
+                for (layer_id, frame) in cells {
+                    changed |= crate::audio::keyframe_audio(
+                        &mut self.state.project,
+                        self.session.current_q0rg_id,
+                        layer_id,
+                        frame,
+                        false,
+                    );
+                    if let Some(layer) = self
+                        .state
+                        .project
+                        .q0rgs
+                        .iter_mut()
+                        .find(|q| q.q0rg_id == self.session.current_q0rg_id)
+                        .and_then(|q| q.layers.iter_mut().find(|l| l.layer_id == layer_id))
+                    {
+                        let before = layer.placements.len();
+                        layer
+                            .placements
+                            .retain(|placement| placement.frame != frame);
+                        changed |= layer.placements.len() != before;
+                        if !layer.has_keyframe(frame) {
+                            layer.ensure_explicit_keyframe(frame);
+                            changed = true;
+                        }
+                    }
+                }
+                if changed {
+                    self.state.mark_dirty();
+                }
+                self.session.selection = Selection::None;
+                if self.session.playing {
+                    let _ = self.refresh_audio_playback();
+                }
+                self.session.status = "audio cut at selected blank keys".into();
+                return;
+            }
         }
         match self.delete_timeline_selection() {
             Some((cell_count, _, false)) => {
@@ -9428,6 +9835,68 @@ impl EditorApp {
             }
         }
     }
+    pub(crate) fn audio_keyframe_at(
+        &mut self,
+        q0rg_id: u16,
+        layer_id: u16,
+        frame: u16,
+        continue_audio: bool,
+    ) -> bool {
+        if self.state.project.layer_is_locked(q0rg_id, layer_id) {
+            return false;
+        }
+        self.history.snapshot(&self.state.project);
+        let changed = crate::audio::keyframe_audio(
+            &mut self.state.project,
+            q0rg_id,
+            layer_id,
+            frame,
+            continue_audio,
+        );
+        if changed {
+            self.state.mark_dirty();
+            self.session.selection = Selection::None;
+            self.session.status = if continue_audio {
+                "audio split; source continues in the new clip"
+            } else {
+                "audio stops at the blank key"
+            }
+            .into();
+            if self.session.playing {
+                let _ = self.refresh_audio_playback();
+            }
+        }
+        changed
+    }
+
+    pub(crate) fn scrub_audio_at(&mut self, frame: u16) {
+        if self.session.playing
+            || !self.session.audio_scrubbing
+            || !crate::audio::has_audible_timeline_audio(
+                &self.state.project,
+                self.session.current_q0rg_id,
+            )
+        {
+            return;
+        }
+        if self.audio_playback.is_none() {
+            match crate::audio::EditorAudioPlayback::new() {
+                Ok(audio) => self.audio_playback = Some(audio),
+                Err(error) => {
+                    self.session.status = error;
+                    return;
+                }
+            }
+        }
+        if let Some(audio) = self.audio_playback.as_mut() {
+            if let Err(error) =
+                audio.scrub(&self.state.project, self.session.current_q0rg_id, frame)
+            {
+                self.session.status = error;
+            }
+        }
+    }
+
     pub(crate) fn refresh_audio_playback(&mut self) -> Result<(), String> {
         let has_audio = crate::audio::has_audible_timeline_audio(
             &self.state.project,
@@ -9460,6 +9929,7 @@ impl EditorApp {
     }
 
     fn go_to_frame(&mut self, requested: u16) {
+        let previous_frame = self.session.current_frame;
         self.session.pending_timeline_frame = None;
         let last_frame = self
             .state
@@ -9471,6 +9941,9 @@ impl EditorApp {
             .unwrap_or(0);
         self.session.current_frame = requested.min(last_frame);
         self.session.status = format!("frame {}", self.session.current_frame + 1);
+        if self.session.current_frame != previous_frame {
+            self.scrub_audio_at(self.session.current_frame);
+        }
     }
 
     /// F6 / Insert Keyframe with Flash-like playhead semantics.
@@ -9518,13 +9991,6 @@ impl EditorApp {
             {
                 self.session.status =
                     "unlock selected layers before inserting keyframes".to_string();
-                return;
-            }
-            if cells.iter().any(|(layer_id, frame)| {
-                crate::audio::audio_clip_at_frame(&self.state.project, q0rg_id, *layer_id, *frame)
-                    .is_some()
-            }) {
-                self.session.status = "audio frames cannot contain visual keyframes".to_string();
                 return;
             }
 
@@ -9577,6 +10043,7 @@ impl EditorApp {
                         &before,
                         &self.state.project,
                         &mut self.session.selection,
+                        &mut self.session.transform_pivot,
                         q0rg_id,
                         &selection_frames,
                     );
@@ -9708,8 +10175,7 @@ impl EditorApp {
         if crate::audio::audio_clip_at_frame(&self.state.project, q0rg_id, layer_id, frame)
             .is_some()
         {
-            self.session.status = "audio frames cannot contain blank keyframes".to_string();
-            return false;
+            return self.audio_keyframe_at(q0rg_id, layer_id, frame, false);
         }
         let has_keyframe = self
             .state
@@ -9776,8 +10242,7 @@ impl EditorApp {
         if crate::audio::audio_clip_at_frame(&self.state.project, q0rg_id, layer_id, frame)
             .is_some()
         {
-            self.session.status = "audio frames cannot contain visual keyframes".to_string();
-            return 0;
+            return usize::from(self.audio_keyframe_at(q0rg_id, layer_id, frame, true));
         }
         let active = match self
             .state
@@ -9787,7 +10252,7 @@ impl EditorApp {
             .find(|q| q.q0rg_id == q0rg_id)
             .and_then(|q| q.layers.iter().find(|l| l.layer_id == layer_id))
         {
-            Some(layer) => q0s_format::raster::active_placement_states_at(layer, frame),
+            Some(layer) => crate::timeline_edit::keyframe_source_states_at(layer, frame),
             None => Vec::new(),
         };
         if active.is_empty() {
@@ -9875,6 +10340,7 @@ impl EditorApp {
             &before,
             &self.state.project,
             &mut self.session.selection,
+            &mut self.session.transform_pivot,
             q0rg_id,
             &std::collections::BTreeMap::from([(layer_id, frame)]),
         );
@@ -10440,6 +10906,11 @@ impl EditorApp {
         if !open || close_requested {
             self.session.show_settings = false;
         }
+        crate::ui::hidden_palette_note(
+            ctx,
+            self.session.show_settings,
+            self.settings.theme.accent.to_color32(),
+        );
     }
 
     fn render_shortcuts_dialog(&mut self, ctx: &Context) {
@@ -11098,6 +11569,98 @@ impl EditorApp {
         } else if cancel {
             self.unsaved_action = None;
         }
+    }
+
+    fn duplicate_symbol_instance(&mut self, q0rg_id: u16, layer_id: u16, placement_idx: usize) {
+        if !self.project_active || self.show_home || self.active_document_is_q0lang() {
+            return;
+        }
+        if self.state.project.layer_is_locked(q0rg_id, layer_id) {
+            self.session.status = "layer is locked".to_string();
+            return;
+        }
+        let frame = self.session.current_frame;
+        let source_id = self
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q| q.q0rg_id == q0rg_id)
+            .and_then(|q| q.layers.iter().find(|layer| layer.layer_id == layer_id))
+            .and_then(|layer| {
+                if !q0s_format::raster::active_placement_states_at(layer, frame)
+                    .iter()
+                    .any(|state| state.index == placement_idx)
+                {
+                    return None;
+                }
+                match layer.placements.get(placement_idx)?.target {
+                    Target::Q0rg(id) => Some(id),
+                    Target::Asset(_) => None,
+                }
+            });
+        let Some(source_id) = source_id else {
+            self.session.status = "select a symbol on this frame first".to_string();
+            return;
+        };
+        let (mut candidate, copied_id) =
+            match crate::library_transfer::duplicate_symbol(&self.state.project, source_id) {
+                Ok(result) => result,
+                Err(error) => {
+                    self.session.status = error;
+                    return;
+                }
+            };
+        let Some(new_idx) = crate::tools::materialize_placement_keyframe_for_edit(
+            &mut candidate,
+            q0rg_id,
+            layer_id,
+            placement_idx,
+            frame,
+        ) else {
+            self.session.status =
+                "could not create a keyframe for the independent symbol".to_string();
+            return;
+        };
+        let Some(placement) = candidate
+            .q0rgs
+            .iter_mut()
+            .find(|q| q.q0rg_id == q0rg_id)
+            .and_then(|q| q.layers.iter_mut().find(|layer| layer.layer_id == layer_id))
+            .and_then(|layer| layer.placements.get_mut(new_idx))
+        else {
+            return;
+        };
+        placement.target = Target::Q0rg(copied_id);
+        if let Err(error) = q0s_format::v2::validate(&candidate) {
+            self.session.status = format!("could not duplicate symbol: {error}");
+            return;
+        }
+        let name = candidate
+            .q0rgs
+            .iter()
+            .find(|q| q.q0rg_id == copied_id)
+            .map(|q| q.name.clone())
+            .unwrap_or_default();
+        self.history.snapshot(&self.state.project);
+        self.state.project = candidate;
+        self.state.mark_dirty();
+        self.textures.invalidate();
+        self.session.selection = Selection::Placement {
+            q0rg_id,
+            layer_id,
+            placement_idx: new_idx,
+        };
+        if let Some(tab_id) = self.active_project_tab_id() {
+            let selection = LibrarySelection {
+                tab_id,
+                item: LibraryItem::Q0rg(copied_id),
+            };
+            self.library_selection = Some(selection);
+            self.library_multi_selection = vec![selection];
+            self.library_selection_anchor = Some(selection);
+        }
+        self.session.status = format!("independent symbol: {name}");
     }
 
     pub(crate) fn open_replace_q0rg_dialog(
@@ -11905,14 +12468,34 @@ impl EditorApp {
             .find(|q| q.q0rg_id == self.session.current_q0rg_id)
             .map(|q| q.frame_count.max(1))
             .unwrap_or(1);
+        let (loop_start, loop_end) = self
+            .session
+            .preview_loop_ranges
+            .get(&self.session.current_q0rg_id)
+            .filter(|range| range.0)
+            .map(|range| {
+                let start = range.1.min(total - 1);
+                (start, range.2.max(start).min(total - 1))
+            })
+            .unwrap_or((0, total - 1));
+        let mut wrapped = false;
         let mut transition_budget = MAX_PREVIEW_FRAME_SCRIPT_TRANSITIONS;
         for _ in 0..frames {
             let next = self.session.current_frame.saturating_add(1);
-            self.session.current_frame = if next >= total { 0 } else { next };
+            self.session.current_frame =
+                if next > loop_end || self.session.current_frame < loop_start {
+                    wrapped = true;
+                    loop_start
+                } else {
+                    next
+                };
             self.run_current_preview_frame_scripts(&mut transition_budget);
             if !self.session.playing {
                 break;
             }
+        }
+        if wrapped {
+            self.session.preview_audio_resync_needed = true;
         }
         if self.session.preview_audio_resync_needed {
             self.session.preview_audio_resync_needed = false;
@@ -11924,7 +12507,10 @@ impl EditorApp {
 }
 
 fn color_row(ui: &mut egui::Ui, label: &str, target: &mut crate::settings::ColorRgb) {
-    ui.label(label);
+    let response = ui.label(label);
+    if label == "Window stroke" {
+        crate::ui::hidden_palette_note_trigger(ui, &response);
+    }
     let mut c = [target.r, target.g, target.b];
     if ui.color_edit_button_srgb(&mut c).changed() {
         target.r = c[0];
@@ -12058,7 +12644,7 @@ impl App for EditorApp {
                     .default_height(192.0)
                     .min_height(120.0)
                     .show(ctx, |ui| {
-                        panels::timeline::render(self, ui);
+                        crate::ui::panel_contents(ui, |ui| panels::timeline::render(self, ui));
                     });
                 self.perf
                     .record(crate::perf::PerfSpan::Timeline, timeline_started.elapsed());
@@ -12071,9 +12657,11 @@ impl App for EditorApp {
                 .resizable(false)
                 .exact_width(48.0)
                 .show(ctx, |ui| {
-                    egui::ScrollArea::vertical()
-                        .id_source("tools_scroll")
-                        .show(ui, |ui| panels::toolbar::render(self, ui));
+                    crate::ui::panel_contents(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_source("tools_scroll")
+                            .show(ui, |ui| panels::toolbar::render(self, ui));
+                    });
                 });
             self.perf
                 .record(crate::perf::PerfSpan::Toolbar, toolbar_started.elapsed());
@@ -12083,27 +12671,33 @@ impl App for EditorApp {
                 .default_width(290.0)
                 .min_width(200.0)
                 .show(ctx, |ui| {
-                    let half = ui.available_height() * 0.5;
-                    egui::TopBottomPanel::top("dock_library")
-                        .resizable(true)
-                        .default_height(half)
-                        .show_inside(ui, |ui| {
-                            // The Library owns its own item-list ScrollArea. Wrapping the
-                            // whole panel in another vertical ScrollArea makes the preview
-                            // height depend on the outer scroll offset and can create a
-                            // resize feedback loop where both areas keep clamping each other.
-                            let started = Instant::now();
-                            panels::library::render(self, ui);
-                            self.perf
-                                .record(crate::perf::PerfSpan::Library, started.elapsed());
+                    crate::ui::panel_contents(ui, |ui| {
+                        let half = ui.available_height() * 0.5;
+                        egui::TopBottomPanel::top("dock_library")
+                            .resizable(true)
+                            .default_height(half)
+                            .show_inside(ui, |ui| {
+                                // The Library owns its own item-list ScrollArea. Wrapping the
+                                // whole panel in another vertical ScrollArea makes the preview
+                                // height depend on the outer scroll offset and can create a
+                                // resize feedback loop where both areas keep clamping each other.
+                                let started = Instant::now();
+                                crate::ui::panel_contents(ui, |ui| {
+                                    panels::library::render(self, ui);
+                                });
+                                self.perf
+                                    .record(crate::perf::PerfSpan::Library, started.elapsed());
+                            });
+                        egui::CentralPanel::default().show_inside(ui, |ui| {
+                            let properties_started = Instant::now();
+                            crate::ui::panel_contents(ui, |ui| {
+                                panels::properties::render(self, ui);
+                            });
+                            self.perf.record(
+                                crate::perf::PerfSpan::Properties,
+                                properties_started.elapsed(),
+                            );
                         });
-                    egui::CentralPanel::default().show_inside(ui, |ui| {
-                        let properties_started = Instant::now();
-                        panels::properties::render(self, ui);
-                        self.perf.record(
-                            crate::perf::PerfSpan::Properties,
-                            properties_started.elapsed(),
-                        );
                     });
                 });
 
@@ -12113,6 +12707,7 @@ impl App for EditorApp {
 
             let auxiliary_started = Instant::now();
             panels::q0enc::render(self, ctx);
+            panels::stage::render_animation_preview(self, ctx);
             crate::q0lang::render(self, ctx);
             crate::q0lang::frame_editor::render(self, ctx);
             crate::easing::render_editor(self, ctx);
@@ -15618,7 +16213,7 @@ mod tests {
         let mut app = EditorApp::default();
         app.state.project.assets.push(Asset::Q0v(Q0vAsset {
             asset_id: 77,
-            bytes: test_audio_q0v_bytes(48_000, 4_800),
+            bytes: (test_audio_q0v_bytes(48_000, 4_800)).into(),
         }));
         let before: usize = app.state.project.q0rgs[0]
             .layers
@@ -15649,7 +16244,7 @@ mod tests {
             .clear();
         app.state.project.assets.push(Asset::Q0v(Q0vAsset {
             asset_id: 77,
-            bytes: test_audio_q0v_bytes(48_000, 48_000),
+            bytes: (test_audio_q0v_bytes(48_000, 48_000)).into(),
         }));
         let layer_count_before = app.state.project.q0rgs[0].layers.len();
 
@@ -15688,7 +16283,7 @@ mod tests {
             .clear();
         app.state.project.assets.push(Asset::Q0v(Q0vAsset {
             asset_id: 77,
-            bytes: test_audio_q0v_bytes(48_000, 48_000),
+            bytes: (test_audio_q0v_bytes(48_000, 48_000)).into(),
         }));
         app.handle(
             &Context::default(),
@@ -15729,7 +16324,7 @@ mod tests {
         }));
         app.state.project.assets.push(Asset::Q0v(Q0vAsset {
             asset_id: 78,
-            bytes: test_audio_q0v_bytes(48_000, 48_000),
+            bytes: (test_audio_q0v_bytes(48_000, 48_000)).into(),
         }));
         app.handle(
             &Context::default(),
@@ -15768,7 +16363,7 @@ mod tests {
             .clear();
         app.state.project.assets.push(Asset::Q0v(Q0vAsset {
             asset_id: 77,
-            bytes: test_audio_q0v_bytes(48_000, 48_000),
+            bytes: (test_audio_q0v_bytes(48_000, 48_000)).into(),
         }));
         app.handle(
             &Context::default(),
@@ -15807,7 +16402,7 @@ mod tests {
         app.state.project.q0rgs[0].frame_count = 20;
         app.state.project.assets.push(Asset::Q0v(Q0vAsset {
             asset_id: 77,
-            bytes: test_q0v_bytes(10, 4),
+            bytes: (test_q0v_bytes(10, 4)).into(),
         }));
         app.state
             .project
@@ -15851,7 +16446,7 @@ mod tests {
         app.state.project.q0rgs[0].frame_count = 2;
         app.state.project.assets.push(Asset::Q0v(Q0vAsset {
             asset_id: 77,
-            bytes: test_q0v_bytes(24, 5),
+            bytes: (test_q0v_bytes(24, 5)).into(),
         }));
 
         app.handle(

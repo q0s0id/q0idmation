@@ -963,11 +963,32 @@ fn export_q0v(
                 total,
                 "writing q0v pcm audio",
             );
-            // q0s/q1s does not have audio timeline assets yet. The container
-            // is fully audio-capable now; until those assets land, an enabled
-            // stream is explicit, duration-correct silence rather than fake
-            // data masquerading as mixed timeline sound.
-            writer.write_silence(spec.expected_audio_samples_per_channel())?;
+            let source_start = u64::from(*range.start()) * 48_000 / u64::from(spec.fps);
+            let samples = spec.expected_audio_samples_per_channel();
+            let mut written = 0_u64;
+            while written < samples {
+                if cancel.load(Ordering::Acquire) {
+                    return Ok(WorkerOutcome::Cancelled);
+                }
+                let frames = (samples - written).min(12_000) as usize;
+                let mixed = crate::audio::mix_timeline_audio_chunk(
+                    job.snapshot(),
+                    job.options.source_q0rg_id,
+                    source_start + written,
+                    frames,
+                )
+                .unwrap_or_else(|| vec![0.0; frames * 2]);
+                let pcm = mixed
+                    .into_iter()
+                    .map(|sample| {
+                        (sample * 32767.0)
+                            .round()
+                            .clamp(i16::MIN as f32, i16::MAX as f32) as i16
+                    })
+                    .collect::<Vec<_>>();
+                writer.write_audio_pcm_i16(&pcm)?;
+                written += frames as u64;
+            }
         }
         let mut file = writer.finish()?;
         file.flush()

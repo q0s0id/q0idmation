@@ -13,7 +13,8 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     crate::theme::section_heading(ui, "Properties", "Selection & tool controls");
     ui.separator();
 
-    ScrollArea::vertical()
+    ScrollArea::both()
+        .id_source("properties_scroll")
         .auto_shrink([false, true])
         .show(ui, |ui| {
             if crate::text_tool::render_properties(app, ui) {
@@ -41,6 +42,13 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             }
             if render_audio_clip_properties(app, ui) {
                 return;
+            }
+            if let Selection::Placement { q0rg_id, layer_id, placement_idx } = app.session.selection {
+                let symbol = app.state.project.q0rgs.iter().find(|q| q.q0rg_id == q0rg_id)
+                    .and_then(|q| q.layers.iter().find(|l| l.layer_id == layer_id))
+                    .and_then(|l| l.placements.get(placement_idx))
+                    .and_then(|p| match p.target { Target::Q0rg(id) => app.state.project.q0rgs.iter().find(|q| q.q0rg_id == id), _ => None });
+                if let Some(symbol) = symbol { ui.label(egui::RichText::new(&symbol.name).strong()); }
             }
             let timeline_tweens = crate::easing::selected_tween_targets(app);
             if !timeline_tweens.is_empty() {
@@ -322,7 +330,7 @@ fn render_audio_clip_properties(app: &mut EditorApp, ui: &mut Ui) -> bool {
     let q0rg_id = app.session.current_q0rg_id;
     let layer_id = selection.focus_layer_id;
     let frame = selection.focus_frame;
-    let Some(clip) =
+    let Some(reference) =
         crate::audio::audio_clip_at_frame(&app.state.project, q0rg_id, layer_id, frame)
     else {
         return false;
@@ -332,17 +340,16 @@ fn render_audio_clip_properties(app: &mut EditorApp, ui: &mut Ui) -> bool {
         .project
         .assets
         .iter()
-        .find(|asset| asset.id() == clip.asset_id)
-        .and_then(|asset| match asset {
+        .find(|a| a.id() == reference.asset_id)
+        .and_then(|a| match a {
             Asset::Q0v(media) => q0video::q0v::probe_header(&media.bytes).ok(),
             _ => None,
         })
     else {
         return false;
     };
-    if !header.spec.audio || header.spec.video {
-        return false;
-    }
+    let original = app.state.project.audio_clips[reference.clip_idx];
+    let mut clip = original;
     let name = app
         .state
         .project
@@ -350,99 +357,185 @@ fn render_audio_clip_properties(app: &mut EditorApp, ui: &mut Ui) -> bool {
         .get(&clip.asset_id)
         .cloned()
         .unwrap_or_else(|| format!("Audio {}", clip.asset_id));
-    let before = app.state.project.clone();
-    let Some((mut gain, mut muted)) = app
-        .state
-        .project
-        .audio_clips
-        .get(clip.clip_idx)
-        .map(|clip| (clip.gain, clip.muted))
-    else {
-        return false;
-    };
-
-    ui.label(egui::RichText::new(format!("Audio clip: {name}")).strong());
-    let duration_seconds =
+    let source_seconds =
         header.audio_samples_per_channel as f64 / f64::from(header.spec.audio_sample_rate.max(1));
+    ui.label(egui::RichText::new(name).strong());
     ui.label(
         egui::RichText::new(format!(
-            "{duration_seconds:.2}s | {} hz | {} channel(s)",
+            "{source_seconds:.2}s · {} Hz · {} channels",
             header.spec.audio_sample_rate, header.spec.audio_channels
         ))
         .small()
         .color(app.settings.theme.text_dim.to_color32()),
     );
-    ui.add_space(5.0);
-
-    let mut changed = false;
-    let mut wants_snapshot = false;
-    egui::Grid::new("audio_clip_properties")
-        .num_columns(2)
-        .show(ui, |ui| {
-            ui.label("Starts");
-            ui.label(format!("frame {}", clip.start_frame + 1));
-            ui.end_row();
-
-            ui.label("Ends");
-            ui.label(format!("frame {}", clip.end_frame_exclusive));
-            ui.end_row();
-
-            ui.label("Volume");
-            let mut percent = gain * 100.0;
-            let response = ui.add(
-                egui::Slider::new(&mut percent, 0.0..=200.0)
-                    .suffix("%")
-                    .show_value(true),
-            );
-            wants_snapshot |= response.drag_started() || response.gained_focus();
-            if response.changed() {
-                gain = (percent / 100.0).clamp(0.0, 2.0);
-                changed = true;
-            }
-            ui.end_row();
-
-            ui.label("Mute");
-            let response = ui.checkbox(&mut muted, "");
-            if response.changed() {
-                wants_snapshot = true;
-                changed = true;
-            }
-            ui.end_row();
-        });
-
     ui.add_space(6.0);
-    if ui.button("Play from clip").clicked() {
-        app.session.current_layer_id = layer_id;
-        app.session.current_frame = clip.start_frame;
-        app.session.pending_timeline_frame = None;
-        app.session.timeline_selection = Some(crate::state::TimelineSelection::single(
-            layer_id,
-            clip.start_frame,
-        ));
-        app.session.selection = Selection::None;
-        if app.session.playing {
-            if let Err(error) = app.refresh_audio_playback() {
-                app.session.status = format!("audio preview failed: {error}");
+    let locked = app.state.project.layer_is_locked(q0rg_id, layer_id);
+    let mut snapshot = false;
+    let timeline_length = app
+        .state
+        .project
+        .q0rgs
+        .iter()
+        .find(|q| q.q0rg_id == q0rg_id)
+        .map(|q| q.frame_count)
+        .unwrap_or(1);
+    ui.add_enabled_ui(!locked, |ui| {
+        egui::Grid::new("audio_clip_properties")
+            .num_columns(2)
+            .spacing([10.0, 7.0])
+            .show(ui, |ui| {
+                ui.label("Timeline");
+                ui.label(format!(
+                    "{}–{} · {:.2}s",
+                    clip.start_frame + 1,
+                    reference.end_frame_exclusive,
+                    f64::from(reference.end_frame_exclusive - clip.start_frame)
+                        / f64::from(app.state.project.meta.fps.max(1))
+                ));
+                ui.end_row();
+                ui.label("Source start");
+                let mut seconds = clip.source_offset_samples as f64 / 48_000.0;
+                let response = ui.add(
+                    egui::DragValue::new(&mut seconds)
+                        .speed(0.01)
+                        .suffix(" s")
+                        .clamp_range(0.0..=(source_seconds - 1.0 / 48_000.0).max(0.0)),
+                );
+                snapshot |= response.drag_started() || response.gained_focus();
+                if response.changed() {
+                    clip.source_offset_samples = (seconds * 48_000.0).round() as u64;
+                }
+                ui.end_row();
+                ui.label("Length");
+                ui.horizontal(|ui| {
+                    let mut full = clip.duration_frames.is_none();
+                    let response = ui.checkbox(&mut full, "Full source");
+                    snapshot |= response.changed();
+                    if response.changed() {
+                        clip.duration_frames = if full {
+                            None
+                        } else {
+                            Some(reference.end_frame_exclusive - clip.start_frame)
+                        };
+                    }
+                    if let Some(mut frames) = clip.duration_frames {
+                        let response = ui.add(
+                            egui::DragValue::new(&mut frames)
+                                .suffix(" frames")
+                                .clamp_range(
+                                    1..=timeline_length.saturating_sub(clip.start_frame).max(1),
+                                ),
+                        );
+                        snapshot |= response.drag_started() || response.gained_focus();
+                        if response.changed() {
+                            clip.duration_frames = Some(frames);
+                        }
+                    }
+                });
+                ui.end_row();
+                ui.label("Volume");
+                let mut percent = clip.gain * 100.0;
+                let response = ui.add(egui::Slider::new(&mut percent, 0.0..=400.0).suffix("%"));
+                snapshot |= response.drag_started() || response.gained_focus();
+                if response.changed() {
+                    clip.gain = percent / 100.0;
+                }
+                ui.end_row();
+                ui.label("Balance");
+                let response = ui.add(egui::Slider::new(&mut clip.pan, -1.0..=1.0).text("L / R"));
+                snapshot |= response.drag_started() || response.gained_focus();
+                ui.end_row();
+                for (label, value) in [
+                    ("Fade in", &mut clip.fade_in_ms),
+                    ("Fade out", &mut clip.fade_out_ms),
+                ] {
+                    ui.label(label);
+                    let response = ui.add(
+                        egui::DragValue::new(value)
+                            .speed(10.0)
+                            .suffix(" ms")
+                            .clamp_range(0..=60_000),
+                    );
+                    snapshot |= response.drag_started() || response.gained_focus();
+                    ui.end_row();
+                }
+                ui.label("Mute");
+                snapshot |= ui.checkbox(&mut clip.muted, "").changed();
+                ui.end_row();
+            });
+    });
+    ui.add_space(6.0);
+    let mut keyframe_action = None;
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("Play clip").clicked() {
+            app.session.current_layer_id = layer_id;
+            app.session
+                .set_timeline_frame(clip.start_frame, timeline_length);
+            app.session.timeline_selection = Some(crate::state::TimelineSelection::single(
+                layer_id,
+                clip.start_frame,
+            ));
+            if app.session.playing {
+                let _ = app.refresh_audio_playback();
+            } else {
+                app.queue(Action::TogglePlay);
             }
-        } else {
-            app.queue(Action::TogglePlay);
+        }
+        if ui
+            .add_enabled(
+                !locked && frame > clip.start_frame,
+                egui::Button::new("Split here"),
+            )
+            .on_hover_text(
+                "Split into two clips, preserving the position in the source recording (F6)",
+            )
+            .clicked()
+        {
+            keyframe_action = Some(true);
+            return;
+        }
+        if ui
+            .add_enabled(!locked, egui::Button::new("Stop here"))
+            .on_hover_text("Stop audio at a blank keyframe (F7)")
+            .clicked()
+        {
+            keyframe_action = Some(false);
+            return;
+        }
+        if ui
+            .add_enabled(!locked, egui::Button::new("Reset audio settings"))
+            .clicked()
+        {
+            clip = q0s_format::v2::AudioClip {
+                gain: 1.0,
+                source_offset_samples: original.source_offset_samples,
+                duration_frames: original.duration_frames,
+                ..original
+            };
+            clip.pan = 0.0;
+            clip.fade_in_ms = 0;
+            clip.fade_out_ms = 0;
+            clip.muted = false;
+            snapshot = true;
+        }
+    });
+    ui.label(
+        egui::RichText::new("The next keyframe stops this clip. Source audio stays intact.")
+            .small()
+            .color(app.settings.theme.text_dim.to_color32()),
+    );
+    if snapshot {
+        app.history.snapshot(&app.state.project);
+    }
+    if clip != original && !locked {
+        app.state.project.audio_clips[reference.clip_idx] = clip;
+        app.state.mark_dirty();
+        if app.session.playing {
+            let _ = app.refresh_audio_playback();
         }
     }
-
-    if changed {
-        if wants_snapshot {
-            app.history.snapshot(&before);
-        }
-        if let Some(timeline_clip) = app.state.project.audio_clips.get_mut(clip.clip_idx) {
-            timeline_clip.gain = gain;
-            timeline_clip.muted = muted;
-            app.state.mark_dirty();
-        }
-        if app.session.playing {
-            if let Err(error) = app.refresh_audio_playback() {
-                app.session.status = format!("audio update failed: {error}");
-            }
-        }
+    if let Some(continue_audio) = keyframe_action {
+        app.audio_keyframe_at(q0rg_id, layer_id, frame, continue_audio);
     }
     true
 }
@@ -2130,6 +2223,7 @@ fn placement_properties(
                 .small()
                 .color(app.settings.theme.text_dim.to_color32()),
         );
+        crate::rigging::render_pose_tween_options(app, ui, q0rg_id);
     }
     if source_frame != current_frame {
         let held_message = if rig_bound {
@@ -2226,6 +2320,12 @@ fn placement_properties(
                 app.open_replace_q0rg_dialog(q0rg_id, layer_id, placement_idx);
             }
         });
+        if ui.add_enabled(
+            !app.state.project.layer_is_locked(q0rg_id, layer_id),
+            egui::Button::new("Duplicate Symbol"),
+        ).on_hover_text("Create an independent copy, including nested symbols, without changing the original").clicked() {
+            app.queue(crate::app::Action::DuplicateSymbol(q0rg_id, layer_id, placement_idx));
+        }
         ui.separator();
         ui.label(egui::RichText::new("Playback").strong());
         egui::Grid::new("placement_q0rg_playback")
@@ -2490,6 +2590,43 @@ fn placement_properties(
             ui.end_row();
         });
 
+    ui.add_space(4.0);
+    let mut tint_enabled = fx.tint.is_some();
+    let toggle = ui.checkbox(&mut tint_enabled, "Tint Color Effect");
+    if toggle.changed() {
+        fx.tint = tint_enabled.then_some(q0s_format::v2::TintFx {
+            color: Rgba {
+                r: 255,
+                g: 64,
+                b: 64,
+                a: 255,
+            },
+            amount: 0.5,
+        });
+        fx_dirty = true;
+        wants_snapshot = true;
+    }
+    if let Some(tint) = fx.tint.as_mut() {
+        ui.horizontal(|ui| {
+            let mut color = [tint.color.r, tint.color.g, tint.color.b];
+            let response = ui.color_edit_button_srgb(&mut color);
+            note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
+            if response.changed() {
+                tint.color = Rgba {
+                    r: color[0],
+                    g: color[1],
+                    b: color[2],
+                    a: 255,
+                };
+            }
+            let mut percent = tint.amount * 100.0;
+            let response = ui.add(egui::Slider::new(&mut percent, 0.0..=100.0).suffix("%"));
+            note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
+            if response.changed() {
+                tint.amount = percent / 100.0;
+            }
+        });
+    }
     ui.add_space(4.0);
     ui.label(egui::RichText::new("Filters").small().strong());
 

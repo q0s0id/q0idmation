@@ -300,6 +300,27 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 }
                 if shortcut_button(
                     ui,
+                    "Show / Hide Timeline",
+                    app.settings
+                        .hotkeys
+                        .display(ShortcutCommand::ToggleTimeline),
+                )
+                .clicked()
+                {
+                    app.queue(Action::ToggleTimeline);
+                    ui.close_menu();
+                }
+                if ui
+                    .selectable_label(app.session.show_animation_preview, "Animation Preview")
+                    .clicked()
+                {
+                    app.session.show_animation_preview = !app.session.show_animation_preview;
+                    app.session.animation_preview_frame = app.session.current_frame;
+                    app.session.animation_preview_tick = std::time::Instant::now();
+                    ui.close_menu();
+                }
+                if shortcut_button(
+                    ui,
                     "Script Editor (q0lang)...",
                     app.settings.hotkeys.display(ShortcutCommand::ScriptEditor),
                 )
@@ -336,7 +357,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             );
             ui.label(
                 egui::RichText::new(
-                    "V/A/P/B/N/R/O/K/I tools, Space play/pause, arrows step frames",
+                    "V/A/P/B/N/R/O/K/I tools; arrows move selection (Shift: fine), or step frames without selection",
                 )
                 .color(app.settings.theme.text_dim.to_color32()),
             );
@@ -621,6 +642,8 @@ fn action_for_shortcut(command: ShortcutCommand) -> Option<Action> {
         C::BreakApart => Action::BreakApartSelection,
         C::FlipHorizontal => Action::FlipHorizontal,
         C::FlipVertical => Action::FlipVertical,
+        C::BringForward => Action::BringForward,
+        C::SendBackward => Action::SendBackward,
         C::ZoomIn => Action::ZoomIn,
         C::ZoomOut => Action::ZoomOut,
         C::ZoomReset => Action::ZoomReset,
@@ -651,6 +674,7 @@ fn action_for_shortcut(command: ShortcutCommand) -> Option<Action> {
         C::ToolBucket => Action::SelectTool(crate::state::Tool::Bucket),
         C::ToolEyedropper => Action::SelectTool(crate::state::Tool::Eyedropper),
         C::ToolText => Action::SelectTool(crate::state::Tool::Text),
+        C::ToolRig => Action::SelectTool(crate::state::Tool::Rig),
         C::PerformanceSnapshot | C::ClearSelection => return None,
     })
 }
@@ -725,7 +749,34 @@ pub fn handle_global_shortcuts(app: &mut EditorApp, ctx: &egui::Context) {
     let settings = &app.settings.hotkeys;
     let mut commands = Vec::new();
     let mut native_commands = Vec::new();
+    let mut nudge = q0s_format::v2::Vec2::new(0.0, 0.0);
+    let stage_selection = !typing
+        && !code_document
+        && !matches!(
+            app.session.selection,
+            crate::state::Selection::None
+                | crate::state::Selection::Asset(_)
+                | crate::state::Selection::Q0rg(_)
+        )
+        && app.session.timeline_selection.is_none()
+        && app.session.timeline_layer_selection.is_none()
+        && matches!(app.session.tool_state, crate::state::ToolState::Idle);
     ctx.input_mut(|i| {
+        if stage_selection && !i.modifiers.command && !i.modifiers.alt {
+            let step = if i.modifiers.shift { 0.1 } else { 1.0 };
+            let modifiers = i.modifiers;
+            for (key, x, y) in [
+                (Key::ArrowLeft, -1.0, 0.0),
+                (Key::ArrowRight, 1.0, 0.0),
+                (Key::ArrowUp, 0.0, -1.0),
+                (Key::ArrowDown, 0.0, 1.0),
+            ] {
+                if i.consume_key(modifiers, key) {
+                    nudge.x += x * step;
+                    nudge.y += y * step;
+                }
+            }
+        }
         let (native, had_native_clipboard_event) = if !typing && !code_document {
             consume_native_clipboard_shortcuts(i, settings)
         } else {
@@ -759,6 +810,8 @@ pub fn handle_global_shortcuts(app: &mut EditorApp, ctx: &egui::Context) {
             test(ShortcutCommand::BreakApart);
             test(ShortcutCommand::FlipHorizontal);
             test(ShortcutCommand::FlipVertical);
+            test(ShortcutCommand::BringForward);
+            test(ShortcutCommand::SendBackward);
             test(ShortcutCommand::Cut);
             test(ShortcutCommand::Copy);
             test(ShortcutCommand::Paste);
@@ -772,6 +825,7 @@ pub fn handle_global_shortcuts(app: &mut EditorApp, ctx: &egui::Context) {
         test(ShortcutCommand::ZoomReset);
         if !typing {
             test(ShortcutCommand::PlaybackToggle);
+            test(ShortcutCommand::ToggleTimeline);
             test(ShortcutCommand::FirstFrame);
             test(ShortcutCommand::LastFrame);
             test(ShortcutCommand::PreviousFrame);
@@ -801,11 +855,15 @@ pub fn handle_global_shortcuts(app: &mut EditorApp, ctx: &egui::Context) {
                 ShortcutCommand::ToolBucket,
                 ShortcutCommand::ToolEyedropper,
                 ShortcutCommand::ToolText,
+                ShortcutCommand::ToolRig,
             ] {
                 test(command);
             }
         }
     });
+    if nudge.x != 0.0 || nudge.y != 0.0 {
+        crate::tools::nudge_selection(app, nudge);
+    }
     for command in commands {
         dispatch_shortcut(
             app,

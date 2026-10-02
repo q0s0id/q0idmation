@@ -232,7 +232,7 @@ fn preview_project_asset(
         }),
         Asset::Vector(_) => preview_vector_asset(project, asset_id),
         Asset::Q0v(media) => {
-            let media = Q0vFile::parse(media.bytes.clone())
+            let media = Q0vFile::parse(media.bytes.as_ref().clone())
                 .map_err(|error| format!("parse embedded q0v: {error}"))?;
             preview_q0v_media(&media, frame, !media.spec.video)
         }

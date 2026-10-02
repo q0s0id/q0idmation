@@ -62,13 +62,13 @@ enum RawElement {
 }
 
 #[derive(Debug, Clone)]
-struct RawText {
-    affine: Affine,
-    offset: Vec2,
-    text: String,
-    font: String,
-    size: f32,
-    color: Rgba,
+pub(crate) struct RawText {
+    pub(crate) affine: Affine,
+    pub(crate) offset: Vec2,
+    pub(crate) text: String,
+    pub(crate) font: String,
+    pub(crate) size: f32,
+    pub(crate) color: Rgba,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +77,7 @@ struct RawSymbolInstance {
     affine: Affine,
     playback: Q0rgPlayback,
     opacity: f32,
+    tint: Option<q0s_format::v2::TintFx>,
     blend_mode: BlendMode,
     unsupported_blend_mode: Option<String>,
     blur: Option<BlurFx>,
@@ -107,6 +108,11 @@ pub(crate) struct RawShape {
 pub(crate) enum RawFillStyle {
     Solid(Rgba),
     Gradient(GradientFill),
+    Bitmap {
+        reference: u32,
+        transform: Affine,
+        tiled: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -731,6 +737,7 @@ fn build_q0rg(
                                     tween: motion_tween,
                                     fx: PlacementFx {
                                         opacity: instance.opacity,
+                                        tint: instance.tint,
                                         blend_mode: instance.blend_mode,
                                         blur: instance.blur,
                                         glow: instance.glow,
@@ -814,7 +821,17 @@ fn build_q0rg(
         }
         layers.push(Layer {
             layer_id,
-            timeline_frame_count: None,
+            timeline_frame_count: Some(if raw_layer.kind == LayerKind::Folder {
+                0
+            } else {
+                raw_layer
+                    .frames
+                    .iter()
+                    .map(|frame| frame.index.saturating_add(frame.duration))
+                    .max()
+                    .unwrap_or(1)
+                    .min(timeline.frame_count)
+            }),
             name: raw_layer.name.clone(),
             explicit_keyframes,
             placements,
@@ -918,9 +935,14 @@ pub(crate) fn shape_assets(
         if paths.is_empty() {
             continue;
         }
-        let id = allocate_asset_id(next_asset_id)?;
         let (fallback, gradient) = match fill_style {
             RawFillStyle::Solid(color) => (color, None),
+            RawFillStyle::Bitmap { .. } => {
+                warnings.push(format!(
+                    "{owner_name}: bitmap fill requires its library media; fill was skipped"
+                ));
+                continue;
+            }
             RawFillStyle::Gradient(mut gradient) => {
                 gradient.transform = Affine::compose(shape.affine, gradient.transform);
                 if regularize_gradient_transform(&mut gradient.transform) {
@@ -941,6 +963,7 @@ pub(crate) fn shape_assets(
                 (fallback, Some(gradient))
             }
         };
+        let id = allocate_asset_id(next_asset_id)?;
         project.assets.push(Asset::Vector(VectorAsset {
             asset_id: id,
             paths,
@@ -1102,7 +1125,7 @@ fn regularize_gradient_transform(transform: &mut Affine) -> bool {
     true
 }
 
-fn text_asset(
+pub(crate) fn text_asset(
     text: &RawText,
     owner_name: &str,
     project: &mut ProjectV2,
@@ -1234,8 +1257,13 @@ fn parse_timeline_index(
                 } else if current_layer.is_some() && name == b"DOMFrame" && current_frame.is_none()
                 {
                     let frame = raw_frame(&reader, &element)?;
-                    max_frame_end =
-                        max_frame_end.max(u32::from(frame.index) + u32::from(frame.duration));
+                    if current_layer
+                        .as_ref()
+                        .is_some_and(|(_, layer)| layer.kind != LayerKind::Folder)
+                    {
+                        max_frame_end =
+                            max_frame_end.max(u32::from(frame.index) + u32::from(frame.duration));
+                    }
                     current_frame = Some((depth, frame));
                 } else if current_frame.is_some() && name == b"CustomEase" {
                     custom_ease_depth = Some(depth);
@@ -1332,8 +1360,13 @@ fn parse_timeline_index(
                 }
                 if current_layer.is_some() && name == b"DOMFrame" && current_frame.is_none() {
                     let frame = raw_frame(&reader, &element)?;
-                    max_frame_end =
-                        max_frame_end.max(u32::from(frame.index) + u32::from(frame.duration));
+                    if current_layer
+                        .as_ref()
+                        .is_some_and(|(_, layer)| layer.kind != LayerKind::Folder)
+                    {
+                        max_frame_end =
+                            max_frame_end.max(u32::from(frame.index) + u32::from(frame.duration));
+                    }
                     if let Some((_, layer)) = current_layer.as_mut() {
                         layer.frames.push(frame);
                     }
@@ -1370,11 +1403,32 @@ fn parse_timeline_index(
                             })?;
                             state.instance.opacity = alpha.clamp(0.0, 1.0);
                         }
-                        if attr(&reader, &element, b"brightness")?.is_some()
-                            || attr(&reader, &element, b"tintMultiplier")?.is_some()
-                        {
+                        if let Some(amount) = attr(&reader, &element, b"tintMultiplier")? {
+                            let amount = amount.parse::<f32>().map_err(|_| {
+                                ImportError::Invalid(format!("invalid tintMultiplier '{amount}'"))
+                            })?;
+                            if !amount.is_finite() {
+                                return Err(ImportError::Invalid(
+                                    "non-finite tintMultiplier".to_string(),
+                                ));
+                            }
+                            let color = attr(&reader, &element, b"tintColor")?
+                                .map(|value| parse_hex_color(&value))
+                                .transpose()?
+                                .unwrap_or(Rgba {
+                                    r: 0,
+                                    g: 0,
+                                    b: 0,
+                                    a: 255,
+                                });
+                            state.instance.tint = Some(q0s_format::v2::TintFx {
+                                color,
+                                amount: amount.clamp(0.0, 1.0),
+                            });
+                        }
+                        if attr(&reader, &element, b"brightness")?.is_some() {
                             unsupported.insert(
-                                "symbol brightness/tint color transforms are not imported yet"
+                                "symbol brightness color transforms are not imported yet"
                                     .to_string(),
                             );
                         }
@@ -1710,7 +1764,7 @@ fn parse_bitmap_media(xml: &[u8]) -> Result<Vec<RawBitmapMedia>, ImportError> {
     Ok(media)
 }
 
-fn decode_lossless_bitmap_dat(bytes: &[u8]) -> Result<(u16, u16, Vec<u8>), ImportError> {
+pub(crate) fn decode_lossless_bitmap_dat(bytes: &[u8]) -> Result<(u16, u16, Vec<u8>), ImportError> {
     if bytes.len() < 28 {
         return Err(ImportError::Unsupported(
             "bitmap .dat header is truncated".to_string(),
@@ -1880,6 +1934,7 @@ fn raw_instance(
         library_item_name,
         affine: Affine::IDENTITY,
         opacity: 1.0,
+        tint: None,
         blend_mode,
         unsupported_blend_mode,
         blur: None,
@@ -2622,7 +2677,7 @@ fn parse_matrix(reader: &Reader<&[u8]>, element: &BytesStart<'_>) -> Result<Affi
     })
 }
 
-fn affine_to_transform(affine: Affine) -> Option<Transform2D> {
+pub(crate) fn affine_to_transform(affine: Affine) -> Option<Transform2D> {
     let sx = affine.a11.hypot(affine.a21);
     let determinant = affine.a11 * affine.a22 - affine.a12 * affine.a21;
     if !sx.is_finite() || sx <= 1.0e-7 || !determinant.is_finite() || determinant.abs() <= 1.0e-9 {

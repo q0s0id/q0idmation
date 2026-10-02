@@ -1164,11 +1164,8 @@ impl Settings {
             Some(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
             None => Self::default(),
         };
-        // Migrate the original pre-beta defaults without requiring users to
-        // find and delete their settings file before trying a new build.
-        if settings.theme.accent == ColorRgb::new(0x0F, 0x84, 0xCE) {
-            settings.theme.accent = ColorRgb::new(0xC8, 0x10, 0x2E);
-        }
+        // Persisted accents are user choices. The old default blue is also the
+        // Light preset's accent, so its value cannot identify legacy settings.
         migrate_legacy_timeline_focus_color(&mut settings.theme);
         if settings.q0lang_font_name == "Impact" {
             settings.q0lang_font_name = default_q0lang_font_name();

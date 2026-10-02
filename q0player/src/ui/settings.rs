@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use egui::{FontId, TextStyle};
 use serde::{Deserialize, Serialize};
 
-use super::theme::{ColorRgb, Theme};
+use super::theme::Theme;
 
 const MAX_RECENT_FILES: usize = 10;
 
@@ -84,9 +84,6 @@ impl Settings {
             Some(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
             None => Self::default(),
         };
-        if settings.theme.accent == ColorRgb::new(0x0F, 0x84, 0xCE) {
-            settings.theme.accent = ColorRgb::new(0xC8, 0x10, 0x2E);
-        }
         settings.normalize();
         settings
     }

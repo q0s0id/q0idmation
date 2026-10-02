@@ -447,6 +447,8 @@ struct GlResources {
     group_textured_size_uniform: Option<glow::UniformLocation>,
     group_textured_texture_uniform: Option<glow::UniformLocation>,
     group_textured_srgb_uniform: Option<glow::UniformLocation>,
+    group_textured_color_scale_uniform: Option<glow::UniformLocation>,
+    group_textured_color_offset_uniform: Option<glow::UniformLocation>,
     cached_solid_program: glow::Program,
     cached_solid_vao: glow::VertexArray,
     cached_solid_screen_size_uniform: Option<glow::UniformLocation>,
@@ -458,6 +460,8 @@ struct GlResources {
     cached_solid_screen_uv_tile_uniform: Option<glow::UniformLocation>,
     cached_solid_texture_uniform: Option<glow::UniformLocation>,
     cached_solid_srgb_texture_uniform: Option<glow::UniformLocation>,
+    cached_solid_color_scale_uniform: Option<glow::UniformLocation>,
+    cached_solid_color_offset_uniform: Option<glow::UniformLocation>,
     cached_solid_buffers: HashMap<usize, CachedSolidMeshBuffers>,
     gradient_program: glow::Program,
     gradient_vao: glow::VertexArray,
@@ -472,6 +476,8 @@ struct GlResources {
     gradient_stop_count_uniform: Option<glow::UniformLocation>,
     gradient_stops_uniform: Option<glow::UniformLocation>,
     gradient_tint_uniform: Option<glow::UniformLocation>,
+    gradient_color_scale_uniform: Option<glow::UniformLocation>,
+    gradient_color_offset_uniform: Option<glow::UniformLocation>,
     gradient_screen_offset_uniform: Option<glow::UniformLocation>,
     gradient_offscreen_uniform: Option<glow::UniformLocation>,
     gradient_buffers: HashMap<usize, CachedSolidMeshBuffers>,
@@ -721,6 +727,24 @@ pub fn paint_cached_mesh_affine(
     transform: CachedMeshTransform,
     screen_uv_tile: Option<f32>,
 ) {
+    paint_cached_mesh_affine_color(
+        painter,
+        rect,
+        mesh,
+        transform,
+        screen_uv_tile,
+        ColorTransform::default(),
+    );
+}
+
+pub fn paint_cached_mesh_affine_color(
+    painter: &Painter,
+    rect: Rect,
+    mesh: Arc<Mesh>,
+    transform: CachedMeshTransform,
+    screen_uv_tile: Option<f32>,
+    color_transform: ColorTransform,
+) {
     if mesh.vertices.is_empty() || mesh.indices.is_empty() || !rect.is_positive() {
         return;
     }
@@ -745,6 +769,7 @@ pub fn paint_cached_mesh_affine(
             } else {
                 egui::Vec2::ZERO
             };
+            vertex.color = color_transform.apply(vertex.color);
             vertex.pos = reproject_cached_mesh_point_affine(
                 vertex.pos,
                 fixed_offset,
@@ -804,6 +829,7 @@ pub fn paint_cached_mesh_affine(
                         screen_uv_tile.unwrap_or(0.0),
                         fixed_screen_offset,
                         false,
+                        color_transform,
                     );
                 }
             });
@@ -832,16 +858,144 @@ pub struct GradientMeshPaint {
     pub kind: GradientKind,
     pub stops: Arc<Vec<GradientStop>>,
     pub tint: Color32,
+    pub color_transform: ColorTransform,
+}
+
+/// An affine RGB effect. Offsets are multiplied by coverage in premultiplied
+/// shaders, so tint never changes alpha or fills transparent holes.
+#[derive(Clone, Copy, Debug)]
+pub struct ColorTransform {
+    pub scale: [f32; 3],
+    pub offset: [f32; 3],
+}
+
+impl Default for ColorTransform {
+    fn default() -> Self {
+        Self {
+            scale: [1.0; 3],
+            offset: [0.0; 3],
+        }
+    }
+}
+
+impl ColorTransform {
+    pub fn is_identity(self) -> bool {
+        self.scale == [1.0; 3] && self.offset == [0.0; 3]
+    }
+
+    pub fn tint(effect: q0s_format::v2::TintFx) -> Self {
+        let amount = effect.amount.clamp(0.0, 1.0);
+        Self {
+            scale: [1.0 - amount; 3],
+            offset: [effect.color.r, effect.color.g, effect.color.b]
+                .map(|channel| amount * f32::from(channel) / 255.0),
+        }
+    }
+
+    pub fn then(self, outer: Self) -> Self {
+        Self {
+            scale: std::array::from_fn(|i| self.scale[i] * outer.scale[i]),
+            offset: std::array::from_fn(|i| self.offset[i] * outer.scale[i] + outer.offset[i]),
+        }
+    }
+
+    pub fn apply(self, color: Color32) -> Color32 {
+        if self.is_identity() || color.a() == 0 {
+            return color;
+        }
+        let [r, g, b, a] = color.to_srgba_unmultiplied();
+        let rgb = [r, g, b];
+        let channel = |i: usize| {
+            (f32::from(rgb[i]) * self.scale[i] + 255.0 * self.offset[i])
+                .round()
+                .clamp(0.0, 255.0) as u8
+        };
+        Color32::from_rgba_unmultiplied(channel(0), channel(1), channel(2), a)
+    }
 }
 
 #[derive(Clone)]
 pub enum VectorGroupPrimitive {
     Solid(Mesh),
-    Textured(Arc<Mesh>),
+    Textured {
+        mesh: Arc<Mesh>,
+        color_transform: ColorTransform,
+    },
     Gradient {
         mesh: Arc<Mesh>,
         paint: GradientMeshPaint,
     },
+}
+
+pub fn transform_primitive_colors(primitives: &mut [VectorGroupPrimitive], effect: ColorTransform) {
+    for primitive in primitives {
+        match primitive {
+            VectorGroupPrimitive::Solid(mesh) => {
+                for vertex in &mut mesh.vertices {
+                    vertex.color = effect.apply(vertex.color);
+                }
+            }
+            VectorGroupPrimitive::Textured {
+                color_transform, ..
+            } => {
+                *color_transform = color_transform.then(effect);
+            }
+            VectorGroupPrimitive::Gradient { paint, .. } => {
+                paint.color_transform = paint.color_transform.then(effect);
+            }
+        }
+    }
+}
+
+/// Submit color-only artwork directly, without an intermediate group bitmap.
+pub fn paint_vector_primitives(painter: &Painter, primitives: Vec<VectorGroupPrimitive>) {
+    for primitive in primitives {
+        match primitive {
+            VectorGroupPrimitive::Solid(mesh) => {
+                painter.add(Shape::Mesh(mesh));
+            }
+            VectorGroupPrimitive::Gradient { mesh, paint } => {
+                paint_gradient_mesh(painter, painter.clip_rect(), mesh, paint);
+            }
+            VectorGroupPrimitive::Textured {
+                mesh,
+                color_transform,
+            } => {
+                paint_cached_mesh_affine_color(
+                    painter,
+                    painter.clip_rect(),
+                    mesh,
+                    CachedMeshTransform {
+                        source_origin: Pos2::ZERO,
+                        target_origin: Pos2::ZERO,
+                        linear: [1.0, 0.0, 0.0, 1.0],
+                        fixed_screen_offset: false,
+                    },
+                    None,
+                    color_transform,
+                );
+            }
+        }
+    }
+}
+
+pub fn paint_mesh_color(painter: &Painter, mut mesh: Mesh, effect: ColorTransform) {
+    if effect.is_identity() {
+        painter.add(Shape::Mesh(mesh));
+    } else if mesh.texture_id == TextureId::default() {
+        for vertex in &mut mesh.vertices {
+            vertex.color = effect.apply(vertex.color);
+        }
+        painter.add(Shape::Mesh(mesh));
+    } else {
+        paint_vector_primitives(
+            painter,
+            vec![VectorGroupPrimitive::Textured {
+                mesh: Arc::new(mesh),
+                color_transform: effect,
+            }],
+        );
+    }
 }
 
 /// One independently blended placement inside a timeline layer that is clipped
@@ -916,7 +1070,7 @@ fn vector_group_rect(primitives: &[VectorGroupPrimitive]) -> Option<Rect> {
                     include(vertex.pos);
                 }
             }
-            VectorGroupPrimitive::Textured(mesh) => {
+            VectorGroupPrimitive::Textured { mesh, .. } => {
                 for vertex in &mesh.vertices {
                     include(vertex.pos);
                 }
@@ -1020,7 +1174,7 @@ fn filtered_group_signature(
             }
             // Bitmap content can change behind a stable TextureId. Keep this path
             // uncached until texture updates can participate in cache validation.
-            VectorGroupPrimitive::Textured(_) => return None,
+            VectorGroupPrimitive::Textured { .. } => return None,
             VectorGroupPrimitive::Gradient { mesh, paint } => {
                 signature.push(2);
                 if !push_mesh_signature(&mut signature, mesh) {
@@ -1051,6 +1205,14 @@ fn filtered_group_signature(
                     GradientKind::Radial => 1,
                 });
                 signature.extend(paint.tint.to_array().map(u64::from));
+                for value in paint
+                    .color_transform
+                    .scale
+                    .into_iter()
+                    .chain(paint.color_transform.offset)
+                {
+                    push_signature_f32(&mut signature, value);
+                }
                 signature.push(paint.stops.len() as u64);
                 for stop in paint.stops.iter() {
                     push_signature_f32(&mut signature, stop.position);
@@ -1078,9 +1240,8 @@ fn vector_group_mesh_counts(primitives: &[VectorGroupPrimitive]) -> (u64, u64, u
     for primitive in primitives {
         let mesh = match primitive {
             VectorGroupPrimitive::Solid(mesh) => mesh,
-            VectorGroupPrimitive::Textured(mesh) | VectorGroupPrimitive::Gradient { mesh, .. } => {
-                mesh.as_ref()
-            }
+            VectorGroupPrimitive::Textured { mesh, .. }
+            | VectorGroupPrimitive::Gradient { mesh, .. } => mesh.as_ref(),
         };
         if mesh.vertices.is_empty() || mesh.indices.is_empty() {
             continue;
@@ -1268,7 +1429,10 @@ fn paint_vector_group_fx_impl(
                     }
                     painter.add(Shape::Mesh(mesh));
                 }
-                VectorGroupPrimitive::Textured(mesh) => {
+                VectorGroupPrimitive::Textured {
+                    mesh,
+                    color_transform,
+                } => {
                     let mut mesh = (*mesh).clone();
                     for vertex in &mut mesh.vertices {
                         let [r, g, b, a] = vertex.color.to_array();
@@ -1385,6 +1549,7 @@ pub fn paint_gradient_mesh(
                 ((u16::from(color[2]) * u16::from(paint.tint.b())) / 255) as u8,
                 ((u16::from(color[3]) * u16::from(paint.tint.a())) / 255) as u8,
             );
+            vertex.color = paint.color_transform.apply(vertex.color);
             vertex.pos = reproject_cached_mesh_point_affine(
                 vertex.pos,
                 egui::Vec2::ZERO,
@@ -1667,6 +1832,10 @@ impl GlResources {
             gl.get_uniform_location(group_textured_program, "u_texture");
         let group_textured_srgb_uniform =
             gl.get_uniform_location(group_textured_program, "u_srgb_texture");
+        let group_textured_color_scale_uniform =
+            gl.get_uniform_location(group_textured_program, "u_color_scale");
+        let group_textured_color_offset_uniform =
+            gl.get_uniform_location(group_textured_program, "u_color_offset");
         let cached_solid_program = create_cached_solid_program(gl)?;
         let cached_solid_vao = gl
             .create_vertex_array()
@@ -1688,6 +1857,10 @@ impl GlResources {
             gl.get_uniform_location(cached_solid_program, "u_texture");
         let cached_solid_srgb_texture_uniform =
             gl.get_uniform_location(cached_solid_program, "u_srgb_texture");
+        let cached_solid_color_scale_uniform =
+            gl.get_uniform_location(cached_solid_program, "u_color_scale");
+        let cached_solid_color_offset_uniform =
+            gl.get_uniform_location(cached_solid_program, "u_color_offset");
 
         let gradient_program = create_gradient_program(gl)?;
         let gradient_vao = gl
@@ -1741,6 +1914,10 @@ impl GlResources {
         let gradient_stop_count_uniform = gl.get_uniform_location(gradient_program, "u_stop_count");
         let gradient_stops_uniform = gl.get_uniform_location(gradient_program, "u_stops");
         let gradient_tint_uniform = gl.get_uniform_location(gradient_program, "u_tint");
+        let gradient_color_scale_uniform =
+            gl.get_uniform_location(gradient_program, "u_color_scale");
+        let gradient_color_offset_uniform =
+            gl.get_uniform_location(gradient_program, "u_color_offset");
         let gradient_screen_offset_uniform =
             gl.get_uniform_location(gradient_program, "u_screen_offset");
         let gradient_offscreen_uniform = gl.get_uniform_location(gradient_program, "u_offscreen");
@@ -1807,6 +1984,8 @@ impl GlResources {
             group_textured_size_uniform,
             group_textured_texture_uniform,
             group_textured_srgb_uniform,
+            group_textured_color_scale_uniform,
+            group_textured_color_offset_uniform,
             cached_solid_program,
             cached_solid_vao,
             cached_solid_screen_size_uniform,
@@ -1818,6 +1997,8 @@ impl GlResources {
             cached_solid_screen_uv_tile_uniform,
             cached_solid_texture_uniform,
             cached_solid_srgb_texture_uniform,
+            cached_solid_color_scale_uniform,
+            cached_solid_color_offset_uniform,
             cached_solid_buffers: HashMap::new(),
             gradient_program,
             gradient_vao,
@@ -1832,6 +2013,8 @@ impl GlResources {
             gradient_stop_count_uniform,
             gradient_stops_uniform,
             gradient_tint_uniform,
+            gradient_color_scale_uniform,
+            gradient_color_offset_uniform,
             gradient_screen_offset_uniform,
             gradient_offscreen_uniform,
             gradient_buffers: HashMap::new(),
@@ -1994,6 +2177,7 @@ impl GlResources {
         screen_uv_tile: f32,
         fixed_screen_offset: bool,
         offscreen: bool,
+        color_transform: ColorTransform,
     ) {
         let key = Arc::as_ptr(mesh) as usize;
         let reusable = self
@@ -2147,6 +2331,18 @@ impl GlResources {
         gl.uniform_1_i32(
             self.cached_solid_srgb_texture_uniform.as_ref(),
             i32::from(self.source_srgb),
+        );
+        gl.uniform_3_f32(
+            self.cached_solid_color_scale_uniform.as_ref(),
+            color_transform.scale[0],
+            color_transform.scale[1],
+            color_transform.scale[2],
+        );
+        gl.uniform_3_f32(
+            self.cached_solid_color_offset_uniform.as_ref(),
+            color_transform.offset[0],
+            color_transform.offset[1],
+            color_transform.offset[2],
         );
         gl.draw_elements(glow::TRIANGLES, index_count, glow::UNSIGNED_INT, 0);
     }
@@ -2326,6 +2522,18 @@ impl GlResources {
             f32::from(tg) / 255.0,
             f32::from(tb) / 255.0,
             f32::from(ta) / 255.0,
+        );
+        gl.uniform_3_f32(
+            self.gradient_color_scale_uniform.as_ref(),
+            paint.color_transform.scale[0],
+            paint.color_transform.scale[1],
+            paint.color_transform.scale[2],
+        );
+        gl.uniform_3_f32(
+            self.gradient_color_offset_uniform.as_ref(),
+            paint.color_transform.offset[0],
+            paint.color_transform.offset[1],
+            paint.color_transform.offset[2],
         );
         gl.draw_elements(glow::TRIANGLES, cached.index_count, glow::UNSIGNED_INT, 0);
     }
@@ -2850,7 +3058,10 @@ impl GlResources {
                         draw_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
                     );
                 }
-                VectorGroupPrimitive::Textured(mesh) => {
+                VectorGroupPrimitive::Textured {
+                    mesh,
+                    color_transform,
+                } => {
                     if mesh.indices.is_empty() || mesh.vertices.is_empty() {
                         continue;
                     }
@@ -2924,6 +3135,18 @@ impl GlResources {
                     gl.uniform_1_i32(
                         self.group_textured_srgb_uniform.as_ref(),
                         i32::from(self.source_srgb),
+                    );
+                    gl.uniform_3_f32(
+                        self.group_textured_color_scale_uniform.as_ref(),
+                        color_transform.scale[0],
+                        color_transform.scale[1],
+                        color_transform.scale[2],
+                    );
+                    gl.uniform_3_f32(
+                        self.group_textured_color_offset_uniform.as_ref(),
+                        color_transform.offset[0],
+                        color_transform.offset[1],
+                        color_transform.offset[2],
                     );
                     let draw_started = std::time::Instant::now();
                     gl.draw_elements(
@@ -3111,6 +3334,18 @@ impl GlResources {
                         f32::from(tg) / 255.0,
                         f32::from(tb) / 255.0,
                         f32::from(ta) / 255.0,
+                    );
+                    gl.uniform_3_f32(
+                        self.gradient_color_scale_uniform.as_ref(),
+                        paint.color_transform.scale[0],
+                        paint.color_transform.scale[1],
+                        paint.color_transform.scale[2],
+                    );
+                    gl.uniform_3_f32(
+                        self.gradient_color_offset_uniform.as_ref(),
+                        paint.color_transform.offset[0],
+                        paint.color_transform.offset[1],
+                        paint.color_transform.offset[2],
                     );
                     let draw_started = std::time::Instant::now();
                     gl.draw_elements(glow::TRIANGLES, cached.index_count, glow::UNSIGNED_INT, 0);
@@ -3976,12 +4211,28 @@ uniform sampler2D u_texture;
 uniform int u_srgb_texture;
 in vec2 v_uv;
 in vec4 v_color;
+uniform vec3 u_color_scale;
+uniform vec3 u_color_offset;
 out vec4 out_color;
 vec3 srgb_gamma_from_linear(vec3 rgb) {
     bvec3 cutoff = lessThan(rgb, vec3(0.0031308));
     vec3 lower = rgb * vec3(12.92);
     vec3 higher = vec3(1.055) * pow(rgb, vec3(1.0 / 2.4)) - vec3(0.055);
     return mix(higher, lower, vec3(cutoff));
+}
+vec3 srgb_linear_from_gamma(vec3 rgb) {
+    bvec3 cutoff = lessThanEqual(rgb, vec3(0.04045));
+    vec3 lower = rgb / vec3(12.92);
+    vec3 higher = pow((rgb + vec3(0.055)) / vec3(1.055), vec3(2.4));
+    return mix(higher, lower, vec3(cutoff));
+}
+vec4 apply_color_effect(vec4 color) {
+    if (color.a <= 0.00001 ||
+        (all(equal(u_color_scale, vec3(1.0))) && all(equal(u_color_offset, vec3(0.0))))) return color;
+    // egui textures encode RGB after premultiplication in linear space.
+    vec3 straight = srgb_gamma_from_linear(srgb_linear_from_gamma(color.rgb) / color.a);
+    vec3 tinted = clamp(straight * u_color_scale + u_color_offset, 0.0, 1.0);
+    return vec4(srgb_gamma_from_linear(srgb_linear_from_gamma(tinted) * color.a), color.a);
 }
 void main() {
     vec4 sampled = texture(u_texture, v_uv);
@@ -3990,7 +4241,7 @@ void main() {
     }
     vec4 color = v_color * sampled;
     if (color.a <= 0.00001 && dot(color.rgb, color.rgb) <= 0.0000001) discard;
-    out_color = color;
+    out_color = apply_color_effect(color);
 }
 "#;
     let vertex = gl
@@ -4070,6 +4321,8 @@ uniform int u_stop_count;
 uniform sampler2D u_stops;
 uniform vec4 u_tint;
 in vec2 v_local;
+uniform vec3 u_color_scale;
+uniform vec3 u_color_offset;
 out vec4 out_color;
 vec4 stop_color(int index) {
     return texelFetch(u_stops, ivec2(index, 1), 0);
@@ -4109,6 +4362,7 @@ void main() {
     float t = u_gradient_kind == 0 ? (g.x + 1.0) * 0.5 : length(g);
     vec4 color = sample_gradient(t);
     color *= u_tint;
+    color.rgb = color.rgb * u_color_scale + u_color_offset;
     // q0/egui compositing is premultiplied-alpha.
     out_color = vec4(color.rgb * color.a, color.a);
 }
@@ -4366,6 +4620,8 @@ uniform sampler2D u_texture;
 uniform int u_srgb_texture;
 in vec2 v_uv;
 in vec4 v_color;
+uniform vec3 u_color_scale;
+uniform vec3 u_color_offset;
 out vec4 out_color;
 vec3 srgb_gamma_from_linear(vec3 rgb) {
     bvec3 cutoff = lessThan(rgb, vec3(0.0031308));
@@ -4373,12 +4629,27 @@ vec3 srgb_gamma_from_linear(vec3 rgb) {
     vec3 higher = vec3(1.055) * pow(rgb, vec3(1.0 / 2.4)) - vec3(0.055);
     return mix(higher, lower, vec3(cutoff));
 }
+vec3 srgb_linear_from_gamma(vec3 rgb) {
+    bvec3 cutoff = lessThanEqual(rgb, vec3(0.04045));
+    vec3 lower = rgb / vec3(12.92);
+    vec3 higher = pow((rgb + vec3(0.055)) / vec3(1.055), vec3(2.4));
+    return mix(higher, lower, vec3(cutoff));
+}
+vec4 apply_color_effect(vec4 color) {
+    if (color.a <= 0.00001 ||
+        (all(equal(u_color_scale, vec3(1.0))) && all(equal(u_color_offset, vec3(0.0))))) return color;
+    // egui textures encode RGB after premultiplication in linear space.
+    vec3 straight = srgb_gamma_from_linear(srgb_linear_from_gamma(color.rgb) / color.a);
+    vec3 tinted = clamp(straight * u_color_scale + u_color_offset, 0.0, 1.0);
+    return vec4(srgb_gamma_from_linear(srgb_linear_from_gamma(tinted) * color.a), color.a);
+}
 void main() {
     vec4 sampled = texture(u_texture, v_uv);
     if (u_srgb_texture != 0) {
         sampled = vec4(srgb_gamma_from_linear(sampled.rgb), sampled.a);
     }
-    out_color = v_color * sampled;
+    vec4 color = v_color * sampled;
+    out_color = apply_color_effect(color);
 }
 "#;
 
@@ -4508,6 +4779,7 @@ mod tests {
                 },
             }]),
             tint: Color32::WHITE,
+            color_transform: ColorTransform::default(),
         };
         let primitive = VectorGroupPrimitive::Gradient {
             mesh: Arc::new(Mesh::default()),

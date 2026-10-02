@@ -645,7 +645,7 @@ fn font_picker(ui: &mut egui::Ui, draft: &mut TextDraft) {
         .collect();
     let mut selected = None;
     egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.set_min_width(ui.available_width().max(160.0));
+        ui.set_min_width(ui.available_width());
         if matches.is_empty() {
             ui.label("No matching installed fonts");
         }

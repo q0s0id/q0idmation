@@ -13,6 +13,8 @@
 //! v25 native linear/radial RGBA fill gradients, and v26 independent X/Y blur
 //! and glow radii. v27 adds manually keyframed q0rg playback, v28 adds
 //! Animate-style project scenes, v29 library folders, and v30 timeline masks.
+//! v33 adds instance tint color/amount, mirroring q1s v34.
+//! v34 adds non-destructive audio cuts, source offsets, balance and fades.
 //! Older revisions remain readable.
 
 use crate::error::Error;
@@ -53,7 +55,10 @@ pub const Q0S_VERSION_SCENES: u16 = 28;
 pub const Q0S_VERSION_LIBRARY_FOLDERS: u16 = 29;
 pub const Q0S_VERSION_TIMELINE_MASKS: u16 = 30;
 pub const Q0S_VERSION_LAYER_FRAME_COUNTS: u16 = 31;
-pub const Q0S_VERSION_CURRENT: u16 = Q0S_VERSION_LAYER_FRAME_COUNTS;
+pub const Q0S_VERSION_RIG_POSE_KEYS: u16 = 32;
+pub const Q0S_VERSION_TINT: u16 = 33;
+pub const Q0S_VERSION_AUDIO_EDITING: u16 = 34;
+pub const Q0S_VERSION_CURRENT: u16 = Q0S_VERSION_AUDIO_EDITING;
 
 /// Serialise a `ProjectV2` as the current vector `.q0s` bytes. Internally we
 /// reuse the current `.q1s` writer and patch the magic+version header in-place
@@ -64,7 +69,17 @@ pub fn write_q0s_v2(project: &ProjectV2) -> Result<Vec<u8>, Error> {
         return Err(Error::Validation("v2 writer returned a short buffer"));
     }
     bytes[0..4].copy_from_slice(&Q0S_V2_MAGIC);
-    bytes[4..6].copy_from_slice(&Q0S_VERSION_CURRENT.to_le_bytes());
+    let q1s_version = u16::from_le_bytes([bytes[4], bytes[5]]);
+    let version = if q1s_version >= v2::Q1S_VERSION_AUDIO_EDITING {
+        Q0S_VERSION_AUDIO_EDITING
+    } else if q1s_version >= v2::Q1S_VERSION_TINT {
+        Q0S_VERSION_TINT
+    } else if q1s_version >= v2::Q1S_VERSION_RIG_POSE_KEYS {
+        Q0S_VERSION_RIG_POSE_KEYS
+    } else {
+        Q0S_VERSION_LAYER_FRAME_COUNTS
+    };
+    bytes[4..6].copy_from_slice(&version.to_le_bytes());
     Ok(bytes)
 }
 
@@ -154,6 +169,13 @@ pub fn parse_q0s_v2(bytes: &[u8]) -> Result<ProjectV2, Error> {
         Q0S_VERSION_LAYER_FRAME_COUNTS => {
             v2::parse_body_after_header(bytes, v2::Q1S_VERSION_LAYER_FRAME_COUNTS)
         }
+        Q0S_VERSION_AUDIO_EDITING => {
+            v2::parse_body_after_header(bytes, v2::Q1S_VERSION_AUDIO_EDITING)
+        }
+        Q0S_VERSION_TINT => v2::parse_body_after_header(bytes, v2::Q1S_VERSION_TINT),
+        Q0S_VERSION_RIG_POSE_KEYS => {
+            v2::parse_body_after_header(bytes, v2::Q1S_VERSION_RIG_POSE_KEYS)
+        }
         _ => Err(Error::UnsupportedVersion(version)),
     }
 }
@@ -197,7 +219,11 @@ pub fn is_q0s_v2(bytes: &[u8]) -> bool {
             | Q0S_VERSION_MANUAL_Q0RG_PLAYBACK
             | Q0S_VERSION_SCENES
             | Q0S_VERSION_LIBRARY_FOLDERS
-            | Q0S_VERSION_CURRENT
+            | Q0S_VERSION_TIMELINE_MASKS
+            | Q0S_VERSION_LAYER_FRAME_COUNTS
+            | Q0S_VERSION_RIG_POSE_KEYS
+            | Q0S_VERSION_TINT
+            | Q0S_VERSION_AUDIO_EDITING
     )
 }
 
@@ -331,7 +357,7 @@ mod tests {
         assert_eq!(&bytes[0..4], &Q0S_V2_MAGIC);
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_CURRENT
+            Q0S_VERSION_LAYER_FRAME_COUNTS
         );
         let parsed = parse_q0s_v2(&bytes).expect("parse");
         assert_eq!(parsed, project);
@@ -384,7 +410,7 @@ mod tests {
         let bytes = write_q0s_v2(&project).expect("write gradient q0s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_CURRENT
+            Q0S_VERSION_LAYER_FRAME_COUNTS
         );
         assert_eq!(parse_q0s_v2(&bytes).expect("parse gradient q0s"), project);
     }
@@ -431,7 +457,7 @@ mod tests {
         let bytes = write_q0s_v2(&project).expect("write placement fx q0s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_CURRENT
+            Q0S_VERSION_LAYER_FRAME_COUNTS
         );
         assert_eq!(
             parse_q0s_v2(&bytes).expect("parse placement fx q0s"),
@@ -447,7 +473,7 @@ mod tests {
         let bytes = write_q0s_v2(&project).expect("write audio clip q0s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_CURRENT
+            Q0S_VERSION_LAYER_FRAME_COUNTS
         );
         assert_eq!(parse_q0s_v2(&bytes).expect("parse audio clip q0s"), project);
     }
@@ -457,7 +483,7 @@ mod tests {
         let mut project = small_project();
         project.assets = vec![Asset::Q0v(v2::Q0vAsset {
             asset_id: 77,
-            bytes: test_audio_q0v_bytes(),
+            bytes: (test_audio_q0v_bytes()).into(),
         })];
         project.q0rgs[0].frame_count = 20;
         project.q0rgs[0].layers[0].placements.clear();
@@ -469,12 +495,13 @@ mod tests {
             asset_id: 77,
             gain: 0.625,
             muted: true,
+            ..Default::default()
         });
 
         let bytes = write_q0s_v2(&project).expect("write timeline audio q0s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_CURRENT
+            Q0S_VERSION_LAYER_FRAME_COUNTS
         );
         let parsed = parse_q0s_v2(&bytes).expect("parse timeline audio q0s");
         assert_eq!(parsed, project);
@@ -541,7 +568,7 @@ mod tests {
         project.assets.clear();
         project.assets.push(Asset::Q0v(v2::Q0vAsset {
             asset_id: 7,
-            bytes: test_q0v_bytes(),
+            bytes: (test_q0v_bytes()).into(),
         }));
         project
             .asset_names
@@ -578,7 +605,7 @@ mod tests {
         let bytes = write_q0s_v2(&project).expect("write eased q0s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_CURRENT
+            Q0S_VERSION_LAYER_FRAME_COUNTS
         );
         assert_eq!(parse_q0s_v2(&bytes).expect("parse eased q0s"), project);
     }
@@ -629,7 +656,7 @@ mod tests {
         let bytes = write_q0s_v2(&project).expect("write appearance q0s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_CURRENT
+            Q0S_VERSION_LAYER_FRAME_COUNTS
         );
         assert_eq!(parse_q0s_v2(&bytes).expect("parse appearance q0s"), project);
     }
@@ -686,7 +713,7 @@ mod tests {
         let bytes = write_q0s_v2(&project).expect("write q0s fragments");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_CURRENT
+            Q0S_VERSION_LAYER_FRAME_COUNTS
         );
         assert_eq!(parse_q0s_v2(&bytes).expect("parse q0s fragments"), project);
     }
@@ -756,7 +783,7 @@ mod tests {
         let bytes = write_q0s_v2(&project).expect("write affine q0s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_CURRENT
+            Q0S_VERSION_LAYER_FRAME_COUNTS
         );
         let parsed = parse_q0s_v2(&bytes).expect("parse affine q0s");
         assert_eq!(
@@ -910,7 +937,7 @@ mod tests {
         let bytes = write_q0s_v2(&project).expect("write nested q0s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_CURRENT
+            Q0S_VERSION_LAYER_FRAME_COUNTS
         );
         assert_eq!(parse_q0s_v2(&bytes).expect("parse nested q0s"), project);
     }
@@ -940,7 +967,7 @@ mod tests {
         project.assets.clear();
         project.assets.push(Asset::Q0v(v2::Q0vAsset {
             asset_id: 7,
-            bytes: test_q0v_bytes(),
+            bytes: (test_q0v_bytes()).into(),
         }));
         project.asset_names.insert(7, "embedded video".to_string());
         project.q0rgs[0].layers[0].placements[0].target = Target::Asset(7);
@@ -948,7 +975,7 @@ mod tests {
         let bytes = write_q0s_v2(&project).expect("write q0v q0s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_CURRENT
+            Q0S_VERSION_LAYER_FRAME_COUNTS
         );
         assert_eq!(parse_q0s_v2(&bytes).expect("parse q0v q0s"), project);
     }
@@ -1004,7 +1031,7 @@ mod tests {
         let bytes = write_q0s_v2(&project).expect("write layer-state q0s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_CURRENT
+            Q0S_VERSION_LAYER_FRAME_COUNTS
         );
         let parsed = parse_q0s_v2(&bytes).expect("parse layer-state q0s");
         assert_eq!(parsed, project);
@@ -1111,7 +1138,7 @@ mod tests {
         let bytes = write_q0s_v2(&project).expect("write rigged q0s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_CURRENT
+            Q0S_VERSION_LAYER_FRAME_COUNTS
         );
         assert_eq!(parse_q0s_v2(&bytes).expect("parse rigged q0s"), project);
     }
@@ -1167,7 +1194,7 @@ mod tests {
         let bytes = write_q0s_v2(&project).expect("write deformer q0s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_CURRENT
+            Q0S_VERSION_LAYER_FRAME_COUNTS
         );
         assert_eq!(parse_q0s_v2(&bytes).expect("parse deformer q0s"), project);
     }
@@ -1220,7 +1247,7 @@ mod tests {
         let bytes = write_q0s_v2(&project).expect("write phase h q0s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_CURRENT
+            Q0S_VERSION_LAYER_FRAME_COUNTS
         );
         assert_eq!(parse_q0s_v2(&bytes).expect("parse phase h q0s"), project);
     }
@@ -1254,7 +1281,7 @@ mod tests {
         let bytes = write_q0s_v2(&project).expect("write project runtime q0s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_CURRENT
+            Q0S_VERSION_LAYER_FRAME_COUNTS
         );
         assert_eq!(
             parse_q0s_v2(&bytes).expect("parse project runtime q0s"),
@@ -1301,7 +1328,7 @@ mod tests {
         assert!(is_q0s_v2(&bytes));
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_CURRENT
+            Q0S_VERSION_LAYER_FRAME_COUNTS
         );
         assert_eq!(parse_q0s_v2(&bytes).unwrap(), project);
     }

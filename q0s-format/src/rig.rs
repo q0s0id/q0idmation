@@ -74,6 +74,14 @@ pub fn rig_for_q0rg_mut(project: &mut ProjectV2, q0rg_id: u16) -> Option<&mut Ri
 }
 
 pub fn evaluate_rig(rig: &RigAsset, frame: f32, overrides: &[RigControlOverride]) -> RigPose {
+    let mut binding_offsets = rig
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            node.binding
+                .map(|binding| (node.node_id, binding.bind_offset))
+        })
+        .collect::<HashMap<_, _>>();
     let mut controls = rig
         .controls
         .iter()
@@ -115,6 +123,36 @@ pub fn evaluate_rig(rig: &RigAsset, frame: f32, overrides: &[RigControlOverride]
             continue;
         };
         match channel.property {
+            RigPropertyRef::BindingA11(id) => {
+                if let Some(offset) = binding_offsets.get_mut(&id) {
+                    offset.a11 = value;
+                }
+            }
+            RigPropertyRef::BindingA12(id) => {
+                if let Some(offset) = binding_offsets.get_mut(&id) {
+                    offset.a12 = value;
+                }
+            }
+            RigPropertyRef::BindingA21(id) => {
+                if let Some(offset) = binding_offsets.get_mut(&id) {
+                    offset.a21 = value;
+                }
+            }
+            RigPropertyRef::BindingA22(id) => {
+                if let Some(offset) = binding_offsets.get_mut(&id) {
+                    offset.a22 = value;
+                }
+            }
+            RigPropertyRef::BindingTx(id) => {
+                if let Some(offset) = binding_offsets.get_mut(&id) {
+                    offset.tx = value;
+                }
+            }
+            RigPropertyRef::BindingTy(id) => {
+                if let Some(offset) = binding_offsets.get_mut(&id) {
+                    offset.ty = value;
+                }
+            }
             RigPropertyRef::ControlX(id) => {
                 if let Some(control) = controls.get_mut(&id) {
                     control.x = value;
@@ -275,6 +313,12 @@ pub fn evaluate_rig(rig: &RigAsset, frame: f32, overrides: &[RigControlOverride]
         let t = ((source.value - driver.source_min) / span).clamp(0.0, 1.0);
         let value = driver.target_min + (driver.target_max - driver.target_min) * t;
         match driver.target {
+            RigPropertyRef::BindingA11(_)
+            | RigPropertyRef::BindingA12(_)
+            | RigPropertyRef::BindingA21(_)
+            | RigPropertyRef::BindingA22(_)
+            | RigPropertyRef::BindingTx(_)
+            | RigPropertyRef::BindingTy(_) => {}
             RigPropertyRef::NodeTx(id) => {
                 if let Some(local) = locals.get_mut(&id) {
                     local.tx = value;
@@ -520,7 +564,8 @@ pub fn evaluate_rig(rig: &RigAsset, frame: f32, overrides: &[RigControlOverride]
         .nodes
         .iter()
         .filter_map(|node| {
-            let binding = node.binding?;
+            let mut binding = node.binding?;
+            binding.bind_offset = *binding_offsets.get(&node.node_id)?;
             let world = *node_world.get(&node.node_id)?;
             Some(resolved_binding(node.node_id, binding, world))
         })
@@ -572,7 +617,20 @@ fn sample_keys(keys: &[RigKey], frame: f32) -> Option<f32> {
 }
 
 fn rest_property_value(rig: &RigAsset, property: RigPropertyRef) -> Option<f32> {
+    let binding_offset = |id| {
+        rig.nodes
+            .iter()
+            .find(|node| node.node_id == id)
+            .and_then(|node| node.binding)
+            .map(|binding| binding.bind_offset)
+    };
     match property {
+        RigPropertyRef::BindingA11(id) => binding_offset(id).map(|offset| offset.a11),
+        RigPropertyRef::BindingA12(id) => binding_offset(id).map(|offset| offset.a12),
+        RigPropertyRef::BindingA21(id) => binding_offset(id).map(|offset| offset.a21),
+        RigPropertyRef::BindingA22(id) => binding_offset(id).map(|offset| offset.a22),
+        RigPropertyRef::BindingTx(id) => binding_offset(id).map(|offset| offset.tx),
+        RigPropertyRef::BindingTy(id) => binding_offset(id).map(|offset| offset.ty),
         RigPropertyRef::ControlX(id) => rig
             .controls
             .iter()
@@ -636,6 +694,12 @@ fn current_property_value(
     constraint_weights: &HashMap<u16, f32>,
 ) -> Option<f32> {
     match property {
+        RigPropertyRef::BindingA11(_)
+        | RigPropertyRef::BindingA12(_)
+        | RigPropertyRef::BindingA21(_)
+        | RigPropertyRef::BindingA22(_)
+        | RigPropertyRef::BindingTx(_)
+        | RigPropertyRef::BindingTy(_) => None,
         RigPropertyRef::ControlX(id) => controls.get(&id).map(|v| v.x),
         RigPropertyRef::ControlY(id) => controls.get(&id).map(|v| v.y),
         RigPropertyRef::ControlValue(id) => controls.get(&id).map(|v| v.value),
@@ -656,6 +720,12 @@ fn set_property_value(
     constraint_weights: &mut HashMap<u16, f32>,
 ) {
     match property {
+        RigPropertyRef::BindingA11(_)
+        | RigPropertyRef::BindingA12(_)
+        | RigPropertyRef::BindingA21(_)
+        | RigPropertyRef::BindingA22(_)
+        | RigPropertyRef::BindingTx(_)
+        | RigPropertyRef::BindingTy(_) => {}
         RigPropertyRef::ControlX(id) => {
             if let Some(v) = controls.get_mut(&id) {
                 v.x = value;
@@ -820,6 +890,12 @@ pub fn mirror_pose_values(rig: &RigAsset, pose_id: u16) -> Option<Vec<RigPoseVal
 
 fn property_sort_key(property: RigPropertyRef) -> (u8, u16) {
     match property {
+        RigPropertyRef::BindingA11(id) => (9, id),
+        RigPropertyRef::BindingA12(id) => (10, id),
+        RigPropertyRef::BindingA21(id) => (11, id),
+        RigPropertyRef::BindingA22(id) => (12, id),
+        RigPropertyRef::BindingTx(id) => (13, id),
+        RigPropertyRef::BindingTy(id) => (14, id),
         RigPropertyRef::NodeTx(id) => (0, id),
         RigPropertyRef::NodeTy(id) => (1, id),
         RigPropertyRef::NodeRotation(id) => (2, id),
@@ -1043,6 +1119,39 @@ pub fn control_world_position(rig: &RigAsset, pose: &RigPose, control_id: u16) -
             .and_then(|node| pose.node_world.get(&node))
             .map(|world| world.apply(Vec2::new(0.0, 0.0))),
     }
+}
+
+pub fn capture_timeline_pose_values(rig: &RigAsset, frame: f32) -> Vec<RigPoseValue> {
+    let mut values = capture_pose_values(rig, frame);
+    let pose = evaluate_rig(rig, frame, &[]);
+    for node in &rig.nodes {
+        let Some(binding) = node.binding else {
+            continue;
+        };
+        let Some(inverse) = pose
+            .node_world
+            .get(&node.node_id)
+            .and_then(|world| world.inverse())
+        else {
+            continue;
+        };
+        let Some(world) = pose.binding_transform(binding.instance_id) else {
+            continue;
+        };
+        let offset = Affine::compose(inverse, world);
+        for (property, value) in [
+            (RigPropertyRef::BindingA11(node.node_id), offset.a11),
+            (RigPropertyRef::BindingA12(node.node_id), offset.a12),
+            (RigPropertyRef::BindingA21(node.node_id), offset.a21),
+            (RigPropertyRef::BindingA22(node.node_id), offset.a22),
+            (RigPropertyRef::BindingTx(node.node_id), offset.tx),
+            (RigPropertyRef::BindingTy(node.node_id), offset.ty),
+        ] {
+            values.push(RigPoseValue { property, value });
+        }
+    }
+    values.sort_by_key(|value| property_sort_key(value.property));
+    values
 }
 
 pub fn capture_pose_values(rig: &RigAsset, frame: f32) -> Vec<RigPoseValue> {
@@ -1504,6 +1613,35 @@ pub fn build_skin_anchor_weights(
                 })
         })
         .collect()
+}
+
+/// Author a held pose without changing the rest value or earlier poses.
+/// Keep an explicitly chosen outgoing tween when updating an existing key.
+pub fn upsert_pose_key(rig: &mut RigAsset, property: RigPropertyRef, frame: u16, value: f32) {
+    let baseline = rig
+        .channels
+        .iter()
+        .find(|channel| channel.property == property)
+        .and_then(|channel| sample_keys(&channel.keys, 0.0))
+        .or_else(|| rest_property_value(rig, property));
+    let has_prior = rig
+        .channels
+        .iter()
+        .find(|channel| channel.property == property)
+        .is_some_and(|channel| channel.keys.iter().any(|key| key.frame < frame));
+    if frame > 0 && !has_prior {
+        if let Some(baseline) = baseline {
+            upsert_channel_key(rig, property, 0, baseline, Easing::Hold);
+        }
+    }
+    let easing = rig
+        .channels
+        .iter()
+        .find(|channel| channel.property == property)
+        .and_then(|channel| channel.keys.iter().find(|key| key.frame == frame))
+        .map(|key| key.easing)
+        .unwrap_or(Easing::Hold);
+    upsert_channel_key(rig, property, frame, value, easing);
 }
 
 pub fn upsert_channel_key(

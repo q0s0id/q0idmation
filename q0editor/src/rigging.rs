@@ -546,6 +546,12 @@ fn apply_pose_values(
             RigPropertyRef::NodeTx(id)
             | RigPropertyRef::NodeTy(id)
             | RigPropertyRef::NodeScaleX(id)
+            | RigPropertyRef::BindingA11(id)
+            | RigPropertyRef::BindingA12(id)
+            | RigPropertyRef::BindingA21(id)
+            | RigPropertyRef::BindingA22(id)
+            | RigPropertyRef::BindingTx(id)
+            | RigPropertyRef::BindingTy(id)
             | RigPropertyRef::NodeScaleY(id) => {
                 set_node_property(
                     project,
@@ -707,6 +713,12 @@ pub fn remove_node_subtree(project: &mut ProjectV2, q0rg_id: u16, node_id: u16) 
         | RigPropertyRef::NodeTy(id)
         | RigPropertyRef::NodeRotation(id)
         | RigPropertyRef::NodeScaleX(id)
+        | RigPropertyRef::BindingA11(id)
+        | RigPropertyRef::BindingA12(id)
+        | RigPropertyRef::BindingA21(id)
+        | RigPropertyRef::BindingA22(id)
+        | RigPropertyRef::BindingTx(id)
+        | RigPropertyRef::BindingTy(id)
         | RigPropertyRef::NodeScaleY(id) => !removed.contains(&id),
         RigPropertyRef::ControlX(id)
         | RigPropertyRef::ControlY(id)
@@ -720,6 +732,12 @@ pub fn remove_node_subtree(project: &mut ProjectV2, q0rg_id: u16, node_id: u16) 
                 | RigPropertyRef::NodeTy(id)
                 | RigPropertyRef::NodeRotation(id)
                 | RigPropertyRef::NodeScaleX(id)
+                | RigPropertyRef::BindingA11(id)
+                | RigPropertyRef::BindingA12(id)
+                | RigPropertyRef::BindingA21(id)
+                | RigPropertyRef::BindingA22(id)
+                | RigPropertyRef::BindingTx(id)
+                | RigPropertyRef::BindingTy(id)
                 | RigPropertyRef::NodeScaleY(id) => !removed.contains(&id),
                 RigPropertyRef::ConstraintWeight(id) => remaining_constraints.contains(&id),
                 RigPropertyRef::ControlX(id)
@@ -733,6 +751,12 @@ pub fn remove_node_subtree(project: &mut ProjectV2, q0rg_id: u16, node_id: u16) 
             | RigPropertyRef::NodeTy(id)
             | RigPropertyRef::NodeRotation(id)
             | RigPropertyRef::NodeScaleX(id)
+            | RigPropertyRef::BindingA11(id)
+            | RigPropertyRef::BindingA12(id)
+            | RigPropertyRef::BindingA21(id)
+            | RigPropertyRef::BindingA22(id)
+            | RigPropertyRef::BindingTx(id)
+            | RigPropertyRef::BindingTy(id)
             | RigPropertyRef::NodeScaleY(id) => !removed.contains(&id),
             RigPropertyRef::ConstraintWeight(id) => remaining_constraints.contains(&id),
             RigPropertyRef::ControlX(id)
@@ -1259,16 +1283,22 @@ pub fn bind_selected_placement_to_node(
         instance_id,
         bind_offset,
     });
+    rig.channels
+        .retain(|channel| channel.property.binding_node_id() != Some(node_id));
     Ok(())
 }
 
 pub fn unbind_node(project: &mut ProjectV2, q0rg_id: u16, node_id: u16) -> bool {
-    let Some(node) = rig_for_q0rg_mut(project, q0rg_id)
-        .and_then(|rig| rig.nodes.iter_mut().find(|node| node.node_id == node_id))
-    else {
+    let Some(rig) = rig_for_q0rg_mut(project, q0rg_id) else {
         return false;
     };
-    node.binding.take().is_some()
+    let Some(node) = rig.nodes.iter_mut().find(|node| node.node_id == node_id) else {
+        return false;
+    };
+    let changed = node.binding.take().is_some();
+    rig.channels
+        .retain(|channel| channel.property.binding_node_id() != Some(node_id));
+    changed
 }
 
 pub fn add_rotation_control(
@@ -1458,20 +1488,8 @@ fn set_control_position(
         return false;
     }
     if auto_key {
-        q0s_format::rig::upsert_channel_key(
-            rig,
-            RigPropertyRef::ControlX(control_id),
-            frame,
-            x,
-            Easing::Linear,
-        );
-        q0s_format::rig::upsert_channel_key(
-            rig,
-            RigPropertyRef::ControlY(control_id),
-            frame,
-            y,
-            Easing::Linear,
-        );
+        q0s_format::rig::upsert_pose_key(rig, RigPropertyRef::ControlX(control_id), frame, x);
+        q0s_format::rig::upsert_pose_key(rig, RigPropertyRef::ControlY(control_id), frame, y);
     } else if let Some(control) = rig
         .controls
         .iter_mut()
@@ -1503,12 +1521,11 @@ fn set_control_value(
     };
     let value = value.clamp(control.min_value, control.max_value);
     if auto_key {
-        q0s_format::rig::upsert_channel_key(
+        q0s_format::rig::upsert_pose_key(
             rig,
             RigPropertyRef::ControlValue(control_id),
             frame,
             value,
-            Easing::Linear,
         );
     } else if let Some(control) = rig
         .controls
@@ -1543,12 +1560,11 @@ pub(crate) fn set_node_rotation(
         .map(|control| control.control_id)
     {
         if auto_key {
-            q0s_format::rig::upsert_channel_key(
+            q0s_format::rig::upsert_pose_key(
                 rig,
                 RigPropertyRef::ControlValue(control_id),
                 frame,
                 rotation,
-                Easing::Linear,
             );
         } else if let Some(control) = rig
             .controls
@@ -1558,12 +1574,11 @@ pub(crate) fn set_node_rotation(
             control.rest_value = rotation.clamp(control.min_value, control.max_value);
         }
     } else if auto_key {
-        q0s_format::rig::upsert_channel_key(
+        q0s_format::rig::upsert_pose_key(
             rig,
             RigPropertyRef::NodeRotation(node_id),
             frame,
             rotation,
-            Easing::Linear,
         );
     } else if let Some(node) = rig.nodes.iter_mut().find(|node| node.node_id == node_id) {
         node.rest.rotation = rotation;
@@ -1585,6 +1600,12 @@ fn set_node_property(
         RigPropertyRef::NodeTx(id)
             | RigPropertyRef::NodeTy(id)
             | RigPropertyRef::NodeScaleX(id)
+            | RigPropertyRef::BindingA11(id)
+            | RigPropertyRef::BindingA12(id)
+            | RigPropertyRef::BindingA21(id)
+            | RigPropertyRef::BindingA22(id)
+            | RigPropertyRef::BindingTx(id)
+            | RigPropertyRef::BindingTy(id)
             | RigPropertyRef::NodeScaleY(id)
             if id == node_id
     );
@@ -1604,7 +1625,7 @@ fn set_node_property(
         return false;
     };
     if auto_key {
-        q0s_format::rig::upsert_channel_key(rig, property, frame, value, Easing::Linear);
+        q0s_format::rig::upsert_pose_key(rig, property, frame, value);
         return true;
     }
     let _ = node;
@@ -1643,10 +1664,22 @@ pub(crate) fn set_node_world_transform_from_binding(
         return false;
     };
     let instance_id = binding.instance_id;
-    let Some(binding_inverse) = binding.bind_offset.inverse() else {
+    let pose = evaluate_rig(&rig_snapshot, f32::from(frame), &[]);
+    // Use the correction keyed at this frame instead of the global bind matrix.
+    let Some(node_inverse) = pose
+        .node_world
+        .get(&node_id)
+        .and_then(|world| world.inverse())
+    else {
         return false;
     };
-    let pose = evaluate_rig(&rig_snapshot, f32::from(frame), &[]);
+    let Some(current_object_world) = pose.binding_transform(instance_id) else {
+        return false;
+    };
+    let binding_offset = Affine::compose(node_inverse, current_object_world);
+    let Some(binding_inverse) = binding_offset.inverse() else {
+        return false;
+    };
     let parent_world = node
         .parent
         .and_then(|parent| pose.node_world.get(&parent).copied())
@@ -1715,6 +1748,22 @@ pub(crate) fn set_node_world_transform_from_binding(
         return false;
     };
     let bind_offset = Affine::compose(updated_node_inverse, object_world);
+    if auto_key {
+        let Some(rig) = rig_for_q0rg_mut(project, q0rg_id) else {
+            return false;
+        };
+        for (property, value) in [
+            (RigPropertyRef::BindingA11(node_id), bind_offset.a11),
+            (RigPropertyRef::BindingA12(node_id), bind_offset.a12),
+            (RigPropertyRef::BindingA21(node_id), bind_offset.a21),
+            (RigPropertyRef::BindingA22(node_id), bind_offset.a22),
+            (RigPropertyRef::BindingTx(node_id), bind_offset.tx),
+            (RigPropertyRef::BindingTy(node_id), bind_offset.ty),
+        ] {
+            q0s_format::rig::upsert_pose_key(rig, property, frame, value);
+        }
+        return true;
+    }
     let Some(binding) = rig_for_q0rg_mut(project, q0rg_id)
         .and_then(|rig| rig.nodes.iter_mut().find(|node| node.node_id == node_id))
         .and_then(|node| node.binding.as_mut())
@@ -1857,6 +1906,7 @@ pub fn render_properties(app: &mut EditorApp, ui: &mut Ui) {
         }
     });
     ui.checkbox(&mut app.session.rig_auto_key, "Auto-key controls");
+    render_pose_tween_options(app, ui, q0rg_id);
     if !app.session.rig_auto_key {
         ui.label(
             egui::RichText::new("auto-key off: dragging edits the control's default/rest value")
@@ -2285,6 +2335,12 @@ fn render_pro_controls(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
             | RigPropertyRef::NodeTy(_)
             | RigPropertyRef::NodeRotation(_)
             | RigPropertyRef::NodeScaleX(_)
+            | RigPropertyRef::BindingA11(_)
+            | RigPropertyRef::BindingA12(_)
+            | RigPropertyRef::BindingA21(_)
+            | RigPropertyRef::BindingA22(_)
+            | RigPropertyRef::BindingTx(_)
+            | RigPropertyRef::BindingTy(_)
             | RigPropertyRef::NodeScaleY(_) => true,
             RigPropertyRef::ConstraintWeight(id) => remaining_constraints.contains(&id),
         });
@@ -2429,6 +2485,12 @@ fn rig_property_label(rig: &RigAsset, property: RigPropertyRef) -> String {
         RigPropertyRef::NodeRotation(id) => format!("{} rotation", node_name(id)),
         RigPropertyRef::NodeScaleX(id) => format!("{} scale x", node_name(id)),
         RigPropertyRef::NodeScaleY(id) => format!("{} scale y", node_name(id)),
+        RigPropertyRef::BindingA11(id)
+        | RigPropertyRef::BindingA12(id)
+        | RigPropertyRef::BindingA21(id)
+        | RigPropertyRef::BindingA22(id)
+        | RigPropertyRef::BindingTx(id)
+        | RigPropertyRef::BindingTy(id) => format!("{} binding correction", node_name(id)),
         RigPropertyRef::ConstraintWeight(id) => format!("constraint #{id} weight"),
         RigPropertyRef::ControlX(id) => format!("control #{id} x"),
         RigPropertyRef::ControlY(id) => format!("control #{id} y"),
@@ -2896,6 +2958,154 @@ fn render_pose_library(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
     }
 }
 
+pub(crate) fn render_pose_tween_options(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
+    let Some(rig) = rig_for_q0rg(&app.state.project, q0rg_id) else {
+        return;
+    };
+    let selected_instance = match app.session.selection {
+        Selection::Placement {
+            q0rg_id: owner,
+            layer_id,
+            placement_idx,
+        } if owner == q0rg_id => app
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == owner)
+            .and_then(|q0rg| q0rg.layers.iter().find(|layer| layer.layer_id == layer_id))
+            .and_then(|layer| layer.placements.get(placement_idx))
+            .map(|placement| placement.instance_id),
+        _ => None,
+    };
+    let selected_node = selected_instance
+        .and_then(|instance_id| {
+            rig.nodes
+                .iter()
+                .find(|node| {
+                    node.binding
+                        .is_some_and(|binding| binding.instance_id == instance_id)
+                })
+                .map(|node| node.node_id)
+        })
+        .or(app.session.rig_selected_node);
+    let selected_control = if selected_instance.is_some() {
+        None
+    } else {
+        app.session.rig_selected_control
+    };
+    let frame = app.session.current_frame;
+    let mut spans = Vec::new();
+    for channel in &rig.channels {
+        let relevant = match channel.property {
+            RigPropertyRef::ControlX(id)
+            | RigPropertyRef::ControlY(id)
+            | RigPropertyRef::ControlValue(id) => selected_control.map_or_else(
+                || {
+                    selected_node.is_none_or(|node_id| {
+                        rig.controls.iter().any(|control| {
+                            control.control_id == id && control.target_node == Some(node_id)
+                        })
+                    })
+                },
+                |control_id| control_id == id,
+            ),
+            RigPropertyRef::NodeTx(id)
+            | RigPropertyRef::NodeTy(id)
+            | RigPropertyRef::NodeRotation(id)
+            | RigPropertyRef::NodeScaleX(id)
+            | RigPropertyRef::NodeScaleY(id)
+            | RigPropertyRef::BindingA11(id)
+            | RigPropertyRef::BindingA12(id)
+            | RigPropertyRef::BindingA21(id)
+            | RigPropertyRef::BindingA22(id)
+            | RigPropertyRef::BindingTx(id)
+            | RigPropertyRef::BindingTy(id) => {
+                selected_control.is_none() && selected_node.is_none_or(|node_id| node_id == id)
+            }
+            RigPropertyRef::ConstraintWeight(_) => {
+                selected_control.is_none() && selected_node.is_none()
+            }
+        };
+        if !relevant {
+            continue;
+        }
+        let Some(start) = channel
+            .keys
+            .iter()
+            .filter(|key| key.frame <= frame)
+            .max_by_key(|key| key.frame)
+        else {
+            continue;
+        };
+        let start = if channel.keys.iter().any(|key| key.frame > start.frame) {
+            Some(start)
+        } else {
+            channel
+                .keys
+                .iter()
+                .filter(|key| key.frame < start.frame)
+                .max_by_key(|key| key.frame)
+        };
+        if let Some(start) = start {
+            spans.push((channel.property, start.frame, start.easing));
+        }
+    }
+    let mut tween = spans.iter().any(|(_, _, easing)| *easing != Easing::Hold);
+    let mut easing = spans
+        .iter()
+        .find_map(|(_, _, easing)| (*easing != Easing::Hold).then_some(*easing))
+        .unwrap_or(Easing::Linear);
+    let mut requested = None;
+    ui.add_enabled_ui(!spans.is_empty(), |ui| {
+        if ui.checkbox(&mut tween, "Tween between poses").on_hover_text(
+            "Applies to the selected bone/control's surrounding pose keys. New poses hold by default."
+        ).changed() {
+            requested = Some(if tween { easing } else { Easing::Hold });
+        }
+        if tween {
+            egui::ComboBox::from_id_source(("rig_pose_easing", q0rg_id))
+                .selected_text(crate::easing::easing_label(easing)).show_ui(ui, |ui| {
+                    if ui.selectable_value(&mut easing, Easing::Linear, "Linear").changed() {
+                        requested = Some(easing);
+                    }
+                    for family in q0s_format::v2::EasingFamily::ALL {
+                        for mode in q0s_format::v2::EasingMode::ALL {
+                            let value = Easing::Preset { family, mode };
+                            if ui.selectable_value(&mut easing, value, format!("{} {}", mode.label(), family.label())).changed() {
+                                requested = Some(easing);
+                            }
+                        }
+                    }
+                });
+        }
+    });
+    if spans.is_empty() {
+        ui.label(egui::RichText::new("Add a second pose key to create a tween").small());
+    }
+    if let Some(easing) = requested {
+        app.history.snapshot(&app.state.project);
+        if let Some(rig) = rig_for_q0rg_mut(&mut app.state.project, q0rg_id) {
+            for (property, frame, _) in spans {
+                if let Some(key) = rig
+                    .channels
+                    .iter_mut()
+                    .find(|channel| channel.property == property)
+                    .and_then(|channel| channel.keys.iter_mut().find(|key| key.frame == frame))
+                {
+                    key.easing = easing;
+                }
+            }
+            app.state.mark_dirty();
+            app.session.status = if easing == Easing::Hold {
+                "rig tween removed; poses hold".into()
+            } else {
+                "rig tween applied between pose keys".into()
+            };
+        }
+    }
+}
+
 fn set_constraint_weight(
     project: &mut ProjectV2,
     q0rg_id: u16,
@@ -2916,12 +3126,11 @@ fn set_constraint_weight(
         return false;
     }
     if auto_key {
-        q0s_format::rig::upsert_channel_key(
+        q0s_format::rig::upsert_pose_key(
             rig,
             RigPropertyRef::ConstraintWeight(constraint_id),
             frame,
             weight,
-            Easing::Linear,
         );
     } else if let Some(constraint) = rig
         .constraints
@@ -4935,6 +5144,12 @@ fn render_pro_graph(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                         | RigPropertyRef::NodeTy(id)
                         | RigPropertyRef::NodeRotation(id)
                         | RigPropertyRef::NodeScaleX(id)
+                        | RigPropertyRef::BindingA11(id)
+                        | RigPropertyRef::BindingA12(id)
+                        | RigPropertyRef::BindingA21(id)
+                        | RigPropertyRef::BindingA22(id)
+                        | RigPropertyRef::BindingTx(id)
+                        | RigPropertyRef::BindingTy(id)
                         | RigPropertyRef::NodeScaleY(id) => {
                             if let Some(to) = bone_rects.get(&id) {
                                 edge(*from, *to, accent);
@@ -5572,8 +5787,24 @@ mod tests {
             .iter()
             .find(|channel| channel.property == RigPropertyRef::ControlValue(control))
             .unwrap();
-        assert_eq!(channel.keys[0].frame, 8);
-        assert_eq!(channel.keys[0].value, 0.75);
+        assert_eq!(
+            channel
+                .keys
+                .iter()
+                .find(|key| key.frame == 8)
+                .unwrap()
+                .frame,
+            8
+        );
+        assert_eq!(
+            channel
+                .keys
+                .iter()
+                .find(|key| key.frame == 8)
+                .unwrap()
+                .value,
+            0.75
+        );
     }
 
     #[test]
@@ -5642,8 +5873,24 @@ mod tests {
             .iter()
             .find(|channel| channel.property == RigPropertyRef::NodeRotation(root))
             .expect("simple FK rotation channel");
-        assert_eq!(channel.keys[0].frame, 6);
-        assert_eq!(channel.keys[0].value, 0.8);
+        assert_eq!(
+            channel
+                .keys
+                .iter()
+                .find(|key| key.frame == 6)
+                .unwrap()
+                .frame,
+            6
+        );
+        assert_eq!(
+            channel
+                .keys
+                .iter()
+                .find(|key| key.frame == 6)
+                .unwrap()
+                .value,
+            0.8
+        );
     }
 
     #[test]

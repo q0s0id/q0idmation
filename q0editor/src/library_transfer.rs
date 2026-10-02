@@ -355,6 +355,66 @@ pub fn import_library_item(
     Ok((out, imported_root))
 }
 
+/// Give a symbol its own complete editable dependency graph. Shared references
+/// inside the copy stay shared, but none of its assets or nested symbols alias
+/// the original. Keep the copies in their source library folders.
+pub fn duplicate_symbol(project: &ProjectV2, root_id: u16) -> Result<(ProjectV2, u16), String> {
+    use q0s_format::v2::LibraryItemReference;
+
+    let closure = collect_transfer_closure(project, LibraryItem::Q0rg(root_id))?;
+    let (mut out, imported) = import_library_item(project, project, LibraryItem::Q0rg(root_id))?;
+    let LibraryItem::Q0rg(new_root_id) = imported else {
+        return Err("duplicated library item is not a symbol".to_string());
+    };
+    let mut names = project
+        .q0rgs
+        .iter()
+        .map(|q| q.name.clone())
+        .collect::<HashSet<_>>();
+    for (&old_id, copied) in closure
+        .q0rgs
+        .iter()
+        .zip(&mut out.q0rgs[project.q0rgs.len()..])
+    {
+        let base = format!("{} copy", copied.name);
+        let mut name = base.clone();
+        let mut suffix = 2_u32;
+        while names.contains(&name) {
+            name = format!("{base} #{suffix}");
+            suffix += 1;
+        }
+        names.insert(name.clone());
+        copied.name = name;
+        if let Some(folder) = project
+            .runtime
+            .library_item_folders
+            .get(&LibraryItemReference::Q0rg(old_id))
+        {
+            out.runtime
+                .library_item_folders
+                .insert(LibraryItemReference::Q0rg(copied.q0rg_id), folder.clone());
+        }
+    }
+    for (&old_id, copied) in closure
+        .assets
+        .iter()
+        .zip(&out.assets[project.assets.len()..])
+    {
+        if let Some(folder) = project
+            .runtime
+            .library_item_folders
+            .get(&LibraryItemReference::Asset(old_id))
+        {
+            out.runtime
+                .library_item_folders
+                .insert(LibraryItemReference::Asset(copied.id()), folder.clone());
+        }
+    }
+    q0s_format::v2::validate(&out)
+        .map_err(|error| format!("duplicated symbol is invalid: {error}"))?;
+    Ok((out, new_root_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

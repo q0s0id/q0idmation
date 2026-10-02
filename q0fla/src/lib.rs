@@ -168,6 +168,7 @@ pub(crate) fn normalize_folder_layer_order(
 struct ImportedLayer {
     name: String,
     keyframes: Vec<u16>,
+    frame_end: u64,
     kind: LayerKind,
     masked: bool,
     mask_source_index: Option<usize>,
@@ -219,6 +220,7 @@ impl ImportedLayer {
         Ok(Self {
             name,
             keyframes: Vec::new(),
+            frame_end: 0,
             kind,
             masked: layer_type.eq_ignore_ascii_case("masked"),
             mask_source_index: None,
@@ -655,6 +657,7 @@ fn import_dom_document(
         layers.push(ImportedLayer {
             name: "Layer 1".to_string(),
             keyframes: vec![0],
+            frame_end: 1,
             kind: LayerKind::Normal,
             masked: false,
             mask_source_index: None,
@@ -710,7 +713,7 @@ fn import_dom_document(
             .map_err(|_| ImportError::Invalid("layer id overflow".to_string()))?;
         q0_layers.push(Layer {
             layer_id,
-            timeline_frame_count: None,
+            timeline_frame_count: Some(imported.frame_end.max(1).min(u64::from(frame_count)) as u16),
             name: imported.name.clone(),
             explicit_keyframes: imported.keyframes.clone(),
             placements: Vec::new(),
@@ -807,6 +810,9 @@ fn import_frame(
     layer: &mut ImportedLayer,
     max_frame_end: &mut u64,
 ) -> Result<(), ImportError> {
+    if layer.kind == LayerKind::Folder {
+        return Ok(());
+    }
     let index = attr(reader, element, b"index")?
         .unwrap_or_else(|| "0".to_string())
         .parse::<u64>()
@@ -825,6 +831,7 @@ fn import_frame(
         )));
     }
     layer.keyframes.push(index as u16);
+    layer.frame_end = layer.frame_end.max(end);
     *max_frame_end = (*max_frame_end).max(end);
     Ok(())
 }

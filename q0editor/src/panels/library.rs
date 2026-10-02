@@ -590,71 +590,6 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
 
     crate::ui::search_field(ui, &mut app.library_search, "Search library...");
 
-    ui.add_space(3.0);
-    let columns = if showing_all { 6 } else { 5 };
-    egui::Grid::new("library_header")
-        .num_columns(columns)
-        .min_col_width(28.0)
-        .spacing([8.0, 3.0])
-        .show(ui, |ui| {
-            if ui
-                .selectable_label(
-                    false,
-                    if app.library_sort_by_uses {
-                        if app.library_sort_ascending {
-                            "Uses ↑"
-                        } else {
-                            "Uses ↓"
-                        }
-                    } else if app.library_sort_ascending {
-                        "Name A-Z"
-                    } else {
-                        "Name Z-A"
-                    },
-                )
-                .clicked()
-            {
-                if app.library_sort_by_uses {
-                    app.library_sort_by_uses = false;
-                    app.library_sort_ascending = true;
-                } else {
-                    app.library_sort_ascending = !app.library_sort_ascending;
-                }
-            }
-            ui.label("Type");
-            if ui
-                .selectable_label(app.library_sort_by_uses, "Uses")
-                .on_hover_text("Sort by use count, then by name")
-                .clicked()
-            {
-                if app.library_sort_by_uses {
-                    app.library_sort_ascending = !app.library_sort_ascending;
-                } else {
-                    app.library_sort_by_uses = true;
-                    app.library_sort_ascending = false;
-                }
-            }
-            ui.label("ID");
-            ui.label("Folder");
-            if showing_all {
-                ui.label("Library");
-            }
-            ui.end_row();
-        });
-    ui.separator();
-
-    if rows.is_empty() {
-        ui.label(
-            egui::RichText::new(if needle.is_empty() {
-                "Import media or create a symbol to get started."
-            } else {
-                "No matching library items"
-            })
-            .small()
-            .color(app.settings.theme.text_dim.to_color32()),
-        );
-    }
-
     let mut selected: Option<(LibrarySelection, usize, bool, bool, bool)> = None;
     let mut enter: Option<(u64, u16)> = None;
     let mut rename = None;
@@ -663,131 +598,209 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         .and_then(|tab_id| app.project_for_document_tab(tab_id))
         .map(|project| project.runtime.library_folders.clone())
         .unwrap_or_default();
-    // Only instantiate widgets for rows intersecting the viewport. A large FLA can
-    // contain tens of thousands of library items; building every egui row every
-    // frame is pure off-screen work.
-    let row_height = ui.spacing().interact_size.y;
-    egui::ScrollArea::vertical()
-        .id_source(LIBRARY_ITEMS_SCROLL_ID)
+    // Share one horizontal viewport for the header and the virtualized rows.
+    // Wide names or folder paths should scroll inside the dock, not resize it.
+    egui::ScrollArea::horizontal()
+        .id_source("library_columns_scroll")
         .auto_shrink([false, true])
-        .show_rows(ui, row_height, rows.len(), |ui, visible_rows| {
-            egui::Grid::new("library_items")
-                .striped(true)
+        .show(ui, |ui| {
+            ui.add_space(3.0);
+            let columns = if showing_all { 6 } else { 5 };
+            egui::Grid::new("library_header")
                 .num_columns(columns)
                 .min_col_width(28.0)
-                .spacing([8.0, 2.0])
+                .spacing([8.0, 3.0])
                 .show(ui, |ui| {
-                    for row_index in visible_rows.clone() {
-                        let row = &rows[row_index];
-                        let payload = item_for_key(row.key);
-                        let row_selection = LibrarySelection {
-                            tab_id: row.tab_id,
-                            item: payload,
-                        };
-                        let is_selected = app.library_multi_selection.contains(&row_selection);
-                        let row_is_active = Some(row.tab_id) == active_tab;
-                        let drag_payload = LibraryDragPayload {
-                            source_tab_id: row.tab_id,
-                            item: payload,
-                        };
-                        let response = library_name_cell(
-                            ui,
-                            is_selected,
-                            row.icon,
-                            &truncate_label(&row.name, 28),
-                            app.settings.theme.accent.to_color32(),
-                            Sense::click_and_drag(),
-                        );
-                        // Every open project is a real source library. The payload
-                        // carries its tab id so identical project-local asset/q0rg ids
-                        // can never alias during a cross-project drop.
-                        response.dnd_set_drag_payload(drag_payload);
-                        if response.dragged() {
-                            draw_library_drag_preview(
-                                ui.ctx(),
-                                row.icon,
-                                &row.name,
-                                app.settings.theme.accent.to_color32(),
-                            );
-                        }
-                        let audio_only = row.kind == "audio";
-                        let drag_hint = if audio_only {
-                            if row_is_active {
-                                "Drag onto timeline to place"
+                    if ui
+                        .selectable_label(
+                            false,
+                            if app.library_sort_by_uses {
+                                if app.library_sort_ascending {
+                                    "Uses ↑"
+                                } else {
+                                    "Uses ↓"
+                                }
+                            } else if app.library_sort_ascending {
+                                "Name A-Z"
                             } else {
-                                "Drag onto timeline to copy into current project"
-                            }
-                        } else if row_is_active {
-                            "Drag onto stage to place"
+                                "Name Z-A"
+                            },
+                        )
+                        .clicked()
+                    {
+                        if app.library_sort_by_uses {
+                            app.library_sort_by_uses = false;
+                            app.library_sort_ascending = true;
                         } else {
-                            "Drag onto stage to copy into current project"
-                        };
-                        let response = response.on_hover_text(format!(
-                            "{}\n{}\n{}\nFolder: {}\n{drag_hint}",
-                            row.name,
-                            row.detail,
-                            row.library_label,
-                            row.folder.as_deref().unwrap_or("Unfoldered")
-                        ));
-                        if row_is_active {
-                            response.clone().context_menu(|ui| {
-                                if can_rename_item(app, payload) && ui.button("Rename").clicked() {
-                                    rename = Some(payload);
-                                    ui.close_menu();
-                                }
-                                let can_delete = !matches!(
-                                    payload,
-                                    LibraryItem::Q0rg(id)
-                                        if id == app.state.project.meta.entry_q0rg_id
+                            app.library_sort_ascending = !app.library_sort_ascending;
+                        }
+                    }
+                    ui.label("Type");
+                    if ui
+                        .selectable_label(app.library_sort_by_uses, "Uses")
+                        .on_hover_text("Sort by use count, then by name")
+                        .clicked()
+                    {
+                        if app.library_sort_by_uses {
+                            app.library_sort_ascending = !app.library_sort_ascending;
+                        } else {
+                            app.library_sort_by_uses = true;
+                            app.library_sort_ascending = false;
+                        }
+                    }
+                    ui.label("ID");
+                    ui.label("Folder");
+                    if showing_all {
+                        ui.label("Library");
+                    }
+                    ui.end_row();
+                });
+            ui.separator();
+
+            if rows.is_empty() {
+                ui.label(
+                    egui::RichText::new(if needle.is_empty() {
+                        "Import media or create a symbol to get started."
+                    } else {
+                        "No matching library items"
+                    })
+                    .small()
+                    .color(app.settings.theme.text_dim.to_color32()),
+                );
+            }
+
+            // Only instantiate widgets for rows intersecting the viewport. A large FLA can
+            // contain tens of thousands of library items; building every egui row every
+            // frame is pure off-screen work.
+            let row_height = ui.spacing().interact_size.y;
+            egui::ScrollArea::vertical()
+                .id_source(LIBRARY_ITEMS_SCROLL_ID)
+                .auto_shrink([false, true])
+                .show_rows(ui, row_height, rows.len(), |ui, visible_rows| {
+                    egui::Grid::new("library_items")
+                        .striped(true)
+                        .num_columns(columns)
+                        .min_col_width(28.0)
+                        .spacing([8.0, 2.0])
+                        .show(ui, |ui| {
+                            for row_index in visible_rows.clone() {
+                                let row = &rows[row_index];
+                                let payload = item_for_key(row.key);
+                                let row_selection = LibrarySelection {
+                                    tab_id: row.tab_id,
+                                    item: payload,
+                                };
+                                let is_selected =
+                                    app.library_multi_selection.contains(&row_selection);
+                                let row_is_active = Some(row.tab_id) == active_tab;
+                                let drag_payload = LibraryDragPayload {
+                                    source_tab_id: row.tab_id,
+                                    item: payload,
+                                };
+                                let response = library_name_cell(
+                                    ui,
+                                    is_selected,
+                                    row.icon,
+                                    &truncate_label(&row.name, 28),
+                                    app.settings.theme.accent.to_color32(),
+                                    Sense::click_and_drag(),
                                 );
-                                if can_delete && ui.button("Delete").clicked() {
-                                    delete = Some(payload);
-                                    ui.close_menu();
+                                // Every open project is a real source library. The payload
+                                // carries its tab id so identical project-local asset/q0rg ids
+                                // can never alias during a cross-project drop.
+                                response.dnd_set_drag_payload(drag_payload);
+                                if response.dragged() {
+                                    draw_library_drag_preview(
+                                        ui.ctx(),
+                                        row.icon,
+                                        &row.name,
+                                        app.settings.theme.accent.to_color32(),
+                                    );
                                 }
-                                ui.menu_button("Move to folder", |ui| {
-                                    if ui.button("Unfoldered").clicked() {
-                                        app.queue(Action::MoveLibraryItemToFolder(payload, None));
-                                        ui.close_menu();
+                                let audio_only = row.kind == "audio";
+                                let drag_hint = if audio_only {
+                                    if row_is_active {
+                                        "Drag onto timeline to place"
+                                    } else {
+                                        "Drag onto timeline to copy into current project"
                                     }
-                                    for folder in &active_folder_paths {
-                                        if ui.button(folder).clicked() {
-                                            app.queue(Action::MoveLibraryItemToFolder(
-                                                payload,
-                                                Some(folder.clone()),
-                                            ));
+                                } else if row_is_active {
+                                    "Drag onto stage to place"
+                                } else {
+                                    "Drag onto stage to copy into current project"
+                                };
+                                let response = response.on_hover_text(format!(
+                                    "{}\n{}\n{}\nFolder: {}\n{drag_hint}",
+                                    row.name,
+                                    row.detail,
+                                    row.library_label,
+                                    row.folder.as_deref().unwrap_or("Unfoldered")
+                                ));
+                                if row_is_active {
+                                    response.clone().context_menu(|ui| {
+                                        if can_rename_item(app, payload)
+                                            && ui.button("Rename").clicked()
+                                        {
+                                            rename = Some(payload);
                                             ui.close_menu();
                                         }
+                                        let can_delete = !matches!(
+                                            payload,
+                                            LibraryItem::Q0rg(id)
+                                                if id == app.state.project.meta.entry_q0rg_id
+                                        );
+                                        if can_delete && ui.button("Delete").clicked() {
+                                            delete = Some(payload);
+                                            ui.close_menu();
+                                        }
+                                        ui.menu_button("Move to folder", |ui| {
+                                            if ui.button("Unfoldered").clicked() {
+                                                app.queue(Action::MoveLibraryItemToFolder(
+                                                    payload, None,
+                                                ));
+                                                ui.close_menu();
+                                            }
+                                            for folder in &active_folder_paths {
+                                                if ui.button(folder).clicked() {
+                                                    app.queue(Action::MoveLibraryItemToFolder(
+                                                        payload,
+                                                        Some(folder.clone()),
+                                                    ));
+                                                    ui.close_menu();
+                                                }
+                                            }
+                                        });
+                                    });
+                                }
+                                if response.clicked() || response.drag_started() {
+                                    let (control, shift) = ui.input(|input| {
+                                        (input.modifiers.command, input.modifiers.shift)
+                                    });
+                                    selected = Some((
+                                        row_selection,
+                                        row_index,
+                                        control,
+                                        shift,
+                                        response.drag_started(),
+                                    ));
+                                }
+                                if response.double_clicked() {
+                                    if let LibraryKey::Q0rg(id) = row.key {
+                                        enter = Some((row.tab_id, id));
                                     }
+                                }
+                                ui.label(row.kind);
+                                ui.label(row.uses.to_string());
+                                ui.label(match row.key {
+                                    LibraryKey::Q0rg(id) | LibraryKey::Asset(id) => id.to_string(),
                                 });
-                            });
-                        }
-                        if response.clicked() || response.drag_started() {
-                            let (control, shift) =
-                                ui.input(|input| (input.modifiers.command, input.modifiers.shift));
-                            selected = Some((
-                                row_selection,
-                                row_index,
-                                control,
-                                shift,
-                                response.drag_started(),
-                            ));
-                        }
-                        if response.double_clicked() {
-                            if let LibraryKey::Q0rg(id) = row.key {
-                                enter = Some((row.tab_id, id));
+                                ui.label(row.folder.as_deref().unwrap_or("—"));
+                                if showing_all {
+                                    ui.label(&row.library_label);
+                                }
+                                ui.end_row();
                             }
-                        }
-                        ui.label(row.kind);
-                        ui.label(row.uses.to_string());
-                        ui.label(match row.key {
-                            LibraryKey::Q0rg(id) | LibraryKey::Asset(id) => id.to_string(),
                         });
-                        ui.label(row.folder.as_deref().unwrap_or("—"));
-                        if showing_all {
-                            ui.label(&row.library_label);
-                        }
-                        ui.end_row();
-                    }
                 });
         });
 
@@ -1514,6 +1527,7 @@ fn draw_preview(app: &mut EditorApp, ui: &mut Ui, selection: Option<LibrarySelec
         .preview_backgrounds
         .get(&background_key)
         .cloned();
+    let audio_accent = app.settings.theme.accent.to_color32();
     let ctx = ui.ctx().clone();
     let preview = app.with_project_library_view_mut(
         selection.tab_id,
@@ -1546,6 +1560,64 @@ fn draw_preview(app: &mut EditorApp, ui: &mut Ui, selection: Option<LibrarySelec
                 0.0,
                 Stroke::new(1.0_f32, border.gamma_multiply(0.8)),
             );
+            if let LibraryKey::Asset(id) = key {
+                if crate::audio::asset_is_audio_only(project, id) {
+                    painter.rect_filled(content_rect, 3.0, window_fill);
+                    if let Some((waveform, complete)) = textures.audio_waveform(project, id) {
+                        if !complete {
+                            ctx.request_repaint_after(std::time::Duration::from_millis(30));
+                        }
+                        let waveform_rect = content_rect.shrink2(vec2(8.0, 16.0));
+                        let center = waveform_rect.center().y;
+                        let amplitude = waveform_rect.height().max(2.0) * 0.45;
+                        if waveform.bins.is_empty() {
+                            painter.text(
+                                content_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "Preparing waveform…",
+                                FontId::proportional(11.0),
+                                text_dim,
+                            );
+                        } else {
+                            let columns = (waveform_rect.width().max(1.0) as usize).min(2048);
+                            for column in 0..columns {
+                                let start = column * waveform.bins.len() / columns;
+                                let end = ((column + 1) * waveform.bins.len() / columns)
+                                    .max(start + 1)
+                                    .min(waveform.bins.len());
+                                let (mut min, mut max) = (0.0_f32, 0.0_f32);
+                                for &(lo, hi) in &waveform.bins[start..end] {
+                                    min = min.min(lo);
+                                    max = max.max(hi);
+                                }
+                                let x = waveform_rect.left()
+                                    + (column as f32 + 0.5) * waveform_rect.width()
+                                        / columns as f32;
+                                painter.line_segment(
+                                    [
+                                        pos2(x, center - max * amplitude),
+                                        pos2(x, center - min * amplitude),
+                                    ],
+                                    Stroke::new(1.0_f32, audio_accent),
+                                );
+                            }
+                            let seconds = waveform.samples_per_channel as f64
+                                / f64::from(waveform.sample_rate.max(1));
+                            painter.text(
+                                content_rect.left_bottom() + vec2(6.0, -4.0),
+                                egui::Align2::LEFT_BOTTOM,
+                                format!(
+                                    "{seconds:.2}s · {} Hz · {} channels",
+                                    waveform.sample_rate, waveform.channels
+                                ),
+                                FontId::proportional(10.0),
+                                text_dim,
+                            );
+                        }
+                    }
+                    return (bounds_key, None, background_key, background, label);
+                }
+            }
             let bbox = cached_bounds.unwrap_or_else(|| match key {
                 LibraryKey::Q0rg(id) => q0rg_frame_bbox(project, id, frame),
                 LibraryKey::Asset(id) => placement_bbox(
@@ -1785,7 +1857,7 @@ fn collect_asset_color_stats(project: &ProjectV2, asset_id: u16, stats: &mut Pre
             if !header.spec.video {
                 return;
             }
-            let Ok(media) = q0video::q0v::Q0vFile::parse(video.bytes.clone()) else {
+            let Ok(media) = q0video::q0v::Q0vFile::parse(video.bytes.as_ref().clone()) else {
                 return;
             };
             let Ok(rgba) = media.decode_frame_rgba(0) else {

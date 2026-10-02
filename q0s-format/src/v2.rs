@@ -25,6 +25,7 @@
 //!         tween: [1] kind (0=none, 1=linear, 2=eased), [2 if motion] to_frame,
 //!           v8 eased: [1] easing kind + payload
 //!         v14+: placement FX: [1] sparse flags + optional alpha/blend/blur/glow/shadow payloads
+//!         v34+: trailing tint flag [1], then RGB [3] + amount f32 when present
 //!       v4+: [2] explicit_keyframe_count, explicit_keyframes[]: [2] frame
 //!       v32+: [2] layer_frame_count after every layer's keyframe list
 //!   v6 layer metadata: [2] entry_count, then entries:
@@ -51,7 +52,8 @@
 //! revisions decode isotropic placement effects into matching X/Y radii.
 //! v28 adds manually keyframed q0rg playback.
 //! v29 stores the ordered Animate-style scene list and each scene's root q0rg.
-//! Writing always uses `Q1S_VERSION_CURRENT`.
+//! v33 adds held rig poses and keyframed binding corrections. Documents that
+//! do not use these features remain writable as v32.
 
 use crate::transform::Affine;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -111,7 +113,11 @@ pub const Q1S_VERSION_LIBRARY_FOLDERS: u16 = 30;
 pub const Q1S_VERSION_TIMELINE_MASKS: u16 = 31;
 /// Independent timeline lengths for layers, including empty hold-frame spans.
 pub const Q1S_VERSION_LAYER_FRAME_COUNTS: u16 = 32;
-pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_LAYER_FRAME_COUNTS;
+pub const Q1S_VERSION_RIG_POSE_KEYS: u16 = 33;
+pub const Q1S_VERSION_TINT: u16 = 34;
+/// Lossless audio ranges, pan and fade envelopes; v2-v34 remain readable.
+pub const Q1S_VERSION_AUDIO_EDITING: u16 = 35;
+pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_AUDIO_EDITING;
 /// Kept as an alias so external code that imported the v2-era constant keeps
 /// compiling. It now means "the current write-out version".
 pub const Q1S_V2_VERSION: u16 = Q1S_VERSION_CURRENT;
@@ -137,6 +143,7 @@ const TWEEN_KIND_EASED: u8 = 2;
 const EASING_KIND_LINEAR: u8 = 0;
 const EASING_KIND_PRESET: u8 = 1;
 const EASING_KIND_CUBIC_BEZIER: u8 = 2;
+const EASING_KIND_HOLD: u8 = 3;
 const LAYER_KIND_NORMAL: u8 = 0;
 const LAYER_KIND_FOLDER: u8 = 1;
 const LAYER_KIND_MASK: u8 = 2;
@@ -364,7 +371,7 @@ pub struct Q0vAsset {
     pub asset_id: u16,
     /// Complete embedded `.q0v` bytes. Projects stay portable and never rely
     /// on an external absolute media path.
-    pub bytes: Vec<u8>,
+    pub bytes: std::sync::Arc<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -484,6 +491,30 @@ pub enum RigPropertyRef {
     ControlY(u16),
     ControlValue(u16),
     ConstraintWeight(u16),
+    BindingA11(u16),
+    BindingA12(u16),
+    BindingA21(u16),
+    BindingA22(u16),
+    BindingTx(u16),
+    BindingTy(u16),
+}
+
+impl RigPropertyRef {
+    pub fn is_binding_correction(self) -> bool {
+        self.binding_node_id().is_some()
+    }
+
+    pub fn binding_node_id(self) -> Option<u16> {
+        match self {
+            Self::BindingA11(id)
+            | Self::BindingA12(id)
+            | Self::BindingA21(id)
+            | Self::BindingA22(id)
+            | Self::BindingTx(id)
+            | Self::BindingTy(id) => Some(id),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -794,6 +825,7 @@ impl EasingMode {
 pub enum Easing {
     #[default]
     Linear,
+    Hold,
     Preset {
         family: EasingFamily,
         mode: EasingMode,
@@ -811,6 +843,13 @@ impl Easing {
         let t = t.clamp(0.0, 1.0);
         match self {
             Self::Linear => t,
+            Self::Hold => {
+                if t < 1.0 {
+                    0.0
+                } else {
+                    1.0
+                }
+            }
             Self::Preset { family, mode } => match mode {
                 EasingMode::In => easing_in(family, t),
                 EasingMode::Out => 1.0 - easing_in(family, 1.0 - t),
@@ -828,7 +867,7 @@ impl Easing {
 
     pub fn is_valid(self) -> bool {
         match self {
-            Self::Linear | Self::Preset { .. } => true,
+            Self::Linear | Self::Hold | Self::Preset { .. } => true,
             Self::CubicBezier { x1, y1, x2, y2 } => {
                 x1.is_finite()
                     && y1.is_finite()
@@ -1083,8 +1122,15 @@ pub fn resolve_q0rg_playback_frame(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TintFx {
+    pub color: Rgba,
+    pub amount: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PlacementFx {
     pub opacity: f32,
+    pub tint: Option<TintFx>,
     pub blend_mode: BlendMode,
     pub blur: Option<BlurFx>,
     pub glow: Option<GlowFx>,
@@ -1098,6 +1144,7 @@ impl Default for PlacementFx {
     fn default() -> Self {
         Self {
             opacity: 1.0,
+            tint: None,
             blend_mode: BlendMode::Normal,
             blur: None,
             glow: None,
@@ -1120,7 +1167,8 @@ impl PlacementFx {
         let shadow_identity = self
             .shadow
             .is_none_or(|shadow| shadow.strength <= 1.0e-6 || shadow.color.a == 0);
-        self.opacity >= 0.999_999
+        self.tint.is_none_or(|tint| tint.amount <= 1.0e-6)
+            && self.opacity >= 0.999_999
             && self.blend_mode == BlendMode::Normal
             && blur_identity
             && glow_identity
@@ -1131,6 +1179,28 @@ impl PlacementFx {
         let t = t.clamp(0.0, 1.0);
         Self {
             opacity: lerp_f32(self.opacity, target.opacity, t),
+            tint: match (self.tint, target.tint) {
+                (None, None) => None,
+                (a, b) => {
+                    let a = a.unwrap_or_else(|| TintFx {
+                        color: b.unwrap().color,
+                        amount: 0.0,
+                    });
+                    let b = b.unwrap_or(TintFx {
+                        color: a.color,
+                        amount: 0.0,
+                    });
+                    Some(TintFx {
+                        color: Rgba {
+                            r: lerp_u8(a.color.r, b.color.r, t),
+                            g: lerp_u8(a.color.g, b.color.g, t),
+                            b: lerp_u8(a.color.b, b.color.b, t),
+                            a: 255,
+                        },
+                        amount: lerp_f32(a.amount, b.amount, t),
+                    })
+                }
+            },
             blend_mode: if t >= 1.0 {
                 target.blend_mode
             } else {
@@ -1361,7 +1431,7 @@ pub struct LayerMetadata {
     pub locked: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct AudioClip {
     pub q0rg_id: u16,
     pub layer_id: u16,
@@ -1369,6 +1439,12 @@ pub struct AudioClip {
     pub asset_id: u16,
     pub gain: f32,
     pub muted: bool,
+    /// Offset in the source at the shared 48 kHz audio clock; cuts are lossless.
+    pub source_offset_samples: u64,
+    pub duration_frames: Option<u16>,
+    pub pan: f32,
+    pub fade_in_ms: u32,
+    pub fade_out_ms: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1687,6 +1763,37 @@ impl ProjectV2 {
     }
 }
 
+/// Gain envelope shared by editor scrubbing, playback and exported movies.
+pub fn audio_clip_channel_gain(
+    clip: AudioClip,
+    local_sample: u64,
+    length: u64,
+    sample_rate: u32,
+    channel: u16,
+) -> f32 {
+    let fade_in = u64::from(clip.fade_in_ms).saturating_mul(u64::from(sample_rate)) / 1000;
+    let fade_out = u64::from(clip.fade_out_ms).saturating_mul(u64::from(sample_rate)) / 1000;
+    let attack = if fade_in == 0 {
+        1.0
+    } else {
+        (local_sample as f64 / fade_in as f64).min(1.0) as f32
+    };
+    let release = if fade_out == 0 {
+        1.0
+    } else {
+        (length.saturating_sub(local_sample + 1) as f64 / fade_out as f64).min(1.0) as f32
+    };
+    let balance = if channel == 0 {
+        1.0 - clip.pan.max(0.0)
+    } else {
+        1.0 + clip.pan.min(0.0)
+    };
+    if clip.muted {
+        0.0
+    } else {
+        clip.gain * balance * attack * release
+    }
+}
 pub fn audio_clip_end_frame(project: &ProjectV2, clip: AudioClip) -> Option<u16> {
     let media = project.assets.iter().find_map(|asset| match asset {
         Asset::Q0v(media) if media.asset_id == clip.asset_id => Some(media),
@@ -1696,14 +1803,52 @@ pub fn audio_clip_end_frame(project: &ProjectV2, clip: AudioClip) -> Option<u16>
     if !header.spec.audio || header.spec.video {
         return None;
     }
-    let duration_frames = header
+    let source_samples = header
         .audio_samples_per_channel
+        .saturating_mul(48_000)
+        .div_ceil(u64::from(header.spec.audio_sample_rate.max(1)));
+    let remaining = source_samples.checked_sub(clip.source_offset_samples)?;
+    if remaining == 0 {
+        return None;
+    }
+    let frames = remaining
         .saturating_mul(u64::from(project.meta.fps.max(1)))
-        .div_ceil(u64::from(header.spec.audio_sample_rate.max(1)))
+        .div_ceil(48_000)
         .max(1);
-    u64::from(clip.start_frame)
-        .checked_add(duration_frames)
-        .and_then(|end| u16::try_from(end).ok())
+    let duration = clip
+        .duration_frames
+        .map(u64::from)
+        .unwrap_or(frames)
+        .min(frames);
+    let mut end = u64::from(clip.start_frame)
+        .saturating_add(duration)
+        .min(u64::from(u16::MAX));
+    let q0rg = project.q0rgs.iter().find(|q| q.q0rg_id == clip.q0rg_id)?;
+    let layer = q0rg
+        .layers
+        .iter()
+        .find(|layer| layer.layer_id == clip.layer_id)?;
+    end = end.min(u64::from(
+        layer.timeline_frame_count.unwrap_or(q0rg.frame_count),
+    ));
+    for frame in layer
+        .explicit_keyframes
+        .iter()
+        .copied()
+        .chain(layer.placements.iter().map(|p| p.frame))
+        .chain(
+            project
+                .audio_clips
+                .iter()
+                .filter(|other| other.q0rg_id == clip.q0rg_id && other.layer_id == clip.layer_id)
+                .map(|other| other.start_frame),
+        )
+    {
+        if frame > clip.start_frame {
+            end = end.min(u64::from(frame));
+        }
+    }
+    u16::try_from(end).ok()
 }
 
 /// Return the exact deterministic ordering used by the current q1s/q0s writer.
@@ -1861,6 +2006,13 @@ pub fn wire_equivalent(left: &ProjectV2, right: &ProjectV2) -> bool {
             left_runtime.library_folders.sort();
             right_runtime.library_folders.sort();
             left_runtime != right_runtime
+        }
+        || {
+            let mut a = left.audio_clips.clone();
+            let mut b = right.audio_clips.clone();
+            a.sort_by_key(|c| (c.q0rg_id, c.layer_id, c.start_frame, c.asset_id));
+            b.sort_by_key(|c| (c.q0rg_id, c.layer_id, c.start_frame, c.asset_id));
+            a != b
         }
         || left.assets.len() != right.assets.len()
         || left.q0rgs.len() != right.q0rgs.len()
@@ -2474,10 +2626,21 @@ fn validate_rig_asset(rig: &RigAsset) -> Result<(), Error> {
             return Err(Error::Validation("rig driver is invalid"));
         }
         match driver.target {
+            property if property.is_binding_correction() => {
+                return Err(Error::Validation(
+                    "binding corrections are timeline-only rig properties",
+                ));
+            }
             RigPropertyRef::NodeTx(id)
             | RigPropertyRef::NodeTy(id)
             | RigPropertyRef::NodeRotation(id)
             | RigPropertyRef::NodeScaleX(id)
+            | RigPropertyRef::BindingA11(id)
+            | RigPropertyRef::BindingA12(id)
+            | RigPropertyRef::BindingA21(id)
+            | RigPropertyRef::BindingA22(id)
+            | RigPropertyRef::BindingTx(id)
+            | RigPropertyRef::BindingTy(id)
             | RigPropertyRef::NodeScaleY(id)
                 if !node_ids.contains(&id) =>
             {
@@ -2507,6 +2670,11 @@ fn validate_rig_asset(rig: &RigAsset) -> Result<(), Error> {
         }
         let mut properties = HashSet::new();
         for value in &pose.values {
+            if value.property.is_binding_correction() {
+                return Err(Error::Validation(
+                    "binding corrections are timeline-only rig properties",
+                ));
+            }
             if !value.value.is_finite() || !properties.insert(value.property) {
                 return Err(Error::Validation(
                     "rig pose values must be finite and unique",
@@ -2524,6 +2692,12 @@ fn validate_rig_asset(rig: &RigAsset) -> Result<(), Error> {
                 | RigPropertyRef::NodeTy(id)
                 | RigPropertyRef::NodeRotation(id)
                 | RigPropertyRef::NodeScaleX(id)
+                | RigPropertyRef::BindingA11(id)
+                | RigPropertyRef::BindingA12(id)
+                | RigPropertyRef::BindingA21(id)
+                | RigPropertyRef::BindingA22(id)
+                | RigPropertyRef::BindingTx(id)
+                | RigPropertyRef::BindingTy(id)
                 | RigPropertyRef::NodeScaleY(id)
                     if !node_ids.contains(&id) =>
                 {
@@ -2557,10 +2731,17 @@ fn validate_rig_asset(rig: &RigAsset) -> Result<(), Error> {
         })
     };
     let property_exists = |property: RigPropertyRef| match property {
+        property if property.is_binding_correction() => false,
         RigPropertyRef::NodeTx(id)
         | RigPropertyRef::NodeTy(id)
         | RigPropertyRef::NodeRotation(id)
         | RigPropertyRef::NodeScaleX(id)
+        | RigPropertyRef::BindingA11(id)
+        | RigPropertyRef::BindingA12(id)
+        | RigPropertyRef::BindingA21(id)
+        | RigPropertyRef::BindingA22(id)
+        | RigPropertyRef::BindingTx(id)
+        | RigPropertyRef::BindingTy(id)
         | RigPropertyRef::NodeScaleY(id) => node_ids.contains(&id),
         RigPropertyRef::ControlX(id)
         | RigPropertyRef::ControlY(id)
@@ -2785,6 +2966,26 @@ fn validate_rig_asset(rig: &RigAsset) -> Result<(), Error> {
 
     let mut channel_props = HashSet::new();
     for channel in &rig.channels {
+        if channel.property.is_binding_correction() {
+            let node_id = match channel.property {
+                RigPropertyRef::BindingA11(id)
+                | RigPropertyRef::BindingA12(id)
+                | RigPropertyRef::BindingA21(id)
+                | RigPropertyRef::BindingA22(id)
+                | RigPropertyRef::BindingTx(id)
+                | RigPropertyRef::BindingTy(id) => id,
+                _ => unreachable!(),
+            };
+            if !rig
+                .nodes
+                .iter()
+                .any(|node| node.node_id == node_id && node.binding.is_some())
+            {
+                return Err(Error::Validation(
+                    "rig binding correction references an unbound node",
+                ));
+            }
+        }
         if !channel_props.insert(channel.property) {
             return Err(Error::Validation("rig channel property must be unique"));
         }
@@ -2802,6 +3003,12 @@ fn validate_rig_asset(rig: &RigAsset) -> Result<(), Error> {
             | RigPropertyRef::NodeTy(id)
             | RigPropertyRef::NodeRotation(id)
             | RigPropertyRef::NodeScaleX(id)
+            | RigPropertyRef::BindingA11(id)
+            | RigPropertyRef::BindingA12(id)
+            | RigPropertyRef::BindingA21(id)
+            | RigPropertyRef::BindingA22(id)
+            | RigPropertyRef::BindingTx(id)
+            | RigPropertyRef::BindingTy(id)
             | RigPropertyRef::NodeScaleY(id)
                 if !node_ids.contains(&id) =>
             {
@@ -3439,6 +3646,14 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
                 if !p.transform.skew_x.is_finite() || !p.transform.skew_y.is_finite() {
                     return Err(Error::Validation("placement skew must be finite"));
                 }
+                if let Some(tint) = p.fx.tint {
+                    if !tint.amount.is_finite()
+                        || !(0.0..=1.0).contains(&tint.amount)
+                        || tint.color.a != 255
+                    {
+                        return Err(Error::Validation("invalid placement tint"));
+                    }
+                }
                 if !p.fx.opacity.is_finite() || !(0.0..=1.0).contains(&p.fx.opacity) {
                     return Err(Error::Validation(
                         "placement opacity must be finite and between 0 and 1",
@@ -3565,6 +3780,12 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
 
     let mut audio_ranges = HashMap::<(u16, u16), Vec<(u16, u16)>>::new();
     for &clip in &project.audio_clips {
+        if !clip.pan.is_finite()
+            || !(-1.0..=1.0).contains(&clip.pan)
+            || clip.duration_frames == Some(0)
+        {
+            return Err(Error::Validation("invalid audio pan or duration"));
+        }
         if !clip.gain.is_finite() || !(0.0..=4.0).contains(&clip.gain) {
             return Err(Error::Validation(
                 "audio clip gain must be finite and between 0 and 4",
@@ -3597,9 +3818,9 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
             return Err(Error::Validation("audio clip extends past the timeline"));
         }
         if layer
-            .keyframe_frames()
-            .into_iter()
-            .any(|frame| (clip.start_frame..end_frame).contains(&frame))
+            .placements
+            .iter()
+            .any(|placement| (clip.start_frame..end_frame).contains(&placement.frame))
         {
             return Err(Error::Validation(
                 "audio clip frames cannot contain visual keyframes",
@@ -3608,7 +3829,7 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
         if let Some(previous_key) = layer
             .keyframe_frames()
             .into_iter()
-            .filter(|frame| *frame < clip.start_frame)
+            .filter(|frame| *frame <= clip.start_frame)
             .max()
         {
             if layer
@@ -3954,11 +4175,73 @@ fn validate_q0rg_graph(project: &ProjectV2, index: &HashMap<u16, usize>) -> Resu
 }
 
 pub fn write(project: &ProjectV2) -> Result<Vec<u8>, Error> {
-    write_version(project, Q1S_VERSION_CURRENT)
+    let version = if uses_audio_editing(project) {
+        Q1S_VERSION_AUDIO_EDITING
+    } else if uses_tint(project) {
+        Q1S_VERSION_TINT
+    } else if uses_rig_pose_keys(project) {
+        Q1S_VERSION_RIG_POSE_KEYS
+    } else {
+        Q1S_VERSION_LAYER_FRAME_COUNTS
+    };
+    write_version(project, version)
+}
+
+pub(crate) fn uses_audio_editing(project: &ProjectV2) -> bool {
+    project.audio_clips.iter().any(|clip| {
+        clip.source_offset_samples != 0
+            || clip.duration_frames.is_some()
+            || clip.pan != 0.0
+            || clip.fade_in_ms != 0
+            || clip.fade_out_ms != 0
+    })
+}
+
+pub(crate) fn uses_tint(project: &ProjectV2) -> bool {
+    project
+        .q0rgs
+        .iter()
+        .flat_map(|q| &q.layers)
+        .flat_map(|layer| &layer.placements)
+        .any(|placement| placement.fx.tint.is_some())
+}
+
+fn uses_rig_pose_keys(project: &ProjectV2) -> bool {
+    project.assets.iter().any(|asset| {
+        matches!(asset, Asset::Rig(rig) if
+        rig.channels.iter().any(|channel| channel.property.is_binding_correction()
+            || channel.keys.iter().any(|key| key.easing == Easing::Hold)))
+    }) || project
+        .q0rgs
+        .iter()
+        .flat_map(|q0rg| &q0rg.layers)
+        .flat_map(|layer| &layer.placements)
+        .any(|placement| placement.tween.easing() == Easing::Hold)
+        || project
+            .runtime
+            .camera
+            .keys
+            .iter()
+            .any(|key| key.tween.easing() == Easing::Hold)
 }
 
 pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>, Error> {
     validate(project)?;
+    if version < Q1S_VERSION_AUDIO_EDITING && uses_audio_editing(project) {
+        return Err(Error::Validation(
+            "legacy q1s versions cannot store audio edits",
+        ));
+    }
+    if version < Q1S_VERSION_TINT && uses_tint(project) {
+        return Err(Error::Validation(
+            "legacy q1s versions cannot store tint color effects",
+        ));
+    }
+    if version < Q1S_VERSION_RIG_POSE_KEYS && uses_rig_pose_keys(project) {
+        return Err(Error::Validation(
+            "legacy q1s versions cannot store held rig pose keys",
+        ));
+    }
     if version != Q1S_VERSION_LEGACY
         && version != Q1S_VERSION_SKEW
         && version != Q1S_VERSION_KEYFRAMES
@@ -3990,6 +4273,9 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
         && version != Q1S_VERSION_LIBRARY_FOLDERS
         && version != Q1S_VERSION_TIMELINE_MASKS
         && version != Q1S_VERSION_LAYER_FRAME_COUNTS
+        && version != Q1S_VERSION_RIG_POSE_KEYS
+        && version != Q1S_VERSION_TINT
+        && version != Q1S_VERSION_AUDIO_EDITING
     {
         return Err(Error::UnsupportedVersion(version));
     }
@@ -4481,6 +4767,13 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
             out.extend_from_slice(&clip.asset_id.to_le_bytes());
             out.extend_from_slice(&clip.gain.to_le_bytes());
             out.push(u8::from(clip.muted));
+            if version >= Q1S_VERSION_AUDIO_EDITING {
+                out.extend_from_slice(&clip.source_offset_samples.to_le_bytes());
+                out.extend_from_slice(&clip.duration_frames.unwrap_or(0).to_le_bytes());
+                out.extend_from_slice(&clip.pan.to_le_bytes());
+                out.extend_from_slice(&clip.fade_in_ms.to_le_bytes());
+                out.extend_from_slice(&clip.fade_out_ms.to_le_bytes());
+            }
         }
     }
 
@@ -5077,6 +5370,12 @@ fn write_rig_property_ref(out: &mut Vec<u8>, property: RigPropertyRef) {
         RigPropertyRef::NodeTy(id) => (6, id),
         RigPropertyRef::NodeScaleX(id) => (7, id),
         RigPropertyRef::NodeScaleY(id) => (8, id),
+        RigPropertyRef::BindingA11(id) => (9, id),
+        RigPropertyRef::BindingA12(id) => (10, id),
+        RigPropertyRef::BindingA21(id) => (11, id),
+        RigPropertyRef::BindingA22(id) => (12, id),
+        RigPropertyRef::BindingTx(id) => (13, id),
+        RigPropertyRef::BindingTy(id) => (14, id),
     };
     out.push(kind);
     out.extend_from_slice(&id.to_le_bytes());
@@ -5142,6 +5441,7 @@ fn write_optional_vec2(out: &mut Vec<u8>, v: Option<Vec2>) {
 fn write_easing(out: &mut Vec<u8>, easing: Easing) {
     match easing {
         Easing::Linear => out.push(EASING_KIND_LINEAR),
+        Easing::Hold => out.push(EASING_KIND_HOLD),
         Easing::Preset { family, mode } => {
             out.push(EASING_KIND_PRESET);
             out.push(family as u8);
@@ -5249,6 +5549,16 @@ fn write_placement_fx(out: &mut Vec<u8>, fx: PlacementFx, version: u16) {
             None => out.push(0),
         }
         out.extend_from_slice(&fx.q0rg_playback.single_frame.to_le_bytes());
+    }
+    if version >= Q1S_VERSION_TINT {
+        match fx.tint {
+            None => out.push(0),
+            Some(tint) => {
+                out.push(1);
+                out.extend_from_slice(&[tint.color.r, tint.color.g, tint.color.b]);
+                out.extend_from_slice(&tint.amount.to_le_bytes());
+            }
+        }
     }
 }
 
@@ -5379,8 +5689,26 @@ fn read_placement_fx(c: &mut Cursor<'_>, version: u16) -> Result<PlacementFx, Er
     } else {
         Q0rgPlayback::default()
     };
+    let tint = if version >= Q1S_VERSION_TINT {
+        match c.read_u8()? {
+            0 => None,
+            1 => Some(TintFx {
+                color: Rgba {
+                    r: c.read_u8()?,
+                    g: c.read_u8()?,
+                    b: c.read_u8()?,
+                    a: 255,
+                },
+                amount: c.read_f32()?,
+            }),
+            _ => return Err(Error::Validation("invalid placement tint flag")),
+        }
+    } else {
+        None
+    };
     Ok(PlacementFx {
         opacity,
+        tint,
         blend_mode,
         blur,
         glow,
@@ -5520,6 +5848,9 @@ pub fn parse(bytes: &[u8]) -> Result<ProjectV2, Error> {
         && version != Q1S_VERSION_LIBRARY_FOLDERS
         && version != Q1S_VERSION_TIMELINE_MASKS
         && version != Q1S_VERSION_LAYER_FRAME_COUNTS
+        && version != Q1S_VERSION_RIG_POSE_KEYS
+        && version != Q1S_VERSION_TINT
+        && version != Q1S_VERSION_AUDIO_EDITING
     {
         return Err(Error::UnsupportedVersion(version));
     }
@@ -5763,7 +6094,40 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
                 1 => true,
                 _ => return Err(Error::Validation("invalid audio clip mute flag")),
             };
+            let source_offset_samples = if version >= Q1S_VERSION_AUDIO_EDITING {
+                u64::from_le_bytes(c.read_exact(8)?.try_into().expect("eight offset bytes"))
+            } else {
+                0
+            };
+            let duration_frames = if version >= Q1S_VERSION_AUDIO_EDITING {
+                match c.read_u16()? {
+                    0 => None,
+                    frames => Some(frames),
+                }
+            } else {
+                None
+            };
+            let pan = if version >= Q1S_VERSION_AUDIO_EDITING {
+                c.read_f32()?
+            } else {
+                0.0
+            };
+            let fade_in_ms = if version >= Q1S_VERSION_AUDIO_EDITING {
+                c.read_u32()?
+            } else {
+                0
+            };
+            let fade_out_ms = if version >= Q1S_VERSION_AUDIO_EDITING {
+                c.read_u32()?
+            } else {
+                0
+            };
             audio_clips.push(AudioClip {
+                source_offset_samples,
+                duration_frames,
+                pan,
+                fade_in_ms,
+                fade_out_ms,
                 q0rg_id,
                 layer_id,
                 start_frame,
@@ -6053,7 +6417,7 @@ fn parse_asset(c: &mut Cursor, version: u16) -> Result<(Asset, Option<String>), 
                 .map_err(|_| Error::Validation("q0v payload length does not fit usize"))?;
             Asset::Q0v(Q0vAsset {
                 asset_id,
-                bytes: c.read_exact(len)?.to_vec(),
+                bytes: (c.read_exact(len)?.to_vec()).into(),
             })
         }
         ASSET_KIND_RIG if version >= Q1S_VERSION_RIGGING => {
@@ -6398,6 +6762,12 @@ fn read_rig_property_ref(c: &mut Cursor<'_>) -> Result<RigPropertyRef, Error> {
         6 => Ok(RigPropertyRef::NodeTy(id)),
         7 => Ok(RigPropertyRef::NodeScaleX(id)),
         8 => Ok(RigPropertyRef::NodeScaleY(id)),
+        9 => Ok(RigPropertyRef::BindingA11(id)),
+        10 => Ok(RigPropertyRef::BindingA12(id)),
+        11 => Ok(RigPropertyRef::BindingA21(id)),
+        12 => Ok(RigPropertyRef::BindingA22(id)),
+        13 => Ok(RigPropertyRef::BindingTx(id)),
+        14 => Ok(RigPropertyRef::BindingTy(id)),
         _ => Err(Error::Validation("invalid rig property reference")),
     }
 }
@@ -6469,6 +6839,7 @@ fn read_optional_vec2(c: &mut Cursor) -> Result<Option<Vec2>, Error> {
 fn read_easing(c: &mut Cursor) -> Result<Easing, Error> {
     match c.read_u8()? {
         EASING_KIND_LINEAR => Ok(Easing::Linear),
+        EASING_KIND_HOLD => Ok(Easing::Hold),
         EASING_KIND_PRESET => {
             let family = EasingFamily::from_u8(c.read_u8()?)
                 .ok_or(Error::Validation("invalid easing family"))?;
@@ -7030,7 +7401,7 @@ mod compatibility_tests {
         project.assets.clear();
         project.assets.push(Asset::Q0v(Q0vAsset {
             asset_id: 7,
-            bytes: test_q0v_bytes(),
+            bytes: (test_q0v_bytes()).into(),
         }));
         project
             .asset_names
@@ -7074,7 +7445,7 @@ mod compatibility_tests {
         project.assets.clear();
         project.assets.push(Asset::Q0v(Q0vAsset {
             asset_id: 7,
-            bytes: test_q0v_bytes(),
+            bytes: (test_q0v_bytes()).into(),
         }));
         project.asset_names.insert(
             7,
@@ -7085,7 +7456,7 @@ mod compatibility_tests {
         let bytes = write(&project).expect("write q0v project");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q1S_VERSION_CURRENT
+            Q1S_VERSION_LAYER_FRAME_COUNTS
         );
         assert_eq!(parse(&bytes).expect("parse q0v project"), project);
     }
@@ -7174,7 +7545,7 @@ mod compatibility_tests {
         let bytes = write(&project).expect("write appearance q1s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q1S_VERSION_CURRENT
+            Q1S_VERSION_LAYER_FRAME_COUNTS
         );
         let parsed = parse(&bytes).expect("parse appearance q1s");
         assert_eq!(parsed, project);
@@ -7229,7 +7600,7 @@ mod compatibility_tests {
         let bytes = write(&project).expect("write q1s v10 fragments");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q1S_VERSION_CURRENT
+            Q1S_VERSION_LAYER_FRAME_COUNTS
         );
         assert_eq!(parse(&bytes).expect("parse current q1s fragments"), project);
     }
@@ -7277,7 +7648,7 @@ mod compatibility_tests {
         let bytes = write(&project).expect("write affine q1s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q1S_VERSION_CURRENT
+            Q1S_VERSION_LAYER_FRAME_COUNTS
         );
         let parsed = parse(&bytes).expect("parse affine q1s");
         assert_eq!(
@@ -7439,7 +7810,7 @@ mod compatibility_tests {
         project.assets.clear();
         project.assets.push(Asset::Q0v(Q0vAsset {
             asset_id: 7,
-            bytes: test_q0v_bytes(),
+            bytes: (test_q0v_bytes()).into(),
         }));
         project.q0rgs[0].layers[0].placements[0].target = Target::Asset(7);
 
@@ -7481,7 +7852,7 @@ mod compatibility_tests {
         let bytes = write(&project).expect("write layer state");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q1S_VERSION_CURRENT
+            Q1S_VERSION_LAYER_FRAME_COUNTS
         );
         let parsed = parse(&bytes).expect("parse layer state");
         assert_eq!(parsed, project);
@@ -7550,7 +7921,7 @@ mod compatibility_tests {
         let bytes = write(&project).expect("write nested q1s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q1S_VERSION_CURRENT
+            Q1S_VERSION_LAYER_FRAME_COUNTS
         );
         let parsed = parse(&bytes).expect("parse nested q1s");
         assert_eq!(parsed, project);
@@ -7805,7 +8176,7 @@ mod compatibility_tests {
         let bytes = write(&project).expect("write rigged q1s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q1S_VERSION_CURRENT
+            Q1S_VERSION_LAYER_FRAME_COUNTS
         );
         let parsed = parse(&bytes).expect("parse rigged q1s");
         assert_eq!(parsed, project);
@@ -8067,7 +8438,7 @@ mod compatibility_tests {
         let bytes = write(&project).expect("write pro rig current q1s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q1S_VERSION_CURRENT
+            Q1S_VERSION_LAYER_FRAME_COUNTS
         );
         assert_eq!(parse(&bytes).expect("parse pro rig current q1s"), project);
     }
@@ -8155,7 +8526,7 @@ mod compatibility_tests {
         let bytes = write(&project).expect("write deformer q1s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q1S_VERSION_CURRENT
+            Q1S_VERSION_LAYER_FRAME_COUNTS
         );
         assert_eq!(parse(&bytes).expect("parse deformer q1s"), project);
     }
@@ -8234,7 +8605,7 @@ mod compatibility_tests {
         let bytes = write(&project).expect("write v18 rig extensions");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q1S_VERSION_CURRENT
+            Q1S_VERSION_LAYER_FRAME_COUNTS
         );
         assert_eq!(
             parse(&bytes).expect("parse current rig extensions"),
@@ -8250,7 +8621,7 @@ mod compatibility_tests {
         let bytes = write(&project).expect("write audio clip fx");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q1S_VERSION_CURRENT
+            Q1S_VERSION_LAYER_FRAME_COUNTS
         );
         assert_eq!(parse(&bytes).expect("parse audio clip fx"), project);
     }
@@ -8261,7 +8632,7 @@ mod compatibility_tests {
         project.meta.fps = 24;
         project.assets = vec![Asset::Q0v(Q0vAsset {
             asset_id: 77,
-            bytes: test_audio_q0v_bytes(),
+            bytes: (test_audio_q0v_bytes()).into(),
         })];
         project.q0rgs[0].frame_count = 20;
         project.q0rgs[0].layers[0].placements.clear();
@@ -8273,12 +8644,13 @@ mod compatibility_tests {
             asset_id: 77,
             gain: 0.375,
             muted: true,
+            ..Default::default()
         });
 
         let bytes = write(&project).expect("write timeline audio q1s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q1S_VERSION_CURRENT
+            Q1S_VERSION_LAYER_FRAME_COUNTS
         );
         let parsed = parse(&bytes).expect("parse timeline audio q1s");
         assert_eq!(parsed, project);
@@ -8296,7 +8668,7 @@ mod compatibility_tests {
 
         project.assets = vec![Asset::Q0v(Q0vAsset {
             asset_id: 77,
-            bytes: test_audio_q0v_bytes(),
+            bytes: (test_audio_q0v_bytes()).into(),
         })];
         project.q0rgs[0].frame_count = 20;
         project.q0rgs[0].layers[0].placements.clear();
@@ -8308,6 +8680,7 @@ mod compatibility_tests {
             asset_id: 77,
             gain: 1.0,
             muted: false,
+            ..Default::default()
         });
         assert_eq!(
             write_version(&project, Q1S_VERSION_AUDIO_CLIP_FX)
@@ -8433,7 +8806,7 @@ mod compatibility_tests {
         let bytes = write(&project).expect("write project runtime q1s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q1S_VERSION_CURRENT
+            Q1S_VERSION_LAYER_FRAME_COUNTS
         );
         assert_eq!(parse(&bytes).expect("parse project runtime q1s"), project);
     }
@@ -8469,7 +8842,7 @@ mod compatibility_tests {
         let bytes = write(&project).unwrap();
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q1S_VERSION_CURRENT
+            Q1S_VERSION_LAYER_FRAME_COUNTS
         );
         let decoded = parse(&bytes).unwrap();
         assert_eq!(decoded, project);
@@ -8658,7 +9031,7 @@ mod compatibility_tests {
         let bytes = write(&project).expect("write gradient q1s");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q1S_VERSION_CURRENT
+            Q1S_VERSION_LAYER_FRAME_COUNTS
         );
         assert_eq!(parse(&bytes).expect("parse gradient q1s"), project);
         assert_eq!(
@@ -8695,7 +9068,7 @@ mod compatibility_tests {
         let bytes = write(&project).expect("write anisotropic fx");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q1S_VERSION_CURRENT
+            Q1S_VERSION_LAYER_FRAME_COUNTS
         );
         assert_eq!(parse(&bytes).expect("parse anisotropic fx"), project);
     }

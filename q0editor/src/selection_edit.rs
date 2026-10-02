@@ -19,7 +19,17 @@ pub fn selection_can_clip(selection: &Selection) -> bool {
     match selection {
         Selection::Placement { .. } | Selection::Path { .. } | Selection::StrokeSegment(_) => true,
         Selection::Paths(items) => !items.is_empty(),
-        Selection::RawParts { .. } => false,
+        Selection::RawParts {
+            fills,
+            strokes,
+            stroke_segments,
+            objects,
+        } => {
+            !fills.is_empty()
+                || !strokes.is_empty()
+                || !stroke_segments.is_empty()
+                || !objects.is_empty()
+        }
         Selection::Multi(items) => !items.is_empty(),
         Selection::Mixed { paths, objects } => !paths.is_empty() || !objects.is_empty(),
         Selection::RawArea {
@@ -131,7 +141,7 @@ pub fn selected_object_refs(project: &ProjectV2, selection: &Selection) -> Vec<P
         }],
         Selection::Multi(items) => items.clone(),
         Selection::Mixed { objects, .. } => objects.clone(),
-        Selection::RawArea { objects, .. } => objects.clone(),
+        Selection::RawArea { objects, .. } | Selection::RawParts { objects, .. } => objects.clone(),
         _ => Vec::new(),
     };
     let mut refs: Vec<_> = refs
@@ -168,6 +178,39 @@ fn selected_object_placements(project: &ProjectV2, selection: &Selection) -> Vec
 }
 
 fn selected_raw_vectors(project: &ProjectV2, selection: &Selection) -> Vec<RawVectorClipboard> {
+    if let Selection::RawParts {
+        fills,
+        strokes,
+        stroke_segments,
+        ..
+    } = selection
+    {
+        let mut vectors = selected_raw_vectors(project, &Selection::Paths(fills.clone()));
+        for source in &mut vectors {
+            // Whole-path legacy selections may refer to stroke-only artwork.
+            if source.vector.fill.is_some() {
+                source.vector.stroke = None;
+            }
+        }
+        let mut outlines = selected_raw_vectors(project, &Selection::Paths(strokes.clone()));
+        for source in &mut outlines {
+            if source.vector.stroke.is_some() {
+                source.vector.fill = None;
+                source.appearance = None;
+            }
+        }
+        vectors.extend(outlines);
+        for segment in stroke_segments {
+            if strokes.contains(&segment.path) {
+                continue;
+            }
+            vectors.extend(selected_raw_vectors(
+                project,
+                &Selection::StrokeSegment(*segment),
+            ));
+        }
+        return vectors;
+    }
     if let Selection::StrokeSegment(segment) = selection {
         return crate::tools::stroke_segment_snapshot(project, *segment)
             .map(|vector| {
@@ -308,6 +351,53 @@ fn selected_raw_vectors(project: &ProjectV2, selection: &Selection) -> Vec<RawVe
             continue;
         }
         let source = crate::tools::vector_fill_geometry(vector);
+        if vector.fill.is_some() && vector.stroke.is_some() {
+            let selected_fill = source.intersection(&clip);
+            let (selected_stroke, remainder_stroke) =
+                crate::tools::clip_stroked_paths(vector, &clip.0[0]);
+            let whole_fill = source.difference(&clip).unsigned_area() <= 0.05;
+            if whole_fill && remainder_stroke.is_empty() {
+                let mut snapshot = vector.clone();
+                snapshot.asset_id = 0;
+                vectors.push(RawVectorClipboard {
+                    vector: snapshot,
+                    appearance: None,
+                });
+                continue;
+            }
+            if selected_fill.unsigned_area() > 0.05 {
+                vectors.push(RawVectorClipboard {
+                    vector: VectorAsset {
+                        asset_id: 0,
+                        paths: if whole_fill {
+                            vector
+                                .paths
+                                .iter()
+                                .filter(|path| path.closed)
+                                .cloned()
+                                .collect()
+                        } else {
+                            crate::tools::geo_multi_polygon_to_linear_paths(&selected_fill)
+                        },
+                        fill: vector.fill,
+                        stroke: None,
+                    },
+                    appearance: None,
+                });
+            }
+            if !selected_stroke.is_empty() {
+                vectors.push(RawVectorClipboard {
+                    vector: VectorAsset {
+                        asset_id: 0,
+                        paths: selected_stroke,
+                        fill: None,
+                        stroke: vector.stroke,
+                    },
+                    appearance: None,
+                });
+            }
+            continue;
+        }
         // A marquee can be recorded from authored anchor bounds while the cubic
         // handles bow a tiny amount outside that rectangle. Treat that as a
         // whole-path selection rather than destructively polygonizing the curve.
@@ -809,6 +899,7 @@ pub fn remove_raw_area_and_objects(
 
     let mut remove_refs = objects.clone();
     let mut changed = !objects.is_empty();
+    let mut outline_remainders = Vec::new();
     for reference in &raw_placements {
         let Some(asset_id) = placement_asset_id(project, *reference) else {
             continue;
@@ -821,6 +912,61 @@ pub fn remove_raw_area_and_objects(
         else {
             continue;
         };
+        if snapshot.fill.is_some() && snapshot.stroke.is_some() {
+            let surface = crate::tools::vector_fill_geometry(&snapshot);
+            let selected_fill = surface.intersection(&clip);
+            let (selected_stroke, remainder_stroke) =
+                crate::tools::clip_stroked_paths(&snapshot, &clip.0[0]);
+            if selected_fill.unsigned_area() <= 0.05 && selected_stroke.is_empty() {
+                continue;
+            }
+            changed = true;
+            let remainder_fill = surface.difference(&clip);
+            let fill_paths = if selected_fill.unsigned_area() <= 0.05 {
+                snapshot
+                    .paths
+                    .iter()
+                    .filter(|path| path.closed)
+                    .cloned()
+                    .collect()
+            } else {
+                crate::tools::geo_multi_polygon_to_linear_paths(&remainder_fill)
+            };
+            if fill_paths.is_empty() && remainder_stroke.is_empty() {
+                remove_refs.push(*reference);
+                continue;
+            }
+            let mut replacement = snapshot.clone();
+            if fill_paths.is_empty() {
+                replacement.paths = remainder_stroke;
+                replacement.fill = None;
+            } else {
+                replacement.paths = fill_paths;
+                replacement.stroke = None;
+                if !remainder_stroke.is_empty() {
+                    if let Some(placement) = placement_clone(project, *reference) {
+                        outline_remainders.push((
+                            *reference,
+                            placement,
+                            VectorAsset {
+                                asset_id: 0,
+                                paths: remainder_stroke,
+                                fill: None,
+                                stroke: snapshot.stroke,
+                            },
+                        ));
+                    }
+                }
+            }
+            if let Some(Asset::Vector(vector)) = project
+                .assets
+                .iter_mut()
+                .find(|asset| asset.id() == asset_id)
+            {
+                *vector = replacement;
+            }
+            continue;
+        }
         if snapshot.fill.is_none() && snapshot.stroke.is_some() {
             let (selected, remainder) = crate::tools::clip_stroked_paths(&snapshot, &clip.0[0]);
             if selected.is_empty() {
@@ -917,7 +1063,7 @@ pub fn remove_raw_area_and_objects(
             .then(right.placement_idx.cmp(&left.placement_idx))
     });
     remove_refs.dedup();
-    for reference in remove_refs {
+    for reference in &remove_refs {
         if let Some(layer) = project
             .q0rgs
             .iter_mut()
@@ -931,6 +1077,41 @@ pub fn remove_raw_area_and_objects(
             if reference.placement_idx < layer.placements.len() {
                 layer.placements.remove(reference.placement_idx);
             }
+        }
+    }
+    // Insert surviving real outlines after their fill, once all removals are
+    // finished. This keeps source indices stable while processing the selection.
+    outline_remainders.sort_by_key(|(reference, _, _)| {
+        (
+            reference.q0rg_id,
+            reference.layer_id,
+            std::cmp::Reverse(reference.placement_idx),
+        )
+    });
+    for (reference, mut placement, mut vector) in outline_remainders {
+        let removed_before = remove_refs
+            .iter()
+            .filter(|removed| {
+                removed.q0rg_id == reference.q0rg_id
+                    && removed.layer_id == reference.layer_id
+                    && removed.placement_idx < reference.placement_idx
+            })
+            .count();
+        let index = reference.placement_idx - removed_before + 1;
+        vector.asset_id = next_asset_id(project);
+        placement.target = Target::Asset(vector.asset_id);
+        if let Some(layer) = project
+            .q0rgs
+            .iter_mut()
+            .find(|q0rg| q0rg.q0rg_id == reference.q0rg_id)
+            .and_then(|q0rg| {
+                q0rg.layers
+                    .iter_mut()
+                    .find(|layer| layer.layer_id == reference.layer_id)
+            })
+        {
+            layer.placements.insert(index, placement);
+            project.assets.push(Asset::Vector(vector));
         }
     }
     if changed {

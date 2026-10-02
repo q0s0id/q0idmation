@@ -14,6 +14,11 @@ use q0s_format::v2::{
 use crate::xfl_content::{self, RawEdge, RawFillStyle, RawShape, Segment};
 use crate::{ImportError, ImportReport, ImportedProject};
 
+#[path = "binary_archive.rs"]
+mod archive;
+#[path = "binary_project.rs"]
+mod project;
+
 pub(crate) const OLE2_MAGIC: [u8; 8] = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
 const MAX_STREAM_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_BINARY_SHAPES: usize = 100_000;
@@ -34,225 +39,7 @@ struct RecoveredShape {
 }
 
 pub(crate) fn import_legacy_fla(path: &Path) -> Result<ImportedProject, ImportError> {
-    let mut compound = CompoundFile::open(File::open(path)?).map_err(|error| {
-        ImportError::Invalid(format!("legacy FLA compound container is damaged: {error}"))
-    })?;
-    let streams: Vec<StreamInfo> = compound
-        .walk()
-        .filter(|entry| entry.is_stream())
-        .map(|entry| StreamInfo {
-            name: entry
-                .path()
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default()
-                .to_string(),
-            path: entry.path().to_path_buf(),
-            len: entry.len(),
-        })
-        .collect();
-    let contents_info = streams
-        .iter()
-        .find(|stream| stream.name.eq_ignore_ascii_case("Contents"))
-        .cloned()
-        .ok_or_else(|| ImportError::Invalid("legacy FLA has no Contents stream".to_string()))?;
-    let content_bytes = read_stream(&mut compound, &contents_info)?;
-    let metadata = read_legacy_metadata(&content_bytes);
-    let names = metadata.names;
-    let mut warnings = vec![
-        "legacy binary FLA detected and decoded from its OLE compound container".to_string(),
-        "legacy timeline animation, symbol placements, text and bitmap media are not mapped yet; recovered vector artwork is imported as static frames".to_string(),
-    ];
-
-    let mut page_streams: Vec<_> = streams
-        .iter()
-        .filter_map(|stream| numbered_stream(&stream.name, "Page ").map(|n| (n, stream.clone())))
-        .collect();
-    page_streams.sort_by_key(|(number, _)| *number);
-    let mut symbol_streams: Vec<_> = streams
-        .iter()
-        .filter_map(|stream| numbered_stream(&stream.name, "Symbol ").map(|n| (n, stream.clone())))
-        .collect();
-    symbol_streams.sort_by_key(|(number, _)| *number);
-    if page_streams.is_empty() {
-        return Err(ImportError::Invalid(
-            "legacy FLA has no readable Page streams".to_string(),
-        ));
-    }
-    if page_streams.len() > usize::from(u16::MAX - 1)
-        || symbol_streams.len() > usize::from(u16::MAX - 1).saturating_sub(page_streams.len())
-    {
-        return Err(ImportError::Invalid(
-            "legacy FLA contains too many scenes or symbols for q1s".to_string(),
-        ));
-    }
-
-    let source_name = path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or("untitled")
-        .to_string();
-    let mut project = ProjectV2 {
-        meta: ProjectMeta {
-            name: source_name,
-            fps: metadata.fps,
-            stage_width: metadata.width,
-            stage_height: metadata.height,
-            background_color: metadata.background,
-            entry_q0rg_id: 1,
-        },
-        assets: Vec::new(),
-        asset_names: HashMap::new(),
-        asset_appearances: HashMap::new(),
-        layer_metadata: HashMap::new(),
-        audio_clips: Vec::new(),
-        runtime: ProjectRuntimeData::default(),
-        q0rgs: Vec::new(),
-    };
-
-    let mut next_asset_id = 1_u16;
-    let mut next_q0rg_id = 1_u16;
-    let mut imported_layers = 0_usize;
-    let mut imported_keyframes = 0_usize;
-    for (scene_index, (page_number, stream)) in page_streams.iter().enumerate() {
-        if stream.len > MAX_STREAM_BYTES {
-            warnings.push(format!(
-                "{} is too large to decode safely ({} bytes); scene skipped",
-                stream.name, stream.len
-            ));
-            continue;
-        }
-        let bytes = read_stream(&mut compound, stream)?;
-        let recovered = recover_shapes(
-            &bytes,
-            MAX_BINARY_SHAPES.saturating_sub(project.assets.len()),
-        );
-        let scene_id = next_q0rg_id;
-        next_q0rg_id = next_q0rg_id.saturating_add(1);
-        let scene_name = names
-            .scenes
-            .get(page_number)
-            .cloned()
-            .unwrap_or_else(|| format!("Scene {}", scene_index + 1));
-        let mut layer = empty_layer(1, "Imported artwork");
-        add_shapes_to_layer(
-            recovered,
-            0,
-            &scene_name,
-            &mut layer,
-            &mut project,
-            &mut next_asset_id,
-            &mut warnings,
-        )?;
-        project.q0rgs.push(Q0rg {
-            q0rg_id: scene_id,
-            name: scene_name.clone(),
-            frame_count: 1,
-            script: String::new(),
-            layers: vec![layer],
-        });
-        project.runtime.scenes.push(ProjectScene {
-            scene_id: u16::try_from(scene_index + 1)
-                .map_err(|_| ImportError::Invalid("scene id overflow".to_string()))?,
-            q0rg_id: scene_id,
-            name: scene_name,
-        });
-        imported_layers += 1;
-        imported_keyframes += 1;
-    }
-
-    let mut symbol_number_to_q0rg = BTreeMap::new();
-    for (number, stream) in &symbol_streams {
-        if stream.len > MAX_STREAM_BYTES {
-            warnings.push(format!(
-                "{} is too large to decode safely ({} bytes); library item skipped",
-                stream.name, stream.len
-            ));
-            continue;
-        }
-        let bytes = read_stream(&mut compound, stream)?;
-        let recovered = recover_shapes(
-            &bytes,
-            MAX_BINARY_SHAPES.saturating_sub(project.assets.len()),
-        );
-        if recovered.is_empty() {
-            continue;
-        }
-        let q0rg_id = next_q0rg_id;
-        next_q0rg_id = next_q0rg_id.checked_add(1).ok_or_else(|| {
-            ImportError::Invalid("legacy FLA has too many q0rg symbols".to_string())
-        })?;
-        let name = names
-            .symbols
-            .get(number)
-            .cloned()
-            .unwrap_or_else(|| format!("Symbol {number}"));
-        let mut layer = empty_layer(1, "Artwork");
-        add_shapes_to_layer(
-            recovered,
-            0,
-            &name,
-            &mut layer,
-            &mut project,
-            &mut next_asset_id,
-            &mut warnings,
-        )?;
-        project.q0rgs.push(Q0rg {
-            q0rg_id,
-            name,
-            frame_count: 1,
-            script: String::new(),
-            layers: vec![layer],
-        });
-        symbol_number_to_q0rg.insert(*number, q0rg_id);
-        imported_layers += 1;
-        imported_keyframes += 1;
-    }
-
-    if project.q0rgs.is_empty() {
-        return Err(ImportError::Invalid(
-            "legacy FLA did not contain any recoverable scene artwork".to_string(),
-        ));
-    }
-    project.meta.entry_q0rg_id = project
-        .runtime
-        .scenes
-        .first()
-        .map(|scene| scene.q0rg_id)
-        .unwrap_or(1);
-
-    let missing_symbols = symbol_streams
-        .iter()
-        .filter(|(number, _)| !symbol_number_to_q0rg.contains_key(number))
-        .count();
-    if missing_symbols > 0 {
-        warnings.push(format!(
-            "{missing_symbols} library symbol stream(s) did not contain recoverable vector artwork"
-        ));
-    }
-    if project
-        .q0rgs
-        .iter()
-        .all(|q0rg| q0rg.layers.iter().all(|layer| layer.placements.is_empty()))
-    {
-        return Err(ImportError::Invalid(
-            "legacy FLA container opened, but no supported vector shapes could be recovered"
-                .to_string(),
-        ));
-    }
-    q0s_format::v2::validate(&project).map_err(|error| {
-        ImportError::Invalid(format!("converted q1s model failed validation: {error}"))
-    })?;
-    Ok(ImportedProject {
-        report: ImportReport {
-            source_kind: "legacy binary fla (static vector recovery)".to_string(),
-            imported_layers,
-            imported_keyframes,
-            warnings,
-        },
-        project,
-    })
+    project::import(path)
 }
 
 #[derive(Default)]
@@ -539,19 +326,27 @@ fn parse_shape(bytes: &[u8], start: usize) -> Option<(RawShape, usize)> {
     if object_schema > 8 || reader.u16()? != 0 {
         return None;
     }
-    let point_x = reader.s32()?;
-    let point_y = reader.s32()?;
+    let _point_x = reader.s32()?;
+    let _point_y = reader.s32()?;
     if object_schema > 2 {
         reader.u8()?;
     }
     if object_schema > 3 {
         reader.u8()?;
     }
+    let shape = parse_shape_tail(&mut reader, 0)?;
+    if shape.edges.is_empty() || (shape.fills.is_empty() && shape.strokes.is_empty()) {
+        return None;
+    }
+    Some((shape, reader.position))
+}
+
+fn parse_shape_tail(reader: &mut ByteReader<'_>, gradient_extra: usize) -> Option<RawShape> {
     let shape_schema = reader.u8()?;
     if shape_schema > 16 {
         return None;
     }
-    let matrix = read_matrix(&mut reader)?;
+    let matrix = read_matrix(reader)?;
     if !valid_affine(matrix) {
         return None;
     }
@@ -571,7 +366,7 @@ fn parse_shape(bytes: &[u8], start: usize) -> Option<(RawShape, usize)> {
             reader.u16()?;
             RawFillStyle::Solid(color)
         } else {
-            parse_fill_style(&mut reader, shape_schema > 2)?
+            parse_fill_style(reader, shape_schema > 2, gradient_extra)?
         };
         fills.insert(u16::try_from(style).ok()?, fill);
     }
@@ -587,9 +382,13 @@ fn parse_shape(bytes: &[u8], start: usize) -> Option<(RawShape, usize)> {
         if shape_schema > 2 {
             reader.skip(4)?;
             reader.u16()?;
-            let _line_fill = parse_fill_style(&mut reader, true)?;
+            let _line_fill = parse_fill_style(reader, true, gradient_extra)?;
         }
-        let width = f32::from(width_twips) / 20.0;
+        let width = if width_twips == 0 {
+            1.0
+        } else {
+            f32::from(width_twips) / 20.0
+        };
         if width.is_finite() && width > 0.0 {
             strokes.insert(
                 u16::try_from(style).ok()?,
@@ -604,7 +403,7 @@ fn parse_shape(bytes: &[u8], start: usize) -> Option<(RawShape, usize)> {
 
     let mut edges = Vec::new();
     if shape_data_schema >= 2 {
-        let (edge_result, consumed) = parse_edges(&mut reader)?;
+        let (edge_result, consumed) = parse_edges(reader)?;
         edges = edge_result;
         if consumed == 0 || edges.len() > MAX_EDGE_COUNT {
             return None;
@@ -622,7 +421,11 @@ fn parse_shape(bytes: &[u8], start: usize) -> Option<(RawShape, usize)> {
             reader.skip(usize::try_from(cubic_count).ok()?.checked_mul(32)?)?;
         }
     }
-    if edges.is_empty() || (fills.is_empty() && strokes.is_empty()) {
+    if edges.iter().any(|edge| {
+        edge.fill0.is_some_and(|id| usize::from(id) > fill_count)
+            || edge.fill1.is_some_and(|id| usize::from(id) > fill_count)
+            || edge.stroke.is_some_and(|id| usize::from(id) > line_count)
+    }) {
         return None;
     }
     let shape = RawShape {
@@ -631,26 +434,36 @@ fn parse_shape(bytes: &[u8], start: usize) -> Option<(RawShape, usize)> {
         strokes,
         edges,
     };
-    let _ = (point_x, point_y);
-    Some((shape, reader.position))
+
+    Some(shape)
 }
 
-fn parse_fill_style(reader: &mut ByteReader<'_>, caps: bool) -> Option<RawFillStyle> {
+fn parse_fill_style(
+    reader: &mut ByteReader<'_>,
+    caps: bool,
+    gradient_extra: usize,
+) -> Option<RawFillStyle> {
     let color = read_color(reader.u32()?);
     let subtype = reader.u8()?;
     reader.u8()?;
     if subtype & 0x70 == 0x10 {
-        let transform = read_matrix(reader)?;
+        let mut transform = read_matrix(reader)?;
         let stop_count = usize::from(reader.u8()?);
         if stop_count > 64 {
             return None;
         }
-        let gradient_type = if caps {
+        if caps {
             reader.u16()?;
-            reader.u8()?
-        } else {
-            0
-        };
+            reader.u8()?;
+            reader.skip(gradient_extra)?;
+        }
+        // The gradient's canonical coordinates are +/-16384 twips.
+        // q1s samples gradients in a normalized +/-1 domain in stage pixels.
+        let radius = 16_384.0 / 20.0;
+        transform.a11 *= radius;
+        transform.a12 *= radius;
+        transform.a21 *= radius;
+        transform.a22 *= radius;
         let mut stops = Vec::with_capacity(stop_count);
         for _ in 0..stop_count {
             stops.push(q0s_format::v2::GradientStop {
@@ -675,7 +488,7 @@ fn parse_fill_style(reader: &mut ByteReader<'_>, caps: bool) -> Option<RawFillSt
             });
         }
         return Some(RawFillStyle::Gradient(q0s_format::v2::GradientFill {
-            kind: if gradient_type & 1 == 0 {
+            kind: if subtype & 2 == 0 {
                 q0s_format::v2::GradientKind::Linear
             } else {
                 q0s_format::v2::GradientKind::Radial
@@ -691,9 +504,18 @@ fn parse_fill_style(reader: &mut ByteReader<'_>, caps: bool) -> Option<RawFillSt
         return Some(RawFillStyle::Solid(color));
     }
     if subtype & 0x70 == 0x40 {
-        read_matrix(reader)?;
-        reader.u32()?;
-        return Some(RawFillStyle::Solid(color));
+        let mut transform = read_matrix(reader)?;
+        let reference = u32::from(reader.u16()?);
+        // Bitmap fill bases map source pixels to twips, unlike object bases.
+        transform.a11 /= 20.0;
+        transform.a12 /= 20.0;
+        transform.a21 /= 20.0;
+        transform.a22 /= 20.0;
+        return Some(RawFillStyle::Bitmap {
+            reference,
+            transform,
+            tiled: subtype & 1 == 0,
+        });
     }
     Some(RawFillStyle::Solid(color))
 }
@@ -721,9 +543,9 @@ fn parse_edges(reader: &mut ByteReader<'_>) -> Option<(Vec<RawEdge>, usize)> {
             } else {
                 [reader.u16()?, reader.u16()?, reader.u16()?]
             };
-            fill0 = values[0] & 0x7fff;
-            fill1 = values[1] & 0x7fff;
-            stroke = values[2] & 0x7fff;
+            stroke = values[0] & 0x7fff;
+            fill0 = values[1] & 0x7fff;
+            fill1 = values[2] & 0x7fff;
         }
         let (dx1, dy1) = read_delta(reader, flags & 3)?;
         let (dx2, dy2) = read_delta(reader, (flags >> 2) & 3)?;
@@ -744,10 +566,11 @@ fn parse_edges(reader: &mut ByteReader<'_>) -> Option<(Vec<RawEdge>, usize)> {
             return None;
         }
         let segment = Segment {
-            start: Vec2::new(sx as f32 / 2560.0, sy as f32 / 2560.0),
-            end: Vec2::new(ex as f32 / 2560.0, ey as f32 / 2560.0),
+            // Edges use 8.8 fixed-point twips: 256 * 20 units per pixel.
+            start: Vec2::new(sx as f32 / 5120.0, sy as f32 / 5120.0),
+            end: Vec2::new(ex as f32 / 5120.0, ey as f32 / 5120.0),
             control: (((flags >> 2) & 3) != 0)
-                .then_some(Vec2::new(cx as f32 / 2560.0, cy as f32 / 2560.0)),
+                .then_some(Vec2::new(cx as f32 / 5120.0, cy as f32 / 5120.0)),
         };
         edges.push(RawEdge {
             fill0: (fill0 != 0).then_some(fill0),
@@ -799,15 +622,16 @@ fn valid_affine(matrix: Affine) -> bool {
     .all(|value| value.is_finite() && value.abs() <= 1_000_000.0)
 }
 
-fn read_color(argb: u32) -> Rgba {
+fn read_color(rgba: u32) -> Rgba {
     Rgba {
-        r: ((argb >> 16) & 0xff) as u8,
-        g: ((argb >> 8) & 0xff) as u8,
-        b: (argb & 0xff) as u8,
-        a: (argb >> 24) as u8,
+        r: (rgba & 0xff) as u8,
+        g: ((rgba >> 8) & 0xff) as u8,
+        b: ((rgba >> 16) & 0xff) as u8,
+        a: (rgba >> 24) as u8,
     }
 }
 
+#[derive(Clone)]
 struct ByteReader<'a> {
     bytes: &'a [u8],
     position: usize,

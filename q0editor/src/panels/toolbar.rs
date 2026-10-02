@@ -100,7 +100,7 @@ fn tool_shortcut(tool: Tool) -> Option<crate::hotkeys::ShortcutCommand> {
         Tool::Bucket => C::ToolBucket,
         Tool::Eyedropper => C::ToolEyedropper,
         Tool::Text => C::ToolText,
-        Tool::Rig => return None,
+        Tool::Rig => C::ToolRig,
     })
 }
 

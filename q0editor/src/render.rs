@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-#[cfg(feature = "appearance-mask-eraser")]
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -146,17 +145,18 @@ impl VectorMeshBatch {
         view: &StageView,
         tint: Color32,
         stroke_scale_compensation: f32,
+        color_transform: q0glblend::ColorTransform,
     ) -> bool {
         let fill_color = vector
             .fill
-            .map(|color| modulate(rgba_to_color32(color), tint))
+            .map(|color| color_transform.apply(modulate(rgba_to_color32(color), tint)))
             .unwrap_or(Color32::TRANSPARENT);
         let has_fill = fill_color != Color32::TRANSPARENT
             && !geometry.fill_vertices.is_empty()
             && !geometry.fill_indices.is_empty();
         let stroke_color = vector
             .stroke
-            .map(|stroke| modulate(rgba_to_color32(stroke.color), tint));
+            .map(|stroke| color_transform.apply(modulate(rgba_to_color32(stroke.color), tint)));
         let has_stroke = stroke_color.is_some();
 
         if !has_fill && !has_stroke {
@@ -460,6 +460,33 @@ pub(crate) struct CachedSelectionPaint {
     pub affine_reprojectable: bool,
     pub view_origin: Pos2,
     pub view_scale: f32,
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RawAreaSelectionKey {
+    pub assets: Vec<(u16, [u32; 6])>,
+    pub clip_points: Vec<[u32; 2]>,
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+pub(crate) struct CachedRawAreaSelection {
+    pub fill: CachedSelectionStageMesh,
+    pub strokes: Vec<Vec<Pos2>>,
+    pub paint: Option<CachedSelectionPaint>,
+    pub paint_key: Option<(Color32, TextureId, [u32; 7])>,
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+impl CachedRawAreaSelection {
+    pub(crate) fn new(contours: &[Vec<Pos2>], strokes: Vec<Vec<Pos2>>) -> Self {
+        Self {
+            fill: build_selection_stage_mesh(contours).unwrap_or_default(),
+            strokes,
+            paint: None,
+            paint_key: None,
+        }
+    }
 }
 
 #[cfg(feature = "appearance-mask-eraser")]
@@ -859,6 +886,7 @@ struct MaskFrameKey {
     translate_y_bits: u32,
     editing_q0rg_id: Option<u16>,
     mask_visibility_revision: u64,
+    layer_filter_hash: u64,
 }
 
 struct CachedMaskFrame {
@@ -914,7 +942,7 @@ pub struct TextureCache {
     stage_traversal_stats: StageTraversalStats,
     by_q0v_frame: HashMap<(u16, u32), TextureHandle>,
     q0v_media: HashMap<u16, q0video::q0v::Q0vFile>,
-    audio_waveforms: HashMap<u16, crate::audio::AudioWaveformBuilder>,
+    audio_waveforms: HashMap<u16, crate::audio::AudioWaveformCache>,
     fx_project_snapshot: Option<FxProjectSnapshot>,
     fx_project_revision: Option<(u64, u64)>,
     fx_placement_textures: HashMap<FxPlacementKey, FxPlacementTexture>,
@@ -952,6 +980,10 @@ pub struct TextureCache {
     selection_stage_mesh_by_key: HashMap<SelectionStageMeshKey, CachedSelectionStageMesh>,
     #[cfg(feature = "appearance-mask-eraser")]
     selection_paint_by_key: HashMap<SelectionPaintKey, CachedSelectionPaint>,
+    // Keep only the current marquee. Its stage geometry survives zoom/pan, but
+    // changed selection clips cannot accumulate large meshes indefinitely.
+    #[cfg(feature = "appearance-mask-eraser")]
+    raw_area_selection: Option<(RawAreaSelectionKey, CachedRawAreaSelection)>,
     #[cfg(all(test, feature = "appearance-mask-eraser"))]
     appearance_signature_build_count: usize,
     #[cfg(all(test, feature = "appearance-mask-eraser"))]
@@ -1158,6 +1190,7 @@ impl TextureCache {
             self.active_placement_indexes.clear();
             self.active_placement_indexes_revision = Some(revision);
         }
+        self.refresh_layer_structure(q0rg_id, layer);
         self.active_placement_indexes
             .entry((q0rg_id, layer.layer_id))
             .or_insert_with(|| LayerFrameIndex::new(layer))
@@ -1207,6 +1240,36 @@ impl TextureCache {
         }
         if let Some(cache) = self.placement_bounds_cache.as_mut() {
             cache.bounds.invalidate_placement_transforms();
+        }
+        // A bound placement move edits its rig asset, not placement.transform.
+        // Refresh every pose of the touched rig, including its descendants.
+        let index = self.render_index(project, Some(revision));
+        let rig_owners: HashSet<u16> = locators
+            .iter()
+            .filter_map(|(q0rg_id, _, _)| index.rigs.contains_key(q0rg_id).then_some(*q0rg_id))
+            .collect();
+        if !rig_owners.is_empty() {
+            self.rig_pose_cache
+                .retain(|(q0rg_id, _), _| !rig_owners.contains(q0rg_id));
+            // Cached filtered parent symbols contain the rig's old pose even
+            // though the authored placements themselves have not changed.
+            self.fx_placement_textures.retain(|key, _| {
+                let target = index
+                    .q0rgs
+                    .get(&key.host_q0rg_id)
+                    .and_then(|q0rg_index| project.q0rgs.get(*q0rg_index))
+                    .and_then(|q0rg| {
+                        q0rg.layers
+                            .iter()
+                            .find(|layer| layer.layer_id == key.layer_id)
+                    })
+                    .and_then(|layer| layer.placements.get(key.placement_idx))
+                    .map(|placement| placement.target);
+                !rig_owners.contains(&key.host_q0rg_id)
+                    && !matches!(target, Some(Target::Q0rg(root)) if rig_owners.iter().any(|owner|
+                        q0rg_reaches_q0rg(project, root, *owner, Q0RG_RECURSION_LIMIT)))
+            });
+            self.mask_frame_textures.clear();
         }
         // Live drags keep render_revision stable, but LayerFrameIndex also memoizes
         // the resolved transform values for its last frame. Invalidate only the
@@ -1323,6 +1386,23 @@ impl TextureCache {
             .is_none_or(|bounds| bounds.expand(2.0).intersects(clip_rect))
     }
 
+    fn refresh_layer_structure(&mut self, q0rg_id: u16, layer: &q0s_format::v2::Layer) {
+        // Auto-keying can change topology while live drags keep render_revision
+        // stable. Refresh the touched layer before resolving artwork or hits.
+        if self
+            .active_placement_indexes
+            .get(&(q0rg_id, layer.layer_id))
+            .is_some_and(|index| !index.matches_structure(layer))
+        {
+            self.active_placement_indexes
+                .remove(&(q0rg_id, layer.layer_id));
+            if let Some(cache) = self.placement_bounds_cache.as_mut() {
+                cache.bounds.invalidate_placement_transforms();
+            }
+            self.fx_project_revision = None;
+            self.mask_frame_textures.clear();
+        }
+    }
     fn active_placement_states_at(
         &mut self,
         q0rg_id: u16,
@@ -1342,6 +1422,7 @@ impl TextureCache {
             self.active_placement_indexes.clear();
             self.active_placement_indexes_revision = Some(revision);
         }
+        self.refresh_layer_structure(q0rg_id, layer);
         self.active_placement_indexes
             .entry((q0rg_id, layer.layer_id))
             .or_insert_with(|| LayerFrameIndex::new(layer))
@@ -1550,7 +1631,9 @@ impl TextureCache {
         self.vector_bounds_by_asset.clear();
         self.by_q0v_frame.clear();
         self.q0v_media.clear();
-        self.audio_waveforms.clear();
+        // Artwork edits do not change immutable source audio. Keep completed
+        // peaks and pending jobs; identify replaced sources by their Arc below.
+        self.audio_waveforms.retain(|_, cache| cache.source_alive());
         self.fx_placement_textures.clear();
         self.mask_frame_textures.clear();
         self.mask_frame_revision = None;
@@ -1577,6 +1660,7 @@ impl TextureCache {
             self.selection_geometry_by_key.clear();
             self.selection_stage_mesh_by_key.clear();
             self.selection_paint_by_key.clear();
+            self.raw_area_selection = None;
         }
     }
 
@@ -1622,6 +1706,13 @@ impl TextureCache {
                 .retain(|key, _| key.asset_id != asset_id);
             self.selection_paint_by_key
                 .retain(|key, _| key.asset_id != asset_id);
+            if self
+                .raw_area_selection
+                .as_ref()
+                .is_some_and(|(key, _)| key.assets.iter().any(|(id, _)| *id == asset_id))
+            {
+                self.raw_area_selection = None;
+            }
         }
     }
 
@@ -1636,23 +1727,21 @@ impl TextureCache {
         project: &ProjectV2,
         asset_id: u16,
     ) -> Option<(&crate::audio::AudioWaveform, bool)> {
-        const BINS_PER_REPAINT: usize = 8;
-        let bytes = project
-            .assets
-            .iter()
-            .find(|asset| asset.id() == asset_id)
-            .and_then(|asset| match asset {
-                Asset::Q0v(media) => Some(media.bytes.as_slice()),
-                _ => None,
-            })?;
-        if let std::collections::hash_map::Entry::Vacant(entry) =
-            self.audio_waveforms.entry(asset_id)
+        let bytes = project.assets.iter().find_map(|asset| match asset {
+            Asset::Q0v(media) if media.asset_id == asset_id => Some(&media.bytes),
+            _ => None,
+        })?;
+        if !self
+            .audio_waveforms
+            .get(&asset_id)
+            .is_some_and(|cache| cache.matches_source(bytes))
         {
-            entry.insert(crate::audio::AudioWaveformBuilder::new(bytes)?);
+            self.audio_waveforms.insert(
+                asset_id,
+                crate::audio::AudioWaveformCache::new(std::sync::Arc::clone(bytes))?,
+            );
         }
-        let builder = self.audio_waveforms.get_mut(&asset_id)?;
-        let complete = builder.advance(bytes, BINS_PER_REPAINT);
-        Some((builder.waveform(), complete))
+        Some(self.audio_waveforms.get_mut(&asset_id)?.poll())
     }
 
     fn vector_render_geometry(&mut self, vector: &VectorAsset) -> &CachedVectorRenderGeometry {
@@ -2250,6 +2339,26 @@ impl TextureCache {
             accent,
             false,
         )
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    pub(crate) fn raw_area_selection(
+        &mut self,
+        key: &RawAreaSelectionKey,
+    ) -> Option<&mut CachedRawAreaSelection> {
+        self.raw_area_selection
+            .as_mut()
+            .filter(|(cached_key, _)| cached_key == key)
+            .map(|(_, cached)| cached)
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    pub(crate) fn insert_raw_area_selection(
+        &mut self,
+        key: RawAreaSelectionKey,
+        geometry: CachedRawAreaSelection,
+    ) {
+        self.raw_area_selection = Some((key, geometry));
     }
 
     #[cfg(feature = "appearance-mask-eraser")]
@@ -2900,6 +3009,7 @@ fn gradient_mesh_paint(
         kind: geometry.kind,
         stops: Arc::clone(&geometry.stops),
         tint,
+        color_transform: q0glblend::ColorTransform::default(),
     })
 }
 
@@ -2935,22 +3045,25 @@ fn solid_vector_group_paint(
         kind: GradientKind::Linear,
         stops: Arc::clone(&geometry.stops),
         tint: Color32::WHITE,
+        color_transform: q0glblend::ColorTransform::default(),
     }
 }
 
-fn paint_cached_vector_gradient(
+fn paint_cached_vector_gradient_color(
     painter: &Painter,
     geometry: &CachedGradientRenderGeometry,
     transform: Affine,
     view: &StageView,
     tint: Color32,
+    color_transform: q0glblend::ColorTransform,
 ) {
-    let (Some(mesh), Some(paint)) = (
+    let (Some(mesh), Some(mut paint)) = (
         geometry.mesh.as_ref(),
         gradient_mesh_paint(geometry, transform, view, tint),
     ) else {
         return;
     };
+    paint.color_transform = color_transform;
     q0glblend::paint_gradient_mesh(painter, view.stage_rect, Arc::clone(mesh), paint);
 }
 
@@ -3036,7 +3149,8 @@ fn placement_fx_keeps_vector_body(fx: PlacementFx) -> bool {
     let shadow_active = fx
         .shadow
         .is_some_and(|shadow| shadow.strength > 1.0e-6 && shadow.color.a > 0);
-    fx.opacity >= 0.999_999
+    fx.tint.is_none_or(|tint| tint.amount <= 1.0e-6)
+        && fx.opacity >= 0.999_999
         && fx.blend_mode == BlendMode::Normal
         && blur_is_identity
         && (glow_active || shadow_active)
@@ -3051,7 +3165,8 @@ fn placement_fx_is_pure_blend(fx: PlacementFx) -> bool {
     let shadow_is_identity = fx
         .shadow
         .is_none_or(|shadow| shadow.strength <= 1.0e-6 || shadow.color.a == 0);
-    fx.opacity >= 0.999_999
+    fx.tint.is_none_or(|tint| tint.amount <= 1.0e-6)
+        && fx.opacity >= 0.999_999
         && fx.blend_mode != BlendMode::Normal
         && blur_is_identity
         && glow_is_identity
@@ -3068,7 +3183,8 @@ fn placement_fx_is_pure_opacity(fx: PlacementFx) -> bool {
     let shadow_is_identity = fx
         .shadow
         .is_none_or(|shadow| shadow.strength <= 1.0e-6 || shadow.color.a == 0);
-    fx.opacity < 0.999_999
+    fx.tint.is_none_or(|tint| tint.amount <= 1.0e-6)
+        && fx.opacity < 0.999_999
         && fx.blend_mode == BlendMode::Normal
         && blur_is_identity
         && glow_is_identity
@@ -3085,7 +3201,8 @@ fn placement_fx_is_visual_identity(fx: PlacementFx) -> bool {
     let shadow_is_identity = fx
         .shadow
         .is_none_or(|shadow| shadow.strength <= 1.0e-6 || shadow.color.a == 0);
-    fx.opacity >= 0.999_999
+    fx.tint.is_none_or(|tint| tint.amount <= 1.0e-6)
+        && fx.opacity >= 0.999_999
         && fx.blend_mode == BlendMode::Normal
         && blur_is_identity
         && glow_is_identity
@@ -3099,6 +3216,11 @@ fn placement_fx_has_gpu_blur_or_glow(fx: PlacementFx) -> bool {
                 && glow.color.a > 0
                 && (glow.radius_x > 1.0e-6 || glow.radius_y > 1.0e-6)
         })
+}
+
+fn placement_fx_without_tint(mut fx: PlacementFx) -> PlacementFx {
+    fx.tint = None;
+    fx
 }
 fn linear_affine_bits(affine: Affine) -> [u32; 4] {
     [
@@ -3497,7 +3619,10 @@ fn collect_vector_asset_group_primitives(
                 });
             }
             mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
-            primitives.push(q0glblend::VectorGroupPrimitive::Textured(Arc::new(mesh)));
+            primitives.push(q0glblend::VectorGroupPrimitive::Textured {
+                mesh: Arc::new(mesh),
+                color_transform: q0glblend::ColorTransform::default(),
+            });
             return true;
         }
         Asset::Vector(vector) => vector,
@@ -3507,7 +3632,8 @@ fn collect_vector_asset_group_primitives(
     match project.asset_appearances.get(&asset_id) {
         None => {
             if let Some(group_fill) = textures.vector_group_fill(vector) {
-                let paint = solid_vector_group_paint(&group_fill, fill_transform, view);
+                let mut paint = solid_vector_group_paint(&group_fill, fill_transform, view);
+                paint.tint = tint;
                 primitives.push(q0glblend::VectorGroupPrimitive::Gradient {
                     mesh: group_fill.mesh,
                     paint,
@@ -3518,11 +3644,7 @@ fn collect_vector_asset_group_primitives(
             // Solid fills and Animate gradients remain vector primitives. Soft
             // materials and vector-local erase/clip paths need separate GPU
             // material passes and are left to the established renderer.
-            if !matches!(appearance.material, q0s_format::v2::VectorMaterial::Solid)
-                || !appearance.erase_mask.is_empty()
-                || !appearance.material_source.is_empty()
-                || !appearance.clip_mask.is_empty()
-            {
+            if !matches!(appearance.material, q0s_format::v2::VectorMaterial::Solid) {
                 return false;
             }
             fill_transform = Affine::compose(transform, appearance.field_transform);
@@ -3559,7 +3681,8 @@ fn collect_vector_asset_group_primitives(
                 #[cfg(not(feature = "appearance-mask-eraser"))]
                 return false;
             } else if let Some(group_fill) = textures.vector_group_fill(vector) {
-                let paint = solid_vector_group_paint(&group_fill, fill_transform, view);
+                let mut paint = solid_vector_group_paint(&group_fill, fill_transform, view);
+                paint.tint = tint;
                 primitives.push(q0glblend::VectorGroupPrimitive::Gradient {
                     mesh: group_fill.mesh,
                     paint,
@@ -3713,9 +3836,10 @@ fn collect_vector_q0rg_group_primitives(
             return false;
         }
         for resolved in resolved_layer {
-            if !placement_fx_is_visual_identity(resolved.fx) {
+            if !placement_fx_is_visual_identity(placement_fx_without_tint(resolved.fx)) {
                 return false;
             }
+            let primitive_start = primitives.len();
             let placement = resolved.placement;
             let composed = Affine::compose(parent, Affine::from_transform(resolved.interp));
             match placement.target {
@@ -3752,6 +3876,12 @@ fn collect_vector_q0rg_group_primitives(
                 }
                 Target::Q0rg(_) => return false,
             }
+            if let Some(effect) = resolved.fx.tint {
+                q0glblend::transform_primitive_colors(
+                    &mut primitives[primitive_start..],
+                    q0glblend::ColorTransform::tint(effect),
+                );
+            }
         }
     }
     true
@@ -3772,8 +3902,18 @@ fn try_render_gpu_vector_filter_placement(
     ctx: &Context,
     depth: u8,
     tint: Color32,
+    inherited_color: q0glblend::ColorTransform,
 ) -> bool {
-    if !placement_fx_has_gpu_blur_or_glow(fx) || lookup.has_rig(host_q0rg_id) {
+    let tint_active = fx.tint.is_some_and(|effect| effect.amount > 1.0e-6);
+    if (!placement_fx_has_gpu_blur_or_glow(fx) && !tint_active) || lookup.has_rig(host_q0rg_id) {
+        return false;
+    }
+    if fx.glow.is_some_and(|glow| {
+        glow.strength > 1.0e-6
+            && glow.color.a > 0
+            && glow.radius_x <= 1.0e-6
+            && glow.radius_y <= 1.0e-6
+    }) {
         return false;
     }
     if fx
@@ -3783,7 +3923,12 @@ fn try_render_gpu_vector_filter_placement(
         return false;
     }
 
-    let group_tint = Color32::from_rgba_unmultiplied(tint.r(), tint.g(), tint.b(), 255);
+    // Apply the editor's preview modulation after authored tint, not before it.
+    let group_tint = if tint_active {
+        Color32::WHITE
+    } else {
+        Color32::from_rgba_unmultiplied(tint.r(), tint.g(), tint.b(), 255)
+    };
     let mut primitives = Vec::new();
     let supported = match placement.target {
         Target::Asset(asset_id) => collect_vector_asset_group_primitives(
@@ -3825,6 +3970,20 @@ fn try_render_gpu_vector_filter_placement(
         return false;
     }
 
+    if tint_active {
+        let effect = q0glblend::ColorTransform::tint(fx.tint.unwrap());
+        let modulation = q0glblend::ColorTransform {
+            scale: [tint.r(), tint.g(), tint.b()].map(|c| f32::from(c) / 255.0),
+            offset: [0.0; 3],
+        };
+        q0glblend::transform_primitive_colors(&mut primitives, effect.then(modulation));
+        if placement_fx_is_visual_identity(placement_fx_without_tint(fx)) && tint.a() == 255 {
+            q0glblend::transform_primitive_colors(&mut primitives, inherited_color);
+            q0glblend::paint_vector_primitives(painter, primitives);
+            return true;
+        }
+    }
+
     let filter_scale = composed.uniform_scale().abs() * view.effective_scale().abs();
     let blur = fx
         .blur
@@ -3844,10 +4003,11 @@ fn try_render_gpu_vector_filter_placement(
             .unwrap_or([0.0, 0.0]),
         glow_quality: glow.map_or(1, |glow| glow.quality),
         glow_color: glow
-            .map(|glow| modulate(rgba_to_color32(glow.color), group_tint))
+            .map(|glow| inherited_color.apply(modulate(rgba_to_color32(glow.color), group_tint)))
             .unwrap_or(Color32::TRANSPARENT),
         glow_strength: glow.map_or(0.0, |glow| glow.strength),
     };
+    q0glblend::transform_primitive_colors(&mut primitives, inherited_color);
     let opacity = fx.opacity.clamp(0.0, 1.0) * (f32::from(tint.a()) / 255.0);
     if textures.gpu_filter_cache_enabled {
         q0glblend::paint_vector_group_fx_cached_on_opaque_backdrop(
@@ -3883,7 +4043,11 @@ fn try_render_direct_vector_opacity_placement(
     ctx: &Context,
     depth: u8,
     tint: Color32,
+    inherited_color: q0glblend::ColorTransform,
 ) -> bool {
+    if fx.tint.is_some_and(|tint| tint.amount > 1.0e-6) {
+        return false;
+    }
     if !placement_fx_is_pure_opacity(fx) || lookup.has_rig(host_q0rg_id) {
         return false;
     }
@@ -3904,7 +4068,10 @@ fn try_render_direct_vector_opacity_placement(
             ) {
                 return false;
             }
-            for mesh in meshes {
+            for mut mesh in meshes {
+                for vertex in &mut mesh.vertices {
+                    vertex.color = inherited_color.apply(vertex.color);
+                }
                 painter.add(Shape::Mesh(mesh));
             }
             true
@@ -3938,6 +4105,7 @@ fn try_render_direct_vector_opacity_placement(
             ) {
                 return false;
             }
+            q0glblend::transform_primitive_colors(&mut primitives, inherited_color);
             let opacity = fx.opacity.clamp(0.0, 1.0) * (f32::from(tint.a()) / 255.0);
             q0glblend::paint_vector_group_on_opaque_backdrop(
                 painter,
@@ -3966,7 +4134,11 @@ fn try_render_gpu_vector_blend_placement(
     ctx: &Context,
     depth: u8,
     tint: Color32,
+    inherited_color: q0glblend::ColorTransform,
 ) -> bool {
+    if fx.tint.is_some_and(|tint| tint.amount > 1.0e-6) {
+        return false;
+    }
     if !placement_fx_is_pure_blend(fx) || lookup.has_rig(host_q0rg_id) {
         return false;
     }
@@ -4011,6 +4183,7 @@ fn try_render_gpu_vector_blend_placement(
     if !supported {
         return false;
     }
+    q0glblend::transform_primitive_colors(&mut primitives, inherited_color);
     let opacity = f32::from(tint.a()) / 255.0;
     q0glblend::paint_vector_group_on_opaque_backdrop(painter, primitives, fx.blend_mode, opacity);
     true
@@ -4031,6 +4204,7 @@ fn render_fx_placement(
     ctx: &Context,
     tint: Color32,
     outer_only: bool,
+    inherited_color: q0glblend::ColorTransform,
 ) {
     let (width, height) = fx_cache_render_size(project, view, ctx, outer_only, fx);
 
@@ -4149,6 +4323,24 @@ fn render_fx_placement(
         Vec2::new(composed.tx, composed.ty),
         view,
     );
+    if !inherited_color.is_identity() {
+        let mut mesh = Mesh::with_texture(cached.texture.id());
+        mesh.add_rect_with_uv(
+            screen_rect,
+            Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+        q0glblend::paint_vector_group_on_opaque_backdrop(
+            painter,
+            vec![q0glblend::VectorGroupPrimitive::Textured {
+                mesh: Arc::new(mesh),
+                color_transform: inherited_color,
+            }],
+            cached.blend_mode,
+            1.0,
+        );
+        return;
+    }
     q0glblend::paint_texture_on_opaque_backdrop(
         painter,
         screen_rect,
@@ -4207,7 +4399,6 @@ pub(crate) struct StageRenderPass<'a> {
 
 #[derive(Clone, Copy)]
 enum RootLayerFilter<'a> {
-    Only(u16),
     Excluding(&'a HashSet<u16>),
     ExcludingPlacement(u16, usize),
 }
@@ -4215,7 +4406,6 @@ enum RootLayerFilter<'a> {
 impl RootLayerFilter<'_> {
     fn includes(self, layer_id: u16) -> bool {
         match self {
-            Self::Only(only) => only == layer_id,
             Self::Excluding(excluded) => !excluded.contains(&layer_id),
             Self::ExcludingPlacement(_, _) => true,
         }
@@ -4226,7 +4416,7 @@ impl RootLayerFilter<'_> {
             Self::ExcludingPlacement(excluded_layer, excluded_idx) => {
                 layer_id != excluded_layer || placement_idx != excluded_idx
             }
-            Self::Only(_) | Self::Excluding(_) => true,
+            Self::Excluding(_) => true,
         }
     }
 }
@@ -4278,6 +4468,32 @@ impl<'a> StageRenderPass<'a> {
         ctx: &Context,
         tint: Color32,
     ) {
+        self.render_tinted_filtered(painter, q0rg_id, frame, view, textures, ctx, tint, None);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_tinted_filtered(
+        &self,
+        painter: &Painter,
+        q0rg_id: u16,
+        frame: u16,
+        view: &StageView,
+        textures: &mut TextureCache,
+        ctx: &Context,
+        tint: Color32,
+        excluded_layers: Option<&HashSet<u16>>,
+    ) {
+        let layer_filter_hash = excluded_layers.map_or(0, |excluded| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            if let Some(q0rg) = self.lookup.q0rg(q0rg_id) {
+                for layer in &q0rg.layers {
+                    if excluded.contains(&layer.layer_id) {
+                        layer.layer_id.hash(&mut hasher);
+                    }
+                }
+            }
+            hasher.finish()
+        });
         let __t = std::time::Instant::now();
         let contains_mask = q0rg_contains_mask(
             self.project,
@@ -4338,6 +4554,7 @@ impl<'a> StageRenderPass<'a> {
                     translate_y_bits: root.ty.to_bits(),
                     editing_q0rg_id: textures.editing_mask_q0rg_id,
                     mask_visibility_revision: textures.mask_visibility_revision,
+                    layer_filter_hash,
                 };
                 let translation = view.origin
                     - textures
@@ -4378,11 +4595,13 @@ impl<'a> StageRenderPass<'a> {
                         root,
                         &q0s_format::rig::RigRuntimeOverrides::new(),
                         &q0s_format::runtime_scene::RuntimeSceneState::new(),
-                        textures.editing_mask_q0rg_id.map(|editing_q0rg_id| {
-                            q0s_format::raster::MaskEditingPreview {
-                                q0rg_id: editing_q0rg_id,
-                                hidden_artwork: &textures.hidden_mask_art_layers,
-                            }
+                        (excluded_layers.is_some()
+                            || textures.editing_mask_q0rg_id == Some(q0rg_id))
+                        .then_some(q0s_format::raster::MaskEditingPreview {
+                            q0rg_id,
+                            hidden_artwork: (textures.editing_mask_q0rg_id == Some(q0rg_id))
+                                .then_some(&textures.hidden_mask_art_layers),
+                            excluded_layers,
                         }),
                     );
                     let image = ColorImage::from_rgba_unmultiplied(
@@ -4427,7 +4646,7 @@ impl<'a> StageRenderPass<'a> {
                 ctx,
                 0,
                 tint,
-                None,
+                excluded_layers.map(RootLayerFilter::Excluding),
             );
         }
         if std::env::var_os("Q0_RENDER_PROFILE").is_some() {
@@ -4451,56 +4670,6 @@ impl<'a> StageRenderPass<'a> {
         self.render_tinted(painter, q0rg_id, frame, view, textures, ctx, Color32::WHITE);
     }
 
-    pub(crate) fn render_tinted_on_layer(
-        &self,
-        painter: &Painter,
-        q0rg_id: u16,
-        layer_id: u16,
-        frame: u16,
-        view: &StageView,
-        textures: &mut TextureCache,
-        ctx: &Context,
-        tint: Color32,
-    ) {
-        // Unsupported masked assets still need the complete legacy render pass.
-        let contains_mask = q0rg_contains_mask(
-            self.project,
-            q0rg_id,
-            frame,
-            &mut std::collections::HashSet::new(),
-            0,
-            textures,
-        );
-        if contains_mask
-            && !q0rg_masks_supported_by_gpu(
-                self.project,
-                &self.lookup,
-                q0rg_id,
-                frame,
-                0,
-                &mut HashSet::new(),
-                textures,
-            )
-        {
-            self.render_tinted(painter, q0rg_id, frame, view, textures, ctx, tint);
-            return;
-        }
-        render_q0rg(
-            painter,
-            self.project,
-            &self.lookup,
-            q0rg_id,
-            frame,
-            Affine::IDENTITY,
-            view,
-            textures,
-            ctx,
-            0,
-            tint,
-            Some(RootLayerFilter::Only(layer_id)),
-        );
-    }
-
     pub(crate) fn render_tinted_excluding_layers(
         &self,
         painter: &Painter,
@@ -4512,42 +4681,15 @@ impl<'a> StageRenderPass<'a> {
         tint: Color32,
         excluded_layers: &HashSet<u16>,
     ) {
-        // Unsupported masked assets still need the complete legacy render pass.
-        let contains_mask = q0rg_contains_mask(
-            self.project,
-            q0rg_id,
-            frame,
-            &mut std::collections::HashSet::new(),
-            0,
-            textures,
-        );
-        if contains_mask
-            && !q0rg_masks_supported_by_gpu(
-                self.project,
-                &self.lookup,
-                q0rg_id,
-                frame,
-                0,
-                &mut HashSet::new(),
-                textures,
-            )
-        {
-            self.render_tinted(painter, q0rg_id, frame, view, textures, ctx, tint);
-            return;
-        }
-        render_q0rg(
+        self.render_tinted_filtered(
             painter,
-            self.project,
-            &self.lookup,
             q0rg_id,
             frame,
-            Affine::IDENTITY,
             view,
             textures,
             ctx,
-            0,
             tint,
-            Some(RootLayerFilter::Excluding(excluded_layers)),
+            Some(excluded_layers),
         );
     }
 
@@ -4644,7 +4786,10 @@ fn q0rg_contains_mask(
             .then(|| project.layer_mask_sources(q0rg_id, layer.layer_id))
             .unwrap_or_default()
             .into_iter()
-            .filter(|mask_id| textures.mask_clips(q0rg_id, *mask_id))
+            .filter(|mask_id| {
+                textures.mask_clips(q0rg_id, *mask_id)
+                    && !mask_layer_is_blank(q0rg, *mask_id, local_frame, textures)
+            })
             .collect::<Vec<_>>();
         if !mask_sources.is_empty()
             && mask_sources.iter().all(|mask_layer_id| {
@@ -4679,6 +4824,22 @@ fn q0rg_contains_mask(
     }
     visited.remove(&q0rg_id);
     contains_mask
+}
+
+fn mask_layer_is_blank(
+    q0rg: &Q0rg,
+    mask_layer_id: u16,
+    frame: u16,
+    textures: &mut TextureCache,
+) -> bool {
+    q0rg.layers
+        .iter()
+        .find(|layer| layer.layer_id == mask_layer_id)
+        .is_some_and(|layer| {
+            textures
+                .active_placement_states_at(q0rg.q0rg_id, layer, frame)
+                .is_empty()
+        })
 }
 
 fn mask_layer_has_active_art(
@@ -4770,7 +4931,7 @@ fn q0rg_group_supported_for_gpu_masks(
             break;
         }
         for state in active {
-            if !placement_fx_is_visual_identity(state.fx) {
+            if !placement_fx_is_visual_identity(placement_fx_without_tint(state.fx)) {
                 supported = false;
                 break;
             }
@@ -4859,7 +5020,10 @@ fn q0rg_masks_supported_by_gpu(
             .then(|| project.layer_mask_sources(q0rg_id, layer.layer_id))
             .unwrap_or_default()
             .into_iter()
-            .filter(|mask_id| textures.mask_clips(q0rg_id, *mask_id))
+            .filter(|mask_id| {
+                textures.mask_clips(q0rg_id, *mask_id)
+                    && !mask_layer_is_blank(q0rg, *mask_id, local_frame, textures)
+            })
             .collect::<Vec<_>>();
         let is_masked = !mask_sources.is_empty();
         if is_masked {
@@ -4878,7 +5042,7 @@ fn q0rg_masks_supported_by_gpu(
                     .active_placement_states_at(q0rg_id, mask_layer, local_frame)
                     .iter()
                     .all(|state| {
-                        placement_fx_is_visual_identity(state.fx)
+                        placement_fx_is_visual_identity(placement_fx_without_tint(state.fx))
                             && mask_layer
                                 .placements
                                 .get(state.index)
@@ -4912,9 +5076,10 @@ fn q0rg_masks_supported_by_gpu(
                 let Some(placement) = layer.placements.get(state.index) else {
                     return true;
                 };
-                let fx_supported = placement_fx_is_visual_identity(state.fx)
-                    || placement_fx_is_pure_opacity(state.fx)
-                    || placement_fx_is_pure_blend(state.fx);
+                let fx_supported =
+                    placement_fx_is_visual_identity(placement_fx_without_tint(state.fx))
+                        || placement_fx_is_pure_opacity(placement_fx_without_tint(state.fx))
+                        || placement_fx_is_pure_blend(placement_fx_without_tint(state.fx));
                 fx_supported
                     && match placement.target {
                         Target::Asset(asset_id) => group_asset_supported(project, lookup, asset_id),
@@ -4967,7 +5132,7 @@ fn q0rg_masks_supported_by_gpu(
                     depth + 1,
                     textures,
                 ) {
-                    if !placement_fx_is_visual_identity(state.fx)
+                    if !placement_fx_is_visual_identity(placement_fx_without_tint(state.fx))
                         || !q0rg_masks_supported_by_gpu(
                             project,
                             lookup,
@@ -5012,7 +5177,8 @@ fn collect_gpu_mask_placement_primitives(
         return false;
     }
     let composed = Affine::compose(parent, Affine::from_transform(active.transform));
-    match placement.target {
+    let start = primitives.len();
+    let supported = match placement.target {
         Target::Asset(asset_id) => collect_vector_asset_group_primitives(
             project, lookup, asset_id, composed, view, textures, ctx, tint, primitives,
         ),
@@ -5039,7 +5205,16 @@ fn collect_gpu_mask_placement_primitives(
             )
         }
         Target::Q0rg(_) => false,
+    };
+    if supported {
+        if let Some(effect) = active.fx.tint {
+            q0glblend::transform_primitive_colors(
+                &mut primitives[start..],
+                q0glblend::ColorTransform::tint(effect),
+            );
+        }
     }
+    supported
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5055,6 +5230,7 @@ fn collect_gpu_masked_layer(
     ctx: &Context,
     depth: u8,
     tint: Color32,
+    inherited_color: q0glblend::ColorTransform,
 ) -> Option<(
     Vec<Vec<q0glblend::VectorGroupPrimitive>>,
     Vec<q0glblend::VectorMaskedPlacement>,
@@ -5071,7 +5247,10 @@ fn collect_gpu_masked_layer(
     for mask_id in project
         .layer_mask_sources(q0rg.q0rg_id, layer.layer_id)
         .into_iter()
-        .filter(|mask_id| textures.mask_clips(q0rg.q0rg_id, *mask_id))
+        .filter(|mask_id| {
+            textures.mask_clips(q0rg.q0rg_id, *mask_id)
+                && !mask_layer_is_blank(q0rg, *mask_id, local_frame, textures)
+        })
         .collect::<Vec<_>>()
     {
         let mask_layer = q0rg
@@ -5092,7 +5271,7 @@ fn collect_gpu_masked_layer(
             let Some(placement) = mask_layer.placements.get(state.index) else {
                 continue;
             };
-            if !placement_fx_is_visual_identity(state.fx)
+            if !placement_fx_is_visual_identity(placement_fx_without_tint(state.fx))
                 || !collect_gpu_mask_placement_primitives(
                     project,
                     lookup,
@@ -5121,9 +5300,9 @@ fn collect_gpu_masked_layer(
         if textures.hidden_text_placement == Some((q0rg.q0rg_id, layer.layer_id, state.index)) {
             continue;
         }
-        if !placement_fx_is_visual_identity(state.fx)
-            && !placement_fx_is_pure_opacity(state.fx)
-            && !placement_fx_is_pure_blend(state.fx)
+        if !placement_fx_is_visual_identity(placement_fx_without_tint(state.fx))
+            && !placement_fx_is_pure_opacity(placement_fx_without_tint(state.fx))
+            && !placement_fx_is_pure_blend(placement_fx_without_tint(state.fx))
         {
             return None;
         }
@@ -5148,6 +5327,7 @@ fn collect_gpu_masked_layer(
         ) {
             return None;
         }
+        q0glblend::transform_primitive_colors(&mut primitives, inherited_color);
         placements.push(q0glblend::VectorMaskedPlacement {
             primitives,
             blend_mode: state.fx.blend_mode,
@@ -5169,9 +5349,9 @@ pub fn render_stage(
     StageRenderPass::new(project, textures).render(painter, q0rg_id, frame, view, textures, ctx);
 }
 
-pub fn render_stage_outline(
+pub(crate) fn render_stage_outline(
     painter: &Painter,
-    project: &ProjectV2,
+    render_pass: &StageRenderPass<'_>,
     q0rg_id: u16,
     frame: u16,
     view: &StageView,
@@ -5179,7 +5359,8 @@ pub fn render_stage_outline(
 ) {
     render_q0rg_outline(
         painter,
-        project,
+        render_pass.project,
+        &render_pass.lookup,
         q0rg_id,
         frame,
         Affine::IDENTITY,
@@ -5192,7 +5373,7 @@ pub fn render_stage_outline(
 
 pub(crate) fn render_stage_outline_layers(
     painter: &Painter,
-    project: &ProjectV2,
+    render_pass: &StageRenderPass<'_>,
     q0rg_id: u16,
     frame: u16,
     view: &StageView,
@@ -5201,7 +5382,8 @@ pub(crate) fn render_stage_outline_layers(
 ) {
     render_q0rg_outline(
         painter,
-        project,
+        render_pass.project,
+        &render_pass.lookup,
         q0rg_id,
         frame,
         Affine::IDENTITY,
@@ -5215,6 +5397,7 @@ pub(crate) fn render_stage_outline_layers(
 fn render_q0rg_outline(
     painter: &Painter,
     project: &ProjectV2,
+    lookup: &RenderLookup<'_>,
     q0rg_id: u16,
     frame: u16,
     parent: Affine,
@@ -5226,7 +5409,7 @@ fn render_q0rg_outline(
     if depth > Q0RG_RECURSION_LIMIT {
         return;
     }
-    let Some(q0rg) = project.q0rgs.iter().find(|q0rg| q0rg.q0rg_id == q0rg_id) else {
+    let Some(q0rg) = lookup.q0rg(q0rg_id) else {
         return;
     };
     let local_frame = if q0rg.frame_count > 0 {
@@ -5234,6 +5417,8 @@ fn render_q0rg_outline(
     } else {
         0
     };
+    let rig = lookup.rig(q0rg_id);
+    let rig_pose = lookup.rig_pose(q0rg_id, local_frame);
     for layer in &q0rg.layers {
         if depth == 0 && root_layer_filter.is_some_and(|only| !only.contains(&layer.layer_id)) {
             continue;
@@ -5250,15 +5435,36 @@ fn render_q0rg_outline(
         let color = outline_color_for_layer(layer.layer_id);
         for resolved in resolve_layer_at_frame(layer, local_frame) {
             let placement = resolved.placement;
-            let composed = Affine::compose(parent, Affine::from_transform(resolved.interp));
-            match placement.target {
+            let local_affine = rig_pose
+                .as_ref()
+                .and_then(|pose| pose.binding_transform(placement.instance_id))
+                .unwrap_or_else(|| Affine::from_transform(resolved.interp));
+            let composed = Affine::compose(parent, local_affine);
+            let target = match (rig, rig_pose.as_ref()) {
+                (Some(rig), Some(pose)) => q0s_format::rig::resolved_variant_target(
+                    rig,
+                    pose,
+                    placement.instance_id,
+                    placement.target,
+                ),
+                _ => placement.target,
+            };
+            match target {
                 Target::Asset(asset_id) => {
-                    let Some(asset) = project.assets.iter().find(|asset| asset.id() == asset_id)
-                    else {
+                    let Some(asset) = lookup.asset(asset_id) else {
                         continue;
                     };
                     match asset {
                         Asset::Vector(vector) => {
+                            let deformed = rig.zip(rig_pose.as_ref()).and_then(|(rig, pose)| {
+                                q0s_format::rig::deform_vector_for_instance(
+                                    rig,
+                                    pose,
+                                    placement.instance_id,
+                                    vector,
+                                )
+                            });
+                            let vector = deformed.as_ref().unwrap_or(vector);
                             for path in &vector.paths {
                                 let points: Vec<Pos2> = flatten_path(path)
                                     .into_iter()
@@ -5297,6 +5503,7 @@ fn render_q0rg_outline(
                     render_q0rg_outline(
                         painter,
                         project,
+                        lookup,
                         child_id,
                         child_frame,
                         composed,
@@ -5390,6 +5597,7 @@ fn render_q0rg(
         tint,
         root_layer_filter,
         &mut vector_batch,
+        q0glblend::ColorTransform::default(),
     );
     vector_batch.flush(painter);
     textures.record_vector_mesh_batch(&vector_batch);
@@ -5410,6 +5618,7 @@ fn render_q0rg_with_vector_batch(
     tint: Color32,
     root_layer_filter: Option<RootLayerFilter<'_>>,
     vector_batch: &mut VectorMeshBatch,
+    inherited_color: q0glblend::ColorTransform,
 ) {
     if depth > Q0RG_RECURSION_LIMIT {
         return;
@@ -5442,13 +5651,15 @@ fn render_q0rg_with_vector_batch(
         if is_mask && !textures.mask_art_visible(q0rg_id, layer.layer_id) {
             continue;
         }
-        // if any linked mask is empty or hidden on this frame, the complete
-        // masked layer is transparent. skip it without rasterizing the stage.
+        // Blank mask frames disable that mask; populated masks keep clipping.
         let mask_sources = layer_has_mask_assignment(project, q0rg_id, layer.layer_id)
             .then(|| project.layer_mask_sources(q0rg_id, layer.layer_id))
             .unwrap_or_default()
             .into_iter()
-            .filter(|mask_id| textures.mask_clips(q0rg_id, *mask_id))
+            .filter(|mask_id| {
+                textures.mask_clips(q0rg_id, *mask_id)
+                    && !mask_layer_is_blank(q0rg, *mask_id, local_frame, textures)
+            })
             .collect::<Vec<_>>();
         if !mask_sources.is_empty()
             && mask_sources.iter().any(|mask_layer_id| {
@@ -5471,6 +5682,7 @@ fn render_q0rg_with_vector_batch(
                 ctx,
                 depth,
                 tint,
+                inherited_color,
             ) {
                 q0glblend::paint_vector_masked_placements_on_opaque_backdrop(
                     painter, masks, placements,
@@ -5508,7 +5720,19 @@ fn render_q0rg_with_vector_batch(
             // non-uniform scale through to children, which the old
             // `compose(Transform2D, Transform2D)` discarded.
             let composed = Affine::compose(parent, local_affine);
-            if !resolved.fx.is_identity() {
+            let color_only =
+                placement_fx_is_visual_identity(placement_fx_without_tint(resolved.fx));
+            let color_transform = if color_only {
+                resolved
+                    .fx
+                    .tint
+                    .map(q0glblend::ColorTransform::tint)
+                    .unwrap_or_default()
+                    .then(inherited_color)
+            } else {
+                inherited_color
+            };
+            if !color_only {
                 vector_batch.flush(painter);
                 if try_render_gpu_vector_filter_placement(
                     painter,
@@ -5524,6 +5748,7 @@ fn render_q0rg_with_vector_batch(
                     ctx,
                     depth,
                     tint,
+                    inherited_color,
                 ) {
                     continue;
                 }
@@ -5541,6 +5766,7 @@ fn render_q0rg_with_vector_batch(
                     ctx,
                     depth,
                     tint,
+                    inherited_color,
                 ) {
                     continue;
                 }
@@ -5558,6 +5784,7 @@ fn render_q0rg_with_vector_batch(
                     ctx,
                     depth,
                     tint,
+                    inherited_color,
                 ) {
                     continue;
                 }
@@ -5577,6 +5804,7 @@ fn render_q0rg_with_vector_batch(
                     ctx,
                     tint,
                     outer_only,
+                    inherited_color,
                 );
                 if !outer_only {
                     continue;
@@ -5626,7 +5854,7 @@ fn render_q0rg_with_vector_batch(
                         };
                         let dynamic_instance_id = deformed.as_ref().map(|_| placement.instance_id);
                         let appearance = project.asset_appearances.get(&asset_id);
-                        if resolved.fx.is_identity() && deformed.is_none() && appearance.is_none() {
+                        if color_only && deformed.is_none() && appearance.is_none() {
                             if let Asset::Vector(vector) = asset {
                                 let compensation =
                                     textures.live_raw_stroke_scale_compensation(vector.asset_id);
@@ -5639,6 +5867,7 @@ fn render_q0rg_with_vector_batch(
                                     view,
                                     tint,
                                     compensation,
+                                    color_transform,
                                 ) {
                                     continue;
                                 }
@@ -5648,7 +5877,7 @@ fn render_q0rg_with_vector_batch(
                             vector_batch.record_fallback();
                         }
                         vector_batch.flush(painter);
-                        render_asset(
+                        render_asset_color(
                             painter,
                             deformed.as_ref().unwrap_or(asset),
                             appearance,
@@ -5657,6 +5886,7 @@ fn render_q0rg_with_vector_batch(
                             textures,
                             ctx,
                             tint,
+                            color_transform,
                             dynamic_instance_id,
                             local_frame.saturating_sub(placement.frame),
                             project.meta.fps,
@@ -5686,6 +5916,7 @@ fn render_q0rg_with_vector_batch(
                             tint,
                             None,
                             vector_batch,
+                            color_transform,
                         );
                     }
                 }
@@ -5785,6 +6016,8 @@ fn resolve_layer_at_frame(layer: &q0s_format::v2::Layer, frame: u16) -> Vec<Reso
 }
 
 struct LayerFrameIndex {
+    placement_count: usize,
+    explicit_keyframe_count: usize,
     keyframes: Vec<u16>,
     placements_by_frame: HashMap<u16, Vec<usize>>,
     tween_destinations: HashMap<(u16, u8, u16), Vec<usize>>,
@@ -5824,11 +6057,18 @@ impl LayerFrameIndex {
         keyframes.sort_unstable();
         keyframes.dedup();
         Self {
+            placement_count: layer.placements.len(),
+            explicit_keyframe_count: layer.explicit_keyframes.len(),
             keyframes,
             placements_by_frame,
             tween_destinations,
             resolved_frame: None,
         }
+    }
+
+    fn matches_structure(&self, layer: &q0s_format::v2::Layer) -> bool {
+        self.placement_count == layer.placements.len()
+            && self.explicit_keyframe_count == layer.explicit_keyframes.len()
     }
 
     fn target_key(target: Target) -> (u8, u16) {
@@ -5843,6 +6083,9 @@ impl LayerFrameIndex {
         layer: &q0s_format::v2::Layer,
         frame: u16,
     ) -> Arc<Vec<q0s_format::raster::ActivePlacementState>> {
+        if !self.matches_structure(layer) {
+            *self = Self::new(layer);
+        }
         if let Some((cached_frame, states)) = &self.resolved_frame {
             if *cached_frame == frame {
                 return Arc::clone(states);
@@ -5950,6 +6193,35 @@ fn render_asset(
     elapsed_host_frames: u16,
     host_fps: u16,
 ) {
+    render_asset_color(
+        painter,
+        asset,
+        appearance,
+        transform,
+        view,
+        textures,
+        ctx,
+        tint,
+        q0glblend::ColorTransform::default(),
+        dynamic_instance_id,
+        elapsed_host_frames,
+        host_fps,
+    );
+}
+fn render_asset_color(
+    painter: &Painter,
+    asset: &Asset,
+    appearance: Option<&VectorAppearance>,
+    transform: Affine,
+    view: &StageView,
+    textures: &mut TextureCache,
+    ctx: &Context,
+    tint: Color32,
+    color_transform: q0glblend::ColorTransform,
+    dynamic_instance_id: Option<u32>,
+    elapsed_host_frames: u16,
+    host_fps: u16,
+) {
     match asset {
         Asset::Bitmap(b) => {
             let tex = textures.by_asset_id.entry(b.asset_id).or_insert_with(|| {
@@ -5992,13 +6264,13 @@ fn render_asset(
                 });
             }
             mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
-            painter.add(Shape::Mesh(mesh));
+            q0glblend::paint_mesh_color(painter, mesh, color_transform);
         }
         Asset::Q0v(v) => {
             if let std::collections::hash_map::Entry::Vacant(entry) =
                 textures.q0v_media.entry(v.asset_id)
             {
-                let Ok(media) = q0video::q0v::Q0vFile::parse(v.bytes.clone()) else {
+                let Ok(media) = q0video::q0v::Q0vFile::parse(v.bytes.as_ref().clone()) else {
                     return;
                 };
                 entry.insert(media);
@@ -6060,24 +6332,33 @@ fn render_asset(
                 });
             }
             mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
-            painter.add(Shape::Mesh(mesh));
+            q0glblend::paint_mesh_color(painter, mesh, color_transform);
         }
         Asset::Rig(_) => {}
         Asset::Vector(v) => {
             if let Some(appearance) = appearance {
                 if appearance.fill_gradient.is_some() {
                     #[cfg(feature = "appearance-mask-eraser")]
-                    paint_vector_appearance_halo(
-                        painter, v, appearance, transform, view, textures, ctx, tint,
+                    paint_vector_appearance_halo_color(
+                        painter,
+                        v,
+                        appearance,
+                        transform,
+                        view,
+                        textures,
+                        ctx,
+                        tint,
+                        color_transform,
                     );
                     {
                         let gradient_geometry = textures.gradient_render_geometry(v, appearance);
-                        paint_cached_vector_gradient(
+                        paint_cached_vector_gradient_color(
                             painter,
                             gradient_geometry,
                             transform,
                             view,
                             tint,
+                            color_transform,
                         );
                     }
                     if let Some(stroke_style) = &v.stroke {
@@ -6101,7 +6382,7 @@ fn render_asset(
                                 *closed,
                                 stroke.color,
                             ) {
-                                painter.add(Shape::Mesh(mesh));
+                                q0glblend::paint_mesh_color(painter, mesh, color_transform);
                             }
                             if !*closed
                                 && matches!(stroke_style.cap, q0s_format::geom::CapShape::Round)
@@ -6112,10 +6393,18 @@ fn render_asset(
                                     * 0.5;
                                 let color = modulate(rgba_to_color32(stroke_style.color), tint);
                                 if let Some(point) = polyline_screen.first() {
-                                    painter.circle_filled(*point, radius, color);
+                                    painter.circle_filled(
+                                        *point,
+                                        radius,
+                                        color_transform.apply(color),
+                                    );
                                 }
                                 if let Some(point) = polyline_screen.last() {
-                                    painter.circle_filled(*point, radius, color);
+                                    painter.circle_filled(
+                                        *point,
+                                        radius,
+                                        color_transform.apply(color),
+                                    );
                                 }
                             }
                         }
@@ -6126,7 +6415,7 @@ fn render_asset(
             if let Some(instance_id) = dynamic_instance_id {
                 #[cfg(feature = "appearance-mask-eraser")]
                 if let Some(appearance) = appearance {
-                    paint_dynamic_vector_appearance_halo(
+                    paint_dynamic_vector_appearance_halo_color(
                         painter,
                         v,
                         appearance,
@@ -6135,13 +6424,14 @@ fn render_asset(
                         textures,
                         ctx,
                         tint,
+                        color_transform,
                         instance_id,
                     );
                 }
                 let parent_scale = transform.uniform_scale();
                 let fill_color = v
                     .fill
-                    .map(|color| modulate(rgba_to_color32(color), tint))
+                    .map(|color| color_transform.apply(modulate(rgba_to_color32(color), tint)))
                     .unwrap_or(Color32::TRANSPARENT);
                 let geometry = build_dynamic_vector_body_geometry(v, appearance);
                 if fill_color != Color32::TRANSPARENT {
@@ -6166,7 +6456,7 @@ fn render_asset(
                             *closed,
                             stroke.color,
                         ) {
-                            painter.add(Shape::Mesh(mesh));
+                            q0glblend::paint_mesh_color(painter, mesh, color_transform);
                         }
                         if !*closed && matches!(stroke_style.cap, q0s_format::geom::CapShape::Round)
                         {
@@ -6176,10 +6466,10 @@ fn render_asset(
                                 * 0.5;
                             let color = modulate(rgba_to_color32(stroke_style.color), tint);
                             if let Some(point) = polyline_screen.first() {
-                                painter.circle_filled(*point, radius, color);
+                                painter.circle_filled(*point, radius, color_transform.apply(color));
                             }
                             if let Some(point) = polyline_screen.last() {
-                                painter.circle_filled(*point, radius, color);
+                                painter.circle_filled(*point, radius, color_transform.apply(color));
                             }
                         }
                     }
@@ -6188,11 +6478,19 @@ fn render_asset(
             }
             #[cfg(feature = "appearance-mask-eraser")]
             if let Some(appearance) = appearance {
-                paint_vector_appearance_halo(
-                    painter, v, appearance, transform, view, textures, ctx, tint,
+                paint_vector_appearance_halo_color(
+                    painter,
+                    v,
+                    appearance,
+                    transform,
+                    view,
+                    textures,
+                    ctx,
+                    tint,
+                    color_transform,
                 );
                 if let Some(fill) = v.fill {
-                    let fill_color = modulate(rgba_to_color32(fill), tint);
+                    let fill_color = color_transform.apply(modulate(rgba_to_color32(fill), tint));
                     if appearance.erase_mask.is_empty() && appearance.clip_mask.is_empty() {
                         let geometry = textures.vector_render_geometry(v);
                         paint_cached_vector_fill(painter, geometry, transform, view, fill_color);
@@ -6217,7 +6515,7 @@ fn render_asset(
                 transform.uniform_scale() * textures.live_raw_stroke_scale_compensation(v.asset_id);
             let fill_color = v
                 .fill
-                .map(|color| modulate(rgba_to_color32(color), tint))
+                .map(|color| color_transform.apply(modulate(rgba_to_color32(color), tint)))
                 .unwrap_or(Color32::TRANSPARENT);
             let compensation = textures.live_raw_stroke_scale_compensation(v.asset_id);
             let geometry = textures.vector_render_geometry(v);
@@ -6229,7 +6527,7 @@ fn render_asset(
                     geometry,
                     transform,
                     view,
-                    modulate(rgba_to_color32(stroke.color), tint),
+                    color_transform.apply(modulate(rgba_to_color32(stroke.color), tint)),
                 )
             });
 
@@ -6275,16 +6573,16 @@ fn render_asset(
                             *closed,
                             stroke.color,
                         ) {
-                            painter.add(Shape::Mesh(mesh));
+                            q0glblend::paint_mesh_color(painter, mesh, color_transform);
                         }
                         if !*closed && matches!(s.cap, q0s_format::geom::CapShape::Round) {
                             let radius =
                                 s.width.max(0.5) * parent_scale * view.effective_scale() * 0.5;
                             if let Some(point) = polyline_screen.first() {
-                                painter.circle_filled(*point, radius, color);
+                                painter.circle_filled(*point, radius, color_transform.apply(color));
                             }
                             if let Some(point) = polyline_screen.last() {
-                                painter.circle_filled(*point, radius, color);
+                                painter.circle_filled(*point, radius, color_transform.apply(color));
                             }
                         }
                     }
@@ -6454,6 +6752,18 @@ fn parametric_range_toward(
     neighbor_width: f32,
     neighbor: VertexBuffers<lyon_path::math::Point, u32>,
 ) -> Option<CachedParametricStroke> {
+    parametric_range_toward_bounded(points, true, target_width, target, neighbor_width, neighbor)
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn parametric_range_toward_bounded(
+    points: &[Pos2],
+    closed: bool,
+    target_width: f32,
+    target: &VertexBuffers<lyon_path::math::Point, u32>,
+    neighbor_width: f32,
+    neighbor: VertexBuffers<lyon_path::math::Point, u32>,
+) -> Option<CachedParametricStroke> {
     if same_stroke_topology(target, &neighbor) {
         return parametric_stroke_from_samples(target_width, target, neighbor_width, &neighbor);
     }
@@ -6467,7 +6777,7 @@ fn parametric_range_toward(
     let mut nearest_same = None;
     for _ in 0..SELECTION_PARAMETRIC_BOUNDARY_STEPS {
         let midpoint_width = (same_width * other_width).sqrt();
-        let midpoint = tessellate_closed_bevel_stroke(points, midpoint_width)?;
+        let midpoint = tessellate_bounded_stroke(points, midpoint_width, closed)?;
         if same_stroke_topology(target, &midpoint) {
             same_width = midpoint_width;
             nearest_same = Some((midpoint_width, midpoint));
@@ -6723,18 +7033,33 @@ fn parametric_stroke_reference_mesh(
 
 #[cfg(feature = "appearance-mask-eraser")]
 fn fixed_screen_stroke_mesh(points: &[Pos2], width: f32, color: Color32) -> Option<Mesh> {
-    let target = tessellate_closed_bevel_stroke(points, width)?;
+    fixed_screen_bounded_stroke_mesh(points, width, true, color)
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn fixed_screen_bounded_stroke_mesh(
+    points: &[Pos2],
+    width: f32,
+    closed: bool,
+    color: Color32,
+) -> Option<Mesh> {
+    let target = tessellate_bounded_stroke(points, width, closed)?;
     let mut range = None;
     for neighbor_width in [width * 2.0, width * 0.5, width * 1.125, width * 0.875] {
         if neighbor_width <= 0.0 || !neighbor_width.is_finite() {
             continue;
         }
-        let Some(neighbor) = tessellate_closed_bevel_stroke(points, neighbor_width) else {
+        let Some(neighbor) = tessellate_bounded_stroke(points, neighbor_width, closed) else {
             continue;
         };
-        if let Some(candidate) =
-            parametric_range_toward(points, width, &target, neighbor_width, neighbor)
-        {
+        if let Some(candidate) = parametric_range_toward_bounded(
+            points,
+            closed,
+            width,
+            &target,
+            neighbor_width,
+            neighbor,
+        ) {
             range = Some(candidate);
             break;
         }
@@ -6832,6 +7157,80 @@ fn build_selection_reference_meshes(
         meshes.push(accent_outline);
     }
     Some(meshes)
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+pub(crate) fn raw_area_selection_reference_meshes(
+    source: &mut CachedRawAreaSelection,
+    texture_id: TextureId,
+    tile_size: f32,
+    accent: Color32,
+) -> Option<Vec<Mesh>> {
+    let mut meshes =
+        build_selection_reference_meshes(&mut source.fill, 1.0, texture_id, tile_size, accent)?;
+    // Stroke selections are open polylines. Do not close their endpoints or
+    // turn their enclosed area into a selected fill.
+    let mut black = Mesh::default();
+    let mut colored = Mesh::default();
+    for points in &source.strokes {
+        black.append(fixed_screen_bounded_stroke_mesh(
+            points,
+            3.0,
+            false,
+            Color32::from_black_alpha(210),
+        )?);
+        colored.append(fixed_screen_bounded_stroke_mesh(
+            points, 1.5, false, accent,
+        )?);
+    }
+    if !black.is_empty() {
+        meshes.push(black);
+    }
+    if !colored.is_empty() {
+        meshes.push(colored);
+    }
+    Some(meshes)
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+pub(crate) fn raw_area_selection_screen_meshes(
+    source: &mut CachedRawAreaSelection,
+    view: &StageView,
+    texture_id: TextureId,
+    tile_size: f32,
+    accent: Color32,
+) -> Vec<Mesh> {
+    let mut meshes = build_selection_screen_meshes(
+        &mut source.fill,
+        Affine::IDENTITY,
+        view,
+        texture_id,
+        tile_size,
+        accent,
+        true,
+    );
+    let mut black = Mesh::default();
+    let mut colored = Mesh::default();
+    for points in &source.strokes {
+        let screen: Vec<_> = points
+            .iter()
+            .map(|point| stage_pos_to_screen(*point, view))
+            .collect();
+        if let Some(mesh) = bounded_stroke_mesh(&screen, 3.0, false, Color32::from_black_alpha(210))
+        {
+            black.append(mesh);
+        }
+        if let Some(mesh) = bounded_stroke_mesh(&screen, 1.5, false, accent) {
+            colored.append(mesh);
+        }
+    }
+    if !black.is_empty() {
+        meshes.push(black);
+    }
+    if !colored.is_empty() {
+        meshes.push(colored);
+    }
+    meshes
 }
 
 #[cfg(all(test, feature = "appearance-mask-eraser"))]
@@ -8092,7 +8491,7 @@ fn asset_local_outline(asset: &Asset) -> Vec<Vec2> {
             Vec2::new(0.0, f32::from(b.height)),
         ],
         Asset::Vector(v) => v.paths.iter().flat_map(flatten_path).collect(),
-        Asset::Q0v(v) => q0video::q0v::Q0vFile::parse(v.bytes.clone())
+        Asset::Q0v(v) => q0video::q0v::Q0vFile::parse(v.bytes.as_ref().clone())
             .ok()
             .map(|media| {
                 if !media.spec.video {
@@ -8340,7 +8739,8 @@ fn build_dynamic_vector_body_geometry(
 
 #[cfg(feature = "appearance-mask-eraser")]
 #[allow(clippy::too_many_arguments)]
-fn paint_dynamic_vector_appearance_halo(
+#[cfg(feature = "appearance-mask-eraser")]
+fn paint_dynamic_vector_appearance_halo_color(
     painter: &Painter,
     vector: &VectorAsset,
     appearance: &VectorAppearance,
@@ -8349,6 +8749,7 @@ fn paint_dynamic_vector_appearance_halo(
     textures: &mut TextureCache,
     ctx: &Context,
     tint: Color32,
+    color_transform: q0glblend::ColorTransform,
     instance_id: u32,
 ) {
     let q0s_format::v2::VectorMaterial::SoftHalo { .. } = appearance.material else {
@@ -8421,12 +8822,37 @@ fn paint_dynamic_vector_appearance_halo(
         });
     }
     mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
-    painter.add(Shape::Mesh(mesh));
+    q0glblend::paint_mesh_color(painter, mesh, color_transform);
 }
 
 #[cfg(feature = "appearance-mask-eraser")]
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn paint_vector_appearance_halo(
+    painter: &Painter,
+    vector: &VectorAsset,
+    appearance: &VectorAppearance,
+    transform: Affine,
+    view: &StageView,
+    textures: &mut TextureCache,
+    ctx: &Context,
+    tint: Color32,
+) {
+    paint_vector_appearance_halo_color(
+        painter,
+        vector,
+        appearance,
+        transform,
+        view,
+        textures,
+        ctx,
+        tint,
+        q0glblend::ColorTransform::default(),
+    );
+}
+
+#[cfg(feature = "appearance-mask-eraser")]
+fn paint_vector_appearance_halo_color(
     painter: &Painter,
     vector: &q0s_format::v2::VectorAsset,
     appearance: &VectorAppearance,
@@ -8435,6 +8861,7 @@ fn paint_vector_appearance_halo(
     textures: &mut TextureCache,
     ctx: &Context,
     tint: Color32,
+    color_transform: q0glblend::ColorTransform,
 ) {
     let q0s_format::v2::VectorMaterial::SoftHalo { .. } = appearance.material else {
         return;
@@ -8562,7 +8989,7 @@ fn paint_vector_appearance_halo(
         });
     }
     mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
-    painter.add(Shape::Mesh(mesh));
+    q0glblend::paint_mesh_color(painter, mesh, color_transform);
 }
 
 #[cfg(feature = "appearance-mask-eraser")]

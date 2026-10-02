@@ -2355,10 +2355,43 @@ fn merge_touching_raw_fills_after_edit_impl(
                 material,
             )
         });
+        // Keep the union at the frontmost source's depth. Appending it above
+        // unrelated artwork would make a bucket fill cover its own outline.
+        let untouched_tail = project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+            .and_then(|q0rg| q0rg.layers.iter().find(|layer| layer.layer_id == layer_id))
+            .and_then(|layer| {
+                layer.placements.iter().rposition(|placement| {
+                    placement.frame == frame
+                        && placement.transform == Transform2D::IDENTITY
+                        && matches!(placement.tween, Tween::None)
+                        && matches!(placement.target, Target::Asset(id) if asset_ids.contains(&id))
+                }).map(|index| layer.placements.len() - index - 1)
+            })
+            .unwrap_or(0);
         remove_current_layer_asset_placements(project, q0rg_id, layer_id, frame, &asset_ids);
         // Allocate before deleting old assets so a new shape never inherits an
         // old asset id and its cached body/halo/selection geometry.
         let new_asset_id = append_raw_fill(project, q0rg_id, layer_id, frame, style.color, paths);
+        if untouched_tail > 0 {
+            if let Some(layer) = project
+                .q0rgs
+                .iter_mut()
+                .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+                .and_then(|q0rg| {
+                    q0rg.layers
+                        .iter_mut()
+                        .find(|layer| layer.layer_id == layer_id)
+                })
+            {
+                if let Some(placement) = layer.placements.pop() {
+                    let insertion = layer.placements.len().saturating_sub(untouched_tail);
+                    layer.placements.insert(insertion, placement);
+                }
+            }
+        }
         if let Some(Asset::Vector(vector)) =
             project.assets.iter_mut().find(|a| a.id() == new_asset_id)
         {

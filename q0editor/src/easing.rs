@@ -48,7 +48,7 @@ impl CubicCurve {
                 },
                 EasingMode::InOut => Self::DEFAULT,
             },
-            Easing::Linear => Self {
+            Easing::Linear | Easing::Hold => Self {
                 x1: 0.0,
                 y1: 0.0,
                 x2: 1.0,
@@ -921,9 +921,10 @@ pub fn render_warning(app: &mut EditorApp, ctx: &egui::Context) {
     }
 }
 
-fn easing_label(easing: Easing) -> String {
+pub(crate) fn easing_label(easing: Easing) -> String {
     match easing {
         Easing::Linear => "Linear".to_string(),
+        Easing::Hold => "Hold".to_string(),
         Easing::Preset { family, mode } => format!("{} {}", mode.label(), family.label()),
         Easing::CubicBezier { x1, y1, x2, y2 } => {
             format!("Custom cubic ({x1:.2}, {y1:.2}, {x2:.2}, {y2:.2})")
