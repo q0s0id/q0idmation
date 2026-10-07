@@ -1891,7 +1891,7 @@ pub fn render_properties(app: &mut EditorApp, ui: &mut Ui) {
         if ui.button("Create rig").clicked() {
             let before = app.state.project.clone();
             if ensure_rig(&mut app.state.project, q0rg_id).is_some() {
-                app.history.snapshot(&before);
+                app.history.snapshot_with_session(&before, &app.session);
                 app.state.mark_dirty();
                 app.session.status = "rig created".into();
             }
@@ -1955,7 +1955,7 @@ pub fn render_properties(app: &mut EditorApp, ui: &mut Ui) {
     {
         let before = app.state.project.clone();
         if delete_rig(&mut app.state.project, q0rg_id) {
-            app.history.snapshot(&before);
+            app.history.snapshot_with_session(&before, &app.session);
             app.state.mark_dirty();
             app.session.rig_selected_node = None;
             app.session.rig_selected_control = None;
@@ -2034,7 +2034,7 @@ fn render_bone_selection(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
             app.session.current_frame,
         ) {
             Ok(()) => {
-                app.history.snapshot(&before);
+                app.history.snapshot_with_session(&before, &app.session);
                 app.state.mark_dirty();
                 app.session.status = "object bound to bone".into();
             }
@@ -2044,14 +2044,14 @@ fn render_bone_selection(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
     if unbind {
         let before = app.state.project.clone();
         if unbind_node(&mut app.state.project, q0rg_id, node_id) {
-            app.history.snapshot(&before);
+            app.history.snapshot_with_session(&before, &app.session);
             app.state.mark_dirty();
         }
     }
     if add_rotation {
         let before = app.state.project.clone();
         if let Some(id) = add_rotation_control(&mut app.state.project, q0rg_id, node_id, true) {
-            app.history.snapshot(&before);
+            app.history.snapshot_with_session(&before, &app.session);
             app.state.mark_dirty();
             app.session.rig_selected_control = Some(id);
         }
@@ -2059,7 +2059,7 @@ fn render_bone_selection(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
     if add_position {
         let before = app.state.project.clone();
         if let Some(id) = add_position_control(&mut app.state.project, q0rg_id, node_id, true) {
-            app.history.snapshot(&before);
+            app.history.snapshot_with_session(&before, &app.session);
             app.state.mark_dirty();
             app.session.rig_selected_control = Some(id);
         }
@@ -2073,7 +2073,7 @@ fn render_bone_selection(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
             app.session.current_frame,
         ) {
             Ok((_, target, _)) => {
-                app.history.snapshot(&before);
+                app.history.snapshot_with_session(&before, &app.session);
                 app.state.mark_dirty();
                 app.session.rig_selected_control = Some(target);
                 app.session.status = "two-bone IK created".into();
@@ -2084,7 +2084,7 @@ fn render_bone_selection(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
     if delete {
         let before = app.state.project.clone();
         if remove_node_subtree(&mut app.state.project, q0rg_id, node_id) {
-            app.history.snapshot(&before);
+            app.history.snapshot_with_session(&before, &app.session);
             app.state.mark_dirty();
             app.session.rig_selected_node = None;
             app.session.rig_selected_control = None;
@@ -2190,7 +2190,7 @@ fn render_selected_node_numeric(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16, 
         node.rest.sx = node.rest.sx.max(0.01);
         node.rest.sy = node.rest.sy.max(0.01);
         node.length = node.length.max(0.0);
-        app.history.snapshot(&before);
+        app.history.snapshot_with_session(&before, &app.session);
         app.state.mark_dirty();
     }
 }
@@ -2214,7 +2214,7 @@ fn render_pro_controls(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                     add_control(&mut app.state.project, q0rg_id, kind, target)
                 };
                 if let Some(control_id) = created {
-                    app.history.snapshot(&before);
+                    app.history.snapshot_with_session(&before, &app.session);
                     app.state.mark_dirty();
                     app.session.rig_selected_control = Some(control_id);
                     app.session.status = format!("{} created", label.trim_start_matches("+ "));
@@ -2383,7 +2383,7 @@ fn render_pro_controls(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                 .rest_value
                 .clamp(control.min_value, control.max_value);
         }
-        app.history.snapshot(&before);
+        app.history.snapshot_with_session(&before, &app.session);
         app.state.mark_dirty();
     }
     if matches!(
@@ -2464,7 +2464,7 @@ fn render_simple_public_controls(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16)
         {
             if response.drag_started() || response.gained_focus() || kind == RigControlKind::Toggle
             {
-                app.history.snapshot(&before);
+                app.history.snapshot_with_session(&before, &app.session);
             }
             app.state.mark_dirty();
         }
@@ -2548,7 +2548,8 @@ fn render_master_driver_editor(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16, c
         )
     {
         if response.drag_started() || response.gained_focus() {
-            app.history.snapshot(&before_value);
+            app.history
+                .snapshot_with_session(&before_value, &app.session);
         }
         app.state.mark_dirty();
     }
@@ -2609,7 +2610,7 @@ fn render_master_driver_editor(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16, c
                 if delete {
                     rig.drivers
                         .retain(|candidate| candidate.driver_id != driver.driver_id);
-                    app.history.snapshot(&before);
+                    app.history.snapshot_with_session(&before, &app.session);
                     app.state.mark_dirty();
                 } else if let Some(candidate) = rig
                     .drivers
@@ -2623,7 +2624,7 @@ fn render_master_driver_editor(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16, c
                     candidate.source_max = source_max;
                     candidate.target_min = target_min;
                     candidate.target_max = target_max;
-                    app.history.snapshot(&before);
+                    app.history.snapshot_with_session(&before, &app.session);
                     app.state.mark_dirty();
                 }
             }
@@ -2684,7 +2685,7 @@ fn render_master_driver_editor(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16, c
                         target_max,
                     ) {
                         Ok(_) => {
-                            app.history.snapshot(&before);
+                            app.history.snapshot_with_session(&before, &app.session);
                             app.state.mark_dirty();
                         }
                         Err(message) => app.session.status = message.into(),
@@ -2724,7 +2725,7 @@ fn render_master_driver_editor(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16, c
                 1.0,
             ) {
                 Ok(_) => {
-                    app.history.snapshot(&before);
+                    app.history.snapshot_with_session(&before, &app.session);
                     app.state.mark_dirty();
                 }
                 Err(message) => app.session.status = message.into(),
@@ -2767,7 +2768,7 @@ fn render_pose_library(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
             if let Some(pose_id) =
                 save_pose(&mut app.state.project, q0rg_id, app.session.current_frame)
             {
-                app.history.snapshot(&before);
+                app.history.snapshot_with_session(&before, &app.session);
                 app.state.mark_dirty();
                 app.session.status = format!("pose {pose_id} saved");
             }
@@ -2827,7 +2828,7 @@ fn render_pose_library(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                     .find(|item| item.pose_id == pose.pose_id)
                 {
                     current.name = name;
-                    app.history.snapshot(&before);
+                    app.history.snapshot_with_session(&before, &app.session);
                     app.state.mark_dirty();
                 }
             }
@@ -2842,7 +2843,7 @@ fn render_pose_library(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                 app.session.rig_auto_key,
             ) {
                 Ok(()) => {
-                    app.history.snapshot(&before);
+                    app.history.snapshot_with_session(&before, &app.session);
                     app.state.mark_dirty();
                     app.session.status = format!("pose '{}' applied", pose.name);
                 }
@@ -2869,7 +2870,7 @@ fn render_pose_library(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                     app.session.rig_auto_key,
                 ) {
                     Ok(()) => {
-                        app.history.snapshot(&before);
+                        app.history.snapshot_with_session(&before, &app.session);
                         app.state.mark_dirty();
                         app.session.status = format!(
                             "pose '{}' blended at {:.0}%",
@@ -2894,7 +2895,7 @@ fn render_pose_library(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                     app.session.rig_auto_key,
                 ) {
                     Ok(()) => {
-                        app.history.snapshot(&before);
+                        app.history.snapshot_with_session(&before, &app.session);
                         app.state.mark_dirty();
                         app.session.status = format!("pose '{}' mirrored", pose.name);
                     }
@@ -2914,7 +2915,7 @@ fn render_pose_library(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                     app.session.rig_pose_blend_mode,
                 ) {
                     Ok(id) => {
-                        app.history.snapshot(&before);
+                        app.history.snapshot_with_session(&before, &app.session);
                         app.state.mark_dirty();
                         app.session.status = format!("pose driver #{id} created");
                     }
@@ -2938,7 +2939,7 @@ fn render_pose_library(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                     .find(|item| item.pose_id == pose.pose_id)
                 {
                     current.values = values;
-                    app.history.snapshot(&before);
+                    app.history.snapshot_with_session(&before, &app.session);
                     app.state.mark_dirty();
                     app.session.status = format!("pose '{}' updated", pose.name);
                 }
@@ -2950,7 +2951,7 @@ fn render_pose_library(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                 let count = rig.poses.len();
                 rig.poses.retain(|item| item.pose_id != pose.pose_id);
                 if rig.poses.len() != count {
-                    app.history.snapshot(&before);
+                    app.history.snapshot_with_session(&before, &app.session);
                     app.state.mark_dirty();
                 }
             }
@@ -3084,7 +3085,8 @@ pub(crate) fn render_pose_tween_options(app: &mut EditorApp, ui: &mut Ui, q0rg_i
         ui.label(egui::RichText::new("Add a second pose key to create a tween").small());
     }
     if let Some(easing) = requested {
-        app.history.snapshot(&app.state.project);
+        app.history
+            .snapshot_with_session(&app.state.project, &app.session);
         if let Some(rig) = rig_for_q0rg_mut(&mut app.state.project, q0rg_id) {
             for (property, frame, _) in spans {
                 if let Some(key) = rig
@@ -3462,13 +3464,13 @@ fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                         });
                 });
                 if delete {
-                    app.history.snapshot(&before);
+                    app.history.snapshot_with_session(&before, &app.session);
                     if remove_constraint(&mut app.state.project, q0rg_id, constraint_id) {
                         app.state.mark_dirty();
                     }
                 } else if changed {
                     if snapshot {
-                        app.history.snapshot(&before);
+                        app.history.snapshot_with_session(&before, &app.session);
                     }
                     if set_rotation_limit(
                         &mut app.state.project,
@@ -3540,7 +3542,7 @@ fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                         });
                 });
                 if delete {
-                    app.history.snapshot(&before);
+                    app.history.snapshot_with_session(&before, &app.session);
                     if remove_constraint(&mut app.state.project, q0rg_id, constraint_id) {
                         app.state.mark_dirty();
                     }
@@ -3567,7 +3569,7 @@ fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                             max_y,
                         },
                     ) {
-                        app.history.snapshot(&before);
+                        app.history.snapshot_with_session(&before, &app.session);
                         app.state.mark_dirty();
                     }
                 }
@@ -3650,7 +3652,7 @@ fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                         });
                 });
                 if delete {
-                    app.history.snapshot(&before);
+                    app.history.snapshot_with_session(&before, &app.session);
                     if remove_constraint(&mut app.state.project, q0rg_id, constraint_id) {
                         app.state.mark_dirty();
                     }
@@ -3680,7 +3682,7 @@ fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                         );
                     }
                     if did_change {
-                        app.history.snapshot(&before);
+                        app.history.snapshot_with_session(&before, &app.session);
                         app.state.mark_dirty();
                     }
                 }
@@ -3764,7 +3766,7 @@ fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                         });
                 });
                 if delete {
-                    app.history.snapshot(&before);
+                    app.history.snapshot_with_session(&before, &app.session);
                     if remove_constraint(&mut app.state.project, q0rg_id, constraint_id) {
                         app.state.mark_dirty();
                     }
@@ -3782,7 +3784,7 @@ fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                         },
                     )
                 {
-                    app.history.snapshot(&before);
+                    app.history.snapshot_with_session(&before, &app.session);
                     app.state.mark_dirty();
                 }
             }
@@ -3875,7 +3877,7 @@ fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                         });
                 });
                 if delete {
-                    app.history.snapshot(&before);
+                    app.history.snapshot_with_session(&before, &app.session);
                     if remove_constraint(&mut app.state.project, q0rg_id, constraint_id) {
                         app.state.mark_dirty();
                     }
@@ -3911,7 +3913,7 @@ fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                         );
                     }
                     if did_change {
-                        app.history.snapshot(&before);
+                        app.history.snapshot_with_session(&before, &app.session);
                         app.state.mark_dirty();
                     }
                 }
@@ -3991,7 +3993,7 @@ fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                 });
 
                 if delete {
-                    app.history.snapshot(&before);
+                    app.history.snapshot_with_session(&before, &app.session);
                     if remove_constraint(&mut app.state.project, q0rg_id, constraint_id) {
                         app.state.mark_dirty();
                     }
@@ -3999,7 +4001,7 @@ fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                 }
                 if weight_changed {
                     if snapshot {
-                        app.history.snapshot(&before);
+                        app.history.snapshot_with_session(&before, &app.session);
                     }
                     if set_constraint_weight(
                         &mut app.state.project,
@@ -4014,7 +4016,7 @@ fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                 }
                 if settings_changed {
                     if !weight_changed || !snapshot {
-                        app.history.snapshot(&before);
+                        app.history.snapshot_with_session(&before, &app.session);
                     }
                     if set_ik_settings(
                         &mut app.state.project,
@@ -4027,7 +4029,7 @@ fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                     }
                 }
                 if match_target {
-                    app.history.snapshot(&before);
+                    app.history.snapshot_with_session(&before, &app.session);
                     match match_ik_target_to_fk(
                         &mut app.state.project,
                         q0rg_id,
@@ -4043,7 +4045,7 @@ fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                     }
                 }
                 if bake_fk {
-                    app.history.snapshot(&before);
+                    app.history.snapshot_with_session(&before, &app.session);
                     match bake_ik_pose_to_fk(
                         &mut app.state.project,
                         q0rg_id,
@@ -4087,7 +4089,7 @@ fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                     min_radians: -std::f32::consts::PI,
                     max_radians: std::f32::consts::PI,
                 });
-                app.history.snapshot(&before);
+                app.history.snapshot_with_session(&before, &app.session);
                 app.state.mark_dirty();
             }
         }
@@ -4122,7 +4124,7 @@ fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                     min_y: node.rest.ty - 100.0,
                     max_y: node.rest.ty + 100.0,
                 });
-                app.history.snapshot(&before);
+                app.history.snapshot_with_session(&before, &app.session);
                 app.state.mark_dirty();
             }
         }
@@ -4165,7 +4167,7 @@ fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                         angle_offset: 0.0,
                         weight: 1.0,
                     });
-                    app.history.snapshot(&before);
+                    app.history.snapshot_with_session(&before, &app.session);
                     app.state.mark_dirty();
                 }
             }
@@ -4191,7 +4193,7 @@ fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                         max_distance: 250.0,
                         weight: 1.0,
                     });
-                    app.history.snapshot(&before);
+                    app.history.snapshot_with_session(&before, &app.session);
                     app.state.mark_dirty();
                 }
             }
@@ -4226,7 +4228,7 @@ fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                     position_weight: 1.0,
                     rotation_weight: 1.0,
                 });
-                app.history.snapshot(&before);
+                app.history.snapshot_with_session(&before, &app.session);
                 app.state.mark_dirty();
             }
         }
@@ -4275,7 +4277,7 @@ fn render_pro_pose_metadata(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                     Some(right) => {
                         match add_node_mirror_pairs(&mut app.state.project, q0rg_id, left, right) {
                             Ok(()) => {
-                                app.history.snapshot(&before);
+                                app.history.snapshot_with_session(&before, &app.session);
                                 app.state.mark_dirty();
                             }
                             Err(message) => app.session.status = message.into(),
@@ -4327,7 +4329,7 @@ fn render_pro_pose_metadata(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                         match add_control_mirror_pairs(&mut app.state.project, q0rg_id, left, right)
                         {
                             Ok(()) => {
-                                app.history.snapshot(&before);
+                                app.history.snapshot_with_session(&before, &app.session);
                                 app.state.mark_dirty();
                             }
                             Err(message) => app.session.status = message.into(),
@@ -4359,7 +4361,7 @@ fn render_pro_pose_metadata(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                         let before = app.state.project.clone();
                         if let Some(rig) = rig_for_q0rg_mut(&mut app.state.project, q0rg_id) {
                             rig.mirror_pairs.retain(|candidate| *candidate != pair);
-                            app.history.snapshot(&before);
+                            app.history.snapshot_with_session(&before, &app.session);
                             app.state.mark_dirty();
                         }
                     }
@@ -4468,7 +4470,7 @@ fn render_pro_pose_metadata(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                     current.weight_max = weight_max;
                     current.mode = mode;
                 }
-                app.history.snapshot(&before);
+                app.history.snapshot_with_session(&before, &app.session);
                 app.state.mark_dirty();
             }
         }
@@ -4507,7 +4509,7 @@ fn render_pro_variants(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                 source,
             ) {
                 Ok(id) => {
-                    app.history.snapshot(&before);
+                    app.history.snapshot_with_session(&before, &app.session);
                     app.state.mark_dirty();
                     app.session.status = format!("variant set #{id} created");
                 }
@@ -4624,7 +4626,7 @@ fn render_pro_variants(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                                         .rest_value
                                         .clamp(control.min_value, control.max_value);
                                 }
-                                app.history.snapshot(&before);
+                                app.history.snapshot_with_session(&before, &app.session);
                                 app.state.mark_dirty();
                             }
                         }
@@ -4641,7 +4643,7 @@ fn render_pro_variants(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                     .find(|candidate| candidate.variant_id == variant.variant_id)
                 {
                     current.name = name;
-                    app.history.snapshot(&before);
+                    app.history.snapshot_with_session(&before, &app.session);
                     app.state.mark_dirty();
                 }
             }
@@ -4651,7 +4653,7 @@ fn render_pro_variants(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
             if let Some(rig) = rig_for_q0rg_mut(&mut app.state.project, q0rg_id) {
                 rig.variants
                     .retain(|candidate| candidate.variant_id != variant.variant_id);
-                app.history.snapshot(&before);
+                app.history.snapshot_with_session(&before, &app.session);
                 app.state.mark_dirty();
             }
         }
@@ -4683,7 +4685,7 @@ fn render_pro_deformers(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                 };
                 match result {
                     Ok(id) => {
-                        app.history.snapshot(&before);
+                        app.history.snapshot_with_session(&before, &app.session);
                         app.state.mark_dirty();
                         app.session.status = format!("{label} deformer #{id} created");
                     }
@@ -4737,7 +4739,7 @@ fn render_pro_deformers(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                         ) {
                             if let Some(RigDeformer::Skin { bind_transform, anchors, .. }) = rig.deformers.iter_mut().find(|candidate| candidate.id() == id) {
                                 *anchors = build_skin_anchor_weights(&snapshot, &vector, *bind_transform, 4);
-                                app.history.snapshot(&before);
+                                app.history.snapshot_with_session(&before, &app.session);
                                 app.state.mark_dirty();
                             }
                         }
@@ -4782,7 +4784,7 @@ fn render_pro_deformers(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                                         if let Some(RigDeformer::Skin { anchors, .. }) = rig.deformers.iter_mut().find(|candidate| candidate.id() == id) {
                                             if let Some(anchor) = anchors.iter_mut().find(|anchor| anchor.path_index == path_index && anchor.anchor_index == anchor_index) {
                                                 anchor.weights = edited;
-                                                app.history.snapshot(&before);
+                                                app.history.snapshot_with_session(&before, &app.session);
                                                 app.state.mark_dirty();
                                             }
                                         }
@@ -4798,7 +4800,7 @@ fn render_pro_deformers(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
         if delete {
             let before = app.state.project.clone();
             if remove_deformer(&mut app.state.project, q0rg_id, id) {
-                app.history.snapshot(&before);
+                app.history.snapshot_with_session(&before, &app.session);
                 app.state.mark_dirty();
             }
         }
@@ -5227,7 +5229,7 @@ fn handle_add_bone(
             end,
             app.session.current_frame,
         ) {
-            app.history.snapshot(&before);
+            app.history.snapshot_with_session(&before, &app.session);
             app.state.mark_dirty();
             app.session.rig_selected_node = Some(node_id);
             app.session.rig_selected_control = None;
@@ -5275,14 +5277,15 @@ fn handle_pose(
                         if value.value >= 0.5 { 0.0 } else { 1.0 },
                         app.session.rig_auto_key,
                     ) {
-                        app.history.snapshot(&before);
+                        app.history.snapshot_with_session(&before, &app.session);
                         app.state.mark_dirty();
                         app.session.rig_selected_control = Some(control_id);
                         app.session.rig_selected_node = None;
                     }
                     return;
                 }
-                app.history.snapshot(&app.state.project);
+                app.history
+                    .snapshot_with_session(&app.state.project, &app.session);
                 app.session.rig_control_drag = Some(RigControlDrag {
                     control_id,
                     start_cursor: pointer,
@@ -5311,7 +5314,8 @@ fn handle_pose(
                 .and_then(|parent| pose.node_world.get(&parent))
                 .map(|world| world.a21.atan2(world.a11))
                 .unwrap_or(0.0);
-            app.history.snapshot(&app.state.project);
+            app.history
+                .snapshot_with_session(&app.state.project, &app.session);
             app.session.rig_bone_drag = Some(RigBoneDrag {
                 node_id,
                 center_world,

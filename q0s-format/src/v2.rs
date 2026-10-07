@@ -22,8 +22,9 @@
 //!       placements[]: [2] frame, [1] target_kind, [2] target_id,
 //!         v2: transform [20]: tx ty sx sy rot (5 Р В РІР‚СљР Р†Р вЂљРІР‚Сњ f32)
 //!         v3+: transform [28]: tx ty sx sy rot skew_x skew_y (7 Р В РІР‚СљР Р†Р вЂљРІР‚Сњ f32)
-//!         tween: [1] kind (0=none, 1=linear, 2=eased), [2 if motion] to_frame,
+//!         tween: [1] kind (0=none, 1=linear, 2=eased, 3=shape), [2 if motion] to_frame,
 //!           v8 eased: [1] easing kind + payload
+//!           v39 shape: [1] easing kind + payload
 //!         v14+: placement FX: [1] sparse flags + optional alpha/blend/blur/glow/shadow payloads
 //!         v34+: trailing tint flag [1], then RGB [3] + amount f32 when present
 //!       v4+: [2] explicit_keyframe_count, explicit_keyframes[]: [2] frame
@@ -57,6 +58,7 @@
 
 use crate::transform::Affine;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use crate::error::Error;
 use crate::io::{write_string_u16, Cursor};
@@ -117,7 +119,15 @@ pub const Q1S_VERSION_RIG_POSE_KEYS: u16 = 33;
 pub const Q1S_VERSION_TINT: u16 = 34;
 /// Lossless audio ranges, pan and fade envelopes; v2-v34 remain readable.
 pub const Q1S_VERSION_AUDIO_EDITING: u16 = 35;
-pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_AUDIO_EDITING;
+/// Explicit per-instance clock for automatic symbol playback ranges.
+pub const Q1S_VERSION_Q0RG_CLOCK: u16 = 36;
+/// Per-instance playback speed in hundredths of the normal rate.
+pub const Q1S_VERSION_Q0RG_SPEED: u16 = 37;
+/// Media aliases keep library identities while storing an immutable payload once.
+pub const Q1S_VERSION_SHARED_MEDIA: u16 = 38;
+/// Shape tweens: a keyframe's vector artwork morphs into the next keyframe's.
+pub const Q1S_VERSION_SHAPE_TWEENS: u16 = 39;
+pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_SHAPE_TWEENS;
 /// Kept as an alias so external code that imported the v2-era constant keeps
 /// compiling. It now means "the current write-out version".
 pub const Q1S_V2_VERSION: u16 = Q1S_VERSION_CURRENT;
@@ -135,11 +145,13 @@ const ASSET_KIND_BITMAP: u8 = 1;
 const ASSET_KIND_VECTOR: u8 = 2;
 const ASSET_KIND_Q0V: u8 = 3;
 const ASSET_KIND_RIG: u8 = 4;
+const ASSET_KIND_Q0V_REFERENCE: u8 = 5;
 const TARGET_KIND_ASSET: u8 = 1;
 const TARGET_KIND_Q0RG: u8 = 2;
 const TWEEN_KIND_NONE: u8 = 0;
 const TWEEN_KIND_LINEAR: u8 = 1;
 const TWEEN_KIND_EASED: u8 = 2;
+const TWEEN_KIND_SHAPE: u8 = 3;
 const EASING_KIND_LINEAR: u8 = 0;
 const EASING_KIND_PRESET: u8 = 1;
 const EASING_KIND_CUBIC_BEZIER: u8 = 2;
@@ -954,42 +966,62 @@ fn sample_cubic_bezier(x1: f32, y1: f32, x2: f32, y2: f32, x: f32) -> f32 {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Tween {
     None,
-    Linear { to_frame: u16 },
-    Eased { to_frame: u16, easing: Easing },
+    Linear {
+        to_frame: u16,
+    },
+    Eased {
+        to_frame: u16,
+        easing: Easing,
+    },
+    /// Morph this keyframe's vector artwork into the vector artwork of the
+    /// keyframe at `to_frame`. The placement itself keeps its transform; the
+    /// geometry and paint are interpolated by `crate::shape_tween`.
+    Shape {
+        to_frame: u16,
+        easing: Easing,
+    },
 }
 
 impl Tween {
     pub const fn to_frame(self) -> Option<u16> {
         match self {
             Self::None => None,
-            Self::Linear { to_frame } | Self::Eased { to_frame, .. } => Some(to_frame),
+            Self::Linear { to_frame }
+            | Self::Eased { to_frame, .. }
+            | Self::Shape { to_frame, .. } => Some(to_frame),
         }
     }
 
     pub const fn easing(self) -> Easing {
         match self {
-            Self::Eased { easing, .. } => easing,
+            Self::Eased { easing, .. } | Self::Shape { easing, .. } => easing,
             Self::None | Self::Linear { .. } => Easing::Linear,
         }
+    }
+
+    pub const fn is_shape(self) -> bool {
+        matches!(self, Self::Shape { .. })
     }
 
     pub const fn with_to_frame(self, to_frame: u16) -> Self {
         match self {
             Self::Eased { easing, .. } => Self::Eased { to_frame, easing },
+            Self::Shape { easing, .. } => Self::Shape { to_frame, easing },
             Self::None | Self::Linear { .. } => Self::Linear { to_frame },
         }
     }
 
     pub const fn with_easing(self, easing: Easing) -> Self {
-        match self.to_frame() {
-            Some(to_frame) => {
+        match self {
+            Self::None => Self::None,
+            Self::Shape { to_frame, .. } => Self::Shape { to_frame, easing },
+            Self::Linear { to_frame } | Self::Eased { to_frame, .. } => {
                 if matches!(easing, Easing::Linear) {
                     Self::Linear { to_frame }
                 } else {
                     Self::Eased { to_frame, easing }
                 }
             }
-            None => Self::None,
         }
     }
 }
@@ -1043,6 +1075,11 @@ pub enum Q0rgPlaybackMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Q0rgPlayback {
     pub mode: Q0rgPlaybackMode,
+    /// Playback rate, where 100 is 1x. Valid authored rates are 1..=10_000.
+    pub speed_percent: u16,
+    /// Authored playback follows this instance's continuous placement clock.
+    /// False preserves the parent-clock behavior of legacy all-default symbols.
+    pub placement_relative: bool,
     /// Inclusive first frame of the playback range.
     pub first_frame: u16,
     /// Inclusive last frame. None follows the q0rg's current final frame.
@@ -1055,6 +1092,8 @@ impl Default for Q0rgPlayback {
     fn default() -> Self {
         Self {
             mode: Q0rgPlaybackMode::Loop,
+            speed_percent: 100,
+            placement_relative: false,
             first_frame: 0,
             last_frame: None,
             single_frame: 0,
@@ -1063,6 +1102,22 @@ impl Default for Q0rgPlayback {
 }
 
 impl Q0rgPlayback {
+    /// A full range follows future symbol length changes. Any custom endpoint
+    /// freezes both bounds until the user explicitly restores the full range.
+    pub fn set_range(&mut self, first: u16, last: u16, frame_count: u16) {
+        self.placement_relative = true;
+        self.first_frame = first.min(last);
+        self.last_frame = if self.first_frame == 0 && last == frame_count.saturating_sub(1) {
+            None
+        } else {
+            Some(last)
+        };
+    }
+
+    pub fn follows_symbol_length(self) -> bool {
+        self.first_frame == 0 && self.last_frame.is_none()
+    }
+
     pub fn resolve(self, parent_frame: u16, placement_frame: u16, frame_count: u16) -> u16 {
         if frame_count == 0 {
             return 0;
@@ -1089,7 +1144,9 @@ impl Q0rgPlayback {
             .min(max_frame)
             .max(first);
         let span = u32::from(last - first) + 1;
-        let elapsed = u32::from(parent_frame.saturating_sub(placement_frame));
+        let elapsed = u32::from(parent_frame.saturating_sub(placement_frame))
+            * u32::from(self.speed_percent.clamp(1, 10_000))
+            / 100;
         match self.mode {
             Q0rgPlaybackMode::Loop => first + (elapsed % span) as u16,
             Q0rgPlaybackMode::PlayOnce => {
@@ -1103,6 +1160,92 @@ impl Q0rgPlayback {
             Q0rgPlaybackMode::Manual => self.single_frame.min(max_frame),
         }
     }
+}
+
+/// Playback origins for continuous display-object tracks. Keyframes capture
+/// visual state, but do not restart the same symbol/media instance. An absent
+/// instance, changed target or changed playback range starts a new segment.
+pub fn placement_playback_start_frames(layer: &Layer) -> Vec<u16> {
+    let mut frames = std::collections::BTreeMap::<u16, Vec<usize>>::new();
+    for frame in &layer.explicit_keyframes {
+        frames.entry(*frame).or_default();
+    }
+    for (index, placement) in layer.placements.iter().enumerate() {
+        frames.entry(placement.frame).or_default().push(index);
+    }
+    let mut starts: Vec<u16> = layer
+        .placements
+        .iter()
+        .map(|placement| placement.frame)
+        .collect();
+    let mut previous = HashMap::<(u32, u8, u16, usize), (usize, u16)>::new();
+    for (_, indices) in frames {
+        let mut current = HashMap::with_capacity(indices.len());
+        let mut occurrences = HashMap::<(u8, u16), usize>::new();
+        for index in indices {
+            let placement = &layer.placements[index];
+            let target = match placement.target {
+                Target::Asset(id) => (0, id),
+                Target::Q0rg(id) => (1, id),
+            };
+            let occurrence = occurrences.entry(target).or_default();
+            // Legacy id-less placements follow target + occurrence. Persistent
+            // identities keep separate copies independent even after reordering.
+            let key = if placement.instance_id == 0 {
+                (0, target.0, target.1, *occurrence)
+            } else {
+                (placement.instance_id, 0, 0, 0)
+            };
+            *occurrence += 1;
+            let start = previous
+                .get(&key)
+                .and_then(|&(previous_index, start)| {
+                    let previous = &layer.placements[previous_index];
+                    (previous.target == placement.target
+                        && previous.fx.q0rg_playback == placement.fx.q0rg_playback)
+                        .then_some(start)
+                })
+                .unwrap_or(placement.frame);
+            starts[index] = start;
+            current.insert(key, (index, start));
+        }
+        previous = current;
+    }
+    starts
+}
+
+/// Resolve isolated FX/property queries without losing their host track clock.
+pub fn placement_playback_start_frame(
+    project: &ProjectV2,
+    host_q0rg_id: u16,
+    placement: &Placement,
+) -> u16 {
+    let Some(host) = project.q0rgs.iter().find(|q| q.q0rg_id == host_q0rg_id) else {
+        return placement.frame;
+    };
+    // Normal render queries borrow the original placement. Avoid confusing two
+    // identical id-less copies on different layers when finding that source.
+    for layer in &host.layers {
+        if let Some(index) = layer
+            .placements
+            .iter()
+            .position(|p| std::ptr::eq(p, placement))
+        {
+            return placement_playback_start_frames(layer)[index];
+        }
+    }
+    if placement.instance_id != 0 {
+        for layer in &host.layers {
+            if let Some(index) = layer.placements.iter().position(|p| {
+                p.instance_id == placement.instance_id
+                    && p.frame == placement.frame
+                    && p.target == placement.target
+            }) {
+                return placement_playback_start_frames(layer)[index];
+            }
+        }
+    }
+    placement.frame
 }
 
 pub fn resolve_q0rg_playback_frame(
@@ -2168,9 +2311,7 @@ impl ProjectV2 {
         let mut pending = vec![layer_id];
         let mut visited = HashSet::new();
         while let Some(id) = pending.pop() {
-            if !visited.insert(id)
-                || visited.len() > MAX_LAYER_FOLDER_NESTING_DEPTH as usize * 2 + 2
-            {
+            if !visited.insert(id) || visited.len() > MAX_LAYER_FOLDER_NESTING_DEPTH * 2 + 2 {
                 return false;
             }
             let metadata = self.layer_metadata(q0rg_id, id);
@@ -2189,9 +2330,7 @@ impl ProjectV2 {
         let mut pending = vec![layer_id];
         let mut visited = HashSet::new();
         while let Some(id) = pending.pop() {
-            if !visited.insert(id)
-                || visited.len() > MAX_LAYER_FOLDER_NESTING_DEPTH as usize * 2 + 2
-            {
+            if !visited.insert(id) || visited.len() > MAX_LAYER_FOLDER_NESTING_DEPTH * 2 + 2 {
                 return true;
             }
             let metadata = self.layer_metadata(q0rg_id, id);
@@ -3314,6 +3453,9 @@ fn validate_project_runtime(project: &ProjectV2) -> Result<(), Error> {
         if !key.tween.easing().is_valid() {
             return Err(Error::Validation("camera tween easing is invalid"));
         }
+        if key.tween.is_shape() {
+            return Err(Error::Validation("camera keys cannot use shape tweens"));
+        }
         if let Some(to_frame) = key.tween.to_frame() {
             if to_frame <= key.frame
                 || to_frame >= entry.frame_count
@@ -3342,6 +3484,7 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
     validate_project_runtime(project)?;
 
     let mut asset_ids = HashSet::new();
+    let mut validated_media = HashSet::new();
     for asset in &project.assets {
         if !asset_ids.insert(asset.id()) {
             return Err(Error::Validation("asset_id must be unique"));
@@ -3386,8 +3529,10 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
                 }
             }
             Asset::Q0v(v) => {
-                q0video::q0v::validate_bytes(&v.bytes)
-                    .map_err(|_| Error::Validation("q0v asset payload is invalid"))?;
+                if validated_media.insert(Arc::as_ptr(&v.bytes) as usize) {
+                    q0video::q0v::validate_bytes(&v.bytes)
+                        .map_err(|_| Error::Validation("q0v asset payload is invalid"))?;
+                }
             }
             Asset::Rig(rig) => validate_rig_asset(rig)?,
         }
@@ -3665,6 +3810,9 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
                     ));
                 }
                 if let Target::Q0rg(target_id) = p.target {
+                    if !(1..=10_000).contains(&p.fx.q0rg_playback.speed_percent) {
+                        return Err(Error::Validation("invalid q0rg playback speed"));
+                    }
                     let target_frames = project
                         .q0rgs
                         .iter()
@@ -3673,12 +3821,19 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
                         .unwrap_or(0);
                     if target_frames > 0 {
                         let max_frame = target_frames - 1;
-                        if p.fx.q0rg_playback.first_frame > max_frame
-                            || p.fx
-                                .q0rg_playback
-                                .last_frame
-                                .is_some_and(|last| last > max_frame)
-                            || p.fx.q0rg_playback.single_frame > max_frame
+                        // Frozen authored ranges retain their chosen endpoints
+                        // if a symbol becomes shorter. Rendering clamps safely;
+                        // extending it again restores the original range.
+                        if (!p.fx.q0rg_playback.placement_relative
+                            && (p.fx.q0rg_playback.first_frame > max_frame
+                                || p.fx
+                                    .q0rg_playback
+                                    .last_frame
+                                    .is_some_and(|last| last > max_frame)))
+                            || (matches!(
+                                p.fx.q0rg_playback.mode,
+                                Q0rgPlaybackMode::SingleFrame | Q0rgPlaybackMode::Manual
+                            ) && p.fx.q0rg_playback.single_frame > max_frame)
                         {
                             return Err(Error::Validation(
                                 "q0rg playback frame is outside target frame_count",
@@ -3915,6 +4070,19 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
             .map(|(index, layer)| (layer.layer_id, index))
             .collect::<HashMap<_, _>>();
 
+        // Name a pure folder cycle for what it is: the dependency walk below
+        // follows folder parents as well and would blame the masks instead.
+        for layer in &q0rg.layers {
+            let mut visited = HashSet::from([layer.layer_id]);
+            let mut current_id = layer.layer_id;
+            while let Some(parent_id) = project.layer_parent_folder(q0rg.q0rg_id, current_id) {
+                if !visited.insert(parent_id) {
+                    return Err(Error::Validation("layer folder parent cycle"));
+                }
+                current_id = parent_id;
+            }
+        }
+
         let mut dependency_state = HashMap::<u16, u8>::new();
         for layer in &q0rg.layers {
             if dependency_state.get(&layer.layer_id) == Some(&2) {
@@ -4091,12 +4259,43 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
     for (i, q) in project.q0rgs.iter().enumerate() {
         q0rg_index.insert(q.q0rg_id, i);
     }
-    validate_q0rg_graph(project, &q0rg_index)?;
+    validate_q0rg_graph(project, &q0rg_index, None)?;
 
     Ok(())
 }
 
-fn validate_q0rg_graph(project: &ProjectV2, index: &HashMap<u16, usize>) -> Result<(), Error> {
+/// Check symbol references before inserting artwork, frames or layers. This
+/// uses the same stack-safe graph rules as file validation, including rig
+/// variants and the maximum nesting depth, without cloning or mutating artwork.
+pub fn validate_q0rg_insertions(
+    project: &ProjectV2,
+    parent_q0rg_id: u16,
+    targets: impl IntoIterator<Item = Target>,
+) -> Result<(), Error> {
+    let children: Vec<u16> = targets
+        .into_iter()
+        .filter_map(|target| match target {
+            Target::Q0rg(id) => Some(id),
+            Target::Asset(_) => None,
+        })
+        .collect();
+    if children.is_empty() {
+        return Ok(());
+    }
+    let index = project
+        .q0rgs
+        .iter()
+        .enumerate()
+        .map(|(index, q0rg)| (q0rg.q0rg_id, index))
+        .collect();
+    validate_q0rg_graph(project, &index, Some((parent_q0rg_id, &children)))
+}
+
+fn validate_q0rg_graph(
+    project: &ProjectV2,
+    index: &HashMap<u16, usize>,
+    insertions: Option<(u16, &[u16])>,
+) -> Result<(), Error> {
     let q0rgs = &project.q0rgs;
     let mut children = vec![Vec::<usize>::new(); q0rgs.len()];
     let mut indegree = vec![0usize; q0rgs.len()];
@@ -4137,6 +4336,21 @@ fn validate_q0rg_graph(project: &ProjectV2, index: &HashMap<u16, usize>) -> Resu
         }
     }
 
+    if let Some((parent_id, child_ids)) = insertions {
+        let parent = index
+            .get(&parent_id)
+            .copied()
+            .ok_or(Error::Validation("insertion parent q0rg is missing"))?;
+        for id in child_ids {
+            let child = index
+                .get(id)
+                .copied()
+                .ok_or(Error::Validation("placement references unknown q0rg_id"))?;
+            children[parent].push(child);
+            indegree[child] = indegree[child].saturating_add(1);
+        }
+    }
+
     // Kahn's algorithm detects cycles without recursing through attacker-owned
     // graph depth and also gives us the order needed for longest-path depth.
     let mut ready = VecDeque::new();
@@ -4174,8 +4388,92 @@ fn validate_q0rg_graph(project: &ProjectV2, index: &HashMap<u16, usize>) -> Resu
     Ok(())
 }
 
+fn media_hash(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn shared_media_references(project: &ProjectV2) -> HashMap<u16, u16> {
+    let mut videos: Vec<_> = project
+        .assets
+        .iter()
+        .filter_map(|asset| match asset {
+            Asset::Q0v(video) => Some(video),
+            _ => None,
+        })
+        .collect();
+    videos.sort_by_key(|video| video.asset_id);
+    let mut pointers = HashMap::new();
+    let mut contents: HashMap<u64, Vec<&Q0vAsset>> = HashMap::new();
+    let mut references = HashMap::new();
+    for video in videos {
+        let pointer = Arc::as_ptr(&video.bytes) as usize;
+        if let Some(&original) = pointers.get(&pointer) {
+            references.insert(video.asset_id, original);
+            continue;
+        }
+        let bucket = contents.entry(media_hash(&video.bytes)).or_default();
+        let original = bucket
+            .iter()
+            .find(|other| other.bytes.as_slice() == video.bytes.as_slice());
+        let source_id = if let Some(original) = original {
+            references.insert(video.asset_id, original.asset_id);
+            original.asset_id
+        } else {
+            bucket.push(video);
+            video.asset_id
+        };
+        pointers.insert(pointer, source_id);
+    }
+    references
+}
+
+#[derive(Default)]
+struct MediaPayloads {
+    contents: HashMap<u64, Vec<Arc<Vec<u8>>>>,
+    by_id: HashMap<u16, Arc<Vec<u8>>>,
+    unique_bytes: usize,
+}
+
+impl MediaPayloads {
+    fn read_payload(&mut self, bytes: &[u8]) -> Result<Arc<Vec<u8>>, Error> {
+        let bucket = self.contents.entry(media_hash(bytes)).or_default();
+        if let Some(payload) = bucket.iter().find(|payload| payload.as_slice() == bytes) {
+            return Ok(Arc::clone(payload));
+        }
+        // Legacy files can contain gigabytes of repeated media. Only unique
+        // payloads are allocated, with a bound independent of encoded file size.
+        self.unique_bytes = self
+            .unique_bytes
+            .checked_add(bytes.len())
+            .ok_or(Error::Overflow("shared media size overflow"))?;
+        if self.unique_bytes > 1024 * 1024 * 1024 {
+            return Err(Error::Validation("unique media payloads exceed 1 GiB"));
+        }
+        let payload = Arc::new(bytes.to_vec());
+        bucket.push(Arc::clone(&payload));
+        Ok(payload)
+    }
+}
+
 pub fn write(project: &ProjectV2) -> Result<Vec<u8>, Error> {
-    let version = if uses_audio_editing(project) {
+    let version = if uses_shape_tweens(project) {
+        Q1S_VERSION_SHAPE_TWEENS
+    } else if !shared_media_references(project).is_empty() {
+        Q1S_VERSION_SHARED_MEDIA
+    } else if uses_q0rg_speed(project) {
+        Q1S_VERSION_Q0RG_SPEED
+    } else if project
+        .q0rgs
+        .iter()
+        .flat_map(|q| &q.layers)
+        .flat_map(|layer| &layer.placements)
+        .any(|placement| placement.fx.q0rg_playback != Q0rgPlayback::default())
+    {
+        Q1S_VERSION_Q0RG_CLOCK
+    } else if uses_audio_editing(project) {
         Q1S_VERSION_AUDIO_EDITING
     } else if uses_tint(project) {
         Q1S_VERSION_TINT
@@ -4185,6 +4483,24 @@ pub fn write(project: &ProjectV2) -> Result<Vec<u8>, Error> {
         Q1S_VERSION_LAYER_FRAME_COUNTS
     };
     write_version(project, version)
+}
+
+fn uses_shape_tweens(project: &ProjectV2) -> bool {
+    project
+        .q0rgs
+        .iter()
+        .flat_map(|q| &q.layers)
+        .flat_map(|layer| &layer.placements)
+        .any(|placement| placement.tween.is_shape())
+}
+
+fn uses_q0rg_speed(project: &ProjectV2) -> bool {
+    project
+        .q0rgs
+        .iter()
+        .flat_map(|q| &q.layers)
+        .flat_map(|layer| &layer.placements)
+        .any(|placement| placement.fx.q0rg_playback.speed_percent != 100)
 }
 
 pub(crate) fn uses_audio_editing(project: &ProjectV2) -> bool {
@@ -4227,6 +4543,28 @@ fn uses_rig_pose_keys(project: &ProjectV2) -> bool {
 
 pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>, Error> {
     validate(project)?;
+    if version < Q1S_VERSION_Q0RG_SPEED && uses_q0rg_speed(project) {
+        return Err(Error::Validation(
+            "legacy q1s versions cannot store q0rg playback speed",
+        ));
+    }
+    if version < Q1S_VERSION_Q0RG_CLOCK
+        && project
+            .q0rgs
+            .iter()
+            .flat_map(|q| &q.layers)
+            .flat_map(|layer| &layer.placements)
+            .any(|placement| placement.fx.q0rg_playback.placement_relative)
+    {
+        return Err(Error::Validation(
+            "legacy q1s versions cannot store explicit q0rg clocks",
+        ));
+    }
+    if version < Q1S_VERSION_SHAPE_TWEENS && uses_shape_tweens(project) {
+        return Err(Error::Validation(
+            "legacy q1s versions cannot store shape tweens",
+        ));
+    }
     if version < Q1S_VERSION_AUDIO_EDITING && uses_audio_editing(project) {
         return Err(Error::Validation(
             "legacy q1s versions cannot store audio edits",
@@ -4276,6 +4614,10 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
         && version != Q1S_VERSION_RIG_POSE_KEYS
         && version != Q1S_VERSION_TINT
         && version != Q1S_VERSION_AUDIO_EDITING
+        && version != Q1S_VERSION_Q0RG_CLOCK
+        && version != Q1S_VERSION_Q0RG_SPEED
+        && version != Q1S_VERSION_SHARED_MEDIA
+        && version != Q1S_VERSION_SHAPE_TWEENS
     {
         return Err(Error::UnsupportedVersion(version));
     }
@@ -4615,7 +4957,26 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
 
     let mut assets: Vec<&Asset> = project.assets.iter().collect();
     assets.sort_by_key(|a| a.id());
+    let media_references = if version >= Q1S_VERSION_SHARED_MEDIA {
+        shared_media_references(project)
+    } else {
+        HashMap::new()
+    };
     for asset in assets {
+        if let Some(original) = media_references.get(&asset.id()) {
+            out.extend_from_slice(&asset.id().to_le_bytes());
+            out.push(ASSET_KIND_Q0V_REFERENCE);
+            write_string_u16(
+                &mut out,
+                project
+                    .asset_names
+                    .get(&asset.id())
+                    .map(String::as_str)
+                    .unwrap_or(""),
+            )?;
+            out.extend_from_slice(&original.to_le_bytes());
+            continue;
+        }
         write_asset(
             &mut out,
             asset,
@@ -4872,7 +5233,7 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
                     out.push(TWEEN_KIND_LINEAR);
                     out.extend_from_slice(&to_frame.to_le_bytes());
                 }
-                Tween::Eased { to_frame, easing } => {
+                Tween::Eased { to_frame, easing } | Tween::Shape { to_frame, easing } => {
                     out.push(TWEEN_KIND_EASED);
                     out.extend_from_slice(&to_frame.to_le_bytes());
                     write_easing(&mut out, easing);
@@ -5549,6 +5910,12 @@ fn write_placement_fx(out: &mut Vec<u8>, fx: PlacementFx, version: u16) {
             None => out.push(0),
         }
         out.extend_from_slice(&fx.q0rg_playback.single_frame.to_le_bytes());
+        if version >= Q1S_VERSION_Q0RG_CLOCK {
+            out.push(u8::from(fx.q0rg_playback.placement_relative));
+        }
+        if version >= Q1S_VERSION_Q0RG_SPEED {
+            out.extend_from_slice(&fx.q0rg_playback.speed_percent.to_le_bytes());
+        }
     }
     if version >= Q1S_VERSION_TINT {
         match fx.tint {
@@ -5680,8 +6047,28 @@ fn read_placement_fx(c: &mut Cursor<'_>, version: u16) -> Result<PlacementFx, Er
             _ => return Err(Error::Validation("invalid q0rg playback last-frame flag")),
         };
         let single_frame = c.read_u16()?;
+        let placement_relative = if version >= Q1S_VERSION_Q0RG_CLOCK {
+            match c.read_u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(Error::Validation("invalid q0rg playback clock flag")),
+            }
+        } else {
+            false
+        };
+        let speed_percent = if version >= Q1S_VERSION_Q0RG_SPEED {
+            let value = c.read_u16()?;
+            if !(1..=10_000).contains(&value) {
+                return Err(Error::Validation("invalid q0rg playback speed"));
+            }
+            value
+        } else {
+            100
+        };
         Q0rgPlayback {
             mode,
+            speed_percent,
+            placement_relative,
             first_frame,
             last_frame,
             single_frame,
@@ -5778,6 +6165,11 @@ fn write_q0rg(out: &mut Vec<u8>, q0rg: &Q0rg, version: u16) -> Result<(), Error>
                     out.extend_from_slice(&to_frame.to_le_bytes());
                     write_easing(out, easing);
                 }
+                Tween::Shape { to_frame, easing } => {
+                    out.push(TWEEN_KIND_SHAPE);
+                    out.extend_from_slice(&to_frame.to_le_bytes());
+                    write_easing(out, easing);
+                }
             }
             if version >= Q1S_VERSION_PLACEMENT_FX {
                 write_placement_fx(out, p.fx, version);
@@ -5851,6 +6243,10 @@ pub fn parse(bytes: &[u8]) -> Result<ProjectV2, Error> {
         && version != Q1S_VERSION_RIG_POSE_KEYS
         && version != Q1S_VERSION_TINT
         && version != Q1S_VERSION_AUDIO_EDITING
+        && version != Q1S_VERSION_Q0RG_CLOCK
+        && version != Q1S_VERSION_Q0RG_SPEED
+        && version != Q1S_VERSION_SHARED_MEDIA
+        && version != Q1S_VERSION_SHAPE_TWEENS
     {
         return Err(Error::UnsupportedVersion(version));
     }
@@ -5897,8 +6293,9 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
 
     let mut assets = Vec::with_capacity(usize::from(asset_count));
     let mut asset_names = HashMap::new();
+    let mut media_payloads = MediaPayloads::default();
     for _ in 0..asset_count {
-        let (asset, asset_name) = parse_asset(&mut c, version)?;
+        let (asset, asset_name) = parse_asset(&mut c, version, &mut media_payloads)?;
         if let Some(name) = asset_name {
             asset_names.insert(asset.id(), name);
         }
@@ -6278,7 +6675,7 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
     }
     c.finish()?;
 
-    let project = ProjectV2 {
+    let mut project = ProjectV2 {
         meta: ProjectMeta {
             name,
             fps,
@@ -6304,11 +6701,49 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
             "legacy q1s file cannot contain nested layer folders",
         ));
     }
+    if version < Q1S_VERSION_Q0RG_CLOCK {
+        let lengths: HashMap<_, _> = project
+            .q0rgs
+            .iter()
+            .map(|q| (q.q0rg_id, q.frame_count))
+            .collect();
+        for placement in project
+            .q0rgs
+            .iter_mut()
+            .flat_map(|q| &mut q.layers)
+            .flat_map(|layer| &mut layer.placements)
+        {
+            let Target::Q0rg(id) = placement.target else {
+                continue;
+            };
+            let Some(&frames) = lengths.get(&id) else {
+                continue;
+            };
+            let playback = &mut placement.fx.q0rg_playback;
+            if matches!(
+                playback.mode,
+                Q0rgPlaybackMode::Loop | Q0rgPlaybackMode::LoopReversed
+            ) && ((playback.first_frame == 0
+                && playback.last_frame == Some(frames.saturating_sub(1)))
+                || (playback.first_frame != 0 && playback.last_frame.is_none()))
+            {
+                playback.set_range(
+                    playback.first_frame,
+                    playback.last_frame.unwrap_or(frames.saturating_sub(1)),
+                    frames,
+                );
+            }
+        }
+    }
     validate(&project)?;
     Ok(project)
 }
 
-fn parse_asset(c: &mut Cursor, version: u16) -> Result<(Asset, Option<String>), Error> {
+fn parse_asset(
+    c: &mut Cursor,
+    version: u16,
+    media: &mut MediaPayloads,
+) -> Result<(Asset, Option<String>), Error> {
     let asset_id = c.read_u16()?;
     let kind = c.read_u8()?;
     let asset_name = if version >= Q1S_VERSION_ASSET_NAMES {
@@ -6417,14 +6852,34 @@ fn parse_asset(c: &mut Cursor, version: u16) -> Result<(Asset, Option<String>), 
                 .map_err(|_| Error::Validation("q0v payload length does not fit usize"))?;
             Asset::Q0v(Q0vAsset {
                 asset_id,
-                bytes: (c.read_exact(len)?.to_vec()).into(),
+                bytes: media.read_payload(c.read_exact(len)?)?,
             })
+        }
+        ASSET_KIND_Q0V_REFERENCE if version >= Q1S_VERSION_SHARED_MEDIA => {
+            let original = c.read_u16()?;
+            let bytes = media
+                .by_id
+                .get(&original)
+                .cloned()
+                .ok_or(Error::Validation(
+                    "shared media reference must name an earlier media asset",
+                ))?;
+            Asset::Q0v(Q0vAsset { asset_id, bytes })
         }
         ASSET_KIND_RIG if version >= Q1S_VERSION_RIGGING => {
             Asset::Rig(read_rig_asset(c, asset_id, version)?)
         }
         other => return Err(Error::InvalidAssetKind(other)),
     };
+    if let Asset::Q0v(video) = &asset {
+        if media
+            .by_id
+            .insert(asset_id, Arc::clone(&video.bytes))
+            .is_some()
+        {
+            return Err(Error::Validation("duplicate media asset id"));
+        }
+    }
     Ok((asset, asset_name))
 }
 
@@ -6913,6 +7368,10 @@ fn parse_q0rg(c: &mut Cursor, version: u16) -> Result<Q0rg, Error> {
                     to_frame: c.read_u16()?,
                     easing: read_easing(c)?,
                 },
+                TWEEN_KIND_SHAPE if version >= Q1S_VERSION_SHAPE_TWEENS => Tween::Shape {
+                    to_frame: c.read_u16()?,
+                    easing: read_easing(c)?,
+                },
                 _ => return Err(Error::Validation("invalid tween kind")),
             };
             let fx = if version >= Q1S_VERSION_PLACEMENT_FX {
@@ -6966,6 +7425,14 @@ fn parse_q0rg(c: &mut Cursor, version: u16) -> Result<Q0rg, Error> {
 #[cfg(test)]
 mod compatibility_tests {
     use super::*;
+
+    /// The current format always stores the scene table, so a project that relies
+    /// on its implicit scene is read back with that scene spelled out.
+    fn with_scene_table(project: &ProjectV2) -> ProjectV2 {
+        let mut expected = project.clone();
+        expected.runtime.scenes = project.scenes();
+        expected
+    }
 
     fn test_q0v_bytes() -> Vec<u8> {
         let spec = q0video::q0v::Q0vSpec {
@@ -7065,6 +7532,8 @@ mod compatibility_tests {
 
         let looped = Q0rgPlayback {
             mode: Q0rgPlaybackMode::Loop,
+            speed_percent: 100,
+            placement_relative: false,
             first_frame: 1,
             last_frame: Some(3),
             single_frame: 0,
@@ -7119,6 +7588,8 @@ mod compatibility_tests {
         project.q0rgs[0].layers[0].placements[0].target = Target::Q0rg(2);
         project.q0rgs[0].layers[0].placements[0].fx.q0rg_playback = Q0rgPlayback {
             mode: Q0rgPlaybackMode::PlayOnce,
+            speed_percent: 100,
+            placement_relative: false,
             first_frame: 1,
             last_frame: Some(3),
             single_frame: 0,
@@ -7458,7 +7929,10 @@ mod compatibility_tests {
             u16::from_le_bytes([bytes[4], bytes[5]]),
             Q1S_VERSION_LAYER_FRAME_COUNTS
         );
-        assert_eq!(parse(&bytes).expect("parse q0v project"), project);
+        assert_eq!(
+            parse(&bytes).expect("parse q0v project"),
+            with_scene_table(&project)
+        );
     }
 
     fn appearance_project() -> ProjectV2 {
@@ -7548,7 +8022,7 @@ mod compatibility_tests {
             Q1S_VERSION_LAYER_FRAME_COUNTS
         );
         let parsed = parse(&bytes).expect("parse appearance q1s");
-        assert_eq!(parsed, project);
+        assert_eq!(parsed, with_scene_table(&project));
         assert_eq!(parsed.asset_appearances[&1], project.asset_appearances[&1]);
     }
 
@@ -7602,7 +8076,10 @@ mod compatibility_tests {
             u16::from_le_bytes([bytes[4], bytes[5]]),
             Q1S_VERSION_LAYER_FRAME_COUNTS
         );
-        assert_eq!(parse(&bytes).expect("parse current q1s fragments"), project);
+        assert_eq!(
+            parse(&bytes).expect("parse current q1s fragments"),
+            with_scene_table(&project)
+        );
     }
 
     #[test]
@@ -7655,7 +8132,7 @@ mod compatibility_tests {
             parsed.asset_appearances[&1].field_transform,
             field_transform
         );
-        assert_eq!(parsed, project);
+        assert_eq!(parsed, with_scene_table(&project));
     }
 
     #[test]
@@ -7855,7 +8332,7 @@ mod compatibility_tests {
             Q1S_VERSION_LAYER_FRAME_COUNTS
         );
         let parsed = parse(&bytes).expect("parse layer state");
-        assert_eq!(parsed, project);
+        assert_eq!(parsed, with_scene_table(&project));
         assert!(!parsed.layer_is_visible(1, 1));
         assert!(parsed.layer_is_locked(1, 1));
     }
@@ -7924,7 +8401,7 @@ mod compatibility_tests {
             Q1S_VERSION_LAYER_FRAME_COUNTS
         );
         let parsed = parse(&bytes).expect("parse nested q1s");
-        assert_eq!(parsed, project);
+        assert_eq!(parsed, with_scene_table(&project));
 
         assert_eq!(
             write_version(&project, Q1S_VERSION_LAYER_STATE)
@@ -8179,7 +8656,7 @@ mod compatibility_tests {
             Q1S_VERSION_LAYER_FRAME_COUNTS
         );
         let parsed = parse(&bytes).expect("parse rigged q1s");
-        assert_eq!(parsed, project);
+        assert_eq!(parsed, with_scene_table(&project));
         let rig = parsed
             .assets
             .iter()
@@ -8440,7 +8917,10 @@ mod compatibility_tests {
             u16::from_le_bytes([bytes[4], bytes[5]]),
             Q1S_VERSION_LAYER_FRAME_COUNTS
         );
-        assert_eq!(parse(&bytes).expect("parse pro rig current q1s"), project);
+        assert_eq!(
+            parse(&bytes).expect("parse pro rig current q1s"),
+            with_scene_table(&project)
+        );
     }
 
     #[test]
@@ -8528,7 +9008,10 @@ mod compatibility_tests {
             u16::from_le_bytes([bytes[4], bytes[5]]),
             Q1S_VERSION_LAYER_FRAME_COUNTS
         );
-        assert_eq!(parse(&bytes).expect("parse deformer q1s"), project);
+        assert_eq!(
+            parse(&bytes).expect("parse deformer q1s"),
+            with_scene_table(&project)
+        );
     }
 
     #[test]
@@ -8609,7 +9092,7 @@ mod compatibility_tests {
         );
         assert_eq!(
             parse(&bytes).expect("parse current rig extensions"),
-            project
+            with_scene_table(&project)
         );
     }
 
@@ -8623,7 +9106,10 @@ mod compatibility_tests {
             u16::from_le_bytes([bytes[4], bytes[5]]),
             Q1S_VERSION_LAYER_FRAME_COUNTS
         );
-        assert_eq!(parse(&bytes).expect("parse audio clip fx"), project);
+        assert_eq!(
+            parse(&bytes).expect("parse audio clip fx"),
+            with_scene_table(&project)
+        );
     }
 
     #[test]
@@ -8653,7 +9139,7 @@ mod compatibility_tests {
             Q1S_VERSION_LAYER_FRAME_COUNTS
         );
         let parsed = parse(&bytes).expect("parse timeline audio q1s");
-        assert_eq!(parsed, project);
+        assert_eq!(parsed, with_scene_table(&project));
         assert_eq!(parsed.audio_clips, project.audio_clips);
     }
 
@@ -8808,7 +9294,10 @@ mod compatibility_tests {
             u16::from_le_bytes([bytes[4], bytes[5]]),
             Q1S_VERSION_LAYER_FRAME_COUNTS
         );
-        assert_eq!(parse(&bytes).expect("parse project runtime q1s"), project);
+        assert_eq!(
+            parse(&bytes).expect("parse project runtime q1s"),
+            with_scene_table(&project)
+        );
     }
 
     #[test]
@@ -8845,7 +9334,7 @@ mod compatibility_tests {
             Q1S_VERSION_LAYER_FRAME_COUNTS
         );
         let decoded = parse(&bytes).unwrap();
-        assert_eq!(decoded, project);
+        assert_eq!(decoded, with_scene_table(&project));
         assert_eq!(write(&decoded).unwrap(), bytes);
         assert_eq!(decoded.runtime.resolve_frame_label(1, "intro"), Some(0));
         assert_eq!(decoded.runtime.resolve_frame_label(2, "intro"), Some(1));
@@ -8867,7 +9356,10 @@ mod compatibility_tests {
         let decoded = parse(&legacy).unwrap();
         assert_eq!(decoded, project);
         assert!(decoded.runtime.frame_labels.is_empty());
-        assert_eq!(parse(&write(&decoded).unwrap()).unwrap(), project);
+        assert_eq!(
+            parse(&write(&decoded).unwrap()).unwrap(),
+            with_scene_table(&project)
+        );
     }
 
     #[test]
@@ -9033,7 +9525,10 @@ mod compatibility_tests {
             u16::from_le_bytes([bytes[4], bytes[5]]),
             Q1S_VERSION_LAYER_FRAME_COUNTS
         );
-        assert_eq!(parse(&bytes).expect("parse gradient q1s"), project);
+        assert_eq!(
+            parse(&bytes).expect("parse gradient q1s"),
+            with_scene_table(&project)
+        );
         assert_eq!(
             write_version(&project, Q1S_VERSION_Q0RG_PLAYBACK),
             Err(Error::Validation(
@@ -9070,7 +9565,10 @@ mod compatibility_tests {
             u16::from_le_bytes([bytes[4], bytes[5]]),
             Q1S_VERSION_LAYER_FRAME_COUNTS
         );
-        assert_eq!(parse(&bytes).expect("parse anisotropic fx"), project);
+        assert_eq!(
+            parse(&bytes).expect("parse anisotropic fx"),
+            with_scene_table(&project)
+        );
     }
 
     #[test]

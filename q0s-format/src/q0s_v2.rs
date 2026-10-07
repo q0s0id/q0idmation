@@ -58,7 +58,11 @@ pub const Q0S_VERSION_LAYER_FRAME_COUNTS: u16 = 31;
 pub const Q0S_VERSION_RIG_POSE_KEYS: u16 = 32;
 pub const Q0S_VERSION_TINT: u16 = 33;
 pub const Q0S_VERSION_AUDIO_EDITING: u16 = 34;
-pub const Q0S_VERSION_CURRENT: u16 = Q0S_VERSION_AUDIO_EDITING;
+pub const Q0S_VERSION_Q0RG_CLOCK: u16 = 35;
+pub const Q0S_VERSION_Q0RG_SPEED: u16 = 36;
+pub const Q0S_VERSION_SHARED_MEDIA: u16 = 37;
+pub const Q0S_VERSION_SHAPE_TWEENS: u16 = 38;
+pub const Q0S_VERSION_CURRENT: u16 = Q0S_VERSION_SHAPE_TWEENS;
 
 /// Serialise a `ProjectV2` as the current vector `.q0s` bytes. Internally we
 /// reuse the current `.q1s` writer and patch the magic+version header in-place
@@ -70,7 +74,15 @@ pub fn write_q0s_v2(project: &ProjectV2) -> Result<Vec<u8>, Error> {
     }
     bytes[0..4].copy_from_slice(&Q0S_V2_MAGIC);
     let q1s_version = u16::from_le_bytes([bytes[4], bytes[5]]);
-    let version = if q1s_version >= v2::Q1S_VERSION_AUDIO_EDITING {
+    let version = if q1s_version >= v2::Q1S_VERSION_SHAPE_TWEENS {
+        Q0S_VERSION_SHAPE_TWEENS
+    } else if q1s_version >= v2::Q1S_VERSION_SHARED_MEDIA {
+        Q0S_VERSION_SHARED_MEDIA
+    } else if q1s_version >= v2::Q1S_VERSION_Q0RG_SPEED {
+        Q0S_VERSION_Q0RG_SPEED
+    } else if q1s_version >= v2::Q1S_VERSION_Q0RG_CLOCK {
+        Q0S_VERSION_Q0RG_CLOCK
+    } else if q1s_version >= v2::Q1S_VERSION_AUDIO_EDITING {
         Q0S_VERSION_AUDIO_EDITING
     } else if q1s_version >= v2::Q1S_VERSION_TINT {
         Q0S_VERSION_TINT
@@ -169,6 +181,14 @@ pub fn parse_q0s_v2(bytes: &[u8]) -> Result<ProjectV2, Error> {
         Q0S_VERSION_LAYER_FRAME_COUNTS => {
             v2::parse_body_after_header(bytes, v2::Q1S_VERSION_LAYER_FRAME_COUNTS)
         }
+        Q0S_VERSION_SHARED_MEDIA => {
+            v2::parse_body_after_header(bytes, v2::Q1S_VERSION_SHARED_MEDIA)
+        }
+        Q0S_VERSION_SHAPE_TWEENS => {
+            v2::parse_body_after_header(bytes, v2::Q1S_VERSION_SHAPE_TWEENS)
+        }
+        Q0S_VERSION_Q0RG_SPEED => v2::parse_body_after_header(bytes, v2::Q1S_VERSION_Q0RG_SPEED),
+        Q0S_VERSION_Q0RG_CLOCK => v2::parse_body_after_header(bytes, v2::Q1S_VERSION_Q0RG_CLOCK),
         Q0S_VERSION_AUDIO_EDITING => {
             v2::parse_body_after_header(bytes, v2::Q1S_VERSION_AUDIO_EDITING)
         }
@@ -224,6 +244,10 @@ pub fn is_q0s_v2(bytes: &[u8]) -> bool {
             | Q0S_VERSION_RIG_POSE_KEYS
             | Q0S_VERSION_TINT
             | Q0S_VERSION_AUDIO_EDITING
+            | Q0S_VERSION_Q0RG_CLOCK
+            | Q0S_VERSION_Q0RG_SPEED
+            | Q0S_VERSION_SHARED_MEDIA
+            | Q0S_VERSION_SHAPE_TWEENS
     )
 }
 
@@ -236,6 +260,14 @@ mod tests {
         RigControlKind, RigKey, RigNode, RigPropertyRef, Target, Transform2D, Tween, Vec2,
         VectorAppearance, VectorAsset, VectorMaterial,
     };
+
+    /// The current format always stores the scene table, so a project that relies
+    /// on its implicit scene is read back with that scene spelled out.
+    fn with_scene_table(project: &ProjectV2) -> ProjectV2 {
+        let mut expected = project.clone();
+        expected.runtime.scenes = project.scenes();
+        expected
+    }
 
     fn test_q0v_bytes() -> Vec<u8> {
         let spec = q0video::q0v::Q0vSpec {
@@ -360,7 +392,7 @@ mod tests {
             Q0S_VERSION_LAYER_FRAME_COUNTS
         );
         let parsed = parse_q0s_v2(&bytes).expect("parse");
-        assert_eq!(parsed, project);
+        assert_eq!(parsed, with_scene_table(&project));
     }
 
     #[test]
@@ -412,7 +444,10 @@ mod tests {
             u16::from_le_bytes([bytes[4], bytes[5]]),
             Q0S_VERSION_LAYER_FRAME_COUNTS
         );
-        assert_eq!(parse_q0s_v2(&bytes).expect("parse gradient q0s"), project);
+        assert_eq!(
+            parse_q0s_v2(&bytes).expect("parse gradient q0s"),
+            with_scene_table(&project)
+        );
     }
 
     #[test]
@@ -420,6 +455,7 @@ mod tests {
         let mut project = small_project();
         project.q0rgs[0].layers[0].placements[0].fx = v2::PlacementFx {
             opacity: 0.55,
+            tint: None,
             blend_mode: v2::BlendMode::Multiply,
             blur: Some(v2::BlurFx {
                 radius_x: 4.0,
@@ -461,7 +497,7 @@ mod tests {
         );
         assert_eq!(
             parse_q0s_v2(&bytes).expect("parse placement fx q0s"),
-            project
+            with_scene_table(&project)
         );
     }
 
@@ -475,7 +511,10 @@ mod tests {
             u16::from_le_bytes([bytes[4], bytes[5]]),
             Q0S_VERSION_LAYER_FRAME_COUNTS
         );
-        assert_eq!(parse_q0s_v2(&bytes).expect("parse audio clip q0s"), project);
+        assert_eq!(
+            parse_q0s_v2(&bytes).expect("parse audio clip q0s"),
+            with_scene_table(&project)
+        );
     }
 
     #[test]
@@ -504,7 +543,7 @@ mod tests {
             Q0S_VERSION_LAYER_FRAME_COUNTS
         );
         let parsed = parse_q0s_v2(&bytes).expect("parse timeline audio q0s");
-        assert_eq!(parsed, project);
+        assert_eq!(parsed, with_scene_table(&project));
         assert_eq!(parsed.audio_clips, project.audio_clips);
     }
 
@@ -607,7 +646,10 @@ mod tests {
             u16::from_le_bytes([bytes[4], bytes[5]]),
             Q0S_VERSION_LAYER_FRAME_COUNTS
         );
-        assert_eq!(parse_q0s_v2(&bytes).expect("parse eased q0s"), project);
+        assert_eq!(
+            parse_q0s_v2(&bytes).expect("parse eased q0s"),
+            with_scene_table(&project)
+        );
     }
 
     #[test]
@@ -658,7 +700,10 @@ mod tests {
             u16::from_le_bytes([bytes[4], bytes[5]]),
             Q0S_VERSION_LAYER_FRAME_COUNTS
         );
-        assert_eq!(parse_q0s_v2(&bytes).expect("parse appearance q0s"), project);
+        assert_eq!(
+            parse_q0s_v2(&bytes).expect("parse appearance q0s"),
+            with_scene_table(&project)
+        );
     }
 
     #[test]
@@ -715,7 +760,10 @@ mod tests {
             u16::from_le_bytes([bytes[4], bytes[5]]),
             Q0S_VERSION_LAYER_FRAME_COUNTS
         );
-        assert_eq!(parse_q0s_v2(&bytes).expect("parse q0s fragments"), project);
+        assert_eq!(
+            parse_q0s_v2(&bytes).expect("parse q0s fragments"),
+            with_scene_table(&project)
+        );
     }
 
     #[test]
@@ -790,7 +838,7 @@ mod tests {
             parsed.asset_appearances[&1].field_transform,
             field_transform
         );
-        assert_eq!(parsed, project);
+        assert_eq!(parsed, with_scene_table(&project));
     }
 
     #[test]
@@ -882,7 +930,7 @@ mod tests {
 
         let bytes = write_q0s_v2(&project).expect("write folder q0s");
         let parsed = parse_q0s_v2(&bytes).expect("parse folder q0s");
-        assert_eq!(parsed, project);
+        assert_eq!(parsed, with_scene_table(&project));
         assert_eq!(
             parsed.q0rgs[0]
                 .layers
@@ -939,7 +987,10 @@ mod tests {
             u16::from_le_bytes([bytes[4], bytes[5]]),
             Q0S_VERSION_LAYER_FRAME_COUNTS
         );
-        assert_eq!(parse_q0s_v2(&bytes).expect("parse nested q0s"), project);
+        assert_eq!(
+            parse_q0s_v2(&bytes).expect("parse nested q0s"),
+            with_scene_table(&project)
+        );
     }
 
     #[test]
@@ -977,7 +1028,10 @@ mod tests {
             u16::from_le_bytes([bytes[4], bytes[5]]),
             Q0S_VERSION_LAYER_FRAME_COUNTS
         );
-        assert_eq!(parse_q0s_v2(&bytes).expect("parse q0v q0s"), project);
+        assert_eq!(
+            parse_q0s_v2(&bytes).expect("parse q0v q0s"),
+            with_scene_table(&project)
+        );
     }
 
     #[test]
@@ -1034,7 +1088,7 @@ mod tests {
             Q0S_VERSION_LAYER_FRAME_COUNTS
         );
         let parsed = parse_q0s_v2(&bytes).expect("parse layer-state q0s");
-        assert_eq!(parsed, project);
+        assert_eq!(parsed, with_scene_table(&project));
         assert!(!parsed.layer_is_visible(1, 1));
         assert!(parsed.layer_is_locked(1, 1));
     }
@@ -1140,7 +1194,10 @@ mod tests {
             u16::from_le_bytes([bytes[4], bytes[5]]),
             Q0S_VERSION_LAYER_FRAME_COUNTS
         );
-        assert_eq!(parse_q0s_v2(&bytes).expect("parse rigged q0s"), project);
+        assert_eq!(
+            parse_q0s_v2(&bytes).expect("parse rigged q0s"),
+            with_scene_table(&project)
+        );
     }
 
     #[test]
@@ -1196,7 +1253,10 @@ mod tests {
             u16::from_le_bytes([bytes[4], bytes[5]]),
             Q0S_VERSION_LAYER_FRAME_COUNTS
         );
-        assert_eq!(parse_q0s_v2(&bytes).expect("parse deformer q0s"), project);
+        assert_eq!(
+            parse_q0s_v2(&bytes).expect("parse deformer q0s"),
+            with_scene_table(&project)
+        );
     }
 
     #[test]
@@ -1249,7 +1309,10 @@ mod tests {
             u16::from_le_bytes([bytes[4], bytes[5]]),
             Q0S_VERSION_LAYER_FRAME_COUNTS
         );
-        assert_eq!(parse_q0s_v2(&bytes).expect("parse phase h q0s"), project);
+        assert_eq!(
+            parse_q0s_v2(&bytes).expect("parse phase h q0s"),
+            with_scene_table(&project)
+        );
     }
 
     #[test]
@@ -1285,7 +1348,7 @@ mod tests {
         );
         assert_eq!(
             parse_q0s_v2(&bytes).expect("parse project runtime q0s"),
-            project
+            with_scene_table(&project)
         );
     }
 
@@ -1330,6 +1393,6 @@ mod tests {
             u16::from_le_bytes([bytes[4], bytes[5]]),
             Q0S_VERSION_LAYER_FRAME_COUNTS
         );
-        assert_eq!(parse_q0s_v2(&bytes).unwrap(), project);
+        assert_eq!(parse_q0s_v2(&bytes).unwrap(), with_scene_table(&project));
     }
 }

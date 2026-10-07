@@ -298,6 +298,24 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     app.queue(Action::ToggleOutlineMode);
                     ui.close_menu();
                 }
+                for (label, shortcut, current_only) in [
+                    (
+                        "Fast Preview — All Scenes",
+                        ShortcutCommand::FastPreview,
+                        false,
+                    ),
+                    (
+                        "Fast Preview — Current Scene",
+                        ShortcutCommand::FastPreviewScene,
+                        true,
+                    ),
+                ] {
+                    if shortcut_button(ui, label, app.settings.hotkeys.display(shortcut)).clicked()
+                    {
+                        app.queue(Action::FastPreview(current_only));
+                        ui.close_menu();
+                    }
+                }
                 if shortcut_button(
                     ui,
                     "Show / Hide Timeline",
@@ -384,6 +402,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         });
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            crate::workspace::render_menu(app, ui);
             let settings_resp = ui
                 .selectable_label(app.session.show_settings, "Settings")
                 .on_hover_text("Open or close settings");
@@ -630,6 +649,8 @@ fn action_for_shortcut(command: ShortcutCommand) -> Option<Action> {
         C::SaveProject => Action::SaveProject,
         C::SaveProjectAs => Action::SaveProjectAs,
         C::Export => Action::OpenQ0Enc,
+        C::FastPreview => Action::FastPreview(false),
+        C::FastPreviewScene => Action::FastPreview(true),
         C::Undo => Action::Undo,
         C::Redo => Action::Redo,
         C::Cut => Action::CutSelection,
@@ -660,6 +681,7 @@ fn action_for_shortcut(command: ShortcutCommand) -> Option<Action> {
         C::ClearKeyframe => Action::ClearKeyframe,
         C::InsertBlankKeyframe => Action::InsertBlankKeyframe,
         C::MotionTween => Action::CreateMotionTween,
+        C::ShapeTween => Action::CreateShapeTween,
         C::ToolSelect => Action::SelectTool(crate::state::Tool::Select),
         C::ToolLasso => Action::SelectTool(crate::state::Tool::Lasso),
         C::ToolSubselect => Action::SelectTool(crate::state::Tool::Subselect),
@@ -820,6 +842,8 @@ pub fn handle_global_shortcuts(app: &mut EditorApp, ctx: &egui::Context) {
             test(ShortcutCommand::Delete);
         }
         test(ShortcutCommand::Export);
+        test(ShortcutCommand::FastPreviewScene);
+        test(ShortcutCommand::FastPreview);
         test(ShortcutCommand::ZoomIn);
         test(ShortcutCommand::ZoomOut);
         test(ShortcutCommand::ZoomReset);
@@ -839,6 +863,7 @@ pub fn handle_global_shortcuts(app: &mut EditorApp, ctx: &egui::Context) {
         test(ShortcutCommand::InsertBlankKeyframe);
         test(ShortcutCommand::ScriptEditor);
         test(ShortcutCommand::MotionTween);
+        test(ShortcutCommand::ShapeTween);
         if !typing {
             for command in [
                 ShortcutCommand::ToolSelect,

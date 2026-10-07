@@ -5,6 +5,14 @@ use q0s_format::v2::{
 };
 use q0s_format::Error;
 
+/// The current format always stores the scene table, so a project that relies
+/// on its implicit scene is read back with that scene spelled out.
+fn with_scene_table(project: &ProjectV2) -> ProjectV2 {
+    let mut expected = project.clone();
+    expected.runtime.scenes = project.scenes();
+    expected
+}
+
 fn sample_v2_project() -> ProjectV2 {
     ProjectV2 {
         meta: ProjectMeta {
@@ -208,7 +216,7 @@ fn v2_roundtrip_binary() {
     let project = sample_v2_project();
     let bytes = write(&project).expect("must serialize");
     let parsed = parse(&bytes).expect("must parse");
-    assert_eq!(project, parsed);
+    assert_eq!(with_scene_table(&project), parsed);
 }
 
 #[test]
@@ -217,6 +225,7 @@ fn placement_fx_survive_q1s_roundtrip_without_touching_symbol_contents() {
     let child_before = project.q0rgs[1].clone();
     project.q0rgs[0].layers[0].placements[1].fx = PlacementFx {
         opacity: 0.42,
+        tint: None,
         blend_mode: BlendMode::Screen,
         blur: Some(BlurFx {
             radius_x: 3.5,
@@ -254,7 +263,7 @@ fn placement_fx_survive_q1s_roundtrip_without_touching_symbol_contents() {
 
     let decoded = parse(&write(&project).expect("write placement fx")).expect("parse placement fx");
 
-    assert_eq!(decoded, project);
+    assert_eq!(decoded, with_scene_table(&project));
     assert_eq!(decoded.q0rgs[1], child_before);
 }
 
@@ -269,7 +278,7 @@ fn custom_asset_names_survive_q1s_roundtrip() {
     let bytes = write(&project).expect("must serialize names");
     let parsed = parse(&bytes).expect("must parse names");
 
-    assert_eq!(parsed, project);
+    assert_eq!(parsed, with_scene_table(&project));
     assert_eq!(
         parsed.asset_names.get(&2).map(String::as_str),
         Some("hero vector / Р»РёС†Рѕ")
@@ -331,6 +340,7 @@ fn layer_folders_and_depth_order_survive_q1s_roundtrip() {
         q0s_format::v2::LayerMetadata {
             kind: q0s_format::v2::LayerKind::Normal,
             parent_folder_id: Some(90),
+            mask_layer_id: None,
             collapsed: false,
             hidden: false,
             locked: false,
@@ -341,6 +351,7 @@ fn layer_folders_and_depth_order_survive_q1s_roundtrip() {
         q0s_format::v2::LayerMetadata {
             kind: q0s_format::v2::LayerKind::Normal,
             parent_folder_id: Some(90),
+            mask_layer_id: None,
             collapsed: false,
             hidden: false,
             locked: false,
@@ -351,6 +362,7 @@ fn layer_folders_and_depth_order_survive_q1s_roundtrip() {
         q0s_format::v2::LayerMetadata {
             kind: q0s_format::v2::LayerKind::Folder,
             parent_folder_id: None,
+            mask_layer_id: None,
             collapsed: true,
             hidden: false,
             locked: false,
@@ -360,7 +372,7 @@ fn layer_folders_and_depth_order_survive_q1s_roundtrip() {
     let bytes = write(&project).expect("serialize layer folders");
     let parsed = parse(&bytes).expect("parse layer folders");
 
-    assert_eq!(parsed, project);
+    assert_eq!(parsed, with_scene_table(&project));
     assert_eq!(
         parsed.q0rgs[0]
             .layers
@@ -379,6 +391,7 @@ fn layer_folder_cannot_hold_keyframes_or_have_noncontiguous_children() {
         q0s_format::v2::LayerMetadata {
             kind: q0s_format::v2::LayerKind::Folder,
             parent_folder_id: None,
+            mask_layer_id: None,
             collapsed: false,
             hidden: false,
             locked: false,
@@ -402,6 +415,7 @@ fn layer_folder_cannot_hold_keyframes_or_have_noncontiguous_children() {
         q0s_format::v2::LayerMetadata {
             kind: q0s_format::v2::LayerKind::Normal,
             parent_folder_id: Some(9),
+            mask_layer_id: None,
             collapsed: false,
             hidden: false,
             locked: false,
@@ -412,6 +426,7 @@ fn layer_folder_cannot_hold_keyframes_or_have_noncontiguous_children() {
         q0s_format::v2::LayerMetadata {
             kind: q0s_format::v2::LayerKind::Folder,
             parent_folder_id: None,
+            mask_layer_id: None,
             collapsed: false,
             hidden: false,
             locked: false,
@@ -441,7 +456,7 @@ fn blank_keyframes_survive_q1s_roundtrip() {
     let bytes = write(&project).expect("must serialize blank keyframes");
     let parsed = parse(&bytes).expect("must parse blank keyframes");
 
-    assert_eq!(parsed, project);
+    assert_eq!(parsed, with_scene_table(&project));
     assert!(parsed.q0rgs[0].layers[0].is_blank_keyframe(3));
     assert!(parsed.q0rgs[0].layers[0].is_blank_keyframe(7));
 }
@@ -462,7 +477,7 @@ fn blank_keyframes_must_be_unique_and_in_bounds() {
     assert!(matches!(
         validate(&out_of_bounds),
         Err(Error::Validation(
-            "explicit keyframe is out of q0rg frame_count bounds"
+            "explicit keyframe is out of layer frame_count bounds"
         ))
     ));
 }
@@ -651,7 +666,7 @@ fn eased_tween_round_trips_in_current_q1s() {
     };
     let bytes = write(&project).expect("write eased project");
     let decoded = parse(&bytes).expect("parse eased project");
-    assert_eq!(decoded, project);
+    assert_eq!(decoded, with_scene_table(&project));
 }
 
 #[test]
@@ -672,7 +687,7 @@ fn custom_cubic_easing_round_trips_and_is_not_linear() {
     };
     let decoded =
         parse(&write(&project).expect("write custom easing")).expect("parse custom easing");
-    assert_eq!(decoded, project);
+    assert_eq!(decoded, with_scene_table(&project));
 }
 
 #[test]

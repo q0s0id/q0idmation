@@ -94,11 +94,20 @@ pub(super) fn import(path: &Path) -> Result<ImportedProject, ImportError> {
             .get(number)
             .cloned()
             .unwrap_or_else(|| format!("Symbol {number}"));
-        if let Some((folder, _)) = name.rsplit_once('/') {
-            if !folder.is_empty() {
-                project.runtime.library_folders.push(folder.to_owned());
+        let normalized = name.replace('\\', "/");
+        if let Some((folder, _)) = normalized.rsplit_once('/') {
+            if let Some(folder) = xfl_content::ensure_library_folder_paths(&mut project, folder) {
+                project.runtime.library_item_folders.insert(
+                    q0s_format::v2::LibraryItemReference::Q0rg(next_q0rg),
+                    folder,
+                );
             }
         }
+        let name = normalized
+            .rsplit('/')
+            .next()
+            .unwrap_or(&normalized)
+            .to_owned();
         symbol_ids.insert(*number, next_q0rg);
         project.q0rgs.push(Q0rg {
             q0rg_id: next_q0rg,
@@ -212,6 +221,18 @@ pub(super) fn import(path: &Path) -> Result<ImportedProject, ImportError> {
                         placement.fx.q0rg_playback.first_frame.min(max);
                     placement.fx.q0rg_playback.single_frame =
                         placement.fx.q0rg_playback.single_frame.min(max);
+                    let playback = &mut placement.fx.q0rg_playback;
+                    if !matches!(
+                        playback.mode,
+                        q0s_format::v2::Q0rgPlaybackMode::SingleFrame
+                            | q0s_format::v2::Q0rgPlaybackMode::Manual
+                    ) {
+                        playback.set_range(
+                            playback.first_frame,
+                            playback.last_frame.unwrap_or(max),
+                            max.saturating_add(1),
+                        );
+                    }
                 }
             }
         }
@@ -490,12 +511,19 @@ impl Converter<'_> {
 
     fn timeline(&mut self, q0rg_id: u16) -> Result<(), ImportError> {
         let root = &self.archive.nodes[self.archive.root];
-        let layer_ids = root
+        let mut layer_ids = root
             .children
             .iter()
             .copied()
             .filter(|id| matches!(self.archive.nodes[*id].kind, Kind::Layer(_)))
             .collect::<Vec<_>>();
+        // Parent references can deserialize a folder/mask before it appears in
+        // the page's child list. Retain those layer nodes as real timeline rows.
+        for (id, node) in self.archive.nodes.iter().enumerate() {
+            if matches!(node.kind, Kind::Layer(_)) && !layer_ids.contains(&id) {
+                layer_ids.push(id);
+            }
+        }
         let model_ids = layer_ids
             .iter()
             .enumerate()
@@ -706,6 +734,7 @@ impl Converter<'_> {
                 ..
             } = node.kind
             {
+                fx.q0rg_playback.placement_relative = true;
                 fx.q0rg_playback.first_frame = first_frame;
                 fx.q0rg_playback.single_frame = first_frame;
                 fx.q0rg_playback.mode = mode;

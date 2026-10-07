@@ -5,11 +5,15 @@ pub mod appearance;
 #[cfg(windows)]
 pub mod assoc;
 pub mod audio;
+pub mod autosave;
 mod bitmap_import;
 pub mod brush;
+pub(crate) mod color_picker;
 pub mod easing;
 pub mod export;
+pub(crate) mod fast_preview;
 pub mod file_io;
+pub(crate) mod frame_edit;
 pub mod hotkeys;
 pub mod l10n;
 pub mod library_transfer;
@@ -30,6 +34,8 @@ pub mod text_tool;
 pub mod theme;
 pub mod timeline_edit;
 mod ui;
+mod video_preview;
+pub mod workspace;
 
 pub mod tools;
 

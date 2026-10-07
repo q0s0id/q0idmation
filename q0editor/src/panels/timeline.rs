@@ -23,7 +23,7 @@ const CELL_PAD_Y: f32 = 1.0;
 /// How many "virtual" frame slots to render past `frame_count` so the user
 /// sees there's room to extend the q0rg. They render as darker chequered
 /// cells and can hold a virtual playhead until F5/F6/F7 materialises them.
-const VIRTUAL_FRAMES_BUFFER: u16 = 30;
+const VIRTUAL_FRAMES_BUFFER: u16 = 500;
 
 /// Visible slots with one neighbour on each side for glyphs and stroke edges.
 /// Keep document coordinates unchanged: scrolling must never renumber frames.
@@ -234,7 +234,13 @@ fn rig_key_frames(
                 | q0s_format::v2::RigPropertyRef::NodeRotation(_)
                 | q0s_format::v2::RigPropertyRef::NodeScaleX(_)
                 | q0s_format::v2::RigPropertyRef::NodeScaleY(_)
-                | q0s_format::v2::RigPropertyRef::ConstraintWeight(_) => false,
+                | q0s_format::v2::RigPropertyRef::ConstraintWeight(_)
+                | q0s_format::v2::RigPropertyRef::BindingA11(_)
+                | q0s_format::v2::RigPropertyRef::BindingA12(_)
+                | q0s_format::v2::RigPropertyRef::BindingA21(_)
+                | q0s_format::v2::RigPropertyRef::BindingA22(_)
+                | q0s_format::v2::RigPropertyRef::BindingTx(_)
+                | q0s_format::v2::RigPropertyRef::BindingTy(_) => false,
             })
         })
         .flat_map(|channel| channel.keys.iter().map(|key| key.frame))
@@ -454,6 +460,71 @@ fn timeline_ruler(
         }
     }
     let frame_painter = ui.painter_at(Rect::from_min_max(pos2(label_edge_x, rect.top()), rect.max));
+    let mut adjusting_range = false;
+    if app.session.onion.enabled || app.session.onion.edit_frames {
+        let playhead = app.session.timeline_frame();
+        let start = playhead.saturating_sub(app.session.onion.before);
+        let end = playhead
+            .saturating_add(app.session.onion.after)
+            .min(visible_frames.saturating_sub(1));
+        let left = frame_base_x + f32::from(start) * FRAME_W;
+        let right = frame_base_x + (f32::from(end) + 1.0) * FRAME_W;
+        frame_painter.rect_filled(
+            Rect::from_min_max(pos2(left, rect.top()), pos2(right, rect.bottom())),
+            0.0,
+            Color32::from_white_alpha(18),
+        );
+        for (past, x, color) in [
+            (true, left, theme.onion_past.to_color32()),
+            (false, right, theme.onion_future.to_color32()),
+        ] {
+            let handle = Rect::from_center_size(pos2(x, rect.center().y), vec2(8.0, ROW_H))
+                .intersect(frame_painter.clip_rect());
+            let drag = ui
+                .interact(
+                    handle,
+                    egui::Id::new(("frame_range_handle", q0rg_id, past)),
+                    Sense::drag(),
+                )
+                .on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
+                .on_hover_text(if past {
+                    "Drag to set the first visible frame"
+                } else {
+                    "Drag to set the last visible frame"
+                });
+            adjusting_range |= drag.dragged() || drag.drag_started() || drag.hovered();
+            if drag.dragged() {
+                if let Some(pointer) = drag.interact_pointer_pos() {
+                    if app.session.onion.edit_frames {
+                        app.session.timeline_cell_selection = None;
+                    }
+                    let boundary = ((pointer.x - frame_base_x) / FRAME_W)
+                        .round()
+                        .clamp(0.0, f32::from(visible_frames))
+                        as u16;
+                    if past {
+                        app.session.onion.before = playhead.saturating_sub(boundary.min(playhead));
+                    } else {
+                        app.session.onion.after = boundary
+                            .saturating_sub(1)
+                            .max(playhead)
+                            .saturating_sub(playhead);
+                    }
+                }
+            }
+            frame_painter.line_segment(
+                [pos2(x, rect.top() + 2.0), pos2(x, rect.bottom() - 2.0)],
+                Stroke::new(2.5_f32, color),
+            );
+            let direction = if past { 1.0 } else { -1.0 };
+            for y in [rect.top() + 2.0, rect.bottom() - 2.0] {
+                frame_painter.line_segment(
+                    [pos2(x, y), pos2(x + direction * 5.0, y)],
+                    Stroke::new(2.0_f32, color),
+                );
+            }
+        }
+    }
     let frame_slots = visible_frame_slots(&frame_painter, frame_base_x, visible_frames);
     let fps = u32::from(app.state.project.meta.fps);
     for f in frame_slots.clone() {
@@ -518,7 +589,10 @@ fn timeline_ruler(
             Stroke::new(1.0_f32, Color32::from_rgb(0xC8, 0x95, 0x30)),
         );
     }
-    if app.session.timeline_layer_drag.is_none() && (response.clicked() || response.dragged()) {
+    if !adjusting_range
+        && app.session.timeline_layer_drag.is_none()
+        && (response.clicked() || response.dragged())
+    {
         if let Some(pos) = response
             .interact_pointer_pos()
             .filter(|pos| pos.x >= label_edge_x)
@@ -530,6 +604,17 @@ fn timeline_ruler(
         }
     }
     let playhead_x = frame_base_x + (f32::from(app.session.timeline_frame()) + 0.5) * FRAME_W;
+    frame_painter.add(egui::Shape::convex_polygon(
+        vec![
+            pos2(playhead_x - 5.0, rect.top()),
+            pos2(playhead_x + 5.0, rect.top()),
+            pos2(playhead_x + 5.0, rect.bottom() - 5.0),
+            pos2(playhead_x, rect.bottom()),
+            pos2(playhead_x - 5.0, rect.bottom() - 5.0),
+        ],
+        theme.playhead.to_color32().gamma_multiply(0.35),
+        Stroke::new(1.0_f32, theme.playhead.to_color32()),
+    ));
     frame_painter.line_segment(
         [
             pos2(playhead_x, rect.top()),
@@ -848,17 +933,13 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         .project
                         .layer_folder_depth(q0rg_id, layer.layer_id) as f32;
                 let hierarchy_indent = (folder_depth * 14.0
-                    + if !app
+                    + app
                         .state
                         .project
                         .layer_mask_sources(q0rg_id, layer.layer_id)
-                        .is_empty()
-                    {
-                        14.0
-                    } else {
-                        0.0
-                    })
-                .min((label_width - if is_mask { 100.0 } else { 78.0 }).max(0.0));
+                        .len() as f32
+                        * 14.0)
+                    .min((label_width - if is_mask { 100.0 } else { 78.0 }).max(0.0));
                 let icon_rect = Rect::from_center_size(
                     label_rect.left_center() + vec2(11.0 + hierarchy_indent, 0.0),
                     vec2(13.0, 13.0),
@@ -2029,10 +2110,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             }
         });
     let scrub_frame = app.session.timeline_frame();
-    if !app.session.playing
-        && app.session.pending_timeline_frame.is_none()
-        && scrub_frame != scrub_frame_before
-    {
+    if app.session.pending_timeline_frame.is_none() && scrub_frame != scrub_frame_before {
         app.scrub_audio_at(scrub_frame);
     }
     render_layer_rename_dialog(app, ui.ctx());
@@ -2135,8 +2213,7 @@ fn layer_drop_target_at(
     let target_id = visible_layer_ids[row_index];
     if dragged_layer_ids.is_empty()
         || dragged_layer_ids.iter().any(|dragged_layer_id| {
-            target_id == *dragged_layer_id
-                || project.layer_is_descendant_of(q0rg_id, target_id, *dragged_layer_id)
+            project.layer_is_descendant_of(q0rg_id, target_id, *dragged_layer_id)
         })
     {
         return None;
@@ -2147,6 +2224,25 @@ fn layer_drop_target_at(
     let row_fraction = ((pos.y - row_y) / ROW_H).clamp(0.0, 1.0);
     let requested_parent =
         layer_parent_for_drop_lane(project, q0rg_id, target_id, pos.x, rect.min.x);
+
+    if dragged_layer_ids.contains(&target_id) {
+        // On its own row a layer can only change lanes: dragging towards the
+        // left edge outdents it from the folders it is nested in.
+        if requested_parent == project.layer_parent_folder(q0rg_id, target_id) {
+            return None;
+        }
+        return Some(if row_fraction < 0.5 {
+            LayerDropTarget::Before {
+                layer_id: target_id,
+                parent_folder_id: requested_parent,
+            }
+        } else {
+            LayerDropTarget::After {
+                layer_id: target_id,
+                parent_folder_id: requested_parent,
+            }
+        });
+    }
 
     if matches!(
         target_metadata.kind,
@@ -2185,6 +2281,7 @@ fn layer_drop_target_at(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_layer_drop_preview(
     painter: &egui::Painter,
     theme: &Theme,
@@ -2218,7 +2315,7 @@ fn draw_layer_drop_preview(
             );
             painter.rect_stroke(highlight, 2.0, Stroke::new(1.5_f32, accent));
         }
-        LayerDropTarget::OutOfMask => return,
+        LayerDropTarget::OutOfMask => (),
         LayerDropTarget::Before {
             layer_id,
             parent_folder_id,
@@ -2382,7 +2479,6 @@ fn timeline_layer_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
                 .small()
                 .italics(),
         );
-        return;
     }
 }
 
@@ -2473,7 +2569,8 @@ fn timeline_frame_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
             )
             .clicked()
         {
-            app.history.snapshot(&app.state.project);
+            app.history
+                .snapshot_with_session(&app.state.project, &app.session);
             app.state.project.audio_clips[audio.clip_idx].muted = !muted;
             app.state.mark_dirty();
             if app.session.playing {
@@ -2579,6 +2676,18 @@ fn timeline_frame_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
         app.queue(Action::CreateMotionTween);
         ui.close_menu();
     }
+    if ui
+        .add(crate::ui::shortcut_button(
+            &app.settings.hotkeys,
+            ShortcutCommand::ShapeTween,
+            "Create shape tween",
+        ))
+        .on_hover_text("Morph the drawn shapes of this keyframe into those of the next one")
+        .clicked()
+    {
+        app.queue(Action::CreateShapeTween);
+        ui.close_menu();
+    }
 }
 
 fn rig_timeline_context_menu(app: &mut EditorApp, ui: &mut Ui) {
@@ -2648,6 +2757,7 @@ fn rig_timeline_context_menu(app: &mut EditorApp, ui: &mut Ui) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_camera_layer_row(
     app: &EditorApp,
     painter: &egui::Painter,
@@ -2880,10 +2990,6 @@ fn draw_camera_spans(
 
 fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
     ui.horizontal_wrapped(|ui| {
-        ui.label(egui::RichText::new("Timeline").strong());
-        ui.toggle_value(&mut app.session.audio_scrubbing, "Scrub audio")
-            .on_hover_text("Listen to short audio snippets while moving the playhead");
-        ui.separator();
         let camera_available = app.session.current_q0rg_id == app.state.project.meta.entry_q0rg_id;
         let camera_enabled = app.state.project.runtime.camera.enabled;
         let camera_response = ui
@@ -2899,7 +3005,7 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
         if camera_response.clicked() {
             let before = app.state.project.clone();
             app.state.project.runtime.camera.enabled = !camera_enabled;
-            app.history.snapshot(&before);
+            app.history.snapshot_with_session(&before, &app.session);
             app.state.mark_dirty();
             app.session.camera_track_selected = app.state.project.runtime.camera.enabled;
             app.session.timeline_selection = None;
@@ -3124,8 +3230,24 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
         .clicked()
         {
             app.session.onion.enabled = !app.session.onion.enabled;
+            if app.session.onion.enabled {
+                crate::frame_edit::disable(app);
+            }
         }
-        if app.session.onion.enabled {
+        if ui
+            .selectable_label(app.session.onion.edit_frames, "Edit frames")
+            .on_hover_text(
+                "Edit objects across a frame range. Drag the coloured range handles on the ruler.",
+            )
+            .clicked()
+        {
+            if app.session.onion.edit_frames {
+                crate::frame_edit::disable(app);
+            } else {
+                crate::frame_edit::enable(app);
+            }
+        }
+        if app.session.onion.enabled || app.session.onion.edit_frames {
             ui.checkbox(&mut app.session.onion.all_unlocked_layers, "all unlocked")
                 .on_hover_text(
                     "Off: onion skin only on the active layer. On: all visible, unlocked layers.",
@@ -3137,7 +3259,7 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
             );
             ui.add(
                 egui::DragValue::new(&mut app.session.onion.before)
-                    .clamp_range(0..=6)
+                    .clamp_range(0..=u16::MAX)
                     .speed(0.1),
             )
             .on_hover_text("Frames to ghost before current");
@@ -3148,7 +3270,7 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
             );
             ui.add(
                 egui::DragValue::new(&mut app.session.onion.after)
-                    .clamp_range(0..=6)
+                    .clamp_range(0..=u16::MAX)
                     .speed(0.1),
             )
             .on_hover_text("Frames to ghost after current");
@@ -3680,7 +3802,7 @@ fn draw_lock_icon(painter: &egui::Painter, rect: Rect, locked: bool, color: Colo
     }
 }
 
-fn draw_layer_icon(
+pub(crate) fn draw_layer_icon(
     painter: &egui::Painter,
     rect: Rect,
     kind: q0s_format::v2::LayerKind,
@@ -4040,12 +4162,23 @@ fn draw_layer_spans(
             .placements
             .iter()
             .any(|placement| placement.frame == keyframe && placement.tween.to_frame().is_some());
+        let has_shape_tween = layer
+            .placements
+            .iter()
+            .any(|placement| placement.frame == keyframe && placement.tween.is_shape());
         let x0 = base_x + f32::from(keyframe) * FRAME_W;
         let x1 = base_x + (f32::from(span_end) + 1.0) * FRAME_W;
         painter.rect_filled(
             egui::Rect::from_min_max(pos2(x0, cell_top), pos2(x1, cell_bot)),
             0.0,
-            if has_tween { tween_fill } else { static_fill },
+            if has_shape_tween {
+                // Green marks a shape tween, as animators expect.
+                blend(tween_fill, Color32::from_rgb(0x4c, 0xb0, 0x6a), 0.55)
+            } else if has_tween {
+                tween_fill
+            } else {
+                static_fill
+            },
         );
         if !has_tween && span_end > keyframe {
             let cap_x = base_x + (f32::from(span_end) + 1.0) * FRAME_W - 1.0;

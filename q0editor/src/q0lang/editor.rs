@@ -454,7 +454,7 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
     if needs_write {
         if app.session.q0lang_edit_armed {
             let before = app.state.project.clone();
-            app.history.snapshot(&before);
+            app.history.snapshot_with_session(&before, &app.session);
             app.session.q0lang_edit_armed = false;
         }
         if let Some(q) = app

@@ -446,7 +446,7 @@ impl Decoder<'_> {
         if version > 14 && self.reader.u16()? != 0 {
             return None;
         }
-        if version > 15 && version >= 23 {
+        if version >= 23 {
             self.cstring()?;
         }
         if version > 19 {

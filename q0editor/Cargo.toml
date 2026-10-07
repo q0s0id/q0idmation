@@ -18,6 +18,7 @@ q0credits = { path = "../q0credits" }
 q0glblend = { path = "../q0glblend" }
 eframe = "0.27"
 egui = "0.27"
+egui_dock = { version = "0.12", features = ["serde"] }
 q0s-format = { path = "../q0s-format" }
 q0video = { path = "../q0video" }
 q0fla = { path = "../q0fla" }
@@ -41,7 +42,8 @@ q0icon = { path = "../q0icon" }
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
 clipboard-win = "5.4.1"
-windows-sys = { version = "0.59", features = ["Win32_UI_Input_KeyboardAndMouse"] }
+memmap2 = "0.9.10"
+windows-sys = { version = "0.59", features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"

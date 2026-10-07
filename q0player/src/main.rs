@@ -7,6 +7,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+use q0player::ui::app::PreviewOptions;
 use q0player::ui::PlayerApp;
 
 include!(concat!(env!("OUT_DIR"), "/window_icon.rs"));
@@ -28,7 +29,7 @@ fn startup_action(argument: Option<OsString>) -> StartupAction {
 
 fn print_help() {
     println!(
-        "q0player {}\n\nUsage: q0player [MOVIE.q0s]\n\nOptions:\n  -h, --help       Show this help\n  -V, --version    Show version",
+        "q0player {}\n\nUsage: q0player [OPTIONS] [MOVIE.q0s]\n\nOptions:\n  -h, --help       Show this help\n  -V, --version    Show version\n  --preview       Play the scene without player panels (Esc closes)\n  --all-scenes    Play document scenes in order in preview mode\n  --delete-after-load  Remove an editor-owned temporary preview after loading",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -50,7 +51,29 @@ fn native_options() -> eframe::NativeOptions {
 }
 
 fn main() -> Result<(), eframe::Error> {
-    let initial_file = match startup_action(std::env::args_os().nth(1)) {
+    let mut preview = PreviewOptions::default();
+    let mut file = None;
+    for argument in std::env::args_os().skip(1) {
+        match argument.to_str() {
+            Some("--preview") => preview.enabled = true,
+            Some("--all-scenes") => preview.all_scenes = true,
+            Some("--delete-after-load") => preview.delete_after_load = true,
+            Some("--help" | "-h" | "--version" | "-V") => {
+                file = Some(argument);
+                break;
+            }
+            Some(flag) if flag.starts_with('-') => {
+                eprintln!("unknown option: {flag}");
+                return Ok(());
+            }
+            _ if file.is_none() => file = Some(argument),
+            _ => {
+                eprintln!("only one movie path can be opened");
+                return Ok(());
+            }
+        }
+    }
+    let initial_file = match startup_action(file) {
         StartupAction::Launch(path) => path,
         StartupAction::Help => {
             print_help();
@@ -65,7 +88,9 @@ fn main() -> Result<(), eframe::Error> {
     eframe::run_native(
         "q0player",
         native_options(),
-        Box::new(move |cc| Box::new(PlayerApp::new(initial_file, &cc.egui_ctx))),
+        Box::new(move |cc| {
+            Box::new(PlayerApp::new(initial_file, &cc.egui_ctx).with_preview(preview))
+        }),
     )
 }
 

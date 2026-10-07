@@ -5,6 +5,7 @@ use crate::state::Selection;
 
 const HISTORY_FRAMES: usize = 180;
 const RECENT_TABLE_FRAMES: usize = 90;
+const RETAINED_STALL_FRAMES: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
@@ -34,10 +35,19 @@ pub enum PerfSpan {
     SelectionPaintSplit,
     FlaImport,
     HistoryTransition,
+    BackendFrame,
+    FrameInterval,
+    ActiveFrameInterval,
+    VideoIndex,
+    VideoDecode,
+    VideoPixels,
+    VideoUpload,
+    MaskRaster,
+    MaskGroupStrokes,
 }
 
 impl PerfSpan {
-    pub const COUNT: usize = 25;
+    pub const COUNT: usize = 34;
     pub const ALL: [Self; Self::COUNT] = [
         Self::Frame,
         Self::AppStartup,
@@ -64,6 +74,15 @@ impl PerfSpan {
         Self::SelectionPaintSplit,
         Self::FlaImport,
         Self::HistoryTransition,
+        Self::BackendFrame,
+        Self::FrameInterval,
+        Self::ActiveFrameInterval,
+        Self::VideoIndex,
+        Self::VideoDecode,
+        Self::VideoPixels,
+        Self::VideoUpload,
+        Self::MaskRaster,
+        Self::MaskGroupStrokes,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -93,6 +112,15 @@ impl PerfSpan {
             Self::SelectionPaintSplit => "selection.paint-split",
             Self::FlaImport => "io.fla-import",
             Self::HistoryTransition => "history.undo-redo",
+            Self::BackendFrame => "frame.backend-cpu",
+            Self::FrameInterval => "frame.interval-including-idle",
+            Self::ActiveFrameInterval => "frame.active-interval",
+            Self::VideoIndex => "video.index",
+            Self::VideoDecode => "video.decode-ui",
+            Self::VideoPixels => "video.prepare-ui",
+            Self::VideoUpload => "video.texture-enqueue",
+            Self::MaskRaster => "mask.software-raster",
+            Self::MaskGroupStrokes => "mask.group-strokes",
         }
     }
 }
@@ -105,16 +133,20 @@ pub enum PerfCounter {
     SelectionPaintCacheMisses,
     SelectionGpuCallbacks,
     SelectionPathCount,
+    VideoPrefetchHits,
+    VideoPrefetchMisses,
 }
 
 impl PerfCounter {
-    pub const COUNT: usize = 5;
+    pub const COUNT: usize = 7;
     pub const ALL: [Self; Self::COUNT] = [
         Self::SelectionMeshVertices,
         Self::SelectionMeshIndices,
         Self::SelectionPaintCacheMisses,
         Self::SelectionGpuCallbacks,
         Self::SelectionPathCount,
+        Self::VideoPrefetchHits,
+        Self::VideoPrefetchMisses,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -124,6 +156,8 @@ impl PerfCounter {
             Self::SelectionPaintCacheMisses => "selection.paint-cache-misses",
             Self::SelectionGpuCallbacks => "selection.gpu-callbacks",
             Self::SelectionPathCount => "selection.path-count",
+            Self::VideoPrefetchHits => "video.prefetch-hits",
+            Self::VideoPrefetchMisses => "video.prefetch-misses",
         }
     }
 }
@@ -264,10 +298,12 @@ impl PerfMetric {
 #[derive(Clone, Debug)]
 struct PerfFrame {
     index: u64,
+    captured_at: Instant,
     metrics: [PerfMetric; PerfSpan::COUNT],
     counters: [u64; PerfCounter::COUNT],
     scene: Option<ScenePerfContext>,
     slow_action: Option<SlowActionPerf>,
+    repaint_causes: Vec<egui::RepaintCause>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -284,6 +320,10 @@ pub struct PerfLog {
     current_scene: Option<ScenePerfContext>,
     current_slow_action: Option<SlowActionPerf>,
     history: VecDeque<PerfFrame>,
+    retained_stalls: VecDeque<PerfFrame>,
+    last_update_started: Option<Instant>,
+    current_repaint_causes: Vec<egui::RepaintCause>,
+    presentation_sync: Option<bool>,
 }
 
 impl Default for PerfLog {
@@ -296,11 +336,79 @@ impl Default for PerfLog {
             current_scene: None,
             current_slow_action: None,
             history: VecDeque::with_capacity(HISTORY_FRAMES),
+            retained_stalls: VecDeque::with_capacity(RETAINED_STALL_FRAMES),
+            last_update_started: None,
+            current_repaint_causes: Vec::new(),
+            presentation_sync: None,
         }
     }
 }
 
 impl PerfLog {
+    pub fn set_presentation_sync(&mut self, enabled: bool) {
+        self.presentation_sync = Some(enabled);
+    }
+
+    pub fn presentation_sync(&self) -> Option<bool> {
+        self.presentation_sync
+    }
+
+    pub fn begin_frame_with_backend(
+        &mut self,
+        ctx: &egui::Context,
+        backend_cpu_seconds: Option<f32>,
+    ) {
+        // eframe reports the *previous* frame's UI, tessellation, texture upload
+        // and GL submission cost. Attach it to that frame, never to the new one.
+        if let Some(seconds) =
+            backend_cpu_seconds.filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+        {
+            let previous = self.history.back_mut().map(|frame| {
+                frame.metrics[PerfSpan::BackendFrame as usize]
+                    .record(Duration::try_from_secs_f32(seconds).unwrap_or(Duration::MAX));
+                frame.clone()
+            });
+            if let Some(previous) = previous {
+                self.retain_stall(previous);
+            }
+        }
+        let now = Instant::now();
+        let interval = self
+            .last_update_started
+            .replace(now)
+            .map(|previous| now.duration_since(previous));
+        self.begin_frame();
+        self.current_repaint_causes = ctx.repaint_causes();
+        if let Some(interval) = interval {
+            self.record(PerfSpan::FrameInterval, interval);
+            let visible_and_focused =
+                ctx.input(|input| input.focused && input.viewport().minimized != Some(true));
+            // A long wait after an idle frame is normal. Only immediate repaint
+            // requests count toward active pacing, excluding unfocused windows.
+            if visible_and_focused && ctx.requested_repaint_last_frame() {
+                self.record(PerfSpan::ActiveFrameInterval, interval);
+            }
+        }
+    }
+
+    fn retain_stall(&mut self, frame: PerfFrame) {
+        let slow = frame.metrics[PerfSpan::Frame as usize].total_ms() >= 33.0
+            || frame.metrics[PerfSpan::BackendFrame as usize].total_ms() >= 33.0
+            || frame.metrics[PerfSpan::ActiveFrameInterval as usize].total_ms() >= 50.0;
+        if let Some(retained) = self
+            .retained_stalls
+            .iter_mut()
+            .find(|retained| retained.index == frame.index)
+        {
+            *retained = frame;
+        } else if slow {
+            if self.retained_stalls.len() == RETAINED_STALL_FRAMES {
+                self.retained_stalls.pop_front();
+            }
+            self.retained_stalls.push_back(frame);
+        }
+    }
+
     pub fn begin_frame(&mut self) {
         // If an integration path ever forgets to finish a frame, keep the log
         // coherent instead of silently merging two UI frames together.
@@ -311,6 +419,7 @@ impl PerfLog {
         self.current_counters = [0; PerfCounter::COUNT];
         self.current_scene = None;
         self.current_slow_action = None;
+        self.current_repaint_causes.clear();
         self.frame_started = Some(Instant::now());
     }
 
@@ -322,13 +431,17 @@ impl PerfLog {
         if self.history.len() == HISTORY_FRAMES {
             self.history.pop_front();
         }
-        self.history.push_back(PerfFrame {
+        let frame = PerfFrame {
             index: self.next_frame_index,
+            captured_at: Instant::now(),
             metrics: self.current_metrics,
             counters: self.current_counters,
             scene: self.current_scene,
             slow_action: self.current_slow_action,
-        });
+            repaint_causes: std::mem::take(&mut self.current_repaint_causes),
+        };
+        self.retain_stall(frame.clone());
+        self.history.push_back(frame);
         self.next_frame_index = self.next_frame_index.wrapping_add(1);
     }
 
@@ -374,6 +487,12 @@ impl PerfLog {
             }
         ));
         out.push_str(&format!("captured_frames={}\n", frames.len()));
+        out.push_str(&format!(
+            "presentation_vsync={}\n",
+            self.presentation_sync
+                .map(|enabled| if enabled { "on" } else { "off" })
+                .unwrap_or("unknown")
+        ));
         out.push_str(&format!("selection={}\n", selection_summary(selection)));
         if let Some(scene) = frames.last().and_then(|frame| frame.scene) {
             out.push_str(&format!(
@@ -426,6 +545,8 @@ impl PerfLog {
             "gpu_timer_note=GL_TIME_ELAPSED samples 1/{} filtered vector callbacks; results are asynchronous and can trail the rendered scene by one or more frames\n",
             q0glblend::GPU_FILTER_SAMPLE_STRIDE,
         ));
+        out.push_str("frame_timing_note=frame.total measures App::update only; frame.backend-cpu also includes tessellation, texture uploads and GL submission, excluding vsync waiting (attached to the previous frame)\n");
+        out.push_str("frame_interval_note=interval-including-idle includes intentional sleep; active-interval counts only focused, visible frames following an immediate repaint request and can expose vsync/event-loop stalls\n");
         out.push_str("units=milliseconds unless noted\n\n");
 
         if frames.is_empty() {
@@ -459,6 +580,18 @@ impl PerfLog {
             ));
         }
 
+        out.push_str("\nretained stalls beyond the rolling capture (update/backend >=33ms or active interval >=50ms; latest 32)\n");
+        if self.retained_stalls.is_empty() {
+            out.push_str("none recorded\n");
+        }
+        for frame in &self.retained_stalls {
+            out.push_str(&format!(
+                "age_seconds={:.1} ",
+                frame.captured_at.elapsed().as_secs_f64()
+            ));
+            append_frame_line(&mut out, frame);
+            out.push_str(&format!("  repaint_causes={:?}\n", frame.repaint_causes));
+        }
         out.push_str("\nworst frames by total frame time\n");
         let mut worst = frames.clone();
         worst.sort_by(|a, b| {
@@ -619,9 +752,12 @@ fn append_frame_line(out: &mut String, frame: &PerfFrame) {
     let c = |counter: PerfCounter| frame.counters[counter as usize];
     let scene = frame.scene.unwrap_or_default();
     out.push_str(&format!(
-        "#{:<6} frame={:>9.3} startup={:>8.3} ingress={:>8.3} prelude={:>8.3} menu={:>8.3} timeline={:>8.3} toolbar={:>8.3} properties={:>8.3} aux={:>8.3} dialogs={:>8.3} actions={:>8.3} library={:>8.3} stage={:>8.3} scene={:>8.3} tools={:>8.3} place_hit={:>8.3} zoom={:>5.2}x scale={:>6.3} pan=({:>6.1},{:>6.1}) pointer={} cursor={:?} q0rg={} at={} qvis={} active={} vector_items={} vector_batches={} vector_vertices={} vector_indices={} vector_fallbacks={} gpu={} fx_gpu={} blur_p={} glow_p={} filter_mpp={:>8.3} max_region_mpx={:>6.3} gpu_samples={} gpu_avg={:>7.3} gpu_max={:>7.3} gpu_est={:>7.3} gpu_cpu={:>7.3} gpu_cpu_max={:>7.3} gpu_cache={}/{} gpu_drop={} sel={:>8.3} transform={:>8.3} body={:>8.3}/{} rawhover={:>8.3}/{} stage_mesh={:>9.3} screen_mesh={:>9.3} mesh_v={} mesh_i={} cache_miss={} gpu_cb={} paths={} fla_import={:>8.3} history={:>8.3} slow_action={} action_ms={:.3}\n",
+        "#{:<6} frame={:>9.3} backend={:>9.3} interval={:>9.3} active_interval={:>9.3} startup={:>8.3} ingress={:>8.3} prelude={:>8.3} menu={:>8.3} timeline={:>8.3} toolbar={:>8.3} properties={:>8.3} aux={:>8.3} dialogs={:>8.3} actions={:>8.3} library={:>8.3} stage={:>8.3} scene={:>8.3} tools={:>8.3} place_hit={:>8.3} zoom={:>5.2}x scale={:>6.3} pan=({:>6.1},{:>6.1}) pointer={} cursor={:?} q0rg={} at={} qvis={} active={} vector_items={} vector_batches={} vector_vertices={} vector_indices={} vector_fallbacks={} gpu={} fx_gpu={} blur_p={} glow_p={} filter_mpp={:>8.3} max_region_mpx={:>6.3} gpu_samples={} gpu_avg={:>7.3} gpu_max={:>7.3} gpu_est={:>7.3} gpu_cpu={:>7.3} gpu_cpu_max={:>7.3} gpu_cache={}/{} gpu_drop={} sel={:>8.3} transform={:>8.3} body={:>8.3}/{} rawhover={:>8.3}/{} stage_mesh={:>9.3} screen_mesh={:>9.3} mesh_v={} mesh_i={} cache_miss={} gpu_cb={} paths={} fla_import={:>8.3} history={:>8.3} slow_action={} action_ms={:.3}\n",
         frame.index,
         m(PerfSpan::Frame),
+        m(PerfSpan::BackendFrame),
+        m(PerfSpan::FrameInterval),
+        m(PerfSpan::ActiveFrameInterval),
         m(PerfSpan::AppStartup),
         m(PerfSpan::AppIngress),
         m(PerfSpan::AppPrelude),
@@ -736,14 +872,23 @@ fn selection_summary(selection: &Selection) -> String {
             objects,
             bounds_min,
             bounds_max,
-            clip_polygon,
+            clip_region,
         } => format!(
             "raw-area(placements={}, objects={}, bounds={:.3}x{:.3}, clip_points={})",
             placements.len(),
             objects.len(),
             (bounds_max.x - bounds_min.x).abs(),
             (bounds_max.y - bounds_min.y).abs(),
-            clip_polygon.as_ref().map_or(0, Vec::len),
+            clip_region.as_ref().map_or(0, |region| region
+                .0
+                .iter()
+                .map(|polygon| polygon.exterior().0.len()
+                    + polygon
+                        .interiors()
+                        .iter()
+                        .map(|ring| ring.0.len())
+                        .sum::<usize>())
+                .sum::<usize>()),
         ),
         Selection::Mixed { paths, objects } => {
             format!("mixed(paths={}, objects={})", paths.len(), objects.len())
@@ -829,7 +974,9 @@ mod tests {
             "latest_scene zoom=4.00x view_scale=1.250 pan=(12.0,-8.0) pointer_over_stage=true cursor_stage=Some([400.0, 220.0]) q0rg=7 frame=12 tool=Select"
         ));
         assert!(text.contains("gpu_work_note=callback counts and filter pixel-work are estimates"));
-        assert!(text.contains("qvis=5 active=143 gpu=27 fx_gpu=19 blur_p=48 glow_p=4"));
+        assert!(text.contains(
+            "qvis=5 active=143 vector_items=120 vector_batches=8 vector_vertices=96000 vector_indices=144000 vector_fallbacks=3 gpu=27 fx_gpu=19 blur_p=48 glow_p=4"
+        ));
         assert!(text.contains("filter_mpp=   2.000 max_region_mpx= 0.750"));
         assert!(text.contains("gpu_cache_hits=3 gpu_cache_misses=8"));
     }

@@ -15,12 +15,18 @@ fn native_options() -> eframe::NativeOptions {
         // Let the framebuffer resolve its actual triangle coverage instead of
         // painting a second translucent outline over the fill.
         multisampling: 4,
+        vsync: q0editor::settings::Settings::load().vertical_sync,
         ..Default::default()
     }
 }
 
 fn main() -> eframe::Result<()> {
-    let initial_path = std::env::args_os().nth(1).map(std::path::PathBuf::from);
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let no_vsync = arguments.iter().any(|argument| argument == "--no-vsync");
+    let initial_path = arguments
+        .into_iter()
+        .find(|argument| argument != "--no-vsync")
+        .map(std::path::PathBuf::from);
     let external_open_inbox =
         match q0editor::single_instance::claim_or_forward(initial_path.clone()) {
             q0editor::single_instance::LaunchDisposition::Primary(primary) => Some(primary.start()),
@@ -28,12 +34,18 @@ fn main() -> eframe::Result<()> {
             q0editor::single_instance::LaunchDisposition::Secondary => None,
         };
 
+    let mut options = native_options();
+    if no_vsync {
+        options.vsync = false;
+    }
+    let vertical_sync = options.vsync;
     eframe::run_native(
         "q0editor",
-        native_options(),
+        options,
         Box::new(move |cc| {
             q0editor::theme::install(&cc.egui_ctx);
             let mut app = EditorApp::default();
+            app.perf.set_presentation_sync(vertical_sync);
             if let Some(inbox) = external_open_inbox {
                 app.set_external_open_inbox(inbox);
             }

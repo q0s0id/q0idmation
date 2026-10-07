@@ -57,12 +57,19 @@ struct FxPlacementTexture {
     blend_mode: BlendMode,
 }
 
+struct VideoTexture {
+    texture: TextureHandle,
+    bytes: usize,
+    last_used: u64,
+}
+
 #[derive(Default)]
 pub struct TextureCache {
     by_asset_id: HashMap<u16, TextureHandle>,
-    by_q0v_frame: HashMap<(u16, u32), TextureHandle>,
+    solid_vectors: HashMap<u16, Vec<std::sync::Arc<Mesh>>>,
+    by_q0v_frame: HashMap<(usize, u32), VideoTexture>,
     masked_q0rg_frames: HashMap<(u16, u16, u32, u32), TextureHandle>,
-    q0v_media: HashMap<u16, q0video::q0v::Q0vFile>,
+    q0v_media: HashMap<usize, q0video::q0v::Q0vFile>,
     fx_placement_textures: HashMap<FxPlacementKey, FxPlacementTexture>,
     fx_serial: u64,
 }
@@ -70,6 +77,7 @@ pub struct TextureCache {
 impl TextureCache {
     pub fn invalidate(&mut self) {
         self.by_asset_id.clear();
+        self.solid_vectors.clear();
         self.by_q0v_frame.clear();
         self.masked_q0rg_frames.clear();
         self.q0v_media.clear();
@@ -302,6 +310,273 @@ fn affine_bits(affine: Affine) -> [u32; 6] {
     ]
 }
 
+fn solid_appearance(appearance: Option<&VectorAppearance>) -> bool {
+    appearance.is_none_or(|appearance| {
+        matches!(appearance.material, q0s_format::v2::VectorMaterial::Solid)
+            && appearance.fill_gradient.is_none()
+            && appearance.erase_mask.is_empty()
+            && appearance.clip_mask.is_empty()
+            && appearance.material_source.is_empty()
+    })
+}
+
+fn similarity(affine: Affine) -> bool {
+    let x = affine.a11 * affine.a11 + affine.a21 * affine.a21;
+    let y = affine.a12 * affine.a12 + affine.a22 * affine.a22;
+    let dot = affine.a11 * affine.a12 + affine.a21 * affine.a22;
+    let tolerance = x.max(y).max(1e-12) * 1e-5;
+    (x - y).abs() <= tolerance && dot.abs() <= tolerance
+}
+
+fn local_solid_meshes(vector: &q0s_format::v2::VectorAsset) -> Vec<std::sync::Arc<Mesh>> {
+    let paths: Vec<_> = vector
+        .paths
+        .iter()
+        .map(|path| {
+            let mut points: Vec<_> = flatten_path(path, BEZIER_SAMPLES)
+                .into_iter()
+                .map(|point| pos2(point.x, point.y))
+                .collect();
+            if path.closed {
+                drop_duplicate_closing_point_pos2(&mut points);
+            }
+            (points, path.closed)
+        })
+        .collect();
+    let mut meshes = Vec::new();
+    if let Some(color) = vector.fill {
+        let contours = paths
+            .iter()
+            .filter(|(_, closed)| *closed)
+            .map(|(points, _)| points.clone())
+            .collect::<Vec<_>>();
+        if let Some(buffers) = tessellate_complex_fill(&contours) {
+            let mesh = Mesh {
+                indices: buffers.indices,
+                vertices: buffers
+                    .vertices
+                    .into_iter()
+                    .map(|point| Vertex {
+                        pos: pos2(point.x, point.y),
+                        uv: Pos2::ZERO,
+                        color: rgba_to_color32(color),
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            meshes.push(std::sync::Arc::new(mesh));
+        }
+    }
+    if let Some(stroke) = vector.stroke {
+        for (points, closed) in &paths {
+            if let Some(mesh) =
+                bounded_stroke_mesh(points, stroke.width, *closed, rgba_to_color32(stroke.color))
+            {
+                meshes.push(std::sync::Arc::new(mesh));
+            }
+            if !closed
+                && points.len() >= 2
+                && matches!(stroke.cap, q0s_format::geom::CapShape::Round)
+            {
+                for center in [points[0], *points.last().unwrap()] {
+                    let points = (0..32)
+                        .map(|i| {
+                            let angle = i as f32 * std::f32::consts::TAU / 32.;
+                            pos2(
+                                center.x + angle.cos() * stroke.width * 0.5,
+                                center.y + angle.sin() * stroke.width * 0.5,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    if let Some(buffers) = tessellate_complex_fill(&[points]) {
+                        let mesh = Mesh {
+                            indices: buffers.indices,
+                            vertices: buffers
+                                .vertices
+                                .into_iter()
+                                .map(|point| Vertex {
+                                    pos: pos2(point.x, point.y),
+                                    uv: Pos2::ZERO,
+                                    color: rgba_to_color32(stroke.color),
+                                })
+                                .collect(),
+                            ..Default::default()
+                        };
+                        meshes.push(std::sync::Arc::new(mesh));
+                    }
+                }
+            }
+        }
+    }
+    meshes
+}
+
+fn solid_meshes(
+    vector: &q0s_format::v2::VectorAsset,
+    transform: Affine,
+    view: &StageView,
+    cache: &mut TextureCache,
+    color: q0glblend::ColorTransform,
+) -> Vec<Mesh> {
+    // Authored assets are immutable in the player. Scene changes invalidate
+    // this cache; translation, tint, playback and zoom only transform vertices.
+    cache
+        .solid_vectors
+        .entry(vector.asset_id)
+        .or_insert_with(|| local_solid_meshes(vector))
+        .iter()
+        .map(|source| {
+            let mut mesh = source.as_ref().clone();
+            // These solid fill/stroke meshes have one authored color. Apply
+            // tint once, rather than converting RGB for every glyph vertex.
+            let paint = source
+                .vertices
+                .first()
+                .map(|vertex| color.apply(vertex.color))
+                .unwrap_or(Color32::TRANSPARENT);
+            for vertex in &mut mesh.vertices {
+                vertex.pos =
+                    stage_to_screen(transform.apply(Vec2::new(vertex.pos.x, vertex.pos.y)), view);
+                vertex.color = paint;
+            }
+            mesh
+        })
+        .collect()
+}
+
+/// Meshes for the in-between shapes of a shape tween. They change every
+/// frame, so unlike authored vectors they are never cached by asset id.
+fn morphed_meshes(
+    shapes: &[q0s_format::v2::VectorAsset],
+    transform: Affine,
+    view: &StageView,
+    color: q0glblend::ColorTransform,
+    opacity: f32,
+) -> Vec<Mesh> {
+    shapes
+        .iter()
+        .flat_map(local_solid_meshes)
+        .map(|source| {
+            let mut mesh = source.as_ref().clone();
+            for vertex in &mut mesh.vertices {
+                vertex.pos =
+                    stage_to_screen(transform.apply(Vec2::new(vertex.pos.x, vertex.pos.y)), view);
+                vertex.color = color.apply(vertex.color).gamma_multiply(opacity);
+            }
+            mesh
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_solid_q0rg(
+    project: &ProjectV2,
+    owner: u16,
+    frame: u16,
+    parent: Affine,
+    view: &StageView,
+    depth: u8,
+    cache: &mut TextureCache,
+    scene: &RuntimeSceneState,
+    color: q0glblend::ColorTransform,
+    meshes: &mut Vec<Mesh>,
+) -> bool {
+    if depth > Q0RG_RECURSION_LIMIT {
+        return false;
+    }
+    let Some(q) = project.q0rgs.iter().find(|q| q.q0rg_id == owner) else {
+        return false;
+    };
+    // Nested masks, rig deformation and nested group effects keep their
+    // existing renderer; this collector accepts only plain vector artwork.
+    if q0s_format::rig::rig_for_q0rg(project, owner).is_some() {
+        return false;
+    }
+    let frame = frame % q.frame_count.max(1);
+    for layer in &q.layers {
+        if !project.layer_is_visible(owner, layer.layer_id) {
+            continue;
+        }
+        if project
+            .layer_metadata
+            .get(&q0s_format::v2::LayerKey {
+                q0rg_id: owner,
+                layer_id: layer.layer_id,
+            })
+            .is_some_and(|metadata| metadata.kind == q0s_format::v2::LayerKind::Mask)
+        {
+            return false;
+        }
+        let shape_morph = q0s_format::shape_tween::project_layer_morph(project, layer, frame);
+        for active in active_placement_states_at(layer, frame) {
+            let placement = &layer.placements[active.index];
+            let mut visual = active.fx;
+            visual.tint = None;
+            if !visual.is_identity() {
+                return false;
+            }
+            let key = InstanceKey::new(owner, placement.instance_id);
+            let transform = Affine::compose(
+                parent,
+                scene.effective_affine(key, Affine::from_transform(active.transform)),
+            );
+            let color = active
+                .fx
+                .tint
+                .map(q0glblend::ColorTransform::tint)
+                .unwrap_or_default()
+                .then(color);
+            if let Some(shapes) = shape_morph
+                .as_ref()
+                .and_then(|morph| morph.for_placement(active.index))
+            {
+                meshes.extend(morphed_meshes(shapes, transform, view, color, 1.0));
+                continue;
+            }
+            match placement.target {
+                Target::Asset(id) => {
+                    let Some(Asset::Vector(vector)) =
+                        project.assets.iter().find(|asset| asset.id() == id)
+                    else {
+                        return false;
+                    };
+                    if !solid_appearance(project.asset_appearances.get(&id))
+                        || (vector.stroke.is_some() && !similarity(transform))
+                    {
+                        return false;
+                    }
+                    meshes.extend(solid_meshes(vector, transform, view, cache, color));
+                }
+                Target::Q0rg(id) => {
+                    let fallback = q0s_format::v2::resolve_q0rg_playback_frame(
+                        project,
+                        id,
+                        frame,
+                        active.playback_start_frame,
+                        active.fx.q0rg_playback,
+                    );
+                    let (child_frame, child_scene) = scene.child_context(key, fallback);
+                    if !collect_solid_q0rg(
+                        project,
+                        id,
+                        child_frame,
+                        transform,
+                        view,
+                        depth + 1,
+                        cache,
+                        child_scene,
+                        color,
+                        meshes,
+                    ) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_fx_placement(
     painter: &Painter,
@@ -440,6 +715,7 @@ fn paint_q0rg(
         if !project.layer_is_visible(q0rg_id, layer.layer_id) {
             continue;
         }
+        let shape_morph = q0s_format::shape_tween::project_layer_morph(project, layer, local_frame);
         for active in active_placement_states_at(layer, local_frame) {
             let Some(placement) = layer.placements.get(active.index) else {
                 continue;
@@ -462,7 +738,86 @@ fn paint_q0rg(
                 .map(q0glblend::ColorTransform::tint)
                 .unwrap_or_default()
                 .then(inherited_color);
+            if let Some(shapes) = shape_morph
+                .as_ref()
+                .and_then(|morph| morph.for_placement(active.index))
+            {
+                // In-between shapes carry tint and opacity; other placement
+                // effects apply to the two authored keyframes only.
+                for mesh in
+                    morphed_meshes(shapes, composed, view, color_transform, active.fx.opacity)
+                {
+                    painter.add(Shape::Mesh(mesh));
+                }
+                continue;
+            }
             if !visual_fx.is_identity() {
+                let mut plain_group = visual_fx;
+                plain_group.opacity = 1.0;
+                plain_group.blend_mode = BlendMode::Normal;
+                if plain_group.is_identity() {
+                    let mut meshes = Vec::new();
+                    let collected = match placement.target {
+                        Target::Q0rg(id) => {
+                            let fallback = q0s_format::v2::resolve_q0rg_playback_frame(
+                                project,
+                                id,
+                                local_frame,
+                                active.playback_start_frame,
+                                active.fx.q0rg_playback,
+                            );
+                            let (child_frame, child_scene) =
+                                scene_state.child_context(key, fallback);
+                            collect_solid_q0rg(
+                                project,
+                                id,
+                                child_frame,
+                                composed,
+                                view,
+                                depth + 1,
+                                cache,
+                                child_scene,
+                                color_transform,
+                                &mut meshes,
+                            )
+                        }
+                        Target::Asset(id) => {
+                            if let Some(Asset::Vector(vector)) =
+                                project.assets.iter().find(|asset| asset.id() == id)
+                            {
+                                if solid_appearance(project.asset_appearances.get(&id))
+                                    && (vector.stroke.is_none() || similarity(composed))
+                                {
+                                    meshes = solid_meshes(
+                                        vector,
+                                        composed,
+                                        view,
+                                        cache,
+                                        color_transform,
+                                    );
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        }
+                    };
+                    if collected {
+                        let rect = meshes
+                            .iter()
+                            .fold(Rect::NOTHING, |rect, mesh| rect.union(mesh.calc_bounds()));
+                        q0glblend::paint_solid_mesh_group_with_opacity_on_opaque_backdrop(
+                            painter,
+                            rect,
+                            meshes,
+                            active.fx.blend_mode,
+                            active.fx.opacity,
+                        );
+                        continue;
+                    }
+                }
                 paint_fx_placement(
                     painter,
                     ctx,
@@ -491,7 +846,7 @@ fn paint_q0rg(
                             composed,
                             view,
                             cache,
-                            local_frame.saturating_sub(placement.frame),
+                            local_frame.saturating_sub(active.playback_start_frame),
                             project.meta.fps,
                             color_transform,
                         );
@@ -502,9 +857,15 @@ fn paint_q0rg(
                         project,
                         child_id,
                         local_frame,
-                        placement.frame,
+                        active.playback_start_frame,
                         active.fx.q0rg_playback,
                     );
+                    let (child_frame, child_scene) = scene_state.child_context(key, child_frame);
+                    let child_rig = if child_scene.rig_overrides.is_empty() {
+                        rig_overrides
+                    } else {
+                        &child_scene.rig_overrides
+                    };
                     paint_q0rg(
                         painter,
                         ctx,
@@ -515,8 +876,8 @@ fn paint_q0rg(
                         view,
                         depth + 1,
                         cache,
-                        rig_overrides,
-                        scene_state,
+                        child_rig,
+                        child_scene,
                         color_transform,
                     );
                 }
@@ -584,15 +945,17 @@ fn paint_asset(
             q0glblend::paint_mesh_color(painter, mesh, color_transform);
         }
         Asset::Q0v(v) => {
-            if let std::collections::hash_map::Entry::Vacant(entry) =
-                cache.q0v_media.entry(v.asset_id)
+            let source = std::sync::Arc::as_ptr(&v.bytes) as usize;
+            if let std::collections::hash_map::Entry::Vacant(entry) = cache.q0v_media.entry(source)
             {
-                let Ok(media) = q0video::q0v::Q0vFile::parse(v.bytes.as_ref().clone()) else {
+                let Ok(media) =
+                    q0video::q0v::Q0vFile::parse_shared(std::sync::Arc::clone(&v.bytes))
+                else {
                     return;
                 };
                 entry.insert(media);
             }
-            let Some(media) = cache.q0v_media.get(&v.asset_id) else {
+            let Some(media) = cache.q0v_media.get(&source) else {
                 return;
             };
             let Some(frame_index) = media.spec.video_frame_for_host_frame(
@@ -601,7 +964,7 @@ fn paint_asset(
             ) else {
                 return;
             };
-            let key = (v.asset_id, frame_index as u32);
+            let key = (source, frame_index as u32);
             if let std::collections::hash_map::Entry::Vacant(entry) = cache.by_q0v_frame.entry(key)
             {
                 let Ok(rgba) = media.decode_frame_rgba(frame_index) else {
@@ -611,18 +974,38 @@ fn paint_asset(
                     [media.spec.width as usize, media.spec.height as usize],
                     &rgba,
                 );
+                let bytes = image.pixels.len() * std::mem::size_of::<Color32>();
                 let texture = ctx.load_texture(
-                    format!("q0player_q0v_{}_{}", v.asset_id, frame_index),
+                    format!("q0player_q0v_{}_{}", source, frame_index),
                     image,
                     TextureOptions::LINEAR,
                 );
-                entry.insert(texture);
+                entry.insert(VideoTexture {
+                    texture,
+                    bytes,
+                    last_used: ctx.frame_nr(),
+                });
             }
-            let Some(tex) = cache.by_q0v_frame.get(&key) else {
+            let Some(cached) = cache.by_q0v_frame.get_mut(&key) else {
                 return;
             };
+            cached.last_used = ctx.frame_nr();
+            let tex = cached.texture.clone();
             let w = media.spec.width as f32;
             let h = media.spec.height as f32;
+            let mut bytes: usize = cache.by_q0v_frame.values().map(|frame| frame.bytes).sum();
+            while bytes > 128 * 1024 * 1024 || cache.by_q0v_frame.len() > 64 {
+                let oldest = cache
+                    .by_q0v_frame
+                    .iter()
+                    .filter(|(_, frame)| frame.last_used != ctx.frame_nr())
+                    .min_by_key(|(_, frame)| frame.last_used)
+                    .map(|(key, _)| *key);
+                let Some(oldest) = oldest else { break };
+                if let Some(frame) = cache.by_q0v_frame.remove(&oldest) {
+                    bytes = bytes.saturating_sub(frame.bytes);
+                }
+            }
             let local_corners = [
                 Vec2::new(0.0, 0.0),
                 Vec2::new(w, 0.0),
@@ -652,6 +1035,12 @@ fn paint_asset(
         }
         Asset::Rig(_) => {}
         Asset::Vector(v) => {
+            if solid_appearance(appearance) && (v.stroke.is_none() || similarity(transform)) {
+                for mesh in solid_meshes(v, transform, view, cache, color_transform) {
+                    painter.add(Shape::Mesh(mesh));
+                }
+                return;
+            }
             // Fill every closed contour in one tessellation pass. A vector asset
             // can contain an exterior plus oppositely-wound hole contours; filling
             // each PathShape independently destroys those holes. egui 0.27 also
@@ -745,7 +1134,7 @@ fn paint_asset(
                     .collect();
                 let stroke = match &v.stroke {
                     Some(s) => Stroke::new(
-                        s.width.max(0.5) * parent_scale * view.scale,
+                        s.width * parent_scale * view.scale,
                         rgba_to_color32(s.color),
                     ),
                     None => Stroke::NONE,
@@ -768,7 +1157,7 @@ fn paint_asset(
                         && polyline_screen.len() >= 2
                         && matches!(s.cap, q0s_format::geom::CapShape::Round)
                     {
-                        let r = s.width.max(0.5) * parent_scale * view.scale * 0.5;
+                        let r = s.width * parent_scale * view.scale * 0.5;
                         let col = color_transform.apply(rgba_to_color32(s.color));
                         if let Some(p) = polyline_screen.first() {
                             painter.circle_filled(*p, r, col);

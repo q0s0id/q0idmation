@@ -94,7 +94,9 @@ pub(crate) fn normalize_folder_layer_order(
         .filter(|layer| {
             layer_metadata
                 .get(&LayerKey::new(q0rg.q0rg_id, layer.layer_id))
-                .is_some_and(|metadata| metadata.kind == LayerKind::Folder)
+                .is_some_and(|metadata| {
+                    matches!(metadata.kind, LayerKind::Folder | LayerKind::Mask)
+                })
         })
         .map(|layer| layer.layer_id)
         .collect();
@@ -103,7 +105,7 @@ pub(crate) fn normalize_folder_layer_order(
     for layer in &q0rg.layers {
         let parent = layer_metadata
             .get(&LayerKey::new(q0rg.q0rg_id, layer.layer_id))
-            .and_then(|metadata| metadata.parent_folder_id)
+            .and_then(|metadata| metadata.parent_folder_id.or(metadata.mask_layer_id))
             .filter(|parent| folder_ids.contains(parent));
         if let Some(parent) = parent {
             children.entry(parent).or_default().push(layer.layer_id);
@@ -668,14 +670,23 @@ fn import_dom_document(
         max_frame_end = max_frame_end.max(1);
     }
 
-    let mut active_mask = None;
+    let parent_kinds: Vec<_> = layers.iter().map(|layer| layer.kind).collect();
+    let mut active_masks = std::collections::HashMap::new();
     for (index, layer) in layers.iter_mut().enumerate() {
+        let explicit = layer
+            .parent_index
+            .filter(|parent| parent_kinds.get(*parent) == Some(&LayerKind::Mask));
+        layer.mask_source_index = explicit.or_else(|| {
+            if layer.masked {
+                active_masks.get(&layer.parent_index).copied()
+            } else {
+                None
+            }
+        });
         if layer.kind == LayerKind::Mask {
-            active_mask = Some(index);
-        } else if layer.masked {
-            layer.mask_source_index = active_mask;
-        } else {
-            active_mask = None;
+            active_masks.insert(layer.parent_index, index);
+        } else if !layer.masked && layer.kind != LayerKind::Folder {
+            active_masks.remove(&layer.parent_index);
         }
     }
 
@@ -726,6 +737,8 @@ fn import_dom_document(
                     Some(u16::try_from(parent_index + 1).map_err(|_| {
                         ImportError::Invalid("parent layer id overflow".to_string())
                     })?)
+                } else if parent.kind == LayerKind::Mask {
+                    None
                 } else {
                     warnings.push(format!(
                         "layer '{}' points at non-folder parent index {}; parent relation was dropped",
@@ -747,7 +760,13 @@ fn import_dom_document(
             kind: imported.kind,
             parent_folder_id,
             mask_layer_id: imported
-                .mask_source_index
+                .parent_index
+                .filter(|index| {
+                    layers
+                        .get(*index)
+                        .is_some_and(|parent| parent.kind == LayerKind::Mask)
+                })
+                .or(imported.mask_source_index)
                 .and_then(|mask_index| u16::try_from(mask_index + 1).ok()),
             collapsed: false,
             hidden: imported.hidden,
@@ -1304,10 +1323,11 @@ mod tests {
 
         let imported = import_fla(&path).expect("import motion tween fla");
         let project = &imported.project;
+        // The stage symbol takes its name from the imported scene.
         let stage = project
             .q0rgs
             .iter()
-            .find(|q0rg| q0rg.name == "Stage")
+            .find(|q0rg| q0rg.q0rg_id == project.meta.entry_q0rg_id)
             .unwrap();
         let outer = project
             .q0rgs
@@ -1388,6 +1408,102 @@ mod tests {
         assert!((held.fx.opacity - 1.0).abs() < 1.0e-6);
 
         q0s_format::v2::validate(project).expect("imported tween project validates");
+        let roundtrip = q0s_format::v2::parse(
+            &q0s_format::v2::write(project).expect("write imported q1s project"),
+        )
+        .expect("parse imported q1s project");
+        assert!(q0s_format::v2::wire_equivalent(project, &roundtrip));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fla_shape_tween_morphs_drawn_shapes_and_survives_q1s_roundtrip() {
+        // A 10px red square that becomes a 30px blue one over ten frames, with
+        // an Animate custom ease. Edge coordinates are in twips (20 per pixel).
+        const STAGE_XFL: &str = r##"<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="320" height="180" frameRate="24">
+  <timelines><DOMTimeline name="Scene 1"><layers><DOMLayer name="morph"><frames>
+    <DOMFrame index="0" duration="10" tweenType="shape"><tweens><CustomEase target="all"><Point x="0" y="0"/><Point x="0.2" y="0"/><Point x="0.7" y="0.4"/><Point x="1" y="1"/></CustomEase></tweens><elements>
+      <DOMShape><fills><FillStyle index="1"><SolidColor color="#FF0000"/></FillStyle></fills><edges><Edge fillStyle1="1" edges="!0 0|200 0|200 200|0 200|0 0"/></edges></DOMShape>
+      <DOMSymbolInstance libraryItemName="Spark" symbolType="graphic" loop="loop"/>
+    </elements></DOMFrame>
+    <DOMFrame index="10" duration="10"><elements>
+      <DOMShape><fills><FillStyle index="1"><SolidColor color="#0000FF"/></FillStyle></fills><edges><Edge fillStyle1="1" edges="!0 0|600 0|600 600|0 600|0 0"/></edges></DOMShape>
+    </elements></DOMFrame>
+  </frames></DOMLayer></layers></DOMTimeline></timelines>
+</DOMDocument>"##;
+        const SPARK_XFL: &str = r##"<DOMSymbolItem xmlns="http://ns.adobe.com/xfl/2008/" name="Spark">
+  <timeline><DOMTimeline name="Spark"><layers><DOMLayer name="content"><frames><DOMFrame index="0" duration="4"/></frames></DOMLayer></layers></DOMTimeline></timeline>
+</DOMSymbolItem>"##;
+
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, contents) in [
+            ("DOMDocument.xml", STAGE_XFL),
+            ("LIBRARY/Spark.xml", SPARK_XFL),
+        ] {
+            writer.start_file(name, FileOptions::default()).unwrap();
+            writer.write_all(contents.as_bytes()).unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner();
+        let root =
+            std::env::temp_dir().join(format!("q0fla-shape-tween-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("shape-tween.fla");
+        std::fs::write(&path, bytes).unwrap();
+
+        let imported = import_fla(&path).expect("import shape tween fla");
+        let project = &imported.project;
+        let stage = project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == project.meta.entry_q0rg_id)
+            .unwrap();
+        let layer = &stage.layers[0];
+        let is_drawing = |placement: &q0s_format::v2::Placement| {
+            matches!(placement.target, q0s_format::v2::Target::Asset(_))
+        };
+
+        let source = layer
+            .placements
+            .iter()
+            .position(|placement| placement.frame == 0 && is_drawing(placement))
+            .expect("drawn shape on the first keyframe");
+        let q0s_format::v2::Tween::Shape { to_frame, easing } = layer.placements[source].tween
+        else {
+            panic!("Animate shape tween did not become a native shape tween");
+        };
+        assert_eq!(to_frame, 10);
+        assert!(matches!(easing, q0s_format::v2::Easing::CubicBezier { .. }));
+        // The symbol sharing that keyframe is held, not tweened.
+        let instance = layer
+            .placements
+            .iter()
+            .find(|placement| placement.frame == 0 && !is_drawing(placement))
+            .expect("symbol instance on the first keyframe");
+        assert_eq!(instance.tween, q0s_format::v2::Tween::None);
+        assert!(layer
+            .placements
+            .iter()
+            .filter(|placement| placement.frame == 10)
+            .all(|placement| placement.tween == q0s_format::v2::Tween::None));
+
+        // Linear progress at frame 5 would be exactly 20px wide; the ease
+        // makes it something else in between, and the colour follows.
+        let morph = q0s_format::shape_tween::project_layer_morph(project, layer, 5)
+            .expect("frame 5 is inside the shape tween");
+        let shape = &morph.for_placement(source).expect("morphed drawing")[0];
+        let width = shape.paths[0]
+            .anchors
+            .iter()
+            .map(|anchor| anchor.point.x)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(width > 10.5 && width < 29.5, "in-between width {width}");
+        assert!((width - 20.0).abs() > 0.5, "the custom ease is applied");
+        let fill = shape.fill.expect("in-between fill");
+        assert!(fill.r > 0 && fill.r < 255 && fill.b > 0 && fill.b < 255);
+        assert_eq!(u16::from(fill.r) + u16::from(fill.b), 255);
+
+        q0s_format::v2::validate(project).expect("imported shape tween project validates");
         let roundtrip = q0s_format::v2::parse(
             &q0s_format::v2::write(project).expect("write imported q1s project"),
         )

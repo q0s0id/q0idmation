@@ -7,12 +7,9 @@ use q0s_format::v2::{
 };
 
 use crate::app::{Action, EditorApp};
-use crate::state::{BrushLibraryFilter, BrushSizePreview, Selection, Tool};
+use crate::state::{BrushLibraryFilter, BrushSizePreview, PlacementRef, Selection, Tool};
 
 pub fn render(app: &mut EditorApp, ui: &mut Ui) {
-    crate::theme::section_heading(ui, "Properties", "Selection & tool controls");
-    ui.separator();
-
     ScrollArea::both()
         .id_source("properties_scroll")
         .auto_shrink([false, true])
@@ -186,13 +183,19 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 }
                 Selection::Multi(refs) => {
                     ui.label(egui::RichText::new(format!("{} objects", refs.len())).strong());
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new("Multiple objects selected. Click one to edit it.")
-                            .color(app.settings.theme.text_dim.to_color32())
-                            .small(),
-                    );
+
                 }
+            }
+
+            let selected_objects = match &app.session.selection {
+                Selection::Multi(objects)
+                | Selection::Mixed { objects, .. }
+                | Selection::RawParts { objects, .. }
+                | Selection::RawArea { objects, .. } => objects.clone(),
+                _ => Vec::new(),
+            };
+            if !selected_objects.is_empty() {
+                multiple_placement_properties(app, ui, &selected_objects);
             }
 
             // Tool style must remain available while artwork is selected. Selecting
@@ -277,7 +280,7 @@ fn render_camera_properties(app: &mut EditorApp, ui: &mut Ui) {
 
     if changed {
         if wants_snapshot {
-            app.history.snapshot(&before);
+            app.history.snapshot_with_session(&before, &app.session);
         }
         if !app.state.project.runtime.camera.has_keyframe(frame) {
             for key in &mut app.state.project.runtime.camera.keys {
@@ -525,7 +528,8 @@ fn render_audio_clip_properties(app: &mut EditorApp, ui: &mut Ui) -> bool {
             .color(app.settings.theme.text_dim.to_color32()),
     );
     if snapshot {
-        app.history.snapshot(&app.state.project);
+        app.history
+            .snapshot_with_session(&app.state.project, &app.session);
     }
     if clip != original && !locked {
         app.state.project.audio_clips[reference.clip_idx] = clip;
@@ -565,7 +569,8 @@ fn selected_stroke_properties(app: &mut EditorApp, ui: &mut Ui) {
                     .clamp_range(0.1..=64.0),
             );
             if response.drag_started() || response.gained_focus() {
-                app.history.snapshot(&app.state.project);
+                app.history
+                    .snapshot_with_session(&app.state.project, &app.session);
             }
             if response.changed() {
                 crate::tools::set_selected_stroke_width(app, width);
@@ -683,7 +688,7 @@ fn stage_properties(app: &mut EditorApp, ui: &mut Ui) {
 
             ui.label("Background");
             let mut background = rgba_to_color32(app.state.project.meta.background_color);
-            let r = ui.color_edit_button_srgba(&mut background);
+            let r = crate::color_picker::color_edit_button_srgba(ui, &mut background);
             if r.gained_focus() || r.clicked() {
                 wants_snapshot = true;
             }
@@ -697,7 +702,8 @@ fn stage_properties(app: &mut EditorApp, ui: &mut Ui) {
     if wants_snapshot {
         let mut snapshot_before = app.state.project.clone();
         snapshot_before.meta = meta_before;
-        app.history.snapshot(&snapshot_before);
+        app.history
+            .snapshot_with_session(&snapshot_before, &app.session);
     }
     if dirty {
         app.state.mark_dirty();
@@ -874,7 +880,12 @@ fn render_tool_properties(app: &mut EditorApp, ui: &mut Ui) {
             "Edit individual vector anchors and handles. This tool has no drawing style.",
         ),
         ToolPropertyKind::Pen => stroke_tool_properties(app, ui, "Pen path", true, true),
-        ToolPropertyKind::Pencil => stroke_tool_properties(app, ui, "Freehand line", false, true),
+        ToolPropertyKind::Pencil => {
+            stroke_tool_properties(app, ui, "Freehand line", false, true);
+            if ui.add(egui::Slider::new(&mut app.settings.pencil_smoothing, 0..=100).text("Smoothing")).changed() {
+                app.settings.save();
+            }
+        }
         ToolPropertyKind::Brush => brush_properties(app, ui),
         ToolPropertyKind::Eraser => eraser_properties(app, ui),
         ToolPropertyKind::Line => stroke_tool_properties(app, ui, "Straight line", false, true),
@@ -1155,7 +1166,7 @@ fn brush_properties(app: &mut EditorApp, ui: &mut Ui) {
                 .show(ui, |ui| {
                     ui.label("Fill color");
                     let mut color = rgba_to_color32(app.session.brush.color);
-                    if ui.color_edit_button_srgba(&mut color).changed() {
+                    if crate::color_picker::color_edit_button_srgba(ui, &mut color).changed() {
                         app.session.brush.color = color32_to_rgba(color);
                     }
                     ui.end_row();
@@ -1244,7 +1255,7 @@ fn brush_properties(app: &mut EditorApp, ui: &mut Ui) {
                 .show(ui, |ui| {
                     ui.label("Color");
                     let mut color = rgba_to_color32(app.session.advanced_brush.color);
-                    if ui.color_edit_button_srgba(&mut color).changed() {
+                    if crate::color_picker::color_edit_button_srgba(ui, &mut color).changed() {
                         app.session.advanced_brush.color = color32_to_rgba(color);
                     }
                     ui.end_row();
@@ -1507,7 +1518,7 @@ fn stroke_tool_properties(
         .show(ui, |ui| {
             ui.label("Stroke color");
             let mut stroke = rgba_to_color32(app.session.stroke_color);
-            if ui.color_edit_button_srgba(&mut stroke).changed() {
+            if crate::color_picker::color_edit_button_srgba(ui, &mut stroke).changed() {
                 app.session.stroke_color = color32_to_rgba(stroke);
             }
             ui.end_row();
@@ -1572,7 +1583,7 @@ fn optional_fill_control(app: &mut EditorApp, ui: &mut Ui) {
     if let Some(fill) = app.session.fill_color.as_mut() {
         ui.label("Fill color");
         let mut color = rgba_to_color32(*fill);
-        if ui.color_edit_button_srgba(&mut color).changed() {
+        if crate::color_picker::color_edit_button_srgba(ui, &mut color).changed() {
             *fill = color32_to_rgba(color);
         }
         ui.end_row();
@@ -1603,7 +1614,7 @@ fn fill_tool_properties(app: &mut EditorApp, ui: &mut Ui) {
         .show(ui, |ui| {
             ui.label("Fill color");
             let mut color = rgba_to_color32(fill);
-            if ui.color_edit_button_srgba(&mut color).changed() {
+            if crate::color_picker::color_edit_button_srgba(ui, &mut color).changed() {
                 fill = color32_to_rgba(color);
             }
             ui.end_row();
@@ -1756,7 +1767,7 @@ fn edit_gradient(ui: &mut Ui, id: u16, gradient: &mut GradientFill) -> bool {
                     changed = true;
                 }
                 let mut color = rgba_to_color32(stop.color);
-                if ui.color_edit_button_srgba(&mut color).changed() {
+                if crate::color_picker::color_edit_button_srgba(ui, &mut color).changed() {
                     stop.color = color32_to_rgba(color);
                     changed = true;
                 }
@@ -1916,7 +1927,7 @@ fn asset_properties(app: &mut EditorApp, ui: &mut Ui, id: u16) {
                     }
                     if let Some(s) = v.stroke.as_mut() {
                         let mut c = rgba_to_color32(s.color);
-                        if ui.color_edit_button_srgba(&mut c).changed() {
+                        if crate::color_picker::color_edit_button_srgba(ui, &mut c).changed() {
                             s.color = color32_to_rgba(c);
                             dirty = true;
                         }
@@ -1978,7 +1989,7 @@ fn asset_properties(app: &mut EditorApp, ui: &mut Ui, id: u16) {
                     }
                     if let Some(fill) = v.fill.as_mut() {
                         let mut c = rgba_to_color32(*fill);
-                        if ui.color_edit_button_srgba(&mut c).changed() {
+                        if crate::color_picker::color_edit_button_srgba(ui, &mut c).changed() {
                             *fill = color32_to_rgba(c);
                             dirty = true;
                         }
@@ -2126,7 +2137,8 @@ fn q0rg_properties(app: &mut EditorApp, ui: &mut Ui, id: u16) {
     }
 
     if wants_snapshot {
-        app.history.snapshot(&app.state.project);
+        app.history
+            .snapshot_with_session(&app.state.project, &app.session);
     }
     if dirty {
         app.state.project.q0rgs[q0rg_idx].name = name_draft;
@@ -2177,8 +2189,13 @@ fn placement_properties(
     layer_id: u16,
     placement_idx: usize,
 ) {
-    let current_frame = app.session.current_frame;
-    let Some((source_frame, target, transform, tween, mut fx)) = app
+    let reference = PlacementRef {
+        q0rg_id,
+        layer_id,
+        placement_idx,
+    };
+    let current_frame = crate::frame_edit::frame_for(app, reference);
+    let Some((source_frame, playback_start_frame, target, transform, tween, mut fx)) = app
         .state
         .project
         .q0rgs
@@ -2192,6 +2209,7 @@ fn placement_properties(
                 .find(|active| active.index == placement_idx)?;
             Some((
                 source.frame,
+                active.playback_start_frame,
                 source.target,
                 active.transform,
                 source.tween,
@@ -2360,16 +2378,57 @@ fn placement_properties(
                                 &app.state.project,
                                 child_id,
                                 current_frame,
-                                source_frame,
+                                playback_start_frame,
                                 Q0rgPlayback {
                                     mode: mode_before,
                                     ..fx.q0rg_playback
                                 },
                             )
                             .min(max_frame);
+                        fx.q0rg_playback.placement_relative = true;
                         manual_playback_edit = Some(fx.q0rg_playback);
+                    } else if fx.q0rg_playback.mode == Q0rgPlaybackMode::SingleFrame {
+                        fx.q0rg_playback.placement_relative = true;
+                    } else {
+                        fx.q0rg_playback.placement_relative = true;
+                        if fx.q0rg_playback.first_frame != 0 && fx.q0rg_playback.last_frame.is_none() {
+                            fx.q0rg_playback.last_frame = Some(max_frame.max(fx.q0rg_playback.first_frame));
+                        }
                     }
                 }
+                ui.end_row();
+
+                ui.label("Speed");
+                let runs_automatically = !matches!(fx.q0rg_playback.mode,
+                    Q0rgPlaybackMode::SingleFrame | Q0rgPlaybackMode::Manual);
+                ui.add_enabled_ui(runs_automatically, |ui| {
+                    ui.horizontal(|ui| {
+                        let mut speed = f32::from(fx.q0rg_playback.speed_percent) / 100.0;
+                        let response = ui.add(egui::DragValue::new(&mut speed)
+                            .clamp_range(0.01..=100.0).speed(0.01)
+                            .max_decimals(2).suffix("×"))
+                            .on_hover_text("Symbol playback speed. 0.5× is half speed; 2× is double speed.");
+                        note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
+                        if response.changed() {
+                            fx.q0rg_playback.speed_percent = (speed * 100.0).round().clamp(1.0, 10_000.0) as u16;
+                            fx.q0rg_playback.placement_relative = true;
+                        }
+                        ui.menu_button("Presets", |ui| {
+                            for (percent, label) in [(25, "0.25×"), (50, "0.5×"), (100, "1×"),
+                                (150, "1.5×"), (200, "2×"), (300, "3×"), (400, "4×")] {
+                                if ui.selectable_label(fx.q0rg_playback.speed_percent == percent, label).clicked() {
+                                    if fx.q0rg_playback.speed_percent != percent {
+                                        fx.q0rg_playback.speed_percent = percent;
+                                        fx.q0rg_playback.placement_relative = true;
+                                        fx_dirty = true;
+                                        wants_snapshot = true;
+                                    }
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                    });
+                });
                 ui.end_row();
 
                 if fx.q0rg_playback.mode == Q0rgPlaybackMode::SingleFrame {
@@ -2387,39 +2446,47 @@ fn placement_properties(
                     ui.end_row();
                 } else if fx.q0rg_playback.mode != Q0rgPlaybackMode::Manual {
                     ui.label("First frame");
-                    let mut first = fx.q0rg_playback.first_frame.min(max_frame) + 1;
+                    let mut first = fx.q0rg_playback.first_frame.saturating_add(1);
                     let response = ui.add(
                         egui::DragValue::new(&mut first)
-                            .clamp_range(1..=child_frames)
+                            .clamp_range(1..=u16::MAX)
                             .speed(1),
                     );
                     note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
-                    if response.changed() {
-                        fx.q0rg_playback.first_frame = first.saturating_sub(1);
-                        if let Some(last) = fx.q0rg_playback.last_frame {
-                            fx.q0rg_playback.last_frame =
-                                Some(last.max(fx.q0rg_playback.first_frame));
-                        }
+                    if response.changed() || (response.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                        let before = fx.q0rg_playback;
+                        let first = first.saturating_sub(1);
+                        let last = fx.q0rg_playback.last_frame.unwrap_or(max_frame).max(first);
+                        fx.q0rg_playback.set_range(first, last, child_frames);
+                        if fx.q0rg_playback != before { fx_dirty = true; wants_snapshot = true; }
                     }
                     ui.end_row();
 
-                    ui.label("Last frame");
+                    ui.label(if fx.q0rg_playback.follows_symbol_length() {
+                        "Last frame (auto)"
+                    } else { "Last frame" }).on_hover_text(
+                        "The full symbol range follows its length. Custom first/last frames stay fixed.",
+                    );
                     let mut last = fx
                         .q0rg_playback
                         .last_frame
                         .unwrap_or(max_frame)
-                        .min(max_frame)
-                        + 1;
+                        .saturating_add(1);
                     let response = ui.add(
                         egui::DragValue::new(&mut last)
                             .clamp_range(
-                                (fx.q0rg_playback.first_frame.min(max_frame) + 1)..=child_frames,
+                                fx.q0rg_playback.first_frame.saturating_add(1)..=u16::MAX,
                             )
                             .speed(1),
                     );
                     note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
-                    if response.changed() {
-                        fx.q0rg_playback.last_frame = Some(last.saturating_sub(1));
+                    if response.changed() || (response.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                        let before = fx.q0rg_playback;
+                        fx.q0rg_playback.set_range(fx.q0rg_playback.first_frame,
+                            last.saturating_sub(1), child_frames);
+                        if fx.q0rg_playback != before { fx_dirty = true; wants_snapshot = true; }
                     }
                     ui.end_row();
                 } else {
@@ -2432,7 +2499,7 @@ fn placement_properties(
                     &app.state.project,
                     child_id,
                     current_frame,
-                    source_frame,
+                    playback_start_frame,
                     fx.q0rg_playback,
                 );
                 ui.label("Preview frame");
@@ -2454,358 +2521,61 @@ fn placement_properties(
                 .max_height(190.0)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let width = ui.available_width().max(48.0);
-                    let gap = ui.spacing().item_spacing.x.max(4.0);
-                    let min_card_size = 64.0;
-                    let columns = (((width + gap) / (min_card_size + gap)).floor() as usize).max(1);
-                    let card_size = ((width - gap * columns.saturating_sub(1) as f32)
-                        / columns as f32)
-                        .max(48.0);
-                    egui::Grid::new((
-                        "placement_q0rg_manual_frame_grid",
-                        q0rg_id,
-                        layer_id,
-                        placement_idx,
-                    ))
-                    .num_columns(columns)
-                    .spacing(egui::vec2(gap, gap))
-                    .show(ui, |ui| {
-                        for frame in 0..child_frames {
-                            let selected = frame == selected_frame;
-                            let (response, preview_rect) = crate::ui::preview_card(
+                    let render_revision = (
+                        app.active_project_tab_id().unwrap_or(0),
+                        app.state.render_revision(),
+                    );
+                    ui.push_id(
+                        (
+                            "placement_q0rg_manual_frame_grid",
+                            q0rg_id,
+                            layer_id,
+                            placement_idx,
+                        ),
+                        |ui| {
+                            crate::ui::preview_card_grid(
                                 ui,
-                                &format!("{}", frame + 1),
-                                selected,
-                                card_size,
-                            );
-                            let visuals = ui.visuals();
-                            if ui.is_rect_visible(preview_rect) {
-                                let preview_painter = ui.painter_at(preview_rect);
-                                crate::panels::library::draw_q0rg_frame_preview_background(
-                                    &preview_painter,
-                                    &app.state.project,
-                                    child_id,
-                                    frame,
-                                    preview_rect,
-                                    preview_light,
-                                    preview_dark,
-                                );
-                                if let Some(bounds) = crate::render::q0rg_frame_bbox(
-                                    &app.state.project,
-                                    child_id,
-                                    frame,
-                                ) {
-                                    let preview_view =
-                                        placement_frame_preview_view(preview_rect, bounds);
-                                    let render_revision = (
-                                        app.active_project_tab_id().unwrap_or(0),
-                                        app.state.render_revision(),
+                                usize::from(child_frames),
+                                None,
+                                |ui, index, rect| {
+                                    let frame = index as u16;
+                                    let (response, preview_rect) = crate::ui::preview_card_at(
+                                        ui,
+                                        &format!("{}", frame + 1),
+                                        frame == selected_frame,
+                                        rect,
                                     );
-                                    crate::render::render_stage_with_revision(
-                                        &preview_painter,
+                                    crate::panels::library::draw_cached_q0rg_frame_preview(
+                                        &ui.painter_at(preview_rect),
                                         &app.state.project,
                                         child_id,
                                         frame,
-                                        &preview_view,
+                                        preview_rect,
                                         &mut app.textures,
                                         ui.ctx(),
                                         render_revision,
+                                        preview_light,
+                                        preview_dark,
                                     );
-                                } else {
-                                    preview_painter.text(
-                                        preview_rect.center(),
-                                        egui::Align2::CENTER_CENTER,
-                                        "empty",
-                                        egui::FontId::proportional(10.0),
-                                        visuals.weak_text_color(),
-                                    );
-                                }
-                            }
-                            if response.clicked() {
-                                fx.q0rg_playback.single_frame = frame;
-                                manual_playback_edit = Some(fx.q0rg_playback);
-                                fx_dirty = true;
-                                wants_snapshot = true;
-                            }
-                            if (usize::from(frame) + 1) % columns == 0 {
-                                ui.end_row();
-                            }
-                        }
-                        if usize::from(child_frames) % columns != 0 {
-                            ui.end_row();
-                        }
-                    });
+                                    if response.clicked() {
+                                        fx.q0rg_playback.single_frame = frame;
+                                        manual_playback_edit = Some(fx.q0rg_playback);
+                                        fx_dirty = true;
+                                        wants_snapshot = true;
+                                    }
+                                },
+                            );
+                        },
+                    );
                 });
         }
     }
 
-    ui.separator();
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("FX").strong());
-        let reset = ui.add_enabled(!fx.is_identity(), egui::Button::new("Reset"));
-        if reset.clicked() {
-            let playback = fx.q0rg_playback;
-            fx = PlacementFx::default();
-            fx.q0rg_playback = playback;
-            fx_dirty = true;
-            wants_snapshot = true;
-        }
-    });
-
-    egui::Grid::new("placement_fx_global")
-        .num_columns(2)
-        .show(ui, |ui| {
-            ui.label("Alpha");
-            let mut percent = fx.opacity * 100.0;
-            let response = ui.add(
-                egui::Slider::new(&mut percent, 0.0..=100.0)
-                    .suffix("%")
-                    .show_value(true),
-            );
-            note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
-            if response.changed() {
-                fx.opacity = (percent / 100.0).clamp(0.0, 1.0);
-            }
-            ui.end_row();
-
-            ui.label("Blend");
-            let blend_before = fx.blend_mode;
-            egui::ComboBox::from_id_source("placement_fx_blend")
-                .selected_text(blend_mode_name(fx.blend_mode))
-                .show_ui(ui, |ui| {
-                    for mode in [
-                        BlendMode::Normal,
-                        BlendMode::Multiply,
-                        BlendMode::Screen,
-                        BlendMode::Add,
-                        BlendMode::Overlay,
-                    ] {
-                        ui.selectable_value(&mut fx.blend_mode, mode, blend_mode_name(mode));
-                    }
-                });
-            if fx.blend_mode != blend_before {
-                fx_dirty = true;
-                wants_snapshot = true;
-            }
-            ui.end_row();
-        });
-
-    ui.add_space(4.0);
-    let mut tint_enabled = fx.tint.is_some();
-    let toggle = ui.checkbox(&mut tint_enabled, "Tint Color Effect");
-    if toggle.changed() {
-        fx.tint = tint_enabled.then_some(q0s_format::v2::TintFx {
-            color: Rgba {
-                r: 255,
-                g: 64,
-                b: 64,
-                a: 255,
-            },
-            amount: 0.5,
-        });
+    let fx_values = [fx];
+    render_fx_controls(ui, &mut fx, &fx_values);
+    if fx != fx_values[0] {
         fx_dirty = true;
         wants_snapshot = true;
-    }
-    if let Some(tint) = fx.tint.as_mut() {
-        ui.horizontal(|ui| {
-            let mut color = [tint.color.r, tint.color.g, tint.color.b];
-            let response = ui.color_edit_button_srgb(&mut color);
-            note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
-            if response.changed() {
-                tint.color = Rgba {
-                    r: color[0],
-                    g: color[1],
-                    b: color[2],
-                    a: 255,
-                };
-            }
-            let mut percent = tint.amount * 100.0;
-            let response = ui.add(egui::Slider::new(&mut percent, 0.0..=100.0).suffix("%"));
-            note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
-            if response.changed() {
-                tint.amount = percent / 100.0;
-            }
-        });
-    }
-    ui.add_space(4.0);
-    ui.label(egui::RichText::new("Filters").small().strong());
-
-    let mut glow_enabled = fx.glow.is_some();
-    let glow_toggle = ui.checkbox(&mut glow_enabled, "Glow");
-    if glow_toggle.changed() {
-        fx.glow = glow_enabled.then_some(GlowFx {
-            color: Rgba {
-                r: 255,
-                g: 32,
-                b: 24,
-                a: 255,
-            },
-            radius_x: 8.0,
-            radius_y: 8.0,
-            strength: 1.0,
-            quality: 3,
-        });
-        fx_dirty = true;
-        wants_snapshot = true;
-    }
-    if let Some(glow) = fx.glow.as_mut() {
-        ui.indent("placement_glow", |ui| {
-            egui::Grid::new("placement_glow_grid")
-                .num_columns(2)
-                .show(ui, |ui| {
-                    ui.label("Color");
-                    let mut color = rgba_to_color32(glow.color);
-                    let response = ui.color_edit_button_srgba(&mut color);
-                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
-                    if response.changed() {
-                        glow.color = color32_to_rgba(color);
-                    }
-                    ui.end_row();
-                    ui.label("Radius X");
-                    let response = ui.add(
-                        egui::DragValue::new(&mut glow.radius_x)
-                            .speed(0.25)
-                            .clamp_range(0.0..=256.0)
-                            .suffix(" px"),
-                    );
-                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
-                    ui.end_row();
-
-                    ui.label("Radius Y");
-                    let response = ui.add(
-                        egui::DragValue::new(&mut glow.radius_y)
-                            .speed(0.25)
-                            .clamp_range(0.0..=256.0)
-                            .suffix(" px"),
-                    );
-                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
-                    ui.end_row();
-
-                    ui.label("Strength");
-                    let response = ui.add(
-                        egui::Slider::new(&mut glow.strength, 0.0..=4.0)
-                            .suffix("x")
-                            .show_value(true),
-                    );
-                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
-                    ui.end_row();
-
-                    ui.label("Quality");
-                    let response =
-                        ui.add(egui::DragValue::new(&mut glow.quality).clamp_range(1..=15));
-                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
-                    ui.end_row();
-                });
-        });
-    }
-
-    let mut blur_enabled = fx.blur.is_some();
-    let blur_toggle = ui.checkbox(&mut blur_enabled, "Blur");
-    if blur_toggle.changed() {
-        fx.blur = blur_enabled.then_some(BlurFx {
-            radius_x: 4.0,
-            radius_y: 4.0,
-            quality: 3,
-        });
-        fx_dirty = true;
-        wants_snapshot = true;
-    }
-    if let Some(blur) = fx.blur.as_mut() {
-        ui.indent("placement_blur", |ui| {
-            egui::Grid::new("placement_blur_grid")
-                .num_columns(2)
-                .show(ui, |ui| {
-                    ui.label("Radius X");
-                    let response = ui.add(
-                        egui::DragValue::new(&mut blur.radius_x)
-                            .speed(0.25)
-                            .clamp_range(0.0..=256.0)
-                            .suffix(" px"),
-                    );
-                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
-                    ui.end_row();
-
-                    ui.label("Radius Y");
-                    let response = ui.add(
-                        egui::DragValue::new(&mut blur.radius_y)
-                            .speed(0.25)
-                            .clamp_range(0.0..=256.0)
-                            .suffix(" px"),
-                    );
-                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
-                    ui.end_row();
-
-                    ui.label("Quality");
-                    let response =
-                        ui.add(egui::DragValue::new(&mut blur.quality).clamp_range(1..=15));
-                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
-                    ui.end_row();
-                });
-        });
-    }
-
-    let mut shadow_enabled = fx.shadow.is_some();
-    let shadow_toggle = ui.checkbox(&mut shadow_enabled, "Drop shadow");
-    if shadow_toggle.changed() {
-        fx.shadow = shadow_enabled.then_some(DropShadowFx {
-            color: Rgba {
-                r: 0,
-                g: 0,
-                b: 0,
-                a: 180,
-            },
-            blur_radius: 6.0,
-            offset_x: 4.0,
-            offset_y: 4.0,
-            strength: 1.0,
-        });
-        fx_dirty = true;
-        wants_snapshot = true;
-    }
-    if let Some(shadow) = fx.shadow.as_mut() {
-        ui.indent("placement_shadow", |ui| {
-            egui::Grid::new("placement_shadow_grid")
-                .num_columns(2)
-                .show(ui, |ui| {
-                    ui.label("Color");
-                    let mut color = rgba_to_color32(shadow.color);
-                    let response = ui.color_edit_button_srgba(&mut color);
-                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
-                    if response.changed() {
-                        shadow.color = color32_to_rgba(color);
-                    }
-                    ui.end_row();
-
-                    ui.label("Blur");
-                    let response = ui.add(
-                        egui::DragValue::new(&mut shadow.blur_radius)
-                            .speed(0.25)
-                            .clamp_range(0.0..=256.0)
-                            .suffix(" px"),
-                    );
-                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
-                    ui.end_row();
-
-                    ui.label("Offset X");
-                    let response = ui.add(egui::DragValue::new(&mut shadow.offset_x).speed(0.25));
-                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
-                    ui.end_row();
-
-                    ui.label("Offset Y");
-                    let response = ui.add(egui::DragValue::new(&mut shadow.offset_y).speed(0.25));
-                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
-                    ui.end_row();
-
-                    ui.label("Strength");
-                    let response = ui.add(
-                        egui::Slider::new(&mut shadow.strength, 0.0..=4.0)
-                            .suffix("x")
-                            .show_value(true),
-                    );
-                    note_property_response(&response, &mut fx_dirty, &mut wants_snapshot);
-                    ui.end_row();
-                });
-        });
     }
 
     ui.separator();
@@ -2838,16 +2608,11 @@ fn placement_properties(
         return;
     }
     if wants_snapshot {
-        app.history.snapshot(&app.state.project);
+        app.history
+            .snapshot_with_session(&app.state.project, &app.session);
     }
     if rig_bound && transform_dirty && !fx_dirty {
-        if crate::tools::set_placement_transform_for_edit(
-            app,
-            q0rg_id,
-            layer_id,
-            placement_idx,
-            transform,
-        ) {
+        if crate::frame_edit::set_transform_at_frame(app, reference, current_frame, transform) {
             app.mark_placement_transforms_changed(&[(q0rg_id, layer_id, placement_idx)]);
         } else {
             app.session.status = "could not update the rig-bound transform".to_string();
@@ -2868,8 +2633,14 @@ fn placement_properties(
         fx,
     ) {
         if rig_bound && transform_dirty {
-            if crate::tools::set_placement_transform_for_edit(
-                app, q0rg_id, layer_id, new_idx, transform,
+            if crate::frame_edit::set_transform_at_frame(
+                app,
+                PlacementRef {
+                    placement_idx: new_idx,
+                    ..reference
+                },
+                current_frame,
+                transform,
             ) {
                 app.mark_placement_transforms_changed(&[(q0rg_id, layer_id, new_idx)]);
             } else {
@@ -2891,16 +2662,590 @@ fn placement_properties(
             layer_id,
             placement_idx: new_idx,
         };
+        if app.session.onion.edit_frames {
+            crate::frame_edit::remap(
+                app,
+                &[reference],
+                &[PlacementRef {
+                    placement_idx: new_idx,
+                    ..reference
+                }],
+            );
+        }
         app.state.mark_dirty();
         app.textures.invalidate();
     }
 }
 
-fn placement_frame_preview_view(
-    rect: egui::Rect,
-    bounds: (f32, f32, f32, f32),
-) -> crate::render::StageView {
-    crate::panels::library::preview_view(rect, bounds)
+#[derive(Clone, Copy)]
+enum FxField {
+    Opacity,
+    Blend,
+    TintEnabled,
+    TintColor,
+    TintAmount,
+    GlowEnabled,
+    GlowColor,
+    GlowRadiusX,
+    GlowRadiusY,
+    GlowStrength,
+    GlowQuality,
+    BlurEnabled,
+    BlurRadiusX,
+    BlurRadiusY,
+    BlurQuality,
+    ShadowEnabled,
+    ShadowColor,
+    ShadowBlur,
+    ShadowOffsetX,
+    ShadowOffsetY,
+    ShadowStrength,
+    Reset,
+}
+
+impl FxField {
+    fn mixed(self, values: &[PlacementFx]) -> bool {
+        let Some(first) = values.first() else {
+            return false;
+        };
+        values.iter().skip(1).any(|value| match self {
+            Self::Opacity => value.opacity != first.opacity,
+            Self::Blend => value.blend_mode != first.blend_mode,
+            Self::TintEnabled => value.tint.is_some() != first.tint.is_some(),
+            Self::TintColor => value.tint.map(|v| v.color) != first.tint.map(|v| v.color),
+            Self::TintAmount => value.tint.map(|v| v.amount) != first.tint.map(|v| v.amount),
+            Self::GlowEnabled => value.glow.is_some() != first.glow.is_some(),
+            Self::GlowColor => value.glow.map(|v| v.color) != first.glow.map(|v| v.color),
+            Self::GlowRadiusX => value.glow.map(|v| v.radius_x) != first.glow.map(|v| v.radius_x),
+            Self::GlowRadiusY => value.glow.map(|v| v.radius_y) != first.glow.map(|v| v.radius_y),
+            Self::GlowStrength => value.glow.map(|v| v.strength) != first.glow.map(|v| v.strength),
+            Self::GlowQuality => value.glow.map(|v| v.quality) != first.glow.map(|v| v.quality),
+            Self::BlurEnabled => value.blur.is_some() != first.blur.is_some(),
+            Self::BlurRadiusX => value.blur.map(|v| v.radius_x) != first.blur.map(|v| v.radius_x),
+            Self::BlurRadiusY => value.blur.map(|v| v.radius_y) != first.blur.map(|v| v.radius_y),
+            Self::BlurQuality => value.blur.map(|v| v.quality) != first.blur.map(|v| v.quality),
+            Self::ShadowEnabled => value.shadow.is_some() != first.shadow.is_some(),
+            Self::ShadowColor => value.shadow.map(|v| v.color) != first.shadow.map(|v| v.color),
+            Self::ShadowBlur => {
+                value.shadow.map(|v| v.blur_radius) != first.shadow.map(|v| v.blur_radius)
+            }
+            Self::ShadowOffsetX => {
+                value.shadow.map(|v| v.offset_x) != first.shadow.map(|v| v.offset_x)
+            }
+            Self::ShadowOffsetY => {
+                value.shadow.map(|v| v.offset_y) != first.shadow.map(|v| v.offset_y)
+            }
+            Self::ShadowStrength => {
+                value.shadow.map(|v| v.strength) != first.shadow.map(|v| v.strength)
+            }
+            Self::Reset => false,
+        })
+    }
+}
+
+#[derive(Default)]
+struct FxEdits(u32);
+
+impl FxEdits {
+    fn mark(&mut self, field: FxField) {
+        self.0 |= 1 << field as u32;
+    }
+    fn has(&self, field: FxField) -> bool {
+        self.0 & (1 << field as u32) != 0
+    }
+    fn changed(&self) -> bool {
+        self.0 != 0
+    }
+    fn response(&mut self, field: FxField, response: &egui::Response) {
+        if response.changed() {
+            self.mark(field);
+        }
+    }
+
+    /// Apply only the controls edited by the user. In particular, a tint color
+    /// must not copy the first object's alpha, filters or playback into others.
+    fn apply(&self, value: &mut PlacementFx, draft: PlacementFx) {
+        if self.has(FxField::Reset) {
+            let playback = value.q0rg_playback;
+            *value = PlacementFx::default();
+            value.q0rg_playback = playback;
+        }
+        if self.has(FxField::Opacity) {
+            value.opacity = draft.opacity;
+        }
+        if self.has(FxField::Blend) {
+            value.blend_mode = draft.blend_mode;
+        }
+        macro_rules! optional {
+            ($member:ident, $enabled:ident, $($field:ident => $property:ident),+ $(,)?) => {
+                if self.has(FxField::$enabled) {
+                    if let Some(source) = draft.$member { value.$member.get_or_insert(source); }
+                    else { value.$member = None; }
+                }
+                if $(self.has(FxField::$field))||+ {
+                    if let Some(source) = draft.$member {
+                        let target = value.$member.get_or_insert(source);
+                        $(if self.has(FxField::$field) { target.$property = source.$property; })+
+                    }
+                }
+            };
+        }
+        optional!(tint, TintEnabled, TintColor => color, TintAmount => amount);
+        optional!(glow, GlowEnabled, GlowColor => color, GlowRadiusX => radius_x,
+            GlowRadiusY => radius_y, GlowStrength => strength, GlowQuality => quality);
+        optional!(blur, BlurEnabled, BlurRadiusX => radius_x, BlurRadiusY => radius_y, BlurQuality => quality);
+        optional!(shadow, ShadowEnabled, ShadowColor => color, ShadowBlur => blur_radius,
+            ShadowOffsetX => offset_x, ShadowOffsetY => offset_y, ShadowStrength => strength);
+    }
+}
+
+fn fx_label(ui: &mut Ui, label: &str, field: FxField, values: &[PlacementFx]) {
+    if field.mixed(values) {
+        ui.label(format!("{label} (mixed)")).on_hover_text("The selected objects have different values. Editing this control applies its value to all selected objects.");
+    } else {
+        ui.label(label);
+    }
+}
+
+fn fx_toggle(
+    ui: &mut Ui,
+    enabled: &mut bool,
+    field: FxField,
+    label: &str,
+    values: &[PlacementFx],
+) -> egui::Response {
+    let mixed = field.mixed(values);
+    if mixed {
+        *enabled = false;
+    }
+    ui.add(egui::Checkbox::new(enabled, label).indeterminate(mixed))
+}
+
+fn multiple_placement_properties(app: &mut EditorApp, ui: &mut Ui, refs: &[PlacementRef]) {
+    let mut refs = refs.to_vec();
+    refs.sort_by_key(|r| (r.q0rg_id, r.layer_id, r.placement_idx));
+    refs.dedup();
+    let frames: Vec<_> = refs
+        .iter()
+        .map(|r| crate::frame_edit::frame_for(app, *r))
+        .collect();
+    let mut active_layers = std::collections::BTreeMap::new();
+    for (reference, frame) in refs.iter().zip(&frames) {
+        let key = (reference.q0rg_id, reference.layer_id, *frame);
+        if active_layers.contains_key(&key) {
+            continue;
+        }
+        if let Some(layer) = app
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q| q.q0rg_id == reference.q0rg_id)
+            .and_then(|q| {
+                q.layers
+                    .iter()
+                    .find(|layer| layer.layer_id == reference.layer_id)
+            })
+        {
+            active_layers.insert(
+                key,
+                q0s_format::raster::active_placement_states_at(layer, *frame)
+                    .into_iter()
+                    .map(|active| (active.index, active.fx))
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            );
+        }
+    }
+    let values: Option<Vec<_>> = refs
+        .iter()
+        .zip(&frames)
+        .map(|(r, frame)| {
+            active_layers
+                .get(&(r.q0rg_id, r.layer_id, *frame))?
+                .get(&r.placement_idx)
+                .copied()
+        })
+        .collect();
+    let Some(values) = values else {
+        ui.label("Selection is no longer available on this frame");
+        return;
+    };
+    let Some(mut draft) = values.first().copied() else {
+        return;
+    };
+    ui.label(egui::RichText::new("Shared effects").strong());
+    ui.label(egui::RichText::new("Changes apply to every selected object").small());
+    let locked = refs
+        .iter()
+        .any(|r| app.state.project.layer_is_locked(r.q0rg_id, r.layer_id));
+    if locked {
+        ui.label("Unlock the selected layers to edit their properties");
+    }
+    let edits = ui
+        .add_enabled_ui(!locked, |ui| render_fx_controls(ui, &mut draft, &values))
+        .inner;
+    if !edits.changed() {
+        return;
+    }
+    let updated: Vec<_> = values
+        .iter()
+        .copied()
+        .map(|mut fx| {
+            edits.apply(&mut fx, draft);
+            fx
+        })
+        .collect();
+    if updated == values {
+        return;
+    }
+
+    // Stage the entire edit so a failed keyframe materialization cannot leave
+    // half of a multi-layer selection changed. Held/interpolated FX are baked
+    // at this frame; past keys and per-instance playback remain intact.
+    let mut project = app.state.project.clone();
+    let Some(mapped) = crate::frame_edit::materialize_refs(&mut project, &refs, &frames) else {
+        app.session.status = "could not create keyframes for the selected objects".into();
+        return;
+    };
+    for (reference, fx) in mapped.iter().zip(updated) {
+        let Some(placement) = project
+            .q0rgs
+            .iter_mut()
+            .find(|q| q.q0rg_id == reference.q0rg_id)
+            .and_then(|q| {
+                q.layers
+                    .iter_mut()
+                    .find(|layer| layer.layer_id == reference.layer_id)
+            })
+            .and_then(|layer| layer.placements.get_mut(reference.placement_idx))
+        else {
+            return;
+        };
+        placement.fx = fx;
+    }
+    app.history
+        .snapshot_with_session(&app.state.project, &app.session);
+    let mut edited_layers =
+        std::collections::BTreeMap::<u16, std::collections::BTreeMap<u16, u16>>::new();
+    for (reference, frame) in refs.iter().zip(&frames) {
+        edited_layers
+            .entry(reference.q0rg_id)
+            .or_default()
+            .insert(reference.layer_id, *frame);
+    }
+    for (q0rg_id, layers) in edited_layers {
+        if app.session.onion.edit_frames {
+            break;
+        }
+        crate::app::remap_selection_after_keyframes(
+            &app.state.project,
+            &project,
+            &mut app.session.selection,
+            &mut app.session.transform_pivot,
+            q0rg_id,
+            &layers,
+        );
+    }
+    app.state.project = project;
+    if app.session.onion.edit_frames {
+        crate::frame_edit::remap(app, &refs, &mapped);
+    }
+    // Resolved layer frames and FX snapshots are keyed by render_revision.
+    // Clearing textures alone leaves those frames displaying the previous FX.
+    app.state.mark_render_dirty();
+    app.textures.invalidate();
+    ui.ctx().request_repaint();
+    app.session.status = format!("updated effects for {} selected objects", refs.len());
+}
+
+fn render_fx_controls(ui: &mut Ui, fx: &mut PlacementFx, values: &[PlacementFx]) -> FxEdits {
+    let mut edits = FxEdits::default();
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("FX").strong());
+        let reset = ui.add_enabled(
+            values.iter().any(|value| !value.is_identity()),
+            egui::Button::new("Reset"),
+        );
+        if reset.clicked() {
+            let playback = fx.q0rg_playback;
+            *fx = PlacementFx::default();
+            fx.q0rg_playback = playback;
+            edits.mark(FxField::Reset);
+        }
+    });
+
+    egui::Grid::new("placement_fx_global")
+        .num_columns(2)
+        .show(ui, |ui| {
+            fx_label(ui, "Alpha", FxField::Opacity, values);
+            let mut percent = fx.opacity * 100.0;
+            let response = ui.add(
+                egui::Slider::new(&mut percent, 0.0..=100.0)
+                    .suffix("%")
+                    .show_value(true),
+            );
+            edits.response(FxField::Opacity, &response);
+            if response.changed() {
+                fx.opacity = (percent / 100.0).clamp(0.0, 1.0);
+            }
+            ui.end_row();
+
+            ui.label("Blend");
+            egui::ComboBox::from_id_source("placement_fx_blend")
+                .selected_text(if FxField::Blend.mixed(values) {
+                    "Mixed"
+                } else {
+                    blend_mode_name(fx.blend_mode)
+                })
+                .show_ui(ui, |ui| {
+                    for mode in [
+                        BlendMode::Normal,
+                        BlendMode::Multiply,
+                        BlendMode::Screen,
+                        BlendMode::Add,
+                        BlendMode::Overlay,
+                    ] {
+                        if ui
+                            .selectable_value(&mut fx.blend_mode, mode, blend_mode_name(mode))
+                            .clicked()
+                        {
+                            edits.mark(FxField::Blend);
+                        }
+                    }
+                });
+            ui.end_row();
+        });
+
+    ui.add_space(4.0);
+    let mut tint_enabled = fx.tint.is_some();
+    let toggle = fx_toggle(
+        ui,
+        &mut tint_enabled,
+        FxField::TintEnabled,
+        "Tint Color Effect",
+        values,
+    );
+    if toggle.changed() {
+        fx.tint = tint_enabled.then_some(q0s_format::v2::TintFx {
+            color: Rgba {
+                r: 255,
+                g: 64,
+                b: 64,
+                a: 255,
+            },
+            amount: 0.5,
+        });
+        edits.mark(FxField::TintEnabled);
+    }
+    if let Some(tint) = fx.tint.as_mut() {
+        ui.horizontal(|ui| {
+            fx_label(ui, "Color", FxField::TintColor, values);
+            let mut color = [tint.color.r, tint.color.g, tint.color.b];
+            let response = crate::color_picker::color_edit_button_srgb(ui, &mut color);
+            edits.response(FxField::TintColor, &response);
+            if response.changed() {
+                tint.color = Rgba {
+                    r: color[0],
+                    g: color[1],
+                    b: color[2],
+                    a: 255,
+                };
+            }
+            fx_label(ui, "Amount", FxField::TintAmount, values);
+            let mut percent = tint.amount * 100.0;
+            let response = ui.add(egui::Slider::new(&mut percent, 0.0..=100.0).suffix("%"));
+            edits.response(FxField::TintAmount, &response);
+            if response.changed() {
+                tint.amount = percent / 100.0;
+            }
+        });
+    }
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new("Filters").small().strong());
+
+    let mut glow_enabled = fx.glow.is_some();
+    let glow_toggle = fx_toggle(ui, &mut glow_enabled, FxField::GlowEnabled, "Glow", values);
+    if glow_toggle.changed() {
+        fx.glow = glow_enabled.then_some(GlowFx {
+            color: Rgba {
+                r: 255,
+                g: 32,
+                b: 24,
+                a: 255,
+            },
+            radius_x: 8.0,
+            radius_y: 8.0,
+            strength: 1.0,
+            quality: 3,
+        });
+        edits.mark(FxField::GlowEnabled);
+    }
+    if let Some(glow) = fx.glow.as_mut() {
+        ui.indent("placement_glow", |ui| {
+            egui::Grid::new("placement_glow_grid")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    fx_label(ui, "Color", FxField::GlowColor, values);
+                    let mut color = rgba_to_color32(glow.color);
+                    let response = crate::color_picker::color_edit_button_srgba(ui, &mut color);
+                    edits.response(FxField::GlowColor, &response);
+                    if response.changed() {
+                        glow.color = color32_to_rgba(color);
+                    }
+                    ui.end_row();
+                    fx_label(ui, "Radius X", FxField::GlowRadiusX, values);
+                    let response = ui.add(
+                        egui::DragValue::new(&mut glow.radius_x)
+                            .speed(0.25)
+                            .clamp_range(0.0..=256.0)
+                            .suffix(" px"),
+                    );
+                    edits.response(FxField::GlowRadiusX, &response);
+                    ui.end_row();
+
+                    fx_label(ui, "Radius Y", FxField::GlowRadiusY, values);
+                    let response = ui.add(
+                        egui::DragValue::new(&mut glow.radius_y)
+                            .speed(0.25)
+                            .clamp_range(0.0..=256.0)
+                            .suffix(" px"),
+                    );
+                    edits.response(FxField::GlowRadiusY, &response);
+                    ui.end_row();
+
+                    fx_label(ui, "Strength", FxField::GlowStrength, values);
+                    let response = ui.add(
+                        egui::Slider::new(&mut glow.strength, 0.0..=4.0)
+                            .suffix("x")
+                            .show_value(true),
+                    );
+                    edits.response(FxField::GlowStrength, &response);
+                    ui.end_row();
+
+                    fx_label(ui, "Quality", FxField::GlowQuality, values);
+                    let response =
+                        ui.add(egui::DragValue::new(&mut glow.quality).clamp_range(1..=15));
+                    edits.response(FxField::GlowQuality, &response);
+                    ui.end_row();
+                });
+        });
+    }
+
+    let mut blur_enabled = fx.blur.is_some();
+    let blur_toggle = fx_toggle(ui, &mut blur_enabled, FxField::BlurEnabled, "Blur", values);
+    if blur_toggle.changed() {
+        fx.blur = blur_enabled.then_some(BlurFx {
+            radius_x: 4.0,
+            radius_y: 4.0,
+            quality: 3,
+        });
+        edits.mark(FxField::BlurEnabled);
+    }
+    if let Some(blur) = fx.blur.as_mut() {
+        ui.indent("placement_blur", |ui| {
+            egui::Grid::new("placement_blur_grid")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    fx_label(ui, "Radius X", FxField::BlurRadiusX, values);
+                    let response = ui.add(
+                        egui::DragValue::new(&mut blur.radius_x)
+                            .speed(0.25)
+                            .clamp_range(0.0..=256.0)
+                            .suffix(" px"),
+                    );
+                    edits.response(FxField::BlurRadiusX, &response);
+                    ui.end_row();
+
+                    fx_label(ui, "Radius Y", FxField::BlurRadiusY, values);
+                    let response = ui.add(
+                        egui::DragValue::new(&mut blur.radius_y)
+                            .speed(0.25)
+                            .clamp_range(0.0..=256.0)
+                            .suffix(" px"),
+                    );
+                    edits.response(FxField::BlurRadiusY, &response);
+                    ui.end_row();
+
+                    fx_label(ui, "Quality", FxField::BlurQuality, values);
+                    let response =
+                        ui.add(egui::DragValue::new(&mut blur.quality).clamp_range(1..=15));
+                    edits.response(FxField::BlurQuality, &response);
+                    ui.end_row();
+                });
+        });
+    }
+
+    let mut shadow_enabled = fx.shadow.is_some();
+    let shadow_toggle = fx_toggle(
+        ui,
+        &mut shadow_enabled,
+        FxField::ShadowEnabled,
+        "Drop shadow",
+        values,
+    );
+    if shadow_toggle.changed() {
+        fx.shadow = shadow_enabled.then_some(DropShadowFx {
+            color: Rgba {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 180,
+            },
+            blur_radius: 6.0,
+            offset_x: 4.0,
+            offset_y: 4.0,
+            strength: 1.0,
+        });
+        edits.mark(FxField::ShadowEnabled);
+    }
+    if let Some(shadow) = fx.shadow.as_mut() {
+        ui.indent("placement_shadow", |ui| {
+            egui::Grid::new("placement_shadow_grid")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    fx_label(ui, "Color", FxField::ShadowColor, values);
+                    let mut color = rgba_to_color32(shadow.color);
+                    let response = crate::color_picker::color_edit_button_srgba(ui, &mut color);
+                    edits.response(FxField::ShadowColor, &response);
+                    if response.changed() {
+                        shadow.color = color32_to_rgba(color);
+                    }
+                    ui.end_row();
+
+                    fx_label(ui, "Blur", FxField::ShadowBlur, values);
+                    let response = ui.add(
+                        egui::DragValue::new(&mut shadow.blur_radius)
+                            .speed(0.25)
+                            .clamp_range(0.0..=256.0)
+                            .suffix(" px"),
+                    );
+                    edits.response(FxField::ShadowBlur, &response);
+                    ui.end_row();
+
+                    fx_label(ui, "Offset X", FxField::ShadowOffsetX, values);
+                    let response = ui.add(egui::DragValue::new(&mut shadow.offset_x).speed(0.25));
+                    edits.response(FxField::ShadowOffsetX, &response);
+                    ui.end_row();
+
+                    fx_label(ui, "Offset Y", FxField::ShadowOffsetY, values);
+                    let response = ui.add(egui::DragValue::new(&mut shadow.offset_y).speed(0.25));
+                    edits.response(FxField::ShadowOffsetY, &response);
+                    ui.end_row();
+
+                    fx_label(ui, "Strength", FxField::ShadowStrength, values);
+                    let response = ui.add(
+                        egui::Slider::new(&mut shadow.strength, 0.0..=4.0)
+                            .suffix("x")
+                            .show_value(true),
+                    );
+                    edits.response(FxField::ShadowStrength, &response);
+                    ui.end_row();
+                });
+        });
+    }
+
+    edits
 }
 
 fn propagate_manual_q0rg_playback(

@@ -20,6 +20,7 @@ enum LibraryKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LibraryIcon {
+    Folder(bool),
     Stage,
     Symbol,
     Vector,
@@ -68,12 +69,188 @@ struct LibraryRow {
 
 const LIBRARY_ROOT_FILTER: &str = "\0root";
 
+#[derive(Clone)]
+struct FolderDrag {
+    tab_id: u64,
+    path: String,
+}
+
+enum TreeRow {
+    Folder {
+        tab_id: u64,
+        path: Option<String>,
+        depth: usize,
+    },
+    Item {
+        index: usize,
+        depth: usize,
+    },
+}
+
+fn library_tree(app: &EditorApp, rows: &[LibraryRow], source: LibrarySource) -> Vec<TreeRow> {
+    use std::collections::BTreeMap;
+    let mut result = Vec::new();
+    let searching = !app.library_search.trim().is_empty();
+    for library in app.project_library_summaries() {
+        if matches!(source, LibrarySource::Project(id) if id != library.tab_id) {
+            continue;
+        }
+        let Some(project) = app.project_for_document_tab(library.tab_id) else {
+            continue;
+        };
+        let mut folders = std::collections::BTreeSet::new();
+        for path in project.runtime.library_folders.iter().chain(
+            rows.iter()
+                .filter(|r| r.tab_id == library.tab_id)
+                .filter_map(|r| r.folder.as_ref()),
+        ) {
+            let mut prefix = String::new();
+            for part in path.split('/') {
+                if !prefix.is_empty() {
+                    prefix.push('/');
+                }
+                prefix.push_str(part);
+                folders.insert(prefix.clone());
+            }
+        }
+        let mut children: BTreeMap<Option<String>, Vec<String>> = BTreeMap::new();
+        let mut matching_folders = std::collections::BTreeSet::new();
+        if searching {
+            for path in rows
+                .iter()
+                .filter(|r| r.tab_id == library.tab_id)
+                .filter_map(|r| r.folder.as_deref())
+            {
+                let mut prefix = String::new();
+                for part in path.split('/') {
+                    if !prefix.is_empty() {
+                        prefix.push('/');
+                    }
+                    prefix.push_str(part);
+                    matching_folders.insert(prefix.clone());
+                }
+            }
+        }
+        for path in folders {
+            if searching && !matching_folders.contains(&path) {
+                continue;
+            }
+            let parent = path.rsplit_once('/').map(|(p, _)| p.to_owned());
+            children.entry(parent).or_default().push(path);
+        }
+        let mut items: BTreeMap<Option<String>, Vec<usize>> = BTreeMap::new();
+        for (index, row) in rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.tab_id == library.tab_id)
+        {
+            items.entry(row.folder.clone()).or_default().push(index);
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn visit(
+            app: &EditorApp,
+            result: &mut Vec<TreeRow>,
+            tab_id: u64,
+            path: Option<String>,
+            depth: usize,
+            children: &BTreeMap<Option<String>, Vec<String>>,
+            items: &BTreeMap<Option<String>, Vec<usize>>,
+            searching: bool,
+        ) {
+            result.push(TreeRow::Folder {
+                tab_id,
+                path: path.clone(),
+                depth,
+            });
+            if !searching
+                && path
+                    .as_ref()
+                    .is_some_and(|p| app.library_collapsed_folders.contains(&(tab_id, p.clone())))
+            {
+                return;
+            }
+            if let Some(indices) = items.get(&path) {
+                result.extend(indices.iter().map(|index| TreeRow::Item {
+                    index: *index,
+                    depth: depth + usize::from(path.is_some()),
+                }));
+            }
+            if depth < 64 {
+                if let Some(paths) = children.get(&path) {
+                    for child in paths {
+                        visit(
+                            app,
+                            result,
+                            tab_id,
+                            Some(child.clone()),
+                            depth + usize::from(path.is_some()),
+                            children,
+                            items,
+                            searching,
+                        );
+                    }
+                }
+            }
+        }
+        visit(
+            app,
+            &mut result,
+            library.tab_id,
+            None,
+            0,
+            &children,
+            &items,
+            searching,
+        );
+    }
+    result
+}
+
+fn folder_drop(app: &mut EditorApp, response: &Response, tab_id: u64, destination: Option<String>) {
+    if app.active_project_tab_id() != Some(tab_id) {
+        return;
+    }
+    if let Some(payload) = response.dnd_release_payload::<LibraryDragPayload>() {
+        if payload.source_tab_id == tab_id {
+            let selected = LibrarySelection {
+                tab_id,
+                item: payload.item,
+            };
+            let items = if app.library_multi_selection.contains(&selected) {
+                app.library_multi_selection.clone()
+            } else {
+                vec![selected]
+            };
+            for selected in items.into_iter().filter(|s| s.tab_id == tab_id) {
+                app.queue(Action::MoveLibraryItemToFolder(
+                    selected.item,
+                    destination.clone(),
+                ));
+            }
+        }
+    }
+    if let Some(payload) = response.dnd_release_payload::<FolderDrag>() {
+        if payload.tab_id == tab_id
+            && destination
+                .as_ref()
+                .is_none_or(|d| d != &payload.path && !d.starts_with(&format!("{}/", payload.path)))
+        {
+            let name = payload.path.rsplit('/').next().unwrap_or(&payload.path);
+            let target = destination.map_or_else(|| name.to_owned(), |d| format!("{d}/{name}"));
+            if target != payload.path {
+                app.queue(Action::RenameLibraryFolder(payload.path.clone(), target));
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct LibraryCache {
     key: u64,
     rows: Arc<Vec<LibraryRow>>,
     item_keys: HashSet<(u64, LibraryKey)>,
     audio_only_items: HashSet<(u64, LibraryKey)>,
+    #[allow(clippy::type_complexity)]
     preview_bounds: Option<(LibraryPreviewBoundsKey, Option<(f32, f32, f32, f32)>)>,
     preview_backgrounds: HashMap<LibraryPreviewBackgroundKey, (PreviewBackground, String)>,
 }
@@ -194,7 +371,6 @@ fn library_rows_cache_key(
 pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     use crate::ui::{icon_button, icon_button_enabled, Icon};
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Library").size(15.0).strong());
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if icon_button(ui, Icon::Symbol, "Create q0rg symbol").clicked() {
                 app.queue(Action::AddQ0rg);
@@ -290,39 +466,8 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     }
     if !showing_all {
         let selected_folder = app.library_folder_filter.clone();
-        let selected_text = if selected_folder.is_empty() {
-            "All folders".to_string()
-        } else if selected_folder == LIBRARY_ROOT_FILTER {
-            "Unfoldered".to_string()
-        } else {
-            selected_folder.clone()
-        };
         let can_manage_folders =
             matches!(source, LibrarySource::Project(tab_id) if Some(tab_id) == active_tab);
-        ui.horizontal(|ui| {
-            ui.label("Folder");
-            egui::ComboBox::from_id_source("library_folder_picker")
-                .width(ui.available_width())
-                .wrap(true)
-                .selected_text(selected_text)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut app.library_folder_filter,
-                        String::new(),
-                        "All folders",
-                    );
-                    ui.selectable_value(
-                        &mut app.library_folder_filter,
-                        LIBRARY_ROOT_FILTER.to_string(),
-                        "Unfoldered",
-                    );
-                    for folder in &folder_paths {
-                        let depth = folder.matches('/').count();
-                        let label = format!("{}folder: {folder}", "  ".repeat(depth));
-                        ui.selectable_value(&mut app.library_folder_filter, folder.clone(), label);
-                    }
-                });
-        });
         ui.horizontal_wrapped(|ui| {
             if icon_button_enabled(
                 ui,
@@ -484,27 +629,8 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         };
     }
     let all_rows = Arc::clone(&app.library_cache.rows);
-    let rows = match app.library_folder_filter.as_str() {
-        "" => all_rows,
-        LIBRARY_ROOT_FILTER => Arc::new(
-            all_rows
-                .iter()
-                .filter(|row| row.folder.is_none())
-                .cloned()
-                .collect(),
-        ),
-        folder => Arc::new(
-            all_rows
-                .iter()
-                .filter(|row| {
-                    row.folder.as_deref().is_some_and(|item_folder| {
-                        item_folder == folder || item_folder.starts_with(&format!("{folder}/"))
-                    })
-                })
-                .cloned()
-                .collect(),
-        ),
-    };
+    let rows = all_rows;
+    let tree_rows = library_tree(app, &rows, source);
     app.library_multi_selection.retain(|selection| {
         rows.iter()
             .any(|row| row.tab_id == selection.tab_id && row.key == key_for_item(selection.item))
@@ -605,7 +731,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         .auto_shrink([false, true])
         .show(ui, |ui| {
             ui.add_space(3.0);
-            let columns = if showing_all { 6 } else { 5 };
+            let columns = if showing_all { 5 } else { 4 };
             egui::Grid::new("library_header")
                 .num_columns(columns)
                 .min_col_width(28.0)
@@ -649,7 +775,6 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         }
                     }
                     ui.label("ID");
-                    ui.label("Folder");
                     if showing_all {
                         ui.label("Library");
                     }
@@ -676,14 +801,144 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             egui::ScrollArea::vertical()
                 .id_source(LIBRARY_ITEMS_SCROLL_ID)
                 .auto_shrink([false, true])
-                .show_rows(ui, row_height, rows.len(), |ui, visible_rows| {
+                .show_rows(ui, row_height, tree_rows.len(), |ui, visible_rows| {
                     egui::Grid::new("library_items")
                         .striped(true)
                         .num_columns(columns)
                         .min_col_width(28.0)
                         .spacing([8.0, 2.0])
                         .show(ui, |ui| {
-                            for row_index in visible_rows.clone() {
+                            for tree_index in visible_rows.clone() {
+                                let (row_index, depth) = match &tree_rows[tree_index] {
+                                    TreeRow::Item { index, depth } => (*index, *depth),
+                                    TreeRow::Folder {
+                                        tab_id,
+                                        path,
+                                        depth,
+                                    } => {
+                                        let tab_id = *tab_id;
+                                        let path = path.clone();
+                                        let closed = path.as_ref().is_some_and(|p| {
+                                            app.library_collapsed_folders
+                                                .contains(&(tab_id, p.clone()))
+                                        });
+                                        let name = path
+                                            .as_deref()
+                                            .and_then(|p| p.rsplit('/').next())
+                                            .unwrap_or("Library root");
+                                        let response = ui
+                                            .horizontal(|ui| {
+                                                ui.add_space(*depth as f32 * 14.0);
+                                                library_name_cell(
+                                                    ui,
+                                                    app.library_folder_filter
+                                                        == path.clone().unwrap_or_default(),
+                                                    LibraryIcon::Folder(closed),
+                                                    name,
+                                                    app.settings.theme.accent.to_color32(),
+                                                    Sense::click_and_drag(),
+                                                )
+                                            })
+                                            .inner;
+                                        if response.clicked() {
+                                            app.library_folder_filter =
+                                                path.clone().unwrap_or_default();
+                                            app.library_selection = None;
+                                            app.library_multi_selection.clear();
+                                            app.session.selection = Selection::None;
+                                        }
+                                        let clicked_icon = response.clicked()
+                                            && response.interact_pointer_pos().is_some_and(|p| {
+                                                p.x < response.rect.left()
+                                                    + ui.spacing().button_padding.x
+                                                    + LIBRARY_ICON_SIZE
+                                                    + LIBRARY_ICON_GAP
+                                            });
+                                        if response.double_clicked() || clicked_icon {
+                                            if let Some(path) = &path {
+                                                let key = (tab_id, path.clone());
+                                                if !app.library_collapsed_folders.remove(&key) {
+                                                    app.library_collapsed_folders.insert(key);
+                                                }
+                                            }
+                                        }
+                                        if let Some(path) = &path {
+                                            response.dnd_set_drag_payload(FolderDrag {
+                                                tab_id,
+                                                path: path.clone(),
+                                            });
+                                        }
+                                        if response.dragged() {
+                                            draw_library_drag_preview(
+                                                ui.ctx(),
+                                                LibraryIcon::Folder(closed),
+                                                name,
+                                                app.settings.theme.accent.to_color32(),
+                                            );
+                                        }
+                                        if response
+                                            .dnd_hover_payload::<LibraryDragPayload>()
+                                            .is_some()
+                                            || response.dnd_hover_payload::<FolderDrag>().is_some()
+                                        {
+                                            ui.painter().rect_stroke(
+                                                response.rect.expand(2.0),
+                                                2.0,
+                                                Stroke::new(
+                                                    1.5_f32,
+                                                    app.settings.theme.accent.to_color32(),
+                                                ),
+                                            );
+                                        }
+                                        folder_drop(app, &response, tab_id, path.clone());
+                                        if Some(tab_id) == active_tab {
+                                            response.context_menu(|ui| {
+                                                if ui.button("New folder").clicked() {
+                                                    app.library_folder_draft =
+                                                        Some(crate::app::LibraryFolderDraft {
+                                                            parent: path.clone(),
+                                                            rename_path: None,
+                                                            name: String::new(),
+                                                        });
+                                                    ui.close_menu();
+                                                }
+                                                if let Some(path) = &path {
+                                                    if ui.button("Rename folder").clicked() {
+                                                        app.library_folder_draft =
+                                                            Some(crate::app::LibraryFolderDraft {
+                                                                parent: path
+                                                                    .rsplit_once('/')
+                                                                    .map(|(p, _)| p.to_string()),
+                                                                rename_path: Some(path.clone()),
+                                                                name: name.to_string(),
+                                                            });
+                                                        ui.close_menu();
+                                                    }
+                                                    if ui.button("Delete folder").clicked() {
+                                                        app.queue(Action::DeleteLibraryFolder(
+                                                            path.clone(),
+                                                        ));
+                                                        ui.close_menu();
+                                                    }
+                                                }
+                                            });
+                                        }
+                                        ui.label("folder");
+                                        ui.label("");
+                                        ui.label("");
+                                        if showing_all {
+                                            ui.label(
+                                                libraries
+                                                    .iter()
+                                                    .find(|lib| lib.tab_id == tab_id)
+                                                    .map(|lib| lib.label.clone())
+                                                    .unwrap_or_default(),
+                                            );
+                                        }
+                                        ui.end_row();
+                                        continue;
+                                    }
+                                };
                                 let row = &rows[row_index];
                                 let payload = item_for_key(row.key);
                                 let row_selection = LibrarySelection {
@@ -697,14 +952,19 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                                     source_tab_id: row.tab_id,
                                     item: payload,
                                 };
-                                let response = library_name_cell(
-                                    ui,
-                                    is_selected,
-                                    row.icon,
-                                    &truncate_label(&row.name, 28),
-                                    app.settings.theme.accent.to_color32(),
-                                    Sense::click_and_drag(),
-                                );
+                                let response = ui
+                                    .horizontal(|ui| {
+                                        ui.add_space(depth as f32 * 14.0);
+                                        library_name_cell(
+                                            ui,
+                                            is_selected,
+                                            row.icon,
+                                            &truncate_label(&row.name, 28),
+                                            app.settings.theme.accent.to_color32(),
+                                            Sense::click_and_drag(),
+                                        )
+                                    })
+                                    .inner;
                                 // Every open project is a real source library. The payload
                                 // carries its tab id so identical project-local asset/q0rg ids
                                 // can never alias during a cross-project drop.
@@ -794,7 +1054,6 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                                 ui.label(match row.key {
                                     LibraryKey::Q0rg(id) | LibraryKey::Asset(id) => id.to_string(),
                                 });
-                                ui.label(row.folder.as_deref().unwrap_or("—"));
                                 if showing_all {
                                     ui.label(&row.library_label);
                                 }
@@ -806,25 +1065,42 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
 
     if let Some((selection, row_index, control, shift, dragging)) = selected {
         if dragging {
-            app.library_multi_selection = vec![selection];
+            if !app.library_multi_selection.contains(&selection) {
+                app.library_multi_selection = vec![selection];
+            }
             app.library_selection = Some(selection);
             app.library_selection_anchor = Some(selection);
         } else if shift {
             let anchor = app
                 .library_selection_anchor
                 .filter(|anchor| anchor.tab_id == selection.tab_id);
+            let visible_items: Vec<_> = tree_rows
+                .iter()
+                .filter_map(|r| {
+                    if let TreeRow::Item { index, .. } = r {
+                        Some(*index)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
             let anchor_index = anchor.and_then(|anchor| {
-                rows.iter().position(|row| {
+                visible_items.iter().position(|index| {
+                    let row = &rows[*index];
                     row.tab_id == anchor.tab_id && row.key == key_for_item(anchor.item)
                 })
             });
-            if let Some(anchor_index) = anchor_index {
-                let start = anchor_index.min(row_index);
+            if let (Some(anchor_index), Some(focus_index)) = (
+                anchor_index,
+                visible_items.iter().position(|index| *index == row_index),
+            ) {
+                let start = anchor_index.min(focus_index);
                 let end = anchor_index
-                    .max(row_index)
-                    .min(rows.len().saturating_sub(1));
-                app.library_multi_selection = rows[start..=end]
+                    .max(focus_index)
+                    .min(visible_items.len().saturating_sub(1));
+                app.library_multi_selection = visible_items[start..=end]
                     .iter()
+                    .map(|index| &rows[*index])
                     .filter(|row| row.tab_id == selection.tab_id)
                     .map(|row| LibrarySelection {
                         tab_id: row.tab_id,
@@ -859,7 +1135,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             }
             if app
                 .library_selection_anchor
-                .map_or(true, |anchor| anchor.tab_id != selection.tab_id)
+                .is_none_or(|anchor| anchor.tab_id != selection.tab_id)
             {
                 app.library_selection_anchor = Some(selection);
             }
@@ -897,10 +1173,9 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     } else if let Some(id) = enter_selected {
         app.queue(Action::EnterQ0rg(id));
     }
-    if ui.input(|input| input.key_pressed(egui::Key::F2)) {
-        if app.library_multi_selection.len() <= 1 {
-            rename_selected = selected_library_item(app).filter(|item| can_rename_item(app, *item));
-        }
+    if ui.input(|input| input.key_pressed(egui::Key::F2)) && app.library_multi_selection.len() <= 1
+    {
+        rename_selected = selected_library_item(app).filter(|item| can_rename_item(app, *item));
     }
     if let Some(item) = rename.or(rename_selected) {
         begin_rename(app, item);
@@ -1196,6 +1471,16 @@ fn draw_library_icon(
     let quiet = Stroke::new(1.1_f32, foreground);
 
     match icon {
+        LibraryIcon::Folder(closed) => {
+            crate::panels::timeline::draw_layer_icon(
+                painter,
+                rect,
+                q0s_format::v2::LayerKind::Folder,
+                closed,
+                foreground,
+                accent,
+            );
+        }
         LibraryIcon::Stage => {
             let screen = Rect::from_min_max(rect.min, pos2(rect.max.x, rect.max.y - 3.5));
             painter.rect_stroke(screen, 1.5, strong);
@@ -1857,7 +2142,7 @@ fn collect_asset_color_stats(project: &ProjectV2, asset_id: u16, stats: &mut Pre
             if !header.spec.video {
                 return;
             }
-            let Ok(media) = q0video::q0v::Q0vFile::parse(video.bytes.as_ref().clone()) else {
+            let Ok(media) = q0video::q0v::Q0vFile::parse_shared(video.bytes.clone()) else {
                 return;
             };
             let Ok(rgba) = media.decode_frame_rgba(0) else {
@@ -1920,17 +2205,86 @@ fn draw_preview_background(
     }
 }
 
-pub(crate) fn draw_q0rg_frame_preview_background(
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LibraryFramePreview {
+    bounds: Option<(f32, f32, f32, f32)>,
+    background: PreviewBackground,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_cached_q0rg_frame_preview(
     painter: &egui::Painter,
     project: &ProjectV2,
     q0rg_id: u16,
     frame: u16,
     rect: Rect,
+    textures: &mut crate::render::TextureCache,
+    ctx: &egui::Context,
+    revision: (u64, u64),
     light: Color32,
     dark: Color32,
 ) {
-    let background = preview_background_for_key(project, LibraryKey::Q0rg(q0rg_id), frame);
-    draw_preview_background(painter, rect, background, light, dark);
+    if !painter.clip_rect().intersects(rect) {
+        return;
+    }
+    if textures.library_frame_preview_revision != Some(revision) {
+        textures.library_frame_previews.clear();
+        textures.library_frame_preview_revision = Some(revision);
+    }
+    let key = (q0rg_id, frame);
+    if textures
+        .library_frame_preview_budget
+        .as_ref()
+        .is_none_or(|(paint_frame, _)| *paint_frame != ctx.frame_nr())
+    {
+        textures.library_frame_preview_budget = Some((ctx.frame_nr(), std::time::Instant::now()));
+    }
+    // Spread cold thumbnail preparation across paints instead of stalling the
+    // window while an entire viewport of unfamiliar symbols is inspected.
+    if !textures.library_frame_previews.contains_key(&key)
+        && textures
+            .library_frame_preview_budget
+            .as_ref()
+            .is_some_and(|(_, start)| start.elapsed() >= std::time::Duration::from_millis(4))
+    {
+        draw_preview_background(painter, rect, PreviewBackground::Checker, light, dark);
+        ctx.request_repaint();
+        return;
+    }
+
+    if textures.library_frame_previews.len() >= 512
+        && !textures.library_frame_previews.contains_key(&key)
+    {
+        textures.library_frame_previews.clear();
+    }
+    let preview = *textures
+        .library_frame_previews
+        .entry(key)
+        .or_insert_with(|| LibraryFramePreview {
+            bounds: q0rg_frame_bbox(project, q0rg_id, frame),
+            background: preview_background_for_key(project, LibraryKey::Q0rg(q0rg_id), frame),
+        });
+    draw_preview_background(painter, rect, preview.background, light, dark);
+    if let Some(bounds) = preview.bounds {
+        crate::render::render_stage_with_revision(
+            painter,
+            project,
+            q0rg_id,
+            frame,
+            &preview_view(rect, bounds),
+            textures,
+            ctx,
+            revision,
+        );
+    } else {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "empty",
+            egui::FontId::proportional(10.0),
+            ctx.style().visuals.weak_text_color(),
+        );
+    }
 }
 
 pub(crate) fn preview_view(rect: Rect, bounds: (f32, f32, f32, f32)) -> StageView {

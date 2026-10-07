@@ -254,7 +254,21 @@ pub fn import_library_item(
         match &mut asset {
             Asset::Bitmap(bitmap) => bitmap.asset_id = new_asset_id,
             Asset::Vector(vector) => vector.asset_id = new_asset_id,
-            Asset::Q0v(video) => video.asset_id = new_asset_id,
+            Asset::Q0v(video) => {
+                video.asset_id = new_asset_id;
+                // Keep item IDs independent, but reuse immutable media bytes.
+                if let Some(shared) = out.assets.iter().find_map(|asset| match asset {
+                    Asset::Q0v(existing)
+                        if std::sync::Arc::ptr_eq(&existing.bytes, &video.bytes)
+                            || existing.bytes.as_slice() == video.bytes.as_slice() =>
+                    {
+                        Some(existing.bytes.clone())
+                    }
+                    _ => None,
+                }) {
+                    video.bytes = shared;
+                }
+            }
             Asset::Rig(rig) => {
                 rig.asset_id = new_asset_id;
                 rig.owner_q0rg_id = *q0rg_ids.get(&rig.owner_q0rg_id).ok_or_else(|| {

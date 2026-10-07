@@ -145,6 +145,33 @@ pub enum TweenCreateError {
     EmptyDestinationKeyframe,
     AlreadyTweened,
     NoMatchingObjects,
+    NoShapeArtwork,
+}
+
+/// What a tween interpolates between its two keyframes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TweenKind {
+    /// The same object moves: transform and effects.
+    Motion,
+    /// One drawing becomes another: outline and colour.
+    Shape,
+}
+
+impl TweenKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Motion => "motion tween",
+            Self::Shape => "shape tween",
+        }
+    }
+
+    pub const fn of(tween: Tween) -> Self {
+        if tween.is_shape() {
+            Self::Shape
+        } else {
+            Self::Motion
+        }
+    }
 }
 
 impl TweenCreateError {
@@ -154,7 +181,7 @@ impl TweenCreateError {
                 "Select a non-keyframe timeline cell between two keyframes first."
             }
             Self::KeyframeSelected => {
-                "A motion tween cannot be created on a keyframe. Select a frame between two keyframes."
+                "A tween cannot be created on a keyframe. Select a frame between two keyframes."
             }
             Self::MissingSourceKeyframe => {
                 "There is no source keyframe behind this cell. Create a non-empty keyframe first."
@@ -163,16 +190,19 @@ impl TweenCreateError {
                 "There is no destination keyframe ahead. Create a non-empty keyframe after this cell first."
             }
             Self::EmptySourceKeyframe => {
-                "The source keyframe is empty. A motion tween needs artwork on both keyframes."
+                "The source keyframe is empty. A tween needs artwork on both keyframes."
             }
             Self::EmptyDestinationKeyframe => {
                 "The keyframe ahead is empty. Put the destination artwork there before creating a tween."
             }
             Self::AlreadyTweened => {
-                "This frame is already part of a motion tween. Use Properties to edit or remove it."
+                "This frame is already part of a tween. Use Properties to edit or remove it."
             }
             Self::NoMatchingObjects => {
                 "The two keyframes do not contain matching objects that can be tweened."
+            }
+            Self::NoShapeArtwork => {
+                "A shape tween needs drawn vector shapes on both keyframes. Break symbols and text apart first."
             }
         }
     }
@@ -208,6 +238,36 @@ pub fn create_tweens_for_selection(
     selection: TimelineSelection,
     visible_layer_ids: &[u16],
 ) -> Result<Vec<TweenRef>, TweenCreateError> {
+    create_tweens_of_kind(
+        project,
+        q0rg_id,
+        selection,
+        visible_layer_ids,
+        TweenKind::Motion,
+    )
+}
+
+pub fn create_tweens_of_kind(
+    project: &mut ProjectV2,
+    q0rg_id: u16,
+    selection: TimelineSelection,
+    visible_layer_ids: &[u16],
+    kind: TweenKind,
+) -> Result<Vec<TweenRef>, TweenCreateError> {
+    // Shape tweens morph drawn vectors only; everything else on the keyframe
+    // is simply held.
+    let vector_assets = match kind {
+        TweenKind::Motion => std::collections::HashSet::new(),
+        TweenKind::Shape => project
+            .assets
+            .iter()
+            .filter_map(|asset| match asset {
+                q0s_format::v2::Asset::Vector(vector) => Some(vector.asset_id),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>(),
+    };
+    let is_shape = |target: q0s_format::v2::Target| matches!(target, q0s_format::v2::Target::Asset(id) if vector_assets.contains(&id));
     let layer_ids = selected_layer_ids(selection, visible_layer_ids);
     if layer_ids.is_empty() {
         return Err(TweenCreateError::NoTimelineCell);
@@ -285,24 +345,40 @@ pub fn create_tweens_for_selection(
                 if source.tween.to_frame().is_some() {
                     return Err(TweenCreateError::AlreadyTweened);
                 }
-                let occurrence = source_indices[..source_order]
-                    .iter()
-                    .filter(|candidate| layer.placements[**candidate].target == source.target)
-                    .count();
-                let destination_exists = layer
-                    .placements
-                    .iter()
-                    .filter(|placement| {
-                        placement.frame == destination_frame && placement.target == source.target
-                    })
-                    .nth(occurrence)
-                    .is_some();
+                let destination_exists = match kind {
+                    TweenKind::Motion => {
+                        let occurrence = source_indices[..source_order]
+                            .iter()
+                            .filter(|candidate| {
+                                layer.placements[**candidate].target == source.target
+                            })
+                            .count();
+                        layer
+                            .placements
+                            .iter()
+                            .filter(|placement| {
+                                placement.frame == destination_frame
+                                    && placement.target == source.target
+                            })
+                            .nth(occurrence)
+                            .is_some()
+                    }
+                    TweenKind::Shape => {
+                        is_shape(source.target)
+                            && layer.placements.iter().any(|placement| {
+                                placement.frame == destination_frame && is_shape(placement.target)
+                            })
+                    }
+                };
                 if destination_exists {
                     placement_indices.push(placement_idx);
                 }
             }
             if placement_indices.is_empty() {
-                return Err(TweenCreateError::NoMatchingObjects);
+                return Err(match kind {
+                    TweenKind::Motion => TweenCreateError::NoMatchingObjects,
+                    TweenKind::Shape => TweenCreateError::NoShapeArtwork,
+                });
             }
             plans.push(TweenCreationPlan {
                 layer_id,
@@ -330,8 +406,14 @@ pub fn create_tweens_for_selection(
             .find(|layer| layer.layer_id == plan.layer_id)
             .expect("selected tween layer still exists");
         for placement_idx in plan.placement_indices {
-            layer.placements[placement_idx].tween = Tween::Linear {
-                to_frame: plan.destination_frame,
+            layer.placements[placement_idx].tween = match kind {
+                TweenKind::Motion => Tween::Linear {
+                    to_frame: plan.destination_frame,
+                },
+                TweenKind::Shape => Tween::Shape {
+                    to_frame: plan.destination_frame,
+                    easing: q0s_format::v2::Easing::Linear,
+                },
             };
             targets.push(TweenRef {
                 q0rg_id,
@@ -479,7 +561,13 @@ pub fn render_tween_properties(
     tween: Tween,
 ) {
     ui.separator();
-    ui.label(egui::RichText::new("Motion tween").strong());
+    ui.label(
+        egui::RichText::new(match TweenKind::of(tween) {
+            TweenKind::Motion => "Motion tween",
+            TweenKind::Shape => "Shape tween",
+        })
+        .strong(),
+    );
     if tween.to_frame().is_none() {
         ui.label(
             egui::RichText::new(
@@ -532,10 +620,19 @@ fn render_tween_controls(
     }
     if timeline_selection {
         ui.label(
-            egui::RichText::new(if spans.len() == 1 {
-                "1 motion tween".to_string()
-            } else {
-                format!("{} motion tweens", spans.len())
+            egui::RichText::new({
+                let kind = if records.iter().all(|(_, _, tween)| tween.is_shape()) {
+                    TweenKind::Shape.label()
+                } else if records.iter().any(|(_, _, tween)| tween.is_shape()) {
+                    "tween"
+                } else {
+                    TweenKind::Motion.label()
+                };
+                if spans.len() == 1 {
+                    format!("1 {kind}")
+                } else {
+                    format!("{} {kind}s", spans.len())
+                }
             })
             .strong(),
         );
@@ -790,7 +887,8 @@ fn apply_tween_easing(app: &mut EditorApp, targets: &[TweenRef], easing: Easing)
         return;
     }
 
-    app.history.snapshot(&app.state.project);
+    app.history
+        .snapshot_with_session(&app.state.project, &app.session);
     let mut updated_count = 0usize;
     for target in changed {
         if let Some(camera_frame) = target.camera_frame {
@@ -850,7 +948,8 @@ fn remove_tweens(app: &mut EditorApp, targets: &[TweenRef]) {
         return;
     }
 
-    app.history.snapshot(&app.state.project);
+    app.history
+        .snapshot_with_session(&app.state.project, &app.session);
     let mut removed = 0usize;
     for target in removable {
         if let Some(camera_frame) = target.camera_frame {
@@ -891,9 +990,9 @@ fn remove_tweens(app: &mut EditorApp, targets: &[TweenRef]) {
     if removed > 0 {
         app.state.mark_dirty();
         app.session.status = if removed == 1 {
-            "removed motion tween".to_string()
+            "removed tween".to_string()
         } else {
-            format!("removed {removed} motion tween tracks")
+            format!("removed {removed} tween tracks")
         };
     }
 }
@@ -904,7 +1003,7 @@ pub fn render_warning(app: &mut EditorApp, ctx: &egui::Context) {
     };
     let mut open = true;
     let mut dismiss = false;
-    egui::Window::new("Motion tween not created")
+    egui::Window::new("Tween not created")
         .open(&mut open)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .collapsible(false)

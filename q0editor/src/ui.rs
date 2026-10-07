@@ -312,14 +312,62 @@ pub(crate) fn name_button(ui: &mut Ui, text: &str, selected: bool, width: f32) -
         .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-/// A shared frame/symbol card; the caller renders artwork into the returned viewport.
-pub(crate) fn preview_card(
+/// Allocate the entire grid, but interact with and paint only visible rows.
+/// The source rectangle remains available even before it has scrolled on screen.
+pub(crate) fn preview_card_grid(
+    ui: &mut Ui,
+    count: usize,
+    source_index: Option<usize>,
+    mut paint_card: impl FnMut(&mut Ui, usize, Rect),
+) -> Option<Rect> {
+    if count == 0 {
+        return None;
+    }
+    let width = ui.available_width().max(48.0);
+    let gap = ui.spacing().item_spacing.x.max(4.0);
+    let columns = (((width + gap) / (64.0 + gap)).floor() as usize).max(1);
+    let size = ((width - gap * columns.saturating_sub(1) as f32) / columns as f32).max(48.0);
+    let rows = count.div_ceil(columns);
+    let stride = size + gap;
+    let height = rows as f32 * stride - gap;
+    let (grid, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
+    let card_rect = |index: usize| {
+        Rect::from_min_size(
+            grid.min
+                + vec2(
+                    (index % columns) as f32 * stride,
+                    (index / columns) as f32 * stride,
+                ),
+            vec2(size, size),
+        )
+    };
+    let source_rect = source_index.filter(|index| *index < count).map(card_rect);
+    let visible = grid.intersect(ui.clip_rect());
+    if visible.is_positive() {
+        let first_row =
+            (((visible.top() - grid.top()) / stride).floor().max(0.0) as usize).min(rows);
+        let last_row =
+            (((visible.bottom() - grid.top()) / stride).floor().max(0.0) as usize + 1).min(rows);
+        for index in first_row * columns..(last_row * columns).min(count) {
+            let rect = card_rect(index);
+            if ui.is_rect_visible(rect) {
+                // A child UI gives each visible cell a stable ID without
+                // advancing the parent cursor beyond the allocated grid.
+                let mut card_ui = ui.child_ui_with_id_source(rect, *ui.layout(), index);
+                paint_card(&mut card_ui, index, rect);
+            }
+        }
+    }
+    source_rect
+}
+
+pub(crate) fn preview_card_at(
     ui: &mut Ui,
     label: &str,
     selected: bool,
-    size: f32,
+    rect: Rect,
 ) -> (Response, Rect) {
-    let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::click());
+    let response = ui.interact(rect, ui.id().with("preview_card"), Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, selected, label)
     });

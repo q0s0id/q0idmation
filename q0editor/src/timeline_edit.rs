@@ -129,9 +129,11 @@ pub(crate) fn sync_folder_timelines(project: &mut ProjectV2, q0rg_id: u16) -> bo
             .filter(|placement| placement.target == q0s_format::v2::Target::Q0rg(q0rg_id))
         {
             let playback = &mut placement.fx.q0rg_playback;
-            playback.first_frame = playback.first_frame.min(last);
             playback.single_frame = playback.single_frame.min(last);
-            playback.last_frame = playback.last_frame.map(|frame| frame.min(last));
+            if !playback.placement_relative {
+                playback.first_frame = playback.first_frame.min(last);
+                playback.last_frame = playback.last_frame.map(|frame| frame.min(last));
+            }
         }
     }
     changed
@@ -946,6 +948,61 @@ pub(crate) fn keyframe_source_states_at(
     q0s_format::raster::active_placement_states_at(layer, source_frame)
 }
 
+/// In-between drawings of shape tweens waiting to become real vector assets
+/// once a new keyframe is committed.
+pub(crate) struct BakedShapes {
+    first_id: u16,
+    shapes: Vec<q0s_format::v2::VectorAsset>,
+}
+
+impl BakedShapes {
+    pub(crate) fn new(project: &ProjectV2) -> Self {
+        Self {
+            first_id: crate::tools::next_asset_id_pub(project),
+            shapes: Vec::new(),
+        }
+    }
+
+    /// The placements a new keyframe needs in place of `copy`, the plain copy
+    /// of the source placement at `source_index`. Inside a shape tween the
+    /// stage shows an in-between drawing, so the keyframe gets that drawing
+    /// (several when a shape is splitting) instead of the first one again.
+    pub(crate) fn keyframe_placements(
+        &mut self,
+        shape_morph: Option<&q0s_format::shape_tween::LayerMorph>,
+        source_index: usize,
+        copy: q0s_format::v2::Placement,
+    ) -> Vec<q0s_format::v2::Placement> {
+        let Some(shapes) = shape_morph.and_then(|morph| morph.for_placement(source_index)) else {
+            return vec![copy];
+        };
+        // Keep the plain copy if the asset id space cannot hold the drawing.
+        if usize::from(self.first_id) + self.shapes.len() + shapes.len() > usize::from(u16::MAX) {
+            return vec![copy];
+        }
+        shapes
+            .iter()
+            .map(|shape| {
+                let asset_id = self.first_id + self.shapes.len() as u16;
+                self.shapes.push(q0s_format::v2::VectorAsset {
+                    asset_id,
+                    ..shape.clone()
+                });
+                q0s_format::v2::Placement {
+                    target: q0s_format::v2::Target::Asset(asset_id),
+                    ..copy.clone()
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn commit(self, project: &mut ProjectV2) {
+        project
+            .assets
+            .extend(self.shapes.into_iter().map(q0s_format::v2::Asset::Vector));
+    }
+}
+
 /// Convert every selected non-key cell into a real keyframe using the exact
 /// visible state from the original timeline. When a new key splits an incoming
 /// tween, retarget that tween to the first inserted key so metadata and the
@@ -994,6 +1051,7 @@ pub fn materialize_keyframes_at_cells(
     let mut blank_keys = Vec::<(u16, u16)>::new();
     let mut tween_retargets = HashMap::<(u16, usize), u16>::new();
     let mut created_cells = 0usize;
+    let mut baked_shapes = BakedShapes::new(project);
 
     for (layer_id, frame) in selected {
         let layer = q0rg
@@ -1010,6 +1068,7 @@ pub fn materialize_keyframes_at_cells(
             .or_insert(frame);
 
         let mut cell_insertions = Vec::new();
+        let shape_morph = q0s_format::shape_tween::project_layer_morph(project, layer, frame);
         for state in keyframe_source_states_at(layer, frame) {
             let source = layer.placements.get(state.index)?;
             if source.frame == frame {
@@ -1030,7 +1089,12 @@ pub fn materialize_keyframes_at_cells(
             placement.transform = state.transform;
             placement.fx = state.fx;
             placement.tween = Tween::None;
-            cell_insertions.push((state.index, placement));
+            cell_insertions.extend(
+                baked_shapes
+                    .keyframe_placements(shape_morph.as_ref(), state.index, placement)
+                    .into_iter()
+                    .map(|placement| (state.index, placement)),
+            );
         }
         if cell_insertions.is_empty() {
             blank_keys.push((layer_id, frame));
@@ -1056,6 +1120,7 @@ pub fn materialize_keyframes_at_cells(
     for (layer_id, frame) in &max_frame_by_layer {
         extend_layer_through_frame(project, q0rg_id, *layer_id, *frame, false)?;
     }
+    baked_shapes.commit(project);
 
     let q0rg = &mut project.q0rgs[q0rg_index];
     for ((layer_id, placement_index), target_frame) in tween_retargets {
@@ -1881,6 +1946,16 @@ pub fn paste_frames(
     if clipboard.width == 0 || clipboard.rows.is_empty() {
         return None;
     }
+    q0s_format::v2::validate_q0rg_insertions(
+        project,
+        q0rg_id,
+        clipboard
+            .rows
+            .iter()
+            .flat_map(|row| &row.placements)
+            .map(|p| p.target),
+    )
+    .ok()?;
     let target_layer_ids =
         ensure_target_frame_layers(project, q0rg_id, target_layer_id, clipboard.rows.len());
     if target_layer_ids.len() != clipboard.rows.len() {
@@ -2252,6 +2327,16 @@ pub fn paste_layers(
     if clipboard.layers.is_empty() {
         return None;
     }
+    q0s_format::v2::validate_q0rg_insertions(
+        project,
+        q0rg_id,
+        clipboard
+            .layers
+            .iter()
+            .flat_map(|layer| &layer.placements)
+            .map(|p| p.target),
+    )
+    .ok()?;
     let insert_at = layer_insert_index(project, q0rg_id, target_layer_id)?;
     let q0rg_index = q0rg_index(project, q0rg_id)?;
     let mut next_id = project.q0rgs[q0rg_index]
@@ -2351,11 +2436,22 @@ mod tests {
     use super::*;
     use q0s_format::v2::{LayerKind, Placement, Target, Transform2D};
 
+    // Timeline fixtures need a real child symbol, not a reference back to
+    // their containing stage, now that paste rejects recursive references.
+    fn timeline_project() -> ProjectV2 {
+        let mut project = crate::state::default_project();
+        let mut child = project.q0rgs[0].clone();
+        child.q0rg_id = u16::MAX;
+        child.name = "Timeline fixture child".into();
+        project.q0rgs.push(child);
+        project
+    }
+
     fn placement(frame: u16, x: f32, tween: Tween) -> Placement {
         Placement {
             instance_id: 0,
             frame,
-            target: Target::Q0rg(1),
+            target: Target::Q0rg(u16::MAX),
             transform: Transform2D {
                 tx: x,
                 ..Transform2D::IDENTITY
@@ -2367,7 +2463,7 @@ mod tests {
 
     #[test]
     fn frame_clipboard_preserves_content_blank_keys_and_internal_tweens() {
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         let q0rg = &mut project.q0rgs[0];
         q0rg.frame_count = 12;
         q0rg.layers[0].placements = vec![
@@ -2404,7 +2500,7 @@ mod tests {
 
     #[test]
     fn moving_selected_frames_keeps_payload_even_when_ranges_overlap() {
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         project.q0rgs[0].frame_count = 8;
         project.q0rgs[0].layers[0].placements = vec![
             placement(1, 10.0, Tween::None),
@@ -2431,7 +2527,7 @@ mod tests {
 
     #[test]
     fn repeated_frame_moves_do_not_leave_blank_keyframe_trails() {
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         project.q0rgs[0].frame_count = 8;
         project.q0rgs[0].layers[0].placements = vec![placement(1, 10.0, Tween::None)];
 
@@ -2448,7 +2544,7 @@ mod tests {
 
     #[test]
     fn moving_first_frame_leaves_one_blank_root_keyframe() {
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         project.q0rgs[0].frame_count = 8;
         project.q0rgs[0].layers[0].placements = vec![placement(0, 10.0, Tween::None)];
         project.q0rgs[0].layers[0].explicit_keyframes.clear();
@@ -2464,7 +2560,7 @@ mod tests {
 
     #[test]
     fn duplicate_frames_places_the_complete_range_immediately_after_itself() {
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         let q0rg = &mut project.q0rgs[0];
         q0rg.frame_count = 6;
         q0rg.layers[0].explicit_keyframes = vec![2];
@@ -2490,7 +2586,7 @@ mod tests {
 
     #[test]
     fn materializing_a_frame_range_creates_every_key_and_clips_incoming_tween() {
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         let q0rg = &mut project.q0rgs[0];
         q0rg.frame_count = 8;
         q0rg.layers[0].explicit_keyframes.clear();
@@ -2524,7 +2620,7 @@ mod tests {
 
     #[test]
     fn removing_selected_keyframes_demotes_range_but_preserves_root_key() {
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         let q0rg = &mut project.q0rgs[0];
         q0rg.frame_count = 8;
         q0rg.layers[0].explicit_keyframes = vec![4];
@@ -2556,7 +2652,7 @@ mod tests {
     fn copy_and_paste_preserve_custom_tween_easing() {
         use q0s_format::v2::Easing;
 
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         project.q0rgs[0].frame_count = 8;
         let layer_id = project.q0rgs[0].layers[0].layer_id;
         project.q0rgs[0].layers[0].explicit_keyframes.clear();
@@ -2608,7 +2704,7 @@ mod tests {
 
     #[test]
     fn inserting_hold_frame_shifts_only_target_layer_and_its_frame_script() {
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         project.q0rgs[0].frame_count = 6;
         project.q0rgs[0].layers[0].placements = vec![
             placement(0, 0.0, Tween::None),
@@ -2653,7 +2749,7 @@ mod tests {
 
     #[test]
     fn inserting_hold_frame_inside_tween_extends_tween_destination() {
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         project.q0rgs[0].frame_count = 6;
         project.q0rgs[0].layers[0].placements = vec![
             placement(0, 0.0, Tween::Linear { to_frame: 4 }),
@@ -2672,7 +2768,7 @@ mod tests {
 
     #[test]
     fn inserting_hold_at_frame_zero_keeps_root_key_and_shifts_later_keys() {
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         project.q0rgs[0].frame_count = 5;
         project.q0rgs[0].layers[0].placements = vec![
             placement(0, 0.0, Tween::None),
@@ -2696,7 +2792,7 @@ mod tests {
 
     #[test]
     fn removing_selected_frame_columns_shifts_keys_blanks_and_tween_targets() {
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         let q0rg = &mut project.q0rgs[0];
         q0rg.frame_count = 10;
         q0rg.layers[0].explicit_keyframes = vec![2, 4, 7];
@@ -2738,7 +2834,7 @@ mod tests {
 
     #[test]
     fn removing_leading_frame_columns_shifts_every_drawable_layer_and_restores_root_keys() {
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         let q0rg = &mut project.q0rgs[0];
         q0rg.frame_count = 6;
         q0rg.layers[0].explicit_keyframes.clear();
@@ -2785,7 +2881,7 @@ mod tests {
 
     #[test]
     fn removing_the_complete_timeline_keeps_one_blank_root_on_every_drawable_layer() {
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         let q0rg = &mut project.q0rgs[0];
         q0rg.frame_count = 4;
         q0rg.layers[0].placements = vec![placement(0, 0.0, Tween::None)];
@@ -2819,7 +2915,7 @@ mod tests {
 
     #[test]
     fn materializing_a_multi_layer_range_updates_every_selected_drawable_row() {
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         let q0rg = &mut project.q0rgs[0];
         q0rg.frame_count = 5;
         q0rg.layers[0].placements = vec![placement(0, 10.0, Tween::None)];
@@ -2864,7 +2960,7 @@ mod tests {
 
     #[test]
     fn layer_clipboard_remaps_folder_tree_and_preserves_animation() {
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         let q0rg = &mut project.q0rgs[0];
         q0rg.layers = vec![
             Layer {
@@ -2931,7 +3027,7 @@ mod tests {
 
     #[test]
     fn layer_clipboard_copies_and_remaps_nested_folder_subtrees() {
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         project.q0rgs[0].layers = vec![
             Layer {
                 layer_id: 2,
@@ -3020,7 +3116,7 @@ mod tests {
 
     #[test]
     fn cutting_every_layer_leaves_a_drawable_layer() {
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         let removed = remove_layers(&mut project, 1, TimelineLayerSelection::single(1))
             .expect("remove layer");
         assert_eq!(removed, 1);
@@ -3067,7 +3163,7 @@ mod tests {
 
     #[test]
     fn artwork_frame_clipboard_keeps_rig_subtracks_separate() {
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         project.q0rgs[0].frame_count = 12;
         add_timeline_test_rig(&mut project, &[(2, 0.2), (4, 0.4)]);
         let selection = TimelineSelection {
@@ -3084,7 +3180,7 @@ mod tests {
 
     #[test]
     fn one_layer_copy_does_not_smuggle_global_rig_keys_when_other_layers_exist() {
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         project.q0rgs[0].frame_count = 8;
         project.q0rgs[0].layers.push(Layer {
             layer_id: 2,
@@ -3106,7 +3202,7 @@ mod tests {
 
     #[test]
     fn removing_frame_columns_removes_and_shifts_rig_keys_with_time() {
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         project.q0rgs[0].frame_count = 10;
         add_timeline_test_rig(&mut project, &[(1, 0.1), (3, 0.3), (7, 0.7)]);
         let selection = TimelineSelection {
@@ -3124,7 +3220,7 @@ mod tests {
 
     #[test]
     fn moving_artwork_frames_does_not_move_rig_subtracks() {
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         project.q0rgs[0].frame_count = 12;
         add_timeline_test_rig(&mut project, &[(2, 0.2), (3, 0.3)]);
         let selection = TimelineSelection {
@@ -3139,7 +3235,7 @@ mod tests {
 
     #[test]
     fn deleting_bound_layer_unbinds_rig_instead_of_leaving_invalid_reference() {
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         let mut bound = placement(0, 0.0, Tween::None);
         bound.instance_id = 77;
         project.q0rgs[0].layers[0].push_placement(bound);
@@ -3164,7 +3260,7 @@ mod tests {
 
     #[test]
     fn frame_copy_to_another_layer_remaps_live_instance_identity() {
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         project.q0rgs[0].frame_count = 8;
         let mut source = placement(1, 10.0, Tween::None);
         source.instance_id = 42;
@@ -3197,7 +3293,7 @@ mod tests {
 
     #[test]
     fn moving_whole_instance_to_another_layer_preserves_identity_when_source_is_gone() {
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         project.q0rgs[0].frame_count = 8;
         let mut source = placement(1, 10.0, Tween::None);
         source.instance_id = 52;
@@ -3231,7 +3327,7 @@ mod tests {
 
     #[test]
     fn layer_copy_remaps_instance_identity_consistently_across_keyframes() {
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         project.q0rgs[0].frame_count = 8;
         let mut first = placement(0, 10.0, Tween::None);
         first.instance_id = 91;
@@ -3269,7 +3365,7 @@ mod tests {
 
     #[test]
     fn frame_scripts_follow_copy_move_and_removed_frame_columns() {
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         project.q0rgs[0].frame_count = 10;
         project.runtime.frame_scripts = vec![
             FrameScript {
@@ -3345,7 +3441,7 @@ mod tests {
     #[test]
     fn frame_labels_shift_with_deleted_columns_and_stay_scoped_to_symbols() {
         use q0s_format::v2::FrameLabelKey;
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         project.q0rgs[0].frame_count = 10;
         let mut child = project.q0rgs[0].clone();
         child.q0rg_id = 2;
@@ -3376,7 +3472,7 @@ mod tests {
 
     #[test]
     fn layer_copy_preserves_frame_scripts_and_remaps_layer_identity() {
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         project.q0rgs[0].frame_count = 6;
         project.runtime.frame_scripts.push(FrameScript {
             q0rg_id: 1,
@@ -3419,7 +3515,7 @@ mod tests {
     fn removing_frame_columns_shifts_camera_keys_and_tween_target_with_entry_time() {
         use q0s_format::v2::{CameraKey, CameraState};
 
-        let mut project = crate::state::default_project();
+        let mut project = timeline_project();
         project.q0rgs[0].frame_count = 10;
         project.runtime.camera.enabled = true;
         let identity = project.default_camera_state();

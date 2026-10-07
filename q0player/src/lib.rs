@@ -111,9 +111,11 @@ pub struct Player {
     initial_script_diagnostics: Vec<RuntimeDiagnostic>,
     rig_runtime_overrides: RigRuntimeOverrides,
     scene_runtime: RuntimeSceneState,
+    runtime_bounds_cache: Option<(Arc<ProjectV2>, q0s_format::raster::RuntimeBoundsCache)>,
     objects: objects::ObjectWorld,
     scene_library: HashMap<String, Arc<ProjectV2>>,
     active_scene_alias: Option<String>,
+    document_scene_sequence: Vec<u16>,
     scene_generation: u64,
     input: PlayerInputState,
     audio_timeline: Option<PlayerAudioTimeline>,
@@ -375,9 +377,11 @@ impl Player {
             initial_script_diagnostics: Vec::new(),
             rig_runtime_overrides: RigRuntimeOverrides::new(),
             scene_runtime: RuntimeSceneState::new(),
+            runtime_bounds_cache: None,
             objects: objects::ObjectWorld::default(),
             scene_library: HashMap::new(),
             active_scene_alias: None,
+            document_scene_sequence: Vec::new(),
             scene_generation: 0,
             input: PlayerInputState::default(),
             audio_timeline,
@@ -430,9 +434,11 @@ impl Player {
                 initial_script_diagnostics,
                 rig_runtime_overrides: RigRuntimeOverrides::new(),
                 scene_runtime: RuntimeSceneState::new(),
+                runtime_bounds_cache: None,
                 objects: objects::ObjectWorld::default(),
                 scene_library,
                 active_scene_alias: None,
+                document_scene_sequence: Vec::new(),
                 scene_generation: 0,
                 input: PlayerInputState::default(),
                 audio_timeline,
@@ -486,9 +492,11 @@ impl Player {
                 initial_script_diagnostics: Vec::new(),
                 rig_runtime_overrides: RigRuntimeOverrides::new(),
                 scene_runtime: RuntimeSceneState::new(),
+                runtime_bounds_cache: None,
                 objects: objects::ObjectWorld::default(),
                 scene_library: HashMap::new(),
                 active_scene_alias: None,
+                document_scene_sequence: Vec::new(),
                 scene_generation: 0,
                 input: PlayerInputState::default(),
                 audio_timeline: None,
@@ -748,6 +756,63 @@ impl Player {
         self.loop_enabled = value;
     }
 
+    /// Preview document scenes in their authored order. Normal movie playback
+    /// retains its existing script-driven scene switching behavior.
+    pub fn enable_document_scene_sequence(&mut self) {
+        let Some(project) = self.project_v2() else {
+            return;
+        };
+        self.document_scene_sequence = project
+            .scenes()
+            .into_iter()
+            .filter(|scene| project.q0rgs.iter().any(|q| q.q0rg_id == scene.q0rg_id))
+            .map(|scene| scene.q0rg_id)
+            .collect();
+        if let Some(first) = self.document_scene_sequence.first().copied() {
+            let current = self.project_v2().map(|project| project.meta.entry_q0rg_id);
+            if current != Some(first) {
+                self.select_document_scene(first);
+            }
+        }
+    }
+
+    fn select_document_scene(&mut self, root: u16) {
+        let Inner::V2 {
+            project,
+            entry_q0rg_id,
+            frame_count,
+            frame_index,
+            ..
+        } = &mut self.inner
+        else {
+            return;
+        };
+        let Some(scene) = project.q0rgs.iter().find(|q| q.q0rg_id == root) else {
+            return;
+        };
+        let script = scene.script.clone();
+        *frame_count = scene.frame_count.max(1);
+        *frame_index = 0;
+        *entry_q0rg_id = root;
+        // This is the player's private parsed snapshot. The editor's authored
+        // project is never changed. Keep all existing camera/render entry rules.
+        Arc::make_mut(project).meta.entry_q0rg_id = root;
+        self.audio_timeline = build_project_audio_timeline(project);
+        self.scene_runtime = RuntimeSceneState::new();
+        self.objects = objects::ObjectWorld::default();
+        self.rig_runtime_overrides.clear();
+        self.input = PlayerInputState::default();
+        self.active_scene_alias = None;
+        self.scene_generation = self.scene_generation.wrapping_add(1);
+        let mut budget = MAX_FRAME_SCRIPT_TRANSITIONS;
+        let entries = self.frame_script_entries;
+        self.run_q0lang_source_with_budget(&script, &mut budget);
+        if self.frame_script_entries == entries {
+            self.run_current_frame_scripts(&mut budget);
+        }
+        self.update_objects(false);
+    }
+
     pub fn is_loop_enabled(&self) -> bool {
         self.loop_enabled
     }
@@ -853,6 +918,26 @@ impl Player {
     /// when a v2 frame was entered and its frame script should run.
     fn advance_timeline_one_frame(&mut self) -> bool {
         let total = self.total_frames();
+        if !self.document_scene_sequence.is_empty() && self.current_frame() + 1 >= total {
+            let current = self.project_v2().map(|project| project.meta.entry_q0rg_id);
+            let index = self
+                .document_scene_sequence
+                .iter()
+                .position(|root| Some(*root) == current)
+                .unwrap_or(0);
+            let next = self
+                .document_scene_sequence
+                .get(index + 1)
+                .copied()
+                .or_else(|| self.loop_enabled.then(|| self.document_scene_sequence[0]));
+            if let Some(root) = next {
+                self.select_document_scene(root);
+                // Scene entry already dispatched its first frame script.
+                return false;
+            }
+            self.playing = false;
+            return false;
+        }
         let mut hit_end = false;
         let mut entered_v2_frame = false;
         match &mut self.inner {
@@ -940,7 +1025,24 @@ impl Player {
         self.input.jump_pressed = false;
     }
 
+    fn ensure_runtime_bounds_cache(&mut self) {
+        let Inner::V2 { project, .. } = &self.inner else {
+            return;
+        };
+        if self
+            .runtime_bounds_cache
+            .as_ref()
+            .is_none_or(|(source, _)| !Arc::ptr_eq(source, project))
+        {
+            self.runtime_bounds_cache = Some((
+                Arc::clone(project),
+                q0s_format::raster::RuntimeBoundsCache::new(project),
+            ));
+        }
+    }
+
     fn sync_q0lang_host_globals(&mut self) {
+        self.ensure_runtime_bounds_cache();
         let (stage_width, stage_height, owner, frame, names) = match &self.inner {
             Inner::V2 {
                 project,
@@ -966,12 +1068,13 @@ impl Player {
             .iter()
             .filter_map(|(key, name)| {
                 self.project_v2().and_then(|project| {
-                    q0s_format::raster::runtime_instance_metrics(
+                    q0s_format::raster::runtime_instance_metrics_with_cache(
                         project,
                         owner,
                         frame,
                         key.instance_id,
                         &self.scene_runtime,
+                        &self.runtime_bounds_cache.as_ref()?.1,
                     )
                     .map(|metrics| (name.clone(), metrics))
                 })
@@ -1637,6 +1740,7 @@ mod tests {
         let layers = (1..=max_layer)
             .map(|layer_id| Layer {
                 layer_id,
+                timeline_frame_count: None,
                 name: format!("layer {layer_id}"),
                 explicit_keyframes: Vec::new(),
                 placements: Vec::new(),

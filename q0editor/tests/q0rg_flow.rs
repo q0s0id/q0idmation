@@ -478,7 +478,7 @@ fn convert_raw_area_to_q0rg_preserves_resolved_glow_pixels() {
         objects: Vec::new(),
         bounds_min: Vec2::new(0.0, 0.0),
         bounds_max: Vec2::new(100.0, 100.0),
-        clip_polygon: None,
+        clip_region: None,
     };
     invoke_convert(&mut app);
 
@@ -610,7 +610,7 @@ fn convert_halo_only_raw_area_to_q0rg_preserves_visible_glow_without_loss() {
         objects: Vec::new(),
         bounds_min: Vec2::new(24.0, 40.0),
         bounds_max: Vec2::new(29.0, 60.0),
-        clip_polygon: None,
+        clip_region: None,
     };
     invoke_convert(&mut app);
 
@@ -947,7 +947,7 @@ fn convert_full_marquee_real_bezier_raw_fill_to_q0rg_preserves_curve_handles_exa
         objects: Vec::new(),
         bounds_min,
         bounds_max,
-        clip_polygon: None,
+        clip_region: None,
     };
 
     invoke_convert(&mut app);
@@ -1387,7 +1387,7 @@ fn select_mixed_raw_area(
         }],
         bounds_min: Vec2::new(0.0, 0.0),
         bounds_max: Vec2::new(10.0, 10.0),
-        clip_polygon: None,
+        clip_region: None,
     };
 }
 
@@ -1604,7 +1604,7 @@ fn convert_dotted_raw_area_without_objects_to_q0rg() {
         objects: Vec::new(),
         bounds_min: Vec2::new(0.0, 0.0),
         bounds_max: Vec2::new(10.0, 10.0),
-        clip_polygon: None,
+        clip_region: None,
     };
 
     invoke_convert(&mut app);

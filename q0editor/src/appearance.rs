@@ -965,7 +965,8 @@ pub fn erase_visible_region(app: &mut EditorApp, region: MultiPolygon<f64>) -> b
         return false;
     }
 
-    app.history.snapshot(&app.state.project);
+    app.history
+        .snapshot_with_session(&app.state.project, &app.session);
     if crate::tools::materialize_layer_keyframe_for_edit(
         &mut app.state.project,
         q0rg_id,

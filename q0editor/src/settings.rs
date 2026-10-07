@@ -1024,9 +1024,19 @@ pub struct Settings {
     #[serde(default)]
     pub language: Language,
     pub theme: Theme,
+    /// Synchronize native frame presentation with display refresh.
+    /// Changes take effect when the native window is recreated on restart.
+    pub vertical_sync: bool,
+    /// Write recovery snapshots of unsaved documents in the background.
+    #[serde(default = "default_autosave_enabled")]
+    pub autosave_enabled: bool,
+    #[serde(default = "default_autosave_interval_secs")]
+    pub autosave_interval_secs: u32,
     pub brush_cap: BrushCap,
     #[serde(default)]
     pub brush: BrushPreferences,
+    /// Freehand pencil smoothing, independent of brush settings.
+    pub pencil_smoothing: u8,
     #[serde(default)]
     pub brush_mode: PersistBrushMode,
     #[serde(default)]
@@ -1037,6 +1047,11 @@ pub struct Settings {
     /// User-created easing curves shared by every project.
     #[serde(default)]
     pub easing_presets: Vec<EasingPreset>,
+    /// Last panel arrangement and user-created workspace presets, shared by projects.
+    #[serde(default)]
+    pub workspace_layout: serde_json::Value,
+    #[serde(default)]
+    pub workspace_layout_presets: Vec<crate::workspace::LayoutPreset>,
     /// Font name used inside the q0lang script editor. Resolved via
     /// `q0lang::fonts::resolve` at install time; if the system can't find
     /// it, falls back to bundled monospace and warns once in status.
@@ -1085,6 +1100,12 @@ fn default_q0lang_font_size() -> PersistFontSize {
 fn default_q0lang_show_line_numbers() -> bool {
     true
 }
+fn default_autosave_enabled() -> bool {
+    true
+}
+fn default_autosave_interval_secs() -> u32 {
+    crate::autosave::DEFAULT_INTERVAL_SECS
+}
 fn default_q0lang_tab_width() -> u8 {
     4
 }
@@ -1112,12 +1133,18 @@ impl Default for Settings {
         Self {
             language: Language::English,
             theme: Theme::default(),
+            vertical_sync: true,
+            autosave_enabled: default_autosave_enabled(),
+            autosave_interval_secs: default_autosave_interval_secs(),
             brush_cap: BrushCap::Round,
             brush: BrushPreferences::default(),
+            pencil_smoothing: 50,
             brush_mode: PersistBrushMode::Classic,
             advanced_brush: AdvancedBrushPreferences::default(),
             advanced_brush_presets: Vec::new(),
             easing_presets: Vec::new(),
+            workspace_layout: serde_json::Value::Null,
+            workspace_layout_presets: Vec::new(),
             q0lang_font_name: default_q0lang_font_name(),
             q0lang_font_size: default_q0lang_font_size(),
             q0lang_show_line_numbers: default_q0lang_show_line_numbers(),
@@ -1178,6 +1205,10 @@ impl Settings {
         }
         settings.q0lang_font_size.0 = settings.q0lang_font_size.0.clamp(8.0, 72.0);
         settings.q0lang_tab_width = settings.q0lang_tab_width.clamp(1, 8);
+        settings.autosave_interval_secs = settings.autosave_interval_secs.clamp(
+            crate::autosave::MIN_INTERVAL_SECS,
+            crate::autosave::MAX_INTERVAL_SECS,
+        );
         settings.new_project_width = settings.new_project_width.clamp(1, 8192);
         settings.new_project_height = settings.new_project_height.clamp(1, 8192);
         settings.new_project_fps = settings.new_project_fps.clamp(1, 240);
@@ -1191,6 +1222,7 @@ impl Settings {
         migrate_legacy_brush_glow(&mut settings);
         sanitize_advanced_brush_presets(&mut settings.advanced_brush_presets);
         crate::easing::sanitize_library(&mut settings.easing_presets);
+        crate::workspace::sanitize_presets(&mut settings.workspace_layout_presets);
         settings.hotkeys.sanitize();
         settings.prune_recent();
         settings

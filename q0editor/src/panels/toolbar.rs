@@ -52,35 +52,46 @@ impl ToolIcon {
 }
 
 pub fn render(app: &mut EditorApp, ui: &mut Ui) {
-    ui.vertical_centered(|ui| {
-        ui.spacing_mut().item_spacing.y = 2.0;
-        ui.add_space(4.0);
-        for tool in Tool::ALL {
-            if matches!(tool, Tool::Pen | Tool::Line | Tool::Bucket | Tool::Text) {
-                ui.add_space(3.0);
-                ui.separator();
+    if ui.available_width() >= 90.0 {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+            for tool in Tool::ALL {
+                render_tool_button(app, ui, tool);
             }
-            let selected = app.session.current_tool == tool;
-            let response = tool_button(
-                ui,
-                tool,
-                selected,
-                app.settings.theme.text.to_color32(),
-                app.settings.theme.panel.to_color32(),
-                app.settings.theme.accent.to_color32(),
-            )
-            .on_hover_text(
-                tool_shortcut(tool)
-                    .map(|command| app.settings.hotkeys.hint(command, tool.label()))
-                    .unwrap_or_else(|| tool.label().to_string()),
-            );
-            if response.clicked() {
-                app.queue(Action::SelectTool(tool));
+        });
+    } else {
+        ui.vertical_centered(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.add_space(4.0);
+            for tool in Tool::ALL {
+                if matches!(tool, Tool::Pen | Tool::Line | Tool::Bucket | Tool::Text) {
+                    ui.add_space(3.0);
+                    ui.separator();
+                }
+                render_tool_button(app, ui, tool);
             }
-        }
-        ui.add_space(8.0);
-        ui.separator();
-    });
+            ui.add_space(8.0);
+        });
+    }
+}
+
+fn render_tool_button(app: &mut EditorApp, ui: &mut Ui, tool: Tool) {
+    let response = tool_button(
+        ui,
+        tool,
+        app.session.current_tool == tool,
+        app.settings.theme.text.to_color32(),
+        app.settings.theme.panel.to_color32(),
+        app.settings.theme.accent.to_color32(),
+    )
+    .on_hover_text(
+        tool_shortcut(tool)
+            .map(|command| app.settings.hotkeys.hint(command, tool.label()))
+            .unwrap_or_else(|| tool.label().to_string()),
+    );
+    if response.clicked() {
+        app.queue(Action::SelectTool(tool));
+    }
 }
 
 fn tool_shortcut(tool: Tool) -> Option<crate::hotkeys::ShortcutCommand> {

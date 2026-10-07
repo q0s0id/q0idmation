@@ -24,6 +24,10 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         ui.spacing_mut().item_spacing.x = 16.0;
                         header(app, ui);
                         ui.add_space(24.0);
+                        if !app.autosave.recovered().is_empty() {
+                            recovered_work(app, ui);
+                            ui.add_space(16.0);
+                        }
                         action_row(app, ui);
                         ui.add_space(28.0);
                         content_columns(app, ui);
@@ -63,6 +67,90 @@ fn header(app: &EditorApp, ui: &mut Ui) {
             .size(15.0)
             .color(app.settings.theme.text_dim.to_color32()),
     );
+}
+
+/// Snapshots left behind by a session that did not exit cleanly.
+fn recovered_work(app: &mut EditorApp, ui: &mut Ui) {
+    use crate::autosave::DiscardTarget;
+
+    let dim = app.settings.theme.text_dim.to_color32();
+    let accent = app.settings.theme.accent.to_color32();
+    let rows = app
+        .autosave
+        .recovered()
+        .iter()
+        .map(|entry| {
+            (
+                entry.title().to_string(),
+                entry.detail(),
+                entry.original_path(),
+                entry.key().to_path_buf(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let armed = app.autosave.discard_armed.clone();
+    let mut open = None;
+    let mut discard = None;
+    let mut discard_all = false;
+    let mut arm = None;
+    crate::theme::surface(ui)
+        .fill(app.settings.theme.panel.to_color32())
+        .stroke(egui::Stroke::new(1.0_f32, accent))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new("Recovered work").size(19.0).strong());
+            ui.label(
+                RichText::new(
+                    "q0editor did not close cleanly. These unsaved documents were kept; \
+                     opening one changes nothing on disk until you save.",
+                )
+                .color(dim),
+            );
+            ui.add_space(12.0);
+            for (index, (title, detail, path, key)) in rows.iter().enumerate() {
+                ui.horizontal_wrapped(|ui| {
+                    if crate::theme::primary_button(ui, "Open", accent).clicked() {
+                        open = Some(index);
+                    }
+                    let this = DiscardTarget::One(key.clone());
+                    if armed.as_ref() == Some(&this) {
+                        if ui.button("Delete for good").clicked() {
+                            discard = Some(index);
+                        }
+                    } else if ui.button("Discard").clicked() {
+                        arm = Some(this);
+                    }
+                    ui.label(RichText::new(title).strong());
+                    ui.label(RichText::new(detail).small().color(dim));
+                    let origin = match path {
+                        Some(path) => path.display().to_string(),
+                        None => "never saved".to_string(),
+                    };
+                    ui.label(RichText::new(origin).small().color(dim));
+                });
+                ui.add_space(4.0);
+            }
+            if rows.len() > 1 {
+                ui.add_space(4.0);
+                if armed == Some(DiscardTarget::All) {
+                    if ui.button("Delete all for good").clicked() {
+                        discard_all = true;
+                    }
+                } else if ui.button("Discard all").clicked() {
+                    arm = Some(DiscardTarget::All);
+                }
+            }
+        });
+    if let Some(target) = arm {
+        app.autosave.discard_armed = Some(target);
+    }
+    if let Some(index) = open {
+        app.open_recovered_document(index);
+    } else if let Some(index) = discard {
+        app.autosave.discard_recovered(index);
+    } else if discard_all {
+        app.autosave.discard_all_recovered();
+    }
 }
 
 fn action_row(app: &mut EditorApp, ui: &mut Ui) {
@@ -392,4 +480,30 @@ fn recent_project_button(ui: &mut Ui, path: &Path) -> egui::Response {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, path.display().to_string())
     });
     response.on_hover_text(path.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovered_work_lists_every_snapshot_of_a_crashed_session() {
+        let root = crate::autosave::test_support::TestDir::new("home");
+        let ctx = egui::Context::default();
+        crate::autosave::test_support::leave_crashed_script(&root, "go 4");
+
+        let mut app = EditorApp::default();
+        crate::autosave::test_support::enable(&mut app, &root);
+        crate::autosave::tick(&mut app, &ctx);
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| recovered_work(&mut app, ui));
+        });
+        assert!(!output.shapes.is_empty());
+        assert_eq!(
+            app.autosave.recovered().len(),
+            1,
+            "drawing discards nothing"
+        );
+        assert_eq!(root.files().len(), 2);
+    }
 }

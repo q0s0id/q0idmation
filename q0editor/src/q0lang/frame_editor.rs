@@ -192,7 +192,8 @@ pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
     });
 
     if save {
-        app.history.snapshot(&app.state.project);
+        app.history
+            .snapshot_with_session(&app.state.project, &app.session);
         app.state.project.runtime.frame_scripts.retain(|script| {
             script.q0rg_id != draft.q0rg_id
                 || script.layer_id != draft.layer_id

@@ -307,7 +307,7 @@ pub enum Selection {
         bounds_min: Vec2,
         bounds_max: Vec2,
         /// Freehand clip for a lasso selection; None uses the rectangular bounds.
-        clip_polygon: Option<Vec<Vec2>>,
+        clip_region: Option<geo::MultiPolygon<f64>>,
     },
     /// Materialized mixed free-transform selection. Raw marquee fragments are
     /// cut into path-granular geometry only when the user starts moving or
@@ -405,6 +405,38 @@ pub struct ClipboardPayload {
 }
 
 impl ClipboardPayload {
+    pub(crate) fn validate_for_q0rg(
+        &self,
+        project: &ProjectV2,
+        q0rg_id: u16,
+    ) -> Result<(), q0s_format::Error> {
+        match &self.timeline {
+            Some(TimelineClipboard::Frames(frames)) => q0s_format::v2::validate_q0rg_insertions(
+                project,
+                q0rg_id,
+                frames
+                    .rows
+                    .iter()
+                    .flat_map(|row| &row.placements)
+                    .map(|p| p.target),
+            ),
+            Some(TimelineClipboard::Layers(layers)) => q0s_format::v2::validate_q0rg_insertions(
+                project,
+                q0rg_id,
+                layers
+                    .layers
+                    .iter()
+                    .flat_map(|layer| &layer.placements)
+                    .map(|p| p.target),
+            ),
+            None => q0s_format::v2::validate_q0rg_insertions(
+                project,
+                q0rg_id,
+                self.placements.iter().map(|p| p.target),
+            ),
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.placements.is_empty() && self.raw_vectors.is_empty() && self.timeline.is_none()
     }
@@ -495,13 +527,20 @@ impl ProjectState {
     }
 
     pub fn mark_dirty(&mut self) {
-        self.dirty = true;
-        self.revision = self.revision.wrapping_add(1);
-        self.render_revision = self.render_revision.wrapping_add(1);
+        self.mark_render_dirty();
         self.library_revision = self.library_revision.wrapping_add(1);
     }
 
-    /// Mark artwork-only edits without rebuilding the library's row model.
+    /// Invalidate revision-scoped render state without rebuilding library rows.
+    /// Effect edits need this: resolved layer frames also cache PlacementFx.
+    pub fn mark_render_dirty(&mut self) {
+        self.mark_artwork_dirty();
+        self.render_revision = self.render_revision.wrapping_add(1);
+    }
+
+    /// Mark artwork edits whose render caches are refreshed separately.
+    /// Keeps render_revision stable for incremental drag/brush updates. Model
+    /// changes such as PlacementFx edits must use mark_render_dirty instead.
     pub fn mark_artwork_dirty(&mut self) {
         self.dirty = true;
         self.revision = self.revision.wrapping_add(1);
@@ -774,23 +813,21 @@ impl ToolState {
     }
 }
 
-/// Onion-skin display settings. When `enabled`, the stage renders the
-/// `before` previous frames and `after` subsequent frames of the current
-/// q0rg semi-transparently behind/over the live frame, like Flash's
-/// "Onion Skin" toggle. Counts capped at 6 each side Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ past that the
-/// display is just visual noise.
+/// Mutually exclusive onion preview and range editing, with a shared ruler range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OnionSettings {
     pub enabled: bool,
+    pub edit_frames: bool,
     pub all_unlocked_layers: bool,
-    pub before: u8,
-    pub after: u8,
+    pub before: u16,
+    pub after: u16,
 }
 
 impl Default for OnionSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            edit_frames: false,
             all_unlocked_layers: false,
             before: 2,
             after: 2,
@@ -896,6 +933,11 @@ pub struct Session {
     pub selection: Selection,
     pub transform_pivot: Option<TransformPivot>,
     pub marquee_base_selection: Option<Selection>,
+    /// One history step for a completed selection gesture, never per pointer move.
+    pub selection_history_gesture: Option<(HistoryPivotState, bool)>,
+    pub(crate) frame_edit_gesture: Option<crate::frame_edit::Gesture>,
+    pub(crate) frame_edit_selection: Vec<crate::frame_edit::FrameRef>,
+    #[allow(clippy::type_complexity)]
     pub symbol_edit_click: Option<(u16, Option<(u16, usize)>, f64, egui::Pos2)>,
     pub timeline_horizontal_scroll: f32,
     pub preview_loop_ranges: HashMap<u16, (bool, u16, u16)>,
@@ -1016,6 +1058,53 @@ pub struct EditInPlaceContext {
 }
 
 impl Session {
+    pub fn history_pivot_state(&self) -> HistoryPivotState {
+        HistoryPivotState {
+            q0rg_id: self.current_q0rg_id,
+            frame: self.current_frame,
+            layer_id: self.current_layer_id,
+            selection: self.selection.clone(),
+            timeline_selection: self.timeline_selection,
+            timeline_cell_selection: self.timeline_cell_selection.clone(),
+            timeline_layer_selection: self.timeline_layer_selection,
+            camera_track_selected: self.camera_track_selected,
+            camera_timeline_selection: self.camera_timeline_selection,
+            pivot: self
+                .transform_pivot
+                .as_ref()
+                .filter(|pivot| pivot.selection == self.selection)
+                .cloned(),
+        }
+    }
+
+    pub fn restore_history_pivot(&mut self, state: Option<HistoryPivotState>, project: &ProjectV2) {
+        let Some(state) = state else {
+            self.transform_pivot = None;
+            return;
+        };
+        self.current_q0rg_id = state.q0rg_id;
+        self.current_layer_id = state.layer_id;
+        self.current_frame = state.frame;
+        self.pending_timeline_frame = None;
+        self.selection = state.selection;
+        self.timeline_selection = state.timeline_selection;
+        self.timeline_cell_selection = state.timeline_cell_selection;
+        self.timeline_layer_selection = state.timeline_layer_selection;
+        self.camera_track_selected = state.camera_track_selected;
+        self.camera_timeline_selection = state.camera_timeline_selection;
+        self.tool_state = ToolState::Idle;
+        self.marquee_base_selection = None;
+        self.selection_history_gesture = None;
+        self.frame_edit_gesture = None;
+        self.frame_edit_selection.clear();
+        self.symbol_edit_click = None;
+        self.reconcile_with(project);
+        self.transform_pivot = state
+            .pivot
+            .filter(|pivot| pivot.selection == self.selection);
+        self.timeline_scroll_to_layer = Some((self.current_q0rg_id, self.current_layer_id));
+    }
+
     pub fn timeline_history_position(&self) -> TimelineHistoryPosition {
         TimelineHistoryPosition {
             q0rg_id: self.current_q0rg_id,
@@ -1086,6 +1175,9 @@ impl Session {
             selection: Selection::None,
             transform_pivot: None,
             marquee_base_selection: None,
+            selection_history_gesture: None,
+            frame_edit_gesture: None,
+            frame_edit_selection: Vec::new(),
             symbol_edit_click: None,
             timeline_horizontal_scroll: 0.0,
             preview_loop_ranges: HashMap::new(),
@@ -1187,7 +1279,7 @@ impl Session {
     /// undo/redo Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the project might have lost q0rgs, layers, placements etc.
     /// Reconcile transient selection across a project-history boundary.
     ///
-    /// History stores `ProjectV2`, not session/UI state. Path and placement
+    /// History stores `ProjectV2` and transform-pivot metadata. Path and placement
     /// references are index-based, so blindly carrying them across undo/redo
     /// can reinterpret an old selection as a different contour (notably a hole)
     /// after topology or target changes. Preserve references when their structural
@@ -1550,6 +1642,10 @@ impl Session {
     }
 
     pub fn clear_inactive_frame_selection(&mut self, project: &ProjectV2) {
+        if self.onion.edit_frames {
+            crate::frame_edit::refresh_session(self, project);
+            return;
+        }
         let frame = self.current_frame;
         let current_q0rg_id = self.current_q0rg_id;
         let placement_on_current_frame = |r: PlacementRef| {
@@ -1747,7 +1843,7 @@ impl Session {
                 objects,
                 bounds_min,
                 bounds_max,
-                clip_polygon,
+                clip_region,
             } => {
                 let kept_raw: Vec<PlacementRef> = placements
                     .into_iter()
@@ -1774,7 +1870,7 @@ impl Session {
                         objects: kept_objects,
                         bounds_min,
                         bounds_max,
-                        clip_polygon,
+                        clip_region,
                     }
                 }
             }
@@ -1999,7 +2095,7 @@ fn history_stable_selection(from: &ProjectV2, to: &ProjectV2, selection: Selecti
             objects,
             bounds_min,
             bounds_max,
-            clip_polygon,
+            clip_region,
         } => {
             let stable_raw: Vec<PlacementRef> = placements
                 .iter()
@@ -2017,7 +2113,7 @@ fn history_stable_selection(from: &ProjectV2, to: &ProjectV2, selection: Selecti
                     objects: stable_objects,
                     bounds_min,
                     bounds_max,
-                    clip_polygon,
+                    clip_region,
                 }
             } else {
                 Selection::None
@@ -2185,9 +2281,37 @@ pub struct TimelineHistoryPosition {
     pub camera_track_selected: bool,
 }
 
+#[derive(Clone, PartialEq)]
+pub struct HistoryPivotState {
+    pub(crate) q0rg_id: u16,
+    frame: u16,
+    layer_id: u16,
+    selection: Selection,
+    timeline_selection: Option<TimelineSelection>,
+    timeline_cell_selection: Option<(u16, Vec<(u16, u16)>)>,
+    timeline_layer_selection: Option<TimelineLayerSelection>,
+    camera_track_selected: bool,
+    camera_timeline_selection: Option<CameraTimelineSelection>,
+    pivot: Option<TransformPivot>,
+}
+
+impl HistoryPivotState {
+    pub(crate) fn same_selection(&self, other: &Self) -> bool {
+        self.selection == other.selection
+            && self.timeline_selection == other.timeline_selection
+            && self.timeline_cell_selection == other.timeline_cell_selection
+            && self.timeline_layer_selection == other.timeline_layer_selection
+            && self.camera_track_selected == other.camera_track_selected
+            && self.camera_timeline_selection == other.camera_timeline_selection
+            && self.pivot == other.pivot
+    }
+}
+
 struct HistoryEntry {
-    project: ProjectV2,
+    // Selection-only entries do not copy or modify project artwork.
+    project: Option<ProjectV2>,
     timeline_position: Option<TimelineHistoryPosition>,
+    pivot_state: Option<HistoryPivotState>,
 }
 
 pub struct History {
@@ -2225,6 +2349,26 @@ impl History {
         self.redo.last().and_then(|entry| entry.timeline_position)
     }
 
+    pub fn undo_pivot_state(&self) -> Option<HistoryPivotState> {
+        self.undo.last().and_then(|entry| entry.pivot_state.clone())
+    }
+
+    pub fn redo_pivot_state(&self) -> Option<HistoryPivotState> {
+        self.redo.last().and_then(|entry| entry.pivot_state.clone())
+    }
+
+    pub fn set_undo_pivot_state(&mut self, state: HistoryPivotState) {
+        if let Some(entry) = self.undo.last_mut() {
+            entry.pivot_state = Some(state);
+        }
+    }
+
+    pub fn set_redo_pivot_state(&mut self, state: HistoryPivotState) {
+        if let Some(entry) = self.redo.last_mut() {
+            entry.pivot_state = Some(state);
+        }
+    }
+
     pub fn set_undo_timeline_position(&mut self, position: TimelineHistoryPosition) {
         if let Some(entry) = self.undo.last_mut() {
             entry.timeline_position = Some(position);
@@ -2237,22 +2381,54 @@ impl History {
         }
     }
 
+    pub fn undo_changes_project(&self) -> bool {
+        self.undo
+            .last()
+            .is_some_and(|entry| entry.project.is_some())
+    }
+
+    pub fn redo_changes_project(&self) -> bool {
+        self.redo
+            .last()
+            .is_some_and(|entry| entry.project.is_some())
+    }
+
+    pub fn snapshot_selection(&mut self, state: HistoryPivotState) {
+        self.undo.push(HistoryEntry {
+            project: None,
+            timeline_position: None,
+            pivot_state: Some(state),
+        });
+        self.snapshot_revision = self.snapshot_revision.wrapping_add(1);
+        if self.undo.len() > HISTORY_CAP {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
     /// Record the project's CURRENT state as the "before" of the upcoming change.
     /// Clears any redo branch (standard undo semantics). Skips pushing if the
     /// current state already matches the top of the stack Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ this lets callers
     /// safely snapshot on every `.changed()` from a DragValue without bloating
     /// the stack with duplicates of the same intermediate value.
     pub fn snapshot(&mut self, current: &ProjectV2) {
-        if self
-            .undo
-            .last()
-            .is_some_and(|entry| &entry.project == current)
-        {
+        self.snapshot_inner(current, None);
+    }
+
+    pub fn snapshot_with_session(&mut self, current: &ProjectV2, session: &Session) {
+        self.snapshot_inner(current, Some(session.history_pivot_state()));
+    }
+
+    fn snapshot_inner(&mut self, current: &ProjectV2, pivot_state: Option<HistoryPivotState>) {
+        if self.undo.last().is_some_and(|entry| {
+            entry.project.as_ref() == Some(current) && entry.pivot_state == pivot_state
+        }) {
             return;
         }
         self.undo.push(HistoryEntry {
-            project: current.clone(),
+            project: Some(current.clone()),
             timeline_position: None,
+            pivot_state,
         });
         self.snapshot_revision = self.snapshot_revision.wrapping_add(1);
         if self.undo.len() > HISTORY_CAP {
@@ -2262,6 +2438,7 @@ impl History {
     }
 
     /// Pop the latest "before"; move `current` onto the redo stack.
+    #[allow(clippy::result_large_err)]
     pub fn pop_undo(
         &mut self,
         current: ProjectV2,
@@ -2270,15 +2447,24 @@ impl History {
         let Some(prior) = self.undo.pop() else {
             return Err(current);
         };
-        reconcile(&current, &prior.project);
+        self.snapshot_revision = self.snapshot_revision.wrapping_add(1);
+        let (restored, redo_project) = if let Some(project) = prior.project {
+            reconcile(&current, &project);
+            (project, Some(current))
+        } else {
+            reconcile(&current, &current);
+            (current, None)
+        };
         self.redo.push(HistoryEntry {
-            project: current,
+            project: redo_project,
             timeline_position: None,
+            pivot_state: None,
         });
-        Ok(prior.project)
+        Ok(restored)
     }
 
     /// Pop the latest "after" off redo; move `current` back onto undo.
+    #[allow(clippy::result_large_err)]
     pub fn pop_redo(
         &mut self,
         current: ProjectV2,
@@ -2287,12 +2473,20 @@ impl History {
         let Some(next) = self.redo.pop() else {
             return Err(current);
         };
-        reconcile(&current, &next.project);
+        self.snapshot_revision = self.snapshot_revision.wrapping_add(1);
+        let (restored, undo_project) = if let Some(project) = next.project {
+            reconcile(&current, &project);
+            (project, Some(current))
+        } else {
+            reconcile(&current, &current);
+            (current, None)
+        };
         self.undo.push(HistoryEntry {
-            project: current,
+            project: undo_project,
             timeline_position: None,
+            pivot_state: None,
         });
-        Ok(next.project)
+        Ok(restored)
     }
 }
 
@@ -2434,7 +2628,9 @@ mod default_project_tests {
         history.snapshot(&before);
         let mut after = before.clone();
         crate::rigging::set_node_rotation(&mut after, 1, bone, 6, 0.75, true);
-        let undone = history.pop_undo(after, |_, _| {}).expect("undo snapshot");
+        let undone = history
+            .pop_undo(after.clone(), |_, _| {})
+            .expect("undo snapshot");
         assert_eq!(undone, before);
         assert_eq!(
             undone.q0rgs[0].layers[0].placements[0].instance_id,

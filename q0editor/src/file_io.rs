@@ -12,10 +12,73 @@ use q0s_format::{migrate_v1_to_v2, parse_q1s, Q1S_MAGIC};
 pub const Q1S_EXTENSION: &str = "q1s";
 pub const Q0LANG_EXTENSIONS: &[&str] = &["q0l", "q0lang"];
 pub const MAX_Q0LANG_BYTES: u64 = 8 * 1024 * 1024;
-/// Refuse unexpectedly large projects before allocating a matching buffer.
-/// Normal beta projects are far smaller; 256 MiB still leaves ample room for
-/// embedded raster assets while preventing accidental multi-gigabyte loads.
+/// Large legacy projects are mapped on Windows rather than copied into RAM.
+/// The format parser interns repeated media and bounds unique payload memory.
+#[cfg(windows)]
+pub const MAX_PROJECT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+#[cfg(not(windows))]
 pub const MAX_PROJECT_BYTES: u64 = 256 * 1024 * 1024;
+const BUFFERED_PROJECT_BYTES: u64 = 256 * 1024 * 1024;
+
+enum ProjectBytes {
+    Buffered(Vec<u8>),
+    #[cfg(windows)]
+    Mapped {
+        mapping: memmap2::Mmap,
+        _file: File,
+    },
+}
+
+impl AsRef<[u8]> for ProjectBytes {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Buffered(bytes) => bytes,
+            #[cfg(windows)]
+            Self::Mapped { mapping, .. } => mapping,
+        }
+    }
+}
+
+fn read_project_bytes(path: &Path) -> Result<ProjectBytes, FileError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Allow other readers, but hold off writers and deletion for the entire
+        // mapping lifetime. The unsafe mapping therefore sees immutable bytes.
+        options.share_mode(1); // FILE_SHARE_READ
+    }
+    let file = options.open(path)?;
+    let size = file.metadata()?.len();
+    if size > MAX_PROJECT_BYTES {
+        return Err(FileError::TooLarge {
+            size,
+            max: MAX_PROJECT_BYTES,
+        });
+    }
+    #[cfg(windows)]
+    if size > BUFFERED_PROJECT_BYTES {
+        // SAFETY: the live file handle denies writes/deletion on Windows and
+        // is retained with the mapping until all parsing has finished.
+        let mapping = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        return Ok(ProjectBytes::Mapped {
+            mapping,
+            _file: file,
+        });
+    }
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    file.take(BUFFERED_PROJECT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > BUFFERED_PROJECT_BYTES {
+        return Err(FileError::TooLarge {
+            size: bytes.len() as u64,
+            max: BUFFERED_PROJECT_BYTES,
+        });
+    }
+    Ok(ProjectBytes::Buffered(bytes))
+}
 
 static NEXT_STAGING_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -55,20 +118,8 @@ impl From<q0s_format::Error> for FileError {
 }
 
 pub fn load_project(path: &Path) -> Result<ProjectV2, FileError> {
-    let size = fs::metadata(path)?.len();
-    if size > MAX_PROJECT_BYTES {
-        return Err(FileError::TooLarge {
-            size,
-            max: MAX_PROJECT_BYTES,
-        });
-    }
-    let bytes = fs::read(path)?;
-    if bytes.len() as u64 > MAX_PROJECT_BYTES {
-        return Err(FileError::TooLarge {
-            size: bytes.len() as u64,
-            max: MAX_PROJECT_BYTES,
-        });
-    }
+    let storage = read_project_bytes(path)?;
+    let bytes = storage.as_ref();
     if bytes.len() < 6 {
         return Err(FileError::Empty);
     }
@@ -77,12 +128,12 @@ pub fn load_project(path: &Path) -> Result<ProjectV2, FileError> {
     let version = u16::from_le_bytes([bytes[4], bytes[5]]);
 
     if magic == Q1S_MAGIC && version == 1 {
-        let v1 = parse_q1s(&bytes)?;
+        let v1 = parse_q1s(bytes)?;
         let mut project = migrate_v1_to_v2(v1)?;
         q0s_format::v2::assign_missing_instance_ids(&mut project)?;
         Ok(project)
     } else if magic == Q1S_V2_MAGIC {
-        let mut project = parse_v2(&bytes)?;
+        let mut project = parse_v2(bytes)?;
         if version < q0s_format::v2::Q1S_VERSION_RIGGING {
             q0s_format::v2::assign_missing_instance_ids(&mut project)?;
         }
@@ -555,6 +606,8 @@ mod tests {
         let file = File::create(&path).expect("create sparse project");
         file.set_len(MAX_PROJECT_BYTES + 1)
             .expect("grow sparse project");
+        // Loading denies concurrent writers, so the writing handle must be gone.
+        drop(file);
 
         assert!(matches!(
             load_project(&path),

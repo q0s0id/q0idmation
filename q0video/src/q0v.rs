@@ -1,4 +1,5 @@
 use std::io::{Seek, SeekFrom, Write};
+use std::sync::Arc;
 
 pub const MAGIC: [u8; 4] = *b"Q0V\0";
 pub const VERSION: u16 = 1;
@@ -468,7 +469,7 @@ pub fn audio_view(bytes: &[u8]) -> Result<Q0vAudioView<'_>, String> {
 
 #[derive(Debug, Clone)]
 pub struct Q0vFile {
-    bytes: Vec<u8>,
+    bytes: Arc<Vec<u8>>,
     pub spec: Q0vSpec,
     pub frames: Vec<FrameIndex>,
     pub audio_samples_per_channel: u64,
@@ -478,6 +479,11 @@ pub struct Q0vFile {
 
 impl Q0vFile {
     pub fn parse(bytes: Vec<u8>) -> Result<Self, String> {
+        Self::parse_shared(Arc::new(bytes))
+    }
+
+    /// Index immutable embedded media without copying its complete payload.
+    pub fn parse_shared(bytes: Arc<Vec<u8>>) -> Result<Self, String> {
         let layout = parse_layout(&bytes)?;
         Ok(Self {
             bytes,
@@ -502,7 +508,7 @@ impl Q0vFile {
             .ok_or_else(|| "q0v frame index is out of range".to_string())?;
         let decoded = image::load_from_memory_with_format(payload, image::ImageFormat::Png)
             .map_err(|error| format!("decode q0v frame png: {error}"))?
-            .to_rgba8();
+            .into_rgba8();
         if decoded.dimensions() != (self.spec.width, self.spec.height) {
             return Err("q0v frame dimensions disagree with the container".to_string());
         }

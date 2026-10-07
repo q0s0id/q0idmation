@@ -109,6 +109,7 @@ fn record_gpu_filter_sample_drop() {
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_gpu_filter_callback_cpu(
     ns: u64,
     region: CallbackRegion,
@@ -1120,6 +1121,7 @@ fn push_mesh_signature(signature: &mut Vec<u64>, mesh: &Mesh) -> bool {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
 fn filtered_group_signature(
     primitives: &[VectorGroupPrimitive],
     mode: i32,
@@ -3507,6 +3509,7 @@ impl GlResources {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     unsafe fn paint_primitives_into_filter_slot(
         &mut self,
         glow_painter: &egui_glow::Painter,

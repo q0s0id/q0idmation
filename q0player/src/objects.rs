@@ -6,7 +6,9 @@ use std::sync::Arc;
 use q0s_format::q0lang::runtime::{
     ExecutionReport, Runtime, RuntimeAction, RuntimeDiagnostic, RuntimeValue, TimelineTarget,
 };
-use q0s_format::raster::{active_placement_states_at, runtime_instance_metrics};
+use q0s_format::raster::{
+    active_placement_states_at, runtime_instance_metrics_with_cache, RuntimeBoundsCache,
+};
 use q0s_format::rig::RigControlOverride;
 use q0s_format::runtime_scene::{PlaybackRequest, RuntimeSceneState};
 use q0s_format::transform::Affine;
@@ -113,6 +115,7 @@ impl ObjectWorld {
 
 struct ObjectPass<'a> {
     project: &'a ProjectV2,
+    bounds: &'a RuntimeBoundsCache,
     globals: &'a BTreeMap<String, RuntimeValue>,
     instructions: usize,
     transitions: usize,
@@ -265,8 +268,14 @@ impl ObjectPass<'_> {
             }
             let mut local = scene.effective_affine(key, authored);
             let world_transform = Affine::compose(parent, local);
-            let metrics =
-                runtime_instance_metrics(self.project, owner, frame, key.instance_id, scene);
+            let metrics = runtime_instance_metrics_with_cache(
+                self.project,
+                owner,
+                frame,
+                key.instance_id,
+                scene,
+                self.bounds,
+            );
             let pointer = match (self.globals.get("mouse.x"), self.globals.get("mouse.y")) {
                 (Some(RuntimeValue::Number(x)), Some(RuntimeValue::Number(y))) => {
                     Some(Vec2::new(*x as f32, *y as f32))
@@ -302,6 +311,7 @@ impl ObjectPass<'_> {
                     local,
                     &child.scene,
                     metrics,
+                    self.bounds,
                     hovered,
                     local_pointer,
                 );
@@ -532,6 +542,7 @@ fn sync_globals(
     local: Affine,
     scene: &RuntimeSceneState,
     metrics: Option<q0s_format::raster::RuntimeInstanceMetrics>,
+    bounds: &RuntimeBoundsCache,
     hovered: bool,
     local_pointer: Option<Vec2>,
 ) {
@@ -576,9 +587,14 @@ fn sync_globals(
         if key.q0rg_id != owner {
             continue;
         }
-        if let Some(metrics) =
-            runtime_instance_metrics(project, owner, object.frame, key.instance_id, scene)
-        {
+        if let Some(metrics) = runtime_instance_metrics_with_cache(
+            project,
+            owner,
+            object.frame,
+            key.instance_id,
+            scene,
+            bounds,
+        ) {
             insert_metrics(runtime, name, metrics, true);
         }
     }
@@ -743,6 +759,11 @@ impl Player {
             .unwrap_or_default();
         let mut pass = ObjectPass {
             project: &project,
+            bounds: &self
+                .runtime_bounds_cache
+                .as_ref()
+                .expect("v2 bounds initialized by host sync")
+                .1,
             globals: &globals,
             instructions: OBJECT_INSTRUCTION_BUDGET,
             transitions: MAX_FRAME_SCRIPT_TRANSITIONS,

@@ -11,6 +11,7 @@ pub mod q1s;
 pub mod raster;
 pub mod rig;
 pub mod runtime_scene;
+pub mod shape_tween;
 pub mod transform;
 pub mod v2;
 

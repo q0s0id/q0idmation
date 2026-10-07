@@ -503,6 +503,7 @@ fn main() {
         origin: pos2(100.0, 100.0),
         scale: 1.0,
         stage_rect: screen,
+        edit_transform: q0s_format::transform::Affine::IDENTITY,
     };
     let mut cache = TextureCache::default();
     let mut ts = Vec::new();

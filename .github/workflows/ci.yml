@@ -1,13 +1,16 @@
-name: appearance eraser experiment
+name: ci
 
 on:
   push:
-    branches:
-      - experiment/appearance-mask-eraser
   pull_request:
     branches:
       - main
   workflow_dispatch:
+
+# A newer push to the same branch supersedes the run in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   verify:
@@ -21,20 +24,23 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Cache build
+        uses: Swatinem/rust-cache@v2
+
       - name: Format check
         run: cargo fmt --all -- --check
 
       - name: Workspace check
         run: cargo check --workspace --locked
 
-      - name: Workspace tests
-        run: cargo test --workspace --locked
-
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Release q0editor
-        run: cargo build --release --locked -p q0editor
+      - name: Workspace tests
+        run: cargo test --workspace --locked
 
       - name: Legacy fallback check
         run: cargo check --locked -p q0editor --no-default-features
+
+      - name: Release q0editor
+        run: cargo build --release --locked -p q0editor

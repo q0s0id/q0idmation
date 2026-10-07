@@ -490,7 +490,10 @@ mod tests {
         let bytes = export_to_q0s_bytes(&project).expect("export");
         assert!(q0s_format::is_q0s_v2(&bytes));
         let parsed = q0s_format::parse_q0s_v2(&bytes).expect("parse");
-        assert_eq!(parsed, project);
+        // An exported movie always carries its scene table explicitly.
+        let mut expected = project.clone();
+        expected.runtime.scenes = project.scenes();
+        assert_eq!(parsed, expected);
     }
 
     #[test]

@@ -6,10 +6,10 @@ use q0s_format::geom::CapShape;
 use q0s_format::transform::Affine;
 use q0s_format::v2::{
     Anchor, Asset, BitmapAsset, BlendMode, BlurFx, CameraKey, CameraState, CameraTrack, Easing,
-    GlowFx, GradientFill, GradientKind, GradientStop, Layer, LayerKey, LayerKind, LayerMetadata,
-    Path as VectorPath, Placement, PlacementFx, ProjectScene, ProjectV2, Q0rg, Q0rgPlayback,
-    Q0rgPlaybackMode, Rgba, Stroke, Target, Transform2D, Tween, Vec2, VectorAppearance,
-    VectorAsset, VectorMaterial,
+    EasingFamily, EasingMode, GlowFx, GradientFill, GradientKind, GradientStop, Layer, LayerKey,
+    LayerKind, LayerMetadata, Path as VectorPath, Placement, PlacementFx, ProjectScene, ProjectV2,
+    Q0rg, Q0rgPlayback, Q0rgPlaybackMode, Rgba, Stroke, Target, Transform2D, Tween, Vec2,
+    VectorAppearance, VectorAsset, VectorMaterial,
 };
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
@@ -49,6 +49,8 @@ struct RawFrame {
     index: u16,
     duration: u16,
     tween_type: RawTweenType,
+    ease_method: Option<String>,
+    ease_intensity: f32,
     custom_ease_points: Vec<[f32; 2]>,
     elements: Vec<RawElement>,
 }
@@ -266,6 +268,21 @@ pub(crate) fn enrich_project(
     imported.project.runtime.scenes.clear();
     imported.project.runtime.library_folders.clear();
     imported.project.runtime.library_item_folders.clear();
+    let mut folder_reader = Reader::from_reader(dom_xml);
+    loop {
+        match folder_reader.read_event() {
+            Ok(Event::Start(element) | Event::Empty(element))
+                if element.name().as_ref() == b"DOMFolderItem" =>
+            {
+                if let Some(name) = attr(&folder_reader, &element, b"name")? {
+                    ensure_library_folder_paths(&mut imported.project, &name.replace('\\', "/"));
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(error) => return Err(ImportError::Invalid(format!("library folders: {error}"))),
+            _ => {}
+        }
+    }
     imported.project.runtime.camera = CameraTrack::default();
     if let Some(entry_scene) = document_scenes.first() {
         imported.project.runtime.camera =
@@ -324,11 +341,19 @@ pub(crate) fn enrich_project(
                     height,
                     rgba,
                 }));
-                imported
-                    .project
-                    .asset_names
-                    .insert(asset_id, media.name.clone());
-                if let Some(folder) = bitmap_folders.get(&normalize_library_reference(&media.name))
+                let normalized_name = media.name.replace('\\', "/");
+                imported.project.asset_names.insert(
+                    asset_id,
+                    normalized_name
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&media.name)
+                        .to_string(),
+                );
+                let name_folder = library_folder_from_item_path(&normalized_name);
+                if let Some(folder) = name_folder
+                    .as_ref()
+                    .or_else(|| bitmap_folders.get(&normalize_library_reference(&media.name)))
                 {
                     if let Some(folder) = ensure_library_folder_paths(&mut imported.project, folder)
                     {
@@ -376,7 +401,12 @@ pub(crate) fn enrich_project(
     }
 
     for ((path, symbol), q0rg_id) in symbols.into_iter().zip(symbol_ids_by_path) {
-        let symbol_name = symbol.name.clone();
+        let normalized_name = symbol.name.replace('\\', "/");
+        let symbol_name = normalized_name
+            .rsplit('/')
+            .next()
+            .unwrap_or(&symbol.name)
+            .to_string();
         let built = build_q0rg(
             &symbol,
             q0rg_id,
@@ -477,7 +507,7 @@ fn normalize_library_folder_path(path: &str) -> Option<String> {
     (!segments.is_empty()).then(|| segments.join("/"))
 }
 
-fn ensure_library_folder_paths(project: &mut ProjectV2, path: &str) -> Option<String> {
+pub(crate) fn ensure_library_folder_paths(project: &mut ProjectV2, path: &str) -> Option<String> {
     let path = normalize_library_folder_path(path)?;
     let mut current = String::new();
     for segment in path.split('/') {
@@ -511,14 +541,28 @@ fn import_frame_tween(
     layer_name: &str,
     warnings: &mut Vec<String>,
 ) -> Tween {
-    let (RawTweenType::Motion, Some(to_frame)) = (frame.tween_type, next_frame) else {
+    // Motion and shape tweens share Animate's easing description; the caller
+    // decides which artwork the result applies to.
+    let (RawTweenType::Motion | RawTweenType::Shape, Some(to_frame)) =
+        (frame.tween_type, next_frame)
+    else {
         return Tween::None;
     };
     if to_frame <= frame.index {
         return Tween::None;
     }
     if frame.custom_ease_points.is_empty() {
-        return Tween::Linear { to_frame };
+        let Some(easing) = animate_easing(frame.ease_method.as_deref(), frame.ease_intensity)
+        else {
+            warnings.push(format!(
+                "'{q0rg_name}' layer '{layer_name}' frame {} has unsupported Animate ease method '{}' or intensity {}; imported as linear",
+                frame.index,
+                frame.ease_method.as_deref().unwrap_or("classic"),
+                frame.ease_intensity,
+            ));
+            return Tween::Linear { to_frame };
+        };
+        return Tween::Linear { to_frame }.with_easing(easing);
     }
     if frame.custom_ease_points.len() != 4 {
         warnings.push(format!(
@@ -545,6 +589,52 @@ fn import_frame_tween(
         ));
         Tween::Linear { to_frame }
     }
+}
+
+fn animate_easing(method: Option<&str>, intensity: f32) -> Option<Easing> {
+    let method = method.unwrap_or("classic");
+    if matches!(method, "none" | "linear") {
+        return Some(Easing::Linear);
+    }
+    if matches!(method, "classic" | "") {
+        if !intensity.is_finite() || !(-100.0..=100.0).contains(&intensity) {
+            return None;
+        }
+        if intensity == 0.0 {
+            return Some(Easing::Linear);
+        }
+        // Flash's classic ease blends linear progress with quadratic ease:
+        // positive intensity decelerates; negative intensity accelerates.
+        // Fixed x handles make this cubic exactly (1+s)*t - s*t*t.
+        let strength = intensity / 100.0;
+        return Some(Easing::CubicBezier {
+            x1: 1.0 / 3.0,
+            y1: (1.0 + strength) / 3.0,
+            x2: 2.0 / 3.0,
+            y2: (2.0 + strength) / 3.0,
+        });
+    }
+    let (family, mode) = if let Some(family) = method.strip_suffix("InOut") {
+        (family, EasingMode::InOut)
+    } else if let Some(family) = method.strip_suffix("Out") {
+        (family, EasingMode::Out)
+    } else {
+        (method.strip_suffix("In")?, EasingMode::In)
+    };
+    let family = match family {
+        "quad" => EasingFamily::Quad,
+        "cubic" => EasingFamily::Cubic,
+        "quart" => EasingFamily::Quart,
+        "quint" => EasingFamily::Quint,
+        "sine" => EasingFamily::Sine,
+        "expo" => EasingFamily::Expo,
+        "circ" => EasingFamily::Circ,
+        "back" => EasingFamily::Back,
+        "elastic" => EasingFamily::Elastic,
+        "bounce" => EasingFamily::Bounce,
+        _ => return None,
+    };
+    Some(Easing::Preset { family, mode })
 }
 
 fn camera_track_from_timeline(timeline: &RawTimeline, warnings: &mut Vec<String>) -> CameraTrack {
@@ -676,13 +766,26 @@ fn build_q0rg(
             for (frame_pos, frame) in raw_layer.frames.iter().enumerate() {
                 explicit_keyframes.push(frame.index);
                 let next_frame = raw_layer.frames.get(frame_pos + 1).map(|next| next.index);
-                let motion_tween = import_frame_tween(
+                let frame_tween = import_frame_tween(
                     frame,
                     next_frame,
                     q0rg_name,
                     &raw_layer.name,
                     &mut warnings,
                 );
+                // A motion tween moves instances; a shape tween morphs the
+                // drawn shapes and leaves instances on the frame held.
+                let (motion_tween, shape_tween) = match (frame.tween_type, frame_tween.to_frame()) {
+                    (RawTweenType::Shape, Some(to_frame)) => (
+                        Tween::None,
+                        Tween::Shape {
+                            to_frame,
+                            easing: frame_tween.easing(),
+                        },
+                    ),
+                    (RawTweenType::Motion, _) => (frame_tween, Tween::None),
+                    _ => (Tween::None, Tween::None),
+                };
                 for element in &frame.elements {
                     match element {
                         RawElement::Symbol(instance) => {
@@ -702,14 +805,6 @@ fn build_q0rg(
                                     .copied()
                                     .unwrap_or(1)
                                     .max(1);
-                                // Make imported loop playback explicit so it follows Flash's
-                                // placement-relative graphic-symbol clock instead of the legacy
-                                // q0rg parent-clock compatibility path.
-                                if playback.mode == Q0rgPlaybackMode::Loop
-                                    && playback.last_frame.is_none()
-                                {
-                                    playback.last_frame = Some(frame_count - 1);
-                                }
                                 let max_frame = frame_count - 1;
                                 let original_playback = playback;
                                 playback.first_frame = playback.first_frame.min(max_frame);
@@ -722,6 +817,16 @@ fn build_q0rg(
                                         "symbol '{}' playback range was adjusted to its {} available frames",
                                         instance.library_item_name, frame_count
                                     ));
+                                }
+                                if !matches!(
+                                    playback.mode,
+                                    Q0rgPlaybackMode::SingleFrame | Q0rgPlaybackMode::Manual
+                                ) {
+                                    playback.set_range(
+                                        playback.first_frame,
+                                        playback.last_frame.unwrap_or(max_frame),
+                                        frame_count,
+                                    );
                                 }
                                 if let Some(mode) = instance.unsupported_blend_mode.as_deref() {
                                     warnings.push(format!(
@@ -791,7 +896,7 @@ fn build_q0rg(
                                     frame: frame.index,
                                     target: Target::Asset(target),
                                     transform: Transform2D::IDENTITY,
-                                    tween: Tween::None,
+                                    tween: shape_tween,
                                     fx: PlacementFx::default(),
                                 });
                             }
@@ -848,7 +953,14 @@ fn build_q0rg(
             kind: raw_layer.kind,
             parent_folder_id,
             mask_layer_id: raw_layer
-                .mask_source_index
+                .parent_index
+                .filter(|index| {
+                    timeline
+                        .layers
+                        .get(*index)
+                        .is_some_and(|parent| parent.kind == LayerKind::Mask)
+                })
+                .or(raw_layer.mask_source_index)
                 .and_then(|mask_index| u16::try_from(mask_index + 1).ok()),
             collapsed: false,
             hidden: raw_layer.hidden,
@@ -1192,10 +1304,7 @@ fn parse_timeline(xml: &[u8], symbol_document: bool) -> Result<Option<RawTimelin
 
 fn parse_document_timelines(xml: &[u8]) -> Result<Vec<RawTimeline>, ImportError> {
     let mut timelines = Vec::new();
-    loop {
-        let Some(timeline) = parse_timeline_index(xml, false, timelines.len())? else {
-            break;
-        };
+    while let Some(timeline) = parse_timeline_index(xml, false, timelines.len())? {
         timelines.push(timeline);
         if timelines.len() >= usize::from(u16::MAX) {
             return Err(ImportError::Invalid("too many fla scenes".to_string()));
@@ -1267,6 +1376,10 @@ fn parse_timeline_index(
                     current_frame = Some((depth, frame));
                 } else if current_frame.is_some() && name == b"CustomEase" {
                     custom_ease_depth = Some(depth);
+                } else if current_frame.is_some() && name == b"Ease" {
+                    if let Some((_, frame)) = current_frame.as_mut() {
+                        read_frame_ease(&reader, &element, frame, &mut unsupported)?;
+                    }
                 } else if current_frame.is_some() && name == b"DOMGroup" {
                     groups.push(GroupState {
                         depth,
@@ -1387,6 +1500,10 @@ fn parse_timeline_index(
                     raw.affine = Affine::compose(group_affine(&groups), raw.affine);
                     if let Some((_, frame)) = current_frame.as_mut() {
                         frame.elements.push(RawElement::Bitmap(raw));
+                    }
+                } else if current_frame.is_some() && name == b"Ease" {
+                    if let Some((_, frame)) = current_frame.as_mut() {
+                        read_frame_ease(&reader, &element, frame, &mut unsupported)?;
                     }
                 } else if name == b"Point" && custom_ease_depth.is_some() {
                     if let Some((_, frame)) = current_frame.as_mut() {
@@ -1599,14 +1716,21 @@ fn parse_timeline_index(
         buf.clear();
     }
 
-    let mut active_mask = None;
-    for (index, layer) in layers.iter_mut().enumerate() {
-        if layer.kind == LayerKind::Mask {
-            active_mask = Some(index);
-        } else if layer.masked {
-            layer.mask_source_index = active_mask;
-        } else {
-            active_mask = None;
+    let mut masks_by_parent = HashMap::new();
+    for index in 0..layers.len() {
+        let parent = layers[index].parent_index;
+        let explicit_mask =
+            parent.filter(|p| layers.get(*p).is_some_and(|l| l.kind == LayerKind::Mask));
+        layers[index].mask_source_index = explicit_mask.or_else(|| {
+            layers[index]
+                .masked
+                .then(|| masks_by_parent.get(&parent).copied())
+                .flatten()
+        });
+        if layers[index].kind == LayerKind::Mask {
+            masks_by_parent.insert(parent, index);
+        } else if !layers[index].masked && layers[index].kind != LayerKind::Folder {
+            masks_by_parent.remove(&parent);
         }
     }
 
@@ -1716,9 +1840,31 @@ fn raw_frame(reader: &Reader<&[u8]>, element: &BytesStart<'_>) -> Result<RawFram
         index,
         duration,
         tween_type,
+        ease_method: attr(reader, element, b"easeMethodName")?,
+        ease_intensity: parse_f32_attr(reader, element, b"tweenEasing", 0.0)?,
         custom_ease_points: Vec::new(),
         elements: Vec::new(),
     })
+}
+
+fn read_frame_ease(
+    reader: &Reader<&[u8]>,
+    element: &BytesStart<'_>,
+    frame: &mut RawFrame,
+    unsupported: &mut HashSet<String>,
+) -> Result<(), ImportError> {
+    let target = attr(reader, element, b"target")?.unwrap_or_else(|| "all".to_string());
+    if target != "all" {
+        unsupported.insert(format!(
+            "property-specific tween ease for '{target}' is not imported yet; the shared frame ease is used"
+        ));
+        return Ok(());
+    }
+    // The <Ease> entry is authoritative; old XFL stores only its intensity,
+    // while newer Animate stores the preset method here and on DOMFrame.
+    frame.ease_method = attr(reader, element, b"method")?;
+    frame.ease_intensity = parse_f32_attr(reader, element, b"intensity", frame.ease_intensity)?;
+    Ok(())
 }
 
 fn raw_bitmap_instance(
@@ -1941,6 +2087,8 @@ fn raw_instance(
         glow: None,
         playback: Q0rgPlayback {
             mode,
+            speed_percent: 100,
+            placement_relative: true,
             first_frame: first,
             last_frame: last,
             single_frame: first,

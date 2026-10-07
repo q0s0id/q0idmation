@@ -26,7 +26,6 @@ fn sample_project() -> Q1Project {
             frame_count: 2,
             layers: vec![Q1Layer {
                 layer_id: 1,
-                timeline_frame_count: None,
                 name: "Layer1".to_string(),
                 placements: vec![Q1Placement {
                     frame: 0,

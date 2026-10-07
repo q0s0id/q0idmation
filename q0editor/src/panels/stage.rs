@@ -131,6 +131,8 @@ pub(crate) fn render_animation_preview(app: &mut EditorApp, ctx: &egui::Context)
                 app.animation_preview_textures.invalidate();
                 app.animation_preview_revision = Some(revision);
             }
+            app.animation_preview_textures.video_playback_active =
+                app.session.animation_preview_playing;
             let pass = StageRenderPass::new_with_revision(
                 &app.state.project,
                 &mut app.animation_preview_textures,
@@ -298,7 +300,9 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     }
     if !library_drag_active && !editing_text && !camera_editing {
         let tools_started = std::time::Instant::now();
-        crate::tools::handle(app, &response, &painter, &view, &ctx);
+        if !crate::frame_edit::handle(app, &response, &view, &ctx) {
+            crate::tools::handle(app, &response, &painter, &view, &ctx);
+        }
         app.perf
             .record(crate::perf::PerfSpan::ToolHandle, tools_started.elapsed());
     }
@@ -312,15 +316,36 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         .iter()
         .filter_map(|(outlined_q0rg, layer_id)| (*outlined_q0rg == q0rg_id).then_some(*layer_id))
         .collect::<std::collections::HashSet<_>>();
-    app.textures.hidden_text_placement = app
-        .session
-        .text_editor
-        .as_ref()
-        .and_then(|draft| draft.placement)
-        .map(|r| (r.q0rg_id, r.layer_id, r.placement_idx));
+    let text_preview = crate::text_tool::scene_preview(app, &ctx);
+    let preview_state_id = egui::Id::new("painted_text_scene_preview");
+    let previous_preview = ctx.data(|data| data.get_temp::<(u64, u16)>(preview_state_id));
+    let current_preview = text_preview.as_ref().map(|p| (p.revision, p.asset_id));
+    if previous_preview != current_preview {
+        if let Some((_, id)) = current_preview.or(previous_preview) {
+            app.textures.invalidate_asset(id);
+        }
+        ctx.data_mut(|data| {
+            if let Some(current) = current_preview {
+                data.insert_temp(preview_state_id, current);
+            } else {
+                data.remove::<(u64, u16)>(preview_state_id);
+            }
+        });
+    }
+    app.textures.hidden_text_placement = if text_preview.is_some() {
+        None
+    } else {
+        app.session
+            .text_editor
+            .as_ref()
+            .and_then(|draft| draft.placement)
+            .map(|r| (r.q0rg_id, r.layer_id, r.placement_idx))
+    };
     app.textures.interactive_transform = ui.input(|i| i.pointer.primary_down());
-    app.textures.gpu_filter_cache_enabled =
-        !app.session.playing && !app.textures.interactive_transform && !app.session.onion.enabled;
+    app.textures.gpu_filter_cache_enabled = !app.session.playing
+        && !app.textures.interactive_transform
+        && !app.session.onion.enabled
+        && !app.session.onion.edit_frames;
 
     // Editing inside a q0rg uses a subtle full-stage veil. The veil is drawn
     // before the symbol, so the current q0rg remains crisp while the canvas
@@ -333,7 +358,9 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     // every onion frame plus the live frame painted below.
     let render_revision = (
         app.active_project_tab_id().unwrap_or(0),
-        app.state.render_revision(),
+        text_preview
+            .as_ref()
+            .map_or(app.state.render_revision(), |p| p.revision),
     );
     let hidden_mask_art_layers = app
         .session
@@ -349,11 +376,14 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         app.textures.hidden_mask_art_layers = hidden_mask_art_layers;
     }
     app.textures.editing_mask_q0rg_id = Some(q0rg_id);
+    app.textures.video_playback_active = app.session.playing;
     app.textures.reset_stage_traversal_stats();
     q0glblend::reset_paint_diagnostics();
     let scene_started = std::time::Instant::now();
     let render_pass = StageRenderPass::new_with_revision(
-        &app.state.project,
+        text_preview
+            .as_ref()
+            .map_or(&app.state.project, |p| p.project.as_ref()),
         &mut app.textures,
         Some(render_revision),
     );
@@ -430,6 +460,31 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 Color32::WHITE,
                 &excluded,
             );
+        }
+        if app.session.onion.edit_frames {
+            for (sample, layers) in crate::frame_edit::preview_layers(app) {
+                let excluded = app
+                    .state
+                    .project
+                    .q0rgs
+                    .iter()
+                    .find(|q| q.q0rg_id == q0rg_id)
+                    .into_iter()
+                    .flat_map(|q| &q.layers)
+                    .filter(|l| !layers.contains(&l.layer_id))
+                    .map(|l| l.layer_id)
+                    .collect();
+                render_pass.render_tinted_excluding_layers(
+                    &painter,
+                    q0rg_id,
+                    sample,
+                    &view,
+                    &mut app.textures,
+                    ui.ctx(),
+                    Color32::WHITE,
+                    &excluded,
+                );
+            }
         }
         if app.session.onion.enabled {
             let excluded_layers: std::collections::HashSet<_> = app
@@ -548,6 +603,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     }
     let scene_elapsed = scene_started.elapsed();
     let traversal = app.textures.stage_traversal_stats();
+    app.textures.record_stage_work_timings(&mut app.perf);
     let gpu = q0glblend::take_paint_diagnostics();
     let gpu_timing = q0glblend::take_gpu_callback_timing();
     app.perf.set_scene_context(crate::perf::ScenePerfContext {
@@ -706,7 +762,9 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
 
     // Canvas text UI and transient overlays stay above the freshly rendered scene.
     let editing_text = crate::text_tool::render_canvas(app, ui, &view);
-    if !editing_text {
+    if !editing_text && app.session.onion.edit_frames {
+        crate::frame_edit::draw_overlay(app, &painter, &view);
+    } else if !editing_text {
         crate::tools::draw_overlay(app, &response, &painter, &view);
         let selection_started = std::time::Instant::now();
         crate::tools::draw_selection_overlay(app, &painter, &view);
@@ -719,7 +777,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
 
     // Right-click context menu — pre-select the placement under cursor so the
     // menu's actions act on what the user actually right-clicked.
-    if response.secondary_clicked() {
+    if response.secondary_clicked() && !app.session.onion.edit_frames && !editing_text {
         if let Some(p) = response.interact_pointer_pos() {
             let stage_pos = view.screen_to_stage(p);
             let clicked_selection = crate::tools::selection_at_point_cached_for_scale(
@@ -746,7 +804,9 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             }
         }
     }
-    response.context_menu(|ui| stage_context_menu(app, ui));
+    if !editing_text {
+        response.context_menu(|ui| stage_context_menu(app, ui));
+    }
 
     if !breadcrumb_is_at_root(app) {
         let inner = Rect::from_min_size(stage_rect.min, vec2(stage_rect.width(), 18.0));
@@ -771,7 +831,8 @@ fn handle_camera_stage_input(
     ctx: &egui::Context,
 ) {
     if response.drag_started_by(PointerButton::Primary) {
-        app.history.snapshot(&app.state.project);
+        app.history
+            .snapshot_with_session(&app.state.project, &app.session);
     }
     if !response.dragged_by(PointerButton::Primary) {
         return;
@@ -1121,8 +1182,10 @@ fn breadcrumb_bar(app: &mut EditorApp, ui: &mut Ui) {
             .first()
             .copied()
             .unwrap_or(app.session.current_q0rg_id);
-        let root_name = q0rg_name(app, root_q0rg_id, "Stage");
-        chain.push((0, root_name, app.session.breadcrumb.is_empty()));
+        if !app.session.breadcrumb.is_empty() {
+            let root_name = q0rg_name(app, root_q0rg_id, "Stage");
+            chain.push((0, root_name, false));
+        }
         for (i, parent_id) in app.session.breadcrumb.iter().enumerate().skip(1) {
             let nm = q0rg_name(app, *parent_id, "Unknown");
             chain.push((i, nm, false));
@@ -1223,6 +1286,27 @@ fn current_q0rg_name(app: &EditorApp) -> String {
 }
 
 fn stage_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
+    if app.session.onion.edit_frames {
+        if ui.button("Select all objects in range").clicked() {
+            crate::frame_edit::select_all(app);
+            ui.close_menu();
+        }
+        if ui
+            .add_enabled(
+                !app.session.frame_edit_selection.is_empty(),
+                egui::Button::new("Delete selected objects"),
+            )
+            .clicked()
+        {
+            app.queue(Action::DeleteSelection);
+            ui.close_menu();
+        }
+        if ui.button("Exit multiple-frame editing").clicked() {
+            crate::frame_edit::disable(app);
+            ui.close_menu();
+        }
+        return;
+    }
     use crate::state::Selection;
     let has_selection = !matches!(app.session.selection, Selection::None);
     let has_clip = app.has_clipboard();
@@ -1544,8 +1628,8 @@ fn selected_has_stroke(app: &EditorApp) -> bool {
 /// strongest, the furthest barely a ghost.
 fn onion_tint_for(
     offset: i32,
-    before: u8,
-    after: u8,
+    before: u16,
+    after: u16,
     past: egui::Color32,
     future: egui::Color32,
 ) -> egui::Color32 {

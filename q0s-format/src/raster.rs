@@ -28,6 +28,8 @@ use crate::v2::{
     Transform2D, Vec2, VectorAppearance, VectorAsset, VectorMaterial, MAX_Q0RG_NESTING_DEPTH,
 };
 
+mod video;
+
 /// Render one frame of `q0rg_id` (resolved against `project`) into an
 /// RGBA8 buffer of size `w Р“вЂ” h`. `ss` controls supersample factor:
 ///   * `ss = 1`: no AA, fast РІР‚вЂќ fine for live playback.
@@ -234,7 +236,10 @@ fn asset_stage_bounds(
         },
         Asset::Vector(vector) => vector_local_visual_bounds(project, vector)?,
         Asset::Q0v(video) => {
-            let media = q0video::q0v::Q0vFile::parse(video.bytes.as_ref().clone()).ok()?;
+            let media = q0video::q0v::probe_header(&video.bytes).ok()?;
+            if !media.spec.video {
+                return None;
+            }
             StageBounds {
                 min_x: 0.0,
                 min_y: 0.0,
@@ -278,17 +283,29 @@ fn placement_target_stage_bounds(
     project: &ProjectV2,
     host_q0rg_id: u16,
     placement: &Placement,
+    playback_start_frame: u16,
     resolved_fx: PlacementFx,
     local_frame: u16,
     composed: Affine,
     depth: u8,
     scene_state: &RuntimeSceneState,
+    cache: Option<&RuntimeBoundsCache>,
 ) -> Option<StageBounds> {
     if depth > MAX_Q0RG_NESTING_DEPTH {
         return None;
     }
     let rig = crate::rig::rig_for_q0rg(project, host_q0rg_id);
-    let rig_pose = rig.map(|rig| crate::rig::evaluate_rig(rig, f32::from(local_frame), &[]));
+    let rig_pose = rig.map(|rig| {
+        crate::rig::evaluate_rig(
+            rig,
+            f32::from(local_frame),
+            scene_state
+                .rig_overrides
+                .get(&host_q0rg_id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        )
+    });
     let target = match (rig, rig_pose.as_ref()) {
         (Some(rig), Some(pose)) => {
             crate::rig::resolved_variant_target(rig, pose, placement.instance_id, placement.target)
@@ -305,6 +322,16 @@ fn placement_target_stage_bounds(
                 }
                 _ => None,
             };
+            if deformed.is_none() {
+                if let Some(cache) = cache {
+                    return cache
+                        .assets
+                        .get(&asset_id)
+                        .copied()
+                        .flatten()
+                        .map(|bounds| bounds.transform(composed));
+                }
+            }
             asset_stage_bounds(project, deformed.as_ref().unwrap_or(asset), composed)
         }
 
@@ -313,16 +340,19 @@ fn placement_target_stage_bounds(
                 project,
                 child_id,
                 local_frame,
-                placement.frame,
+                playback_start_frame,
                 resolved_fx.q0rg_playback,
             );
+            let key = InstanceKey::new(host_q0rg_id, placement.instance_id);
+            let (child_frame, child_scene) = scene_state.child_context(key, child_frame);
             q0rg_stage_bounds(
                 project,
                 child_id,
                 child_frame,
                 composed,
                 depth + 1,
-                scene_state,
+                child_scene,
+                cache,
             )
         }
         Target::Q0rg(_) => None,
@@ -336,6 +366,7 @@ fn q0rg_stage_bounds(
     parent: Affine,
     depth: u8,
     scene_state: &RuntimeSceneState,
+    cache: Option<&RuntimeBoundsCache>,
 ) -> Option<StageBounds> {
     if depth > MAX_Q0RG_NESTING_DEPTH {
         return None;
@@ -347,8 +378,17 @@ fn q0rg_stage_bounds(
         0
     };
     let mut bounds: Option<StageBounds> = None;
-    let rig_pose = crate::rig::rig_for_q0rg(project, q0rg_id)
-        .map(|rig| crate::rig::evaluate_rig(rig, f32::from(local_frame), &[]));
+    let rig_pose = crate::rig::rig_for_q0rg(project, q0rg_id).map(|rig| {
+        crate::rig::evaluate_rig(
+            rig,
+            f32::from(local_frame),
+            scene_state
+                .rig_overrides
+                .get(&q0rg_id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        )
+    });
     for layer in &q0rg.layers {
         if !project.layer_is_visible(q0rg_id, layer.layer_id) {
             continue;
@@ -368,11 +408,13 @@ fn q0rg_stage_bounds(
                 project,
                 q0rg_id,
                 placement,
+                active.playback_start_frame,
                 active.fx,
                 local_frame,
                 composed,
                 depth,
                 scene_state,
+                cache,
             ) else {
                 continue;
             };
@@ -407,15 +449,61 @@ impl RuntimeInstanceMetrics {
     }
 }
 
+/// Precomputed bounds of immutable authored assets. Rebuild when replacing
+/// the project; transforms, nested playback and rig deformation stay dynamic.
+#[derive(Debug)]
+pub struct RuntimeBoundsCache {
+    assets: HashMap<u16, Option<StageBounds>>,
+}
+
+impl RuntimeBoundsCache {
+    pub fn new(project: &ProjectV2) -> Self {
+        Self {
+            assets: project
+                .assets
+                .iter()
+                .map(|asset| {
+                    (
+                        asset.id(),
+                        asset_stage_bounds(project, asset, Affine::IDENTITY),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Resolve one stable display-object instance at a host q0rg frame using the
 /// same visual bounds path as the shared renderer. Runtime position overrides
 /// are ephemeral and do not mutate `ProjectV2`.
 pub fn runtime_instance_metrics(
     project: &ProjectV2,
+    owner: u16,
+    frame: u16,
+    instance: u32,
+    scene: &RuntimeSceneState,
+) -> Option<RuntimeInstanceMetrics> {
+    runtime_instance_metrics_impl(project, owner, frame, instance, scene, None)
+}
+
+pub fn runtime_instance_metrics_with_cache(
+    project: &ProjectV2,
+    owner: u16,
+    frame: u16,
+    instance: u32,
+    scene: &RuntimeSceneState,
+    cache: &RuntimeBoundsCache,
+) -> Option<RuntimeInstanceMetrics> {
+    runtime_instance_metrics_impl(project, owner, frame, instance, scene, Some(cache))
+}
+
+fn runtime_instance_metrics_impl(
+    project: &ProjectV2,
     host_q0rg_id: u16,
     frame: u16,
     instance_id: u32,
     scene_state: &RuntimeSceneState,
+    cache: Option<&RuntimeBoundsCache>,
 ) -> Option<RuntimeInstanceMetrics> {
     if instance_id == 0 {
         return None;
@@ -429,8 +517,17 @@ pub fn runtime_instance_metrics(
     } else {
         0
     };
-    let rig_pose = crate::rig::rig_for_q0rg(project, host_q0rg_id)
-        .map(|rig| crate::rig::evaluate_rig(rig, f32::from(local_frame), &[]));
+    let rig_pose = crate::rig::rig_for_q0rg(project, host_q0rg_id).map(|rig| {
+        crate::rig::evaluate_rig(
+            rig,
+            f32::from(local_frame),
+            scene_state
+                .rig_overrides
+                .get(&host_q0rg_id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        )
+    });
     for layer in &q0rg.layers {
         if !project.layer_is_visible(host_q0rg_id, layer.layer_id) {
             continue;
@@ -450,11 +547,13 @@ pub fn runtime_instance_metrics(
                 project,
                 host_q0rg_id,
                 placement,
+                active.playback_start_frame,
                 active.fx,
                 local_frame,
                 effective,
                 0,
                 scene_state,
+                cache,
             )?;
             let visible = bounds_with_placement_fx(target, active.fx, effective.uniform_scale());
             return Some(RuntimeInstanceMetrics {
@@ -496,17 +595,21 @@ pub fn rasterize_placement_fx_scaled_cropped(
     if w == 0 || h == 0 {
         return None;
     }
+    let playback_start_frame =
+        crate::v2::placement_playback_start_frame(project, host_q0rg_id, placement);
     let stage_w = f32::from(project.meta.stage_width.max(1));
     let stage_h = f32::from(project.meta.stage_height.max(1));
     let target_bounds = placement_target_stage_bounds(
         project,
         host_q0rg_id,
         placement,
+        playback_start_frame,
         fx,
         local_frame,
         composed_stage_transform,
         0,
         &RuntimeSceneState::new(),
+        None,
     )?;
     let fx_bounds =
         bounds_with_placement_fx(target_bounds, fx, composed_stage_transform.uniform_scale());
@@ -546,6 +649,7 @@ pub fn rasterize_placement_fx_scaled_cropped(
         project,
         host_q0rg_id,
         placement,
+        playback_start_frame,
         fx,
         local_frame,
         composed_pixels,
@@ -557,6 +661,7 @@ pub fn rasterize_placement_fx_scaled_cropped(
         &RuntimeSceneState::new(),
         rig,
         rig_pose.as_ref(),
+        None,
     );
     let mut filtered = vec![0u8; len];
     let local_fx = PlacementFx {
@@ -609,17 +714,21 @@ pub fn rasterize_placement_outer_fx_scaled_cropped(
         return None;
     }
 
+    let playback_start_frame =
+        crate::v2::placement_playback_start_frame(project, host_q0rg_id, placement);
     let stage_w = f32::from(project.meta.stage_width.max(1));
     let stage_h = f32::from(project.meta.stage_height.max(1));
     let target_bounds = placement_target_stage_bounds(
         project,
         host_q0rg_id,
         placement,
+        playback_start_frame,
         fx,
         local_frame,
         composed_stage_transform,
         0,
         &RuntimeSceneState::new(),
+        None,
     )?;
     let outer_fx = PlacementFx {
         opacity: fx.opacity,
@@ -672,6 +781,7 @@ pub fn rasterize_placement_outer_fx_scaled_cropped(
         project,
         host_q0rg_id,
         placement,
+        playback_start_frame,
         fx,
         local_frame,
         composed_pixels,
@@ -683,6 +793,7 @@ pub fn rasterize_placement_outer_fx_scaled_cropped(
         &RuntimeSceneState::new(),
         rig,
         rig_pose.as_ref(),
+        None,
     );
     let source_alpha = alpha_channel(&source);
     if source_alpha.iter().all(|alpha| *alpha == 0) {
@@ -1119,10 +1230,14 @@ fn render_layer_contents(
     scene_state: &RuntimeSceneState,
     rig_pose: Option<&crate::rig::RigPose>,
 ) {
+    let shape_morph = crate::shape_tween::project_layer_morph(project, layer, local_frame);
     for active in active_placement_states_at(layer, local_frame) {
         let Some(placement) = layer.placements.get(active.index) else {
             continue;
         };
+        let morphed = shape_morph
+            .as_ref()
+            .and_then(|morph| morph.for_placement(active.index));
         let authored_affine = rig_pose
             .and_then(|pose| pose.binding_transform(placement.instance_id))
             .unwrap_or_else(|| Affine::from_transform(active.transform));
@@ -1134,6 +1249,7 @@ fn render_layer_contents(
                 project,
                 q0rg_id,
                 placement,
+                active.playback_start_frame,
                 active.fx,
                 local_frame,
                 composed,
@@ -1145,6 +1261,7 @@ fn render_layer_contents(
                 scene_state,
                 crate::rig::rig_for_q0rg(project, q0rg_id),
                 rig_pose,
+                morphed,
             );
         } else {
             let mut source = vec![0u8; buffer.len()];
@@ -1152,6 +1269,7 @@ fn render_layer_contents(
                 project,
                 q0rg_id,
                 placement,
+                active.playback_start_frame,
                 active.fx,
                 local_frame,
                 composed,
@@ -1163,6 +1281,7 @@ fn render_layer_contents(
                 scene_state,
                 crate::rig::rig_for_q0rg(project, q0rg_id),
                 rig_pose,
+                morphed,
             );
             apply_placement_fx(buffer, &source, w, h, active.fx, composed.uniform_scale());
         }
@@ -1187,10 +1306,14 @@ fn render_masked_layer_contents(
 ) {
     let mut source = vec![0u8; buffer.len()];
     let mut effected = vec![0u8; buffer.len()];
+    let shape_morph = crate::shape_tween::project_layer_morph(project, layer, local_frame);
     for active in active_placement_states_at(layer, local_frame) {
         let Some(placement) = layer.placements.get(active.index) else {
             continue;
         };
+        let morphed = shape_morph
+            .as_ref()
+            .and_then(|morph| morph.for_placement(active.index));
         source.fill(0);
         let authored_affine = rig_pose
             .and_then(|pose| pose.binding_transform(placement.instance_id))
@@ -1202,6 +1325,7 @@ fn render_masked_layer_contents(
             project,
             q0rg_id,
             placement,
+            active.playback_start_frame,
             active.fx,
             local_frame,
             composed,
@@ -1213,6 +1337,7 @@ fn render_masked_layer_contents(
             scene_state,
             crate::rig::rig_for_q0rg(project, q0rg_id),
             rig_pose,
+            morphed,
         );
         let source_to_composite = if active.fx.is_identity() {
             &mut source
@@ -1246,6 +1371,7 @@ fn render_placement_target(
     project: &ProjectV2,
     host_q0rg_id: u16,
     placement: &Placement,
+    playback_start_frame: u16,
     resolved_fx: PlacementFx,
     local_frame: u16,
     composed: Affine,
@@ -1257,7 +1383,23 @@ fn render_placement_target(
     scene_state: &RuntimeSceneState,
     rig: Option<&crate::v2::RigAsset>,
     rig_pose: Option<&crate::rig::RigPose>,
+    morphed: Option<&[crate::v2::VectorAsset]>,
 ) {
+    if let Some(shapes) = morphed {
+        // Inside a shape tween the stored asset is replaced by its in-between.
+        for shape in shapes {
+            let mut context = AssetRasterContext {
+                transform: composed,
+                buffer: &mut *buffer,
+                width: w,
+                height: h,
+                elapsed_host_frames: 0,
+                host_fps: project.meta.fps,
+            };
+            rasterize_asset(&Asset::Vector(shape.clone()), None, &mut context);
+        }
+        return;
+    }
     let target = match (rig, rig_pose) {
         (Some(rig), Some(pose)) => {
             crate::rig::resolved_variant_target(rig, pose, placement.instance_id, placement.target)
@@ -1285,7 +1427,7 @@ fn render_placement_target(
                     buffer,
                     width: w,
                     height: h,
-                    elapsed_host_frames: local_frame.saturating_sub(placement.frame),
+                    elapsed_host_frames: local_frame.saturating_sub(playback_start_frame),
                     host_fps: project.meta.fps,
                 };
                 rasterize_asset(asset, project.asset_appearances.get(&id), &mut context);
@@ -1296,7 +1438,7 @@ fn render_placement_target(
                 project,
                 child_id,
                 local_frame,
-                placement.frame,
+                playback_start_frame,
                 resolved_fx.q0rg_playback,
             );
             render_to_buffer(
@@ -1717,6 +1859,8 @@ fn apply_placement_fx(
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ActivePlacementState {
     pub index: usize,
+    /// Origin of this continuous symbol/video track, independent of F6 keys.
+    pub playback_start_frame: u16,
     pub transform: Transform2D,
     pub fx: PlacementFx,
 }
@@ -1755,6 +1899,10 @@ pub fn active_placement_states_at(
     if source_indices.is_empty() {
         return Vec::new();
     }
+    // A first-key hold has no earlier segment to look up, even if the layer
+    // contains thousands of future keys. The editor indexes other keys once.
+    let playback_starts =
+        (keyframe != 0).then(|| crate::v2::placement_playback_start_frames(layer));
 
     // Most held frames have no tween at all: avoid building any destination
     // index in that overwhelmingly common case.
@@ -1771,6 +1919,9 @@ pub fn active_placement_states_at(
                 let placement = &layer.placements[index];
                 ActivePlacementState {
                     index,
+                    playback_start_frame: playback_starts
+                        .as_ref()
+                        .map_or(placement.frame, |starts| starts[index]),
                     transform: placement.transform,
                     fx: placement.fx,
                 }
@@ -1809,6 +1960,9 @@ pub fn active_placement_states_at(
             let source_occurrence = *occurrence;
             *occurrence += 1;
             let (transform, fx) = match placement.tween.to_frame() {
+                // A shape tween morphs geometry (see `crate::shape_tween`);
+                // the placement itself is held.
+                Some(_) if placement.tween.is_shape() => (placement.transform, placement.fx),
                 Some(to_frame) if to_frame > keyframe && frame >= keyframe => {
                     let target = destinations
                         .get(&(to_frame, key.0, key.1))
@@ -1830,6 +1984,9 @@ pub fn active_placement_states_at(
             };
             ActivePlacementState {
                 index,
+                playback_start_frame: playback_starts
+                    .as_ref()
+                    .map_or(placement.frame, |starts| starts[index]),
                 transform,
                 fx,
             }
@@ -1928,31 +2085,12 @@ fn rasterize_asset(
             context.height,
         ),
         Asset::Q0v(v) => {
-            let Ok(media) = q0video::q0v::Q0vFile::parse(v.bytes.as_ref().clone()) else {
-                return;
-            };
-            let Some(frame_index) = media.spec.video_frame_for_host_frame(
-                u32::from(context.elapsed_host_frames),
-                u32::from(context.host_fps.max(1)),
-            ) else {
-                return;
-            };
-            let Ok(rgba) = media.decode_frame_rgba(frame_index) else {
-                return;
-            };
-            let Ok(width) = u16::try_from(media.spec.width) else {
-                return;
-            };
-            let Ok(height) = u16::try_from(media.spec.height) else {
+            let Some(bitmap) = video::frame(v, context.elapsed_host_frames, context.host_fps)
+            else {
                 return;
             };
             rasterize_bitmap(
-                &BitmapAsset {
-                    asset_id: v.asset_id,
-                    width,
-                    height,
-                    rgba,
-                },
+                &bitmap,
                 context.transform,
                 context.buffer,
                 context.width,
@@ -2447,7 +2585,7 @@ fn rasterize_vector(
                     continue;
                 }
                 let world: Vec<Vec2> = polyline_local.iter().map(|point| t.apply(*point)).collect();
-                let half = (stroke.width * 0.5 * t.uniform_scale()).max(0.5);
+                let half = stroke.width * 0.5 * t.uniform_scale();
                 let outline = brush_outline(&world, half, 8);
                 if outline.len() >= 3 {
                     scanline_fill(&outline, stroke.color, buffer, w, h);
@@ -2478,7 +2616,7 @@ fn rasterize_vector(
         let world: Vec<Vec2> = polyline_local.iter().map(|p| t.apply(*p)).collect();
 
         if let Some(stroke) = &v.stroke {
-            let half = (stroke.width * 0.5 * t.uniform_scale()).max(0.5);
+            let half = stroke.width * 0.5 * t.uniform_scale();
             let outline = brush_outline(&world, half, 8);
             if outline.len() >= 3 {
                 scanline_fill(&outline, stroke.color, buffer, w, h);
@@ -3462,7 +3600,11 @@ mod resolver_tests {
             .map(|(source_order, index)| {
                 let placement = &layer.placements[*index];
                 let (transform, fx) = match placement.tween.to_frame() {
-                    Some(to_frame) if to_frame > keyframe && frame >= keyframe => {
+                    Some(to_frame)
+                        if to_frame > keyframe
+                            && frame >= keyframe
+                            && !placement.tween.is_shape() =>
+                    {
                         let occurrence = source_indices[..source_order]
                             .iter()
                             .filter(|candidate| {
@@ -3493,6 +3635,7 @@ mod resolver_tests {
                 };
                 ActivePlacementState {
                     index: *index,
+                    playback_start_frame: crate::v2::placement_playback_start_frames(layer)[*index],
                     transform,
                     fx,
                 }

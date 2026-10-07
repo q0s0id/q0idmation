@@ -312,16 +312,16 @@ fn selected_raw_vectors(project: &ProjectV2, selection: &Selection) -> Vec<RawVe
         placements,
         bounds_min,
         bounds_max,
-        clip_polygon,
+        clip_region,
         ..
     } = selection
     else {
         return Vec::new();
     };
-    let clip = MultiPolygon(vec![crate::tools::selection_clip_polygon(
+    let clip = crate::tools::selection_clip_region(
         (bounds_min.x, bounds_min.y, bounds_max.x, bounds_max.y),
-        clip_polygon.as_deref(),
-    )]);
+        clip_region.as_ref(),
+    );
     let mut vectors = Vec::new();
     for reference in placements {
         let Some(placement) = placement_clone(project, *reference) else {
@@ -336,7 +336,7 @@ fn selected_raw_vectors(project: &ProjectV2, selection: &Selection) -> Vec<RawVe
             continue;
         };
         if vector.fill.is_none() && vector.stroke.is_some() {
-            let (paths, _) = crate::tools::clip_stroked_paths(vector, &clip.0[0]);
+            let (paths, _) = crate::tools::clip_stroked_paths_in_region(vector, &clip);
             if !paths.is_empty() {
                 vectors.push(RawVectorClipboard {
                     vector: VectorAsset {
@@ -354,7 +354,7 @@ fn selected_raw_vectors(project: &ProjectV2, selection: &Selection) -> Vec<RawVe
         if vector.fill.is_some() && vector.stroke.is_some() {
             let selected_fill = source.intersection(&clip);
             let (selected_stroke, remainder_stroke) =
-                crate::tools::clip_stroked_paths(vector, &clip.0[0]);
+                crate::tools::clip_stroked_paths_in_region(vector, &clip);
             let whole_fill = source.difference(&clip).unsigned_area() <= 0.05;
             if whole_fill && remainder_stroke.is_empty() {
                 let mut snapshot = vector.clone();
@@ -401,7 +401,7 @@ fn selected_raw_vectors(project: &ProjectV2, selection: &Selection) -> Vec<RawVe
         // A marquee can be recorded from authored anchor bounds while the cubic
         // handles bow a tiny amount outside that rectangle. Treat that as a
         // whole-path selection rather than destructively polygonizing the curve.
-        let authored_whole_path = if clip_polygon.is_none() {
+        let authored_whole_path = if clip_region.is_none() {
             let mut saw_closed_anchor = false;
             let mut all_inside = true;
             for path in vector.paths.iter().filter(|path| path.closed) {
@@ -530,6 +530,9 @@ pub fn paste_payload_with_depth(
     source_depths: &[usize],
 ) -> PasteResult {
     let mut result = PasteResult::default();
+    if payload.validate_for_q0rg(project, q0rg_id).is_err() {
+        return result;
+    }
     let Some(materialized) =
         crate::tools::materialize_layer_keyframe_for_edit(project, q0rg_id, layer_id, frame)
     else {
@@ -838,13 +841,13 @@ pub fn remove_raw_area_and_objects(
     objects: &[PlacementRef],
     bounds_min: Vec2,
     bounds_max: Vec2,
-    clip_polygon: Option<&[Vec2]>,
+    clip_region: Option<&MultiPolygon<f64>>,
     frame: u16,
 ) -> bool {
-    let clip = MultiPolygon(vec![crate::tools::selection_clip_polygon(
+    let clip = crate::tools::selection_clip_region(
         (bounds_min.x, bounds_min.y, bounds_max.x, bounds_max.y),
-        clip_polygon,
-    )]);
+        clip_region,
+    );
     let affected_layers: BTreeSet<(u16, u16)> = raw_placements
         .iter()
         .chain(objects.iter())
@@ -916,7 +919,7 @@ pub fn remove_raw_area_and_objects(
             let surface = crate::tools::vector_fill_geometry(&snapshot);
             let selected_fill = surface.intersection(&clip);
             let (selected_stroke, remainder_stroke) =
-                crate::tools::clip_stroked_paths(&snapshot, &clip.0[0]);
+                crate::tools::clip_stroked_paths_in_region(&snapshot, &clip);
             if selected_fill.unsigned_area() <= 0.05 && selected_stroke.is_empty() {
                 continue;
             }
@@ -968,7 +971,8 @@ pub fn remove_raw_area_and_objects(
             continue;
         }
         if snapshot.fill.is_none() && snapshot.stroke.is_some() {
-            let (selected, remainder) = crate::tools::clip_stroked_paths(&snapshot, &clip.0[0]);
+            let (selected, remainder) =
+                crate::tools::clip_stroked_paths_in_region(&snapshot, &clip);
             if selected.is_empty() {
                 continue;
             }
@@ -1135,7 +1139,7 @@ pub fn selection_from_paste(result: PasteResult) -> Selection {
             objects: result.objects,
             bounds_min,
             bounds_max,
-            clip_polygon: None,
+            clip_region: None,
         };
     }
     if !result.raw_paths.is_empty() {

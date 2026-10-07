@@ -4,7 +4,7 @@
 use egui::{Color32, Context, PointerButton, Response};
 use q0s_format::transform::Affine;
 use q0s_format::v2::{
-    Anchor, Asset, Path, Placement, Rgba, Target, Transform2D, Tween, Vec2, VectorAsset,
+    Anchor, Asset, Path, Placement, ProjectV2, Rgba, Target, Transform2D, Tween, Vec2, VectorAsset,
 };
 use ttf_parser::{Face, OutlineBuilder};
 
@@ -38,6 +38,166 @@ pub struct TextDraft {
     pub font_previews: std::collections::HashMap<String, Option<egui::Mesh>>,
     pub color: Rgba,
     pub focus_requested: bool,
+}
+
+#[derive(Clone, PartialEq)]
+struct ScenePreviewKey {
+    document: u64,
+    revision: u64,
+    placement: Option<crate::state::PlacementRef>,
+    asset: Option<u16>,
+    q0rg: u16,
+    layer: u16,
+    frame: u16,
+    origin: Vec2,
+    font: String,
+    text: String,
+    size: u32,
+    color: Rgba,
+}
+
+#[derive(Clone)]
+pub(crate) struct ScenePreview {
+    key: ScenePreviewKey,
+    pub project: std::sync::Arc<ProjectV2>,
+    pub revision: u64,
+    pub asset_id: u16,
+}
+
+/// Preview is a cached, disposable model, rendered through the same layer,
+/// mask and FX pipeline as committed text. The document is never changed.
+pub(crate) fn scene_preview(app: &EditorApp, ctx: &Context) -> Option<ScenePreview> {
+    let cache_id = egui::Id::new("text_scene_preview");
+    let Some(draft) = &app.session.text_editor else {
+        ctx.data_mut(|data| data.remove::<ScenePreview>(cache_id));
+        return None;
+    };
+    let key = ScenePreviewKey {
+        document: app.active_project_tab_id().unwrap_or(0),
+        revision: app.state.render_revision(),
+        placement: draft.placement,
+        asset: draft.asset_id,
+        q0rg: draft.q0rg_id,
+        layer: draft.layer_id,
+        frame: draft.frame,
+        origin: draft.origin,
+        font: draft.font.clone(),
+        text: draft.text.clone(),
+        size: draft.size.to_bits(),
+        color: draft.color,
+    };
+    if let Some(cached) = ctx.data(|data| data.get_temp::<ScenePreview>(cache_id)) {
+        if cached.key == key {
+            return Some(cached);
+        }
+    }
+    let (bytes, index) = font_bytes(&draft.font)?;
+    let paths = outline_text(&bytes, index, &draft.text, draft.size).ok()?;
+    let mut project = app.state.project.clone();
+    let source = draft.asset_id.and_then(|id| {
+        project.assets.iter().find_map(|a| match a {
+            Asset::Vector(v) if v.asset_id == id => Some(v.clone()),
+            _ => None,
+        })
+    });
+    let asset_id = if draft.placement.is_none() && draft.asset_id.is_some() {
+        draft.asset_id?
+    } else {
+        crate::tools::next_asset_id_pub(&project)
+    };
+    if (draft.placement.is_some() || draft.asset_id.is_none())
+        && project.assets.iter().any(|a| a.id() == asset_id)
+    {
+        return None;
+    }
+    let mut vector = source.unwrap_or(VectorAsset {
+        asset_id,
+        paths: Vec::new(),
+        fill: None,
+        stroke: None,
+    });
+    vector.asset_id = asset_id;
+    vector.paths = paths;
+    vector.fill = Some(draft.color);
+    if let Some(reference) = draft.placement {
+        let index = crate::tools::materialize_placement_keyframe_for_edit(
+            &mut project,
+            reference.q0rg_id,
+            reference.layer_id,
+            reference.placement_idx,
+            draft.frame,
+        )?;
+        let placement = project
+            .q0rgs
+            .iter_mut()
+            .find(|q| q.q0rg_id == reference.q0rg_id)?
+            .layers
+            .iter_mut()
+            .find(|l| l.layer_id == reference.layer_id)?
+            .placements
+            .get_mut(index)?;
+        placement.target = Target::Asset(asset_id);
+        #[cfg(feature = "appearance-mask-eraser")]
+        if let Some(source) = draft.asset_id {
+            crate::appearance::clone_asset_appearance(&mut project, source, asset_id);
+        }
+        project.assets.push(Asset::Vector(vector));
+    } else if draft.asset_id.is_some() {
+        *project.assets.iter_mut().find(|a| a.id() == asset_id)? = Asset::Vector(vector);
+    } else {
+        crate::tools::materialize_layer_keyframe_for_edit(
+            &mut project,
+            draft.q0rg_id,
+            draft.layer_id,
+            draft.frame,
+        )?;
+        project.assets.push(Asset::Vector(vector));
+        project
+            .q0rgs
+            .iter_mut()
+            .find(|q| q.q0rg_id == draft.q0rg_id)?
+            .layers
+            .iter_mut()
+            .find(|l| l.layer_id == draft.layer_id)?
+            .push_placement(Placement {
+                instance_id: 0,
+                frame: draft.frame,
+                target: Target::Asset(asset_id),
+                transform: Transform2D {
+                    tx: draft.origin.x,
+                    ty: draft.origin.y,
+                    ..Transform2D::IDENTITY
+                },
+                tween: Tween::None,
+                fx: Default::default(),
+            });
+    }
+    project.asset_names.insert(
+        asset_id,
+        format!(
+            "{FONT_SOURCE_PREFIX}{}",
+            serde_json::to_string(&TextSource {
+                text: draft.text.clone(),
+                size: draft.size,
+                font: draft.font.clone(),
+            })
+            .ok()?
+        ),
+    );
+    let serial_id = cache_id.with("serial");
+    let serial = ctx.data_mut(|data| {
+        let serial = data.get_temp::<u64>(serial_id).unwrap_or(0).wrapping_add(1);
+        data.insert_temp(serial_id, serial);
+        serial
+    });
+    let preview = ScenePreview {
+        key,
+        project: std::sync::Arc::new(project),
+        revision: (1u64 << 63) | serial,
+        asset_id,
+    };
+    ctx.data_mut(|data| data.insert_temp(cache_id, preview.clone()));
+    Some(preview)
 }
 
 impl Default for TextDraft {
@@ -284,7 +444,8 @@ pub(crate) fn finish_edit(app: &mut EditorApp) -> bool {
                 app.session.text_editor = Some(draft);
                 return false;
             }
-            app.history.snapshot(&app.state.project);
+            app.history
+                .snapshot_with_session(&app.state.project, &app.session);
             let Some(placement_idx) = crate::tools::materialize_placement_keyframe_for_edit(
                 &mut app.state.project,
                 reference.q0rg_id,
@@ -418,8 +579,12 @@ pub(crate) fn render_canvas(
     let mut editor_had_focus = false;
     let line_height = draft.size * scale * 1.25;
     let mut layouter = |ui: &egui::Ui, text: &str, _width: f32| {
-        let mut job =
-            egui::text::LayoutJob::simple(text.to_owned(), font.clone(), color, f32::INFINITY);
+        let mut job = egui::text::LayoutJob::simple(
+            text.to_owned(),
+            font.clone(),
+            Color32::TRANSPARENT,
+            f32::INFINITY,
+        );
         for section in &mut job.sections {
             section.format.line_height = Some(line_height);
         }
@@ -427,13 +592,14 @@ pub(crate) fn render_canvas(
     };
     let focus_requested = draft.focus_requested;
     ui.allocate_ui_at_rect(rect, |ui| {
-        ui.visuals_mut().extreme_bg_color = Color32::from_white_alpha(235);
+        ui.visuals_mut().extreme_bg_color = Color32::TRANSPARENT;
         let response = ui.add(
             egui::TextEdit::multiline(&mut draft.text)
                 .id_source("canvas_text_entry")
                 .font(font.clone())
                 .layouter(&mut layouter)
-                .text_color(color)
+                .text_color(Color32::TRANSPARENT)
+                .frame(false)
                 .desired_width(width)
                 .desired_rows(1)
                 .char_limit(MAX_CHARS)
@@ -452,6 +618,7 @@ pub(crate) fn render_canvas(
             egui::Stroke::new(1.0_f32, app.settings.theme.accent.to_color32()),
         );
     });
+    // The visible glyphs are painted by the stage through scene_preview.
     let escape = editor_had_focus && ui.input(|i| i.key_pressed(egui::Key::Escape));
     let properties_rect = ui
         .ctx()
@@ -475,6 +642,10 @@ pub(crate) fn render_canvas(
         finish_edit(app);
     }
     if escape || apply {
+        app.textures.invalidate();
+        ui.ctx().data_mut(|data| {
+            data.remove::<(u64, u16)>(egui::Id::new("painted_text_scene_preview"))
+        });
         ui.memory_mut(|m| m.surrender_focus(editor_id));
         ui.ctx().request_repaint();
     }
@@ -565,7 +736,7 @@ fn text_controls(ui: &mut egui::Ui, draft: &mut TextDraft) {
             draft.color.b,
             draft.color.a,
         );
-        if ui.color_edit_button_srgba(&mut color).changed() {
+        if crate::color_picker::color_edit_button_srgba(ui, &mut color).changed() {
             draft.color = Rgba {
                 r: color.r(),
                 g: color.g(),
@@ -785,7 +956,8 @@ fn commit(app: &mut EditorApp, draft: &TextDraft) -> Result<(), String> {
                 return Ok(());
             }
         }
-        app.history.snapshot(&app.state.project);
+        app.history
+            .snapshot_with_session(&app.state.project, &app.session);
         if let Some(reference) = draft.placement {
             let placement_idx = crate::tools::materialize_placement_keyframe_for_edit(
                 &mut app.state.project,
@@ -852,7 +1024,8 @@ fn commit(app: &mut EditorApp, draft: &TextDraft) -> Result<(), String> {
         {
             return Err("Choose an unlocked drawing layer for text".into());
         }
-        app.history.snapshot(&app.state.project);
+        app.history
+            .snapshot_with_session(&app.state.project, &app.session);
         crate::tools::materialize_layer_keyframe_for_edit(
             &mut app.state.project,
             q0rg_id,

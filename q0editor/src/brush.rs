@@ -2107,7 +2107,8 @@ pub fn commit_brush_region_with_material(
         }
     }
 
-    app.history.snapshot(&app.state.project);
+    app.history
+        .snapshot_with_session(&app.state.project, &app.session);
     if crate::tools::materialize_layer_keyframe_for_edit(
         &mut app.state.project,
         q0rg_id,
@@ -2467,7 +2468,8 @@ fn erase_brush_region_impl(
     }
 
     if snapshot_history {
-        app.history.snapshot(&app.state.project);
+        app.history
+            .snapshot_with_session(&app.state.project, &app.session);
     }
     if crate::tools::materialize_layer_keyframe_for_edit(
         &mut app.state.project,

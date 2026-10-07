@@ -28,7 +28,15 @@ use super::settings::Settings;
 use super::theme::{ColorRgb, Theme};
 use crate::{Player, PlayerFormat};
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PreviewOptions {
+    pub enabled: bool,
+    pub all_scenes: bool,
+    pub delete_after_load: bool,
+}
+
 pub struct PlayerApp {
+    preview: PreviewOptions,
     settings: Settings,
     player: Option<Player>,
     file_path: Option<PathBuf>,
@@ -198,6 +206,7 @@ impl PlayerApp {
         settings.apply_text_size(ctx);
         Self {
             settings,
+            preview: PreviewOptions::default(),
             player: None,
             file_path: None,
             stats: None,
@@ -214,6 +223,11 @@ impl PlayerApp {
             observed_scene_generation: 0,
             last_pointer_stage: None,
         }
+    }
+
+    pub fn with_preview(mut self, options: PreviewOptions) -> Self {
+        self.preview = options;
+        self
     }
 
     fn sync_timeline_audio(&mut self) -> Result<(), String> {
@@ -242,6 +256,12 @@ impl PlayerApp {
         match Player::from_file(path) {
             Ok(mut player) => {
                 player.set_loop_enabled(self.settings.loop_playback);
+                if self.preview.enabled {
+                    player.set_loop_enabled(true);
+                    if self.preview.all_scenes {
+                        player.enable_document_scene_sequence();
+                    }
+                }
                 let script_warning = player.initial_script_warning();
                 let bytes_len = std::fs::metadata(path)
                     .map(|m| m.len() as usize)
@@ -272,8 +292,10 @@ impl PlayerApp {
                 self.frame_tex = None;
                 self.v2_textures.invalidate();
                 self.last_tick = Instant::now();
-                self.settings.push_recent(path);
-                self.settings.save();
+                if !self.preview.enabled {
+                    self.settings.push_recent(path);
+                    self.settings.save();
+                }
                 self.status = match (script_warning, audio_warning) {
                     (Some(script), Some(audio)) => {
                         format!(
@@ -292,9 +314,31 @@ impl PlayerApp {
                     .and_then(|s| s.to_str())
                     .unwrap_or("q0player");
                 ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{title} - q0player")));
+                if self.preview.enabled {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+                        "q0e — fast preview".into(),
+                    ));
+                    if let Some((w, h)) =
+                        self.stats.as_ref().and_then(|stats| stats.viewport_hint())
+                    {
+                        let scale = (1000.0 / w.max(1) as f32)
+                            .min(700.0 / h.max(1) as f32)
+                            .min(1.0);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                            (w as f32 * scale).max(240.0),
+                            (h as f32 * scale).max(180.0),
+                        )));
+                    }
+                    if self.preview.delete_after_load {
+                        remove_preview_snapshot(path);
+                    }
+                }
             }
             Err(err) => {
                 self.status = format!("open failed: {err}");
+                if self.preview.enabled && self.preview.delete_after_load {
+                    remove_preview_snapshot(path);
+                }
             }
         }
     }
@@ -409,7 +453,15 @@ impl PlayerApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &Context, game_input_active: bool) {
+        if self.preview.enabled
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         for shortcut in take_shortcuts(ctx, game_input_active) {
+            if self.preview.enabled && shortcut == PlayerShortcut::Open {
+                continue;
+            }
             match shortcut {
                 PlayerShortcut::Open => self.pick_open(ctx),
                 PlayerShortcut::TogglePlay => self.toggle_playback(),
@@ -461,6 +513,22 @@ impl PlayerApp {
                 self.frame_tex = Some(handle);
             }
         }
+    }
+}
+
+fn remove_preview_snapshot(path: &Path) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    // Only disposable files created by the editor qualify for automatic cleanup.
+    if path.file_name().is_some_and(|name| name == "preview.q0s")
+        && parent
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("q0e-preview-"))
+        && parent.parent() == Some(std::env::temp_dir().as_path())
+    {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir(parent);
     }
 }
 
@@ -526,14 +594,27 @@ impl App for PlayerApp {
             ctx.request_repaint();
         }
 
-        self.menubar(ctx);
-        self.transport_bar(ctx);
-        self.side_panels(ctx);
+        if !self.preview.enabled {
+            self.menubar(ctx);
+            self.transport_bar(ctx);
+            self.side_panels(ctx);
+        }
         self.sync_scene_resources_if_needed();
         // viewport() retargets the rasteriser size to actual canvas
         // pixels (when auto_resolution is on) and refreshes the texture
         // Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р Р†РІР‚С›РЎС›Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р вЂ Р Р†Р вЂљРЎвЂєР РЋРЎвЂєР В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р Р†РІР‚С›РЎС›Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р Р†РІР‚С›РЎС›Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†РІР‚С›РЎС›Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р Р†РІР‚С›РЎС›Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р Р†РІР‚С›РЎС›Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р вЂ Р Р†Р вЂљРЎвЂєР РЋРЎвЂєР В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р Р†РІР‚С›РЎС›Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р’В Р Р†Р вЂљР’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р РЋРІвЂћСћР В Р’В Р В Р вЂ№Р В Р вЂ Р Р†Р вЂљРЎвЂєР РЋРЎвЂєР В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћвЂ“Р В Р’В Р вЂ™Р’В Р В Р’В Р Р†Р вЂљР’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†Р вЂљРЎвЂќР В Р’В Р В Р вЂ№Р В Р Р‹Р Р†Р вЂљРЎвЂќР В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р Р†РІР‚С›РЎС›Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р’В Р Р†Р вЂљР’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р РЋРІвЂћСћР В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р Р†РІР‚С›РЎС›Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†РІР‚С›РЎС›Р В Р’В Р вЂ™Р’В Р В Р’В Р В РІР‚в„–Р В Р’В Р В РІР‚В Р В Р вЂ Р В РІР‚С™Р РЋРІР‚С”Р В Р Р‹Р РЋРІР‚С”Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р Р†РІР‚С›РІР‚вЂњР В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћвЂ“Р В Р’В Р вЂ™Р’В Р В Р’В Р В РІР‚в„–Р В Р’В Р В РІР‚В Р В Р вЂ Р В РІР‚С™Р РЋРІР‚С”Р В Р Р‹Р РЋРІР‚С” done last so the central area's pixel size is already known.
         self.viewport(ctx);
+
+        if self.preview.enabled && self.player.is_none() {
+            egui::Window::new("Fast preview could not open")
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    ui.label(&self.status);
+                    if ui.button("Close").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+        }
 
         if self.show_settings {
             self.settings_dialog(ctx);
@@ -541,7 +622,9 @@ impl App for PlayerApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.settings.save();
+        if !self.preview.enabled {
+            self.settings.save();
+        }
     }
 }
 
