@@ -26,6 +26,9 @@ impl Mp4Spec {
         if !self.width.is_multiple_of(2) || !self.height.is_multiple_of(2) {
             return Err("h.264 output dimensions must be even".to_string());
         }
+        if u64::from(self.width) * u64::from(self.height) > u64::from(u32::MAX) * 2 / 3 {
+            return Err("mp4 sample buffer exceeds the media foundation size limit".to_string());
+        }
         if self.bitrate < 64_000 {
             return Err("mp4 bitrate is too low".to_string());
         }
@@ -81,15 +84,29 @@ pub struct Mp4Encoder {
 impl Mp4Encoder {
     pub fn create(path: &Path, spec: Mp4Spec) -> Result<Self, String> {
         spec.validate()?;
+        // Allow installed hardware MFTs, but retain software support for
+        // machines/drivers that cannot encode this particular output format.
+        Self::create_with_hardware(path, spec, true)
+            .or_else(|_| Self::create_with_hardware(path, spec, false))
+    }
+
+    fn create_with_hardware(path: &Path, spec: Mp4Spec, hardware: bool) -> Result<Self, String> {
         let session = MediaFoundationSession::start()?;
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-        let writer = unsafe {
-            MFCreateSinkWriterFromURL(
-                PCWSTR(wide.as_ptr()),
-                None::<&IMFByteStream>,
-                None::<&IMFAttributes>,
+        let mut attributes = None;
+        unsafe { MFCreateAttributes(&mut attributes, 1) }
+            .map_err(|error| format!("create mp4 writer attributes: {error}"))?;
+        let attributes = attributes.ok_or("missing mp4 writer attributes")?;
+        unsafe {
+            attributes.SetUINT32(
+                &MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
+                u32::from(hardware),
             )
-            .map_err(|error| format!("create mp4 sink writer: {error}"))?
+        }
+        .map_err(|error| format!("set mp4 hardware encoding: {error}"))?;
+        let writer = unsafe {
+            MFCreateSinkWriterFromURL(PCWSTR(wide.as_ptr()), None::<&IMFByteStream>, &attributes)
+                .map_err(|error| format!("create mp4 sink writer: {error}"))?
         };
 
         let output_type = unsafe { MFCreateMediaType() }
@@ -124,7 +141,7 @@ impl Mp4Encoder {
             .map_err(|error| format!("add h.264 stream: {error}"))?;
 
         let input_type = unsafe { MFCreateMediaType() }
-            .map_err(|error| format!("create bgra input type: {error}"))?;
+            .map_err(|error| format!("create nv12 input type: {error}"))?;
         unsafe {
             input_type
                 .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
@@ -176,14 +193,16 @@ impl Mp4Encoder {
     }
 
     pub fn write_rgba_frame(&mut self, rgba: &[u8]) -> Result<(), String> {
-        let expected = u64::from(self.spec.width)
-            .checked_mul(u64::from(self.spec.height))
-            .and_then(|pixels| pixels.checked_mul(4))
-            .ok_or_else(|| "mp4 frame size overflows".to_string())?;
-        if rgba.len() as u64 != expected {
-            return Err("rgba frame length does not match mp4 dimensions".to_string());
-        }
         let nv12 = rgba_to_nv12(rgba, self.spec.width, self.spec.height)?;
+        self.write_nv12_frame(&nv12)
+    }
+
+    /// Submit a prepared frame. Conversion may run on rendering workers;
+    /// the COM writer stays on its owning thread and receives frames in order.
+    pub fn write_nv12_frame(&mut self, nv12: &[u8]) -> Result<(), String> {
+        if nv12.len() as u64 != u64::from(self.spec.width) * u64::from(self.spec.height) * 3 / 2 {
+            return Err("nv12 frame length does not match mp4 dimensions".to_string());
+        }
         let length = u32::try_from(nv12.len()).map_err(|_| "mp4 frame is too large".to_string())?;
         let buffer = unsafe { MFCreateMemoryBuffer(length) }
             .map_err(|error| format!("allocate mp4 sample buffer: {error}"))?;
@@ -247,12 +266,14 @@ impl Drop for Mp4Encoder {
     }
 }
 
-fn rgba_to_nv12(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
-    if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+pub fn rgba_to_nv12(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
+    if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
         return Err("nv12 conversion requires even dimensions".to_string());
     }
-    let pixels = width as usize * height as usize;
-    if rgba.len() != pixels * 4 {
+    let pixels = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or("nv12 dimensions overflow")?;
+    if pixels.checked_mul(4) != Some(rgba.len()) {
         return Err("rgba buffer length does not match nv12 dimensions".to_string());
     }
     let mut output = vec![0_u8; pixels + pixels / 2];
@@ -300,6 +321,20 @@ const fn pack_ratio(numerator: u32, denominator: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nv12_conversion_preserves_luma_and_averages_each_chroma_block() {
+        let rgba = [
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ];
+        assert_eq!(
+            rgba_to_nv12(&rgba, 2, 2).unwrap(),
+            vec![82, 144, 41, 235, 128, 128]
+        );
+        assert!(rgba_to_nv12(&rgba[..12], 2, 2).is_err());
+        assert!(rgba_to_nv12(&[], 0, 0).is_err());
+        assert!(rgba_to_nv12(&rgba, 1, 4).is_err());
+    }
 
     #[test]
     fn rejects_odd_h264_dimensions() {

@@ -6,401 +6,9 @@ use crate::hotkeys::{HotkeySettings, ShortcutChord, ShortcutCommand, ShortcutKey
 
 pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     egui::menu::bar(ui, |ui| {
-        ui.menu_button("File", |ui| {
-            if app.has_active_document() && !app.home_visible() {
-                if ui.button("Home").clicked() {
-                    app.queue(Action::ShowHome);
-                    ui.close_menu();
-                }
-                ui.separator();
-            }
-            if shortcut_button(
-                ui,
-                "New",
-                app.settings.hotkeys.display(ShortcutCommand::NewProject),
-            )
-            .clicked()
-            {
-                app.queue(Action::NewProject);
-                ui.close_menu();
-            }
-            if shortcut_button(
-                ui,
-                "Open...",
-                app.settings.hotkeys.display(ShortcutCommand::OpenProject),
-            )
-            .clicked()
-            {
-                app.queue(Action::OpenProject);
-                ui.close_menu();
-            }
-            let recent = app.settings.recent_projects.clone();
-            let labels = recent_menu_labels(&recent);
-            ui.add_enabled_ui(!recent.is_empty(), |ui| {
-                ui.menu_button("Open Recent", |ui| {
-                    for (path, label) in recent.into_iter().zip(labels) {
-                        if ui
-                            .button(label)
-                            .on_hover_text(path.display().to_string())
-                            .clicked()
-                        {
-                            app.queue(Action::OpenProjectFromPath(path));
-                            ui.close_menu();
-                        }
-                    }
-                });
-            });
-            ui.separator();
-            if ui
-                .add_enabled(
-                    app.has_active_project() && !app.home_visible(),
-                    egui::Button::new("Import Media to Library..."),
-                )
-                .clicked()
-            {
-                app.queue(Action::ImportMedia);
-                ui.close_menu();
-            }
-            ui.separator();
-            if ui
-                .add_enabled(
-                    app.has_active_document() && !app.home_visible(),
-                    shortcut_button_widget(
-                        "Save",
-                        app.settings.hotkeys.display(ShortcutCommand::SaveProject),
-                    ),
-                )
-                .clicked()
-            {
-                app.queue(Action::SaveProject);
-                ui.close_menu();
-            }
-            if ui
-                .add_enabled(
-                    app.has_active_document() && !app.home_visible(),
-                    shortcut_button_widget(
-                        "Save As...",
-                        app.settings.hotkeys.display(ShortcutCommand::SaveProjectAs),
-                    ),
-                )
-                .clicked()
-            {
-                app.queue(Action::SaveProjectAs);
-                ui.close_menu();
-            }
-            ui.separator();
-            if ui
-                .add_enabled(
-                    app.has_active_project() && !app.home_visible(),
-                    shortcut_button_widget(
-                        "Export...",
-                        app.settings.hotkeys.display(ShortcutCommand::Export),
-                    ),
-                )
-                .clicked()
-            {
-                app.queue(Action::OpenQ0Enc);
-                ui.close_menu();
-            }
-            ui.separator();
-            if ui.button("Exit").clicked() {
-                app.queue(Action::Exit);
-                ui.close_menu();
-            }
-        });
-
-        if !app.home_visible() && app.has_active_project() {
-            ui.menu_button("Edit", |ui| {
-                let can_undo = app.history.can_undo();
-                let can_redo = app.history.can_redo();
-                if ui
-                    .add_enabled(
-                        can_undo,
-                        shortcut_button_widget(
-                            "Undo",
-                            app.settings.hotkeys.display(ShortcutCommand::Undo),
-                        ),
-                    )
-                    .clicked()
-                {
-                    app.queue(Action::Undo);
-                    ui.close_menu();
-                }
-                if ui
-                    .add_enabled(
-                        can_redo,
-                        shortcut_button_widget(
-                            "Redo",
-                            app.settings.hotkeys.display(ShortcutCommand::Redo),
-                        ),
-                    )
-                    .clicked()
-                {
-                    app.queue(Action::Redo);
-                    ui.close_menu();
-                }
-                ui.separator();
-                let can_clip = app.session.timeline_selection.is_some()
-                    || app.session.timeline_layer_selection.is_some()
-                    || crate::selection_edit::selection_can_clip(&app.session.selection);
-                let can_delete = app.session.timeline_selection.is_some()
-                    || selection_can_be_deleted(&app.session.selection);
-                let has_clip = app.has_clipboard();
-                if ui
-                    .add_enabled(
-                        can_clip,
-                        shortcut_button_widget(
-                            "Cut",
-                            app.settings.hotkeys.display(ShortcutCommand::Cut),
-                        ),
-                    )
-                    .clicked()
-                {
-                    app.queue(Action::CutSelection);
-                    ui.close_menu();
-                }
-                if ui
-                    .add_enabled(
-                        can_clip,
-                        shortcut_button_widget(
-                            "Copy",
-                            app.settings.hotkeys.display(ShortcutCommand::Copy),
-                        ),
-                    )
-                    .clicked()
-                {
-                    app.queue(Action::CopySelection);
-                    ui.close_menu();
-                }
-                if ui
-                    .add_enabled(
-                        has_clip,
-                        shortcut_button_widget(
-                            "Paste",
-                            app.settings.hotkeys.display(ShortcutCommand::Paste),
-                        ),
-                    )
-                    .clicked()
-                {
-                    app.queue(Action::Paste);
-                    ui.close_menu();
-                }
-                if ui
-                    .add_enabled(
-                        has_clip,
-                        shortcut_button_widget(
-                            "Paste in Place",
-                            app.settings.hotkeys.display(ShortcutCommand::PasteInPlace),
-                        ),
-                    )
-                    .clicked()
-                {
-                    app.queue(Action::PasteInPlace);
-                    ui.close_menu();
-                }
-                if ui
-                    .add_enabled(
-                        can_clip,
-                        shortcut_button_widget(
-                            "Duplicate",
-                            app.settings.hotkeys.display(ShortcutCommand::Duplicate),
-                        ),
-                    )
-                    .clicked()
-                {
-                    app.queue(Action::DuplicateSelection);
-                    ui.close_menu();
-                }
-                ui.separator();
-                if ui
-                    .add_enabled(
-                        can_delete,
-                        shortcut_button_widget(
-                            "Delete",
-                            app.settings.hotkeys.display(ShortcutCommand::Delete),
-                        ),
-                    )
-                    .clicked()
-                {
-                    app.queue(Action::DeleteSelection);
-                    ui.close_menu();
-                }
-            });
-
-            ui.menu_button("Modify", |ui| {
-                let can_convert = crate::selection_edit::selection_can_clip(&app.session.selection);
-                if ui
-                    .add_enabled(
-                        can_convert,
-                        shortcut_button_widget(
-                            "Convert to Symbol",
-                            app.settings
-                                .hotkeys
-                                .display(ShortcutCommand::ConvertToSymbol),
-                        ),
-                    )
-                    .clicked()
-                {
-                    app.queue(Action::ConvertSelectionToQ0rg);
-                    ui.close_menu();
-                }
-                if ui
-                    .add_enabled(
-                        app.can_break_apart_selection(),
-                        shortcut_button_widget(
-                            "Break Apart",
-                            app.settings.hotkeys.display(ShortcutCommand::BreakApart),
-                        ),
-                    )
-                    .clicked()
-                {
-                    app.queue(Action::BreakApartSelection);
-                    ui.close_menu();
-                }
-            });
-
-            ui.menu_button("View", |ui| {
-                if shortcut_button(
-                    ui,
-                    "Zoom In",
-                    app.settings.hotkeys.display(ShortcutCommand::ZoomIn),
-                )
-                .clicked()
-                {
-                    app.queue(Action::ZoomIn);
-                    ui.close_menu();
-                }
-                if shortcut_button(
-                    ui,
-                    "Zoom Out",
-                    app.settings.hotkeys.display(ShortcutCommand::ZoomOut),
-                )
-                .clicked()
-                {
-                    app.queue(Action::ZoomOut);
-                    ui.close_menu();
-                }
-                if shortcut_button(
-                    ui,
-                    "Reset Zoom",
-                    app.settings.hotkeys.display(ShortcutCommand::ZoomReset),
-                )
-                .clicked()
-                {
-                    app.queue(Action::ZoomReset);
-                    ui.close_menu();
-                }
-                ui.separator();
-                if ui
-                    .selectable_label(app.session.outline_mode, "outline mode")
-                    .clicked()
-                {
-                    app.queue(Action::ToggleOutlineMode);
-                    ui.close_menu();
-                }
-                for (label, shortcut, current_only) in [
-                    (
-                        "Fast Preview — All Scenes",
-                        ShortcutCommand::FastPreview,
-                        false,
-                    ),
-                    (
-                        "Fast Preview — Current Scene",
-                        ShortcutCommand::FastPreviewScene,
-                        true,
-                    ),
-                ] {
-                    if shortcut_button(ui, label, app.settings.hotkeys.display(shortcut)).clicked()
-                    {
-                        app.queue(Action::FastPreview(current_only));
-                        ui.close_menu();
-                    }
-                }
-                if shortcut_button(
-                    ui,
-                    "Show / Hide Timeline",
-                    app.settings
-                        .hotkeys
-                        .display(ShortcutCommand::ToggleTimeline),
-                )
-                .clicked()
-                {
-                    app.queue(Action::ToggleTimeline);
-                    ui.close_menu();
-                }
-                if ui
-                    .selectable_label(app.session.show_animation_preview, "Animation Preview")
-                    .clicked()
-                {
-                    app.session.show_animation_preview = !app.session.show_animation_preview;
-                    app.session.animation_preview_frame = app.session.current_frame;
-                    app.session.animation_preview_tick = std::time::Instant::now();
-                    ui.close_menu();
-                }
-                if shortcut_button(
-                    ui,
-                    "Script Editor (q0lang)...",
-                    app.settings.hotkeys.display(ShortcutCommand::ScriptEditor),
-                )
-                .clicked()
-                {
-                    app.queue(Action::OpenQ0langEditor(None));
-                    ui.close_menu();
-                }
-                if ui
-                    .selectable_label(app.project_tree_open(), "Project...")
-                    .clicked()
-                {
-                    app.queue(Action::ToggleProjectTree);
-                    ui.close_menu();
-                }
-                ui.separator();
-                ui.label(
-                    egui::RichText::new("Mouse wheel: zoom, MMB or hold H/Space + drag: pan")
-                        .color(app.settings.theme.text_dim.to_color32())
-                        .small(),
-                );
-            });
-        }
-
-        ui.menu_button("Help", |ui| {
-            if ui.button("Credits...").clicked() {
-                app.queue(Action::ToggleCredits);
-                ui.close_menu();
-            }
-            ui.separator();
-            ui.label(
-                egui::RichText::new(format!("q0editor {}", env!("CARGO_PKG_VERSION")))
-                    .color(app.settings.theme.text_dim.to_color32()),
-            );
-            ui.label(
-                egui::RichText::new(
-                    "V/A/P/B/N/R/O/K/I tools; arrows move selection (Shift: fine), or step frames without selection",
-                )
-                .color(app.settings.theme.text_dim.to_color32()),
-            );
-        });
+        menus(app, ui);
 
         ui.separator();
-        let status = truncate_label(&app.session.status, 72);
-        let status_color = if status_is_error(&app.session.status) {
-            app.settings.theme.accent.to_color32()
-        } else {
-            app.settings.theme.text_dim.to_color32()
-        };
-        let status_response = ui
-            .label(egui::RichText::new(status).color(status_color))
-            .on_hover_text(format!(
-                "{}\nRight-click to copy",
-                app.session.status.as_str()
-            ));
-        status_response.context_menu(|ui| {
-            if ui.button("Copy status").clicked() {
-                ui.output_mut(|output| output.copied_text = app.session.status.clone());
-                ui.close_menu();
-            }
-        });
-
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             crate::workspace::render_menu(app, ui);
             let settings_resp = ui
@@ -453,7 +61,410 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             if q0fla_resp.clicked() {
                 app.queue(Action::ToggleQ0Fla);
             }
+
+            // The status gets the width the buttons left over, and shortens
+            // itself to fit instead of running underneath them.
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                let status = truncate_label(&app.session.status, 72);
+                let status_color = if status_is_error(&app.session.status) {
+                    app.settings.theme.accent.to_color32()
+                } else {
+                    app.settings.theme.text_dim.to_color32()
+                };
+                let status_response = ui
+                    .add(
+                        egui::Label::new(egui::RichText::new(status).color(status_color))
+                            .truncate(true),
+                    )
+                    .on_hover_text(format!(
+                        "{}\nRight-click to copy",
+                        app.session.status.as_str()
+                    ));
+                status_response.context_menu(|ui| {
+                    if ui.button("Copy status").clicked() {
+                        ui.output_mut(|output| output.copied_text = app.session.status.clone());
+                        ui.close_menu();
+                    }
+                });
+            });
         });
+    });
+}
+
+/// The File, Edit, Modify, View and Help menus.
+pub fn menus(app: &mut EditorApp, ui: &mut Ui) {
+    ui.menu_button("File", |ui| {
+        if app.has_active_document() && !app.home_visible() {
+            if ui.button("Home").clicked() {
+                app.queue(Action::ShowHome);
+                ui.close_menu();
+            }
+            ui.separator();
+        }
+        if shortcut_button(
+            ui,
+            "New",
+            app.settings.hotkeys.display(ShortcutCommand::NewProject),
+        )
+        .clicked()
+        {
+            app.queue(Action::NewProject);
+            ui.close_menu();
+        }
+        if shortcut_button(
+            ui,
+            "Open...",
+            app.settings.hotkeys.display(ShortcutCommand::OpenProject),
+        )
+        .clicked()
+        {
+            app.queue(Action::OpenProject);
+            ui.close_menu();
+        }
+        let recent = app.settings.recent_projects.clone();
+        let labels = recent_menu_labels(&recent);
+        ui.add_enabled_ui(!recent.is_empty(), |ui| {
+            ui.menu_button("Open Recent", |ui| {
+                for (path, label) in recent.into_iter().zip(labels) {
+                    if ui
+                        .button(label)
+                        .on_hover_text(path.display().to_string())
+                        .clicked()
+                    {
+                        app.queue(Action::OpenProjectFromPath(path));
+                        ui.close_menu();
+                    }
+                }
+            });
+        });
+        ui.separator();
+        if ui
+            .add_enabled(
+                app.has_active_project() && !app.home_visible(),
+                egui::Button::new("Import Media to Library..."),
+            )
+            .clicked()
+        {
+            app.queue(Action::ImportMedia);
+            ui.close_menu();
+        }
+        ui.separator();
+        if ui
+            .add_enabled(
+                app.has_active_document() && !app.home_visible(),
+                shortcut_button_widget(
+                    "Save",
+                    app.settings.hotkeys.display(ShortcutCommand::SaveProject),
+                ),
+            )
+            .clicked()
+        {
+            app.queue(Action::SaveProject);
+            ui.close_menu();
+        }
+        if ui
+            .add_enabled(
+                app.has_active_document() && !app.home_visible(),
+                shortcut_button_widget(
+                    "Save As...",
+                    app.settings.hotkeys.display(ShortcutCommand::SaveProjectAs),
+                ),
+            )
+            .clicked()
+        {
+            app.queue(Action::SaveProjectAs);
+            ui.close_menu();
+        }
+        ui.separator();
+        if ui
+            .add_enabled(
+                app.has_active_project() && !app.home_visible(),
+                shortcut_button_widget(
+                    "Export...",
+                    app.settings.hotkeys.display(ShortcutCommand::Export),
+                ),
+            )
+            .clicked()
+        {
+            app.queue(Action::OpenQ0Enc);
+            ui.close_menu();
+        }
+        ui.separator();
+        if ui.button("Exit").clicked() {
+            app.queue(Action::Exit);
+            ui.close_menu();
+        }
+    });
+
+    if !app.home_visible() && app.has_active_project() {
+        ui.menu_button("Edit", |ui| {
+            let can_undo = app.history.can_undo();
+            let can_redo = app.history.can_redo();
+            if ui
+                .add_enabled(
+                    can_undo,
+                    shortcut_button_widget(
+                        "Undo",
+                        app.settings.hotkeys.display(ShortcutCommand::Undo),
+                    ),
+                )
+                .clicked()
+            {
+                app.queue(Action::Undo);
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(
+                    can_redo,
+                    shortcut_button_widget(
+                        "Redo",
+                        app.settings.hotkeys.display(ShortcutCommand::Redo),
+                    ),
+                )
+                .clicked()
+            {
+                app.queue(Action::Redo);
+                ui.close_menu();
+            }
+            ui.separator();
+            let can_clip = app.session.timeline_selection.is_some()
+                || app.session.timeline_layer_selection.is_some()
+                || crate::selection_edit::selection_can_clip(&app.session.selection);
+            let can_delete = app.session.timeline_selection.is_some()
+                || selection_can_be_deleted(&app.session.selection);
+            let has_clip = app.has_clipboard();
+            if ui
+                .add_enabled(
+                    can_clip,
+                    shortcut_button_widget(
+                        "Cut",
+                        app.settings.hotkeys.display(ShortcutCommand::Cut),
+                    ),
+                )
+                .clicked()
+            {
+                app.queue(Action::CutSelection);
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(
+                    can_clip,
+                    shortcut_button_widget(
+                        "Copy",
+                        app.settings.hotkeys.display(ShortcutCommand::Copy),
+                    ),
+                )
+                .clicked()
+            {
+                app.queue(Action::CopySelection);
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(
+                    has_clip,
+                    shortcut_button_widget(
+                        "Paste",
+                        app.settings.hotkeys.display(ShortcutCommand::Paste),
+                    ),
+                )
+                .clicked()
+            {
+                app.queue(Action::Paste);
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(
+                    has_clip,
+                    shortcut_button_widget(
+                        "Paste in Place",
+                        app.settings.hotkeys.display(ShortcutCommand::PasteInPlace),
+                    ),
+                )
+                .clicked()
+            {
+                app.queue(Action::PasteInPlace);
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(
+                    can_clip,
+                    shortcut_button_widget(
+                        "Duplicate",
+                        app.settings.hotkeys.display(ShortcutCommand::Duplicate),
+                    ),
+                )
+                .clicked()
+            {
+                app.queue(Action::DuplicateSelection);
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui
+                .add_enabled(
+                    can_delete,
+                    shortcut_button_widget(
+                        "Delete",
+                        app.settings.hotkeys.display(ShortcutCommand::Delete),
+                    ),
+                )
+                .clicked()
+            {
+                app.queue(Action::DeleteSelection);
+                ui.close_menu();
+            }
+        });
+
+        ui.menu_button("Modify", |ui| {
+            let can_convert = crate::selection_edit::selection_can_clip(&app.session.selection);
+            if ui
+                .add_enabled(
+                    can_convert,
+                    shortcut_button_widget(
+                        "Convert to Symbol",
+                        app.settings
+                            .hotkeys
+                            .display(ShortcutCommand::ConvertToSymbol),
+                    ),
+                )
+                .clicked()
+            {
+                app.queue(Action::ConvertSelectionToQ0rg);
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(
+                    app.can_break_apart_selection(),
+                    shortcut_button_widget(
+                        "Break Apart",
+                        app.settings.hotkeys.display(ShortcutCommand::BreakApart),
+                    ),
+                )
+                .clicked()
+            {
+                app.queue(Action::BreakApartSelection);
+                ui.close_menu();
+            }
+        });
+
+        ui.menu_button("View", |ui| {
+            if shortcut_button(
+                ui,
+                "Zoom In",
+                app.settings.hotkeys.display(ShortcutCommand::ZoomIn),
+            )
+            .clicked()
+            {
+                app.queue(Action::ZoomIn);
+                ui.close_menu();
+            }
+            if shortcut_button(
+                ui,
+                "Zoom Out",
+                app.settings.hotkeys.display(ShortcutCommand::ZoomOut),
+            )
+            .clicked()
+            {
+                app.queue(Action::ZoomOut);
+                ui.close_menu();
+            }
+            if shortcut_button(
+                ui,
+                "Reset Zoom",
+                app.settings.hotkeys.display(ShortcutCommand::ZoomReset),
+            )
+            .clicked()
+            {
+                app.queue(Action::ZoomReset);
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui
+                .selectable_label(app.session.outline_mode, "outline mode")
+                .clicked()
+            {
+                app.queue(Action::ToggleOutlineMode);
+                ui.close_menu();
+            }
+            for (label, shortcut, current_only) in [
+                (
+                    "Fast Preview — All Scenes",
+                    ShortcutCommand::FastPreview,
+                    false,
+                ),
+                (
+                    "Fast Preview — Current Scene",
+                    ShortcutCommand::FastPreviewScene,
+                    true,
+                ),
+            ] {
+                if shortcut_button(ui, label, app.settings.hotkeys.display(shortcut)).clicked() {
+                    app.queue(Action::FastPreview(current_only));
+                    ui.close_menu();
+                }
+            }
+            if shortcut_button(
+                ui,
+                "Show / Hide Timeline",
+                app.settings
+                    .hotkeys
+                    .display(ShortcutCommand::ToggleTimeline),
+            )
+            .clicked()
+            {
+                app.queue(Action::ToggleTimeline);
+                ui.close_menu();
+            }
+            if ui
+                .selectable_label(app.session.show_animation_preview, "Animation Preview")
+                .clicked()
+            {
+                app.session.show_animation_preview = !app.session.show_animation_preview;
+                app.session.animation_preview_frame = app.session.current_frame;
+                app.session.animation_preview_tick = std::time::Instant::now();
+                ui.close_menu();
+            }
+            if shortcut_button(
+                ui,
+                "Script Editor (q0lang)...",
+                app.settings.hotkeys.display(ShortcutCommand::ScriptEditor),
+            )
+            .clicked()
+            {
+                app.queue(Action::OpenQ0langEditor(None));
+                ui.close_menu();
+            }
+            if ui
+                .selectable_label(app.project_tree_open(), "Project...")
+                .clicked()
+            {
+                app.queue(Action::ToggleProjectTree);
+                ui.close_menu();
+            }
+            ui.separator();
+            ui.label(
+                egui::RichText::new("Mouse wheel: zoom, MMB or hold H/Space + drag: pan")
+                    .color(app.settings.theme.text_dim.to_color32())
+                    .small(),
+            );
+        });
+    }
+
+    ui.menu_button("Help", |ui| {
+        if ui.button("Credits...").clicked() {
+            app.queue(Action::ToggleCredits);
+            ui.close_menu();
+        }
+        ui.separator();
+        ui.label(
+            egui::RichText::new(format!("q0editor {}", env!("CARGO_PKG_VERSION")))
+                .color(app.settings.theme.text_dim.to_color32()),
+        );
+        ui.label(
+            egui::RichText::new(
+                "V/A/P/B/N/R/O/K/I tools; arrows move selection (Shift: fine), or step frames without selection",
+            )
+            .color(app.settings.theme.text_dim.to_color32()),
+        );
     });
 }
 

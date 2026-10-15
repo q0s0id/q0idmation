@@ -948,6 +948,143 @@ pub(crate) fn keyframe_source_states_at(
     q0s_format::raster::active_placement_states_at(layer, source_frame)
 }
 
+/// A blank keyframe placed inside a shape tween. Whatever is drawn on it next
+/// takes over the tween towards the original destination.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ShapeTweenContinuation {
+    pub q0rg_id: u16,
+    pub layer_id: u16,
+    pub frame: u16,
+    pub to_frame: u16,
+    pub easing: q0s_format::v2::Easing,
+}
+
+fn is_drawing(project: &ProjectV2, target: q0s_format::v2::Target) -> bool {
+    matches!(target, q0s_format::v2::Target::Asset(id)
+    if project.assets.iter().any(|asset| {
+        matches!(asset, q0s_format::v2::Asset::Vector(vector) if vector.asset_id == id)
+    }))
+}
+
+/// End every shape tween that runs across `frame` at `frame`, which is about
+/// to become a blank keyframe, and report where it was heading.
+pub(crate) fn split_shape_tweens_at_blank_keyframe(
+    project: &mut ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    frame: u16,
+) -> Option<ShapeTweenContinuation> {
+    let layer = project
+        .q0rgs
+        .iter_mut()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)?
+        .layers
+        .iter_mut()
+        .find(|layer| layer.layer_id == layer_id)?;
+    let mut continuation = None;
+    for placement in &mut layer.placements {
+        if let Tween::Shape { to_frame, easing } = placement.tween {
+            if placement.frame < frame && frame < to_frame {
+                placement.tween = Tween::Shape {
+                    to_frame: frame,
+                    easing,
+                };
+                continuation = Some(ShapeTweenContinuation {
+                    q0rg_id,
+                    layer_id,
+                    frame,
+                    to_frame,
+                    easing,
+                });
+            }
+        }
+    }
+    continuation
+}
+
+/// Let freshly drawn artwork join the shape tween of its keyframe.
+///
+/// A tween belongs to the keyframe as the animator sees it, but is stored on
+/// each drawing. So a stroke added to a keyframe that already morphs, or to
+/// the blank keyframe described by `pending`, would otherwise just sit there
+/// until the tween was removed and created again. Returns whether anything
+/// changed; `pending` is cleared once it has been used or can no longer apply.
+pub(crate) fn continue_shape_tweens(
+    project: &mut ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    pending: &mut Option<ShapeTweenContinuation>,
+) -> bool {
+    let Some(layer) = project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+        .and_then(|q0rg| q0rg.layers.iter().find(|layer| layer.layer_id == layer_id))
+    else {
+        return false;
+    };
+    // Keyframes whose drawings already morph, and where to.
+    let mut spans = BTreeMap::<u16, Tween>::new();
+    for placement in &layer.placements {
+        if placement.tween.is_shape() {
+            spans.entry(placement.frame).or_insert(placement.tween);
+        }
+    }
+    if let Some(wanted) = *pending {
+        if wanted.q0rg_id == q0rg_id && wanted.layer_id == layer_id {
+            let drawn = layer
+                .placements
+                .iter()
+                .any(|placement| placement.frame == wanted.frame);
+            let still_valid = layer.has_keyframe(wanted.frame)
+                && layer.has_keyframe(wanted.to_frame)
+                && !spans.contains_key(&wanted.frame);
+            if !still_valid {
+                *pending = None;
+            } else if drawn {
+                spans.insert(
+                    wanted.frame,
+                    Tween::Shape {
+                        to_frame: wanted.to_frame,
+                        easing: wanted.easing,
+                    },
+                );
+                *pending = None;
+            }
+        }
+    }
+    let joining = layer
+        .placements
+        .iter()
+        .enumerate()
+        .filter(|(_, placement)| {
+            matches!(placement.tween, Tween::None)
+                && spans.contains_key(&placement.frame)
+                && is_drawing(project, placement.target)
+        })
+        .map(|(index, placement)| (index, spans[&placement.frame]))
+        .collect::<Vec<_>>();
+    if joining.is_empty() {
+        return false;
+    }
+    let Some(layer) = project
+        .q0rgs
+        .iter_mut()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+        .and_then(|q0rg| {
+            q0rg.layers
+                .iter_mut()
+                .find(|layer| layer.layer_id == layer_id)
+        })
+    else {
+        return false;
+    };
+    for (index, tween) in joining {
+        layer.placements[index].tween = tween;
+    }
+    true
+}
+
 /// In-between drawings of shape tweens waiting to become real vector assets
 /// once a new keyframe is committed.
 pub(crate) struct BakedShapes {
@@ -966,12 +1103,14 @@ impl BakedShapes {
     /// The placements a new keyframe needs in place of `copy`, the plain copy
     /// of the source placement at `source_index`. Inside a shape tween the
     /// stage shows an in-between drawing, so the keyframe gets that drawing
-    /// (several when a shape is splitting) instead of the first one again.
+    /// (several when a shape is splitting) instead of the first one again,
+    /// and goes on morphing into the tween's original destination.
     pub(crate) fn keyframe_placements(
         &mut self,
         shape_morph: Option<&q0s_format::shape_tween::LayerMorph>,
         source_index: usize,
-        copy: q0s_format::v2::Placement,
+        source_tween: Tween,
+        mut copy: q0s_format::v2::Placement,
     ) -> Vec<q0s_format::v2::Placement> {
         let Some(shapes) = shape_morph.and_then(|morph| morph.for_placement(source_index)) else {
             return vec![copy];
@@ -979,6 +1118,11 @@ impl BakedShapes {
         // Keep the plain copy if the asset id space cannot hold the drawing.
         if usize::from(self.first_id) + self.shapes.len() + shapes.len() > usize::from(u16::MAX) {
             return vec![copy];
+        }
+        if let Tween::Shape { to_frame, easing } = source_tween {
+            if to_frame > copy.frame {
+                copy.tween = Tween::Shape { to_frame, easing };
+            }
         }
         shapes
             .iter()
@@ -1091,7 +1235,7 @@ pub fn materialize_keyframes_at_cells(
             placement.tween = Tween::None;
             cell_insertions.extend(
                 baked_shapes
-                    .keyframe_placements(shape_morph.as_ref(), state.index, placement)
+                    .keyframe_placements(shape_morph.as_ref(), state.index, source.tween, placement)
                     .into_iter()
                     .map(|placement| (state.index, placement)),
             );
@@ -2109,6 +2253,128 @@ pub fn duplicate_frames(
     paste_frames(project, q0rg_id, target_layer_id, target_frame, &clipboard)
 }
 
+/// A tween with exactly one end inside a selection that is about to move.
+struct CrossingTween {
+    layer_id: u16,
+    /// Keyframe of the tweened placement and its position among that
+    /// keyframe's placements, which survives the move.
+    frame: u16,
+    ordinal: usize,
+    target: q0s_format::v2::Target,
+    tween: Tween,
+    source_moves: bool,
+}
+
+fn crossing_tweens(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    selection: TimelineSelection,
+) -> Vec<CrossingTween> {
+    let Some((layer_ids, first_frame, last_frame)) =
+        selected_frame_bounds(project, q0rg_id, selection)
+    else {
+        return Vec::new();
+    };
+    let Some(q0rg) = project.q0rgs.iter().find(|q0rg| q0rg.q0rg_id == q0rg_id) else {
+        return Vec::new();
+    };
+    let selected = first_frame..=last_frame;
+    let mut crossing = Vec::new();
+    for layer in &q0rg.layers {
+        if !layer_ids.contains(&layer.layer_id) {
+            continue;
+        }
+        let mut ordinals = HashMap::<u16, usize>::new();
+        for placement in &layer.placements {
+            let ordinal = ordinals.entry(placement.frame).or_insert(0);
+            let own = *ordinal;
+            *ordinal += 1;
+            let Some(to_frame) = placement.tween.to_frame() else {
+                continue;
+            };
+            let source_moves = selected.contains(&placement.frame);
+            if source_moves != selected.contains(&to_frame) {
+                crossing.push(CrossingTween {
+                    layer_id: layer.layer_id,
+                    frame: placement.frame,
+                    ordinal: own,
+                    target: placement.target,
+                    tween: placement.tween,
+                    source_moves,
+                });
+            }
+        }
+    }
+    crossing
+}
+
+/// Reconnect tweens whose keyframe was dragged along its own layer. A tween
+/// stores the frame number it leads to, so moving either of its keyframes
+/// used to cut it; the animator only meant to retime it.
+fn reconnect_moved_tweens(
+    project: &mut ProjectV2,
+    q0rg_id: u16,
+    crossing: Vec<CrossingTween>,
+    stayed_on_layer: &HashSet<u16>,
+    delta: i32,
+) {
+    let Some(q0rg) = project
+        .q0rgs
+        .iter_mut()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+    else {
+        return;
+    };
+    let moved = |frame: u16| u16::try_from(i32::from(frame) + delta).ok();
+    for link in crossing {
+        if !stayed_on_layer.contains(&link.layer_id) {
+            continue;
+        }
+        let Some(to_frame) = link.tween.to_frame() else {
+            continue;
+        };
+        let (frame, to_frame) = if link.source_moves {
+            (moved(link.frame), Some(to_frame))
+        } else {
+            (Some(link.frame), moved(to_frame))
+        };
+        let (Some(frame), Some(to_frame)) = (frame, to_frame) else {
+            continue;
+        };
+        let Some(layer) = q0rg
+            .layers
+            .iter_mut()
+            .find(|layer| layer.layer_id == link.layer_id)
+        else {
+            continue;
+        };
+        // Still a tween between two neighbouring keyframes, in that order.
+        let reachable = frame < to_frame
+            && layer.has_keyframe(to_frame)
+            && layer
+                .timeline_frame_count
+                .is_none_or(|frame_count| to_frame < frame_count)
+            && !layer
+                .keyframe_frames()
+                .into_iter()
+                .any(|keyframe| frame < keyframe && keyframe < to_frame);
+        if !reachable {
+            continue;
+        }
+        if let Some(placement) = layer
+            .placements
+            .iter_mut()
+            .filter(|placement| placement.frame == frame)
+            .nth(link.ordinal)
+            .filter(|placement| {
+                placement.target == link.target && matches!(placement.tween, Tween::None)
+            })
+        {
+            placement.tween = link.tween.with_to_frame(to_frame);
+        }
+    }
+}
+
 pub fn move_frames(
     project: &mut ProjectV2,
     q0rg_id: u16,
@@ -2116,9 +2382,30 @@ pub fn move_frames(
     target_layer_id: u16,
     target_frame: u16,
 ) -> Option<TimelineSelection> {
+    let crossing = crossing_tweens(project, q0rg_id, selection);
+    let (source_layer_ids, first_frame, _) = selected_frame_bounds(project, q0rg_id, selection)?;
     let clipboard = capture_frames(project, q0rg_id, selection)?;
     remove_frames_for_move(project, q0rg_id, selection)?;
-    paste_frames(project, q0rg_id, target_layer_id, target_frame, &clipboard)
+    let moved = paste_frames(project, q0rg_id, target_layer_id, target_frame, &clipboard)?;
+    let stayed_on_layer = source_layer_ids
+        .iter()
+        .zip(target_frame_layer_ids(
+            project,
+            q0rg_id,
+            target_layer_id,
+            source_layer_ids.len(),
+        ))
+        .filter(|(source, target)| **source == *target)
+        .map(|(source, _)| *source)
+        .collect::<HashSet<_>>();
+    reconnect_moved_tweens(
+        project,
+        q0rg_id,
+        crossing,
+        &stayed_on_layer,
+        i32::from(target_frame) - i32::from(first_frame),
+    );
+    Some(moved)
 }
 
 fn selected_layer_ids(
@@ -2459,6 +2746,110 @@ mod tests {
             tween,
             fx: Default::default(),
         }
+    }
+
+    /// Keys at 2 and 6 joined by `tween`, with room to move either one.
+    fn tweened_layer(tween: Tween) -> ProjectV2 {
+        let mut project = timeline_project();
+        let q0rg = &mut project.q0rgs[0];
+        q0rg.frame_count = 16;
+        q0rg.layers[0].explicit_keyframes.clear();
+        q0rg.layers[0].placements =
+            vec![placement(2, 10.0, tween), placement(6, 40.0, Tween::None)];
+        project
+    }
+
+    fn tween_at(project: &ProjectV2, frame: u16) -> Tween {
+        project.q0rgs[0].layers[0]
+            .placements
+            .iter()
+            .find(|placement| placement.frame == frame)
+            .unwrap_or_else(|| panic!("no keyframe content at frame {frame}"))
+            .tween
+    }
+
+    #[test]
+    fn dragging_the_last_keyframe_of_a_tween_retimes_it() {
+        for tween in [
+            Tween::Linear { to_frame: 6 },
+            Tween::Shape {
+                to_frame: 6,
+                easing: q0s_format::v2::Easing::Hold,
+            },
+        ] {
+            let mut project = tweened_layer(tween);
+            move_frames(&mut project, 1, TimelineSelection::single(1, 6), 1, 9)
+                .expect("move destination keyframe");
+            assert_eq!(tween_at(&project, 2), tween.with_to_frame(9));
+            assert_eq!(tween_at(&project, 9), Tween::None);
+            q0s_format::v2::validate(&project).expect("retimed tween project");
+
+            // And back again, shorter than it started.
+            move_frames(&mut project, 1, TimelineSelection::single(1, 9), 1, 4)
+                .expect("move destination keyframe back");
+            assert_eq!(tween_at(&project, 2), tween.with_to_frame(4));
+            q0s_format::v2::validate(&project).expect("shortened tween project");
+        }
+    }
+
+    #[test]
+    fn dragging_the_first_keyframe_of_a_tween_keeps_it_attached() {
+        let tween = Tween::Linear { to_frame: 6 };
+        let mut project = tweened_layer(tween);
+        // Frame 0 holds the layer's root key; move the tween start from 2 to 4.
+        move_frames(&mut project, 1, TimelineSelection::single(1, 2), 1, 4)
+            .expect("move source keyframe");
+        assert_eq!(tween_at(&project, 4), tween);
+        assert!(project.q0rgs[0].layers[0]
+            .placements
+            .iter()
+            .all(|placement| placement.frame != 2));
+        q0s_format::v2::validate(&project).expect("moved tween start project");
+    }
+
+    #[test]
+    fn a_middle_keyframe_keeps_both_of_its_tweens() {
+        let mut project = tweened_layer(Tween::Linear { to_frame: 6 });
+        let layer = &mut project.q0rgs[0].layers[0];
+        layer.placements[1].tween = Tween::Linear { to_frame: 12 };
+        layer.placements.push(placement(12, 90.0, Tween::None));
+
+        move_frames(&mut project, 1, TimelineSelection::single(1, 6), 1, 8)
+            .expect("move middle keyframe");
+        assert_eq!(tween_at(&project, 2), Tween::Linear { to_frame: 8 });
+        assert_eq!(tween_at(&project, 8), Tween::Linear { to_frame: 12 });
+        q0s_format::v2::validate(&project).expect("retimed chain project");
+    }
+
+    #[test]
+    fn a_tween_is_only_cut_when_the_move_makes_it_impossible() {
+        // Past the tween's own start: there is nothing left to tween towards.
+        let mut project = tweened_layer(Tween::Linear { to_frame: 6 });
+        move_frames(&mut project, 1, TimelineSelection::single(1, 6), 1, 1)
+            .expect("move destination before source");
+        assert_eq!(tween_at(&project, 2), Tween::None);
+        q0s_format::v2::validate(&project).expect("cut tween project");
+
+        // Over another keyframe: the tween would have to run through it.
+        let mut project = tweened_layer(Tween::Linear { to_frame: 6 });
+        project.q0rgs[0].layers[0]
+            .placements
+            .push(placement(9, 70.0, Tween::None));
+        move_frames(&mut project, 1, TimelineSelection::single(1, 6), 1, 11)
+            .expect("move destination past another keyframe");
+        assert_eq!(tween_at(&project, 2), Tween::None);
+        q0s_format::v2::validate(&project).expect("blocked tween project");
+
+        // To another layer: a tween cannot span two layers.
+        let mut project = tweened_layer(Tween::Linear { to_frame: 6 });
+        let mut other = project.q0rgs[0].layers[0].clone();
+        other.layer_id = 2;
+        other.placements.clear();
+        project.q0rgs[0].layers.push(other);
+        move_frames(&mut project, 1, TimelineSelection::single(1, 6), 2, 6)
+            .expect("move destination to another layer");
+        assert_eq!(tween_at(&project, 2), Tween::None);
+        q0s_format::v2::validate(&project).expect("cross-layer move project");
     }
 
     #[test]

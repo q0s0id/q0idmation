@@ -2037,7 +2037,16 @@ pub fn commit_brush_region_with_material(
     // A raw drawing is one planar paint surface per visual style. Plain vector
     // paint and glowing paint of the same colour must stay distinct; otherwise
     // toggling Glow would silently restyle older artwork.
-    let mut painted = region;
+    // Publish one authoritative new contour, then use that same contour for
+    // cutting and merging. Independently fitting either side creates cracks.
+    let fresh_paths = coverage_to_paths(&region);
+    let fresh_geometry = vector_fill_geometry(&VectorAsset {
+        asset_id: 0,
+        paths: fresh_paths.clone(),
+        fill: Some(settings.color),
+        stroke: None,
+    });
+    let mut painted = fresh_geometry.clone();
     let mut same_style_assets = BTreeSet::new();
     // Merge drawing is local topology, not a reason to rewrite every same-colour
     // fill in the frame. Keep disconnected raw components as independent assets;
@@ -2082,7 +2091,21 @@ pub fn commit_brush_region_with_material(
         }
         painted = geo::unary_union(surfaces.iter());
     }
-    let painted_paths = coverage_to_paths(&painted);
+    let sources = crate::brush_geometry::BoundarySources::new(
+        app.state
+            .project
+            .assets
+            .iter()
+            .filter_map(|asset| match asset {
+                Asset::Vector(vector) if same_style_assets.contains(&vector.asset_id) => {
+                    Some(vector.paths.iter())
+                }
+                _ => None,
+            })
+            .flatten()
+            .chain(&fresh_paths),
+    );
+    let painted_paths = sources.paths(&painted);
     if painted_paths.is_empty() {
         return;
     }
@@ -2100,10 +2123,15 @@ pub fn commit_brush_region_with_material(
     let mut seen_different = BTreeSet::new();
     for candidate in &candidates {
         if raw_fill_style(&app.state.project, candidate) != requested_style
-            && raw_regions_intersect(&candidate.geometry, &painted)
+            && raw_regions_intersect(&candidate.geometry, &fresh_geometry)
             && seen_different.insert(candidate.asset_id)
         {
-            different_updates.push((candidate.asset_id, candidate.geometry.difference(&painted)));
+            // Only the new stroke overwrites other colours. Re-cutting them
+            // against the complete same-colour union perturbs distant seams.
+            different_updates.push((
+                candidate.asset_id,
+                candidate.geometry.difference(&fresh_geometry),
+            ));
         }
     }
 
@@ -2132,7 +2160,21 @@ pub fn commit_brush_region_with_material(
         let asset_id = *writable_different
             .get(original_asset_id)
             .unwrap_or(original_asset_id);
-        let paths = coverage_to_paths(geometry);
+        let Some(Asset::Vector(source)) = app
+            .state
+            .project
+            .assets
+            .iter()
+            .find(|asset| asset.id() == asset_id)
+        else {
+            continue;
+        };
+        // Match this fill's own segments first. Neighbours can trace the same
+        // curve backwards with different flattening samples; mixing their
+        // provenance would leave a chord at an otherwise untouched join.
+        let paths =
+            crate::brush_geometry::BoundarySources::new(source.paths.iter().chain(&fresh_paths))
+                .paths(geometry);
         if paths.is_empty() {
             remove_asset_ids.insert(asset_id);
         } else if let Some(Asset::Vector(vector)) = app
@@ -2147,6 +2189,21 @@ pub fn commit_brush_region_with_material(
         }
     }
 
+    // Replacing a connected fill must not lift its entire old contour above
+    // neighbouring colours. The fresh footprint has already cut those fills.
+    let untouched_tail = app.state.project.q0rgs.iter()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+        .and_then(|q0rg| q0rg.layers.iter().find(|layer| layer.layer_id == layer_id))
+        .and_then(|layer| {
+            layer.placements.iter().rposition(|placement| placement.frame == frame
+                && placement.transform == Transform2D::IDENTITY && !placement.tween.is_motion()
+                && matches!(placement.target, Target::Asset(id) if same_style_assets.contains(&id)))
+                .map(|index| layer.placements[index + 1..].iter().filter(|placement| {
+                    !(placement.frame == frame && placement.transform == Transform2D::IDENTITY
+                        && !placement.tween.is_motion()
+                        && matches!(placement.target, Target::Asset(id) if remove_asset_ids.contains(&id)))
+                }).count())
+        }).unwrap_or(0);
     remove_current_layer_asset_placements(
         &mut app.state.project,
         q0rg_id,
@@ -2164,6 +2221,25 @@ pub fn commit_brush_region_with_material(
         settings.color,
         painted_paths,
     );
+    if untouched_tail > 0 {
+        if let Some(layer) = app
+            .state
+            .project
+            .q0rgs
+            .iter_mut()
+            .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+            .and_then(|q0rg| {
+                q0rg.layers
+                    .iter_mut()
+                    .find(|layer| layer.layer_id == layer_id)
+            })
+        {
+            if let Some(placement) = layer.placements.pop() {
+                let insertion = layer.placements.len().saturating_sub(untouched_tail);
+                layer.placements.insert(insertion, placement);
+            }
+        }
+    }
     #[cfg(not(feature = "appearance-mask-eraser"))]
     let _ = painted_asset_id;
     #[cfg(feature = "appearance-mask-eraser")]
@@ -2367,7 +2443,7 @@ fn merge_touching_raw_fills_after_edit_impl(
                 layer.placements.iter().rposition(|placement| {
                     placement.frame == frame
                         && placement.transform == Transform2D::IDENTITY
-                        && matches!(placement.tween, Tween::None)
+                        && !placement.tween.is_motion()
                         && matches!(placement.target, Target::Asset(id) if asset_ids.contains(&id))
                 }).map(|index| layer.placements.len() - index - 1)
             })
@@ -2558,7 +2634,7 @@ fn collect_raw_fill_candidates(
         .filter_map(|(placement_idx, _)| {
             let placement = layer.placements.get(placement_idx)?;
             if placement.transform != Transform2D::IDENTITY
-                || !matches!(placement.tween, Tween::None)
+                || placement.tween.is_motion()
                 || !placement.fx.is_identity()
             {
                 return None;
@@ -2648,7 +2724,7 @@ pub(crate) fn prepare_writable_raw_assets(
             for placement in &mut layer.placements {
                 if placement.frame == frame
                     && placement.transform == Transform2D::IDENTITY
-                    && matches!(placement.tween, Tween::None)
+                    && !placement.tween.is_motion()
                     && matches!(placement.target, Target::Asset(id) if id == *asset_id)
                 {
                     placement.target = Target::Asset(new_asset_id);
@@ -2677,7 +2753,7 @@ fn asset_has_external_references(
                     && layer.layer_id == layer_id
                     && placement.frame == frame
                     && placement.transform == Transform2D::IDENTITY
-                    && matches!(placement.tween, Tween::None))
+                    && !placement.tween.is_motion())
             })
         })
     })
@@ -2706,7 +2782,7 @@ fn remove_current_layer_asset_placements(
         layer.placements.retain(|placement| {
             placement.frame != frame
                 || placement.transform != Transform2D::IDENTITY
-                || !matches!(placement.tween, Tween::None)
+                || placement.tween.is_motion()
                 || !matches!(placement.target, Target::Asset(id) if asset_ids.contains(&id))
         });
     }
@@ -2967,21 +3043,7 @@ fn path_to_polygon(path: &VPath) -> Option<Polygon<f64>> {
     for i in 0..path.anchors.len() {
         let a = &path.anchors[i];
         let b = &path.anchors[(i + 1) % path.anchors.len()];
-        if a.out_handle.is_none() && b.in_handle.is_none() {
-            points.push(b.point);
-        } else {
-            let p1 = a.out_handle.unwrap_or(a.point);
-            let p2 = b.in_handle.unwrap_or(b.point);
-            let curve = lyon_path::geom::CubicBezierSegment {
-                from: lyon_path::math::point(a.point.x, a.point.y),
-                ctrl1: lyon_path::math::point(p1.x, p1.y),
-                ctrl2: lyon_path::math::point(p2.x, p2.y),
-                to: lyon_path::math::point(b.point.x, b.point.y),
-            };
-            curve.for_each_flattened(0.1, &mut |line| {
-                points.push(Vec2::new(line.to.x, line.to.y))
-            });
-        }
+        crate::brush_geometry::flatten_segment(a, b, |_, to, _, _| points.push(to));
     }
     let mut coords: Vec<Coord<f64>> = points
         .into_iter()
@@ -4904,6 +4966,194 @@ mod tests {
             cheap[0].geometry, edit[0].geometry,
             "click/move and painting must share the same boundary"
         );
+    }
+
+    #[test]
+    fn brush_cut_preserves_a_small_curved_cap_for_further_edits() {
+        let mut app = EditorApp::default();
+        let green = Rgba {
+            r: 0,
+            g: 220,
+            b: 95,
+            a: 255,
+        };
+        let mut arch = square_path(0.0, 80.0, 100.0, 160.0);
+        arch.anchors[0].out_handle = Some(Vec2::new(0.0, 0.0));
+        arch.anchors[1].in_handle = Some(Vec2::new(100.0, 0.0));
+        app.state.project.assets = vec![raw_fill_asset(1, green, arch)];
+        app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            instance_id: 0,
+            frame: 0,
+            target: Target::Asset(1),
+            transform: Transform2D::IDENTITY,
+            tween: Tween::None,
+            fx: Default::default(),
+        }];
+        let cut = vector_fill_geometry(&VectorAsset {
+            asset_id: 0,
+            paths: vec![square_path(-10.0, 30.0, 110.0, 170.0)],
+            fill: Some(green),
+            stroke: None,
+        });
+        commit_brush_region(&mut app, cut, settings(10.0, 0));
+        let cap = app
+            .state
+            .project
+            .assets
+            .iter()
+            .find_map(|asset| match asset {
+                Asset::Vector(vector) if vector.fill == Some(green) => Some(vector),
+                _ => None,
+            })
+            .expect("curved cap must survive the cut");
+        assert!(vector_fill_geometry(cap).contains(&Point::new(50.0, 25.0)));
+        assert!(cap.paths.iter().all(|path| path.anchors.len() >= 3));
+    }
+
+    #[test]
+    fn local_brush_edit_keeps_detailed_neighbour_boundaries_pixel_identical() {
+        let mut app = EditorApp::default();
+        app.state.project.meta.stage_width = 160;
+        app.state.project.meta.stage_height = 160;
+        let green = Rgba {
+            r: 0,
+            g: 220,
+            b: 95,
+            a: 255,
+        };
+        let cyan = Rgba {
+            r: 0,
+            g: 190,
+            b: 165,
+            a: 255,
+        };
+        let mut left = square_path(10.0, 10.0, 80.0, 150.0);
+        let mut boundary = Vec::new();
+        for i in 0..=28 {
+            let y = 10.0 + i as f32 * 5.0;
+            let x = 80.0 + (i as f32 * 1.7).sin() * 8.0;
+            boundary.push(Anchor {
+                point: Vec2::new(x, y),
+                in_handle: Some(Vec2::new(x - 3.5, y - 1.7)),
+                out_handle: Some(Vec2::new(x + 3.5, y + 1.7)),
+            });
+        }
+        left.anchors.splice(1..3, boundary.iter().cloned());
+        let mut right = square_path(80.0, 10.0, 150.0, 150.0);
+        right.anchors = vec![right.anchors[1].clone(), right.anchors[2].clone()];
+        right
+            .anchors
+            .extend(boundary.iter().rev().map(|anchor| Anchor {
+                point: anchor.point,
+                in_handle: anchor.out_handle,
+                out_handle: anchor.in_handle,
+            }));
+        app.state.project.assets = vec![
+            raw_fill_asset(1, green, left),
+            raw_fill_asset(2, cyan, right),
+        ];
+        app.state.project.q0rgs[0].layers[0].placements = (1..=2)
+            .map(|id| Placement {
+                instance_id: 0,
+                frame: 0,
+                target: Target::Asset(id),
+                transform: Transform2D::IDENTITY,
+                tween: Tween::None,
+                fx: Default::default(),
+            })
+            .collect();
+        let render = |project: &ProjectV2| {
+            q0s_format::raster::rasterize_q0rg_frame_scaled(
+                project,
+                1,
+                0,
+                960,
+                960,
+                1,
+                [40, 40, 40, 255],
+            )
+        };
+        let original = app.state.project.clone();
+        let output =
+            std::env::var_os("Q0EDITOR_BRUSH_REGRESSION_OUTPUT").map(std::path::PathBuf::from);
+        if let Some(dir) = &output {
+            std::fs::create_dir_all(dir).unwrap();
+            crate::file_io::save_project(&dir.join("before.q1s"), &original).unwrap();
+        }
+        let black = Rgba {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        for color in [black, green] {
+            app.state.project = original.clone();
+            let mut paint = settings(10.0, 0);
+            paint.color = color;
+            // Cross a straight edge, paint an interior hole, then cross the
+            // detailed shared curve. Repeat to catch accumulating drift.
+            for (x, y) in [(8.0, 60.0), (25.0, 95.0), (70.0, 115.0), (8.0, 60.0)] {
+                let before = render(&app.state.project);
+                let gesture = stroke(&[Vec2::new(x, y), Vec2::new(x + 18.0, y + 10.0)], paint);
+                commit_brush_region(&mut app, brush_finish(gesture, paint), paint);
+                let after = render(&app.state.project);
+                let holes = before
+                    .chunks_exact(4)
+                    .zip(after.chunks_exact(4))
+                    .filter(|(a, b)| *a != [40, 40, 40, 255] && *b == [40, 40, 40, 255])
+                    .count();
+                assert_eq!(
+                    holes, 0,
+                    "painting must not expose background through the existing fill"
+                );
+                if let Some(dir) = &output {
+                    let prefix = format!("{}-{x}-{y}", color.g);
+                    for (name, pixels) in [("before", &before), ("after", &after)] {
+                        image::save_buffer(
+                            dir.join(format!("{prefix}-{name}.png")),
+                            pixels,
+                            960,
+                            960,
+                            image::ColorType::Rgba8,
+                        )
+                        .unwrap();
+                    }
+                    crate::file_io::save_project(
+                        &dir.join(format!("{prefix}.q1s")),
+                        &app.state.project,
+                    )
+                    .unwrap();
+                }
+                let changed = before
+                    .chunks_exact(4)
+                    .zip(after.chunks_exact(4))
+                    .enumerate()
+                    .filter(|(index, (a, b))| {
+                        let px = (index % 960) as f32 / 6.0;
+                        let py = (index / 960) as f32 / 6.0;
+                        let outside =
+                            px < x - 7.0 || px > x + 25.0 || py < y - 7.0 || py > y + 17.0;
+                        outside && a != b
+                    })
+                    .count();
+                assert_eq!(
+                    changed, 0,
+                    "a local stroke at ({x}, {y}) changed distant pixels, colour {color:?}; first differences: {:?}",
+                    before.chunks_exact(4).zip(after.chunks_exact(4)).enumerate()
+                        .filter(|(i, (a, b))| a != b && (((i / 960) as f32 / 6.0) < y - 7.0 || ((i / 960) as f32 / 6.0) > y + 17.0))
+                        .map(|(i, (a, b))| ((i % 960, i / 960), a, b)).take(15).collect::<Vec<_>>()
+                );
+                if color == black {
+                    let center =
+                        (((y + 5.0) * 6.0) as usize * 960 + ((x + 9.0) * 6.0) as usize) * 4;
+                    assert_eq!(
+                        &after[center..center + 4],
+                        &[0, 0, 0, 255],
+                        "the new stroke must still paint"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

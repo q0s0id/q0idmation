@@ -845,6 +845,20 @@ pub struct Viewport {
     pub panning: bool,
     /// Active hand interaction: permanent Hand tool or temporary Space override.
     pub hand_active: bool,
+    pub touch: TouchGesture,
+}
+
+/// Several fingers on the canvas at once, from the first touch to the last
+/// release.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TouchGesture {
+    pub active: bool,
+    pub started: f64,
+    /// Where the fingers are centred now; zooming keeps this stage point put.
+    pub center: egui::Pos2,
+    pub most_fingers: usize,
+    /// How far the fingers moved in points, with zooming counted as movement.
+    pub travel: f32,
 }
 
 impl Viewport {
@@ -854,6 +868,7 @@ impl Viewport {
             pan: Vec2::new(0.0, 0.0),
             panning: false,
             hand_active: false,
+            touch: TouchGesture::default(),
         }
     }
 }
@@ -955,6 +970,7 @@ pub struct Session {
     pub library_sort_ascending: bool,
     pub library_rename: Option<LibraryRename>,
     pub text_editor: Option<crate::text_tool::TextDraft>,
+    pub(crate) font_audit: crate::font_replacement::ProjectFontAudit,
     pub text_defaults: crate::text_tool::TextDraft,
     pub text_inspector: Option<crate::text_tool::TextDraft>,
     pub text_canvas_click_consumed: bool,
@@ -1190,6 +1206,7 @@ impl Session {
             library_search: String::new(),
             library_sort_ascending: true,
             text_editor: None,
+            font_audit: Default::default(),
             text_defaults: Default::default(),
             text_inspector: None,
             text_canvas_click_consumed: false,

@@ -10,6 +10,22 @@ use q0s_format::v2::{BlendMode, GradientKind, GradientStop};
 #[cfg(not(target_arch = "wasm32"))]
 thread_local! {
     static GL_RESOURCES: RefCell<HashMap<usize, GlResources>> = RefCell::new(HashMap::new());
+    /// Contexts whose resources could not be built. Retrying would recompile
+    /// every shader in every paint callback of every frame.
+    static UNAVAILABLE: RefCell<std::collections::HashSet<usize>> =
+        RefCell::new(std::collections::HashSet::new());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn gl_unavailable(context_key: usize) -> bool {
+    UNAVAILABLE.with(|unavailable| unavailable.borrow().contains(&context_key))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn mark_gl_unavailable(context_key: usize, error: &str) {
+    UNAVAILABLE.with(|unavailable| unavailable.borrow_mut().insert(context_key));
+    // Nothing the compositor draws will appear, so say why, once.
+    eprintln!("q0glblend: GPU compositor unavailable: {error}");
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -595,8 +611,15 @@ pub fn paint_solid_mesh_group_with_opacity_on_opaque_backdrop(
                 if let std::collections::hash_map::Entry::Vacant(entry) =
                     resources.entry(context_key)
                 {
-                    let Ok(created) = (unsafe { GlResources::new(gl) }) else {
+                    if gl_unavailable(context_key) {
                         return;
+                    }
+                    let created = match unsafe { GlResources::new(gl) } {
+                        Ok(created) => created,
+                        Err(error) => {
+                            mark_gl_unavailable(context_key, &error);
+                            return;
+                        }
                     };
                     entry.insert(created);
                 }
@@ -808,8 +831,15 @@ pub fn paint_cached_mesh_affine_color(
                 if let std::collections::hash_map::Entry::Vacant(entry) =
                     resources.entry(context_key)
                 {
-                    let Ok(created) = (unsafe { GlResources::new(gl) }) else {
+                    if gl_unavailable(context_key) {
                         return;
+                    }
+                    let created = match unsafe { GlResources::new(gl) } {
+                        Ok(created) => created,
+                        Err(error) => {
+                            mark_gl_unavailable(context_key, &error);
+                            return;
+                        }
                     };
                     entry.insert(created);
                 }
@@ -1354,8 +1384,15 @@ pub fn paint_vector_masked_placements_on_opaque_backdrop(
                 if let std::collections::hash_map::Entry::Vacant(entry) =
                     resources.entry(context_key)
                 {
-                    let Ok(created) = (unsafe { GlResources::new(gl) }) else {
+                    if gl_unavailable(context_key) {
                         return;
+                    }
+                    let created = match unsafe { GlResources::new(gl) } {
+                        Ok(created) => created,
+                        Err(error) => {
+                            mark_gl_unavailable(context_key, &error);
+                            return;
+                        }
                     };
                     entry.insert(created);
                 }
@@ -1484,8 +1521,15 @@ fn paint_vector_group_fx_impl(
                 if let std::collections::hash_map::Entry::Vacant(entry) =
                     resources.entry(context_key)
                 {
-                    let Ok(created) = (unsafe { GlResources::new(gl) }) else {
+                    if gl_unavailable(context_key) {
                         return;
+                    }
+                    let created = match unsafe { GlResources::new(gl) } {
+                        Ok(created) => created,
+                        Err(error) => {
+                            mark_gl_unavailable(context_key, &error);
+                            return;
+                        }
                     };
                     entry.insert(created);
                 }
@@ -1581,8 +1625,15 @@ pub fn paint_gradient_mesh(
                 if let std::collections::hash_map::Entry::Vacant(entry) =
                     resources.entry(context_key)
                 {
-                    let Ok(created) = (unsafe { GlResources::new(gl) }) else {
+                    if gl_unavailable(context_key) {
                         return;
+                    }
+                    let created = match unsafe { GlResources::new(gl) } {
+                        Ok(created) => created,
+                        Err(error) => {
+                            mark_gl_unavailable(context_key, &error);
+                            return;
+                        }
                     };
                     entry.insert(created);
                 }
@@ -1693,8 +1744,15 @@ fn paint_texture_impl(
                 if let std::collections::hash_map::Entry::Vacant(entry) =
                     resources.entry(context_key)
                 {
-                    let Ok(created) = (unsafe { GlResources::new(gl) }) else {
+                    if gl_unavailable(context_key) {
                         return;
+                    }
+                    let created = match unsafe { GlResources::new(gl) } {
+                        Ok(created) => created,
+                        Err(error) => {
+                            mark_gl_unavailable(context_key, &error);
+                            return;
+                        }
                     };
                     entry.insert(created);
                 }
@@ -4094,7 +4152,7 @@ void main() {
     let vertex = gl
         .create_shader(glow::VERTEX_SHADER)
         .map_err(|error| error.to_string())?;
-    gl.shader_source(vertex, VERTEX);
+    gl.shader_source(vertex, &glsl_for(gl, VERTEX));
     gl.compile_shader(vertex);
     if !gl.get_shader_compile_status(vertex) {
         let log = gl.get_shader_info_log(vertex);
@@ -4104,7 +4162,7 @@ void main() {
     let fragment = gl
         .create_shader(glow::FRAGMENT_SHADER)
         .map_err(|error| error.to_string())?;
-    gl.shader_source(fragment, FRAGMENT);
+    gl.shader_source(fragment, &glsl_for(gl, FRAGMENT));
     gl.compile_shader(fragment);
     if !gl.get_shader_compile_status(fragment) {
         let log = gl.get_shader_info_log(fragment);
@@ -4124,6 +4182,23 @@ void main() {
         return Err(log);
     }
     Ok(program)
+}
+
+/// The shaders are written in desktop GLSL 1.40. OpenGL ES 3 runs the same
+/// code once the version line names its dialect and the default precisions
+/// that ES leaves unset are declared.
+#[cfg(not(target_arch = "wasm32"))]
+fn glsl_for(gl: &glow::Context, source: &str) -> String {
+    if !gl.version().is_embedded {
+        return source.to_owned();
+    }
+    let body = source.strip_prefix("#version 140").unwrap_or(source);
+    format!(
+        "#version 300 es
+precision highp float;
+precision highp int;
+precision highp sampler2D;{body}"
+    )
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -4156,7 +4231,7 @@ void main() {
     let vertex = gl
         .create_shader(glow::VERTEX_SHADER)
         .map_err(|error| error.to_string())?;
-    gl.shader_source(vertex, VERTEX);
+    gl.shader_source(vertex, &glsl_for(gl, VERTEX));
     gl.compile_shader(vertex);
     if !gl.get_shader_compile_status(vertex) {
         let log = gl.get_shader_info_log(vertex);
@@ -4166,7 +4241,7 @@ void main() {
     let fragment = gl
         .create_shader(glow::FRAGMENT_SHADER)
         .map_err(|error| error.to_string())?;
-    gl.shader_source(fragment, FRAGMENT);
+    gl.shader_source(fragment, &glsl_for(gl, FRAGMENT));
     gl.compile_shader(fragment);
     if !gl.get_shader_compile_status(fragment) {
         let log = gl.get_shader_info_log(fragment);
@@ -4250,7 +4325,7 @@ void main() {
     let vertex = gl
         .create_shader(glow::VERTEX_SHADER)
         .map_err(|error| error.to_string())?;
-    gl.shader_source(vertex, VERTEX);
+    gl.shader_source(vertex, &glsl_for(gl, VERTEX));
     gl.compile_shader(vertex);
     if !gl.get_shader_compile_status(vertex) {
         let log = gl.get_shader_info_log(vertex);
@@ -4260,7 +4335,7 @@ void main() {
     let fragment = gl
         .create_shader(glow::FRAGMENT_SHADER)
         .map_err(|error| error.to_string())?;
-    gl.shader_source(fragment, FRAGMENT);
+    gl.shader_source(fragment, &glsl_for(gl, FRAGMENT));
     gl.compile_shader(fragment);
     if !gl.get_shader_compile_status(fragment) {
         let log = gl.get_shader_info_log(fragment);
@@ -4373,7 +4448,7 @@ void main() {
     let vertex = gl
         .create_shader(glow::VERTEX_SHADER)
         .map_err(|error| error.to_string())?;
-    gl.shader_source(vertex, VERTEX);
+    gl.shader_source(vertex, &glsl_for(gl, VERTEX));
     gl.compile_shader(vertex);
     if !gl.get_shader_compile_status(vertex) {
         let log = gl.get_shader_info_log(vertex);
@@ -4383,7 +4458,7 @@ void main() {
     let fragment = gl
         .create_shader(glow::FRAGMENT_SHADER)
         .map_err(|error| error.to_string())?;
-    gl.shader_source(fragment, FRAGMENT);
+    gl.shader_source(fragment, &glsl_for(gl, FRAGMENT));
     gl.compile_shader(fragment);
     if !gl.get_shader_compile_status(fragment) {
         let log = gl.get_shader_info_log(fragment);
@@ -4529,7 +4604,7 @@ unsafe fn create_fullscreen_program(
     let vertex = gl
         .create_shader(glow::VERTEX_SHADER)
         .map_err(|error| error.to_string())?;
-    gl.shader_source(vertex, vertex_source);
+    gl.shader_source(vertex, &glsl_for(gl, vertex_source));
     gl.compile_shader(vertex);
     if !gl.get_shader_compile_status(vertex) {
         let log = gl.get_shader_info_log(vertex);
@@ -4539,7 +4614,7 @@ unsafe fn create_fullscreen_program(
     let fragment = gl
         .create_shader(glow::FRAGMENT_SHADER)
         .map_err(|error| error.to_string())?;
-    gl.shader_source(fragment, fragment_source);
+    gl.shader_source(fragment, &glsl_for(gl, fragment_source));
     gl.compile_shader(fragment);
     if !gl.get_shader_compile_status(fragment) {
         let log = gl.get_shader_info_log(fragment);
@@ -4659,7 +4734,7 @@ void main() {
     let vertex = gl
         .create_shader(glow::VERTEX_SHADER)
         .map_err(|error| error.to_string())?;
-    gl.shader_source(vertex, VERTEX);
+    gl.shader_source(vertex, &glsl_for(gl, VERTEX));
     gl.compile_shader(vertex);
     if !gl.get_shader_compile_status(vertex) {
         let log = gl.get_shader_info_log(vertex);
@@ -4669,7 +4744,7 @@ void main() {
     let fragment = gl
         .create_shader(glow::FRAGMENT_SHADER)
         .map_err(|error| error.to_string())?;
-    gl.shader_source(fragment, FRAGMENT);
+    gl.shader_source(fragment, &glsl_for(gl, FRAGMENT));
     gl.compile_shader(fragment);
     if !gl.get_shader_compile_status(fragment) {
         let log = gl.get_shader_info_log(fragment);

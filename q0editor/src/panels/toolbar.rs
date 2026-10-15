@@ -115,6 +115,15 @@ fn tool_shortcut(tool: Tool) -> Option<crate::hotkeys::ShortcutCommand> {
     })
 }
 
+/// Tool buttons grow to fingertip size in the touch layout.
+fn tool_button_size() -> f32 {
+    if crate::touch::ENABLED {
+        crate::ui::TOUCH_CONTROL_SIZE
+    } else {
+        TOOL_BUTTON_SIZE
+    }
+}
+
 fn tool_button(
     ui: &mut Ui,
     tool: Tool,
@@ -123,7 +132,8 @@ fn tool_button(
     panel: Color32,
     accent: Color32,
 ) -> Response {
-    let desired_size = vec2(TOOL_BUTTON_SIZE, TOOL_BUTTON_SIZE);
+    let size = tool_button_size();
+    let desired_size = vec2(size, size);
     let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click());
     response.widget_info(|| {
         WidgetInfo::selected(
@@ -161,7 +171,10 @@ fn tool_button(
             );
         }
 
-        let icon_rect = Rect::from_center_size(rect.center(), vec2(TOOL_ICON_SIZE, TOOL_ICON_SIZE));
+        let icon_rect = Rect::from_center_size(
+            rect.center(),
+            vec2(TOOL_ICON_SIZE, TOOL_ICON_SIZE) * (size / TOOL_BUTTON_SIZE),
+        );
         let (primary, secondary) = tool_icon_colors(text, accent, selected);
         draw_tool_icon(
             ui.painter(),

@@ -398,6 +398,7 @@ pub(crate) fn enrich_project(
         });
         imported.report.warnings.extend(scene.warnings);
         imported.report.warnings.extend(scene_built.warnings);
+        imported.pending_text.extend(scene_built.pending_text);
     }
 
     for ((path, symbol), q0rg_id) in symbols.into_iter().zip(symbol_ids_by_path) {
@@ -431,6 +432,7 @@ pub(crate) fn enrich_project(
         }
         imported.report.warnings.extend(symbol.warnings);
         imported.report.warnings.extend(built.warnings);
+        imported.pending_text.extend(built.pending_text);
     }
 
     imported.report.imported_layers = imported
@@ -532,6 +534,7 @@ struct BuiltQ0rg {
     q0rg: Q0rg,
     metadata: HashMap<LayerKey, LayerMetadata>,
     warnings: Vec<String>,
+    pending_text: Vec<crate::PendingText>,
 }
 
 fn import_frame_tween(
@@ -753,6 +756,7 @@ fn build_q0rg(
     let mut layers = Vec::with_capacity(timeline.layers.len());
     let mut metadata = HashMap::new();
     let mut warnings = Vec::new();
+    let mut pending_text = Vec::new();
 
     for (original_index, raw_layer) in timeline.layers.iter().enumerate().rev() {
         if raw_layer.is_camera {
@@ -903,7 +907,7 @@ fn build_q0rg(
                         }
                         RawElement::Text(text) => {
                             if let Some(target) =
-                                text_asset(text, q0rg_name, project, next_asset_id, &mut warnings)?
+                                text_asset(text, q0rg_name, project, next_asset_id, &mut warnings, &mut pending_text)?
                             {
                                 placements.push(Placement {
                                     instance_id: 0,
@@ -994,6 +998,7 @@ fn build_q0rg(
         q0rg,
         metadata,
         warnings,
+        pending_text,
     })
 }
 
@@ -1243,18 +1248,45 @@ pub(crate) fn text_asset(
     project: &mut ProjectV2,
     next_asset_id: &mut u16,
     warnings: &mut Vec<String>,
+    pending_text: &mut Vec<crate::PendingText>,
 ) -> Result<Option<u16>, ImportError> {
     if text.text.is_empty() {
         return Ok(None);
     }
-    let mut paths =
-        match crate::text_outline::outline_installed_font(&text.font, &text.text, text.size) {
+    let mut replacement = None;
+    let paths =
+        match text_paths(text) {
             Ok(paths) => paths,
             Err(error) => {
-                warnings.push(format!("{owner_name}: {error}; text was skipped"));
-                return Ok(None);
+                let fallback = crate::fonts::default_name().ok_or_else(|| ImportError::Invalid(
+                    format!("{owner_name}: {error}; no outline font is available for replacement")))?;
+                let mut source = text.clone();
+                source.font = fallback.to_string();
+                let paths = text_paths(&source).map_err(|fallback_error| ImportError::Invalid(
+                    format!("{owner_name}: {error}; fallback failed: {fallback_error}")))?;
+                warnings.push(format!("{owner_name}: {error}; text preserved using '{fallback}' pending font replacement"));
+                replacement = Some(fallback.to_string());
+                paths
             }
         };
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let id = allocate_asset_id(next_asset_id)?;
+    project.assets.push(Asset::Vector(VectorAsset {
+        asset_id: id,
+        paths,
+        fill: Some(text.color),
+        stroke: None,
+    }));
+    if let Some(replacement) = replacement {
+        pending_text.push(crate::PendingText { asset_id: id, source: text.clone(), replacement });
+    }
+    Ok(Some(id))
+}
+
+pub(crate) fn text_paths(text: &RawText) -> Result<Vec<VectorPath>, String> {
+    let mut paths = crate::text_outline::outline_installed_font(&text.font, &text.text, text.size)?;
     let affine = Affine::compose(
         text.affine,
         Affine {
@@ -1270,21 +1302,10 @@ pub(crate) fn text_asset(
             anchor.out_handle = anchor.out_handle.map(|point| affine.apply(point));
         }
     }
-    if paths.is_empty() {
-        warnings.push(format!(
-            "{owner_name}: font '{}' produced no outlines for imported text",
-            text.font
-        ));
-        return Ok(None);
+    if paths.is_empty() && !text.text.trim().is_empty() {
+        return Err(format!("Font '{}' produced no outlines for imported text", text.font));
     }
-    let id = allocate_asset_id(next_asset_id)?;
-    project.assets.push(Asset::Vector(VectorAsset {
-        asset_id: id,
-        paths,
-        fill: Some(text.color),
-        stroke: None,
-    }));
-    Ok(Some(id))
+    Ok(paths)
 }
 
 fn allocate_asset_id(next_asset_id: &mut u16) -> Result<u16, ImportError> {

@@ -34,8 +34,12 @@ pub fn configure(icon_name: &str, product_name: &str, description: &str, origina
     std::fs::write(out_dir.join("window_icon.rs"), generated)
         .expect("failed to write native window icon module");
 
+    // `cfg(windows)` describes the machine running this script. Cross builds
+    // from Windows must not hand a Windows resource object to a foreign linker.
     #[cfg(windows)]
-    embed_windows_resources(&icon, product_name, description, original_filename);
+    if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
+        embed_windows_resources(&icon, product_name, description, original_filename);
+    }
 }
 
 #[cfg(windows)]

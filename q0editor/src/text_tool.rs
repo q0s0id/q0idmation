@@ -277,6 +277,49 @@ pub fn display_name(name: &str) -> Option<String> {
     Some(format!("Text: {first}"))
 }
 
+pub(crate) fn missing_fonts(project: &ProjectV2) -> Vec<q0fla::MissingFont> {
+    let mut rows = std::collections::BTreeMap::<String, q0fla::MissingFont>::new();
+    for asset in &project.assets {
+        let Asset::Vector(vector) = asset else { continue; };
+        let Some(source) = project.asset_names.get(&vector.asset_id).and_then(|name| decode_text_source(name)) else { continue; };
+        if q0fla::fonts::find(&source.font).is_some() { continue; }
+        rows.entry(source.font.to_lowercase()).or_insert_with(|| q0fla::MissingFont {
+            name: source.font,
+            replacement: q0fla::fonts::default_name().unwrap_or_default().to_string(),
+            text_count: 0,
+        }).text_count += 1;
+    }
+    rows.into_values().collect()
+}
+
+pub(crate) fn replace_missing_fonts(app: &mut EditorApp, choices: &std::collections::BTreeMap<String, String>) -> Result<(), String> {
+    let mut prepared = Vec::new();
+    for (index, asset) in app.state.project.assets.iter().enumerate() {
+        let Asset::Vector(vector) = asset else { continue; };
+        let Some(mut source) = app.state.project.asset_names.get(&vector.asset_id).and_then(|name| decode_text_source(name)) else { continue; };
+        let Some((_, replacement)) = choices.iter().find(|(name, _)| name.eq_ignore_ascii_case(&source.font)) else { continue; };
+        let (bytes, face) = q0fla::fonts::load(replacement).ok_or_else(|| format!("Font '{replacement}' is unavailable"))?;
+        let paths = outline_text(&bytes, face, &source.text, source.size)?;
+        if paths.is_empty() && !source.text.trim().is_empty() {
+            return Err(format!("Font '{replacement}' has no outlines for this text"));
+        }
+        source.font = replacement.clone();
+        let name = format!("{FONT_SOURCE_PREFIX}{}", serde_json::to_string(&source).map_err(|error| error.to_string())?);
+        prepared.push((index, vector.asset_id, paths, name));
+    }
+    if prepared.is_empty() { return Ok(()); }
+    app.history.snapshot_with_session(&app.state.project, &app.session);
+    for (index, id, paths, name) in prepared {
+        if let Asset::Vector(vector) = &mut app.state.project.assets[index] { vector.paths = paths; }
+        app.state.project.asset_names.insert(id, name);
+    }
+    app.session.text_inspector = None;
+    app.textures.invalidate();
+    app.state.mark_dirty();
+    app.session.status = "Fonts replaced".into();
+    Ok(())
+}
+
 pub fn selected_asset_id(app: &EditorApp, selection: &Selection) -> Option<u16> {
     let Selection::Placement {
         q0rg_id,
@@ -750,21 +793,23 @@ fn text_controls(ui: &mut egui::Ui, draft: &mut TextDraft) {
 
 fn default_font() -> String {
     static DEFAULT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    DEFAULT
-        .get_or_init(|| {
-            ["Segoe UI", "Tahoma", "Arial", "Verdana"]
-                .iter()
-                .find(|name| crate::q0lang::fonts::load_font_bytes(name).is_some())
-                .copied()
-                .or_else(|| {
-                    crate::text_fonts::installed()?
-                        .first()
-                        .map(|f| f.name.as_str())
-                })
-                .unwrap_or("Segoe UI")
-                .to_owned()
-        })
-        .clone()
+    if let Some(name) = DEFAULT.get() {
+        return name.clone();
+    }
+    let known = ["Segoe UI", "Tahoma", "Arial", "Verdana"]
+        .iter()
+        .find(|name| crate::q0lang::fonts::load_font_bytes(name).is_some())
+        .map(|name| (*name).to_owned());
+    // The installed list comes from a background scan. Only a settled answer
+    // is remembered, so an early call cannot pin a font the device lacks.
+    let scanned = || {
+        crate::text_fonts::installed()?;
+        q0fla::fonts::default_name().map(str::to_owned)
+    };
+    match known.or_else(scanned) {
+        Some(name) => DEFAULT.get_or_init(|| name).clone(),
+        None => "Segoe UI".to_owned(),
+    }
 }
 
 fn font_bytes(name: &str) -> Option<(Vec<u8>, u32)> {

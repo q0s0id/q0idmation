@@ -2,6 +2,7 @@ use egui::{FontFamily, FontId, RichText, TextEdit};
 use q0s_format::v2::FrameScript;
 
 use crate::app::{Action, EditorApp};
+use crate::ui::FitToScreen;
 
 pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
     let Some(mut draft) = app.session.frame_script_editor.clone() else {
@@ -76,6 +77,7 @@ pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
     .default_width(640.0)
     .default_height(480.0)
     .resizable(true)
+    .fit_to_screen(ctx)
     .show(ctx, |ui| {
         ui.horizontal(|ui| {
             ui.label(RichText::new("q0lang frame code").strong());

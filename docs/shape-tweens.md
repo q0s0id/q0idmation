@@ -16,19 +16,29 @@ centre.*
 1. Draw on a keyframe.
 2. Create a later keyframe on the same layer (F6 or F7) and draw the shape it
    should become.
-3. Select any frame between the two and choose **Create shape tween** from the
-   timeline context menu, or press **Ctrl+Alt+S**. The shortcut can be changed
-   in Settings > Keyboard shortcuts.
+3. Select any frame between the two and click the shape tween button in the
+   timeline toolbar (a square turning into a circle, next to the motion tween
+   button), choose **Create shape tween** from the timeline context menu, or
+   press **Ctrl+Alt+S**. The shortcut can be changed in Settings > Keyboard
+   shortcuts.
 
 The span turns green in the timeline. Motion tweens keep their usual colour.
+Both pairs of colours (fill and arrow, for motion and for shape tweens) can be
+set separately under Settings > custom colours > timeline.
 
 Both keyframes need drawn vector shapes: brush strokes, pencil lines, shapes
 and bucket fills. Symbols, bitmaps and text on the same keyframe are left
 alone and simply held for the span; break them apart first if they should
 morph.
 
-To change the pacing or remove the tween, select a frame inside it and use the
-tween section in Properties. Shape tweens accept the same easing presets and
+A shape-tweened drawing is still a drawing. The brush, eraser, bucket and
+path selection keep working on both keyframes; only a motion tween turns
+artwork into an object.
+
+To remove the tween, right-click a frame inside it and choose **Remove shape
+tween**; the menu shows this in place of the two Create entries whenever the
+selection touches a tween. To change the pacing, select a frame inside it and
+use the tween section in Properties, which can also remove it. Shape tweens accept the same easing presets and
 custom curves as motion tweens.
 
 ## How shapes are matched
@@ -38,9 +48,13 @@ There are no shape hints. The match is worked out from the drawings:
 - Shapes pair up by position and size, closest and most similar first.
 - If the next keyframe has more shapes, the nearest shape splits; if it has
   fewer, the spare shapes merge into their nearest neighbour.
-- Inside a shape, outlines pair by area, so an outer edge morphs into an outer
-  edge and a hole into a hole. An outline with no partner grows out of, or
-  shrinks into, the centre of the other shape.
+- Inside a shape, each outline or stroke pairs with the nearest one of similar
+  size, so a drawing made of many strokes keeps every stroke in place. A hole
+  pairs with a hole and an open line with an open line. An outline with no
+  partner grows or shrinks where it is.
+- Every corner and curve of both drawings is kept: the in-between has a point
+  wherever either drawing has one, so the frame before the next keyframe looks
+  like that keyframe, not like a simplified copy.
 - Drawing direction and the point where an outline starts do not matter.
 - A fill or stroke that exists on only one side fades in or out.
 - If the next keyframe is blank, the shapes shrink and fade away.
@@ -51,11 +65,26 @@ correct the drawing there.
 ## Keyframes inside a tween
 
 Pressing **F6** on a frame inside a shape tween creates a keyframe holding the
-in-between drawing exactly as it was shown. The tween now ends at that
-keyframe; the stretch after it is a plain hold until you tween it again.
+in-between drawing exactly as it was shown. Both halves stay shape tweens: the
+first keyframe morphs into the new one, and the new one goes on morphing into
+the original destination. Each half keeps the tween's easing.
 
-Editing artwork on an in-between frame does the same thing first, like any
-edit on a held frame.
+Editing artwork on an in-between frame does the same thing first.
+
+Pressing **F7** inside a shape tween ends the tween at the new blank keyframe.
+Whatever you draw there next takes over and morphs on into the original
+destination, so you can redraw the middle of a morph from scratch. If the
+project is closed before anything is drawn on that blank keyframe, create the
+second tween by hand.
+
+Strokes added later to a keyframe that already starts a shape tween join that
+tween automatically.
+
+Dragging either keyframe of a tween along its layer retimes the tween; this
+applies to motion tweens too. A keyframe with a tween on each side keeps both.
+The tween is only cut when the move makes it impossible: the end keyframe is
+dragged to or before the start, another keyframe ends up between the two, or
+the keyframe is dragged to a different layer.
 
 Removing the keyframe a tween points to removes the tween.
 

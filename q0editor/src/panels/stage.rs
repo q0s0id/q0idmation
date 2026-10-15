@@ -7,6 +7,7 @@ use crate::render::{
     centered_target_transform, render_target_preview_with_revision, StageRenderPass, StageView,
 };
 use crate::state::{LibraryDragPayload, LibraryItem};
+use crate::ui::FitToScreen;
 
 pub const ZOOM_MIN: f32 = 0.05;
 pub const ZOOM_MAX: f32 = 32.0;
@@ -68,6 +69,7 @@ pub(crate) fn render_animation_preview(app: &mut EditorApp, ctx: &egui::Context)
         .id(egui::Id::new("animation_camera_preview"))
         .open(&mut open)
         .default_size(vec2(560.0, 390.0))
+        .fit_to_screen(ctx)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui
@@ -155,8 +157,15 @@ pub(crate) fn render_animation_preview(app: &mut EditorApp, ctx: &egui::Context)
 
 pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     let stage_started = std::time::Instant::now();
-    breadcrumb_bar(app, ui);
-    ui.separator();
+    if !crate::touch::ENABLED {
+        ui.horizontal(|ui| {
+            breadcrumbs(app, ui);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                zoom_controls(app, ui);
+            });
+        });
+        ui.separator();
+    }
 
     let avail = ui.available_size_before_wrap();
     let (canvas_rect, response) = ui.allocate_exact_size(
@@ -1036,6 +1045,10 @@ fn handle_viewport_input(
     fit_scale: f32,
     ctx: &egui::Context,
 ) {
+    if touch_navigation(app, canvas_rect, fit_scale, ctx) {
+        return;
+    }
+
     // --- Wheel zoom (only when hovering the canvas) -------------------------
     if response.contains_pointer() {
         let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
@@ -1103,6 +1116,102 @@ fn handle_viewport_input(
     }
 }
 
+/// A two-finger touch shorter than this, that barely moved, counts as a tap.
+const TOUCH_TAP_SECONDS: f64 = 0.3;
+const TOUCH_TAP_TRAVEL: f32 = 12.0;
+
+/// Two or more fingers on the canvas navigate instead of drawing: pinching
+/// zooms around them and dragging pans. A quick tap with two fingers undoes,
+/// with three it redoes.
+///
+/// Returns true while the gesture owns the canvas, including the frame in
+/// which the last finger lifts, so tools never see that release.
+fn touch_navigation(
+    app: &mut crate::app::EditorApp,
+    canvas_rect: Rect,
+    fit_scale: f32,
+    ctx: &egui::Context,
+) -> bool {
+    let gesture = app.session.viewport.touch;
+    if let Some(touch) = ctx.input(|i| i.multi_touch()) {
+        if !gesture.active {
+            if !canvas_rect.contains(touch.start_pos) {
+                return false;
+            }
+            match touch_gesture_effect(&app.session.tool_state) {
+                TouchGestureEffect::Blocked => return false,
+                TouchGestureEffect::DiscardStroke => {
+                    app.session.tool_state = crate::state::ToolState::Idle;
+                }
+                TouchGestureEffect::Keep => {}
+            }
+            app.session.viewport.touch = crate::state::TouchGesture {
+                active: true,
+                started: touch.start_time,
+                center: touch.start_pos,
+                ..Default::default()
+            };
+        }
+        let gesture = &mut app.session.viewport.touch;
+        gesture.most_fingers = gesture.most_fingers.max(touch.num_touches);
+        gesture.center += touch.translation_delta;
+        gesture.travel +=
+            touch.translation_delta.length() + touch.zoom_delta.ln().abs() * canvas_rect.width();
+        let center = gesture.center;
+        app.session.viewport.pan.x += touch.translation_delta.x;
+        app.session.viewport.pan.y += touch.translation_delta.y;
+        if touch.zoom_delta != 1.0 {
+            zoom_around(app, center, canvas_rect, fit_scale, touch.zoom_delta.ln());
+        }
+        app.session.viewport.panning = true;
+        return true;
+    }
+    if !gesture.active {
+        return false;
+    }
+    app.session.viewport.panning = true;
+    // Lifting all but one finger does not hand the touch back to the tool.
+    if ctx.input(|i| i.any_touches()) {
+        return true;
+    }
+    let quick = ctx.input(|i| i.time) - gesture.started <= TOUCH_TAP_SECONDS;
+    if quick && gesture.travel <= TOUCH_TAP_TRAVEL {
+        match gesture.most_fingers {
+            2 => app.queue(Action::Undo),
+            3 => app.queue(Action::Redo),
+            _ => {}
+        }
+    }
+    app.session.viewport.touch = crate::state::TouchGesture::default();
+    true
+}
+
+enum TouchGestureEffect {
+    /// Navigate and leave the tool as it is.
+    Keep,
+    /// The touch was the start of a stroke that has not been committed yet.
+    DiscardStroke,
+    /// Artwork is being edited live and cannot be abandoned halfway.
+    Blocked,
+}
+
+fn touch_gesture_effect(state: &crate::state::ToolState) -> TouchGestureEffect {
+    use crate::state::ToolState;
+    match state {
+        // Pen anchors are placed by taps, so zooming between them must not
+        // lose the path.
+        ToolState::Idle | ToolState::PenDrawing { .. } => TouchGestureEffect::Keep,
+        ToolState::LassoDrawing { .. }
+        | ToolState::FreehandDrawing { .. }
+        | ToolState::BrushDrawing { .. }
+        | ToolState::AdvancedBrushDrawing { .. }
+        | ToolState::EraserDrawing { .. }
+        | ToolState::PrimitiveDrawing { .. }
+        | ToolState::Marquee { .. } => TouchGestureEffect::DiscardStroke,
+        _ => TouchGestureEffect::Blocked,
+    }
+}
+
 fn release_canvas_keyboard_focus(ctx: &egui::Context, interacted: bool) {
     if !interacted {
         return;
@@ -1163,98 +1272,98 @@ pub fn zoom_around(
     app.session.status = format!("zoom {:.0}%", new_zoom * 100.0);
 }
 
-fn breadcrumb_bar(app: &mut EditorApp, ui: &mut Ui) {
-    ui.horizontal(|ui| {
-        if !app.session.breadcrumb.is_empty()
-            && crate::ui::icon_button(ui, crate::ui::Icon::Back, "Return to parent timeline")
-                .clicked()
-        {
-            app.queue(Action::ExitQ0rg);
-        }
-        // Build the breadcrumb chain: each entry is a clickable jump-to depth.
-        // depth=0 is the root stage. depth>=1 walks down into nested q0rgs.
-        let mut chain: Vec<(usize, String, bool)> = Vec::new();
-        // Root: the q0rg at the bottom of the breadcrumb stack, or the current
-        // q0rg itself if breadcrumb is empty.
-        let root_q0rg_id = app
-            .session
-            .breadcrumb
-            .first()
-            .copied()
-            .unwrap_or(app.session.current_q0rg_id);
-        if !app.session.breadcrumb.is_empty() {
-            let root_name = q0rg_name(app, root_q0rg_id, "Stage");
-            chain.push((0, root_name, false));
-        }
-        for (i, parent_id) in app.session.breadcrumb.iter().enumerate().skip(1) {
-            let nm = q0rg_name(app, *parent_id, "Unknown");
-            chain.push((i, nm, false));
-        }
-        // Final tail: the q0rg we're currently editing (only show if nested).
-        if !app.session.breadcrumb.is_empty() {
-            let nm = q0rg_name(app, app.session.current_q0rg_id, "Unknown");
-            chain.push((app.session.breadcrumb.len(), nm, true));
-        }
+/// The way back out of nested q0rgs: a back button and the chain of parents.
+/// Shows nothing at the root.
+pub(crate) fn breadcrumbs(app: &mut EditorApp, ui: &mut Ui) {
+    if !app.session.breadcrumb.is_empty()
+        && crate::ui::icon_button(ui, crate::ui::Icon::Back, "Return to parent timeline").clicked()
+    {
+        app.queue(Action::ExitQ0rg);
+    }
+    // Build the breadcrumb chain: each entry is a clickable jump-to depth.
+    // depth=0 is the root stage. depth>=1 walks down into nested q0rgs.
+    let mut chain: Vec<(usize, String, bool)> = Vec::new();
+    // Root: the q0rg at the bottom of the breadcrumb stack, or the current
+    // q0rg itself if breadcrumb is empty.
+    let root_q0rg_id = app
+        .session
+        .breadcrumb
+        .first()
+        .copied()
+        .unwrap_or(app.session.current_q0rg_id);
+    if !app.session.breadcrumb.is_empty() {
+        let root_name = q0rg_name(app, root_q0rg_id, "Stage");
+        chain.push((0, root_name, false));
+    }
+    for (i, parent_id) in app.session.breadcrumb.iter().enumerate().skip(1) {
+        let nm = q0rg_name(app, *parent_id, "Unknown");
+        chain.push((i, nm, false));
+    }
+    // Final tail: the q0rg we're currently editing (only show if nested).
+    if !app.session.breadcrumb.is_empty() {
+        let nm = q0rg_name(app, app.session.current_q0rg_id, "Unknown");
+        chain.push((app.session.breadcrumb.len(), nm, true));
+    }
 
-        let mut jump: Option<usize> = None;
-        for (i, (depth, name, is_current)) in chain.iter().enumerate() {
-            if i > 0 {
-                ui.label(
-                    egui::RichText::new(">")
-                        .color(app.settings.theme.text_dim.to_color32())
-                        .small(),
-                );
-            }
-            let display_name = truncate_label(name, 24);
-            let resp = ui
-                .add(
-                    egui::Label::new(
-                        egui::RichText::new(display_name)
-                            .color(if *is_current {
-                                app.settings.theme.text.to_color32()
-                            } else {
-                                app.settings.theme.text_dim.to_color32()
-                            })
-                            .small(),
-                    )
-                    .sense(Sense::click()),
-                )
-                .on_hover_text(name.as_str());
-            if resp.clicked() && !is_current {
-                jump = Some(*depth);
-            }
-        }
-        if let Some(d) = jump {
-            app.queue(Action::BreadcrumbJumpTo(d));
-        }
-
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if crate::ui::icon_button(
-                ui,
-                crate::ui::Icon::Fit,
-                &app.settings.hotkeys.hint(
-                    crate::hotkeys::ShortcutCommand::ZoomReset,
-                    "Fit stage to window",
-                ),
-            )
-            .clicked()
-            {
-                app.queue(Action::ZoomReset);
-            }
+    let mut jump: Option<usize> = None;
+    for (i, (depth, name, is_current)) in chain.iter().enumerate() {
+        if i > 0 {
             ui.label(
-                egui::RichText::new(format!("{:.0}%", app.session.viewport.zoom * 100.0,))
+                egui::RichText::new(">")
                     .color(app.settings.theme.text_dim.to_color32())
                     .small(),
+            );
+        }
+        let display_name = truncate_label(name, 24);
+        let resp = ui
+            .add(
+                egui::Label::new(
+                    egui::RichText::new(display_name)
+                        .color(if *is_current {
+                            app.settings.theme.text.to_color32()
+                        } else {
+                            app.settings.theme.text_dim.to_color32()
+                        })
+                        .small(),
+                )
+                .sense(Sense::click()),
             )
-            .on_hover_text(format!(
-                "{} x {} · {} fps · frame {}",
-                app.state.project.meta.stage_width,
-                app.state.project.meta.stage_height,
-                app.state.project.meta.fps,
-                app.session.current_frame + 1
-            ));
-        });
-    });
+            .on_hover_text(name.as_str());
+        if resp.clicked() && !is_current {
+            jump = Some(*depth);
+        }
+    }
+    if let Some(d) = jump {
+        app.queue(Action::BreadcrumbJumpTo(d));
+    }
+}
+
+/// Fit-to-window and the current zoom, laid out right to left.
+pub(crate) fn zoom_controls(app: &mut EditorApp, ui: &mut Ui) {
+    if crate::ui::icon_button(
+        ui,
+        crate::ui::Icon::Fit,
+        &app.settings.hotkeys.hint(
+            crate::hotkeys::ShortcutCommand::ZoomReset,
+            "Fit stage to window",
+        ),
+    )
+    .clicked()
+    {
+        app.queue(Action::ZoomReset);
+    }
+    ui.label(
+        egui::RichText::new(format!("{:.0}%", app.session.viewport.zoom * 100.0,))
+            .color(app.settings.theme.text_dim.to_color32())
+            .small(),
+    )
+    .on_hover_text(format!(
+        "{} x {} · {} fps · frame {}",
+        app.state.project.meta.stage_width,
+        app.state.project.meta.stage_height,
+        app.state.project.meta.fps,
+        app.session.current_frame + 1
+    ));
 }
 
 fn q0rg_name(app: &EditorApp, id: u16, fallback: &str) -> String {

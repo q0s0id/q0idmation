@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-feature
+        android:glEsVersion="0x00030000"
+        android:required="true" />
+
+    <!-- The home screen fetches the release feed. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:label="q0editor"
+        android:theme="@style/Theme.Q0Editor">
+
+        <!--
+            The native event loop cannot be restarted inside a live process, so
+            the activity handles every configuration change itself instead of
+            being recreated.
+        -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|density|uiMode|fontScale|locale|layoutDirection|touchscreen"
+            android:windowSoftInputMode="adjustResize">
+
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="q0editor_android" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

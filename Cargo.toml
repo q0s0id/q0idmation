@@ -1,5 +1,5 @@
 [workspace]
-members = ["q0credits", "q0icon", "q0theme", "q0glblend", "q0vm", "q0s-format", "q0video", "q0player", "q0fla", "q0editor", "q0shell", "q0term", "canripper"]
+members = ["q0credits", "q0icon", "q0theme", "q0glblend", "q0vm", "q0s-format", "q0video", "q0player", "q0fla", "q0editor", "q0editor-android", "q0shell", "q0term", "canripper"]
 resolver = "2"
 
 [workspace.package]

@@ -11,6 +11,7 @@ use q0s_format::v2::{Asset, Placement, ProjectV2, Rgba, Target, Transform2D, Twe
 use crate::app::{Action, EditorApp, LibrarySelection, LibrarySource, ProjectLibrarySummary};
 use crate::render::{active_placements_at, placement_bbox, q0rg_frame_bbox, StageView};
 use crate::state::{LibraryDragPayload, LibraryItem, LibraryRename, Selection};
+use crate::ui::FitToScreen;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum LibraryKey {
@@ -1309,6 +1310,7 @@ fn render_rename_dialog(app: &mut EditorApp, ctx: &egui::Context) {
         .collapsible(false)
         .resizable(false)
         .open(&mut open)
+        .fit_to_screen(ctx)
         .show(ctx, |ui| {
             let response = ui.add(
                 egui::TextEdit::singleline(&mut rename.draft)

@@ -39,6 +39,18 @@ rustup target add aarch64-pc-windows-msvc
 ARM64 compile checks can use Visual Studio LLVM automatically. Linking the final `.exe`
 requires the Visual Studio C++ ARM64 build tools.
 
+An Android build of q0editor is in progress. It needs the Android SDK and NDK,
+a JDK 17 or 21, and `cargo-ndk`:
+
+```powershell
+rustup target add aarch64-linux-android
+cargo install cargo-ndk
+.\android\build.ps1
+```
+
+The script builds a debug APK for arm64 devices. Its modes are `check`, `apk`
+(default), `install`, and `run`; the last two need a device connected over adb.
+
 To build the complete workspace manually:
 
 ```powershell

@@ -1,4 +1,5 @@
 mod binary_fla;
+pub mod fonts;
 mod text_outline;
 mod xfl_content;
 
@@ -80,6 +81,56 @@ impl ImportReport {
 pub struct ImportedProject {
     pub project: ProjectV2,
     pub report: ImportReport,
+    pub(crate) pending_text: Vec<PendingText>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingText {
+    asset_id: u16,
+    source: xfl_content::RawText,
+    replacement: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingFont {
+    pub name: String,
+    pub replacement: String,
+    pub text_count: usize,
+}
+
+impl ImportedProject {
+    pub fn missing_fonts(&self) -> Vec<MissingFont> {
+        let mut rows = std::collections::BTreeMap::<String, MissingFont>::new();
+        for text in &self.pending_text {
+            rows.entry(text.source.font.to_lowercase()).or_insert_with(|| MissingFont {
+                name: text.source.font.clone(), replacement: text.replacement.clone(), text_count: 0,
+            }).text_count += 1;
+        }
+        rows.into_values().collect()
+    }
+
+    /// Validate and render every replacement before changing the imported
+    /// project. A bad choice leaves all text and pending choices intact.
+    pub fn replace_missing_fonts(&mut self, choices: &std::collections::BTreeMap<String, String>) -> Result<(), String> {
+        let mut replacements = Vec::with_capacity(self.pending_text.len());
+        for pending in &self.pending_text {
+            let name = choices.iter().find(|(name, _)| name.eq_ignore_ascii_case(&pending.source.font))
+                .map(|(_, replacement)| replacement).ok_or_else(|| format!("Choose a replacement for '{}'", pending.source.font))?;
+            let mut source = pending.source.clone();
+            source.font = name.clone();
+            let paths = xfl_content::text_paths(&source)?;
+            let index = self.project.assets.iter().position(|asset| matches!(asset, q0s_format::v2::Asset::Vector(vector) if vector.asset_id == pending.asset_id))
+                .ok_or("Imported text asset is missing")?;
+            replacements.push((index, paths));
+        }
+        for (index, paths) in replacements {
+            if let q0s_format::v2::Asset::Vector(vector) = &mut self.project.assets[index] {
+                vector.paths = paths;
+            }
+        }
+        self.pending_text.clear();
+        Ok(())
+    }
 }
 
 pub(crate) fn normalize_folder_layer_order(
@@ -813,6 +864,7 @@ fn import_dom_document(
     );
 
     Ok(ImportedProject {
+        pending_text: Vec::new(),
         report: ImportReport {
             source_kind: source_kind.to_string(),
             imported_layers: project.q0rgs[0].layers.len(),

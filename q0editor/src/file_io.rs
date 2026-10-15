@@ -348,7 +348,7 @@ pub fn save_q0lang_document(path: &Path, text: &str) -> io::Result<()> {
 }
 
 pub fn pick_open_path() -> Option<PathBuf> {
-    rfd::FileDialog::new()
+    crate::platform::FileDialog::new()
         .add_filter(
             "q0editor documents",
             &["q1s", "fla", "xfl", "q0l", "q0lang"],
@@ -361,7 +361,7 @@ pub fn pick_open_path() -> Option<PathBuf> {
 }
 
 pub fn pick_fla_import_path() -> Option<PathBuf> {
-    rfd::FileDialog::new()
+    crate::platform::FileDialog::new()
         .add_filter("Adobe Animate (.fla, .xfl)", q0fla::IMPORT_EXTENSIONS)
         .pick_file()
 }
@@ -372,7 +372,7 @@ pub fn pick_q0fla_save_path(source: &Path) -> Option<PathBuf> {
         .and_then(|stem| stem.to_str())
         .map(|stem| format!("{stem}.q1s"))
         .unwrap_or_else(|| "imported.q1s".to_string());
-    let mut dialog = rfd::FileDialog::new()
+    let mut dialog = crate::platform::FileDialog::new()
         .add_filter("q0s project (.q1s)", &[Q1S_EXTENSION])
         .set_file_name(default_name);
     if let Some(parent) = source.parent() {
@@ -386,7 +386,7 @@ pub fn pick_q0lang_save_path(suggested: Option<&Path>) -> Option<PathBuf> {
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
         .unwrap_or("script.q0l");
-    let mut dialog = rfd::FileDialog::new()
+    let mut dialog = crate::platform::FileDialog::new()
         .add_filter("q0lang source (.q0l, .q0lang)", Q0LANG_EXTENSIONS)
         .set_file_name(default_name);
     if let Some(parent) = suggested.and_then(Path::parent) {
@@ -396,13 +396,13 @@ pub fn pick_q0lang_save_path(suggested: Option<&Path>) -> Option<PathBuf> {
 }
 
 pub fn pick_bitmap_import_path() -> Option<PathBuf> {
-    rfd::FileDialog::new()
+    crate::platform::FileDialog::new()
         .add_filter("bitmap image", &["png", "jpg", "jpeg", "webp"])
         .pick_file()
 }
 
 pub fn pick_media_import_path() -> Option<PathBuf> {
-    rfd::FileDialog::new()
+    crate::platform::FileDialog::new()
         .add_filter(
             "q0editor media",
             &[
@@ -424,7 +424,7 @@ pub fn is_supported_video_import_path(path: &Path) -> bool {
 }
 
 pub fn pick_save_path(suggested: Option<&Path>) -> Option<PathBuf> {
-    let mut dialog = rfd::FileDialog::new()
+    let mut dialog = crate::platform::FileDialog::new()
         .add_filter("q0s project (.q1s)", &[Q1S_EXTENSION])
         .set_file_name("untitled.q1s");
     if let Some(p) = suggested {
@@ -448,7 +448,7 @@ pub fn pick_export_q0s_path(suggested: Option<&Path>) -> Option<PathBuf> {
         .and_then(|s| s.to_str())
         .map(|s| format!("{s}.q0s"))
         .unwrap_or_else(|| "movie.q0s".to_string());
-    let mut dialog = rfd::FileDialog::new()
+    let mut dialog = crate::platform::FileDialog::new()
         .add_filter("q0s movie (.q0s)", &["q0s"])
         .set_file_name(&default_name);
     if let Some(parent) = suggested.and_then(|p| p.parent()) {

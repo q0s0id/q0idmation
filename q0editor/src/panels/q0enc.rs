@@ -5,6 +5,7 @@ use q0s_format::v2::ProjectV2;
 
 use crate::app::EditorApp;
 use crate::q0enc::{ExportFormat, ImageCodec, JobState, Q0EncState};
+use crate::ui::FitToScreen;
 
 pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
     if !app.q0enc.open {
@@ -32,6 +33,7 @@ pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
         .max_width(860.0)
         .collapsible(false)
         .resizable(true)
+        .fit_to_screen(ctx)
         .show(ctx, |ui| {
             ui.style_mut().wrap = Some(true);
             let project = &app.state.project;
@@ -633,7 +635,7 @@ fn browse_output(state: &Q0EncState, suggested: Option<&Path>) -> Option<std::pa
         })
         .or_else(|| current.parent())
         .or_else(|| suggested.and_then(Path::parent));
-    let mut dialog = rfd::FileDialog::new();
+    let mut dialog = crate::platform::FileDialog::new();
     if let Some(directory) = preferred.filter(|path| !path.as_os_str().is_empty()) {
         dialog = dialog.set_directory(directory);
     }

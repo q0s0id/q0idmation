@@ -12,7 +12,7 @@ use crate::state::{
     Selection, TimelineFrameDrag, TimelineLayerDrag, TimelineLayerSelection,
     TimelineRigKeySelection, TimelineSelection,
 };
-use crate::ui::{icon_button, icon_button_enabled, icon_toggle, Icon};
+use crate::ui::{icon_button, icon_button_enabled, icon_toggle, FitToScreen, Icon};
 
 const FRAME_W: f32 = 12.0;
 const ROW_H: f32 = 26.0;
@@ -2665,6 +2665,15 @@ fn timeline_frame_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
         ui.close_menu();
     }
     ui.separator();
+    // A frame that already belongs to a tween cannot start another one, so
+    // offer to remove what is there instead.
+    if let Some(label) = crate::easing::selected_tween_removal_label(app) {
+        if ui.button(label).clicked() {
+            crate::easing::remove_selected_tweens(app);
+            ui.close_menu();
+        }
+        return;
+    }
     if ui
         .add(crate::ui::shortcut_button(
             &app.settings.hotkeys,
@@ -3453,6 +3462,19 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
         {
             app.queue(Action::CreateMotionTween);
         }
+        if icon_button_enabled(
+            ui,
+            can_tween && !app.camera_track_is_selected(),
+            Icon::ShapeTween,
+            &app.settings.hotkeys.hint(
+                ShortcutCommand::ShapeTween,
+                "Create shape tween: morph this keyframe's drawing into the next",
+            ),
+        )
+        .clicked()
+        {
+            app.queue(Action::CreateShapeTween);
+        }
     });
 }
 
@@ -3489,6 +3511,7 @@ fn render_layer_rename_dialog(app: &mut EditorApp, ctx: &egui::Context) {
         .collapsible(false)
         .resizable(false)
         .open(&mut open)
+        .fit_to_screen(ctx)
         .show(ctx, |ui| {
             let response = ui.add(
                 egui::TextEdit::singleline(&mut rename.draft)
@@ -3593,6 +3616,7 @@ fn render_frame_label_dialog(app: &mut EditorApp, ctx: &egui::Context) {
         .collapsible(false)
         .resizable(false)
         .open(&mut open)
+        .fit_to_screen(ctx)
         .show(ctx, |ui| {
             let response = ui.add(
                 egui::TextEdit::singleline(&mut edit.draft)
@@ -4141,6 +4165,8 @@ fn draw_layer_spans(
     };
     let tween_fill = theme.tween_fill.to_color32();
     let tween_arrow = theme.tween_arrow.to_color32();
+    let shape_tween_fill = theme.shape_tween_fill().to_color32();
+    let shape_tween_arrow = theme.shape_tween_arrow().to_color32();
     let stroke_dark = theme.stroke_dark.to_color32();
 
     for (position, keyframe) in keyframes.iter().copied().enumerate() {
@@ -4172,8 +4198,7 @@ fn draw_layer_spans(
             egui::Rect::from_min_max(pos2(x0, cell_top), pos2(x1, cell_bot)),
             0.0,
             if has_shape_tween {
-                // Green marks a shape tween, as animators expect.
-                blend(tween_fill, Color32::from_rgb(0x4c, 0xb0, 0x6a), 0.55)
+                shape_tween_fill
             } else if has_tween {
                 tween_fill
             } else {
@@ -4211,11 +4236,16 @@ fn draw_layer_spans(
                 && to_frame >= frame_slots.start
                 && to_frame < layer_frame_count
             {
-                arrows.insert((placement.frame, to_frame));
+                arrows.insert((placement.frame, to_frame, placement.tween.is_shape()));
             }
         }
     }
-    for (from_frame, to_frame) in arrows {
+    for (from_frame, to_frame, is_shape) in arrows {
+        let tween_arrow = if is_shape {
+            shape_tween_arrow
+        } else {
+            tween_arrow
+        };
         let from_x = base_x + (f32::from(from_frame) + 0.5) * FRAME_W + 4.0;
         let to_x = base_x + (f32::from(to_frame) + 0.5) * FRAME_W - 4.0;
         let mid_y = row_y + ROW_H * 0.5;

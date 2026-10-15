@@ -1,123 +1,5 @@
-use std::collections::BTreeSet;
-use std::path::PathBuf;
-use std::sync::OnceLock;
-
 use q0s_format::v2::{Anchor, Path as VectorPath, Vec2};
 use ttf_parser::{Face, OutlineBuilder};
-
-#[derive(Debug, Clone)]
-struct InstalledFont {
-    name: String,
-    path: PathBuf,
-    index: u32,
-}
-
-fn font_files() -> BTreeSet<PathBuf> {
-    let mut files = BTreeSet::new();
-    let mut dirs = Vec::new();
-    #[cfg(windows)]
-    {
-        let system =
-            PathBuf::from(std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into()))
-                .join("Fonts");
-        dirs.push(system);
-        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-            dirs.push(PathBuf::from(local).join("Microsoft/Windows/Fonts"));
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        dirs.extend(
-            [
-                "/usr/share/fonts",
-                "/usr/local/share/fonts",
-                "/System/Library/Fonts",
-                "/Library/Fonts",
-            ]
-            .map(PathBuf::from),
-        );
-        if let Some(home) = std::env::var_os("HOME") {
-            let home = PathBuf::from(home);
-            dirs.extend([
-                home.join(".fonts"),
-                home.join(".local/share/fonts"),
-                home.join("Library/Fonts"),
-            ]);
-        }
-    }
-    while let Some(dir) = dirs.pop() {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            if kind.is_dir() {
-                dirs.push(entry.path());
-            } else if kind.is_file() {
-                files.insert(entry.path());
-            }
-        }
-    }
-    files.retain(|path| {
-        path.extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| {
-                matches!(
-                    extension.to_ascii_lowercase().as_str(),
-                    "ttf" | "otf" | "ttc" | "otc"
-                )
-            })
-    });
-    files
-}
-
-fn installed_fonts() -> &'static [InstalledFont] {
-    static FONTS: OnceLock<Vec<InstalledFont>> = OnceLock::new();
-    FONTS.get_or_init(|| {
-        let mut fonts = Vec::new();
-        for path in font_files() {
-            let Ok(bytes) = std::fs::read(&path) else {
-                continue;
-            };
-            for index in 0..ttf_parser::fonts_in_collection(&bytes).unwrap_or(1) {
-                let Ok(face) = Face::parse(&bytes, index) else {
-                    continue;
-                };
-                let names: Vec<_> = face
-                    .names()
-                    .into_iter()
-                    .filter(|name| name.name_id == ttf_parser::name_id::FULL_NAME)
-                    .collect();
-                let name = names
-                    .iter()
-                    .find(|name| name.language_id == 0x409)
-                    .and_then(|name| name.to_string())
-                    .or_else(|| names.iter().find_map(|name| name.to_string()));
-                if let Some(name) = name.filter(|name| !name.trim().is_empty()) {
-                    fonts.push(InstalledFont {
-                        name,
-                        path: path.clone(),
-                        index,
-                    });
-                }
-            }
-        }
-        fonts.sort_by_cached_key(|font| font.name.to_lowercase());
-        fonts.dedup_by(|left, right| left.name.eq_ignore_ascii_case(&right.name));
-        fonts
-    })
-}
-
-fn load_font(face_name: &str) -> Option<(Vec<u8>, u32)> {
-    let font = installed_fonts()
-        .iter()
-        .find(|font| font.name.eq_ignore_ascii_case(face_name))?;
-    std::fs::read(&font.path)
-        .ok()
-        .map(|bytes| (bytes, font.index))
-}
 
 struct GlyphPaths {
     paths: Vec<VectorPath>,
@@ -214,9 +96,9 @@ pub(crate) fn outline_installed_font(
     size: f32,
 ) -> Result<Vec<VectorPath>, String> {
     let (bytes, index) =
-        load_font(face_name).ok_or_else(|| format!("font '{face_name}' is not installed"))?;
+        crate::fonts::load(face_name).ok_or_else(|| format!("Font '{face_name}' is not installed"))?;
     let face =
-        Face::parse(&bytes, index).map_err(|_| format!("font '{face_name}' is unreadable"))?;
+        Face::parse(&bytes, index).map_err(|_| format!("Font '{face_name}' is unreadable"))?;
     let scale = size / f32::from(face.units_per_em());
     let mut builder = GlyphPaths {
         paths: Vec::new(),

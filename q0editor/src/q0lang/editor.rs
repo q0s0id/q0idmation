@@ -22,6 +22,7 @@ use egui::{Context, FontFamily, FontId, Key, Modifiers, Sense, Stroke, TextEdit,
 
 use crate::app::EditorApp;
 use crate::settings::PersistFontSize;
+use crate::ui::FitToScreen;
 
 const EDITOR_ANALYSIS_INSTRUCTION_BUDGET: usize = 4_096;
 
@@ -129,6 +130,7 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
         .min_height(360.0)
         .resizable(true)
         .collapsible(true)
+        .fit_to_screen(ctx)
         .show(ctx, |ui| {
             // ------ top toolbar: font picker, size, tab width, gutter toggle ------
             ui.horizontal(|ui| {

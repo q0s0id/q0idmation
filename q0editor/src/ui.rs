@@ -3,6 +3,52 @@ use egui::{pos2, vec2, Color32, Painter, Rect, Response, Sense, Shape, Stroke, U
 
 const ICON_CONTROL_SIZE: f32 = 26.0;
 
+/// Logical screen size the editor's layout is designed never to go below.
+pub(crate) const MIN_SCREEN_SIZE: egui::Vec2 = vec2(900.0, 560.0);
+
+/// Makes a floating window usable on a screen smaller than the layout was
+/// designed for. egui already stops a window growing past the screen; without
+/// scrolling, whatever does not fit would simply be cut off at that edge.
+pub(crate) trait FitToScreen {
+    fn fit_to_screen(self, ctx: &egui::Context) -> Self;
+}
+
+impl FitToScreen for egui::Window<'_> {
+    fn fit_to_screen(self, ctx: &egui::Context) -> Self {
+        let screen = ctx.screen_rect().size();
+        if screen.x >= MIN_SCREEN_SIZE.x && screen.y >= MIN_SCREEN_SIZE.y {
+            self
+        } else {
+            self.scroll2([true, true])
+        }
+    }
+}
+
+/// Shrinks the whole interface when the device's screen is too small for the
+/// editor at the system's own scale.
+#[cfg(target_os = "android")]
+pub(crate) fn apply_compact_zoom(ctx: &egui::Context, screen: Option<Rect>) {
+    let (Some(screen), Some(native_scale)) = (screen, ctx.native_pixels_per_point()) else {
+        return;
+    };
+    let native_points = screen.size() * ctx.pixels_per_point() / native_scale;
+    // Whole percents only: the size computed above shifts by rounding error
+    // from frame to frame, and every new factor costs a full relayout.
+    let zoom = (compact_zoom_factor(native_points) * 100.0).floor() / 100.0;
+    ctx.set_zoom_factor(zoom);
+}
+
+/// Interface zoom for a screen measuring `native_points` at the system's own
+/// scale, where 1.0 leaves the interface at its normal size.
+#[cfg(target_os = "android")]
+fn compact_zoom_factor(native_points: egui::Vec2) -> f32 {
+    // The touch layout keeps the canvas large by itself, so phones only get a
+    // little denser and tablets keep the normal size. The long side barely
+    // changes with the system bars, so turning the device keeps text the same.
+    const FULL_SIZE_LONG_SIDE: f32 = 1000.0;
+    (native_points.max_elem() / FULL_SIZE_LONG_SIDE).clamp(0.75, 1.0)
+}
+
 pub(crate) fn hidden_palette_note_trigger(ui: &Ui, label: &Response) {
     // A deliberately obscure gesture on an existing, otherwise inert label.
     // The counter and reveal live only in this UI session, never in a project.
@@ -47,6 +93,7 @@ pub(crate) fn hidden_palette_note(ctx: &egui::Context, settings_open: bool, acce
         .resizable(false)
         .default_width(300.0)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .fit_to_screen(ctx)
         .show(ctx, |ui| {
             ui.add_space(12.0);
             let text_color = ui.visuals().text_color();
@@ -156,12 +203,17 @@ pub(crate) enum Icon {
     RemoveFrames,
     RemoveColumns,
     Tween,
+    ShapeTween,
     Up,
     Down,
     Indent,
     Outdent,
     Fit,
     Back,
+    Menu,
+    Undo,
+    Redo,
+    Properties,
 }
 
 pub(crate) fn icon_button(ui: &mut Ui, icon: Icon, label: &str) -> Response {
@@ -200,9 +252,30 @@ pub(crate) fn icon_toggle(ui: &mut Ui, icon: Icon, label: &str, selected: bool) 
     icon_control(ui, icon, label, selected)
 }
 
+/// Side of an icon control meant for a fingertip rather than a mouse.
+pub(crate) const TOUCH_CONTROL_SIZE: f32 = 40.0;
+
+pub(crate) fn touch_icon_button(ui: &mut Ui, enabled: bool, icon: Icon, label: &str) -> Response {
+    ui.add_enabled_ui(enabled, |ui| {
+        icon_control_sized(ui, icon, label, false, TOUCH_CONTROL_SIZE)
+    })
+    .inner
+}
+
+pub(crate) fn touch_icon_toggle(ui: &mut Ui, icon: Icon, label: &str, selected: bool) -> Response {
+    icon_control_sized(ui, icon, label, selected, TOUCH_CONTROL_SIZE)
+}
+
+pub(crate) fn sized_icon_button(ui: &mut Ui, icon: Icon, label: &str, size: f32) -> Response {
+    icon_control_sized(ui, icon, label, false, size)
+}
+
 fn icon_control(ui: &mut Ui, icon: Icon, label: &str, selected: bool) -> Response {
-    let (rect, response) =
-        ui.allocate_exact_size(vec2(ICON_CONTROL_SIZE, ICON_CONTROL_SIZE), Sense::click());
+    icon_control_sized(ui, icon, label, selected, ICON_CONTROL_SIZE)
+}
+
+fn icon_control_sized(ui: &mut Ui, icon: Icon, label: &str, selected: bool, size: f32) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::click());
     response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, selected, label));
     if ui.is_rect_visible(rect) {
         let visuals = ui.style().interact_selectable(&response, selected);
@@ -218,9 +291,10 @@ fn icon_control(ui: &mut Ui, icon: Icon, label: &str, selected: bool) -> Respons
         } else {
             visuals.fg_stroke.color
         };
+        let glyph = size * 16.0 / ICON_CONTROL_SIZE;
         paint_icon(
             ui.painter(),
-            Rect::from_center_size(rect.center(), vec2(16.0, 16.0)),
+            Rect::from_center_size(rect.center(), vec2(glyph, glyph)),
             icon,
             color,
         );
@@ -601,6 +675,13 @@ pub(crate) fn paint_icon(painter: &Painter, rect: Rect, icon: Icon, color: Color
             line((0.28, 0.50), (0.70, 0.50));
             path(&[(0.53, 0.30), (0.73, 0.50), (0.53, 0.70)]);
         }
+        Icon::ShapeTween => {
+            // A square becoming a circle.
+            painter.rect_filled(r(0.02, 0.36, 0.26, 0.64), 0.0, color);
+            painter.circle_stroke(p(0.86, 0.50), 2.4, stroke);
+            line((0.36, 0.50), (0.66, 0.50));
+            path(&[(0.52, 0.33), (0.69, 0.50), (0.52, 0.67)]);
+        }
         Icon::Up => {
             line((0.50, 0.85), (0.50, 0.15));
             path(&[(0.25, 0.40), (0.50, 0.15), (0.75, 0.40)]);
@@ -624,6 +705,37 @@ pub(crate) fn paint_icon(painter: &Painter, rect: Rect, icon: Icon, color: Color
             path(&[(0.64, 0.12), (0.88, 0.12), (0.88, 0.36)]);
             path(&[(0.88, 0.64), (0.88, 0.88), (0.64, 0.88)]);
             path(&[(0.36, 0.88), (0.12, 0.88), (0.12, 0.64)]);
+        }
+        Icon::Menu => {
+            for y in [0.26, 0.5, 0.74] {
+                line((0.16, y), (0.84, y));
+            }
+        }
+        Icon::Undo => {
+            path(&[
+                (0.84, 0.82),
+                (0.84, 0.58),
+                (0.74, 0.43),
+                (0.58, 0.37),
+                (0.18, 0.37),
+            ]);
+            path(&[(0.36, 0.19), (0.18, 0.37), (0.36, 0.55)]);
+        }
+        Icon::Redo => {
+            path(&[
+                (0.16, 0.82),
+                (0.16, 0.58),
+                (0.26, 0.43),
+                (0.42, 0.37),
+                (0.82, 0.37),
+            ]);
+            path(&[(0.64, 0.19), (0.82, 0.37), (0.64, 0.55)]);
+        }
+        Icon::Properties => {
+            for (y, knob) in [(0.24, 0.34), (0.5, 0.66), (0.76, 0.44)] {
+                line((0.12, y), (0.88, y));
+                painter.circle_filled(p(knob, y), rect.width() * 0.09, color);
+            }
         }
     }
 }

@@ -1031,7 +1031,112 @@ pub fn rasterize_q0rg_frame_with_mask_preview(
     if ss == 1 {
         return hi;
     }
+    // Source-over compositing preserves an opaque stage. In that case the
+    // premultiplied box filter reduces exactly to an integer RGB average.
+    // Specializing export's two AA factors avoids three u64 divisions per
+    // output pixel (and redundant alpha multiplication for every sample).
+    if bg_rgba[3] == 255 {
+        match ss {
+            2 => return downscale_box_opaque_2x(&hi, w, h),
+            4 => return downscale_box_opaque::<4>(&hi, w, h),
+            _ => {}
+        }
+    }
     downscale_box(&hi, sw, w, h, ss)
+}
+
+fn downscale_box_opaque_2x(src: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let stride = w as usize * 8;
+    let mut out = vec![0; w as usize * h as usize * 4];
+    if out.is_empty() {
+        return out;
+    }
+    for (rows, output) in src
+        .chunks_exact(stride * 2)
+        .zip(out.chunks_exact_mut(w as usize * 4))
+    {
+        let (top, bottom) = rows.split_at(stride);
+        for ((top, bottom), pixel) in top
+            .chunks_exact(8)
+            .zip(bottom.chunks_exact(8))
+            .zip(output.chunks_exact_mut(4))
+        {
+            let a = u32::from_le_bytes(top[..4].try_into().unwrap());
+            let b = u32::from_le_bytes(top[4..].try_into().unwrap());
+            let c = u32::from_le_bytes(bottom[..4].try_into().unwrap());
+            let d = u32::from_le_bytes(bottom[4..].try_into().unwrap());
+            // Sum R/B in separate 16-bit lanes; four bytes cannot carry into
+            // the adjacent lane. This is the same rounded four-sample box.
+            let rb = (a & 0x00ff00ff) + (b & 0x00ff00ff) + (c & 0x00ff00ff) + (d & 0x00ff00ff);
+            let g = ((a >> 8) & 255) + ((b >> 8) & 255) + ((c >> 8) & 255) + ((d >> 8) & 255);
+            let rgba = (((rb + 0x00020002) >> 2) & 0x00ff00ff) | (((g + 2) >> 2) << 8) | 0xff000000;
+            pixel.copy_from_slice(&rgba.to_le_bytes());
+        }
+    }
+    out
+}
+
+fn downscale_box_opaque<const S: usize>(src: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let stride = w as usize * S * 4;
+    let mut out = vec![0; w as usize * h as usize * 4];
+    if out.is_empty() {
+        return out;
+    }
+    for (rows, output) in src
+        .chunks_exact(stride * S)
+        .zip(out.chunks_exact_mut(w as usize * 4))
+    {
+        for (x, pixel) in output.chunks_exact_mut(4).enumerate() {
+            let mut sum = [0u32; 3];
+            for dy in 0..S {
+                let start = dy * stride + x * S * 4;
+                for sample in rows[start..start + S * 4].chunks_exact(4) {
+                    for channel in 0..3 {
+                        sum[channel] += u32::from(sample[channel]);
+                    }
+                }
+            }
+            for channel in 0..3 {
+                pixel[channel] = ((sum[channel] + (S * S / 2) as u32) / (S * S) as u32) as u8;
+            }
+            pixel[3] = 255;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod export_filter_tests {
+    use super::*;
+
+    #[test]
+    fn opaque_export_filter_is_byte_identical_to_premultiplied_filter() {
+        fn check<const S: usize>(w: u32, h: u32) {
+            let mut seed = 1234567u32;
+            let mut pixels = vec![0; w as usize * h as usize * S * S * 4];
+            for pixel in pixels.chunks_exact_mut(4) {
+                for value in &mut pixel[..3] {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    *value = (seed >> 24) as u8;
+                }
+                pixel[3] = 255;
+            }
+            assert_eq!(
+                downscale_box_opaque::<S>(&pixels, w, h),
+                downscale_box(&pixels, w * S as u32, w, h, S as u32)
+            );
+            if S == 2 {
+                assert_eq!(
+                    downscale_box_opaque_2x(&pixels, w, h),
+                    downscale_box(&pixels, w * 2, w, h, 2)
+                );
+            }
+        }
+        for (w, h) in [(0, 0), (0, 1), (1, 0), (1, 1), (7, 9), (320, 180)] {
+            check::<2>(w, h);
+            check::<4>(w, h);
+        }
+    }
 }
 
 fn downscale_box(src: &[u8], sw: u32, dw: u32, dh: u32, ss: u32) -> Vec<u8> {

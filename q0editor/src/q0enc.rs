@@ -1026,6 +1026,83 @@ fn export_q0v(
 }
 
 #[cfg(windows)]
+fn mp4_render_workers(options: &ExportOptions, total: u32) -> usize {
+    let pixels = u64::from(h264_encoded_dimension(options.width))
+        * u64::from(h264_encoded_dimension(options.height));
+    // Account for a supersampled stage plus an isolation surface, RGBA and
+    // NV12. Large/4x exports use fewer workers. Rendezvous channels below keep
+    // at most one prepared frame per worker, regardless of movie duration.
+    let working_bytes = pixels * (8 * u64::from(options.supersampling).pow(2) + 6);
+    let memory_workers = (768 * 1024 * 1024 / working_bytes.max(1)).max(1) as usize;
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .saturating_sub(1)
+        .max(1)
+        .min(4)
+        .min(memory_workers)
+        .min(total.max(1) as usize)
+}
+
+/// Prepare independent frames concurrently, consume in timeline order. Each
+/// worker has a rendezvous channel: a slow early frame cannot cause an
+/// unbounded collection of later frames. Dropping all receivers unblocks
+/// producers on cancellation, renderer failure, or an encoder error.
+#[cfg(any(windows, test))]
+fn ordered_render_frames<T: Send>(
+    range: RangeInclusive<u16>,
+    workers: usize,
+    cancel: &AtomicBool,
+    render: impl Fn(u16) -> Result<T, String> + Sync,
+    mut consume: impl FnMut(u32, T) -> Result<(), String>,
+) -> Result<WorkerOutcome, String> {
+    let stopped = AtomicBool::new(false);
+    let first = u32::from(*range.start());
+    let count = range.count();
+    let workers = workers.max(1).min(count.max(1));
+    std::thread::scope(|scope| {
+        let mut receivers = Vec::with_capacity(workers);
+        for worker in 0..workers {
+            let (sender, receiver) = mpsc::sync_channel(0);
+            receivers.push(receiver);
+            let (render, stopped) = (&render, &stopped);
+            scope.spawn(move || {
+                for offset in (worker..count).step_by(workers) {
+                    if cancel.load(Ordering::Acquire) || stopped.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let frame = (first + offset as u32) as u16;
+                    let rendered =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render(frame)))
+                            .unwrap_or_else(|_| Err("frame renderer panicked".to_string()));
+                    let failed = rendered.is_err();
+                    if sender.send(rendered).is_err() || failed {
+                        break;
+                    }
+                }
+            });
+        }
+        let result = (|| {
+            for offset in 0..count {
+                if cancel.load(Ordering::Acquire) {
+                    return Ok(WorkerOutcome::Cancelled);
+                }
+                let received = receivers[offset % workers].recv();
+                if cancel.load(Ordering::Acquire) {
+                    return Ok(WorkerOutcome::Cancelled);
+                }
+                let frame = received.map_err(|_| "frame renderer disconnected".to_string())??;
+                consume(offset as u32, frame)?;
+            }
+            Ok(WorkerOutcome::Completed)
+        })();
+        stopped.store(true, Ordering::Release);
+        drop(receivers);
+        result
+    })
+}
+
+#[cfg(windows)]
 fn export_mp4(
     job: &ExportJob,
     cancel: &AtomicBool,
@@ -1033,6 +1110,9 @@ fn export_mp4(
 ) -> Result<WorkerOutcome, String> {
     let range = job.options.frame_range(job.snapshot())?;
     let total = job.options.total_frames(job.snapshot())?;
+    if cancel.load(Ordering::Acquire) {
+        return Ok(WorkerOutcome::Cancelled);
+    }
     ensure_parent(&job.output_path)?;
     let staging = media_staging_path(&job.output_path, job.id, "mp4");
     if staging.exists() {
@@ -1049,21 +1129,30 @@ fn export_mp4(
             bitrate: job.options.mp4_bitrate,
         };
         let mut encoder = q0video::mp4::Mp4Encoder::create(&staging, spec)?;
-        for (offset, frame_number) in range.enumerate() {
-            if cancel.load(Ordering::Acquire) {
-                return Ok(WorkerOutcome::Cancelled);
-            }
-            progress(offset as u32, total, "encoding h.264 frames");
-            let rgba = render_frame(job.snapshot(), &job.options, frame_number);
-            let encoded = pad_rgba_to_even(
-                &rgba,
-                job.options.width,
-                job.options.height,
-                encoded_width,
-                encoded_height,
-            );
-            encoder.write_rgba_frame(&encoded)?;
-            progress(offset as u32 + 1, total, "writing mp4 samples");
+        progress(0, total, "rendering and encoding h.264 frames");
+        let outcome = ordered_render_frames(
+            range,
+            mp4_render_workers(&job.options, total),
+            cancel,
+            |frame_number| {
+                let rgba = render_frame(job.snapshot(), &job.options, frame_number);
+                let encoded = pad_rgba_to_even(
+                    &rgba,
+                    job.options.width,
+                    job.options.height,
+                    encoded_width,
+                    encoded_height,
+                );
+                q0video::mp4::rgba_to_nv12(&encoded, encoded_width, encoded_height)
+            },
+            |offset, nv12| {
+                encoder.write_nv12_frame(&nv12)?;
+                progress(offset + 1, total, "rendering and encoding h.264 frames");
+                Ok(())
+            },
+        )?;
+        if matches!(outcome, WorkerOutcome::Cancelled) {
+            return Ok(outcome);
         }
         if cancel.load(Ordering::Acquire) {
             return Ok(WorkerOutcome::Cancelled);
@@ -1305,9 +1394,9 @@ fn pad_rgba_to_even(
     height: u32,
     encoded_width: u32,
     encoded_height: u32,
-) -> Vec<u8> {
+) -> std::borrow::Cow<'_, [u8]> {
     if width == encoded_width && height == encoded_height {
-        return rgba.to_vec();
+        return std::borrow::Cow::Borrowed(rgba);
     }
     let mut output = vec![255_u8; encoded_width as usize * encoded_height as usize * 4];
     for y in 0..height as usize {
@@ -1316,7 +1405,7 @@ fn pad_rgba_to_even(
         output[target_start..target_start + width as usize * 4]
             .copy_from_slice(&rgba[source_start..source_start + width as usize * 4]);
     }
-    output
+    std::borrow::Cow::Owned(output)
 }
 
 fn sync_existing_file(path: &Path) -> Result<(), String> {
@@ -1549,6 +1638,99 @@ mod tests {
         }
         statuses.extend(state.poll_events());
         statuses
+    }
+
+    #[test]
+    fn parallel_frames_preserve_order_and_bound_render_ahead() {
+        use std::sync::atomic::AtomicUsize;
+        let cancel = AtomicBool::new(false);
+        let started = AtomicUsize::new(0);
+        let mut seen = Vec::new();
+        let outcome = ordered_render_frames(
+            25..=48,
+            4,
+            &cancel,
+            |frame| {
+                started.fetch_add(1, Ordering::SeqCst);
+                if frame == 25 {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Ok(frame)
+            },
+            |offset, frame| {
+                assert_eq!(frame, 25 + offset as u16);
+                // One current frame per producer; no movie-sized reorder buffer.
+                assert!(started.load(Ordering::SeqCst) <= offset as usize + 5);
+                seen.push(frame);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(matches!(outcome, WorkerOutcome::Completed));
+        assert_eq!(seen, (25..=48).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn parallel_frames_release_waiting_workers_on_cancel_and_error() {
+        for stop in ["cancel", "render", "encode", "panic"] {
+            let cancel = AtomicBool::new(false);
+            let mut seen = Vec::new();
+            let result = ordered_render_frames(
+                0..=30,
+                4,
+                &cancel,
+                |frame| {
+                    if frame == 3 && stop == "render" {
+                        return Err("render failed".into());
+                    }
+                    assert!(!(frame == 3 && stop == "panic"), "simulated renderer panic");
+                    Ok(frame)
+                },
+                |_, frame| {
+                    seen.push(frame);
+                    if frame == 2 && stop == "cancel" {
+                        cancel.store(true, Ordering::Release);
+                    }
+                    if frame == 2 && stop == "encode" {
+                        return Err("encode failed".into());
+                    }
+                    Ok(())
+                },
+            );
+            if stop == "cancel" {
+                assert!(matches!(result, Ok(WorkerOutcome::Cancelled)));
+            } else {
+                assert!(result.is_err());
+            }
+            assert_eq!(seen, vec![0, 1, 2]);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancelled_mp4_preserves_destination_and_removes_staging() {
+        let project = visual_project(12);
+        let output = unique_output("cancel-movie").with_extension("mp4");
+        std::fs::write(&output, b"existing movie").unwrap();
+        let mut state = Q0EncState::default();
+        state.open_for_project(&project, None);
+        state.select_format(ExportFormat::Mp4, None);
+        state.width = 64;
+        state.height = 64;
+        state.output_text = output.display().to_string();
+        state.enqueue(&project).unwrap();
+        let cancel = AtomicBool::new(false);
+        let job = &state.queue[0];
+        let outcome = export_mp4(job, &cancel, |completed, _, _| {
+            if completed == 2 {
+                cancel.store(true, Ordering::Release);
+            }
+        })
+        .unwrap();
+        assert!(matches!(outcome, WorkerOutcome::Cancelled));
+        assert_eq!(std::fs::read(&output).unwrap(), b"existing movie");
+        assert!(!media_staging_path(&output, job.id, "mp4").exists());
+        std::fs::remove_file(output).unwrap();
     }
 
     #[test]

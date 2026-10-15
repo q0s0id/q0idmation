@@ -121,6 +121,7 @@ pub(super) fn import(path: &Path) -> Result<ImportedProject, ImportError> {
     project.runtime.library_folders.sort();
     project.runtime.library_folders.dedup();
     let mut warnings = Vec::new();
+    let mut pending_text = Vec::new();
     let mut next_asset = 1_u16;
     let mut bitmaps = HashMap::new();
     for stream in &streams {
@@ -174,6 +175,7 @@ pub(super) fn import(path: &Path) -> Result<ImportedProject, ImportError> {
                     next_asset: &mut next_asset,
                     next_q0rg: &mut next_q0rg,
                     warnings: &mut warnings,
+                    pending_text: &mut pending_text,
                     owner: &owner,
                     targets: HashMap::new(),
                 };
@@ -253,6 +255,7 @@ pub(super) fn import(path: &Path) -> Result<ImportedProject, ImportError> {
         .sum();
     Ok(ImportedProject {
         project,
+        pending_text,
         report: ImportReport {
             source_kind: "legacy binary fla".into(),
             imported_layers,
@@ -270,6 +273,7 @@ struct Converter<'a> {
     next_asset: &'a mut u16,
     next_q0rg: &'a mut u16,
     warnings: &'a mut Vec<String>,
+    pending_text: &'a mut Vec<crate::PendingText>,
     owner: &'a str,
     targets: HashMap<usize, Vec<Target>>,
 }
@@ -675,6 +679,7 @@ impl Converter<'_> {
                         self.project,
                         self.next_asset,
                         self.warnings,
+                        self.pending_text,
                     )? {
                         targets.push(Target::Asset(id));
                     }

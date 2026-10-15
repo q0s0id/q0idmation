@@ -1,6 +1,7 @@
 use egui::{Context, RichText};
 
 use crate::app::{Action, EditorApp};
+use crate::ui::FitToScreen;
 
 pub fn render(app: &mut EditorApp, ctx: &Context) {
     if !app.q0fla_open {
@@ -12,6 +13,7 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
         .open(&mut open)
         .resizable(false)
         .default_width(390.0)
+        .fit_to_screen(ctx)
         .show(ctx, |ui| {
             ui.label(RichText::new("Adobe Animate -> q1s").strong());
             ui.add_space(4.0);

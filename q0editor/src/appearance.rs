@@ -3,8 +3,8 @@ use std::collections::BTreeSet;
 use geo::{BooleanOps, Buffer, Contains, Coord, LineString, MultiPolygon, Point, Polygon};
 use q0s_format::transform::Affine;
 use q0s_format::v2::{
-    Anchor, Asset, Path as VPath, ProjectV2, Rgba, Target, Transform2D, Tween, Vec2,
-    VectorAppearance, VectorAsset, VectorMaterial,
+    Anchor, Asset, Path as VPath, ProjectV2, Rgba, Target, Transform2D, Vec2, VectorAppearance,
+    VectorAsset, VectorMaterial,
 };
 
 use crate::app::EditorApp;
@@ -913,7 +913,7 @@ pub fn erase_visible_region(app: &mut EditorApp, region: MultiPolygon<f64>) -> b
         let Some(placement) = layer.placements.get(placement_idx) else {
             continue;
         };
-        if placement.transform != Transform2D::IDENTITY || !matches!(placement.tween, Tween::None) {
+        if placement.transform != Transform2D::IDENTITY || placement.tween.is_motion() {
             continue;
         }
         let Target::Asset(asset_id) = placement.target else {
@@ -1098,7 +1098,7 @@ mod tests {
                 frame: 0,
                 target: Target::Asset(1),
                 transform: Transform2D::IDENTITY,
-                tween: Tween::None,
+                tween: q0s_format::v2::Tween::None,
                 fx: Default::default(),
             });
         app

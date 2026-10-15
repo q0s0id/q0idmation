@@ -129,12 +129,19 @@ pub struct Theme {
     /// distinct so the user sees which row the next op lands on.
     #[serde(default = "default_extension_active")]
     pub extension_active: ColorRgb,
-    /// Linear-tween fill behind the cells.
+    /// Motion-tween fill behind the cells.
     #[serde(default = "default_tween_fill")]
     pub tween_fill: ColorRgb,
-    /// Tween direction arrow drawn over the tween fill.
+    /// Motion-tween direction arrow drawn over the tween fill.
     #[serde(default = "default_tween_arrow")]
     pub tween_arrow: ColorRgb,
+    /// Shape-tween fill and arrow. Themes saved before shape tweens existed
+    /// have neither; they get a green matched to their motion-tween colours
+    /// (see `shape_tween_fill()`) until the user picks their own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape_tween_fill: Option<ColorRgb>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape_tween_arrow: Option<ColorRgb>,
     /// Empty-but-inside-frame_count cell colour (mid grey).
     #[serde(default = "default_empty_inside")]
     pub empty_inside: ColorRgb,
@@ -234,6 +241,31 @@ fn default_tween_fill() -> ColorRgb {
 fn default_tween_arrow() -> ColorRgb {
     ColorRgb::new(0x3A, 0x1A, 0x55)
 }
+/// The green animators expect for shape tweens.
+const SHAPE_TWEEN_GREEN: ColorRgb = ColorRgb::new(0x4C, 0xB0, 0x6A);
+
+impl Theme {
+    /// Shape-tween span fill: the chosen colour, or a green that sits at the
+    /// same depth as this theme's motion-tween fill.
+    pub fn shape_tween_fill(&self) -> ColorRgb {
+        self.shape_tween_fill
+            .unwrap_or_else(|| blend(self.tween_fill, SHAPE_TWEEN_GREEN, 0.55))
+    }
+
+    /// Shape-tween arrow: the chosen colour, or the motion-tween arrow, which
+    /// already contrasts with a fill of that depth.
+    pub fn shape_tween_arrow(&self) -> ColorRgb {
+        self.shape_tween_arrow.unwrap_or(self.tween_arrow)
+    }
+
+    /// Give the shape-tween colours values of their own, so that editing the
+    /// motion-tween colours no longer moves them.
+    pub fn pin_shape_tween_colors(&mut self) {
+        self.shape_tween_fill = Some(self.shape_tween_fill());
+        self.shape_tween_arrow = Some(self.shape_tween_arrow());
+    }
+}
+
 fn default_empty_inside() -> ColorRgb {
     ColorRgb::new(0x40, 0x40, 0x40)
 }
@@ -313,6 +345,8 @@ impl Default for Theme {
             extension_active: default_extension_active(),
             tween_fill: default_tween_fill(),
             tween_arrow: default_tween_arrow(),
+            shape_tween_fill: None,
+            shape_tween_arrow: None,
             empty_inside: default_empty_inside(),
             empty_inside_active: default_empty_inside_active(),
             empty_beyond: default_empty_beyond(),
@@ -398,6 +432,9 @@ impl Theme {
         } else {
             blend(text, accent, 0.7)
         };
+        // Re-derived palettes get a matching shape-tween green again.
+        self.shape_tween_fill = None;
+        self.shape_tween_arrow = None;
 
         // Keyframe dot — text colour reads as the strongest contrast
         // dot against any cell.

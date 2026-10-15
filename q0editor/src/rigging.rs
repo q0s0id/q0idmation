@@ -5185,7 +5185,12 @@ pub fn handle_stage(
         }
         return;
     }
-    let pointer_stage = response.hover_pos().map(|pos| screen_to_stage(pos, view));
+    // A lifted finger leaves no hover position behind; fall back to where the
+    // drag happened so releasing a touch still places the bone.
+    let pointer_stage = response
+        .hover_pos()
+        .or_else(|| response.interact_pointer_pos())
+        .map(|pos| screen_to_stage(pos, view));
 
     match app.session.rig_edit_mode {
         RigEditMode::AddBone => handle_add_bone(app, response, pointer_stage, view),

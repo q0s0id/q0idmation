@@ -37,7 +37,7 @@ pub fn render(app: &mut EditorApp, ui: &mut egui::Ui) {
             .on_hover_text("Link a .q0s, .q0l or .q0lang file")
             .clicked()
         {
-            if let Some(path) = rfd::FileDialog::new()
+            if let Some(path) = crate::platform::FileDialog::new()
                 .add_filter("q0 project dependency", &["q0s", "q0l", "q0lang"])
                 .pick_file()
             {
@@ -304,7 +304,7 @@ fn render_selection_details(
                             ProjectDependencyKind::Movie => &["q0s"],
                             ProjectDependencyKind::Q0lang => &["q0l", "q0lang"],
                         };
-                        if let Some(path) = rfd::FileDialog::new()
+                        if let Some(path) = crate::platform::FileDialog::new()
                             .add_filter("replacement dependency", extensions)
                             .pick_file()
                         {

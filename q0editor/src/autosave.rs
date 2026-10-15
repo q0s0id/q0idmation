@@ -358,7 +358,7 @@ fn claim_session(root: &Path) -> io::Result<SessionDir> {
     let dir = root.join(format!("{}-{millis}", std::process::id()));
     fs::create_dir_all(&dir)?;
     let lock = open_lock(&dir)?;
-    lock.try_lock()
+    try_lock_exclusive(&lock)
         .map_err(|error| io::Error::other(format!("could not lock recovery session: {error}")))?;
     Ok(SessionDir {
         dir,
@@ -372,6 +372,25 @@ fn open_lock(dir: &Path) -> io::Result<File> {
         .truncate(false)
         .write(true)
         .open(dir.join(LOCK_FILE))
+}
+
+#[cfg(not(target_os = "android"))]
+fn try_lock_exclusive(file: &File) -> io::Result<()> {
+    file.try_lock().map_err(io::Error::from)
+}
+
+/// std reports file locking as unsupported on Android, although the kernel
+/// implements `flock` like any other Linux.
+#[cfg(target_os = "android")]
+fn try_lock_exclusive(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: `flock` only reads the descriptor, which `file` keeps open.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 /// Collect the snapshots of every session that no running editor owns.
@@ -389,7 +408,7 @@ fn scan(root: &Path, own: Option<&Path>) -> (Vec<RecoveryEntry>, Vec<SessionDir>
         // A held lock means another editor instance is alive and still owns
         // these snapshots.
         let Ok(lock) = open_lock(&dir) else { continue };
-        if lock.try_lock().is_err() {
+        if try_lock_exclusive(&lock).is_err() {
             continue;
         }
         let mut session = SessionDir {

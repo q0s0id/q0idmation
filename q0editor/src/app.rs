@@ -22,6 +22,7 @@ use crate::state::{
     ProjectState, SceneRename, Selection, Session, TimelineClipboard, TimelineLayerSelection,
     TimelineRigKeySelection, TimelineSelection, Tool, ToolState,
 };
+use crate::ui::FitToScreen;
 
 const MAX_PREVIEW_FRAME_SCRIPT_TRANSITIONS: usize = 64;
 
@@ -223,6 +224,11 @@ pub struct EditorApp {
     pub(crate) fast_preview: crate::fast_preview::FastPreview,
     /// Timed recovery snapshots of unsaved documents and crash recovery.
     pub(crate) autosave: crate::autosave::Autosave,
+    /// A blank keyframe made inside a shape tween, waiting to be drawn on.
+    shape_tween_continuation: Option<crate::timeline_edit::ShapeTweenContinuation>,
+    /// Project revision at which drawings were last matched to their
+    /// keyframe's shape tween, per document tab.
+    shape_tweens_checked: Option<(Option<u64>, u64)>,
     pub(crate) animation_preview_revision: Option<(u64, u64)>,
     /// Persistent theme, drawing, and script-editor settings.
     /// `<config>/q0editor/settings.json`.
@@ -257,6 +263,10 @@ pub struct EditorApp {
     native_paste_key_down: bool,
     audio_playback: Option<crate::audio::EditorAudioPlayback>,
     external_open_inbox: Option<crate::single_instance::ExternalOpenInbox>,
+    soft_keyboard: Option<Box<dyn crate::platform::SoftKeyboard>>,
+    pub(crate) touch: crate::touch::TouchLayout,
+    /// Whether a text field was being edited at the end of the last frame.
+    text_field_focused: bool,
     show_project_tree: bool,
     pub(crate) library_source: Option<LibrarySource>,
     pub(crate) library_selection: Option<LibrarySelection>,
@@ -291,6 +301,7 @@ struct FlaImportJob {
     receiver: Receiver<Result<q0fla::ImportedProject, String>>,
     completed: Option<Result<q0fla::ImportedProject, String>>,
     started_at: Instant,
+    font_dialog: Option<crate::font_replacement::FontReplacementDialog>,
 }
 
 #[derive(Clone, Copy)]
@@ -1043,6 +1054,8 @@ impl Default for EditorApp {
             animation_preview_textures: TextureCache::default(),
             fast_preview: crate::fast_preview::FastPreview::default(),
             autosave: crate::autosave::Autosave::default(),
+            shape_tween_continuation: None,
+            shape_tweens_checked: None,
             animation_preview_revision: None,
             settings,
             q0enc,
@@ -1066,6 +1079,9 @@ impl Default for EditorApp {
             native_paste_key_down: false,
             audio_playback: None,
             external_open_inbox: None,
+            soft_keyboard: None,
+            touch: crate::touch::TouchLayout::default(),
+            text_field_focused: false,
             show_project_tree: false,
             library_source: None,
             library_selection: None,
@@ -1211,6 +1227,10 @@ impl EditorApp {
 
     pub fn set_external_open_inbox(&mut self, inbox: crate::single_instance::ExternalOpenInbox) {
         self.external_open_inbox = Some(inbox);
+    }
+
+    pub fn set_soft_keyboard(&mut self, keyboard: Box<dyn crate::platform::SoftKeyboard>) {
+        self.soft_keyboard = Some(keyboard);
     }
 
     fn poll_external_open_requests(&mut self, ctx: &Context) {
@@ -10607,6 +10627,16 @@ impl EditorApp {
             self.session.status = "timeline is already at its maximum length".to_string();
             return false;
         }
+        // A blank keyframe inside a shape tween ends the tween there; what is
+        // drawn on it next carries on towards the original destination.
+        if let Some(continuation) = crate::timeline_edit::split_shape_tweens_at_blank_keyframe(
+            &mut self.state.project,
+            q0rg_id,
+            layer_id,
+            frame,
+        ) {
+            self.shape_tween_continuation = Some(continuation);
+        }
         let Some(layer) = self
             .state
             .project
@@ -10627,6 +10657,24 @@ impl EditorApp {
         self.session.selection = Selection::None;
         self.session.status = format!("inserted blank keyframe at frame {}", frame + 1);
         true
+    }
+
+    /// Once an edit has settled, let new drawings join the shape tween of the
+    /// keyframe they were drawn on. Part of that edit: no undo step of its own.
+    pub(crate) fn continue_shape_tweens(&mut self) {
+        let stamp = (self.active_project_tab_id(), self.state.revision());
+        if self.shape_tweens_checked == Some(stamp) {
+            return;
+        }
+        if crate::timeline_edit::continue_shape_tweens(
+            &mut self.state.project,
+            self.session.current_q0rg_id,
+            self.session.current_layer_id,
+            &mut self.shape_tween_continuation,
+        ) {
+            self.state.mark_dirty();
+        }
+        self.shape_tweens_checked = Some((stamp.0, self.state.revision()));
     }
     /// Capture every placement active on the current layer at `frame` as a
     /// real keyframe. Interpolated transforms are baked and the new entries
@@ -10693,7 +10741,7 @@ impl EditorApp {
                 };
                 insertions.extend(
                     baked_shapes
-                        .keyframe_placements(shape_morph.as_ref(), state.index, copy)
+                        .keyframe_placements(shape_morph.as_ref(), state.index, src.tween, copy)
                         .into_iter()
                         .map(|placement| (state.index, placement)),
                 );
@@ -10924,6 +10972,7 @@ impl EditorApp {
             .min_size([420.0, 360.0])
             .collapsible(false)
             .resizable(true)
+            .fit_to_screen(ctx)
             .show(ctx, |ui| {
                 panels::project_tree::render(self, ui);
             });
@@ -10945,6 +10994,7 @@ impl EditorApp {
             .max_height((screen.height() - 90.0).max(360.0))
             .collapsible(false)
             .resizable(true)
+            .fit_to_screen(ctx)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .id_source("q0editor_credits_scroll")
@@ -10982,6 +11032,7 @@ impl EditorApp {
             .default_pos(ctx.screen_rect().center() - egui::vec2(336.0, 330.0))
             .collapsible(false)
             .resizable(true)
+            .fit_to_screen(ctx)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -11083,7 +11134,7 @@ impl EditorApp {
                         .on_hover_text("Persist current colours as a reusable .q7s theme")
                         .clicked()
                     {
-                        if let Some(path) = rfd::FileDialog::new()
+                        if let Some(path) = crate::platform::FileDialog::new()
                             .add_filter("q7s theme", &["q7s"])
                             .set_file_name("my-theme.q7s")
                             .save_file()
@@ -11109,7 +11160,7 @@ impl EditorApp {
                         .on_hover_text("Apply a previously saved .q7s theme (works with q0player .q7s files too)")
                         .clicked()
                     {
-                        if let Some(path) = rfd::FileDialog::new()
+                        if let Some(path) = crate::platform::FileDialog::new()
                             .add_filter("q7s theme", &["q7s"])
                             .pick_file()
                         {
@@ -11176,7 +11227,7 @@ impl EditorApp {
                             });
                         ui.horizontal_wrapped(|ui| {
                             if ui.button("Choose canvas photo...").clicked() {
-                                if let Some(path) = rfd::FileDialog::new()
+                                if let Some(path) = crate::platform::FileDialog::new()
                                     .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
                                     .pick_file()
                                 {
@@ -11229,8 +11280,17 @@ impl EditorApp {
                                 color_row(ui, "Keyframe dot", &mut t.keyframe);
                                 color_row(ui, "Span fill", &mut t.extension);
                                 color_row(ui, "Span fill (active layer)", &mut t.extension_active);
-                                color_row(ui, "Tween fill", &mut t.tween_fill);
-                                color_row(ui, "Tween arrow", &mut t.tween_arrow);
+                                // Once shown here the two kinds are edited
+                                // independently of each other.
+                                t.pin_shape_tween_colors();
+                                color_row(ui, "Motion tween fill", &mut t.tween_fill);
+                                color_row(ui, "Motion tween arrow", &mut t.tween_arrow);
+                                if let Some(fill) = t.shape_tween_fill.as_mut() {
+                                    color_row(ui, "Shape tween fill", fill);
+                                }
+                                if let Some(arrow) = t.shape_tween_arrow.as_mut() {
+                                    color_row(ui, "Shape tween arrow", arrow);
+                                }
                                 color_row(ui, "Empty cell (inside)", &mut t.empty_inside);
                                 color_row(
                                     ui,
@@ -11401,6 +11461,7 @@ impl EditorApp {
             .default_pos(ctx.screen_rect().center() - egui::vec2(280.0, 270.0))
             .collapsible(false)
             .resizable(true)
+            .fit_to_screen(ctx)
             .show(ctx, |ui| {
                 ui.label("Choose a command, then press the key combination you want to use.");
                 ui.label(
@@ -11599,6 +11660,7 @@ impl EditorApp {
             receiver,
             completed: None,
             started_at,
+            font_dialog: None,
         });
         self.session.status = format!("importing {} in the background...", path.display());
         ctx.request_repaint_after(Duration::from_millis(50));
@@ -11640,6 +11702,18 @@ impl EditorApp {
                 ctx.request_repaint_after(Duration::from_millis(50));
             }
             return;
+        }
+
+        if let Some(job) = self.fla_import_job.as_mut() {
+            if let Some(Ok(imported)) = &job.completed {
+                let missing = imported.missing_fonts();
+                if !missing.is_empty() {
+                    if job.font_dialog.is_none() {
+                        job.font_dialog = Some(crate::font_replacement::FontReplacementDialog::new(missing));
+                    }
+                    return;
+                }
+            }
         }
 
         let job = self
@@ -11688,6 +11762,30 @@ impl EditorApp {
                 self.session.status = format!("q0fla import failed: {error}");
             }
         }
+    }
+
+    fn render_fla_font_dialog(&mut self, ctx: &Context) -> bool {
+        let Some(job) = self.fla_import_job.as_mut() else { return false; };
+        let Some(dialog) = job.font_dialog.as_mut() else { return false; };
+        match dialog.show(ctx, true) {
+            Some(crate::font_replacement::DialogAction::Apply(choices)) => {
+                if let Some(Ok(imported)) = job.completed.as_mut() {
+                    match imported.replace_missing_fonts(&choices) {
+                        Ok(()) => {
+                            job.font_dialog = None;
+                            ctx.request_repaint();
+                        }
+                        Err(error) => dialog.error = Some(error),
+                    }
+                }
+            }
+            Some(crate::font_replacement::DialogAction::Cancel) => {
+                self.fla_import_job = None;
+                self.session.status = "Import cancelled".to_string();
+            }
+            None => {}
+        }
+        true
     }
 
     fn open_from_path(&mut self, ctx: &Context, path: &std::path::Path) -> bool {
@@ -11885,6 +11983,7 @@ impl EditorApp {
             .default_width(510.0)
             .max_height((ctx.screen_rect().height() - 110.0).max(320.0))
             .vscroll(true)
+            .fit_to_screen(ctx)
             .show(ctx, |ui| {
                 ui.label(
                     egui::RichText::new("Every story starts with a stage.")
@@ -12007,6 +12106,7 @@ impl EditorApp {
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .collapsible(false)
             .resizable(false)
+            .fit_to_screen(ctx)
             .show(ctx, |ui| {
                 ui.label(format!("Save your changes before you {destination}?"));
                 ui.add_space(8.0);
@@ -12432,6 +12532,7 @@ impl EditorApp {
             .default_pos(ctx.screen_rect().center() - egui::vec2(280.0, 270.0))
             .collapsible(false)
             .resizable(true)
+            .fit_to_screen(ctx)
             .show(ctx, |ui| {
                 ui.label(format!("replacing: {}", dialog.source_q0rg_name));
                 crate::ui::search_field(ui, &mut search, "Search symbols...");
@@ -12527,6 +12628,7 @@ impl EditorApp {
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .collapsible(false)
                 .resizable(false)
+                .fit_to_screen(ctx)
                 .show(ctx, |ui| {
                     ui.label(format!(
                         "Asset {asset_id} is used by {references} placement(s)."
@@ -12562,6 +12664,7 @@ impl EditorApp {
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .collapsible(false)
                 .resizable(false)
+                .fit_to_screen(ctx)
                 .show(ctx, |ui| {
                     ui.label(format!(
                         "Symbol {q0rg_id} is used by {references} placement(s)."
@@ -12593,6 +12696,7 @@ impl EditorApp {
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .collapsible(false)
                 .resizable(false)
+                .fit_to_screen(ctx)
                 .show(ctx, |ui| {
                     ui.label(format!(
                         "Delete {layer_count} layer row(s) and {item_count} timeline item(s)?"
@@ -12661,6 +12765,7 @@ impl EditorApp {
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .collapsible(false)
                 .resizable(false)
+                .fit_to_screen(ctx)
                 .show(ctx, |ui| {
                     ui.label(format!("Reduce the symbol to {frames} frame(s)?"));
                     ui.label(format!(
@@ -12915,6 +13020,15 @@ impl App for EditorApp {
     }
 
     fn raw_input_hook(&mut self, ctx: &Context, raw_input: &mut egui::RawInput) {
+        // Sized from the whole screen, before a soft keyboard takes its share.
+        #[cfg(target_os = "android")]
+        crate::ui::apply_compact_zoom(ctx, raw_input.screen_rect);
+        if let Some(keyboard) = self.soft_keyboard.as_mut() {
+            keyboard.update(ctx, self.text_field_focused, raw_input);
+        }
+        // Keys latched on the touch layout's modifier bar act as if held.
+        raw_input.modifiers = raw_input.modifiers | self.touch.modifiers;
+
         let native_down = crate::system_clipboard::ctrl_v_down();
         let native_pressed = native_down && !self.native_paste_key_down;
         self.native_paste_key_down = native_down;
@@ -12957,6 +13071,16 @@ impl App for EditorApp {
                 crate::autosave::emergency_flush(self);
             }));
             std::panic::resume_unwind(panic);
+        }
+        // egui reports an input-method target only while a text field is
+        // being edited, which is exactly when a soft keyboard is wanted.
+        let text_field_focused = ctx.output(|output| output.ime.is_some());
+        if text_field_focused != self.text_field_focused {
+            self.text_field_focused = text_field_focused;
+            if self.soft_keyboard.is_some() {
+                // The keyboard follows on the next frame, so there has to be one.
+                ctx.request_repaint();
+            }
         }
     }
 }
@@ -13040,12 +13164,16 @@ impl EditorApp {
             .record(crate::perf::PerfSpan::AppPrelude, prelude_started.elapsed());
 
         let menu_started = Instant::now();
-        egui::TopBottomPanel::top("menu_bar")
-            .resizable(false)
-            .show(ctx, |ui| {
-                panels::menu::render(self, ui);
-            });
-        panels::tabs::render(self, ctx);
+        if crate::touch::ENABLED {
+            crate::touch::top_bar(self, ctx);
+        } else {
+            egui::TopBottomPanel::top("menu_bar")
+                .resizable(false)
+                .show(ctx, |ui| {
+                    panels::menu::render(self, ui);
+                });
+            panels::tabs::render(self, ctx);
+        }
         crate::color_picker::set_scope(
             ctx,
             (self.active_project_tab_id(), self.session.current_q0rg_id),
@@ -13064,7 +13192,11 @@ impl EditorApp {
                 crate::q0lang::editor::render_standalone(self, ui);
             });
         } else {
-            crate::workspace::render(self, ctx);
+            if crate::touch::ENABLED {
+                crate::touch::workspace(self, ctx);
+            } else {
+                crate::workspace::render(self, ctx);
+            }
 
             let auxiliary_started = Instant::now();
             panels::q0enc::render(self, ctx);
@@ -13099,6 +13231,9 @@ impl EditorApp {
         self.render_replace_q0rg_dialog(ctx);
         self.render_destructive_change_dialogs(ctx);
         self.render_unsaved_changes_dialog(ctx);
+        if !self.render_fla_font_dialog(ctx) {
+            crate::font_replacement::render_project_dialog(self, ctx);
+        }
         self.perf
             .record(crate::perf::PerfSpan::Dialogs, dialogs_started.elapsed());
 
@@ -13150,6 +13285,7 @@ impl EditorApp {
             && !ctx.input(|input| input.pointer.any_down())
             && matches!(self.session.tool_state, crate::state::ToolState::Idle)
         {
+            self.continue_shape_tweens();
             let gesture = self.session.selection_history_gesture.take();
             let (before, record) =
                 gesture.unwrap_or((selection_before_frame, !project_or_history_changed));
@@ -17254,6 +17390,19 @@ mod tests {
         );
         assert_eq!(app.session.status, "created shape tween");
         assert!(app.session.tween_warning.is_none());
+        // It is still a drawing: brush, eraser, bucket and path selection keep
+        // working on it. Only a motion tween turns artwork into an object.
+        let tweened = &app.state.project.q0rgs[0].layers[0].placements[0];
+        assert!(crate::tools::is_raw_graphics_placement(
+            &app.state.project,
+            tweened
+        ));
+        let mut moving = tweened.clone();
+        moving.tween = Tween::Linear { to_frame: 6 };
+        assert!(!crate::tools::is_raw_graphics_placement(
+            &app.state.project,
+            &moving
+        ));
         assert!(app.state.dirty);
         q0s_format::v2::validate(&app.state.project).expect("shape tween project");
 
@@ -17277,6 +17426,184 @@ mod tests {
         assert_eq!(
             app.state.project.q0rgs[0].layers[0].placements[0].tween,
             Tween::None
+        );
+    }
+
+    #[test]
+    fn timeline_menu_offers_to_remove_the_tween_under_the_selection() {
+        let mut app = app_with_two_drawings();
+        assert_eq!(crate::easing::selected_tween_removal_label(&app), None);
+
+        app.handle(&Context::default(), Action::CreateShapeTween);
+        assert_eq!(
+            crate::easing::selected_tween_removal_label(&app),
+            Some("Remove shape tween")
+        );
+
+        crate::easing::remove_selected_tweens(&mut app);
+        assert_eq!(
+            app.state.project.q0rgs[0].layers[0].placements[0].tween,
+            Tween::None
+        );
+        assert_eq!(crate::easing::selected_tween_removal_label(&app), None);
+
+        // Removal is its own undo step and brings the shape tween back.
+        app.handle(&Context::default(), Action::Undo);
+        assert!(app.state.project.q0rgs[0].layers[0].placements[0]
+            .tween
+            .is_shape());
+
+        // The other kind is named for what it is. Both drawings must be the
+        // same object for a motion tween.
+        crate::easing::remove_selected_tweens(&mut app);
+        app.state.project.q0rgs[0].layers[0].placements[1].target = Target::Asset(77);
+        app.handle(&Context::default(), Action::CreateMotionTween);
+        assert_eq!(
+            crate::easing::selected_tween_removal_label(&app),
+            Some("Remove motion tween")
+        );
+    }
+
+    #[test]
+    fn shape_tween_theme_colours_follow_motion_until_they_are_pinned() {
+        let mut theme = crate::settings::Theme::default();
+        assert_eq!(theme.shape_tween_fill, None, "older themes have no value");
+        let derived = theme.shape_tween_fill();
+        assert_ne!(derived, theme.tween_fill, "shape spans are told apart");
+        assert_eq!(theme.shape_tween_arrow(), theme.tween_arrow);
+
+        // Unpinned, the green tracks the theme's motion colour...
+        theme.tween_fill = crate::settings::ColorRgb::new(10, 10, 10);
+        assert_ne!(theme.shape_tween_fill(), derived);
+
+        // ...pinned (as the theme editor does), the two are independent.
+        theme.pin_shape_tween_colors();
+        let pinned = theme.shape_tween_fill();
+        theme.tween_fill = crate::settings::ColorRgb::new(200, 0, 0);
+        theme.tween_arrow = crate::settings::ColorRgb::new(0, 0, 200);
+        assert_eq!(theme.shape_tween_fill(), pinned);
+        assert_ne!(theme.shape_tween_arrow(), theme.tween_arrow);
+
+        // Saved themes keep the pinned colours and old ones still load.
+        let saved = serde_json::to_string(&theme).expect("serialize theme");
+        let loaded: crate::settings::Theme = serde_json::from_str(&saved).expect("load theme");
+        assert_eq!(loaded.shape_tween_fill(), pinned);
+        let old = serde_json::to_value(crate::settings::Theme::default()).unwrap();
+        assert!(old.get("shape_tween_fill").is_none());
+        let loaded: crate::settings::Theme = serde_json::from_value(old).expect("old theme");
+        assert_eq!(loaded.shape_tween_fill, None);
+    }
+
+    /// What the brush leaves behind: a new drawing on the current keyframe.
+    fn draw_on_keyframe(app: &mut EditorApp, frame: u16, asset_id: u16) -> usize {
+        app.state.project.assets.push(Asset::Vector(VectorAsset {
+            asset_id,
+            paths: vec![test_square(0.0, 20.0)],
+            fill: None,
+            stroke: None,
+        }));
+        let layer = &mut app.state.project.q0rgs[0].layers[0];
+        layer.push_placement(Placement {
+            instance_id: 0,
+            frame,
+            target: Target::Asset(asset_id),
+            transform: Transform2D::IDENTITY,
+            tween: Tween::None,
+            fx: Default::default(),
+        });
+        app.state.mark_dirty();
+        layer_placement_at(app, frame, asset_id)
+    }
+
+    fn layer_placement_at(app: &EditorApp, frame: u16, asset_id: u16) -> usize {
+        app.state.project.q0rgs[0].layers[0]
+            .placements
+            .iter()
+            .position(|p| p.frame == frame && p.target == Target::Asset(asset_id))
+            .expect("drawing on the keyframe")
+    }
+
+    fn shape_to(to_frame: u16) -> Tween {
+        Tween::Shape {
+            to_frame,
+            easing: q0s_format::v2::Easing::Linear,
+        }
+    }
+
+    #[test]
+    fn drawing_on_a_blank_keyframe_inside_a_shape_tween_keeps_it_tweening() {
+        let mut app = app_with_two_drawings();
+        app.handle(&Context::default(), Action::CreateShapeTween);
+
+        app.handle(&Context::default(), Action::InsertBlankKeyframe);
+        let layer = &app.state.project.q0rgs[0].layers[0];
+        assert!(layer.is_blank_keyframe(3));
+        assert_eq!(
+            layer.placements[0].tween,
+            shape_to(3),
+            "ends at the blank key"
+        );
+        q0s_format::v2::validate(&app.state.project).expect("blank key inside shape tween");
+
+        // Nothing drawn yet: nothing to tween, and the wish is remembered.
+        app.continue_shape_tweens();
+        assert!(app.shape_tween_continuation.is_some());
+
+        let drawn = draw_on_keyframe(&mut app, 3, 90);
+        app.continue_shape_tweens();
+        assert_eq!(
+            app.state.project.q0rgs[0].layers[0].placements[drawn].tween,
+            shape_to(6),
+            "the new drawing morphs on into the original destination"
+        );
+        assert!(app.shape_tween_continuation.is_none());
+        q0s_format::v2::validate(&app.state.project).expect("continued shape tween");
+
+        // The second half really morphs again.
+        let layer = &app.state.project.q0rgs[0].layers[0];
+        assert!(
+            q0s_format::shape_tween::project_layer_morph(&app.state.project, layer, 4).is_some()
+        );
+    }
+
+    #[test]
+    fn a_stroke_added_to_a_tweened_keyframe_joins_the_tween() {
+        let mut app = app_with_two_drawings();
+        app.handle(&Context::default(), Action::CreateShapeTween);
+        app.continue_shape_tweens();
+
+        let drawn = draw_on_keyframe(&mut app, 0, 91);
+        app.continue_shape_tweens();
+        assert_eq!(
+            app.state.project.q0rgs[0].layers[0].placements[drawn].tween,
+            shape_to(6)
+        );
+
+        // Removing the tween is respected: later strokes stay plain.
+        crate::easing::remove_selected_tweens(&mut app);
+        app.continue_shape_tweens();
+        let later = draw_on_keyframe(&mut app, 0, 92);
+        app.continue_shape_tweens();
+        let layer = &app.state.project.q0rgs[0].layers[0];
+        assert!(layer.placements.iter().all(|p| p.tween == Tween::None));
+        assert_eq!(layer.placements[later].tween, Tween::None);
+    }
+
+    #[test]
+    fn a_forgotten_blank_keyframe_does_not_tween_later_drawings() {
+        let mut app = app_with_two_drawings();
+        app.handle(&Context::default(), Action::CreateShapeTween);
+        app.handle(&Context::default(), Action::InsertBlankKeyframe);
+        assert!(app.shape_tween_continuation.is_some());
+
+        // The blank keyframe is undone before anything is drawn on it.
+        app.handle(&Context::default(), Action::Undo);
+        app.continue_shape_tweens();
+        assert!(app.shape_tween_continuation.is_none());
+        assert_eq!(
+            app.state.project.q0rgs[0].layers[0].placements[0].tween,
+            shape_to(6),
+            "undo restores the whole tween"
         );
     }
 
@@ -17324,8 +17651,15 @@ mod tests {
         assert!(baked != 77 && baked != 78, "a new drawing, not a copy");
         assert_eq!(app.state.project.assets.len(), assets_before + 1);
         assert!((drawing_width(&app, baked) - 20.0).abs() < 0.01);
-        assert_eq!(new_key.tween, Tween::None);
-        // The first half still morphs, now into the captured drawing.
+        // Both halves stay shape tweens: the captured drawing goes on morphing
+        // into the original destination.
+        assert_eq!(
+            new_key.tween,
+            Tween::Shape {
+                to_frame: 6,
+                easing: q0s_format::v2::Easing::Linear,
+            }
+        );
         assert_eq!(
             layer
                 .placements
@@ -17363,6 +17697,21 @@ mod tests {
             panic!("the new keyframe holds a drawing");
         };
         assert!((drawing_width(&app, baked) - 20.0).abs() < 0.01);
+        // Before and after the edited frame the drawing keeps morphing.
+        assert_eq!(
+            placement.tween,
+            Tween::Shape {
+                to_frame: 6,
+                easing: q0s_format::v2::Easing::Linear,
+            }
+        );
+        assert_eq!(
+            app.state.project.q0rgs[0].layers[0].placements[0].tween,
+            Tween::Shape {
+                to_frame: 3,
+                easing: q0s_format::v2::Easing::Linear,
+            }
+        );
         q0s_format::v2::validate(&app.state.project).expect("edited shape tween project");
     }
 

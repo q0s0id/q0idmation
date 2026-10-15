@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::EditorApp;
 use crate::state::TimelineSelection;
+use crate::ui::FitToScreen;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CubicCurve {
@@ -562,9 +563,10 @@ pub fn render_tween_properties(
 ) {
     ui.separator();
     ui.label(
-        egui::RichText::new(match TweenKind::of(tween) {
-            TweenKind::Motion => "Motion tween",
-            TweenKind::Shape => "Shape tween",
+        egui::RichText::new(match tween {
+            Tween::None => "Tween",
+            Tween::Shape { .. } => "Shape tween",
+            Tween::Linear { .. } | Tween::Eased { .. } => "Motion tween",
         })
         .strong(),
     );
@@ -748,6 +750,7 @@ pub fn render_editor(app: &mut EditorApp, ctx: &egui::Context) {
         .open(&mut open)
         .default_width(430.0)
         .resizable(true)
+        .fit_to_screen(ctx)
         .show(ctx, |ui| {
             ui.label(
                 egui::RichText::new("drag the two handles; x is time, y is progress")
@@ -936,6 +939,35 @@ fn apply_tween_easing(app: &mut EditorApp, targets: &[TweenRef], easing: Easing)
     }
 }
 
+/// Menu label for removing the tweens under the timeline selection, or
+/// `None` when the selection touches no tween.
+pub(crate) fn selected_tween_removal_label(app: &EditorApp) -> Option<&'static str> {
+    let tweens = selected_tween_targets(app)
+        .into_iter()
+        .filter_map(|target| tween_for_target(app, target))
+        .map(|(start, tween)| (start, tween.to_frame(), tween.is_shape()))
+        .collect::<Vec<_>>();
+    let first = tweens.first()?;
+    let one_span = tweens
+        .iter()
+        .all(|tween| (tween.0, tween.1) == (first.0, first.1));
+    let all_shape = tweens.iter().all(|tween| tween.2);
+    let all_motion = tweens.iter().all(|tween| !tween.2);
+    Some(match (all_shape, all_motion, one_span) {
+        (true, _, true) => "Remove shape tween",
+        (true, _, false) => "Remove shape tweens",
+        (_, true, true) => "Remove motion tween",
+        (_, true, false) => "Remove motion tweens",
+        _ => "Remove tweens",
+    })
+}
+
+/// Remove every tween under the timeline selection as one undo step.
+pub(crate) fn remove_selected_tweens(app: &mut EditorApp) {
+    let targets = selected_tween_targets(app);
+    remove_tweens(app, &targets);
+}
+
 fn remove_tweens(app: &mut EditorApp, targets: &[TweenRef]) {
     let mut removable = targets
         .iter()
@@ -1008,6 +1040,7 @@ pub fn render_warning(app: &mut EditorApp, ctx: &egui::Context) {
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .collapsible(false)
         .resizable(false)
+        .fit_to_screen(ctx)
         .show(ctx, |ui| {
             ui.label(message);
             ui.add_space(8.0);

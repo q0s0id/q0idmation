@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::EditorApp;
 use crate::settings::Settings;
+use crate::ui::FitToScreen;
 
 const MAX_PRESETS: usize = 32;
 const SAVE_DELAY: Duration = Duration::from_millis(500);
@@ -723,6 +724,7 @@ pub(crate) fn render_manager(app: &mut EditorApp, ctx: &Context) {
             .open(&mut open)
             .default_width(440.0)
             .resizable(true)
+            .fit_to_screen(ctx)
             .show(ctx, |ui| {
                 ui.label("Save the current arrangement and switch between your workspaces.");
                 ui.add_space(6.0);

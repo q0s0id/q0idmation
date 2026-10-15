@@ -108,7 +108,11 @@ pub fn handle(
             .interact_pointer_pos()
             .or_else(|| response.hover_pos())
     } else {
-        response.hover_pos()
+        // A lifted finger leaves no hover position behind, so a tap has to be
+        // read from where the interaction happened.
+        response
+            .hover_pos()
+            .or_else(|| response.interact_pointer_pos())
     };
     let cursor_stage = cursor_screen.map(|p| screen_to_stage(p, view)).filter(|p| {
         // Allow cursor while in-stage; tools clamp themselves to stage rect.
@@ -8639,7 +8643,7 @@ pub(crate) fn materialize_raw_paths_as_placements(
             .get(placement_idx)?;
         if placement.frame != frame
             || placement.transform != Transform2D::IDENTITY
-            || !matches!(placement.tween, Tween::None)
+            || placement.tween.is_motion()
         {
             return None;
         }
@@ -11611,6 +11615,7 @@ pub(crate) fn materialize_layer_keyframe_for_edit(
     }
 
     let mut baked_shapes = crate::timeline_edit::BakedShapes::new(project);
+    let mut retargeted_sources = Vec::new();
     let clones: Vec<(usize, Placement)> = {
         let layer = project
             .q0rgs
@@ -11634,9 +11639,23 @@ pub(crate) fn materialize_layer_keyframe_for_edit(
                 tween: Tween::None,
                 fx: state.fx,
             };
+            // The source now morphs into this keyframe, which carries on to
+            // the original destination.
+            if matches!(source.tween, Tween::Shape { to_frame, .. } if to_frame > frame)
+                && shape_morph
+                    .as_ref()
+                    .is_some_and(|morph| morph.for_placement(source_index).is_some())
+            {
+                retargeted_sources.push(source_index);
+            }
             clones.extend(
                 baked_shapes
-                    .keyframe_placements(shape_morph.as_ref(), source_index, placement)
+                    .keyframe_placements(
+                        shape_morph.as_ref(),
+                        source_index,
+                        source.tween,
+                        placement,
+                    )
                     .into_iter()
                     .map(|placement| (source_index, placement)),
             );
@@ -11651,6 +11670,10 @@ pub(crate) fn materialize_layer_keyframe_for_edit(
         .layers
         .iter_mut()
         .find(|layer| layer.layer_id == layer_id)?;
+    for source_index in retargeted_sources {
+        let source = &mut layer.placements[source_index];
+        source.tween = source.tween.with_to_frame(frame);
+    }
     let insert_at = layer.placements.len();
     for (offset, (source_index, placement)) in clones.into_iter().enumerate() {
         let new_index = insert_at + offset;
@@ -12568,7 +12591,7 @@ fn find_touching_drawing(
         if placement.transform != Transform2D::IDENTITY {
             continue;
         }
-        if !matches!(placement.tween, Tween::None) {
+        if placement.tween.is_motion() {
             continue;
         }
         let Target::Asset(asset_id) = placement.target else {
@@ -13126,7 +13149,7 @@ fn active_raw_placement_indices(
 }
 
 pub(crate) fn is_raw_graphics_placement(project: &ProjectV2, placement: &Placement) -> bool {
-    if placement.transform != Transform2D::IDENTITY || !matches!(placement.tween, Tween::None) {
+    if placement.transform != Transform2D::IDENTITY || placement.tween.is_motion() {
         return false;
     }
     if let Target::Asset(asset_id) = placement.target {
@@ -13153,7 +13176,7 @@ fn is_raw_graphics_placement_cached(
     placement: &Placement,
     bounds: &crate::render::PlacementBoundsCache,
 ) -> bool {
-    if placement.transform != Transform2D::IDENTITY || !matches!(placement.tween, Tween::None) {
+    if placement.transform != Transform2D::IDENTITY || placement.tween.is_motion() {
         return false;
     }
     if let Target::Asset(asset_id) = placement.target {

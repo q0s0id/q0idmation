@@ -1003,6 +1003,13 @@ impl Tween {
         matches!(self, Self::Shape { .. })
     }
 
+    /// True for tweens that animate the placement itself. Such a placement
+    /// behaves as an object; one that is held or shape-tweened is still the
+    /// drawing it was.
+    pub const fn is_motion(self) -> bool {
+        matches!(self, Self::Linear { .. } | Self::Eased { .. })
+    }
+
     pub const fn with_to_frame(self, to_frame: u16) -> Self {
         match self {
             Self::Eased { easing, .. } => Self::Eased { to_frame, easing },
