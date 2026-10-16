@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-feature
+        android:glEsVersion="0x00030000"
+        android:required="true" />
+
+    <application
+        android:icon="@mipmap/ic_launcher"
+        android:label="q0player"
+        android:theme="@style/Theme.Q0">
+
+        <!--
+            The native event loop cannot be restarted inside a live process, so
+            the activity handles every configuration change itself instead of
+            being recreated.
+        -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|density|uiMode|fontScale|locale|layoutDirection|touchscreen">
+
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="q0player_android" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!--
+                "Open with" from file managers, chats and browsers, and q0editor
+                previews. Movies have no registered MIME type, so most apps call
+                them octet streams.
+            -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="application/octet-stream" />
+            </intent-filter>
+
+            <!-- Apps that do put the file name in the link. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:host="*" />
+                <data android:mimeType="*/*" />
+                <data android:pathPattern=".*\\.q0s" />
+                <data android:pathPattern=".*\\..*\\.q0s" />
+                <data android:pathPattern=".*\\..*\\..*\\.q0s" />
+                <data android:pathPattern=".*\\.q0v" />
+                <data android:pathPattern=".*\\..*\\.q0v" />
+                <data android:pathPattern=".*\\..*\\..*\\.q0v" />
+            </intent-filter>
+
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/octet-stream" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

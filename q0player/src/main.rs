@@ -8,9 +8,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use q0player::ui::app::PreviewOptions;
-use q0player::ui::PlayerApp;
-
-include!(concat!(env!("OUT_DIR"), "/window_icon.rs"));
+use q0player::ui::launch::{self, Launch};
 
 #[derive(Debug, PartialEq, Eq)]
 enum StartupAction {
@@ -32,22 +30,6 @@ fn print_help() {
         "q0player {}\n\nUsage: q0player [OPTIONS] [MOVIE.q0s]\n\nOptions:\n  -h, --help       Show this help\n  -V, --version    Show version\n  --preview       Play the scene without player panels (Esc closes)\n  --all-scenes    Play document scenes in order in preview mode\n  --delete-after-load  Remove an editor-owned temporary preview after loading",
         env!("CARGO_PKG_VERSION")
     );
-}
-
-fn native_options() -> eframe::NativeOptions {
-    let viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1100.0, 720.0])
-        .with_min_inner_size([640.0, 420.0])
-        .with_title("q0player")
-        .with_icon(q0_window_icon());
-    eframe::NativeOptions {
-        viewport,
-        // Match q0editor: lyon emits one fill mesh and the native framebuffer
-        // resolves triangle-edge coverage. This gives smooth vector edges
-        // without painting a second translucent outline or creating dark halos.
-        multisampling: 4,
-        ..Default::default()
-    }
 }
 
 fn main() -> Result<(), eframe::Error> {
@@ -85,13 +67,11 @@ fn main() -> Result<(), eframe::Error> {
         }
     };
 
-    eframe::run_native(
-        "q0player",
-        native_options(),
-        Box::new(move |cc| {
-            Box::new(PlayerApp::new(initial_file, &cc.egui_ctx).with_preview(preview))
-        }),
-    )
+    launch::run(Launch {
+        initial_file,
+        preview,
+        ..Launch::default()
+    })
 }
 
 #[cfg(test)]
@@ -112,7 +92,7 @@ mod tests {
 
     #[test]
     fn native_window_uses_the_q0player_icon() {
-        let options = native_options();
+        let options = launch::native_options(launch::PREFERRED_MULTISAMPLING);
         let icon = options.viewport.icon.expect("q0player viewport icon");
         assert_eq!((icon.width, icon.height), (48, 48));
         assert_eq!(icon.rgba.len(), 48 * 48 * 4);
@@ -121,7 +101,8 @@ mod tests {
 
     #[test]
     fn native_window_matches_q0editor_four_sample_msaa() {
-        assert_eq!(native_options().multisampling, 4);
+        assert_eq!(launch::PREFERRED_MULTISAMPLING, 4);
+        assert_eq!(launch::native_options(4).multisampling, 4);
     }
 
     #[test]

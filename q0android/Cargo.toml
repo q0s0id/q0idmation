@@ -1,0 +1,18 @@
+[package]
+name = "q0android"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Android activity services shared by q0editor and q0player."
+
+# Everything is target-gated so desktop workspace builds see an empty crate.
+[target.'cfg(target_os = "android")'.dependencies]
+egui = "0.27"
+jni = "0.21"
+ndk-context = "0.1"
+log = "0.4"
+glutin = { version = "0.31", default-features = false, features = ["egl"] }
+raw-window-handle = "0.5"

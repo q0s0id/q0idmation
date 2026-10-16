@@ -14,5 +14,6 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "q0editor"
-include(":app")
+rootProject.name = "q0idmation"
+include(":app") // q0editor
+include(":player") // q0player

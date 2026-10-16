@@ -3172,6 +3172,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eb8486b569e12e2c32ad3e204dbaba5e4b5b216e9367044f25f1dba42341773"
 
 [[package]]
+name = "q0android"
+version = "0.1.0-beta.4.2"
+dependencies = [
+ "egui",
+ "glutin",
+ "jni",
+ "log",
+ "ndk-context",
+ "raw-window-handle 0.5.2",
+]
+
+[[package]]
 name = "q0credits"
 version = "0.1.0-beta.4.2"
 dependencies = [
@@ -3195,6 +3207,7 @@ dependencies = [
  "lyon_path",
  "lyon_tessellation",
  "memmap2",
+ "q0android",
  "q0credits",
  "q0fla",
  "q0glblend",
@@ -3219,11 +3232,10 @@ version = "0.1.0-beta.4.2"
 dependencies = [
  "android_logger",
  "egui",
- "glutin",
  "jni",
  "log",
+ "q0android",
  "q0editor",
- "raw-window-handle 0.5.2",
  "winit",
 ]
 
@@ -3262,8 +3274,10 @@ dependencies = [
  "eframe",
  "egui",
  "image",
+ "log",
  "lyon_path",
  "lyon_tessellation",
+ "q0android",
  "q0credits",
  "q0glblend",
  "q0icon",
@@ -3276,6 +3290,17 @@ dependencies = [
  "serde_json",
  "winreg",
  "winres",
+]
+
+[[package]]
+name = "q0player-android"
+version = "0.1.0-beta.4.2"
+dependencies = [
+ "android_logger",
+ "log",
+ "q0android",
+ "q0player",
+ "winit",
 ]
 
 [[package]]

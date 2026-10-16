@@ -2,29 +2,24 @@ package com.q0id.q0editor
 
 import android.content.Context
 import android.os.Bundle
-import android.os.Process
 import android.text.InputType
+import android.view.KeyCharacterMap
 import android.view.KeyEvent
-import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
-import androidx.core.view.ViewCompat
-import androidx.core.view.WindowCompat
-import androidx.core.view.WindowInsetsCompat
-import com.google.androidgamesdk.GameActivity
+import com.q0id.android.Q0Activity
 
-class MainActivity : GameActivity() {
+class MainActivity : Q0Activity() {
     companion object {
         init {
             System.loadLibrary("q0editor_android")
         }
     }
 
-    private val surfaceOrigin = IntArray(2)
     private lateinit var textSink: TextSink
 
     private external fun nativeImeCompose(text: String)
@@ -35,29 +30,12 @@ class MainActivity : GameActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        // The window spans the whole display. Padding the content view keeps the
-        // editor's surface clear of what would hide or swallow touches: the
-        // status bar, a button navigation bar and the camera cutout. Gesture
-        // navigation only draws a handle, so the surface runs on underneath it.
-        //
-        // The keyboard is reported rather than padded for: resizing the
-        // surface every time it opens would rescale the whole interface.
-        WindowCompat.setDecorFitsSystemWindows(window, false)
-        val content = mSurfaceView.parent as ViewGroup
-        ViewCompat.setOnApplyWindowInsetsListener(content) { view, insets ->
-            val clear = insets.getInsets(
-                WindowInsetsCompat.Type.tappableElement() or
-                    WindowInsetsCompat.Type.displayCutout()
-            )
-            view.setPadding(clear.left, clear.top, clear.right, clear.bottom)
-            val keyboard = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom - clear.bottom
-            nativeKeyboardCovers(keyboard.coerceAtLeast(0))
-            insets
-        }
-
         textSink = TextSink(this)
-        content.addView(textSink, ViewGroup.LayoutParams(1, 1))
+        (mSurfaceView.parent as ViewGroup).addView(textSink, ViewGroup.LayoutParams(1, 1))
+    }
+
+    override fun onKeyboardCovers(pixels: Int) {
+        nativeKeyboardCovers(pixels)
     }
 
     /** Called by the native side whenever one of its text fields gains or loses focus. */
@@ -97,30 +75,6 @@ class MainActivity : GameActivity() {
     private fun isEnter(keyCode: Int): Boolean =
         keyCode == KeyEvent.KEYCODE_ENTER || keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER
 
-    override fun onTouchEvent(event: MotionEvent): Boolean {
-        return super.onTouchEvent(relativeToSurface(event))
-    }
-
-    override fun onGenericMotionEvent(event: MotionEvent): Boolean {
-        return super.onGenericMotionEvent(relativeToSurface(event))
-    }
-
-    // Events reach the activity in window coordinates, while the native side
-    // reads them as positions on its surface.
-    private fun relativeToSurface(event: MotionEvent): MotionEvent {
-        mSurfaceView.getLocationInWindow(surfaceOrigin)
-        event.offsetLocation(-surfaceOrigin[0].toFloat(), -surfaceOrigin[1].toFloat())
-        return event
-    }
-
-    override fun onDestroy() {
-        // GameActivity blocks this thread until the native main function
-        // returns, and the editor's event loop never returns. Ending the
-        // process is the only way out that does not hang.
-        Process.killProcess(Process.myPid())
-        super.onDestroy()
-    }
-
     /**
      * An invisible text target for the input method. The editor draws its own
      * text fields, so this only relays what is typed to the native side.
@@ -155,6 +109,40 @@ class MainActivity : GameActivity() {
                     return true
                 }
             }
+        }
+
+        // Many keyboards send digits as key presses instead of text, as do
+        // hardware keyboards for everything. The native side gets key presses
+        // without the characters they type, so printable ones go over as text
+        // while a field is being edited. Enter, Backspace and the arrows carry
+        // no printable character and keep going the native way.
+        override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+            val typed = typedText(event) ?: return super.onKeyDown(keyCode, event)
+            nativeImeCommit(typed)
+            return true
+        }
+
+        override fun onKeyMultiple(keyCode: Int, repeatCount: Int, event: KeyEvent): Boolean {
+            val characters = event.characters
+            if (keyCode == KeyEvent.KEYCODE_UNKNOWN && !characters.isNullOrEmpty()) {
+                nativeImeCommit(characters)
+                return true
+            }
+            return super.onKeyMultiple(keyCode, repeatCount, event)
+        }
+
+        private fun typedText(event: KeyEvent): String? {
+            // Ctrl and Alt combinations are shortcuts, not typing.
+            if (event.isCtrlPressed || event.isAltPressed || event.isMetaPressed) {
+                return null
+            }
+            val character = event.unicodeChar
+            if (character == 0 || character and KeyCharacterMap.COMBINING_ACCENT != 0 ||
+                Character.isISOControl(character)
+            ) {
+                return null
+            }
+            return String(Character.toChars(character))
         }
     }
 }

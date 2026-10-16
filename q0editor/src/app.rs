@@ -126,6 +126,116 @@ fn rebind_transform_pivot(
     }
 }
 
+/// Layers whose objects an in-progress drag is moving, rotating, skewing or
+/// scaling. Raw drawing edits are left out: their paths can be shared with
+/// other keyframes, so keying mid-drag could reach back into finished frames.
+pub(crate) fn held_object_layers(
+    state: &crate::state::ToolState,
+    q0rg_id: u16,
+) -> std::collections::BTreeSet<u16> {
+    use crate::state::ToolState;
+    let mut layers = std::collections::BTreeSet::new();
+    match state {
+        ToolState::DraggingPlacement {
+            q0rg_id: held,
+            layer_id,
+            ..
+        }
+        | ToolState::DraggingPlacementRotate {
+            q0rg_id: held,
+            layer_id,
+            ..
+        }
+        | ToolState::DraggingPlacementSkew {
+            q0rg_id: held,
+            layer_id,
+            ..
+        }
+        | ToolState::DraggingHandle {
+            q0rg_id: held,
+            layer_id,
+            ..
+        } => {
+            if *held == q0rg_id {
+                layers.insert(*layer_id);
+            }
+        }
+        ToolState::DraggingGroup { refs, objects, .. } if refs.is_empty() => {
+            layers.extend(
+                objects
+                    .iter()
+                    .filter(|object| object.q0rg_id == q0rg_id)
+                    .map(|object| object.layer_id),
+            );
+        }
+        _ => {}
+    }
+    layers
+}
+
+/// Points an object drag at the copies a keyframe insertion just made, so the
+/// drag carries on in the new keyframe.
+fn remap_tool_state_after_keyframes(
+    before: &ProjectV2,
+    after: &ProjectV2,
+    state: &mut crate::state::ToolState,
+    q0rg_id: u16,
+    frame_by_layer: &std::collections::BTreeMap<u16, u16>,
+) {
+    use crate::state::ToolState;
+    let remap = |layer_id: u16, placement_idx: &mut usize| {
+        if let Some(frame) = frame_by_layer.get(&layer_id) {
+            *placement_idx = remapped_keyframe_placement_index(
+                before,
+                after,
+                q0rg_id,
+                layer_id,
+                *placement_idx,
+                *frame,
+            );
+        }
+    };
+    match state {
+        ToolState::DraggingPlacement {
+            q0rg_id: held,
+            layer_id,
+            placement_idx,
+            ..
+        }
+        | ToolState::DraggingPlacementRotate {
+            q0rg_id: held,
+            layer_id,
+            placement_idx,
+            ..
+        }
+        | ToolState::DraggingPlacementSkew {
+            q0rg_id: held,
+            layer_id,
+            placement_idx,
+            ..
+        }
+        | ToolState::DraggingHandle {
+            q0rg_id: held,
+            layer_id,
+            placement_idx,
+            ..
+        } => {
+            if *held == q0rg_id {
+                remap(*layer_id, placement_idx);
+            }
+        }
+        ToolState::DraggingGroup { objects, .. } => {
+            for object in objects
+                .iter_mut()
+                .filter(|object| object.q0rg_id == q0rg_id)
+            {
+                remap(object.layer_id, &mut object.placement_idx);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(crate) fn remap_selection_after_keyframes(
     before: &ProjectV2,
     after: &ProjectV2,
@@ -266,7 +376,7 @@ pub struct EditorApp {
     soft_keyboard: Option<Box<dyn crate::platform::SoftKeyboard>>,
     pub(crate) touch: crate::touch::TouchLayout,
     /// Whether a text field was being edited at the end of the last frame.
-    text_field_focused: bool,
+    pub(crate) text_field_focused: bool,
     show_project_tree: bool,
     pub(crate) library_source: Option<LibrarySource>,
     pub(crate) library_selection: Option<LibrarySelection>,
@@ -625,6 +735,8 @@ pub enum Action {
     ToggleQ0Fla,
     ImportFlaProject,
     ConvertFlaToQ1s,
+    ConvertFlaFromPath(PathBuf),
+    LoadThemeFromPath(PathBuf),
     Exit,
     Undo,
     Redo,
@@ -758,6 +870,8 @@ impl Action {
             Self::ToggleQ0Fla => "toggle-q0fla",
             Self::ImportFlaProject => "import-fla-dialog",
             Self::ConvertFlaToQ1s => "convert-fla-dialog",
+            Self::ConvertFlaFromPath(_) => "convert-fla-path",
+            Self::LoadThemeFromPath(_) => "load-theme-path",
             Self::Exit => "exit",
             Self::Undo => "undo",
             Self::Redo => "redo",
@@ -1231,6 +1345,17 @@ impl EditorApp {
 
     pub fn set_soft_keyboard(&mut self, keyboard: Box<dyn crate::platform::SoftKeyboard>) {
         self.soft_keyboard = Some(keyboard);
+    }
+
+    /// Files the platform picked or received, its messages and Back.
+    fn poll_platform(&mut self, ctx: &Context) {
+        for event in crate::platform::take_events(ctx) {
+            match event {
+                crate::platform::PlatformEvent::Run(action) => self.queue(action),
+                crate::platform::PlatformEvent::Status(message) => self.session.status = message,
+                crate::platform::PlatformEvent::Back => crate::touch::back(self, ctx),
+            }
+        }
     }
 
     fn poll_external_open_requests(&mut self, ctx: &Context) {
@@ -2776,24 +2901,33 @@ impl EditorApp {
                 self.close_document_tab(tab_id);
             }
             Action::OpenProject => {
-                if let Some(path) = file_io::pick_open_path() {
-                    self.handle(ctx, Action::OpenProjectFromPath(path));
+                if let Some(action) = crate::platform::pick_file_then(
+                    file_io::open_dialog(),
+                    Action::OpenProjectFromPath,
+                ) {
+                    self.handle(ctx, action);
                 }
             }
             Action::OpenProjectFromPath(path) => {
                 self.open_from_path(ctx, &path);
             }
             Action::ImportBitmap => {
-                if let Some(path) = file_io::pick_bitmap_import_path() {
-                    self.import_bitmap_from_path(&path);
+                if let Some(action) = crate::platform::pick_file_then(
+                    file_io::bitmap_import_dialog(),
+                    Action::ImportBitmapFromPath,
+                ) {
+                    self.handle(ctx, action);
                 }
             }
             Action::ImportBitmapFromPath(path) => {
                 self.import_bitmap_from_path(&path);
             }
             Action::ImportMedia => {
-                if let Some(path) = file_io::pick_media_import_path() {
-                    self.import_media_from_path(ctx, &path);
+                if let Some(action) = crate::platform::pick_file_then(
+                    file_io::media_import_dialog(),
+                    Action::ImportMediaFromPath,
+                ) {
+                    self.handle(ctx, action);
                 }
             }
             Action::ImportMediaFromPath(path) => {
@@ -2864,15 +2998,33 @@ impl EditorApp {
                 .to_string();
             }
             Action::ImportFlaProject => {
-                if let Some(path) = file_io::pick_fla_import_path() {
-                    self.open_from_path(ctx, &path);
+                if let Some(action) = crate::platform::pick_file_then(
+                    file_io::fla_import_dialog(),
+                    Action::OpenProjectFromPath,
+                ) {
+                    self.handle(ctx, action);
                 }
             }
             Action::ConvertFlaToQ1s => {
-                if let Some(source) = file_io::pick_fla_import_path() {
-                    self.start_fla_import(ctx, &source, FlaImportPurpose::Convert);
+                if let Some(action) = crate::platform::pick_file_then(
+                    file_io::fla_import_dialog(),
+                    Action::ConvertFlaFromPath,
+                ) {
+                    self.handle(ctx, action);
                 }
             }
+            Action::ConvertFlaFromPath(source) => {
+                self.start_fla_import(ctx, &source, FlaImportPurpose::Convert);
+            }
+            Action::LoadThemeFromPath(path) => match crate::settings::Theme::read_q7s(&path) {
+                Ok((name, theme)) => {
+                    self.settings.theme = theme;
+                    self.settings.theme.apply(ctx);
+                    self.settings.save();
+                    self.session.status = format!("theme: {name}");
+                }
+                Err(error) => self.session.status = format!("load theme failed: {error}"),
+            },
             Action::Exit => {
                 if self.active_workspace_busy() {
                     self.session.status =
@@ -3065,7 +3217,11 @@ impl EditorApp {
                 }
             }
             Action::InsertKeyframe => {
-                if let Some(selection) =
+                if !held_object_layers(&self.session.tool_state, self.session.current_q0rg_id)
+                    .is_empty()
+                {
+                    self.key_held_objects(true);
+                } else if let Some(selection) =
                     self.session.timeline_rig_key_selection.filter(|selection| {
                         selection.q0rg_id == self.session.current_q0rg_id
                             && matches!(&self.session.selection, Selection::None)
@@ -10371,6 +10527,103 @@ impl EditorApp {
     /// On a held frame, bake the visible state at the current playhead and
     /// stay there. On an existing keyframe, create the next keyframe to the
     /// right and move the playhead onto it.
+    /// F6 while objects are held mid-drag: key every layer the drag touches and
+    /// carry the drag over to the new poses, so motion can be recorded without
+    /// letting go. As with F6, a held frame becomes a keyframe in place and a
+    /// keyframe gets a new one on the next frame. `undo_step` leaves out the
+    /// undo step, for recorded keys after the first of a hold.
+    pub(crate) fn key_held_objects(&mut self, undo_step: bool) {
+        let q0rg_id = self.session.current_q0rg_id;
+        let layers = held_object_layers(&self.session.tool_state, q0rg_id);
+        if layers
+            .iter()
+            .any(|layer_id| self.state.project.layer_is_locked(q0rg_id, *layer_id))
+        {
+            self.session.status = "unlock the layer before keying it".to_string();
+            return;
+        }
+        let current = self.session.current_frame;
+        let keyed_here = self
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+            .is_some_and(|q0rg| {
+                q0rg.layers
+                    .iter()
+                    .filter(|layer| layers.contains(&layer.layer_id))
+                    .all(|layer| layer.has_keyframe(current))
+            });
+        let target = if keyed_here {
+            current.saturating_add(1)
+        } else {
+            current
+        };
+        let cells: Vec<(u16, u16)> = layers.iter().map(|layer_id| (*layer_id, target)).collect();
+        let before = self.state.project.clone();
+        match crate::timeline_edit::materialize_keyframes_at_cells(
+            &mut self.state.project,
+            q0rg_id,
+            &cells,
+        ) {
+            Some(created) if created > 0 => {
+                if undo_step {
+                    self.history.snapshot_with_session(&before, &self.session);
+                }
+                self.state.mark_dirty();
+                let frames = cells.into_iter().collect();
+                remap_selection_after_keyframes(
+                    &before,
+                    &self.state.project,
+                    &mut self.session.selection,
+                    &mut self.session.transform_pivot,
+                    q0rg_id,
+                    &frames,
+                );
+                remap_tool_state_after_keyframes(
+                    &before,
+                    &self.state.project,
+                    &mut self.session.tool_state,
+                    q0rg_id,
+                    &frames,
+                );
+                self.session.current_frame = target;
+                self.session.pending_timeline_frame = None;
+                self.textures.invalidate();
+                self.session.status = format!("keyed frame {}", u32::from(target) + 1);
+            }
+            _ => self.session.status = "could not key the held objects here".to_string(),
+        }
+    }
+
+    /// While recording is on, objects held mid-drag get a keyframe at every
+    /// frame tick of the project's frame rate. A whole hold undoes as one step.
+    fn record_held_objects(&mut self, ctx: &Context) {
+        if !self.session.record_held
+            || held_object_layers(&self.session.tool_state, self.session.current_q0rg_id).is_empty()
+        {
+            self.session.last_held_key = None;
+            self.session.held_run_keyed = false;
+            return;
+        }
+        let now = ctx.input(|input| input.time);
+        let interval = 1.0 / f64::from(self.state.project.meta.fps.max(1));
+        match self.session.last_held_key {
+            None => self.session.last_held_key = Some(now),
+            Some(last) if now - last >= interval => {
+                self.key_held_objects(!self.session.held_run_keyed);
+                self.session.held_run_keyed = true;
+                // Keep the cadence when a frame runs late, without bursting
+                // to catch up after a long stall.
+                self.session.last_held_key = Some((last + interval).max(now - interval));
+            }
+            Some(_) => {}
+        }
+        let next = self.session.last_held_key.unwrap_or(now) + interval;
+        ctx.request_repaint_after(Duration::from_secs_f64((next - now).max(0.0)));
+    }
+
     fn insert_keyframe_smart(&mut self) {
         let q0rg_id = self.session.current_q0rg_id;
         let selected_cells = self
@@ -11146,6 +11399,7 @@ impl EditorApp {
                                 .to_string();
                             match self.settings.theme.write_q7s(&path, &name) {
                                 Ok(()) => {
+                                    crate::platform::file_written(&path);
                                     self.session.status =
                                         format!("saved theme: {}", path.display())
                                 }
@@ -11160,21 +11414,11 @@ impl EditorApp {
                         .on_hover_text("Apply a previously saved .q7s theme (works with q0player .q7s files too)")
                         .clicked()
                     {
-                        if let Some(path) = crate::platform::FileDialog::new()
-                            .add_filter("q7s theme", &["q7s"])
-                            .pick_file()
-                        {
-                            match Theme::read_q7s(&path) {
-                                Ok((name, theme)) => {
-                                    self.settings.theme = theme;
-                                    self.settings.theme.apply(ctx);
-                                    self.settings.save();
-                                    self.session.status = format!("theme: {name}");
-                                }
-                                Err(e) => {
-                                    self.session.status = format!("load theme failed: {e}")
-                                }
-                            }
+                        if let Some(action) = crate::platform::pick_file_then(
+                            crate::platform::FileDialog::new().add_filter("q7s theme", &["q7s"]),
+                            Action::LoadThemeFromPath,
+                        ) {
+                            self.queue(action);
                         }
                     }
                 });
@@ -11601,6 +11845,7 @@ impl EditorApp {
         self.rebase_project_dependencies_for_save(&mut project_to_save, path);
         match file_io::save_project(path, &project_to_save) {
             Ok(_) => {
+                crate::platform::file_written(path);
                 self.state.project = project_to_save;
                 self.state.mark_dirty();
                 self.state.dirty = false;
@@ -11744,6 +11989,7 @@ impl EditorApp {
                     if let Some(destination) = file_io::pick_q0fla_save_path(&job.path) {
                         match file_io::save_project(&destination, &imported.project) {
                             Ok(()) => {
+                                crate::platform::file_written(&destination);
                                 self.session.status = format!(
                                     "q0fla converted {} -> {}; {}",
                                     job.path.display(),
@@ -11926,6 +12172,7 @@ impl EditorApp {
         };
         match file_io::save_q0lang_document(path, &text) {
             Ok(()) => {
+                crate::platform::file_written(path);
                 if let Some(document) = self.active_q0lang_document_mut() {
                     document.path = path.to_path_buf();
                     document.dirty = false;
@@ -13028,6 +13275,17 @@ impl App for EditorApp {
         }
         // Keys latched on the touch layout's modifier bar act as if held.
         raw_input.modifiers = raw_input.modifiers | self.touch.modifiers;
+        if std::mem::take(&mut self.touch.press_escape) {
+            for pressed in [true, false] {
+                raw_input.events.push(egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+        }
 
         let native_down = crate::system_clipboard::ctrl_v_down();
         let native_pressed = native_down && !self.native_paste_key_down;
@@ -13110,6 +13368,17 @@ impl EditorApp {
 
         let ingress_started = Instant::now();
         self.poll_external_open_requests(ctx);
+        self.poll_platform(ctx);
+        #[cfg(target_os = "android")]
+        if ctx.input(|input| {
+            input
+                .raw
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::WindowFocused(false)))
+        }) {
+            crate::autosave::flush_now(self);
+        }
         self.poll_media_import();
         crate::fast_preview::poll(self, ctx);
         self.poll_fla_import(ctx);
@@ -13210,6 +13479,8 @@ impl EditorApp {
                 auxiliary_started.elapsed(),
             );
         }
+
+        self.record_held_objects(ctx);
 
         let dialogs_started = Instant::now();
         crate::workspace::render_manager(self, ctx);

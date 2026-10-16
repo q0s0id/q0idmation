@@ -211,6 +211,7 @@ pub(crate) enum Icon {
     Fit,
     Back,
     Menu,
+    Record,
     Undo,
     Redo,
     Properties,
@@ -264,6 +265,16 @@ pub(crate) fn touch_icon_button(ui: &mut Ui, enabled: bool, icon: Icon, label: &
 
 pub(crate) fn touch_icon_toggle(ui: &mut Ui, icon: Icon, label: &str, selected: bool) -> Response {
     icon_control_sized(ui, icon, label, selected, TOUCH_CONTROL_SIZE)
+}
+
+pub(crate) fn sized_icon_toggle(
+    ui: &mut Ui,
+    icon: Icon,
+    label: &str,
+    selected: bool,
+    size: f32,
+) -> Response {
+    icon_control_sized(ui, icon, label, selected, size)
 }
 
 pub(crate) fn sized_icon_button(ui: &mut Ui, icon: Icon, label: &str, size: f32) -> Response {
@@ -710,6 +721,9 @@ pub(crate) fn paint_icon(painter: &Painter, rect: Rect, icon: Icon, color: Color
             for y in [0.26, 0.5, 0.74] {
                 line((0.16, y), (0.84, y));
             }
+        }
+        Icon::Record => {
+            painter.circle_filled(p(0.5, 0.5), rect.width() * 0.3, color);
         }
         Icon::Undo => {
             path(&[

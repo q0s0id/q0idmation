@@ -1,4 +1,5 @@
 //! Disposable runtime snapshots, exported off the UI thread.
+#[cfg(not(target_os = "android"))]
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
@@ -9,6 +10,7 @@ pub(crate) struct FastPreview {
     pending: Option<Receiver<Result<(), String>>>,
 }
 
+#[cfg(not(target_os = "android"))]
 fn player_path() -> Option<PathBuf> {
     let sibling = std::env::current_exe().ok()?.with_file_name("q0player.exe");
     if sibling.is_file() {
@@ -33,6 +35,7 @@ pub(crate) fn start(app: &mut EditorApp, ctx: &egui::Context, current_only: bool
     if !crate::text_tool::finish_edit(app) {
         return;
     }
+    #[cfg(not(target_os = "android"))]
     let Some(player) = player_path() else {
         app.session.status =
             "fast preview needs q0player: install it or place q0player.exe beside q0editor.exe"
@@ -69,6 +72,13 @@ pub(crate) fn start(app: &mut EditorApp, ctx: &egui::Context, current_only: bool
     app.fast_preview.pending = Some(receiver);
     app.session.status = "preparing fast preview…".into();
     let ctx = ctx.clone();
+    #[cfg(target_os = "android")]
+    std::thread::spawn(move || {
+        let result = show_in_player_app(&project, source_path.as_deref(), current_only);
+        let _ = sender.send(result);
+        ctx.request_repaint();
+    });
+    #[cfg(not(target_os = "android"))]
     std::thread::spawn(move || {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -120,6 +130,25 @@ pub(crate) fn start(app: &mut EditorApp, ctx: &egui::Context, current_only: bool
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&directory);
     });
+}
+
+/// Android: q0player is another app, handed the snapshot through the one
+/// folder the editor shares. Each preview replaces the last, so nothing piles
+/// up, and q0player keeps its own copy.
+#[cfg(target_os = "android")]
+fn show_in_player_app(
+    project: &q0s_format::v2::ProjectV2,
+    source_path: Option<&std::path::Path>,
+    current_only: bool,
+) -> Result<(), String> {
+    let directory = crate::platform::preview_dir();
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("create preview directory: {error}"))?;
+    let path = directory.join("preview.q0s");
+    let export = crate::export::export_with_embedded_dependencies(project, source_path)?;
+    crate::file_io::write_bytes_atomic(&path, &export.bytes)
+        .map_err(|error| format!("write preview: {error}"))?;
+    crate::platform::open_in_player(&path, !current_only)
 }
 
 pub(crate) fn poll(app: &mut EditorApp, ctx: &egui::Context) {

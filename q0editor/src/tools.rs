@@ -26531,4 +26531,177 @@ mod tests {
             "dense selection geometry leaked back into per-frame egui tessellation: {egui_mesh_vertices} vertices"
         );
     }
+
+    #[test]
+    fn keying_while_holding_an_object_records_each_pose() {
+        let mut app = EditorApp::default();
+        app.state.project = project_with_held_display_object();
+        app.session.current_q0rg_id = 1;
+        app.session.current_layer_id = 1;
+        app.session.current_frame = 0;
+        let ctx = Context::default();
+        let frame = |app: &mut EditorApp, events: Vec<egui::Event>| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        Pos2::ZERO,
+                        egui::vec2(100.0, 100.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::none())
+                        .show(ctx, |ui| {
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(100.0, 100.0),
+                                egui::Sense::click_and_drag(),
+                            );
+                            let view = StageView {
+                                origin: Pos2::ZERO,
+                                scale: 1.0,
+                                stage_rect: rect,
+                                edit_transform: q0s_format::transform::Affine::IDENTITY,
+                            };
+                            let cursor = response
+                                .interact_pointer_pos()
+                                .or_else(|| response.hover_pos())
+                                .map(|p| Vec2::new(p.x, p.y));
+                            select(app, &response, cursor, &view);
+                        });
+                },
+            );
+        };
+        let pointer = |x: f32, pressed| {
+            vec![
+                egui::Event::PointerMoved(pos2(x, 10.0)),
+                egui::Event::PointerButton {
+                    pos: pos2(x, 10.0),
+                    button: PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                },
+            ]
+        };
+        let pose_at = |app: &EditorApp, key: u16| {
+            app.state.project.q0rgs[0].layers[0]
+                .placements
+                .iter()
+                .find(|placement| placement.frame == key)
+                .map(|placement| placement.transform.tx)
+        };
+
+        frame(&mut app, vec![]);
+        frame(&mut app, pointer(10.0, true));
+        frame(&mut app, vec![egui::Event::PointerMoved(pos2(25.0, 10.0))]);
+        frame(&mut app, vec![egui::Event::PointerMoved(pos2(30.0, 10.0))]);
+        assert!(matches!(
+            app.session.tool_state,
+            ToolState::DraggingPlacement { .. }
+        ));
+        assert_eq!(
+            pose_at(&app, 0),
+            Some(20.0),
+            "the drag moves the object live"
+        );
+
+        // F6 mid-drag keys the next frame and the drag carries on there.
+        app.queue(crate::app::Action::InsertKeyframe);
+        app.flush_pending_actions();
+        assert_eq!(app.session.current_frame, 1);
+        assert!(matches!(
+            app.session.tool_state,
+            ToolState::DraggingPlacement { .. }
+        ));
+        frame(&mut app, vec![egui::Event::PointerMoved(pos2(50.0, 10.0))]);
+        frame(&mut app, pointer(50.0, false));
+
+        assert_eq!(pose_at(&app, 0), Some(20.0), "the first pose stays put");
+        assert_eq!(
+            pose_at(&app, 1),
+            Some(40.0),
+            "the drag continued on the new key"
+        );
+        assert!(matches!(
+            app.session.selection,
+            Selection::Placement { placement_idx, .. }
+                if app.state.project.q0rgs[0].layers[0].placements[placement_idx].frame == 1
+        ));
+    }
+
+    #[test]
+    fn a_recorded_hold_undoes_in_one_step() {
+        let mut app = EditorApp::default();
+        app.state.project = project_with_held_display_object();
+        app.session.current_q0rg_id = 1;
+        app.session.current_layer_id = 1;
+        app.session.current_frame = 0;
+        let ctx = Context::default();
+        let frame = |app: &mut EditorApp, events: Vec<egui::Event>| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        Pos2::ZERO,
+                        egui::vec2(100.0, 100.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::none())
+                        .show(ctx, |ui| {
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(100.0, 100.0),
+                                egui::Sense::click_and_drag(),
+                            );
+                            let view = StageView {
+                                origin: Pos2::ZERO,
+                                scale: 1.0,
+                                stage_rect: rect,
+                                edit_transform: q0s_format::transform::Affine::IDENTITY,
+                            };
+                            let cursor = response
+                                .interact_pointer_pos()
+                                .or_else(|| response.hover_pos())
+                                .map(|p| Vec2::new(p.x, p.y));
+                            select(app, &response, cursor, &view);
+                        });
+                },
+            );
+        };
+        let button = |x: f32, pressed| {
+            vec![
+                egui::Event::PointerMoved(pos2(x, 10.0)),
+                egui::Event::PointerButton {
+                    pos: pos2(x, 10.0),
+                    button: PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                },
+            ]
+        };
+        let keys = |app: &EditorApp| {
+            app.state.project.q0rgs[0].layers[0]
+                .placements
+                .iter()
+                .map(|placement| placement.frame)
+                .collect::<Vec<_>>()
+        };
+
+        frame(&mut app, vec![]);
+        frame(&mut app, button(10.0, true));
+        frame(&mut app, vec![egui::Event::PointerMoved(pos2(30.0, 10.0))]);
+        // Recording keys the first tick with an undo step and the rest without.
+        app.key_held_objects(true);
+        app.key_held_objects(false);
+        app.key_held_objects(false);
+        frame(&mut app, button(30.0, false));
+        assert_eq!(keys(&app), [0, 1, 2, 3]);
+
+        app.queue(crate::app::Action::Undo);
+        app.flush_pending_actions();
+        assert_eq!(keys(&app), [0], "one undo takes back the whole recording");
+    }
 }

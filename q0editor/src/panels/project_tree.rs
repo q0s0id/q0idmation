@@ -37,11 +37,12 @@ pub fn render(app: &mut EditorApp, ui: &mut egui::Ui) {
             .on_hover_text("Link a .q0s, .q0l or .q0lang file")
             .clicked()
         {
-            if let Some(path) = crate::platform::FileDialog::new()
-                .add_filter("q0 project dependency", &["q0s", "q0l", "q0lang"])
-                .pick_file()
-            {
-                app.queue(Action::AddProjectDependency(path, parent_for_new));
+            if let Some(action) = crate::platform::pick_file_then(
+                crate::platform::FileDialog::new()
+                    .add_filter("q0 project dependency", &["q0s", "q0l", "q0lang"]),
+                move |path| Action::AddProjectDependency(path, parent_for_new),
+            ) {
+                app.queue(action);
             }
         }
         if ui
@@ -57,7 +58,10 @@ pub fn render(app: &mut EditorApp, ui: &mut egui::Ui) {
                 .map(|base| base.join("script.q0l"));
             if let Some(path) = crate::file_io::pick_q0lang_save_path(suggested.as_deref()) {
                 match crate::file_io::save_q0lang_document(&path, "") {
-                    Ok(()) => app.queue(Action::AddProjectDependency(path, parent_for_new)),
+                    Ok(()) => {
+                        crate::platform::file_written(&path);
+                        app.queue(Action::AddProjectDependency(path, parent_for_new));
+                    }
                     Err(error) => {
                         app.session.status = format!("could not create q0lang source: {error}")
                     }
@@ -304,11 +308,12 @@ fn render_selection_details(
                             ProjectDependencyKind::Movie => &["q0s"],
                             ProjectDependencyKind::Q0lang => &["q0l", "q0lang"],
                         };
-                        if let Some(path) = crate::platform::FileDialog::new()
-                            .add_filter("replacement dependency", extensions)
-                            .pick_file()
-                        {
-                            app.queue(Action::RelinkProjectDependency(node_id, path));
+                        if let Some(action) = crate::platform::pick_file_then(
+                            crate::platform::FileDialog::new()
+                                .add_filter("replacement dependency", extensions),
+                            move |path| Action::RelinkProjectDependency(node_id, path),
+                        ) {
+                            app.queue(action);
                         }
                     }
                     if ui

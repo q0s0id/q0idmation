@@ -64,4 +64,4 @@ jobs:
 
       # The runner image ships an NDK and exports ANDROID_NDK_HOME.
       - name: Android check
-        run: cargo ndk -t arm64-v8a --platform 26 check -p q0editor-android --locked
+        run: cargo ndk -t arm64-v8a --platform 26 check -p q0editor-android -p q0player-android --locked

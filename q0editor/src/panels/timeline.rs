@@ -3045,6 +3045,16 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
         {
             app.queue(Action::TogglePlay);
         }
+        if icon_toggle(
+            ui,
+            Icon::Record,
+            "Record held objects: while on, dragging an object keys every frame (F6 keys one at a time)",
+            app.session.record_held,
+        )
+        .clicked()
+        {
+            app.session.record_held = !app.session.record_held;
+        }
         if icon_button(
             ui,
             Icon::First,

@@ -704,6 +704,48 @@ pub(crate) fn tick(app: &mut EditorApp, ctx: &egui::Context) {
     app.autosave.finish_pass_if_idle(interval);
 }
 
+/// Takes every snapshot that is due right away and waits for them to be
+/// written. Android may end a backgrounded app without warning, and the frame
+/// that notices the editor leaving the screen is the last one it can count on.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) fn flush_now(app: &mut EditorApp) {
+    if app.autosave.root.is_none() || !app.settings.autosave_enabled {
+        return;
+    }
+    let interval = interval_of(app);
+    let wait = |app: &mut EditorApp| {
+        if let Some(pending) = app.autosave.pending.take() {
+            let result = pending
+                .receiver
+                .recv_timeout(EXIT_WAIT)
+                .unwrap_or_else(|_| Err("autosave did not finish in time".to_string()));
+            complete_pending(app, pending, result, interval);
+        }
+    };
+    wait(app);
+    let changed = app
+        .autosave_documents()
+        .into_iter()
+        .filter(|document| {
+            document.dirty
+                && app
+                    .autosave
+                    .tracked
+                    .get(&document.tab_id)
+                    .is_none_or(|tracked| tracked.stamp != document.stamp)
+        })
+        .map(|document| document.tab_id)
+        .collect::<Vec<_>>();
+    app.autosave.queue.clear();
+    for tab_id in changed {
+        if let Err(error) = start_snapshot(app, tab_id) {
+            app.autosave.report_error(&mut app.session.status, error);
+            return;
+        }
+        wait(app);
+    }
+}
+
 /// Write whatever is newer than the last timed snapshot, synchronously. Called
 /// after the UI thread panicked, just before the panic is allowed to continue.
 pub(crate) fn emergency_flush(app: &mut EditorApp) {

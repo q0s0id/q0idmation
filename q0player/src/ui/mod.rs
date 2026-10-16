@@ -5,6 +5,8 @@ pub mod analytics;
 pub mod app;
 mod atomic_file;
 pub mod credits;
+pub mod launch;
+mod platform;
 pub mod recent;
 pub mod render;
 pub mod settings;

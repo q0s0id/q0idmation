@@ -11,7 +11,8 @@ use egui::{pos2, vec2, Align, Align2, Context, Layout, Rect, Ui};
 
 use crate::app::{Action, EditorApp};
 use crate::ui::{
-    paint_icon, sized_icon_button, touch_icon_button, touch_icon_toggle, Icon, TOUCH_CONTROL_SIZE,
+    paint_icon, sized_icon_button, sized_icon_toggle, touch_icon_button, touch_icon_toggle, Icon,
+    TOUCH_CONTROL_SIZE,
 };
 
 /// Whether this build lays the editor out for touch.
@@ -42,6 +43,10 @@ pub(crate) struct TouchLayout {
     pub(crate) modifiers: egui::Modifiers,
     shown_status: String,
     status_since: f64,
+    /// Whether the main menu was open last frame.
+    menu_open: bool,
+    /// Back asked for an Escape press on the next frame.
+    pub(crate) press_escape: bool,
 }
 
 impl TouchLayout {
@@ -87,11 +92,11 @@ pub(crate) fn top_bar(app: &mut EditorApp, ctx: &Context) {
 }
 
 fn main_menu(app: &mut EditorApp, ui: &mut Ui) {
-    let response = ui
+    let (response, open) = ui
         .scope(|ui| {
             // Blank text sized like the other bar buttons; the icon is painted over it.
             ui.spacing_mut().button_padding = vec2(14.0, 10.0);
-            ui.menu_button("   ", |ui| {
+            let menu = ui.menu_button("   ", |ui| {
                 crate::panels::menu::menus(app, ui);
                 ui.separator();
                 if app.has_active_project() && !app.home_visible() {
@@ -112,16 +117,41 @@ fn main_menu(app: &mut EditorApp, ui: &mut Ui) {
                     app.queue(Action::ToggleSettings);
                     ui.close_menu();
                 }
-            })
-            .response
+            });
+            (menu.response, menu.inner.is_some())
         })
         .inner;
+    app.touch.menu_open = open;
     paint_icon(
         ui.painter(),
         Rect::from_center_size(response.rect.center(), vec2(20.0, 20.0)),
         Icon::Menu,
         ui.visuals().text_color(),
     );
+}
+
+/// The system Back button: closes the most passing thing that is open, and
+/// with nothing left to close sends the editor to the background, the way
+/// Back leaves other apps. Windows stay as they are either way.
+pub(crate) fn back(app: &mut EditorApp, ctx: &Context) {
+    if app.touch.drawer != Drawer::Closed {
+        app.touch.drawer = Drawer::Closed;
+        ctx.request_repaint();
+        return;
+    }
+    let dismissable = app.touch.menu_open
+        || app.text_field_focused
+        || app.session.text_editor.is_some()
+        || ctx.memory(|memory| memory.any_popup_open())
+        || !matches!(app.session.tool_state, crate::state::ToolState::Idle);
+    if dismissable {
+        // Escape closes menus and popups, ends text editing and cancels
+        // gestures in progress all over the editor already.
+        app.touch.press_escape = true;
+        ctx.request_repaint();
+    } else {
+        crate::platform::leave();
+    }
 }
 
 fn history_buttons(app: &mut EditorApp, ui: &mut Ui) {
@@ -249,6 +279,27 @@ fn transport(app: &mut EditorApp, ui: &mut Ui) {
         if sized_icon_button(ui, icon, label, TRANSPORT_CONTROL_SIZE).clicked() {
             app.queue(Action::TogglePlay);
         }
+        let recording = app.session.record_held;
+        if sized_icon_toggle(
+            ui,
+            Icon::Record,
+            "Record held objects: dragging an object keys every frame",
+            recording,
+            TRANSPORT_CONTROL_SIZE,
+        )
+        .clicked()
+        {
+            app.session.record_held = !recording;
+        }
+        let key = sized_icon_button(
+            ui,
+            Icon::Keyframe,
+            "Insert keyframe; tap with a second finger while holding an object",
+            TRANSPORT_CONTROL_SIZE,
+        );
+        if key.clicked() || tapped_while_holding(app, ui, &key) {
+            app.queue(Action::InsertKeyframe);
+        }
         for (icon, label, action) in [
             (Icon::First, "First frame", Action::FirstFrame),
             (Icon::Previous, "Previous frame", Action::PreviousFrame),
@@ -281,6 +332,25 @@ fn transport(app: &mut EditorApp, ui: &mut Ui) {
             }
         });
     });
+}
+
+/// A second finger tapping `button` while the first holds an object on the
+/// canvas. egui follows only the first finger, so the button never sees that
+/// tap as a click of its own.
+fn tapped_while_holding(app: &EditorApp, ui: &Ui, button: &egui::Response) -> bool {
+    !crate::app::held_object_layers(&app.session.tool_state, app.session.current_q0rg_id).is_empty()
+        && ui.input(|input| {
+            input.raw.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Touch {
+                        phase: egui::TouchPhase::Start,
+                        pos,
+                        ..
+                    } if button.rect.contains(*pos)
+                )
+            })
+        })
 }
 
 /// Library or properties, laid over the right side of the canvas so opening

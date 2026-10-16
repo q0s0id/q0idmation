@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- What q0editor shares with other apps: fast preview snapshots for q0player. -->
+<paths>
+    <cache-path
+        name="preview"
+        path="preview/" />
+</paths>

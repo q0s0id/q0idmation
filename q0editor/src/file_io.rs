@@ -347,7 +347,7 @@ pub fn save_q0lang_document(path: &Path, text: &str) -> io::Result<()> {
     write_bytes_atomic(path, text.as_bytes())
 }
 
-pub fn pick_open_path() -> Option<PathBuf> {
+pub(crate) fn open_dialog() -> crate::platform::FileDialog {
     crate::platform::FileDialog::new()
         .add_filter(
             "q0editor documents",
@@ -357,13 +357,11 @@ pub fn pick_open_path() -> Option<PathBuf> {
         .add_filter("Adobe Animate (.fla, .xfl)", q0fla::IMPORT_EXTENSIONS)
         .add_filter("q0lang source (.q0l, .q0lang)", Q0LANG_EXTENSIONS)
         .add_filter("any", &["*"])
-        .pick_file()
 }
 
-pub fn pick_fla_import_path() -> Option<PathBuf> {
+pub(crate) fn fla_import_dialog() -> crate::platform::FileDialog {
     crate::platform::FileDialog::new()
         .add_filter("Adobe Animate (.fla, .xfl)", q0fla::IMPORT_EXTENSIONS)
-        .pick_file()
 }
 
 pub fn pick_q0fla_save_path(source: &Path) -> Option<PathBuf> {
@@ -395,13 +393,11 @@ pub fn pick_q0lang_save_path(suggested: Option<&Path>) -> Option<PathBuf> {
     dialog.save_file()
 }
 
-pub fn pick_bitmap_import_path() -> Option<PathBuf> {
-    crate::platform::FileDialog::new()
-        .add_filter("bitmap image", &["png", "jpg", "jpeg", "webp"])
-        .pick_file()
+pub(crate) fn bitmap_import_dialog() -> crate::platform::FileDialog {
+    crate::platform::FileDialog::new().add_filter("bitmap image", &["png", "jpg", "jpeg", "webp"])
 }
 
-pub fn pick_media_import_path() -> Option<PathBuf> {
+pub(crate) fn media_import_dialog() -> crate::platform::FileDialog {
     crate::platform::FileDialog::new()
         .add_filter(
             "q0editor media",
@@ -412,7 +408,6 @@ pub fn pick_media_import_path() -> Option<PathBuf> {
         .add_filter("video", &["mp4", "q0v"])
         .add_filter("audio", &["wav", "mp3", "ogg", "flac"])
         .add_filter("bitmap image", &["png", "jpg", "jpeg", "webp"])
-        .pick_file()
 }
 
 pub fn is_supported_video_import_path(path: &Path) -> bool {

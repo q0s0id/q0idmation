@@ -683,6 +683,9 @@ impl Q0EncState {
                             job.state = JobState::Completed;
                             job.completed_units = job.total_units;
                             job.phase = "completed".to_string();
+                            if format != ExportFormat::PngSequence {
+                                crate::platform::export_finished(&path);
+                            }
                             statuses.push(format!(
                                 "q0enc exported {}: {}",
                                 format.label(),

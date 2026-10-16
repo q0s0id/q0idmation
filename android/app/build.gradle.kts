@@ -33,6 +33,14 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+
+    // The activity base and theme q0player shares.
+    sourceSets {
+        getByName("main") {
+            java.srcDir("../shared/java")
+            res.srcDir("../shared/res")
+        }
+    }
 }
 
 dependencies {

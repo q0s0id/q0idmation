@@ -983,6 +983,12 @@ pub struct Session {
     pub timeline_rig_key_drag: Option<TimelineRigKeySelection>,
     pub camera_frame_drag: Option<CameraFrameDrag>,
     pub playing: bool,
+    /// Record motion while objects are held: a keyframe at every frame tick.
+    pub record_held: bool,
+    /// When the last recorded keyframe was taken, in input time.
+    pub last_held_key: Option<f64>,
+    /// Whether this hold already recorded a keyframe, and so an undo step.
+    pub held_run_keyed: bool,
     pub last_tick: Instant,
     /// Persistent q0lang state for editor playback preview. Scrubbing does not
     /// execute it; playback/frame-runtime transitions do.
@@ -1220,6 +1226,9 @@ impl Session {
             timeline_rig_key_drag: None,
             camera_frame_drag: None,
             playing: false,
+            record_held: false,
+            last_held_key: None,
+            held_run_keyed: false,
             last_tick: Instant::now(),
             preview_q0lang_runtime: q0s_format::q0lang::runtime::Runtime::new(),
             preview_q0lang_initialized: false,

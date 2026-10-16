@@ -22,6 +22,7 @@ use rodio::{OutputStream, OutputStreamHandle, Sink, Source};
 
 use super::analytics::FileStats;
 use super::credits;
+use super::platform::PlayerEvent;
 use super::recent;
 use super::render::TextureCache;
 use super::settings::Settings;
@@ -65,6 +66,17 @@ pub struct PlayerApp {
     timeline_audio: Option<TimelineAudioPlayback>,
     observed_scene_generation: u64,
     last_pointer_stage: Option<(f32, f32, bool)>,
+    /// Touch screens: controls and system bars hidden, the movie alone.
+    immersive: bool,
+    /// Touch screens: whether the display was last asked to stay awake.
+    screen_kept_on: bool,
+    /// Whether a menu bar menu was open last frame.
+    menu_open: bool,
+    /// Back asked for an Escape press on the next frame.
+    press_escape: bool,
+    touch_pad: TouchPad,
+    /// Where the movie was drawn last frame.
+    last_canvas: egui::Rect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +234,12 @@ impl PlayerApp {
             timeline_audio: None,
             observed_scene_generation: 0,
             last_pointer_stage: None,
+            immersive: false,
+            screen_kept_on: false,
+            menu_open: false,
+            press_escape: false,
+            touch_pad: TouchPad::default(),
+            last_canvas: egui::Rect::NOTHING,
         }
     }
 
@@ -344,12 +362,66 @@ impl PlayerApp {
     }
 
     fn pick_open(&mut self, ctx: &Context) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("q0player media", &["q0s", "q0v"])
-            .pick_file()
-        {
+        if let Some(path) = super::platform::pick_movie() {
             self.open_path(ctx, &path);
         }
+    }
+
+    fn load_theme(&mut self, ctx: &Context, path: &Path) {
+        match Theme::read_q7s(path) {
+            Ok((name, theme)) => {
+                self.settings.theme = theme;
+                self.settings.theme.apply(ctx);
+                self.settings.apply_text_size(ctx);
+                self.settings.save();
+                self.status = format!("theme: {name}");
+            }
+            Err(e) => self.status = format!("load theme failed: {e}"),
+        }
+    }
+
+    fn apply_recent(&mut self, ctx: &Context, action: recent::RecentAction) {
+        match action {
+            recent::RecentAction::Open(p) => self.open_path(ctx, &p),
+            recent::RecentAction::Forget(p) => {
+                self.settings.recent.retain(|x| x != &p);
+                self.settings.save();
+            }
+            recent::RecentAction::ClearAll => {
+                self.settings.recent.clear();
+                self.settings.save();
+            }
+        }
+    }
+
+    /// Movies picked or sent by other apps, platform messages and Back.
+    fn poll_platform(&mut self, ctx: &Context) {
+        for event in super::platform::take_events(ctx) {
+            match event {
+                PlayerEvent::Open { path, preview } => {
+                    self.preview = preview.unwrap_or_default();
+                    self.open_path(ctx, &path);
+                }
+                PlayerEvent::Theme(path) => self.load_theme(ctx, &path),
+                PlayerEvent::Status(message) => self.status = message,
+                PlayerEvent::Back => self.back(ctx),
+            }
+        }
+    }
+
+    /// The system Back button: closes what is open, and with nothing left
+    /// sends the player to the background, back to q0editor after a preview.
+    fn back(&mut self, ctx: &Context) {
+        if self.show_settings {
+            self.show_settings = false;
+        } else if self.immersive {
+            self.toggle_fullscreen(ctx);
+        } else if self.menu_open || ctx.memory(|memory| memory.any_popup_open()) {
+            self.press_escape = true;
+        } else {
+            super::platform::leave();
+        }
+        ctx.request_repaint();
     }
 
     fn close_file(&mut self, ctx: &Context) {
@@ -443,6 +515,16 @@ impl PlayerApp {
     }
 
     fn toggle_fullscreen(&mut self, ctx: &Context) {
+        if super::platform::TOUCH {
+            self.immersive = !self.immersive;
+            super::platform::immersive(self.immersive);
+            self.status = if self.immersive {
+                "fullscreen; Back returns".to_string()
+            } else {
+                "windowed mode".to_string()
+            };
+            return;
+        }
         let fullscreen = ctx.input(|input| input.viewport().fullscreen.unwrap_or(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
         self.status = if fullscreen {
@@ -568,13 +650,21 @@ impl App for PlayerApp {
         if let Some(p) = self.pending_open.take() {
             self.open_path(ctx, &p);
         }
+        self.poll_platform(ctx);
 
         let game_input_active = self
             .player
             .as_ref()
             .is_some_and(crate::Player::uses_game_input);
         if game_input_active {
-            let (left, right, jump) = take_game_input(ctx, self.show_settings);
+            let (mut left, mut right, mut jump) = take_game_input(ctx, self.show_settings);
+            if super::platform::TOUCH && !self.show_settings {
+                let (touch_left, touch_right, touch_jump) =
+                    self.touch_pad.held(ctx, self.last_canvas);
+                left |= touch_left;
+                right |= touch_right;
+                jump |= touch_jump;
+            }
             if let Some(player) = self.player.as_mut() {
                 player.set_input_state(left, right, jump);
             }
@@ -588,16 +678,23 @@ impl App for PlayerApp {
             .map(|p| p.is_playing())
             .unwrap_or(false);
         self.maybe_advance();
+        let keep_awake = was_playing || game_input_active;
+        if keep_awake != self.screen_kept_on {
+            self.screen_kept_on = keep_awake;
+            super::platform::keep_screen_on(keep_awake);
+        }
         if was_playing || game_input_active {
             // Interactive q0.input movies own a fixed-step runtime clock even
             // while authored timeline transport is paused.
             ctx.request_repaint();
         }
 
-        if !self.preview.enabled {
+        if !self.preview.enabled && !self.immersive {
             self.menubar(ctx);
             self.transport_bar(ctx);
             self.side_panels(ctx);
+        } else {
+            self.menu_open = false;
         }
         self.sync_scene_resources_if_needed();
         // viewport() retargets the rasteriser size to actual canvas
@@ -619,6 +716,23 @@ impl App for PlayerApp {
         if self.show_settings {
             self.settings_dialog(ctx);
         }
+        if self.immersive && !self.preview.enabled {
+            self.leave_fullscreen_button(ctx);
+        }
+    }
+
+    fn raw_input_hook(&mut self, _ctx: &Context, raw_input: &mut egui::RawInput) {
+        if std::mem::take(&mut self.press_escape) {
+            for pressed in [true, false] {
+                raw_input.events.push(egui::Event::Key {
+                    key: Key::Escape,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                });
+            }
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -634,7 +748,7 @@ impl PlayerApp {
     fn menubar(&mut self, ctx: &Context) {
         egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
-                ui.menu_button("File", |ui| {
+                let file = ui.menu_button("File", |ui| {
                     if ui.button("Open...").clicked() {
                         ui.close_menu();
                         self.pick_open(ctx);
@@ -670,13 +784,16 @@ impl PlayerApp {
                         ui.close_menu();
                         self.close_file(ctx);
                     }
-                    ui.separator();
-                    if ui.button("Exit").clicked() {
-                        ui.close_menu();
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    // Android apps are left with Back or Home, not closed.
+                    if !super::platform::TOUCH {
+                        ui.separator();
+                        if ui.button("Exit").clicked() {
+                            ui.close_menu();
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
                     }
                 });
-                ui.menu_button("View", |ui| {
+                let view = ui.menu_button("View", |ui| {
                     ui.checkbox(&mut self.settings.show_left_panel, "Recent panel");
                     ui.checkbox(&mut self.settings.show_right_panel, "File info panel");
                     ui.separator();
@@ -692,7 +809,7 @@ impl PlayerApp {
                         self.toggle_fullscreen(ctx);
                     }
                 });
-                ui.menu_button("Tools", |ui| {
+                let tools = ui.menu_button("Tools", |ui| {
                     if ui.button("Credits...").clicked() {
                         ui.close_menu();
                         self.dialog_tab = DialogTab::Credits;
@@ -740,7 +857,7 @@ impl PlayerApp {
                         }
                     }
                 });
-                ui.menu_button("Help", |ui| {
+                let help = ui.menu_button("Help", |ui| {
                     ui.label(egui::RichText::new("q0player").strong());
                     ui.label(egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).weak());
                     ui.separator();
@@ -750,6 +867,9 @@ impl PlayerApp {
                     ui.label("Ctrl+O: open | Space: play/pause | F11: fullscreen");
                     ui.label("Left/Right: one frame | Home/End: first/last frame");
                 });
+                self.menu_open = [file.inner, view.inner, tools.inner, help.inner]
+                    .iter()
+                    .any(Option::is_some);
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let full_status = self.status.clone();
@@ -774,6 +894,10 @@ impl PlayerApp {
     fn transport_bar(&mut self, ctx: &Context) {
         egui::TopBottomPanel::bottom("transport").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                if super::platform::TOUCH {
+                    ui.spacing_mut().interact_size.y = 40.0;
+                    ui.spacing_mut().button_padding = egui::vec2(14.0, 8.0);
+                }
                 let has_player = self.player.is_some();
                 let interactive_single_frame = self
                     .player
@@ -818,6 +942,10 @@ impl PlayerApp {
                 let total = self.player.as_ref().map(|p| p.total_frames()).unwrap_or(1);
                 let mut current = self.player.as_ref().map(|p| p.current_frame()).unwrap_or(0);
                 let max = total.saturating_sub(1);
+                if super::platform::TOUCH {
+                    // The slider takes what the fps label and Loop leave.
+                    ui.spacing_mut().slider_width = (ui.available_width() - 190.0).max(80.0);
+                }
                 let resp = ui
                     .add_enabled(
                         has_player,
@@ -861,17 +989,7 @@ impl PlayerApp {
                 .show(ctx, |ui| {
                     let recent = self.settings.recent.clone();
                     if let Some(action) = recent::render(&recent, ui) {
-                        match action {
-                            recent::RecentAction::Open(p) => self.open_path(ctx, &p),
-                            recent::RecentAction::Forget(p) => {
-                                self.settings.recent.retain(|x| x != &p);
-                                self.settings.save();
-                            }
-                            recent::RecentAction::ClearAll => {
-                                self.settings.recent.clear();
-                                self.settings.save();
-                            }
-                        }
+                        self.apply_recent(ctx, action);
                     }
                 });
         }
@@ -966,6 +1084,7 @@ impl PlayerApp {
                 let canvas_rect = ui.max_rect();
                 let painter = ui.painter_at(canvas_rect);
                 self.dispatch_stage_pointer(ctx, canvas_rect);
+                self.last_canvas = canvas_rect;
 
                 let format = self.player.as_ref().map(|p| p.format());
 
@@ -1036,14 +1155,52 @@ impl PlayerApp {
                         ui.vertical_centered(|ui| {
                             ui.add_space(40.0);
                             ui.heading("q0player");
-                            ui.label(
-                                egui::RichText::new(
-                                    "Drop a .q0s or .q0v file here, or use File > Open...",
-                                )
-                                .weak(),
-                            );
+                            if super::platform::TOUCH {
+                                ui.add_space(12.0);
+                                let open = egui::Button::new("Open a movie...")
+                                    .min_size(egui::vec2(220.0, 44.0));
+                                if ui.add(open).clicked() {
+                                    self.pick_open(ctx);
+                                }
+                            } else {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Drop a .q0s or .q0v file here, or use File > Open...",
+                                    )
+                                    .weak(),
+                                );
+                            }
                         });
+                        // The recent panel starts hidden on touch screens.
+                        if super::platform::TOUCH && !self.settings.show_left_panel {
+                            ui.add_space(24.0);
+                            let recent = self.settings.recent.clone();
+                            if let Some(action) = recent::render(&recent, ui) {
+                                self.apply_recent(ctx, action);
+                            }
+                        }
                     }
+                }
+                let game_input = self
+                    .player
+                    .as_ref()
+                    .is_some_and(crate::Player::uses_game_input);
+                if super::platform::TOUCH && game_input && !self.show_settings {
+                    self.touch_pad.paint(&painter, canvas_rect);
+                }
+            });
+    }
+
+    /// Touch screens have no Escape or F11 to get out of fullscreen.
+    fn leave_fullscreen_button(&mut self, ctx: &Context) {
+        egui::Area::new(egui::Id::new("q0player_leave_fullscreen"))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let button = egui::Button::new(egui::RichText::new("Exit fullscreen").small())
+                    .fill(Color32::from_black_alpha(120));
+                if ui.add(button).clicked() {
+                    self.toggle_fullscreen(ctx);
                 }
             });
     }
@@ -1052,10 +1209,11 @@ impl PlayerApp {
         let mut open = self.show_settings;
         let mut close_requested = false;
         let mut viewport_changed = false;
+        let screen = ctx.screen_rect().size() - egui::vec2(16.0, 16.0);
         egui::Window::new("q0player")
             .open(&mut open)
-            .default_size([720.0, 680.0])
-            .min_size([500.0, 500.0])
+            .default_size([720.0_f32.min(screen.x), 680.0_f32.min(screen.y)])
+            .min_size([500.0_f32.min(screen.x), 500.0_f32.min(screen.y)])
             .collapsible(false)
             .resizable(true)
             .show(ctx, |ui| {
@@ -1127,11 +1285,7 @@ impl PlayerApp {
                         .on_hover_text("Save the current colours as a reusable .q7s theme")
                         .clicked()
                     {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("q7s theme", &["q7s"])
-                            .set_file_name("my-theme.q7s")
-                            .save_file()
-                        {
+                        if let Some(path) = super::platform::theme_save_path() {
                             let name = path
                                 .file_stem()
                                 .and_then(|s| s.to_str())
@@ -1139,6 +1293,7 @@ impl PlayerApp {
                                 .to_string();
                             match self.settings.theme.write_q7s(&path, &name) {
                                 Ok(()) => {
+                                    super::platform::file_written(&path);
                                     self.status = format!("saved theme: {}", path.display())
                                 }
                                 Err(e) => self.status = format!("save theme failed: {e}"),
@@ -1150,20 +1305,8 @@ impl PlayerApp {
                         .on_hover_text("Apply a previously saved .q7s theme")
                         .clicked()
                     {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("q7s theme", &["q7s"])
-                            .pick_file()
-                        {
-                            match Theme::read_q7s(&path) {
-                                Ok((name, theme)) => {
-                                    self.settings.theme = theme;
-                                    self.settings.theme.apply(ctx);
-                                    self.settings.apply_text_size(ctx);
-                                    self.settings.save();
-                                    self.status = format!("theme: {name}");
-                                }
-                                Err(e) => self.status = format!("load theme failed: {e}"),
-                            }
+                        if let Some(path) = super::platform::pick_theme() {
+                            self.load_theme(ctx, &path);
                         }
                     }
                 });
@@ -1354,6 +1497,79 @@ fn take_shortcuts(ctx: &Context, game_input_active: bool) -> Vec<PlayerShortcut>
         }
         shortcuts
     })
+}
+
+/// On-screen buttons for movies that read q0.input, on screens without keys.
+/// Every finger counts, not just the one egui follows as the pointer, so
+/// running and jumping can be held at once.
+#[derive(Default)]
+struct TouchPad {
+    /// Where each finger down is, by touch id.
+    fingers: std::collections::HashMap<u64, egui::Pos2>,
+}
+
+impl TouchPad {
+    const SIZE: f32 = 76.0;
+    const MARGIN: f32 = 18.0;
+
+    /// Left, right and jump, from the bottom corners of `canvas`.
+    fn buttons(canvas: egui::Rect) -> [egui::Rect; 3] {
+        let size = egui::vec2(Self::SIZE, Self::SIZE);
+        let top = canvas.bottom() - Self::MARGIN - Self::SIZE;
+        let left = egui::Rect::from_min_size(egui::pos2(canvas.left() + Self::MARGIN, top), size);
+        let right = left.translate(egui::vec2(Self::SIZE + 12.0, 0.0));
+        let jump = egui::Rect::from_min_size(
+            egui::pos2(canvas.right() - Self::MARGIN - Self::SIZE, top),
+            size,
+        );
+        [left, right, jump]
+    }
+
+    fn held(&mut self, ctx: &Context, canvas: egui::Rect) -> (bool, bool, bool) {
+        ctx.input(|input| {
+            for event in &input.events {
+                if let egui::Event::Touch { id, phase, pos, .. } = event {
+                    match phase {
+                        egui::TouchPhase::Start | egui::TouchPhase::Move => {
+                            self.fingers.insert(id.0, *pos);
+                        }
+                        egui::TouchPhase::End | egui::TouchPhase::Cancel => {
+                            self.fingers.remove(&id.0);
+                        }
+                    }
+                }
+            }
+        });
+        let [left, right, jump] =
+            Self::buttons(canvas).map(|rect| self.fingers.values().any(|pos| rect.contains(*pos)));
+        (left, right, jump)
+    }
+
+    fn paint(&self, painter: &egui::Painter, canvas: egui::Rect) {
+        let [left, right, jump] = Self::buttons(canvas);
+        for (rect, direction) in [
+            (left, egui::vec2(-1.0, 0.0)),
+            (right, egui::vec2(1.0, 0.0)),
+            (jump, egui::vec2(0.0, -1.0)),
+        ] {
+            let down = self.fingers.values().any(|pos| rect.contains(*pos));
+            painter.rect_filled(
+                rect,
+                14.0,
+                Color32::from_white_alpha(if down { 90 } else { 36 }),
+            );
+            // A triangle pointing in `direction`.
+            let center = rect.center();
+            let side = egui::vec2(-direction.y, direction.x);
+            let tip = center + direction * 16.0;
+            let back = center - direction * 12.0;
+            painter.add(egui::Shape::convex_polygon(
+                vec![tip, back + side * 16.0, back - side * 16.0],
+                Color32::from_white_alpha(200),
+                egui::Stroke::NONE,
+            ));
+        }
+    }
 }
 
 fn take_game_input(ctx: &Context, blocked_by_dialog: bool) -> (bool, bool, bool) {
@@ -1618,5 +1834,46 @@ mod tests {
         assert!(status_needs_attention("q0s file is too large"));
         assert!(!status_needs_attention("loaded movie.q0s"));
         assert!(!status_needs_attention("paused"));
+    }
+
+    #[test]
+    fn touch_pad_holds_every_finger_down_until_it_lifts() {
+        let ctx = Context::default();
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0));
+        let [left, _, jump] = TouchPad::buttons(canvas);
+        let touch = |id, phase, pos| egui::Event::Touch {
+            device_id: egui::TouchDeviceId(0),
+            id: egui::TouchId(id),
+            phase,
+            pos,
+            force: None,
+        };
+        let mut pad = TouchPad::default();
+        let mut frame = |events| {
+            let mut held = (false, false, false);
+            let _ = ctx.run(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| held = pad.held(ctx, canvas),
+            );
+            held
+        };
+
+        let both = vec![
+            touch(1, egui::TouchPhase::Start, left.center()),
+            touch(2, egui::TouchPhase::Start, jump.center()),
+        ];
+        assert_eq!(frame(both), (true, false, true), "run and jump together");
+        assert_eq!(
+            frame(vec![]),
+            (true, false, true),
+            "held without new events"
+        );
+        let slide_off = vec![touch(1, egui::TouchPhase::Move, canvas.center())];
+        assert_eq!(frame(slide_off), (false, false, true));
+        let lift = vec![touch(2, egui::TouchPhase::End, jump.center())];
+        assert_eq!(frame(lift), (false, false, false));
     }
 }

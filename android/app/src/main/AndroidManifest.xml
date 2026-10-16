@@ -8,9 +8,15 @@
     <!-- The home screen fetches the release feed. -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- Fast preview hands its snapshot to q0player. -->
+    <queries>
+        <package android:name="com.q0id.q0player" />
+    </queries>
+
     <application
+        android:icon="@mipmap/ic_launcher"
         android:label="q0editor"
-        android:theme="@style/Theme.Q0Editor">
+        android:theme="@style/Theme.Q0">
 
         <!--
             The native event loop cannot be restarted inside a live process, so
@@ -32,7 +38,59 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
+            <!--
+                "Open with" from file managers, chats and browsers. Projects and
+                Animate files have no registered MIME type, so most apps call
+                them octet streams; .fla files are zip archives.
+            -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <action android:name="android.intent.action.EDIT" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="application/octet-stream" />
+                <data android:mimeType="application/zip" />
+                <data android:mimeType="application/x-zip-compressed" />
+                <data android:mimeType="application/vnd.adobe.fla" />
+            </intent-filter>
+
+            <!-- Apps that do put the file name in the link. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:host="*" />
+                <data android:mimeType="*/*" />
+                <data android:pathPattern=".*\\.q1s" />
+                <data android:pathPattern=".*\\..*\\.q1s" />
+                <data android:pathPattern=".*\\..*\\..*\\.q1s" />
+                <data android:pathPattern=".*\\.fla" />
+                <data android:pathPattern=".*\\..*\\.fla" />
+                <data android:pathPattern=".*\\..*\\..*\\.fla" />
+            </intent-filter>
+
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/octet-stream" />
+                <data android:mimeType="application/zip" />
+                <data android:mimeType="application/vnd.adobe.fla" />
+            </intent-filter>
         </activity>
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/shared_files" />
+        </provider>
     </application>
 
 </manifest>

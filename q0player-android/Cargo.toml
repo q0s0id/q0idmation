@@ -1,0 +1,20 @@
+[package]
+name = "q0player-android"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Android activity glue for q0player."
+
+[lib]
+crate-type = ["cdylib"]
+
+# Everything is target-gated so desktop workspace builds see an empty crate.
+[target.'cfg(target_os = "android")'.dependencies]
+q0player = { path = "../q0player" }
+q0android = { path = "../q0android" }
+winit = { version = "0.29", default-features = false, features = ["android-game-activity"] }
+log = "0.4"
+android_logger = "0.14"

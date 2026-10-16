@@ -43,6 +43,7 @@ rfd = "0.14"
 
 [target.'cfg(target_os = "android")'.dependencies]
 libc = "0.2"
+q0android = { path = "../q0android" }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
