@@ -17,7 +17,7 @@ use crate::ui::{icon_button, icon_button_enabled, icon_toggle, FitToScreen, Icon
 const FRAME_W: f32 = 12.0;
 const ROW_H: f32 = 26.0;
 const LAYER_LABEL_W: f32 = 174.0;
-/// Gap above and below the cell fill РІР‚вЂќ leaves room for thin row separators
+/// Gap above and below the cell fill — leaves room for thin row separators
 /// like the original Flash CS3 timeline.
 const CELL_PAD_Y: f32 = 1.0;
 /// How many "virtual" frame slots to render past `frame_count` so the user
@@ -803,7 +803,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 }
             }
 
-            // Timeline base panel РІР‚вЂќ same as the editor's window colour
+            // Timeline base panel — same as the editor's window colour
             // so it visually merges with the surrounding chrome.
             painter.rect_filled(rect, 0.0, theme.window.to_color32());
             label_painter.rect_filled(rect, 0.0, theme.window.to_color32());
@@ -904,7 +904,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     is_current_layer,
                 );
 
-                // Label (left-side fixed column) РІР‚вЂќ pull tones from the
+                // Label (left-side fixed column) — pull tones from the
                 // panel/window pair so any theme reads as a coherent strip.
                 let label_rect =
                     Rect::from_min_size(pos2(rect.min.x, row_y), vec2(label_width, ROW_H));
@@ -1075,7 +1075,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     Stroke::new(1.0_f32, theme.stroke_dark.to_color32()),
                 );
 
-                // Bottom row separator РІР‚вЂќ hairline in the theme's stroke colour.
+                // Bottom row separator — hairline in the theme's stroke colour.
                 label_painter.line_segment(
                     [
                         pos2(rect.min.x, row_y + ROW_H),
@@ -1204,7 +1204,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     continue;
                 }
 
-                // Click in row РІвЂ вЂ™ set current_layer + current_frame
+                // Click in row → set current_layer + current_frame
                 if let Some(pos) = response.interact_pointer_pos() {
                     if row_rect.contains(pos) && response.clicked() {
                         if visibility_rect.contains(pos) {
@@ -3934,11 +3934,11 @@ pub(crate) fn draw_layer_icon(
 
 /// Paint per-frame base cells before any span/keyframe glyphs go on top.
 /// Three states:
-///   * inside `frame_count`, no placement covering this frame    РІвЂ вЂ™ mid grey
+///   * inside `frame_count`, no placement covering this frame    → mid grey
 ///     (active layer is a touch brighter so it's clear which row drawing
 ///     will land in).
-///   * beyond `frame_count`                                       РІвЂ вЂ™ very dark
-///   * beyond + every-5th                                          РІвЂ вЂ™ slightly
+///   * beyond `frame_count`                                       → very dark
+///   * beyond + every-5th                                          → slightly
 ///     brighter dark, producing a chequered "virtual frames" band.
 fn draw_empty_cells(
     painter: &egui::Painter,

@@ -15,7 +15,7 @@
 //!   while x < 10 { ... }
 //!   return x
 //!
-//! The tokenizer is tiny and intentionally forgiving вЂ” it never panics on
+//! The tokenizer is tiny and intentionally forgiving — it never panics on
 //! malformed input, it just falls back to `Identifier` for whatever it
 //! can't classify. That matters because the editor live-relexes every
 //! keystroke; a broken intermediate state must still render.
@@ -39,7 +39,7 @@ pub enum TokenKind {
     Number,
     Comment,
     Operator,
-    /// `Q0Signal UP!` and similar вЂ” uppercase identifiers ending in `!`.
+    /// `Q0Signal UP!` and similar — uppercase identifiers ending in `!`.
     Signal,
     Identifier,
     Whitespace,
@@ -118,7 +118,7 @@ pub fn tokenize(src: &str) -> Vec<Token> {
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
-        // Newline first вЂ” keep separate so the layouter can pass through line breaks.
+        // Newline first — keep separate so the layouter can pass through line breaks.
         if b == b'\n' {
             out.push(Token {
                 kind: TokenKind::Newline,
@@ -169,7 +169,7 @@ pub fn tokenize(src: &str) -> Vec<Token> {
             });
             continue;
         }
-        // String: "..." вЂ” backslash escapes are not part of q0lang per the
+        // String: "..." — backslash escapes are not part of q0lang per the
         // examples, but we tolerate them by skipping the next byte.
         if b == b'"' {
             let s = i;
@@ -250,7 +250,7 @@ pub fn tokenize(src: &str) -> Vec<Token> {
                 });
                 continue;
             }
-            // Dotted path (qos.lib.X) вЂ” only if the next byte is `.` followed by another identifier.
+            // Dotted path (qos.lib.X) — only if the next byte is `.` followed by another identifier.
             if i < bytes.len()
                 && bytes[i] == b'.'
                 && i + 1 < bytes.len()
@@ -290,7 +290,7 @@ pub fn tokenize(src: &str) -> Vec<Token> {
             });
             continue;
         }
-        // Operator / punctuation вЂ” single byte at a time.
+        // Operator / punctuation — single byte at a time.
         if matches!(
             b,
             b'(' | b')'
@@ -325,7 +325,7 @@ pub fn tokenize(src: &str) -> Vec<Token> {
             i += 1;
             continue;
         }
-        // Unknown byte вЂ” emit one Other and keep going so we never loop.
+        // Unknown byte — emit one Other and keep going so we never loop.
         let s = i;
         // Walk forward bytewise but try to stop at the next "interesting"
         // boundary so we don't shrink tokens to size-1 over multi-byte UTF-8
@@ -408,7 +408,7 @@ fn token_color(kind: TokenKind, theme: &Theme) -> Color32 {
 
 /// Build a `LayoutJob` for a single line of source. The script editor
 /// uses egui's per-line layouter callback (one call per visible row), so
-/// this runs hot вЂ” keep it allocation-light. We retokenise the line each
+/// this runs hot — keep it allocation-light. We retokenise the line each
 /// time rather than caching, because lines are short and the cost is
 /// dwarfed by glyph layout anyway.
 pub fn layout_line(src: &str, theme: &Theme, font: FontId, wrap_width: f32) -> LayoutJob {

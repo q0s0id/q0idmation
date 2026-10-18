@@ -1,4 +1,4 @@
-//! Software rasteriser for `ProjectV2` РІР‚вЂќ turns a single frame of a q0rg
+//! Software rasteriser for `ProjectV2` — turns a single frame of a q0rg
 //! into a flat RGBA buffer. Shared between:
 //!   * q0editor's `.q0s` export path (rasterise + ship if you want a v1
 //!     bitmap-only `.q0s`, or skip rasterisation entirely for v2 vector
@@ -14,8 +14,8 @@
 //!     sharp turns; even-odd would punch holes).
 //!
 //! `rasterize_q0rg_frame` does optional supersampling: pass `ss > 1` and
-//! the function rasterises at `ss Р“вЂ” ss` and box-filters down. Caller
-//! controls quality/cost trade-off РІР‚вЂќ players default to `1` (live), the
+//! the function rasterises at `ss × ss` and box-filters down. Caller
+//! controls quality/cost trade-off — players default to `1` (live), the
 //! exporter could use `2`.
 
 use std::collections::{HashMap, HashSet};
@@ -31,9 +31,9 @@ use crate::v2::{
 mod video;
 
 /// Render one frame of `q0rg_id` (resolved against `project`) into an
-/// RGBA8 buffer of size `w Р“вЂ” h`. `ss` controls supersample factor:
-///   * `ss = 1`: no AA, fast РІР‚вЂќ fine for live playback.
-///   * `ss = 2`: ~4Р“вЂ” slower, smooth diagonals РІР‚вЂќ sane default for export.
+/// RGBA8 buffer of size `w × h`. `ss` controls supersample factor:
+///   * `ss = 1`: no AA, fast — fine for live playback.
+///   * `ss = 2`: ~4× slower, smooth diagonals — sane default for export.
 ///   * `ss >= 3`: diminishing returns, lots of memory.
 ///
 /// `bg_rgba` is the canvas clear colour. Use `[255, 255, 255, 255]` to
@@ -3071,7 +3071,7 @@ fn blend_pixel(buffer: &mut [u8], idx: usize, c: Rgba) {
     buffer[idx + 3] = ((out_a_numerator + 127) / 255) as u8;
 }
 
-// (Affine moved to crate::transform РІР‚вЂќ shared with the editor / player
+// (Affine moved to crate::transform — shared with the editor / player
 // renderers so q0rg parent transforms compose identically across all
 // three rasterise/draw paths.)
 

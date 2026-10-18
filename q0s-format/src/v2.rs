@@ -1,4 +1,4 @@
-//! .q1s format v2/v3 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ vector shapes + recursive q0rg (MovieClip) symbols.
+//! .q1s format v2/v3 — vector shapes + recursive q0rg (MovieClip) symbols.
 //!
 //! Binary layout (little-endian):
 //!
@@ -20,8 +20,8 @@
 //!     [2]   q0rg_id, [2+N] name, [2] frame_count, [2+N] script, [2] layer_count
 //!     layers[layer_count]: [2] layer_id, [2+N] name, [2] placement_count,
 //!       placements[]: [2] frame, [1] target_kind, [2] target_id,
-//!         v2: transform [20]: tx ty sx sy rot (5 Р В РІР‚СљР Р†Р вЂљРІР‚Сњ f32)
-//!         v3+: transform [28]: tx ty sx sy rot skew_x skew_y (7 Р В РІР‚СљР Р†Р вЂљРІР‚Сњ f32)
+//!         v2: transform [20]: tx ty sx sy rot (5 × f32)
+//!         v3+: transform [28]: tx ty sx sy rot skew_x skew_y (7 × f32)
 //!         tween: [1] kind (0=none, 1=linear, 2=eased, 3=shape), [2 if motion] to_frame,
 //!           v8 eased: [1] easing kind + payload
 //!           v39 shape: [1] easing kind + payload
@@ -211,7 +211,7 @@ pub struct Stroke {
     pub width: f32,
     /// Cap shape applied to open paths' endpoints. On-disk the field is
     /// optional (legacy strokes default to `Round`) so old files still
-    /// load Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ see the `flag == 1` vs `flag == 2` branches in the
+    /// load — see the `flag == 1` vs `flag == 2` branches in the
     /// parser/writer.
     pub cap: crate::geom::CapShape,
 }
@@ -6789,7 +6789,7 @@ fn parse_asset(
             };
             let stroke = match c.read_u8()? {
                 0 => None,
-                // Legacy (pre-cap) stroke Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ implicit round cap.
+                // Legacy (pre-cap) stroke — implicit round cap.
                 1 => {
                     let bytes = c.read_exact(4)?;
                     let color = Rgba {

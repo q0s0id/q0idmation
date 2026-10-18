@@ -496,7 +496,7 @@ fn v2_rejects_q0rg_self_reference() {
 #[test]
 fn v2_detects_q0rg_cycle() {
     let mut project = sample_v2_project();
-    // q0rg 2 references q0rg 1, while q0rg 1 already references 2 РІвЂ вЂ™ cycle.
+    // q0rg 2 references q0rg 1, while q0rg 1 already references 2 → cycle.
     project.q0rgs[1].layers[0].push_placement(Placement {
         instance_id: 0,
         frame: 0,

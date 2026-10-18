@@ -1,9 +1,9 @@
-//! `.q0s` v2 Р Р†Р вЂљРІР‚Сњ vector player format.
+//! `.q0s` v2 — vector player format.
 //!
 //! Same on-disk shape as the corresponding `.q1s` project body, but with
 //! `Q0S\0` magic and independent player-format versions. Lets the editor ship
 //! that q0player can play frame-by-frame using the shared software
-//! rasteriser, with vector data and q0rg transforms intact Р Р†Р вЂљРІР‚Сњ no pre-baked
+//! rasteriser, with vector data and q0rg transforms intact — no pre-baked
 //! bitmaps, dramatically smaller than the snapshot-style v1 output and
 //! resolution-independent on playback.
 //!
@@ -1039,7 +1039,7 @@ mod tests {
         let project = small_project();
         let bytes = write_q0s_v2(&project).expect("write");
         assert!(is_q0s_v2(&bytes));
-        // Patch magic to legacy Q1S Р Р†Р вЂљРІР‚Сњ should no longer be flagged.
+        // Patch magic to legacy Q1S — should no longer be flagged.
         let mut tampered = bytes.clone();
         tampered[0..4].copy_from_slice(&Q1S_V2_MAGIC);
         assert!(!is_q0s_v2(&tampered));

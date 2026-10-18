@@ -1,10 +1,10 @@
 //! Export a `ProjectV2` to the `.q0s` player format.
 //!
 //! The player format is a versioned wrapper:
-//!   * **v1** вЂ” legacy bitmap-only `Movie` (one bitmap per frame). Big
+//!   * **v1** — legacy bitmap-only `Movie` (one bitmap per frame). Big
 //!     and pixelated; we no longer write it. Old files still play
 //!     because q0player's loader recognises the v1 magic+version.
-//!   * **v2** вЂ” full vector data: assets (vector paths + bitmaps), q0rg
+//!   * **v2** — full vector data: assets (vector paths + bitmaps), q0rg
 //!     hierarchy, transforms, tweens. Same on-disk layout as `.q1s` but
 //!     with `Q0S\0` magic. q0player rasterises each frame at playback
 //!     time via the shared software rasteriser, so the file stays small
@@ -500,7 +500,7 @@ mod tests {
     fn export_v2_is_dramatically_smaller_than_a_bitmap_snapshot_would_be() {
         // Sanity: vector .q0s should be tiny compared to even a single
         // pre-baked frame bitmap (stage_w*stage_h*4 = 16384 bytes for
-        // 64Г—64). One asset + one placement is well under 200 bytes.
+        // 64×64). One asset + one placement is well under 200 bytes.
         let project = one_red_square_project();
         let bytes = export_to_q0s_bytes(&project).expect("export");
         let bitmap_per_frame = (64 * 64 * 4) as usize;

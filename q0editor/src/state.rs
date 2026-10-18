@@ -1302,7 +1302,7 @@ impl Session {
     }
 
     /// Make sure cached selectors still point at valid model state. Called after
-    /// undo/redo Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the project might have lost q0rgs, layers, placements etc.
+    /// undo/redo — the project might have lost q0rgs, layers, placements etc.
     /// Reconcile transient selection across a project-history boundary.
     ///
     /// History stores `ProjectV2` and transform-pivot metadata. Path and placement
@@ -2434,7 +2434,7 @@ impl History {
 
     /// Record the project's CURRENT state as the "before" of the upcoming change.
     /// Clears any redo branch (standard undo semantics). Skips pushing if the
-    /// current state already matches the top of the stack Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ this lets callers
+    /// current state already matches the top of the stack — this lets callers
     /// safely snapshot on every `.changed()` from a DragValue without bloating
     /// the stack with duplicates of the same intermediate value.
     pub fn snapshot(&mut self, current: &ProjectV2) {

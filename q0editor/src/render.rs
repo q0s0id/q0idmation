@@ -5872,7 +5872,7 @@ pub(crate) fn render_stage_with_revision(
 }
 
 /// Same as `render_stage` but every emitted shape's RGBA is multiplied by
-/// `tint` (per-channel Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р РЋРЎв„ўР В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р вЂ Р В РІР‚С™Р РЋРЎС™ tint / 255). Used for onion-skin renders: pass a
+/// `tint` (per-channel × tint / 255). Used for onion-skin renders: pass a
 /// low-alpha bluish/orangeish Color32 to dim and colour-cast historical /
 /// upcoming frames.
 #[allow(clippy::too_many_arguments)]
@@ -6053,7 +6053,7 @@ fn render_q0rg_with_vector_batch(
                 .as_ref()
                 .and_then(|pose| pose.binding_transform(placement.instance_id))
                 .unwrap_or_else(|| Affine::from_transform(resolved.interp));
-            // Affine matrix composition Р В Р’В Р вЂ™Р’В Р В Р’В Р Р†Р вЂљР’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р РЋРІвЂћСћР В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р РЋРЎв„ў propagates parent skew and
+            // Affine matrix composition — propagates parent skew and
             // non-uniform scale through to children, which the old
             // `compose(Transform2D, Transform2D)` discarded.
             let composed = Affine::compose(parent, local_affine);
@@ -6376,7 +6376,7 @@ struct Resolved<'a> {
     playback_start_frame: u16,
     interp: Transform2D,
     fx: PlacementFx,
-    /// Index of the active placement within `layer.placements` Р В Р’В Р вЂ™Р’В Р В Р’В Р Р†Р вЂљР’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р РЋРІвЂћСћР В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р РЋРЎв„ў exposed so
+    /// Index of the active placement within `layer.placements` — exposed so
     /// `active_placements_at` can hand callers a stable reference.
     index: usize,
 }
@@ -6849,7 +6849,7 @@ fn render_asset_color(
             #[cfg(not(feature = "appearance-mask-eraser"))]
             let _ = appearance;
             // Multiply the on-disk stroke width by the composed area
-            // scale so a 2Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р РЋРЎв„ўР В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р вЂ Р В РІР‚С™Р РЋРЎС™ scaled q0rg actually renders 2Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р РЋРЎв„ўР В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р вЂ Р В РІР‚С™Р РЋРЎС™-thick
+            // scale so a 2× scaled q0rg actually renders 2×-thick
             // outlines. Otherwise stroked vectors look comically thin
             // when shrunk and thin-as-paper when blown up.
             let parent_scale =
@@ -8006,7 +8006,7 @@ fn triangulate_polygon(points: &[Pos2]) -> Option<Vec<u32>> {
         return None;
     }
 
-    // Flattened BР В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р РЋРЎв„ўР В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В©ziers contain many collinear samples, and a closed path can
+    // Flattened Béziers contain many collinear samples, and a closed path can
     // repeat its first point at the end. Strip both forms of zero-area vertex
     // before ear clipping.
     let mut remaining: Vec<usize> = Vec::with_capacity(points.len());
@@ -8131,7 +8131,7 @@ fn point_in_triangle(p: Pos2, a: Pos2, b: Pos2, c: Pos2, ccw: bool) -> bool {
     }
 }
 
-/// Per-channel Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р РЋРЎв„ўР В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р вЂ Р В РІР‚С™Р РЋРЎС™ tint / 255. Result keeps tint==WHITE as identity (so the
+/// Per-channel × tint / 255. Result keeps tint==WHITE as identity (so the
 /// non-onion render path is byte-identical to before).
 fn modulate(c: Color32, tint: Color32) -> Color32 {
     if tint == Color32::WHITE {
@@ -8144,7 +8144,7 @@ fn modulate(c: Color32, tint: Color32) -> Color32 {
     Color32::from_rgba_unmultiplied(r, g, b, a)
 }
 
-/// Local-space AABB of a placement's *content* Р В Р’В Р вЂ™Р’В Р В Р’В Р Р†Р вЂљР’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р РЋРІвЂћСћР В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р РЋРЎв„ў i.e. the bounds of the
+/// Local-space AABB of a placement's *content* — i.e. the bounds of the
 /// asset/q0rg before the placement's own transform is applied.  Used by the
 /// transform tool to compute resize handles relative to the untransformed
 /// shape.
@@ -8486,7 +8486,7 @@ fn placement_bbox_at_depth(
         max_y = max_y.max(w.y);
     }
     if stroke_pad > 0.0 {
-        // Inflate by half the stroke width Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р РЋРЎв„ўР В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р вЂ Р В РІР‚С™Р РЋРЎС™ placement's area scale so
+        // Inflate by half the stroke width × placement's area scale so
         // the draggable rect tracks the rendered stroke under any
         // affine transform.
         let pad = stroke_pad * aff.uniform_scale();
