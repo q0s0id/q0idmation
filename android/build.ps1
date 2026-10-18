@@ -139,6 +139,12 @@ try {
     if ($Mode -ne "check") {
         Push-Location $AndroidDir
         try {
+            # Gradle repackages an existing APK in place, and the space of the
+            # replaced native library stays behind, so the file would grow by
+            # one library per build. Starting over keeps it compact.
+            foreach ($target in $Apps) {
+                Remove-Item -LiteralPath $target.Apk -ErrorAction SilentlyContinue
+            }
             $tasks = @($Apps | ForEach-Object { ":$($_.Module):assembleDebug" })
             Invoke-Tool "packaging the apks" (Join-Path $AndroidDir "gradlew.bat") (
                 $tasks + @("--console=plain", "--quiet")

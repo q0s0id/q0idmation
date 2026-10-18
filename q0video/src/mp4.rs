@@ -1,13 +1,21 @@
-//! Windows Media Foundation H.264/MP4 encoder.
+//! H.264/MP4 output: the frame spec and NV12 conversion every platform's
+//! encoder shares, and the Windows Media Foundation encoder.
 
+#[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
 use std::path::Path;
+#[cfg(windows)]
 use std::ptr;
 
+#[cfg(windows)]
 use windows::core::PCWSTR;
+#[cfg(windows)]
 use windows::Win32::Media::MediaFoundation::*;
+#[cfg(windows)]
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
+#[cfg(windows)]
 use crate::q0v::MEDIA_TICKS_PER_SECOND;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,11 +44,13 @@ impl Mp4Spec {
     }
 }
 
+#[cfg(windows)]
 struct MediaFoundationSession {
     com_initialized: bool,
     mf_started: bool,
 }
 
+#[cfg(windows)]
 impl MediaFoundationSession {
     fn start() -> Result<Self, String> {
         unsafe {
@@ -59,6 +69,7 @@ impl MediaFoundationSession {
     }
 }
 
+#[cfg(windows)]
 impl Drop for MediaFoundationSession {
     fn drop(&mut self) {
         unsafe {
@@ -72,6 +83,7 @@ impl Drop for MediaFoundationSession {
     }
 }
 
+#[cfg(windows)]
 pub struct Mp4Encoder {
     writer: IMFSinkWriter,
     stream_index: u32,
@@ -81,6 +93,7 @@ pub struct Mp4Encoder {
     _session: MediaFoundationSession,
 }
 
+#[cfg(windows)]
 impl Mp4Encoder {
     pub fn create(path: &Path, spec: Mp4Spec) -> Result<Self, String> {
         spec.validate()?;
@@ -257,6 +270,7 @@ impl Mp4Encoder {
     }
 }
 
+#[cfg(windows)]
 impl Drop for Mp4Encoder {
     fn drop(&mut self) {
         if !self.finalized {
@@ -314,6 +328,7 @@ fn clamp_u8(value: i32) -> u8 {
     value.clamp(0, 255) as u8
 }
 
+#[cfg(windows)]
 const fn pack_ratio(numerator: u32, denominator: u32) -> u64 {
     ((numerator as u64) << 32) | denominator as u64
 }
@@ -348,6 +363,7 @@ mod tests {
         .is_err());
     }
 
+    #[cfg(windows)]
     #[test]
     fn media_foundation_writes_a_real_mp4() {
         let nonce = std::time::SystemTime::now()

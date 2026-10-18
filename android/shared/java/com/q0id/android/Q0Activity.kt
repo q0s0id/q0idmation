@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
 import android.os.Process
+import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -48,6 +49,7 @@ abstract class Q0Activity : GameActivity() {
 
         private const val REQUEST_OPEN = 0x0501
         private const val REQUEST_CREATE = 0x0502
+        private const val REQUEST_FOLDER = 0x0503
     }
 
     private val surfaceOrigin = IntArray(2)
@@ -63,11 +65,24 @@ abstract class Q0Activity : GameActivity() {
 
     private var pickTag = EXTERNAL
     private var createdFor: String? = null
+    private var folderFor: String? = null
 
     private external fun nativeDocumentOpened(tag: Int, path: String)
     private external fun nativeDocumentFailed(tag: Int, message: String)
     private external fun nativeStatus(message: String)
     private external fun nativeBack()
+
+    /**
+     * Whether the surface stays clear of the camera cutout. Off, it runs to
+     * the edge of the display and the cutout covers a little of it.
+     */
+    protected open val clearsCutout: Boolean = true
+
+    /**
+     * Whether the status and navigation bars stay hidden, coming back for a
+     * moment when swiped in from the edge.
+     */
+    protected open val hidesSystemBars: Boolean = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -76,25 +91,41 @@ abstract class Q0Activity : GameActivity() {
         // native surface clear of what would hide or swallow touches: the
         // status bar, a button navigation bar and the camera cutout. Gesture
         // navigation only draws a handle, so the surface runs on underneath it.
+        // Hidden bars take no room, so they leave no padding either.
         //
         // The keyboard is reported rather than padded for: resizing the
         // surface every time it opens would rescale the whole interface.
         WindowCompat.setDecorFitsSystemWindows(window, false)
         val content = mSurfaceView.parent as ViewGroup
         ViewCompat.setOnApplyWindowInsetsListener(content) { view, insets ->
-            val clear = insets.getInsets(
-                WindowInsetsCompat.Type.tappableElement() or
-                    WindowInsetsCompat.Type.displayCutout()
-            )
+            val avoided = if (clearsCutout) {
+                WindowInsetsCompat.Type.tappableElement() or WindowInsetsCompat.Type.displayCutout()
+            } else {
+                WindowInsetsCompat.Type.tappableElement()
+            }
+            val clear = insets.getInsets(avoided)
             view.setPadding(clear.left, clear.top, clear.right, clear.bottom)
             val keyboard = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom - clear.bottom
             onKeyboardCovers(keyboard.coerceAtLeast(0))
             insets
         }
 
+        if (hidesSystemBars) {
+            immersive(true)
+        }
+
         // A recreated activity would see its launch intent a second time.
         if (savedInstanceState == null) {
             receive(intent)
+        }
+    }
+
+    // Some devices bring the bars back after a picker or another app was in
+    // front, so they are hidden again whenever the window returns.
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && hidesSystemBars) {
+            immersive(true)
         }
     }
 
@@ -181,22 +212,34 @@ abstract class Q0Activity : GameActivity() {
     }
 
     /**
-     * Native side: an export finished at [path]. Its copy goes where one was
-     * chosen for it, or the person is asked where now; a file left inside the
-     * app would be out of everyone's reach.
+     * Native side: an export finished at [path], inside the app where nobody
+     * else can reach it. The person chooses where its copy goes, every time:
+     * an earlier export under the same name is no reason to overwrite.
      */
     @Suppress("unused")
     fun exportFinished(path: String, mimeType: String) {
         files.execute {
             written.add(path)
-            val document = linkOf(path)
-            if (document != null) {
-                copyOut(path, document)
-            } else {
-                createDocument(path, mimeType)
+            unlink(path)
+            createDocument(path, mimeType)
+        }
+    }
+
+    /** Native side: an export of several files finished in the folder at [path]. */
+    @Suppress("unused")
+    fun exportFolderFinished(path: String) {
+        runOnUiThread {
+            folderFor = path
+            start(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), REQUEST_FOLDER) {
+                nativeStatus("this device has no folder picker; the frames stay inside the app")
             }
         }
     }
+
+    /** Native side: an MP4 writer for an export, see [Mp4Encoder]. */
+    @Suppress("unused")
+    fun createMp4Encoder(path: String, width: Int, height: Int, fps: Int, bitrate: Int): Any =
+        Mp4Encoder(path, width, height, fps, bitrate)
 
     /** Native side: plays a snapshot in q0player. [path] must be in cache/preview. */
     @Suppress("unused")
@@ -261,6 +304,15 @@ abstract class Q0Activity : GameActivity() {
                 } else {
                     keepAccess(document, data!!.flags)
                     files.execute { open(tag, document) }
+                }
+            }
+            REQUEST_FOLDER -> {
+                val path = folderFor ?: return
+                folderFor = null
+                if (document == null) {
+                    nativeStatus("kept inside the app only")
+                } else {
+                    files.execute { copyFolderOut(File(path), document) }
                 }
             }
             REQUEST_CREATE -> {
@@ -373,6 +425,36 @@ abstract class Q0Activity : GameActivity() {
                 "saved inside the app, but ${displayName(document)} could not be updated: " +
                     describe(error)
             )
+        }
+    }
+
+    /**
+     * Copies the files in [folder] into a new folder of the same name inside
+     * the [tree] the person picked. Runs on [files].
+     */
+    private fun copyFolderOut(folder: File, tree: Uri) {
+        try {
+            val parent = DocumentsContract.buildDocumentUriUsingTree(
+                tree,
+                DocumentsContract.getTreeDocumentId(tree)
+            )
+            val target = DocumentsContract.createDocument(
+                contentResolver,
+                parent,
+                DocumentsContract.Document.MIME_TYPE_DIR,
+                folder.name
+            ) ?: throw IOException("could not create the folder ${folder.name}")
+            val members = folder.listFiles().orEmpty().filter { it.isFile }.sortedBy { it.name }
+            for (member in members) {
+                val mimeType = MimeTypeMap.getSingleton().getMimeTypeFromExtension(member.extension)
+                    ?: "application/octet-stream"
+                val copy = DocumentsContract.createDocument(contentResolver, target, mimeType, member.name)
+                    ?: throw IOException("could not create ${member.name}")
+                openTruncated(copy).use { sink -> member.inputStream().use { it.copyTo(sink) } }
+            }
+            nativeStatus("saved ${members.size} files to ${folder.name}")
+        } catch (error: Exception) {
+            nativeStatus("could not save ${folder.name}: ${describe(error)}")
         }
     }
 

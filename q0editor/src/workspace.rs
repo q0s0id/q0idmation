@@ -477,6 +477,21 @@ impl TabViewer for Viewer<'_> {
     fn scroll_bars(&self, _: &Panel) -> [bool; 2] {
         [false, false]
     }
+    /// The canvas gets every pixel of its panel, and the tool column nearly so.
+    fn tab_style_override(
+        &self,
+        tab: &Panel,
+        global_style: &egui_dock::TabStyle,
+    ) -> Option<egui_dock::TabStyle> {
+        let margin = match tab {
+            Panel::Stage => 0.0,
+            Panel::Tools => 2.0,
+            _ => return None,
+        };
+        let mut style = global_style.clone();
+        style.tab_body.inner_margin = egui::Margin::same(margin);
+        Some(style)
+    }
     fn on_tab_button(&mut self, panel: &mut Panel, response: &egui::Response) {
         response.clone().on_hover_text("Drag to a dock target to split or make tabs. Drop away from a target to float. Right-click for panel options.");
         if response.dragged() || response.drag_stopped() {
@@ -562,9 +577,14 @@ pub(crate) fn render(app: &mut EditorApp, ctx: &Context) {
             let mut style = egui_dock::Style::from_egui(ui.style());
             style.dock_area_padding = Some(egui::Margin::ZERO);
             style.tab_bar.height = 26.0;
-            style.tab.tab_body.inner_margin = egui::Margin::same(6.0);
-            style.separator.width = 4.0;
-            style.separator.extra_interact_width = 4.0;
+            style.tab.tab_body.inner_margin = egui::Margin::same(3.0);
+            // A thin line between panels, still easy to grab.
+            style.separator.width = 2.0;
+            style.separator.extra_interact_width = 8.0;
+            // How narrow a docked panel may get. egui_dock's own 175 kept the
+            // tool column from ever shrinking to one button per row, and
+            // snapped it back wider whenever it was dragged.
+            style.separator.extra = 40.0;
             style.tab.minimum_width = Some(24.0);
             style.overlay.selection_color =
                 app.settings.theme.accent.to_color32().linear_multiply(0.35);

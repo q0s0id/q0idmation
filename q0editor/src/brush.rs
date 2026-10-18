@@ -975,13 +975,28 @@ fn signed_ring_area(ring: &LineString<f64>) -> f64 {
         * 0.5
 }
 
+/// Fill rings smaller than this, in square stage pixels, are crumbs that
+/// boolean operations leave along nearly shared edges: a tenth of a pixel
+/// square or less, invisible at any zoom. Kept, each one costs a full union
+/// in every later selection, bucket fill and merge of its drawing.
+pub(crate) const SPECK_AREA: f64 = 0.01;
+
+/// Whether `ring` encloses too little to be seen.
+pub(crate) fn is_speck(ring: &LineString<f64>) -> bool {
+    signed_ring_area(ring).abs() <= SPECK_AREA
+}
+
 pub fn coverage_to_paths(coverage: &MultiPolygon<f64>) -> Vec<VPath> {
     let mut paths = Vec::new();
     for polygon in &coverage.0 {
+        // A speck's holes are smaller still.
+        if is_speck(polygon.exterior()) {
+            continue;
+        }
         if let Some(path) = ring_to_path(polygon.exterior()) {
             paths.push(path);
         }
-        for hole in polygon.interiors() {
+        for hole in polygon.interiors().iter().filter(|hole| !is_speck(hole)) {
             if let Some(path) = ring_to_path(hole) {
                 paths.push(path);
             }
@@ -2868,7 +2883,7 @@ fn canonical_vector_fill_topology(vector: &VectorAsset) -> Option<VectorFillTopo
     {
         let polygon = path_to_polygon(path)?;
         let area = signed_ring_area(polygon.exterior());
-        if area.abs() <= 1.0e-8 {
+        if area.abs() <= SPECK_AREA {
             continue;
         }
         let bounds = polygon.bounding_rect()?;
@@ -2989,7 +3004,7 @@ fn vector_fill_geometry_boolean(vector: &VectorAsset) -> MultiPolygon<f64> {
         .filter_map(|path| {
             let polygon = path_to_polygon(path)?;
             let area = signed_ring_area(polygon.exterior());
-            (area.abs() > 1.0e-8).then_some((polygon, area))
+            (area.abs() > SPECK_AREA).then_some((polygon, area))
         })
         .collect();
     rings.sort_by(|left, right| right.1.abs().total_cmp(&left.1.abs()));
@@ -5745,5 +5760,78 @@ mod tests {
             .assets
             .iter()
             .any(|asset| asset.id() == original_asset_id));
+    }
+
+    /// Crumbs like the ones bucket fills used to leave along nearly shared
+    /// edges: each a few thousandths of a pixel wide.
+    fn crumb(x: f32, y: f32) -> VPath {
+        VPath {
+            anchors: [
+                Vec2::new(x, y),
+                Vec2::new(x + 0.001, y + 0.03),
+                Vec2::new(x + 0.0005, y + 0.05),
+            ]
+            .into_iter()
+            .map(|point| Anchor {
+                point,
+                in_handle: None,
+                out_handle: None,
+            })
+            .collect(),
+            closed: true,
+        }
+    }
+
+    #[test]
+    fn boolean_crumbs_are_left_out_of_fill_geometry() {
+        let mut paths = vec![square_path(0.0, 0.0, 20.0, 20.0)];
+        // Apart from the square, where each would count as a piece of its own.
+        paths.extend((0..200).map(|step| crumb(25.0, step as f32 * 0.1)));
+        let vector = VectorAsset {
+            asset_id: 1,
+            paths,
+            fill: Some(Rgba {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255,
+            }),
+            stroke: None,
+        };
+
+        let surface = vector_fill_geometry(&vector);
+        assert_eq!(surface.0.len(), 1, "the square alone, without 200 crumbs");
+        assert!((surface.unsigned_area() - 400.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn boolean_results_drop_their_crumbs_when_they_become_paths() {
+        let polygon = |path: &VPath| path_to_polygon(path).expect("polygon");
+        let square = polygon(&square_path(0.0, 0.0, 20.0, 20.0));
+        let with_crumbs = MultiPolygon(vec![
+            square.clone(),
+            polygon(&crumb(30.0, 5.0)),
+            polygon(&crumb(31.0, 5.0)),
+        ]);
+        assert_eq!(coverage_to_paths(&with_crumbs).len(), 1);
+        assert_eq!(
+            crate::tools::geo_multi_polygon_to_linear_paths(&with_crumbs).len(),
+            1
+        );
+        // A real hole survives; a crumb of a hole does not.
+        let holed = MultiPolygon(vec![Polygon::new(
+            square.exterior().clone(),
+            vec![
+                polygon(&square_path(5.0, 5.0, 10.0, 10.0))
+                    .exterior()
+                    .clone(),
+                polygon(&crumb(15.0, 15.0)).exterior().clone(),
+            ],
+        )]);
+        assert_eq!(coverage_to_paths(&holed).len(), 2);
+        assert_eq!(
+            crate::tools::geo_multi_polygon_to_linear_paths(&holed).len(),
+            2
+        );
     }
 }

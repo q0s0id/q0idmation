@@ -2535,10 +2535,19 @@ pub(crate) fn geo_multi_polygon_to_linear_paths(geometry: &MultiPolygon<f64>) ->
 
     let mut paths = Vec::new();
     for polygon in &geometry.0 {
+        // Boolean results also leave invisible crumbs along nearly shared
+        // edges; a speck's holes are smaller still.
+        if crate::brush::is_speck(polygon.exterior()) {
+            continue;
+        }
         if let Some(path) = ring_path(polygon.exterior()) {
             paths.push(path);
         }
-        for hole in polygon.interiors() {
+        for hole in polygon
+            .interiors()
+            .iter()
+            .filter(|hole| !crate::brush::is_speck(hole))
+        {
             if let Some(path) = ring_path(hole) {
                 paths.push(path);
             }
@@ -9371,6 +9380,133 @@ fn clear_live_raw_stroke_scale(app: &mut EditorApp, refs: &[PathRef]) {
     }
 }
 
+/// Moves every anchor and handle of `vector` through `affine`.
+fn bake_affine_into_vector(vector: &mut VectorAsset, affine: Affine) {
+    for path in &mut vector.paths {
+        for anchor in &mut path.anchors {
+            anchor.point = affine.apply(anchor.point);
+            if let Some(point) = &mut anchor.in_handle {
+                *point = affine.apply(*point);
+            }
+            if let Some(point) = &mut anchor.out_handle {
+                *point = affine.apply(*point);
+            }
+        }
+    }
+}
+
+/// A raw placement a drag holds, as found before keyframes are inserted.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HeldRaw {
+    layer_id: u16,
+    frame: u16,
+    asset_id: u16,
+}
+
+/// The raw placements of `q0rg_id` that `state` moves through a live offset.
+pub(crate) fn held_raw_placements(
+    project: &ProjectV2,
+    state: &ToolState,
+    q0rg_id: u16,
+) -> Vec<HeldRaw> {
+    let Some(refs) = live_raw_transform_refs(state) else {
+        return Vec::new();
+    };
+    let mut held: Vec<HeldRaw> = Vec::new();
+    for reference in refs.iter().filter(|reference| reference.q0rg_id == q0rg_id) {
+        let Some(placement) = project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+            .and_then(|q0rg| {
+                q0rg.layers
+                    .iter()
+                    .find(|layer| layer.layer_id == reference.layer_id)
+            })
+            .and_then(|layer| layer.placements.get(reference.placement_idx))
+        else {
+            continue;
+        };
+        let Target::Asset(asset_id) = placement.target else {
+            continue;
+        };
+        let raw = HeldRaw {
+            layer_id: reference.layer_id,
+            frame: placement.frame,
+            asset_id,
+        };
+        if !held
+            .iter()
+            .any(|other| other.layer_id == raw.layer_id && other.asset_id == raw.asset_id)
+        {
+            held.push(raw);
+        }
+    }
+    held
+}
+
+/// Freezes the pose a keyframe insertion leaves behind mid-drag: the
+/// placement of `held` on its original frame gets its own copy of the shapes
+/// with the live offset baked in, as releasing the drag would have done. The
+/// original shapes stay with the new key's copy, which the drag carries on.
+pub(crate) fn freeze_raw_pose(app: &mut EditorApp, q0rg_id: u16, held: HeldRaw) -> bool {
+    let project = &mut app.state.project;
+    let Some(placement_idx) = project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+        .and_then(|q0rg| {
+            q0rg.layers
+                .iter()
+                .find(|layer| layer.layer_id == held.layer_id)
+        })
+        .and_then(|layer| {
+            layer.placements.iter().position(|placement| {
+                placement.frame == held.frame && placement.target == Target::Asset(held.asset_id)
+            })
+        })
+    else {
+        return false;
+    };
+    let Some(Asset::Vector(mut frozen)) = project
+        .assets
+        .iter()
+        .find(|asset| asset.id() == held.asset_id)
+        .cloned()
+    else {
+        return false;
+    };
+    let new_id = next_asset_id(project);
+    let Some(placement) = project
+        .q0rgs
+        .iter_mut()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+        .and_then(|q0rg| {
+            q0rg.layers
+                .iter_mut()
+                .find(|layer| layer.layer_id == held.layer_id)
+        })
+        .and_then(|layer| layer.placements.get_mut(placement_idx))
+    else {
+        return false;
+    };
+    let affine = Affine::from_transform(placement.transform);
+    placement.target = Target::Asset(new_id);
+    placement.transform = Transform2D::IDENTITY;
+    frozen.asset_id = new_id;
+    bake_affine_into_vector(&mut frozen, affine);
+    project.assets.push(Asset::Vector(frozen));
+    #[cfg(feature = "appearance-mask-eraser")]
+    {
+        crate::appearance::clone_asset_appearance(project, held.asset_id, new_id);
+        if let Some(appearance) = project.asset_appearances.get_mut(&new_id) {
+            appearance.field_transform = Affine::compose(affine, appearance.field_transform);
+        }
+    }
+    app.textures.invalidate_asset(new_id);
+    true
+}
+
 fn bake_raw_refs_live_transform(app: &mut EditorApp, refs: &[PathRef]) -> bool {
     clear_live_raw_stroke_scale(app, refs);
     let unique: std::collections::BTreeSet<(u16, u16, usize)> = refs
@@ -9411,17 +9547,7 @@ fn bake_raw_refs_live_transform(app: &mut EditorApp, refs: &[PathRef]) -> bool {
             .iter_mut()
             .find(|asset| asset.id() == asset_id)
         {
-            for path in &mut vector.paths {
-                for anchor in &mut path.anchors {
-                    anchor.point = affine.apply(anchor.point);
-                    if let Some(point) = &mut anchor.in_handle {
-                        *point = affine.apply(*point);
-                    }
-                    if let Some(point) = &mut anchor.out_handle {
-                        *point = affine.apply(*point);
-                    }
-                }
-            }
+            bake_affine_into_vector(vector, affine);
             changed = true;
         }
         #[cfg(feature = "appearance-mask-eraser")]
@@ -26703,5 +26829,208 @@ mod tests {
         app.queue(crate::app::Action::Undo);
         app.flush_pending_actions();
         assert_eq!(keys(&app), [0], "one undo takes back the whole recording");
+    }
+
+    /// The stage panel exactly as the editor runs it, driven by pointer
+    /// events in screen space.
+    struct StageHarness {
+        ctx: Context,
+        time: f64,
+        /// The stage point under screen (200, 200), and screen points per
+        /// stage unit.
+        anchor: Vec2,
+        scale: f32,
+    }
+
+    impl StageHarness {
+        fn new(app: &mut EditorApp) -> Self {
+            let mut harness = Self {
+                ctx: Context::default(),
+                time: 0.0,
+                anchor: Vec2::new(0.0, 0.0),
+                scale: 1.0,
+            };
+            // Learn where stage points land from the hover readout.
+            harness.frame(app, vec![egui::Event::PointerMoved(pos2(200.0, 200.0))]);
+            let a = app.session.stage_cursor.expect("stage cursor");
+            harness.frame(app, vec![egui::Event::PointerMoved(pos2(300.0, 200.0))]);
+            let b = app.session.stage_cursor.expect("stage cursor");
+            harness.anchor = a;
+            harness.scale = 100.0 / (b.x - a.x);
+            harness
+        }
+
+        fn screen(&self, x: f32, y: f32) -> Pos2 {
+            pos2(
+                200.0 + (x - self.anchor.x) * self.scale,
+                200.0 + (y - self.anchor.y) * self.scale,
+            )
+        }
+
+        fn frame(&mut self, app: &mut EditorApp, events: Vec<egui::Event>) {
+            self.time += 1.0 / 60.0;
+            let _ = self.ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        Pos2::ZERO,
+                        egui::vec2(400.0, 400.0),
+                    )),
+                    time: Some(self.time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        crate::panels::stage::render(app, ui);
+                    });
+                    app.flush_pending_actions();
+                },
+            );
+        }
+
+        fn press(&mut self, app: &mut EditorApp, x: f32, y: f32) {
+            let at = self.screen(x, y);
+            self.frame(
+                app,
+                vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+        }
+
+        fn drag_to(&mut self, app: &mut EditorApp, x: f32, y: f32) {
+            let at = self.screen(x, y);
+            self.frame(app, vec![egui::Event::PointerMoved(at)]);
+        }
+
+        fn release(&mut self, app: &mut EditorApp, x: f32, y: f32) {
+            let at = self.screen(x, y);
+            self.frame(
+                app,
+                vec![egui::Event::PointerButton {
+                    pos: at,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                }],
+            );
+        }
+    }
+
+    fn select_tool_app(project: ProjectV2) -> EditorApp {
+        let mut app = EditorApp::default();
+        app.state.project = project;
+        app.session.current_q0rg_id = 1;
+        app.session.current_layer_id = 1;
+        app.session.current_frame = 0;
+        app.session.current_tool = crate::state::Tool::Select;
+        app
+    }
+
+    /// F6 mid-drag on a symbol, through the whole stage as the editor runs it.
+    #[test]
+    fn f6_mid_drag_on_the_stage_keeps_the_object_following_the_pointer() {
+        let mut app = select_tool_app(project_with_held_display_object());
+        let mut stage = StageHarness::new(&mut app);
+        let pose_at = |app: &EditorApp, key: u16| {
+            app.state.project.q0rgs[0].layers[0]
+                .placements
+                .iter()
+                .find(|placement| placement.frame == key)
+                .map(|placement| placement.transform.tx)
+        };
+
+        stage.press(&mut app, 10.0, 10.0);
+        for x in [14.0, 20.0, 30.0] {
+            stage.drag_to(&mut app, x, 10.0);
+        }
+        let before = pose_at(&app, 0).expect("frame 0 key");
+        assert!(before > 15.0, "the drag moved the symbol: {before}");
+
+        app.queue(crate::app::Action::InsertKeyframe);
+        stage.frame(&mut app, vec![]);
+        assert_eq!(app.session.current_frame, 1);
+        for x in [34.0, 40.0, 50.0] {
+            stage.drag_to(&mut app, x, 10.0);
+        }
+        stage.release(&mut app, 50.0, 10.0);
+
+        let after = pose_at(&app, 1).expect("frame 1 key");
+        assert!(
+            after > before + 15.0,
+            "the new key follows: {before} -> {after}"
+        );
+        assert_eq!(pose_at(&app, 0), Some(before), "the first pose stays");
+    }
+
+    /// F6 mid-drag on raw graphics keeps them raw graphics on both keys.
+    #[test]
+    fn f6_mid_drag_keys_raw_graphics_without_turning_them_into_an_object() {
+        let mut project = project_with_held_display_object();
+        // The square itself on the scene, not inside a symbol.
+        project.q0rgs[0].layers[0].placements[0].target = Target::Asset(1);
+        let mut app = select_tool_app(project);
+        let mut stage = StageHarness::new(&mut app);
+
+        stage.press(&mut app, 10.0, 10.0);
+        for x in [14.0, 20.0, 30.0] {
+            stage.drag_to(&mut app, x, 10.0);
+        }
+        app.queue(crate::app::Action::InsertKeyframe);
+        stage.frame(&mut app, vec![]);
+        assert_eq!(app.session.current_frame, 1);
+        for x in [34.0, 40.0, 50.0] {
+            stage.drag_to(&mut app, x, 10.0);
+        }
+        stage.release(&mut app, 50.0, 10.0);
+
+        let project = &app.state.project;
+        let layer = &project.q0rgs[0].layers[0];
+        let left_edge = |key: u16| {
+            let placement = layer
+                .placements
+                .iter()
+                .find(|placement| placement.frame == key)
+                .expect("keyframe");
+            assert_eq!(
+                placement.transform,
+                Transform2D::IDENTITY,
+                "frame {key} stays raw graphics, not an offset object"
+            );
+            let Target::Asset(asset_id) = placement.target else {
+                panic!("frame {key} turned into a symbol");
+            };
+            let Some(Asset::Vector(vector)) =
+                project.assets.iter().find(|asset| asset.id() == asset_id)
+            else {
+                panic!("frame {key} lost its shapes");
+            };
+            (
+                asset_id,
+                vector
+                    .paths
+                    .iter()
+                    .flat_map(|path| &path.anchors)
+                    .map(|anchor| anchor.point.x)
+                    .fold(f32::INFINITY, f32::min),
+            )
+        };
+        let (first_asset, first) = left_edge(0);
+        let (second_asset, second) = left_edge(1);
+        assert_ne!(first_asset, second_asset, "each key owns its shapes");
+        assert!(
+            (first - 20.0).abs() < 1.0,
+            "frame 0 kept the pose at F6: {first}"
+        );
+        assert!(
+            (second - 40.0).abs() < 1.0,
+            "frame 1 followed the drag: {second}"
+        );
     }
 }

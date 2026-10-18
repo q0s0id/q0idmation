@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use jni::objects::{JObject, JString, JValue};
+use jni::objects::{GlobalRef, JObject, JString, JValue};
 use jni::sys::{jint, jsize};
 use jni::{JNIEnv, JavaVM};
 
@@ -110,27 +110,60 @@ pub extern "system" fn Java_com_q0id_android_Q0Activity_nativeBack(
     push(Event::Back);
 }
 
-/// Runs `call` against the activity from the current thread.
+/// A failed call, described for the person who will read it.
+struct CallError(String);
+
+impl From<jni::errors::Error> for CallError {
+    fn from(error: jni::errors::Error) -> Self {
+        Self(error.to_string())
+    }
+}
+
+/// Runs `call` from the current thread, attaching it to the VM if needed.
 ///
 /// The native main thread never returns to Java, so nothing would ever free
 /// the local references a call creates; the local frame does that instead.
+/// A Java exception comes back as its own description.
+fn with_env<T>(call: impl FnOnce(&mut JNIEnv) -> jni::errors::Result<T>) -> Result<T, String> {
+    let context = ndk_context::android_context();
+    // SAFETY: android-activity sets the context up before `android_main` runs
+    // and keeps the VM alive until it ends.
+    let vm = unsafe { JavaVM::from_raw(context.vm().cast()) }.map_err(|e| e.to_string())?;
+    let mut env = vm
+        .attach_current_thread_permanently()
+        .map_err(|e| e.to_string())?;
+    env.with_local_frame(8, |env| -> Result<T, CallError> {
+        call(env).map_err(|error| match error {
+            jni::errors::Error::JavaException => CallError(take_exception(env)),
+            other => CallError(other.to_string()),
+        })
+    })
+    .map_err(|CallError(message)| message)
+}
+
+/// Clears the pending Java exception and says what it was.
+fn take_exception(env: &mut JNIEnv) -> String {
+    let Ok(throwable) = env.exception_occurred() else {
+        return "a java exception".to_string();
+    };
+    let _ = env.exception_clear();
+    let described = env
+        .call_method(&throwable, "toString", "()Ljava/lang/String;", &[])
+        .and_then(|value| value.l())
+        .and_then(|text| env.get_string(&JString::from(text)).map(String::from));
+    let _ = env.exception_clear();
+    described.unwrap_or_else(|_| "a java exception".to_string())
+}
+
+/// Runs `call` against the activity, as [`with_env`] does.
 fn with_activity<T>(
     call: impl FnOnce(&mut JNIEnv, &JObject) -> jni::errors::Result<T>,
 ) -> Result<T, String> {
     let context = ndk_context::android_context();
-    // SAFETY: android-activity sets the context up before `android_main` runs
-    // and keeps the VM and its reference to the activity alive until it ends.
-    let vm = unsafe { JavaVM::from_raw(context.vm().cast()) }.map_err(|e| e.to_string())?;
+    // SAFETY: android-activity keeps its reference to the activity alive
+    // until `android_main` returns.
     let activity = unsafe { JObject::from_raw(context.context().cast()) };
-    let mut env = vm
-        .attach_current_thread_permanently()
-        .map_err(|e| e.to_string())?;
-    let result = env.with_local_frame(8, |env| call(env, &activity));
-    if env.exception_check().unwrap_or(false) {
-        let _ = env.exception_describe();
-        let _ = env.exception_clear();
-    }
-    result.map_err(|error| error.to_string())
+    with_env(|env| call(env, &activity))
 }
 
 fn path_text(path: &Path) -> Result<&str, String> {
@@ -212,6 +245,108 @@ pub fn export_finished(path: &Path, mime_type: &str) -> Result<(), String> {
         )?;
         Ok(())
     })
+}
+
+/// Tells the activity that an export of several files finished in the
+/// folder at `path`. The person picks a folder to copy it into.
+pub fn export_folder_finished(path: &Path) -> Result<(), String> {
+    let path = path_text(path)?;
+    with_activity(|env, activity| {
+        let path = env.new_string(path)?;
+        env.call_method(
+            activity,
+            "exportFolderFinished",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(&path)],
+        )?;
+        Ok(())
+    })
+}
+
+/// An MP4 file written by the device's own H.264 encoder, one frame at a
+/// time. Dropping it before [`Mp4Encoder::finish`] abandons the file.
+pub struct Mp4Encoder {
+    writer: Option<GlobalRef>,
+    luma_bytes: usize,
+}
+
+impl Mp4Encoder {
+    pub fn create(
+        path: &Path,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate: u32,
+    ) -> Result<Self, String> {
+        let path = path_text(path)?;
+        let int = |value: u32| i32::try_from(value).map_err(|_| format!("{value} is too large"));
+        let arguments = [int(width)?, int(height)?, int(fps)?, int(bitrate)?];
+        let writer = with_activity(|env, activity| {
+            let path = env.new_string(path)?;
+            let writer = env
+                .call_method(
+                    activity,
+                    "createMp4Encoder",
+                    "(Ljava/lang/String;IIII)Ljava/lang/Object;",
+                    &[
+                        JValue::Object(&path),
+                        JValue::Int(arguments[0]),
+                        JValue::Int(arguments[1]),
+                        JValue::Int(arguments[2]),
+                        JValue::Int(arguments[3]),
+                    ],
+                )?
+                .l()?;
+            env.new_global_ref(writer)
+        })
+        .map_err(|error| format!("start the h.264 encoder: {error}"))?;
+        Ok(Self {
+            writer: Some(writer),
+            luma_bytes: width as usize * height as usize,
+        })
+    }
+
+    /// One frame as NV12: the luma plane, then interleaved U and V at half
+    /// resolution.
+    pub fn write_nv12_frame(&mut self, nv12: &[u8]) -> Result<(), String> {
+        let writer = self.writer.as_ref().ok_or("the mp4 writer is closed")?;
+        if nv12.len() != self.luma_bytes + self.luma_bytes / 2 {
+            return Err("the frame does not match the mp4 size".to_string());
+        }
+        let (luma, chroma) = nv12.split_at(self.luma_bytes);
+        with_env(|env| {
+            let luma = env.byte_array_from_slice(luma)?;
+            let chroma = env.byte_array_from_slice(chroma)?;
+            env.call_method(
+                writer,
+                "writeFrame",
+                "([B[B)V",
+                &[JValue::Object(&luma), JValue::Object(&chroma)],
+            )?;
+            Ok(())
+        })
+        .map_err(|error| format!("encode a frame: {error}"))
+    }
+
+    pub fn finish(mut self) -> Result<(), String> {
+        let writer = self.writer.take().ok_or("the mp4 writer is closed")?;
+        with_env(|env| {
+            env.call_method(&writer, "finish", "()V", &[])?;
+            Ok(())
+        })
+        .map_err(|error| format!("finish the mp4: {error}"))
+    }
+}
+
+impl Drop for Mp4Encoder {
+    fn drop(&mut self) {
+        if let Some(writer) = self.writer.take() {
+            let _ = with_env(|env| {
+                env.call_method(&writer, "abort", "()V", &[])?;
+                Ok(())
+            });
+        }
+    }
 }
 
 /// Hands the movie at `path` to q0player. It must sit in the app's cache

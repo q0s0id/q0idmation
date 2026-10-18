@@ -291,6 +291,7 @@ fn transport(app: &mut EditorApp, ui: &mut Ui) {
         {
             app.session.record_held = !recording;
         }
+        ui.separator();
         let key = sized_icon_button(
             ui,
             Icon::Keyframe,
@@ -300,6 +301,41 @@ fn transport(app: &mut EditorApp, ui: &mut Ui) {
         if key.clicked() || tapped_while_holding(app, ui, &key) {
             app.queue(Action::InsertKeyframe);
         }
+        for (icon, label, action) in [
+            (
+                Icon::BlankKeyframe,
+                "Insert blank keyframe",
+                Action::InsertBlankKeyframe,
+            ),
+            (Icon::Frame, "Insert frame", Action::InsertFrame),
+            (Icon::RemoveFrames, "Remove frame", Action::RemoveFrame),
+            (
+                Icon::Tween,
+                "Create motion tween",
+                Action::CreateMotionTween,
+            ),
+        ] {
+            if sized_icon_button(ui, icon, label, TRANSPORT_CONTROL_SIZE).clicked() {
+                app.queue(action);
+            }
+        }
+        ui.separator();
+        let onion = app.session.onion.enabled;
+        if sized_icon_toggle(
+            ui,
+            Icon::Onion,
+            "Onion skin: show neighbouring frames on the active layer",
+            onion,
+            TRANSPORT_CONTROL_SIZE,
+        )
+        .clicked()
+        {
+            app.session.onion.enabled = !onion;
+            if !onion {
+                crate::frame_edit::disable(app);
+            }
+        }
+        ui.separator();
         for (icon, label, action) in [
             (Icon::First, "First frame", Action::FirstFrame),
             (Icon::Previous, "Previous frame", Action::PreviousFrame),

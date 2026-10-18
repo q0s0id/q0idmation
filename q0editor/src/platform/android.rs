@@ -138,14 +138,43 @@ pub(super) fn file_written(path: &Path) {
     }
 }
 
-pub(super) fn export_finished(path: &Path) {
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or_default();
-    let mime_type = mime_type(extension).unwrap_or("application/octet-stream");
-    if let Err(error) = q0android::export_finished(path, mime_type) {
+pub(super) fn exports_dir() -> Option<PathBuf> {
+    Some(dirs::home_dir()?.join("exports"))
+}
+
+pub(super) fn export_finished(path: &Path, folder: bool) {
+    let result = if folder {
+        q0android::export_folder_finished(path)
+    } else {
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default();
+        let mime_type = mime_type(extension).unwrap_or("application/octet-stream");
+        q0android::export_finished(path, mime_type)
+    };
+    if let Err(error) = result {
         eprintln!("could not pass {} on: {error}", path.display());
+    }
+}
+
+/// The device's own H.264 encoder, shaped like the Media Foundation one q0enc
+/// uses on Windows.
+pub(crate) struct Mp4Encoder(q0android::Mp4Encoder);
+
+impl Mp4Encoder {
+    pub(crate) fn create(path: &Path, spec: q0video::mp4::Mp4Spec) -> Result<Self, String> {
+        spec.validate()?;
+        q0android::Mp4Encoder::create(path, spec.width, spec.height, spec.fps, spec.bitrate)
+            .map(Self)
+    }
+
+    pub(crate) fn write_nv12_frame(&mut self, nv12: &[u8]) -> Result<(), String> {
+        self.0.write_nv12_frame(nv12)
+    }
+
+    pub(crate) fn finish(self) -> Result<(), String> {
+        self.0.finish()
     }
 }
 

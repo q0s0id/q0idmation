@@ -4402,6 +4402,46 @@ fn media_hash(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
+/// Makes every video asset with the same bytes share one buffer, as loading
+/// a saved project does. Copies made while editing can each bring their own
+/// buffer of the same clip; sharing it keeps one copy in memory and lets
+/// players and editors decode each frame once for all of them. Returns how
+/// many buffers were merged away.
+pub fn share_identical_media(project: &mut ProjectV2) -> usize {
+    let mut contents: HashMap<(usize, u64), Vec<Arc<Vec<u8>>>> = HashMap::new();
+    let mut by_pointer: HashMap<usize, Arc<Vec<u8>>> = HashMap::new();
+    let mut merged = 0;
+    for asset in &mut project.assets {
+        let Asset::Q0v(video) = asset else {
+            continue;
+        };
+        let pointer = Arc::as_ptr(&video.bytes) as usize;
+        if let Some(shared) = by_pointer.get(&pointer) {
+            video.bytes = Arc::clone(shared);
+            continue;
+        }
+        let bucket = contents
+            .entry((video.bytes.len(), media_hash(&video.bytes)))
+            .or_default();
+        let shared = match bucket
+            .iter()
+            .find(|other| other.as_slice() == video.bytes.as_slice())
+        {
+            Some(original) => {
+                merged += 1;
+                Arc::clone(original)
+            }
+            None => {
+                bucket.push(Arc::clone(&video.bytes));
+                Arc::clone(&video.bytes)
+            }
+        };
+        video.bytes = Arc::clone(&shared);
+        by_pointer.insert(pointer, shared);
+    }
+    merged
+}
+
 fn shared_media_references(project: &ProjectV2) -> HashMap<u16, u16> {
     let mut videos: Vec<_> = project
         .assets
@@ -9721,5 +9761,36 @@ mod compatibility_tests {
             validate(&project).expect_err("duplicate sibling alias must fail"),
             Error::Validation("project dependency aliases must be unique among siblings")
         );
+    }
+
+    #[test]
+    fn identical_videos_end_up_sharing_one_buffer() {
+        let video = |asset_id: u16, bytes: &[u8]| {
+            Asset::Q0v(Q0vAsset {
+                asset_id,
+                bytes: Arc::new(bytes.to_vec()),
+            })
+        };
+        let mut project = legacy_project();
+        project.assets = vec![
+            video(1, b"clip"),
+            video(2, b"clip"),
+            video(3, b"other clip"),
+            video(4, b"clip"),
+        ];
+        assert_eq!(share_identical_media(&mut project), 2);
+        let buffers: Vec<Arc<Vec<u8>>> = project
+            .assets
+            .iter()
+            .map(|asset| match asset {
+                Asset::Q0v(video) => Arc::clone(&video.bytes),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert!(Arc::ptr_eq(&buffers[0], &buffers[1]));
+        assert!(Arc::ptr_eq(&buffers[0], &buffers[3]));
+        assert!(!Arc::ptr_eq(&buffers[0], &buffers[2]));
+        assert_eq!(buffers[2].as_slice(), b"other clip");
+        assert_eq!(share_identical_media(&mut project), 0, "already shared");
     }
 }

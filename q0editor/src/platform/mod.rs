@@ -13,7 +13,7 @@ mod text_input;
 mod workspace;
 
 #[cfg(target_os = "android")]
-pub(crate) use android::FileDialog;
+pub(crate) use android::{FileDialog, Mp4Encoder};
 #[cfg(not(target_os = "android"))]
 pub(crate) use rfd::FileDialog;
 pub use text_input::{ImeAction, ImeTranslator, SoftKeyboard};
@@ -71,13 +71,30 @@ pub(crate) fn file_written(path: &Path) {
     let _ = path;
 }
 
-/// Reports a finished export. On Android, where the file was written inside
-/// the app, it is copied out to where the person chooses.
-pub(crate) fn export_finished(path: &Path) {
+/// Whether exports are written inside the app and copied out afterwards to
+/// where the person chooses, instead of straight to a path from a dialog.
+pub(crate) const EXPORTS_IN_APP: bool = cfg!(target_os = "android");
+
+/// Where exports are written when [`EXPORTS_IN_APP`].
+pub(crate) fn exports_dir() -> Option<PathBuf> {
     #[cfg(target_os = "android")]
-    android::export_finished(path);
+    {
+        android::exports_dir()
+    }
     #[cfg(not(target_os = "android"))]
-    let _ = path;
+    {
+        None
+    }
+}
+
+/// Reports a finished export: a file, or a folder of files. On Android,
+/// where it was written inside the app, it is copied out to where the person
+/// chooses.
+pub(crate) fn export_finished(path: &Path, folder: bool) {
+    #[cfg(target_os = "android")]
+    android::export_finished(path, folder);
+    #[cfg(not(target_os = "android"))]
+    let _ = (path, folder);
 }
 
 /// Sends the app to the background, for Back with nothing left to close.

@@ -8,6 +8,11 @@ use std::sync::{mpsc, Arc};
 use image::{DynamicImage, ImageBuffer, ImageOutputFormat, RgbaImage};
 use q0s_format::v2::ProjectV2;
 
+#[cfg(target_os = "android")]
+use crate::platform::Mp4Encoder;
+#[cfg(windows)]
+use q0video::mp4::Mp4Encoder;
+
 const MAX_RENDER_ALLOCATION_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_RENDER_DIMENSION: u32 = 16_384;
 pub const MIN_RENDER_SCALE: f32 = 1.0;
@@ -472,9 +477,8 @@ impl Q0EncState {
     }
 
     fn refresh_output_for_format(&mut self, file_path: Option<&Path>) {
-        let directory = self
-            .last_export_directory
-            .clone()
+        let directory = crate::platform::exports_dir()
+            .or_else(|| self.last_export_directory.clone())
             .or_else(|| file_path.and_then(Path::parent).map(Path::to_path_buf))
             .unwrap_or_default();
         if self.selected_format == ExportFormat::PngSequence {
@@ -548,7 +552,9 @@ impl Q0EncState {
             image_codec: self.image_codec,
             jpeg_quality: self.jpeg_quality,
             sequence_prefix: self.sequence_prefix.clone(),
-            sequence_create_subfolder: self.sequence_create_subfolder,
+            // Frames copied out of the app go as one folder.
+            sequence_create_subfolder: self.sequence_create_subfolder
+                || crate::platform::EXPORTS_IN_APP,
             gif_loop: self.gif_loop,
             gif_speed: self.gif_speed,
             mp4_bitrate: self.mp4_bitrate,
@@ -577,8 +583,13 @@ impl Q0EncState {
         self.current_validation(project)?;
         let mut output_path = PathBuf::from(self.output_text.trim());
         if self.selected_format == ExportFormat::PngSequence {
-            if self.sequence_create_subfolder {
+            if self.sequence_create_subfolder || crate::platform::EXPORTS_IN_APP {
                 output_path = output_path.join(self.sequence_subfolder.trim());
+            }
+            if crate::platform::EXPORTS_IN_APP && output_path.is_dir() {
+                // The frames of an earlier export, already copied out or given up.
+                std::fs::remove_dir_all(&output_path)
+                    .map_err(|error| format!("clear the previous frames: {error}"))?;
             }
         } else {
             let expected_extension = match self.selected_format {
@@ -683,9 +694,10 @@ impl Q0EncState {
                             job.state = JobState::Completed;
                             job.completed_units = job.total_units;
                             job.phase = "completed".to_string();
-                            if format != ExportFormat::PngSequence {
-                                crate::platform::export_finished(&path);
-                            }
+                            crate::platform::export_finished(
+                                &path,
+                                format == ExportFormat::PngSequence,
+                            );
                             statuses.push(format!(
                                 "q0enc exported {}: {}",
                                 format.label(),
@@ -932,28 +944,38 @@ fn export_q0v(
             timeline_frames: total,
             video: job.options.q0v_streams.video,
             audio: job.options.q0v_streams.audio,
-            audio_sample_rate: 48_000,
-            audio_channels: 2,
+            // A file without audio records no audio format, and the
+            // parse-back check below compares against what was recorded.
+            audio_sample_rate: if job.options.q0v_streams.audio {
+                48_000
+            } else {
+                0
+            },
+            audio_channels: if job.options.q0v_streams.audio { 2 } else { 0 },
         };
         let mut writer = q0video::q0v::Q0vWriter::new(file, spec)?;
         if spec.video {
+            // Held drawings render the same frame again; those skip encoding.
+            let mut previous: Option<Vec<u8>> = None;
             for (offset, frame_number) in range.clone().enumerate() {
                 if cancel.load(Ordering::Acquire) {
                     return Ok(WorkerOutcome::Cancelled);
                 }
                 progress(offset as u32, total, "encoding q0v video frames");
                 let rgba = render_frame(job.snapshot(), &job.options, frame_number);
-                let png = encode_image(
-                    &rgba,
-                    job.options.width,
-                    job.options.height,
-                    ImageCodec::Png,
-                    100,
-                )?;
-                writer.write_video_frame(
-                    (offset as u64).saturating_mul(MEDIA_TICKS_PER_SECOND) / u64::from(spec.fps),
-                    &png,
-                )?;
+                let pts =
+                    (offset as u64).saturating_mul(MEDIA_TICKS_PER_SECOND) / u64::from(spec.fps);
+                if previous.as_ref() == Some(&rgba) {
+                    writer.repeat_video_frame(pts)?;
+                } else {
+                    let png = q0video::q0v::encode_frame_png(
+                        &rgba,
+                        job.options.width,
+                        job.options.height,
+                    )?;
+                    writer.write_video_frame(pts, &png)?;
+                    previous = Some(rgba);
+                }
                 progress(offset as u32 + 1, total, "writing q0v video frames");
             }
         }
@@ -1028,7 +1050,7 @@ fn export_q0v(
     result
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 fn mp4_render_workers(options: &ExportOptions, total: u32) -> usize {
     let pixels = u64::from(h264_encoded_dimension(options.width))
         * u64::from(h264_encoded_dimension(options.height));
@@ -1051,7 +1073,7 @@ fn mp4_render_workers(options: &ExportOptions, total: u32) -> usize {
 /// worker has a rendezvous channel: a slow early frame cannot cause an
 /// unbounded collection of later frames. Dropping all receivers unblocks
 /// producers on cancellation, renderer failure, or an encoder error.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "android", test))]
 fn ordered_render_frames<T: Send>(
     range: RangeInclusive<u16>,
     workers: usize,
@@ -1105,7 +1127,7 @@ fn ordered_render_frames<T: Send>(
     })
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 fn export_mp4(
     job: &ExportJob,
     cancel: &AtomicBool,
@@ -1131,7 +1153,7 @@ fn export_mp4(
             fps: u32::from(job.snapshot().meta.fps.max(1)),
             bitrate: job.options.mp4_bitrate,
         };
-        let mut encoder = q0video::mp4::Mp4Encoder::create(&staging, spec)?;
+        let mut encoder = Mp4Encoder::create(&staging, spec)?;
         progress(0, total, "rendering and encoding h.264 frames");
         let outcome = ordered_render_frames(
             range,
@@ -1174,7 +1196,7 @@ fn export_mp4(
     result
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "android")))]
 fn export_mp4(
     _job: &ExportJob,
     _cancel: &AtomicBool,
@@ -1424,7 +1446,7 @@ fn sync_existing_file(path: &Path) -> Result<(), String> {
 fn verify_mp4(path: &Path) -> Result<(), String> {
     let metadata = std::fs::metadata(path).map_err(|error| format!("stat mp4: {error}"))?;
     if metadata.len() < 32 {
-        return Err("media foundation produced an unexpectedly small mp4".to_string());
+        return Err("the encoder produced an unexpectedly small mp4".to_string());
     }
     let mut file =
         File::open(path).map_err(|error| format!("open mp4 for verification: {error}"))?;
@@ -2198,6 +2220,37 @@ mod tests {
     }
 
     #[test]
+    fn q0v_job_without_audio_completes() {
+        let project = visual_project(2);
+        let output = unique_output("silent").with_extension("q0v");
+        let mut state = Q0EncState::default();
+        state.open_for_project(&project, None);
+        state.select_format(ExportFormat::Q0v, None);
+        state.width = 2;
+        state.height = 2;
+        state.supersampling = 1;
+        state.q0v_streams = Q0vStreams {
+            video: true,
+            audio: false,
+        };
+        state.output_text = output.display().to_string();
+        state.enqueue(&project).expect("enqueue q0v");
+        state.start_queue();
+        wait_for_queue(&mut state);
+
+        assert!(
+            matches!(state.queue[0].state, JobState::Completed),
+            "{:?}",
+            state.queue[0].state
+        );
+        let parsed = q0video::q0v::Q0vFile::parse(std::fs::read(&output).unwrap())
+            .expect("parse exported q0v");
+        assert!(parsed.spec.video && !parsed.spec.audio);
+        assert_eq!(parsed.frames.len(), 2);
+        std::fs::remove_file(output).expect("cleanup q0v");
+    }
+
+    #[test]
     fn q0v_job_contains_seekable_video_and_duration_correct_pcm() {
         let project = visual_project(2);
         let output = unique_output("media").with_extension("q0v");
@@ -2221,6 +2274,10 @@ mod tests {
             .expect("parse exported q0v");
         assert!(parsed.spec.video && parsed.spec.audio);
         assert_eq!(parsed.frames.len(), 2);
+        assert_eq!(
+            parsed.frames[0].offset, parsed.frames[1].offset,
+            "the held frame is stored once"
+        );
         assert_eq!(
             parsed.audio_samples_per_channel,
             parsed.spec.expected_audio_samples_per_channel()

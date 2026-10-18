@@ -1062,6 +1062,11 @@ struct CachedCanvasBackground {
 }
 
 impl TextureCache {
+    /// Drops the decoded frames of video buffers `project` no longer uses.
+    pub(crate) fn forget_unused_videos(&mut self, project: &ProjectV2) {
+        self.sync_video_sources(project);
+    }
+
     fn sync_video_sources(&mut self, project: &ProjectV2) {
         let sources: HashSet<_> = project
             .assets
@@ -13027,5 +13032,48 @@ mod tests {
         ];
         let buffers = tessellate_complex_fill(&[bow_tie]).expect("self-intersection tessellation");
         assert!(!buffers.indices.is_empty());
+    }
+
+    fn two_frame_clip() -> q0s_format::v2::Q0vAsset {
+        let spec = q0video::q0v::Q0vSpec {
+            width: 2,
+            height: 2,
+            fps: 24,
+            timeline_frames: 2,
+            video: true,
+            audio: false,
+            audio_sample_rate: 0,
+            audio_channels: 0,
+        };
+        let mut writer =
+            q0video::q0v::Q0vWriter::new(std::io::Cursor::new(Vec::new()), spec).unwrap();
+        for (frame, colour) in [[255_u8, 0, 0, 255], [0, 0, 255, 255]].iter().enumerate() {
+            let rgba = colour.repeat(4);
+            let png = q0video::q0v::encode_frame_png(&rgba, 2, 2).unwrap();
+            writer
+                .write_video_frame(
+                    frame as u64 * q0video::q0v::MEDIA_TICKS_PER_SECOND / 24,
+                    &png,
+                )
+                .unwrap();
+        }
+        q0s_format::v2::Q0vAsset {
+            asset_id: 1,
+            bytes: Arc::new(writer.finish().unwrap().into_inner()),
+        }
+    }
+
+    #[test]
+    fn paused_seeks_show_the_exact_frame_at_once() {
+        let ctx = Context::default();
+        let clip = two_frame_clip();
+        let mut cache = TextureCache::default();
+        let (first, _) = cache
+            .video_texture(&clip, 0, 24, &ctx)
+            .expect("first frame");
+        let (second, _) = cache
+            .video_texture(&clip, 1, 24, &ctx)
+            .expect("second frame");
+        assert_ne!(second.id(), first.id());
     }
 }

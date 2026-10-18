@@ -172,6 +172,14 @@ pub fn paint_v2_frame_with_runtime_overrides(
         target_rect.center().x - drawn.x * 0.5,
         target_rect.center().y - drawn.y * 0.5,
     );
+    // A player shows the stage only, as Flash does: artwork parked beside it
+    // stays out of view.
+    let clipped = painter.with_clip_rect(
+        painter
+            .clip_rect()
+            .intersect(Rect::from_min_size(origin, drawn)),
+    );
+    let painter = &clipped;
     if white_stage_bg {
         let stage_rect = Rect::from_min_size(origin, drawn);
         let bg = project.meta.background_color;
@@ -182,7 +190,21 @@ pub fn paint_v2_frame_with_runtime_overrides(
         );
     }
     let view = StageView { origin, scale };
-    if q0rg_contains_mask(project, q0rg_id, &mut std::collections::HashSet::new(), 0) {
+    // Masks are cut on the GPU like the editor does. Rasterizing the whole
+    // frame on the CPU is the fallback for what that cannot draw: it costs
+    // tens of milliseconds a frame and has no anti-aliasing.
+    let cpu_masks = q0rg_contains_mask(project, q0rg_id, &mut std::collections::HashSet::new(), 0)
+        && !gpu_masks_supported(
+            project,
+            q0rg_id,
+            frame,
+            authored_root_affine(project, q0rg_id, frame),
+            &view,
+            0,
+            cache,
+            scene_state,
+        );
+    if cpu_masks {
         let stage_rect = Rect::from_min_size(origin, drawn);
         let (width, height) = fx_raster_size(stage_rect, ctx);
         let key = (q0rg_id, frame, width, height);
@@ -715,6 +737,34 @@ fn paint_q0rg(
         if !project.layer_is_visible(q0rg_id, layer.layer_id) {
             continue;
         }
+        // A mask draws nothing itself; it cuts the layers it masks.
+        if is_mask_layer(project, q0rg_id, layer.layer_id) {
+            continue;
+        }
+        if rig_pose.is_none()
+            && !project
+                .layer_mask_sources(q0rg_id, layer.layer_id)
+                .is_empty()
+        {
+            if let Some((masks, placements)) = collect_masked_layer(
+                project,
+                Some(ctx),
+                q,
+                layer,
+                local_frame,
+                parent,
+                view,
+                depth,
+                cache,
+                scene_state,
+                inherited_color,
+            ) {
+                q0glblend::paint_vector_masked_placements_on_opaque_backdrop(
+                    painter, masks, placements,
+                );
+            }
+            continue;
+        }
         let shape_morph = q0s_format::shape_tween::project_layer_morph(project, layer, local_frame);
         for active in active_placement_states_at(layer, local_frame) {
             let Some(placement) = layer.placements.get(active.index) else {
@@ -887,6 +937,432 @@ fn paint_q0rg(
     }
 }
 
+/// A bitmap's texture. Bitmaps never change during playback, so each is
+/// uploaded once.
+fn bitmap_texture(
+    cache: &mut TextureCache,
+    ctx: &Context,
+    b: &q0s_format::v2::BitmapAsset,
+) -> TextureHandle {
+    cache
+        .by_asset_id
+        .entry(b.asset_id)
+        .or_insert_with(|| {
+            let image = ColorImage::from_rgba_unmultiplied(
+                [usize::from(b.width), usize::from(b.height)],
+                &b.rgba,
+            );
+            ctx.load_texture(
+                format!("q0player_asset_{}", b.asset_id),
+                image,
+                TextureOptions::LINEAR,
+            )
+        })
+        .clone()
+}
+
+/// The texture of the video frame `elapsed_host_frames` into the clip, with
+/// the clip's size.
+fn video_frame_texture(
+    cache: &mut TextureCache,
+    ctx: &Context,
+    v: &q0s_format::v2::Q0vAsset,
+    elapsed_host_frames: u16,
+    host_fps: u16,
+) -> Option<(TextureHandle, f32, f32)> {
+    let source = std::sync::Arc::as_ptr(&v.bytes) as usize;
+    if let std::collections::hash_map::Entry::Vacant(entry) = cache.q0v_media.entry(source) {
+        let media = q0video::q0v::Q0vFile::parse_shared(std::sync::Arc::clone(&v.bytes)).ok()?;
+        entry.insert(media);
+    }
+    let media = cache.q0v_media.get(&source)?;
+    let frame_index = media
+        .spec
+        .video_frame_for_host_frame(u32::from(elapsed_host_frames), u32::from(host_fps.max(1)))?;
+    let size = (media.spec.width as f32, media.spec.height as f32);
+    let key = (source, frame_index as u32);
+    if let std::collections::hash_map::Entry::Vacant(entry) = cache.by_q0v_frame.entry(key) {
+        let rgba = media.decode_frame_rgba(frame_index).ok()?;
+        let image = ColorImage::from_rgba_unmultiplied(
+            [media.spec.width as usize, media.spec.height as usize],
+            &rgba,
+        );
+        let bytes = image.pixels.len() * std::mem::size_of::<Color32>();
+        let texture = ctx.load_texture(
+            format!("q0player_q0v_{}_{}", source, frame_index),
+            image,
+            TextureOptions::LINEAR,
+        );
+        entry.insert(VideoTexture {
+            texture,
+            bytes,
+            last_used: ctx.frame_nr(),
+        });
+    }
+    let cached = cache.by_q0v_frame.get_mut(&key)?;
+    cached.last_used = ctx.frame_nr();
+    let texture = cached.texture.clone();
+    let mut bytes: usize = cache.by_q0v_frame.values().map(|frame| frame.bytes).sum();
+    while bytes > 128 * 1024 * 1024 || cache.by_q0v_frame.len() > 64 {
+        let oldest = cache
+            .by_q0v_frame
+            .iter()
+            .filter(|(_, frame)| frame.last_used != ctx.frame_nr())
+            .min_by_key(|(_, frame)| frame.last_used)
+            .map(|(key, _)| *key);
+        let Some(oldest) = oldest else { break };
+        if let Some(frame) = cache.by_q0v_frame.remove(&oldest) {
+            bytes = bytes.saturating_sub(frame.bytes);
+        }
+    }
+    Some((texture, size.0, size.1))
+}
+
+/// A `w` x `h` image placed on the stage by `transform`, as a screen mesh.
+fn image_quad(
+    texture: egui::TextureId,
+    w: f32,
+    h: f32,
+    transform: Affine,
+    view: &StageView,
+) -> Mesh {
+    let mut mesh = Mesh::with_texture(texture);
+    for (corner, uv) in [
+        (Vec2::new(0.0, 0.0), pos2(0.0, 0.0)),
+        (Vec2::new(w, 0.0), pos2(1.0, 0.0)),
+        (Vec2::new(w, h), pos2(1.0, 1.0)),
+        (Vec2::new(0.0, h), pos2(0.0, 1.0)),
+    ] {
+        mesh.vertices.push(Vertex {
+            pos: stage_to_screen(transform.apply(corner), view),
+            uv,
+            color: Color32::WHITE,
+        });
+    }
+    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+    mesh
+}
+
+fn is_mask_layer(project: &ProjectV2, q0rg_id: u16, layer_id: u16) -> bool {
+    project.layer_metadata(q0rg_id, layer_id).kind == q0s_format::v2::LayerKind::Mask
+}
+
+/// Solid meshes of one placement: plain vector artwork, a shape tween's
+/// in-between, or a symbol holding only those. False when it holds anything
+/// else.
+#[allow(clippy::too_many_arguments)]
+fn collect_solid_placement(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    placement: &Placement,
+    active: &q0s_format::raster::ActivePlacementState,
+    morph: Option<&q0s_format::shape_tween::LayerMorph>,
+    local_frame: u16,
+    transform: Affine,
+    view: &StageView,
+    depth: u8,
+    cache: &mut TextureCache,
+    scene_state: &RuntimeSceneState,
+    color: q0glblend::ColorTransform,
+    meshes: &mut Vec<Mesh>,
+) -> bool {
+    if let Some(shapes) = morph.and_then(|morph| morph.for_placement(active.index)) {
+        meshes.extend(morphed_meshes(shapes, transform, view, color, 1.0));
+        return true;
+    }
+    match placement.target {
+        Target::Asset(id) => {
+            let Some(Asset::Vector(vector)) = project.assets.iter().find(|asset| asset.id() == id)
+            else {
+                return false;
+            };
+            if !solid_appearance(project.asset_appearances.get(&id))
+                || (vector.stroke.is_some() && !similarity(transform))
+            {
+                return false;
+            }
+            meshes.extend(solid_meshes(vector, transform, view, cache, color));
+            true
+        }
+        Target::Q0rg(id) => {
+            let fallback = q0s_format::v2::resolve_q0rg_playback_frame(
+                project,
+                id,
+                local_frame,
+                active.playback_start_frame,
+                active.fx.q0rg_playback,
+            );
+            let key = InstanceKey::new(q0rg_id, placement.instance_id);
+            let (child_frame, child_scene) = scene_state.child_context(key, fallback);
+            collect_solid_q0rg(
+                project,
+                id,
+                child_frame,
+                transform,
+                view,
+                depth + 1,
+                cache,
+                child_scene,
+                color,
+                meshes,
+            )
+        }
+    }
+}
+
+type MaskedLayer = (
+    Vec<Vec<q0glblend::VectorGroupPrimitive>>,
+    Vec<q0glblend::VectorMaskedPlacement>,
+);
+
+/// `layer` and the masks over it, ready for the GPU to cut, or `None` when
+/// something in them needs the CPU renderer. Without a `ctx` nothing is
+/// decoded or uploaded: the call only checks that the layer can be drawn so.
+#[allow(clippy::too_many_arguments)]
+fn collect_masked_layer(
+    project: &ProjectV2,
+    ctx: Option<&Context>,
+    q: &q0s_format::v2::Q0rg,
+    layer: &q0s_format::v2::Layer,
+    local_frame: u16,
+    parent: Affine,
+    view: &StageView,
+    depth: u8,
+    cache: &mut TextureCache,
+    scene_state: &RuntimeSceneState,
+    inherited_color: q0glblend::ColorTransform,
+) -> Option<MaskedLayer> {
+    let q0rg_id = q.q0rg_id;
+    let placed = |placement: &Placement, active: &q0s_format::raster::ActivePlacementState| {
+        let key = InstanceKey::new(q0rg_id, placement.instance_id);
+        Affine::compose(
+            parent,
+            scene_state.effective_affine(key, Affine::from_transform(active.transform)),
+        )
+    };
+
+    let mut masks = Vec::new();
+    for mask_id in project.layer_mask_sources(q0rg_id, layer.layer_id) {
+        let mask_layer = q.layers.iter().find(|layer| layer.layer_id == mask_id)?;
+        if !project.layer_is_visible(q0rg_id, mask_id) || !is_mask_layer(project, q0rg_id, mask_id)
+        {
+            return None;
+        }
+        let morph = q0s_format::shape_tween::project_layer_morph(project, mask_layer, local_frame);
+        let mut meshes = Vec::new();
+        for active in active_placement_states_at(mask_layer, local_frame) {
+            let placement = mask_layer.placements.get(active.index)?;
+            let mut visual = active.fx;
+            visual.tint = None;
+            if !visual.is_identity()
+                || !collect_solid_placement(
+                    project,
+                    q0rg_id,
+                    placement,
+                    &active,
+                    morph.as_ref(),
+                    local_frame,
+                    placed(placement, &active),
+                    view,
+                    depth,
+                    cache,
+                    scene_state,
+                    q0glblend::ColorTransform::default(),
+                    &mut meshes,
+                )
+            {
+                return None;
+            }
+        }
+        masks.push(
+            meshes
+                .into_iter()
+                .map(q0glblend::VectorGroupPrimitive::Solid)
+                .collect(),
+        );
+    }
+
+    let morph = q0s_format::shape_tween::project_layer_morph(project, layer, local_frame);
+    let mut placements = Vec::new();
+    for active in active_placement_states_at(layer, local_frame) {
+        let placement = layer.placements.get(active.index)?;
+        // Opacity and blending travel with the masked placement; filters
+        // and the like need the CPU renderer.
+        let mut plain = active.fx;
+        plain.tint = None;
+        plain.opacity = 1.0;
+        plain.blend_mode = BlendMode::Normal;
+        if !plain.is_identity() {
+            return None;
+        }
+        let transform = placed(placement, &active);
+        let color = active
+            .fx
+            .tint
+            .map(q0glblend::ColorTransform::tint)
+            .unwrap_or_default()
+            .then(inherited_color);
+        let mut primitives = Vec::new();
+        let image = match placement.target {
+            Target::Asset(id) => match project.assets.iter().find(|asset| asset.id() == id) {
+                Some(Asset::Bitmap(b)) => Some(ctx.map(|ctx| {
+                    let texture = bitmap_texture(cache, ctx, b);
+                    Some((texture, f32::from(b.width), f32::from(b.height)))
+                })),
+                Some(Asset::Q0v(v)) => Some(ctx.map(|ctx| {
+                    video_frame_texture(
+                        cache,
+                        ctx,
+                        v,
+                        local_frame.saturating_sub(active.playback_start_frame),
+                        project.meta.fps,
+                    )
+                })),
+                _ => None,
+            },
+            Target::Q0rg(_) => None,
+        };
+        match image {
+            Some(texture) => {
+                if let Some((texture, w, h)) = texture.flatten() {
+                    primitives.push(q0glblend::VectorGroupPrimitive::Textured {
+                        mesh: std::sync::Arc::new(image_quad(texture.id(), w, h, transform, view)),
+                        color_transform: color,
+                    });
+                }
+            }
+            None => {
+                let mut meshes = Vec::new();
+                if !collect_solid_placement(
+                    project,
+                    q0rg_id,
+                    placement,
+                    &active,
+                    morph.as_ref(),
+                    local_frame,
+                    transform,
+                    view,
+                    depth,
+                    cache,
+                    scene_state,
+                    color,
+                    &mut meshes,
+                ) {
+                    return None;
+                }
+                primitives.extend(
+                    meshes
+                        .into_iter()
+                        .map(q0glblend::VectorGroupPrimitive::Solid),
+                );
+            }
+        }
+        placements.push(q0glblend::VectorMaskedPlacement {
+            primitives,
+            blend_mode: active.fx.blend_mode,
+            opacity: active.fx.opacity.clamp(0.0, 1.0),
+        });
+    }
+    Some((masks, placements))
+}
+
+/// Whether every masked layer this frame shows can be cut on the GPU.
+#[allow(clippy::too_many_arguments)]
+fn gpu_masks_supported(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    frame: u16,
+    parent: Affine,
+    view: &StageView,
+    depth: u8,
+    cache: &mut TextureCache,
+    scene_state: &RuntimeSceneState,
+) -> bool {
+    if depth > Q0RG_RECURSION_LIMIT {
+        return true;
+    }
+    let Some(q) = project.q0rgs.iter().find(|q| q.q0rg_id == q0rg_id) else {
+        return true;
+    };
+    let local_frame = if q.frame_count > 0 {
+        frame % q.frame_count
+    } else {
+        0
+    };
+    let rigged = q0s_format::rig::rig_for_q0rg(project, q0rg_id).is_some();
+    for layer in &q.layers {
+        if !project.layer_is_visible(q0rg_id, layer.layer_id)
+            || is_mask_layer(project, q0rg_id, layer.layer_id)
+        {
+            continue;
+        }
+        if !project
+            .layer_mask_sources(q0rg_id, layer.layer_id)
+            .is_empty()
+        {
+            if rigged
+                || collect_masked_layer(
+                    project,
+                    None,
+                    q,
+                    layer,
+                    local_frame,
+                    parent,
+                    view,
+                    depth,
+                    cache,
+                    scene_state,
+                    q0glblend::ColorTransform::default(),
+                )
+                .is_none()
+            {
+                return false;
+            }
+            continue;
+        }
+        for active in active_placement_states_at(layer, local_frame) {
+            let Some(placement) = layer.placements.get(active.index) else {
+                continue;
+            };
+            let Target::Q0rg(child_id) = placement.target else {
+                continue;
+            };
+            let mut visual = active.fx;
+            visual.tint = None;
+            // Filtered symbols are drawn whole by their own renderer.
+            if child_id == q0rg_id || !visual.is_identity() {
+                continue;
+            }
+            let key = InstanceKey::new(q0rg_id, placement.instance_id);
+            let fallback = q0s_format::v2::resolve_q0rg_playback_frame(
+                project,
+                child_id,
+                local_frame,
+                active.playback_start_frame,
+                active.fx.q0rg_playback,
+            );
+            let (child_frame, child_scene) = scene_state.child_context(key, fallback);
+            let transform = Affine::compose(
+                parent,
+                scene_state.effective_affine(key, Affine::from_transform(active.transform)),
+            );
+            if !gpu_masks_supported(
+                project,
+                child_id,
+                child_frame,
+                transform,
+                view,
+                depth + 1,
+                cache,
+                child_scene,
+            ) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_asset(
     painter: &Painter,
@@ -902,135 +1378,18 @@ fn paint_asset(
 ) {
     match asset {
         Asset::Bitmap(b) => {
-            // Upload once, reuse forever. Bitmap data in v2 doesn't mutate
-            // at playback time so the cache is safe across frames.
-            let tex = cache.by_asset_id.entry(b.asset_id).or_insert_with(|| {
-                let image = ColorImage::from_rgba_unmultiplied(
-                    [usize::from(b.width), usize::from(b.height)],
-                    &b.rgba,
-                );
-                ctx.load_texture(
-                    format!("q0player_asset_{}", b.asset_id),
-                    image,
-                    TextureOptions::LINEAR,
-                )
-            });
-            let w = f32::from(b.width);
-            let h = f32::from(b.height);
-            let local_corners = [
-                Vec2::new(0.0, 0.0),
-                Vec2::new(w, 0.0),
-                Vec2::new(w, h),
-                Vec2::new(0.0, h),
-            ];
-            let screen_corners: Vec<Pos2> = local_corners
-                .iter()
-                .map(|p| stage_to_screen(transform.apply(*p), view))
-                .collect();
-            let mut mesh = Mesh::with_texture(tex.id());
-            let uv = [
-                pos2(0.0, 0.0),
-                pos2(1.0, 0.0),
-                pos2(1.0, 1.0),
-                pos2(0.0, 1.0),
-            ];
-            for (corner, uv) in screen_corners.iter().zip(uv.iter()) {
-                mesh.vertices.push(Vertex {
-                    pos: *corner,
-                    uv: *uv,
-                    color: Color32::WHITE,
-                });
-            }
-            mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+            let texture = bitmap_texture(cache, ctx, b);
+            let (w, h) = (f32::from(b.width), f32::from(b.height));
+            let mesh = image_quad(texture.id(), w, h, transform, view);
             q0glblend::paint_mesh_color(painter, mesh, color_transform);
         }
         Asset::Q0v(v) => {
-            let source = std::sync::Arc::as_ptr(&v.bytes) as usize;
-            if let std::collections::hash_map::Entry::Vacant(entry) = cache.q0v_media.entry(source)
-            {
-                let Ok(media) =
-                    q0video::q0v::Q0vFile::parse_shared(std::sync::Arc::clone(&v.bytes))
-                else {
-                    return;
-                };
-                entry.insert(media);
-            }
-            let Some(media) = cache.q0v_media.get(&source) else {
+            let Some((texture, w, h)) =
+                video_frame_texture(cache, ctx, v, elapsed_host_frames, host_fps)
+            else {
                 return;
             };
-            let Some(frame_index) = media.spec.video_frame_for_host_frame(
-                u32::from(elapsed_host_frames),
-                u32::from(host_fps.max(1)),
-            ) else {
-                return;
-            };
-            let key = (source, frame_index as u32);
-            if let std::collections::hash_map::Entry::Vacant(entry) = cache.by_q0v_frame.entry(key)
-            {
-                let Ok(rgba) = media.decode_frame_rgba(frame_index) else {
-                    return;
-                };
-                let image = ColorImage::from_rgba_unmultiplied(
-                    [media.spec.width as usize, media.spec.height as usize],
-                    &rgba,
-                );
-                let bytes = image.pixels.len() * std::mem::size_of::<Color32>();
-                let texture = ctx.load_texture(
-                    format!("q0player_q0v_{}_{}", source, frame_index),
-                    image,
-                    TextureOptions::LINEAR,
-                );
-                entry.insert(VideoTexture {
-                    texture,
-                    bytes,
-                    last_used: ctx.frame_nr(),
-                });
-            }
-            let Some(cached) = cache.by_q0v_frame.get_mut(&key) else {
-                return;
-            };
-            cached.last_used = ctx.frame_nr();
-            let tex = cached.texture.clone();
-            let w = media.spec.width as f32;
-            let h = media.spec.height as f32;
-            let mut bytes: usize = cache.by_q0v_frame.values().map(|frame| frame.bytes).sum();
-            while bytes > 128 * 1024 * 1024 || cache.by_q0v_frame.len() > 64 {
-                let oldest = cache
-                    .by_q0v_frame
-                    .iter()
-                    .filter(|(_, frame)| frame.last_used != ctx.frame_nr())
-                    .min_by_key(|(_, frame)| frame.last_used)
-                    .map(|(key, _)| *key);
-                let Some(oldest) = oldest else { break };
-                if let Some(frame) = cache.by_q0v_frame.remove(&oldest) {
-                    bytes = bytes.saturating_sub(frame.bytes);
-                }
-            }
-            let local_corners = [
-                Vec2::new(0.0, 0.0),
-                Vec2::new(w, 0.0),
-                Vec2::new(w, h),
-                Vec2::new(0.0, h),
-            ];
-            let screen_corners: Vec<Pos2> = local_corners
-                .iter()
-                .map(|point| stage_to_screen(transform.apply(*point), view))
-                .collect();
-            let mut mesh = Mesh::with_texture(tex.id());
-            let uv = [
-                pos2(0.0, 0.0),
-                pos2(1.0, 0.0),
-                pos2(1.0, 1.0),
-                pos2(0.0, 1.0),
-            ];
-            for (corner, uv) in screen_corners.iter().zip(uv.iter()) {
-                mesh.vertices.push(Vertex {
-                    pos: *corner,
-                    uv: *uv,
-                    color: Color32::WHITE,
-                });
-            }
-            mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+            let mesh = image_quad(texture.id(), w, h, transform, view);
             q0glblend::paint_mesh_color(painter, mesh, color_transform);
         }
         Asset::Rig(_) => {}

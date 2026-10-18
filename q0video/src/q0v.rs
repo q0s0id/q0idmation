@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::io::{Seek, SeekFrom, Write};
 use std::sync::Arc;
 
@@ -128,10 +130,68 @@ pub struct FrameIndex {
     pub length: u32,
 }
 
+/// Encodes one video frame for q0v as small as PNG gets while keeping every
+/// pixel: the strongest compression, a filter chosen per row, and no alpha
+/// channel when every pixel is opaque. Decoding gives back the same RGBA.
+pub fn encode_frame_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+    use image::ImageEncoder;
+
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4));
+    if expected != Some(rgba.len()) {
+        return Err("q0v frame buffer does not match its dimensions".to_string());
+    }
+    let mut png = Vec::new();
+    let encoder =
+        PngEncoder::new_with_quality(&mut png, CompressionType::Best, FilterType::Adaptive);
+    let written = if rgba.chunks_exact(4).all(|pixel| pixel[3] == u8::MAX) {
+        let rgb: Vec<u8> = rgba
+            .chunks_exact(4)
+            .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
+            .collect();
+        encoder.write_image(&rgb, width, height, image::ColorType::Rgb8)
+    } else {
+        encoder.write_image(rgba, width, height, image::ColorType::Rgba8)
+    };
+    written.map_err(|error| format!("encode q0v frame png: {error}"))?;
+    Ok(png)
+}
+
+/// Identifies a frame payload by its length and two independent 64-bit
+/// hashes, so a false match is beyond any practical chance.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct PayloadKey {
+    length: usize,
+    fnv: u64,
+    sip: u64,
+}
+
+impl PayloadKey {
+    fn of(payload: &[u8]) -> Self {
+        let mut fnv = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in payload {
+            fnv = (fnv ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        let mut sip = std::collections::hash_map::DefaultHasher::new();
+        payload.hash(&mut sip);
+        Self {
+            length: payload.len(),
+            fnv,
+            sip: sip.finish(),
+        }
+    }
+}
+
 pub struct Q0vWriter<W: Write + Seek> {
     writer: W,
     spec: Q0vSpec,
     frames: Vec<FrameIndex>,
+    /// Payloads already in the file. A frame that repeats one points at it
+    /// instead of storing it again; every index entry still names one whole
+    /// PNG, so seeking stays a single decode.
+    stored: HashMap<PayloadKey, (u64, u32)>,
     audio_offset: Option<u64>,
     audio_samples_per_channel: u64,
     finished: bool,
@@ -151,13 +211,14 @@ impl<W: Write + Seek> Q0vWriter<W> {
             } else {
                 0
             }),
+            stored: HashMap::new(),
             audio_offset: None,
             audio_samples_per_channel: 0,
             finished: false,
         })
     }
 
-    pub fn write_video_frame(&mut self, pts_ticks: u64, png: &[u8]) -> Result<(), String> {
+    fn check_video_frame(&self) -> Result<(), String> {
         if !self.spec.video {
             return Err("q0v has no video stream".to_string());
         }
@@ -167,8 +228,38 @@ impl<W: Write + Seek> Q0vWriter<W> {
         if self.frames.len() >= self.spec.timeline_frames as usize {
             return Err("q0v received more video frames than its timeline length".to_string());
         }
+        Ok(())
+    }
+
+    /// Adds a frame identical to the previous one without encoding it again.
+    pub fn repeat_video_frame(&mut self, pts_ticks: u64) -> Result<(), String> {
+        self.check_video_frame()?;
+        let previous = self
+            .frames
+            .last()
+            .ok_or_else(|| "q0v has no frame to repeat".to_string())?;
+        let (offset, length) = (previous.offset, previous.length);
+        self.frames.push(FrameIndex {
+            pts_ticks,
+            offset,
+            length,
+        });
+        Ok(())
+    }
+
+    pub fn write_video_frame(&mut self, pts_ticks: u64, png: &[u8]) -> Result<(), String> {
+        self.check_video_frame()?;
         if png.len() > u32::MAX as usize {
             return Err("q0v frame payload is too large".to_string());
+        }
+        let key = PayloadKey::of(png);
+        if let Some(&(offset, length)) = self.stored.get(&key) {
+            self.frames.push(FrameIndex {
+                pts_ticks,
+                offset,
+                length,
+            });
+            return Ok(());
         }
         let offset = self
             .writer
@@ -182,6 +273,7 @@ impl<W: Write + Seek> Q0vWriter<W> {
             offset,
             length: png.len() as u32,
         });
+        self.stored.insert(key, (offset, png.len() as u32));
         Ok(())
     }
 
@@ -606,6 +698,59 @@ mod tests {
             parsed.audio_pcm_le_bytes(),
             &[1, 0, 255, 255, 2, 0, 254, 255]
         );
+    }
+
+    #[test]
+    fn repeated_frames_share_one_payload_and_still_seek() {
+        let spec = Q0vSpec {
+            width: 1,
+            height: 1,
+            fps: 24,
+            timeline_frames: 4,
+            video: true,
+            audio: false,
+            audio_sample_rate: 48_000,
+            audio_channels: 2,
+        };
+        let tick = MEDIA_TICKS_PER_SECOND / 24;
+        let mut writer = Q0vWriter::new(Cursor::new(Vec::new()), spec).unwrap();
+        writer.write_video_frame(0, &png([255, 0, 0, 255])).unwrap();
+        writer
+            .write_video_frame(tick, &png([0, 255, 0, 255]))
+            .unwrap();
+        // A cycle back to the first image, then a hold.
+        writer
+            .write_video_frame(2 * tick, &png([255, 0, 0, 255]))
+            .unwrap();
+        writer.repeat_video_frame(3 * tick).unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+
+        let parsed = Q0vFile::parse(bytes).expect("parse");
+        let offsets: Vec<u64> = parsed.frames.iter().map(|frame| frame.offset).collect();
+        assert_eq!(offsets[0], offsets[2], "the cycle reuses the first payload");
+        assert_eq!(offsets[2], offsets[3], "the hold reuses it as well");
+        assert_ne!(offsets[0], offsets[1]);
+        assert_eq!(parsed.decode_frame_rgba(3).unwrap(), vec![255, 0, 0, 255]);
+        assert_eq!(parsed.decode_frame_rgba(1).unwrap(), vec![0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn frame_png_is_lossless_and_drops_alpha_only_when_opaque() {
+        // PNG keeps its colour type in the IHDR chunk: 2 is RGB, 6 is RGBA.
+        let colour_type = |png: &[u8]| png[25];
+        let opaque = [10, 20, 30, 255, 40, 50, 60, 255];
+        let encoded = encode_frame_png(&opaque, 2, 1).unwrap();
+        assert_eq!(colour_type(&encoded), 2);
+        let decoded = image::load_from_memory(&encoded).unwrap().into_rgba8();
+        assert_eq!(decoded.into_raw(), opaque);
+
+        let translucent = [10, 20, 30, 255, 40, 50, 60, 128];
+        let encoded = encode_frame_png(&translucent, 2, 1).unwrap();
+        assert_eq!(colour_type(&encoded), 6);
+        let decoded = image::load_from_memory(&encoded).unwrap().into_rgba8();
+        assert_eq!(decoded.into_raw(), translucent);
+
+        assert!(encode_frame_png(&opaque, 3, 1).is_err());
     }
 
     #[test]

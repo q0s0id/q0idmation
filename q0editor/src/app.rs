@@ -126,9 +126,8 @@ fn rebind_transform_pivot(
     }
 }
 
-/// Layers whose objects an in-progress drag is moving, rotating, skewing or
-/// scaling. Raw drawing edits are left out: their paths can be shared with
-/// other keyframes, so keying mid-drag could reach back into finished frames.
+/// Layers whose objects or raw graphics an in-progress drag is moving,
+/// rotating, skewing or scaling.
 pub(crate) fn held_object_layers(
     state: &crate::state::ToolState,
     q0rg_id: u16,
@@ -160,12 +159,27 @@ pub(crate) fn held_object_layers(
                 layers.insert(*layer_id);
             }
         }
-        ToolState::DraggingGroup { refs, objects, .. } if refs.is_empty() => {
+        ToolState::DraggingGroup { refs, objects, .. } => {
             layers.extend(
                 objects
                     .iter()
                     .filter(|object| object.q0rg_id == q0rg_id)
                     .map(|object| object.layer_id),
+            );
+            layers.extend(
+                refs.iter()
+                    .filter(|reference| reference.q0rg_id == q0rg_id)
+                    .map(|reference| reference.layer_id),
+            );
+        }
+        ToolState::DraggingPaths { refs, .. }
+        | ToolState::DraggingRawHandle { refs, .. }
+        | ToolState::DraggingRawRotate { refs, .. }
+        | ToolState::DraggingRawSkew { refs, .. } => {
+            layers.extend(
+                refs.iter()
+                    .filter(|reference| reference.q0rg_id == q0rg_id)
+                    .map(|reference| reference.layer_id),
             );
         }
         _ => {}
@@ -173,8 +187,8 @@ pub(crate) fn held_object_layers(
     layers
 }
 
-/// Points an object drag at the copies a keyframe insertion just made, so the
-/// drag carries on in the new keyframe.
+/// Points a drag at the copies a keyframe insertion just made, so the drag
+/// carries on in the new keyframe.
 fn remap_tool_state_after_keyframes(
     before: &ProjectV2,
     after: &ProjectV2,
@@ -224,12 +238,29 @@ fn remap_tool_state_after_keyframes(
                 remap(*layer_id, placement_idx);
             }
         }
-        ToolState::DraggingGroup { objects, .. } => {
+        ToolState::DraggingGroup { objects, refs, .. } => {
             for object in objects
                 .iter_mut()
                 .filter(|object| object.q0rg_id == q0rg_id)
             {
                 remap(object.layer_id, &mut object.placement_idx);
+            }
+            for reference in refs
+                .iter_mut()
+                .filter(|reference| reference.q0rg_id == q0rg_id)
+            {
+                remap(reference.layer_id, &mut reference.placement_idx);
+            }
+        }
+        ToolState::DraggingPaths { refs, .. }
+        | ToolState::DraggingRawHandle { refs, .. }
+        | ToolState::DraggingRawRotate { refs, .. }
+        | ToolState::DraggingRawSkew { refs, .. } => {
+            for reference in refs
+                .iter_mut()
+                .filter(|reference| reference.q0rg_id == q0rg_id)
+            {
+                remap(reference.layer_id, &mut reference.placement_idx);
             }
         }
         _ => {}
@@ -373,6 +404,8 @@ pub struct EditorApp {
     native_paste_key_down: bool,
     audio_playback: Option<crate::audio::EditorAudioPlayback>,
     external_open_inbox: Option<crate::single_instance::ExternalOpenInbox>,
+    /// Distinct video buffers in the project after the last sharing pass.
+    video_buffers: usize,
     soft_keyboard: Option<Box<dyn crate::platform::SoftKeyboard>>,
     pub(crate) touch: crate::touch::TouchLayout,
     /// Whether a text field was being edited at the end of the last frame.
@@ -1193,6 +1226,7 @@ impl Default for EditorApp {
             native_paste_key_down: false,
             audio_playback: None,
             external_open_inbox: None,
+            video_buffers: 0,
             soft_keyboard: None,
             touch: crate::touch::TouchLayout::default(),
             text_field_focused: false,
@@ -1345,6 +1379,32 @@ impl EditorApp {
 
     pub fn set_soft_keyboard(&mut self, keyboard: Box<dyn crate::platform::SoftKeyboard>) {
         self.soft_keyboard = Some(keyboard);
+    }
+
+    /// Pastes, duplicates, imports and undo can bring a fresh buffer of a
+    /// video that is already in the project. Every buffer is decoded and
+    /// cached on its own, so each copy of a clip used to cost a full decode
+    /// per frame, and memory, until saving and reloading merged them. They
+    /// are merged as soon as they appear instead.
+    fn share_video_buffers(&mut self) {
+        let buffers = |project: &ProjectV2| {
+            project
+                .assets
+                .iter()
+                .filter_map(|asset| match asset {
+                    Asset::Q0v(video) => Some(std::sync::Arc::as_ptr(&video.bytes) as usize),
+                    _ => None,
+                })
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        };
+        let before = buffers(&self.state.project);
+        if before > self.video_buffers
+            && q0s_format::v2::share_identical_media(&mut self.state.project) > 0
+        {
+            self.textures.forget_unused_videos(&self.state.project);
+        }
+        self.video_buffers = buffers(&self.state.project);
     }
 
     /// Files the platform picked or received, its messages and Back.
@@ -10561,6 +10621,11 @@ impl EditorApp {
             current
         };
         let cells: Vec<(u16, u16)> = layers.iter().map(|layer_id| (*layer_id, target)).collect();
+        let raw = crate::tools::held_raw_placements(
+            &self.state.project,
+            &self.session.tool_state,
+            q0rg_id,
+        );
         let before = self.state.project.clone();
         match crate::timeline_edit::materialize_keyframes_at_cells(
             &mut self.state.project,
@@ -10588,6 +10653,13 @@ impl EditorApp {
                     q0rg_id,
                     &frames,
                 );
+                // Raw graphics move through a live offset that the end of the
+                // drag bakes into their shapes. The new key's copy shares the
+                // shapes and carries the drag on; the pose being left behind
+                // gets its own shapes with the offset baked in now.
+                for held in raw {
+                    crate::tools::freeze_raw_pose(self, q0rg_id, held);
+                }
                 self.session.current_frame = target;
                 self.session.pending_timeline_frame = None;
                 self.textures.invalidate();
@@ -13369,6 +13441,9 @@ impl EditorApp {
         let ingress_started = Instant::now();
         self.poll_external_open_requests(ctx);
         self.poll_platform(ctx);
+        if self.project_active {
+            self.share_video_buffers();
+        }
         #[cfg(target_os = "android")]
         if ctx.input(|input| {
             input

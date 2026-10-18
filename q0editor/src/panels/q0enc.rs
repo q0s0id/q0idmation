@@ -112,20 +112,24 @@ pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
                                 ui.label(
                                     RichText::new(output_label(state.selected_format)).strong(),
                                 );
-                                ui.horizontal(|ui| {
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut state.output_text)
-                                            .desired_width(
-                                                (ui.available_width() - 90.0).max(120.0),
-                                            ),
-                                    );
-                                    if ui
-                                        .add_enabled(true, egui::Button::new("browse..."))
-                                        .clicked()
-                                    {
-                                        browse_requested = true;
-                                    }
-                                });
+                                if crate::platform::EXPORTS_IN_APP {
+                                    in_app_output(ui, state, theme.text_dim.to_color32());
+                                } else {
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut state.output_text)
+                                                .desired_width(
+                                                    (ui.available_width() - 90.0).max(120.0),
+                                                ),
+                                        );
+                                        if ui
+                                            .add_enabled(true, egui::Button::new("browse..."))
+                                            .clicked()
+                                        {
+                                            browse_requested = true;
+                                        }
+                                    });
+                                }
 
                                 let validation = state.current_validation(project);
                                 if let Err(message) = &validation {
@@ -446,11 +450,14 @@ fn render_format_settings(
                 ui.label("_0001.png");
             });
             ui.checkbox(&mut state.transparent, "transparent background");
-            ui.checkbox(
-                &mut state.sequence_create_subfolder,
-                "create a subfolder inside the selected folder",
-            );
-            if state.sequence_create_subfolder {
+            // Frames copied out of the app always go as one folder.
+            if !crate::platform::EXPORTS_IN_APP {
+                ui.checkbox(
+                    &mut state.sequence_create_subfolder,
+                    "create a subfolder inside the selected folder",
+                );
+            }
+            if state.sequence_create_subfolder || crate::platform::EXPORTS_IN_APP {
                 ui.horizontal(|ui| {
                     ui.label("subfolder");
                     ui.text_edit_singleline(&mut state.sequence_subfolder);
@@ -662,11 +669,38 @@ fn browse_output(state: &Q0EncState, suggested: Option<&Path>) -> Option<std::pa
 }
 
 fn output_label(format: ExportFormat) -> &'static str {
-    if format == ExportFormat::PngSequence {
-        "selected folder"
-    } else {
-        "output"
+    match (
+        format == ExportFormat::PngSequence,
+        crate::platform::EXPORTS_IN_APP,
+    ) {
+        (true, false) => "selected folder",
+        (true, true) => "saving",
+        (false, false) => "output",
+        (false, true) => "file name",
     }
+}
+
+/// Where exports are written inside the app, only the name is chosen here;
+/// the place comes from the system picker once the export is done.
+fn in_app_output(ui: &mut egui::Ui, state: &mut Q0EncState, dim: egui::Color32) {
+    let note = if state.selected_format == ExportFormat::PngSequence {
+        "when the frames are ready, you pick a folder to save them in."
+    } else {
+        let output = Path::new(state.output_text.trim()).to_path_buf();
+        let mut name = output
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let field = egui::TextEdit::singleline(&mut name).desired_width(ui.available_width());
+        if ui.add(field).changed() {
+            // Only the last component counts, so a name can never leave the folder.
+            if let Some(name) = Path::new(name.trim()).file_name() {
+                state.output_text = output.with_file_name(name).display().to_string();
+            }
+        }
+        "when the export is done, you pick where to save it."
+    };
+    ui.label(RichText::new(note).small().color(dim));
 }
 
 fn q0rg_label(project: &ProjectV2, id: u16) -> String {

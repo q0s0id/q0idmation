@@ -22,6 +22,11 @@ class MainActivity : Q0Activity() {
 
     private lateinit var textSink: TextSink
 
+    // Every pixel goes to the canvas: no status bar, and the surface runs
+    // past the camera cutout to the edge of the display.
+    override val clearsCutout = false
+    override val hidesSystemBars = true
+
     private external fun nativeImeCompose(text: String)
     private external fun nativeImeCommit(text: String)
     private external fun nativeImeFinish()
