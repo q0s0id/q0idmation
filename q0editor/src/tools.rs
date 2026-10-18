@@ -57,7 +57,11 @@ pub fn handle(
                 egui::CursorIcon::Grab
             });
         }
-        ctx.request_repaint();
+        // Only a pan in progress moves anything. Holding the Hand tool idle
+        // used to redraw the editor flat out.
+        if app.session.viewport.panning {
+            ctx.request_repaint();
+        }
         return;
     }
 
@@ -158,6 +162,7 @@ pub fn handle(
 /// the artwork and its selection/transform UI observe the same frame state.
 pub fn draw_overlay(app: &mut EditorApp, response: &Response, painter: &Painter, view: &StageView) {
     draw_in_progress_overlay(app, painter, view);
+    crate::physics::paint_stage_overlay(app, painter, view);
     if app.session.viewport.hand_active || app.session.viewport.panning {
         return;
     }

@@ -95,8 +95,8 @@ pub(crate) fn outline_installed_font(
     text: &str,
     size: f32,
 ) -> Result<Vec<VectorPath>, String> {
-    let (bytes, index) =
-        crate::fonts::load(face_name).ok_or_else(|| format!("Font '{face_name}' is not installed"))?;
+    let (bytes, index) = crate::fonts::load(face_name)
+        .ok_or_else(|| format!("Font '{face_name}' is not installed"))?;
     let face =
         Face::parse(&bytes, index).map_err(|_| format!("Font '{face_name}' is unreadable"))?;
     let scale = size / f32::from(face.units_per_em());

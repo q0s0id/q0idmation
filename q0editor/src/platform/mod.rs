@@ -87,14 +87,13 @@ pub(crate) fn exports_dir() -> Option<PathBuf> {
     }
 }
 
-/// Reports a finished export: a file, or a folder of files. On Android,
-/// where it was written inside the app, it is copied out to where the person
-/// chooses.
-pub(crate) fn export_finished(path: &Path, folder: bool) {
+/// Reports a finished export. On Android, where it was written inside the
+/// app, it is copied out to where the person chooses.
+pub(crate) fn export_finished(path: &Path) {
     #[cfg(target_os = "android")]
-    android::export_finished(path, folder);
+    android::export_finished(path);
     #[cfg(not(target_os = "android"))]
-    let _ = (path, folder);
+    let _ = path;
 }
 
 /// Sends the app to the background, for Back with nothing left to close.

@@ -142,18 +142,13 @@ pub(super) fn exports_dir() -> Option<PathBuf> {
     Some(dirs::home_dir()?.join("exports"))
 }
 
-pub(super) fn export_finished(path: &Path, folder: bool) {
-    let result = if folder {
-        q0android::export_folder_finished(path)
-    } else {
-        let extension = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or_default();
-        let mime_type = mime_type(extension).unwrap_or("application/octet-stream");
-        q0android::export_finished(path, mime_type)
-    };
-    if let Err(error) = result {
+pub(super) fn export_finished(path: &Path) {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+    let mime_type = mime_type(extension).unwrap_or("application/octet-stream");
+    if let Err(error) = q0android::export_finished(path, mime_type) {
         eprintln!("could not pass {} on: {error}", path.display());
     }
 }

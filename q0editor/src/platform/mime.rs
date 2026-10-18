@@ -24,6 +24,7 @@ pub(crate) fn mime_type(extension: &str) -> Option<&'static str> {
         "gif" => "image/gif",
         "bmp" => "image/bmp",
         "mp4" => "video/mp4",
+        "zip" => "application/zip",
         // Audio apps disagree on these, so any audio will do.
         "wav" | "mp3" | "ogg" | "flac" => "audio/*",
         _ => return None,

@@ -605,8 +605,29 @@ impl Theme {
         visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, accent);
         visuals.widgets.active.rounding = Rounding::same(5.0);
         visuals.widgets.open = visuals.widgets.active;
+        // Soft shadows that fall straight down read as depth rather than as
+        // a dark smear off to one side.
+        let shadow = if dark { 90 } else { 45 };
+        visuals.window_shadow = egui::epaint::Shadow {
+            offset: egui::vec2(0.0, 8.0),
+            blur: 28.0,
+            spread: 0.0,
+            color: Color32::from_black_alpha(shadow),
+        };
+        visuals.popup_shadow = egui::epaint::Shadow {
+            offset: egui::vec2(0.0, 4.0),
+            blur: 14.0,
+            spread: 0.0,
+            color: Color32::from_black_alpha(shadow * 3 / 4),
+        };
 
         style.visuals = visuals;
+        // A touch longer than egui's default, so panels and headers open
+        // with a visible ease instead of a jump.
+        style.animation_time = 0.12;
+        // Labels are text to read. Selectable, a drag across one on a touch
+        // screen selected text instead of scrolling the panel.
+        style.interaction.selectable_labels = false;
         ctx.set_style(style);
     }
 }
@@ -1126,6 +1147,9 @@ pub struct Settings {
     pub new_project_fps: u16,
     #[serde(default = "default_new_project_frame_count")]
     pub new_project_frame_count: u16,
+    /// Opt-in physics editor. While off, nothing of it is shown.
+    #[serde(default)]
+    pub physics_enabled: bool,
 }
 
 fn default_q0lang_font_name() -> String {
@@ -1195,6 +1219,7 @@ impl Default for Settings {
             new_project_height: default_new_project_height(),
             new_project_fps: default_new_project_fps(),
             new_project_frame_count: default_new_project_frame_count(),
+            physics_enabled: false,
         }
     }
 }

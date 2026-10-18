@@ -906,9 +906,14 @@ fn build_q0rg(
                             }
                         }
                         RawElement::Text(text) => {
-                            if let Some(target) =
-                                text_asset(text, q0rg_name, project, next_asset_id, &mut warnings, &mut pending_text)?
-                            {
+                            if let Some(target) = text_asset(
+                                text,
+                                q0rg_name,
+                                project,
+                                next_asset_id,
+                                &mut warnings,
+                                &mut pending_text,
+                            )? {
                                 placements.push(Placement {
                                     instance_id: 0,
                                     frame: frame.index,
@@ -1254,21 +1259,28 @@ pub(crate) fn text_asset(
         return Ok(None);
     }
     let mut replacement = None;
-    let paths =
-        match text_paths(text) {
-            Ok(paths) => paths,
-            Err(error) => {
-                let fallback = crate::fonts::default_name().ok_or_else(|| ImportError::Invalid(
-                    format!("{owner_name}: {error}; no outline font is available for replacement")))?;
-                let mut source = text.clone();
-                source.font = fallback.to_string();
-                let paths = text_paths(&source).map_err(|fallback_error| ImportError::Invalid(
-                    format!("{owner_name}: {error}; fallback failed: {fallback_error}")))?;
-                warnings.push(format!("{owner_name}: {error}; text preserved using '{fallback}' pending font replacement"));
-                replacement = Some(fallback.to_string());
-                paths
-            }
-        };
+    let paths = match text_paths(text) {
+        Ok(paths) => paths,
+        Err(error) => {
+            let fallback = crate::fonts::default_name().ok_or_else(|| {
+                ImportError::Invalid(format!(
+                    "{owner_name}: {error}; no outline font is available for replacement"
+                ))
+            })?;
+            let mut source = text.clone();
+            source.font = fallback.to_string();
+            let paths = text_paths(&source).map_err(|fallback_error| {
+                ImportError::Invalid(format!(
+                    "{owner_name}: {error}; fallback failed: {fallback_error}"
+                ))
+            })?;
+            warnings.push(format!(
+                "{owner_name}: {error}; text preserved using '{fallback}' pending font replacement"
+            ));
+            replacement = Some(fallback.to_string());
+            paths
+        }
+    };
     if paths.is_empty() {
         return Ok(None);
     }
@@ -1280,7 +1292,11 @@ pub(crate) fn text_asset(
         stroke: None,
     }));
     if let Some(replacement) = replacement {
-        pending_text.push(crate::PendingText { asset_id: id, source: text.clone(), replacement });
+        pending_text.push(crate::PendingText {
+            asset_id: id,
+            source: text.clone(),
+            replacement,
+        });
     }
     Ok(Some(id))
 }
@@ -1303,7 +1319,10 @@ pub(crate) fn text_paths(text: &RawText) -> Result<Vec<VectorPath>, String> {
         }
     }
     if paths.is_empty() && !text.text.trim().is_empty() {
-        return Err(format!("Font '{}' produced no outlines for imported text", text.font));
+        return Err(format!(
+            "Font '{}' produced no outlines for imported text",
+            text.font
+        ));
     }
     Ok(paths)
 }

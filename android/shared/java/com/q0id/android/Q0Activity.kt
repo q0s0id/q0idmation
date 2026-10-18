@@ -6,7 +6,6 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
 import android.os.Process
-import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -49,7 +48,6 @@ abstract class Q0Activity : GameActivity() {
 
         private const val REQUEST_OPEN = 0x0501
         private const val REQUEST_CREATE = 0x0502
-        private const val REQUEST_FOLDER = 0x0503
     }
 
     private val surfaceOrigin = IntArray(2)
@@ -65,7 +63,6 @@ abstract class Q0Activity : GameActivity() {
 
     private var pickTag = EXTERNAL
     private var createdFor: String? = null
-    private var folderFor: String? = null
 
     private external fun nativeDocumentOpened(tag: Int, path: String)
     private external fun nativeDocumentFailed(tag: Int, message: String)
@@ -225,17 +222,6 @@ abstract class Q0Activity : GameActivity() {
         }
     }
 
-    /** Native side: an export of several files finished in the folder at [path]. */
-    @Suppress("unused")
-    fun exportFolderFinished(path: String) {
-        runOnUiThread {
-            folderFor = path
-            start(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), REQUEST_FOLDER) {
-                nativeStatus("this device has no folder picker; the frames stay inside the app")
-            }
-        }
-    }
-
     /** Native side: an MP4 writer for an export, see [Mp4Encoder]. */
     @Suppress("unused")
     fun createMp4Encoder(path: String, width: Int, height: Int, fps: Int, bitrate: Int): Any =
@@ -304,15 +290,6 @@ abstract class Q0Activity : GameActivity() {
                 } else {
                     keepAccess(document, data!!.flags)
                     files.execute { open(tag, document) }
-                }
-            }
-            REQUEST_FOLDER -> {
-                val path = folderFor ?: return
-                folderFor = null
-                if (document == null) {
-                    nativeStatus("kept inside the app only")
-                } else {
-                    files.execute { copyFolderOut(File(path), document) }
                 }
             }
             REQUEST_CREATE -> {
@@ -432,32 +409,6 @@ abstract class Q0Activity : GameActivity() {
      * Copies the files in [folder] into a new folder of the same name inside
      * the [tree] the person picked. Runs on [files].
      */
-    private fun copyFolderOut(folder: File, tree: Uri) {
-        try {
-            val parent = DocumentsContract.buildDocumentUriUsingTree(
-                tree,
-                DocumentsContract.getTreeDocumentId(tree)
-            )
-            val target = DocumentsContract.createDocument(
-                contentResolver,
-                parent,
-                DocumentsContract.Document.MIME_TYPE_DIR,
-                folder.name
-            ) ?: throw IOException("could not create the folder ${folder.name}")
-            val members = folder.listFiles().orEmpty().filter { it.isFile }.sortedBy { it.name }
-            for (member in members) {
-                val mimeType = MimeTypeMap.getSingleton().getMimeTypeFromExtension(member.extension)
-                    ?: "application/octet-stream"
-                val copy = DocumentsContract.createDocument(contentResolver, target, mimeType, member.name)
-                    ?: throw IOException("could not create ${member.name}")
-                openTruncated(copy).use { sink -> member.inputStream().use { it.copyTo(sink) } }
-            }
-            nativeStatus("saved ${members.size} files to ${folder.name}")
-        } catch (error: Exception) {
-            nativeStatus("could not save ${folder.name}: ${describe(error)}")
-        }
-    }
-
     /**
      * Opens [document] for a full rewrite. Plain "w" is not tried: some
      * providers leave the old tail in place after a shorter write with it.

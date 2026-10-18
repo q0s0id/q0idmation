@@ -694,14 +694,18 @@ impl Q0EncState {
                             job.state = JobState::Completed;
                             job.completed_units = job.total_units;
                             job.phase = "completed".to_string();
-                            crate::platform::export_finished(
-                                &path,
-                                format == ExportFormat::PngSequence,
-                            );
+                            let delivered = if format == ExportFormat::PngSequence
+                                && crate::platform::EXPORTS_IN_APP
+                            {
+                                sequence_zip_path(&path)
+                            } else {
+                                path.clone()
+                            };
+                            crate::platform::export_finished(&delivered);
                             statuses.push(format!(
                                 "q0enc exported {}: {}",
                                 format.label(),
-                                path.display()
+                                delivered.display()
                             ));
                         }
                         Ok(WorkerOutcome::Cancelled) => {
@@ -1063,8 +1067,7 @@ fn mp4_render_workers(options: &ExportOptions, total: u32) -> usize {
         .map(usize::from)
         .unwrap_or(1)
         .saturating_sub(1)
-        .max(1)
-        .min(4)
+        .clamp(1, 4)
         .min(memory_workers)
         .min(total.max(1) as usize)
 }
@@ -1278,6 +1281,16 @@ fn export_png_sequence(
     match result {
         Ok(WorkerOutcome::Completed) if job.options.sequence_create_subfolder => {
             match std::fs::rename(&staging, &job.output_path) {
+                // A phone saves one file far more reliably than a folder:
+                // Android's folder picker refuses Download and the storage
+                // root, and copies hundreds of files one by one. The frames
+                // leave the app as one zip that unpacks into the folder.
+                Ok(()) if crate::platform::EXPORTS_IN_APP => {
+                    progress(total, total, "packing the frames into one zip");
+                    let packed = pack_sequence_zip(&job.output_path, &filenames);
+                    let _ = std::fs::remove_dir_all(&job.output_path);
+                    packed.map(|()| WorkerOutcome::Completed)
+                }
                 Ok(()) => Ok(WorkerOutcome::Completed),
                 Err(error) => {
                     let _ = std::fs::remove_dir_all(&staging);
@@ -1527,6 +1540,48 @@ fn media_staging_path(target: &Path, job_id: u64, extension: &str) -> PathBuf {
             ".{name}.q0enc-{}-{job_id}.tmp.{extension}",
             std::process::id()
         ))
+}
+
+/// The zip a PNG sequence in `folder` is packed into: beside it, named after it.
+pub(crate) fn sequence_zip_path(folder: &Path) -> PathBuf {
+    let name = folder
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "frames".to_string());
+    folder.with_file_name(format!("{name}.zip"))
+}
+
+/// Packs the frames `filenames` of `folder` into [`sequence_zip_path`], under
+/// a folder of the same name. PNGs are compressed already, so they are stored.
+fn pack_sequence_zip(folder: &Path, filenames: &[String]) -> Result<(), String> {
+    let zip_path = sequence_zip_path(folder);
+    let folder_name = folder
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "frames".to_string());
+    let file = File::create(&zip_path).map_err(|error| format!("create the zip: {error}"))?;
+    let mut zip = zip::ZipWriter::new(std::io::BufWriter::new(file));
+    let options = zip::write::FileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored)
+        .large_file(true);
+    let result = (|| {
+        for filename in filenames {
+            let bytes = std::fs::read(folder.join(filename))
+                .map_err(|error| format!("read {filename}: {error}"))?;
+            zip.start_file(format!("{folder_name}/{filename}"), options)
+                .map_err(|error| format!("pack {filename}: {error}"))?;
+            zip.write_all(&bytes)
+                .map_err(|error| format!("pack {filename}: {error}"))?;
+        }
+        zip.finish()
+            .and_then(|mut writer| writer.flush().map_err(Into::into))
+            .map_err(|error| format!("finish the zip: {error}"))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&zip_path);
+    }
+    result
 }
 
 fn sequence_staging_path(target: &Path, job_id: u64) -> PathBuf {
@@ -2172,6 +2227,30 @@ mod tests {
         assert!(matches!(outcome, WorkerOutcome::Cancelled));
         assert!(!output.exists());
         assert!(!sequence_staging_path(&output, job.id).exists());
+    }
+
+    #[test]
+    fn png_sequences_pack_into_one_zip_of_their_folder() {
+        let root = std::env::temp_dir().join(format!("q0enc-zip-{}", std::process::id()));
+        let folder = root.join("walk-frames");
+        std::fs::create_dir_all(&folder).unwrap();
+        let names = ["walk_0001.png".to_string(), "walk_0002.png".to_string()];
+        for (index, name) in names.iter().enumerate() {
+            std::fs::write(folder.join(name), [index as u8; 3]).unwrap();
+        }
+        pack_sequence_zip(&folder, &names).unwrap();
+        let zip_path = sequence_zip_path(&folder);
+        assert_eq!(zip_path, root.join("walk-frames.zip"));
+        let mut archive = zip::ZipArchive::new(File::open(&zip_path).unwrap()).unwrap();
+        assert_eq!(archive.len(), 2);
+        for (index, name) in names.iter().enumerate() {
+            let mut entry = archive.by_index(index).unwrap();
+            assert_eq!(entry.name(), format!("walk-frames/{name}"));
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, vec![index as u8; 3]);
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

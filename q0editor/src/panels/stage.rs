@@ -231,6 +231,10 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         .max(ZOOM_MIN);
 
     handle_viewport_input(app, &response, canvas_rect, fit_scale, ui.ctx());
+    let frame_time = ui.ctx().input(|input| input.predicted_dt);
+    if app.session.viewport.step_glide(frame_time) {
+        ui.ctx().request_repaint();
+    }
 
     let scale = (fit_scale * app.session.viewport.zoom).clamp(ZOOM_MIN, fit_scale * ZOOM_MAX);
     let scaled = vec2(stage_w * scale, stage_h * scale);
@@ -326,6 +330,11 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         .filter_map(|(outlined_q0rg, layer_id)| (*outlined_q0rg == q0rg_id).then_some(*layer_id))
         .collect::<std::collections::HashSet<_>>();
     let text_preview = crate::text_tool::scene_preview(app, &ctx);
+    // A running physics preview draws its baked copy of the project instead.
+    let physics_preview = text_preview
+        .is_none()
+        .then(|| crate::physics::stage_preview(app))
+        .flatten();
     let preview_state_id = egui::Id::new("painted_text_scene_preview");
     let previous_preview = ctx.data(|data| data.get_temp::<(u64, u16)>(preview_state_id));
     let current_preview = text_preview.as_ref().map(|p| (p.revision, p.asset_id));
@@ -369,7 +378,9 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         app.active_project_tab_id().unwrap_or(0),
         text_preview
             .as_ref()
-            .map_or(app.state.render_revision(), |p| p.revision),
+            .map(|p| p.revision)
+            .or(physics_preview.as_ref().map(|(_, revision)| *revision))
+            .unwrap_or(app.state.render_revision()),
     );
     let hidden_mask_art_layers = app
         .session
@@ -392,7 +403,11 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     let render_pass = StageRenderPass::new_with_revision(
         text_preview
             .as_ref()
-            .map_or(&app.state.project, |p| p.project.as_ref()),
+            .map(|p| p.project.as_ref())
+            .or(physics_preview
+                .as_ref()
+                .map(|(project, _)| project.as_ref()))
+            .unwrap_or(&app.state.project),
         &mut app.textures,
         Some(render_revision),
     );
@@ -1110,6 +1125,7 @@ fn handle_viewport_input(
     if app.session.viewport.panning {
         let d = ctx.input(|i| i.pointer.delta());
         if d != egui::Vec2::ZERO {
+            app.session.viewport.glide = None;
             app.session.viewport.pan.x += d.x;
             app.session.viewport.pan.y += d.y;
         }
@@ -1158,6 +1174,7 @@ fn touch_navigation(
         gesture.travel +=
             touch.translation_delta.length() + touch.zoom_delta.ln().abs() * canvas_rect.width();
         let center = gesture.center;
+        app.session.viewport.glide = None;
         app.session.viewport.pan.x += touch.translation_delta.x;
         app.session.viewport.pan.y += touch.translation_delta.y;
         if touch.zoom_delta != 1.0 {
@@ -1241,6 +1258,7 @@ pub fn zoom_around(
 ) {
     let stage_w = app.state.project.meta.stage_width as f32;
     let stage_h = app.state.project.meta.stage_height as f32;
+    app.session.viewport.glide = None;
 
     let old_zoom = app.session.viewport.zoom;
     let scale_old = (fit_scale * old_zoom).clamp(ZOOM_MIN, fit_scale * ZOOM_MAX);

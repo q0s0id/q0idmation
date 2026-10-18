@@ -55,6 +55,14 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     app.queue(Action::ToggleQ0Enc);
                 }
             }
+            if app.settings.physics_enabled && app.has_active_project() && !app.home_visible() {
+                let physics_resp = ui
+                    .selectable_label(app.session.physics.open, "Physics")
+                    .on_hover_text("Open or close the physics editor");
+                if physics_resp.clicked() {
+                    app.queue(Action::TogglePhysics);
+                }
+            }
             let q0fla_resp = ui
                 .selectable_label(app.q0fla_open, "q0fla")
                 .on_hover_text("Open or close the FLA/XFL import workshop");
@@ -343,6 +351,16 @@ pub fn menus(app: &mut EditorApp, ui: &mut Ui) {
             {
                 app.queue(Action::BreakApartSelection);
                 ui.close_menu();
+            }
+            if app.settings.physics_enabled {
+                ui.separator();
+                if ui
+                    .selectable_label(app.session.physics.open, "Physics...")
+                    .clicked()
+                {
+                    app.queue(Action::TogglePhysics);
+                    ui.close_menu();
+                }
             }
         });
 

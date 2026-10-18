@@ -22,6 +22,7 @@ pub mod launch;
 pub mod library_transfer;
 pub mod panels;
 pub mod perf;
+pub mod physics;
 pub mod platform;
 pub mod q0enc;
 pub mod q0lang;

@@ -1,5 +1,6 @@
 //! The open palette owns outside clicks: pick a displayed screen pixel, then close.
 use egui::{Color32, Context, Id, Key, Pos2, Rect, Response, Sense, Ui};
+#[cfg(windows)]
 use std::sync::Arc;
 
 pub(crate) type PickerScope = (Option<u64>, u16);

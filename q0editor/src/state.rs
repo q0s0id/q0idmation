@@ -846,6 +846,9 @@ pub struct Viewport {
     /// Active hand interaction: permanent Hand tool or temporary Space override.
     pub hand_active: bool,
     pub touch: TouchGesture,
+    /// Zoom and pan a zoom command is gliding towards; any hands-on
+    /// navigation stops it where it is.
+    pub glide: Option<(f32, Vec2)>,
 }
 
 /// Several fingers on the canvas at once, from the first touch to the last
@@ -869,7 +872,49 @@ impl Viewport {
             panning: false,
             hand_active: false,
             touch: TouchGesture::default(),
+            glide: None,
         }
+    }
+
+    /// Zooms by `factor` around the middle of the view, gliding there.
+    /// Presses in quick succession add up. Returns the zoom it heads for.
+    pub fn glide_zoom(&mut self, factor: f32) -> f32 {
+        let (zoom, pan) = self.glide.unwrap_or((self.zoom, self.pan));
+        let target = (zoom * factor).clamp(0.05, 32.0);
+        // The stage point in the middle of the view stays put when the pan,
+        // measured in screen pixels, grows with the zoom.
+        let keep = target / zoom;
+        self.glide = Some((target, Vec2::new(pan.x * keep, pan.y * keep)));
+        target
+    }
+
+    /// Glides back to the fitted, centred view.
+    pub fn glide_home(&mut self) {
+        self.glide = Some((1.0, Vec2::new(0.0, 0.0)));
+    }
+
+    /// Moves one frame of `dt` seconds along a glide. True while it still
+    /// has a way to go.
+    pub fn step_glide(&mut self, dt: f32) -> bool {
+        let Some((zoom, pan)) = self.glide else {
+            return false;
+        };
+        // Eases out over roughly a sixth of a second at any frame rate.
+        let t = 1.0 - (-dt.clamp(0.001, 0.05) * 18.0).exp();
+        self.zoom = (self.zoom.ln() + (zoom.ln() - self.zoom.ln()) * t).exp();
+        self.pan = Vec2::new(
+            self.pan.x + (pan.x - self.pan.x) * t,
+            self.pan.y + (pan.y - self.pan.y) * t,
+        );
+        let arrived = (self.zoom / zoom - 1.0).abs() < 0.002
+            && (pan.x - self.pan.x).abs() < 0.5
+            && (pan.y - self.pan.y).abs() < 0.5;
+        if arrived {
+            self.zoom = zoom;
+            self.pan = pan;
+            self.glide = None;
+        }
+        !arrived
     }
 }
 
@@ -1023,6 +1068,8 @@ pub struct Session {
     /// Rigging uses one project/runtime model; this is only the editor presentation mode.
     pub rig_mode: RigMode,
     pub rig_edit_mode: RigEditMode,
+    /// Physics editor window and preview; hidden unless enabled in Settings.
+    pub physics: crate::physics::PhysicsSession,
     pub rig_auto_key: bool,
     pub rig_selected_node: Option<u16>,
     pub rig_selected_control: Option<u16>,
@@ -1256,6 +1303,7 @@ impl Session {
             brush_cap: CapShape::Round,
             rig_mode: RigMode::Simple,
             rig_edit_mode: RigEditMode::Pose,
+            physics: Default::default(),
             rig_auto_key: true,
             rig_selected_node: None,
             rig_selected_control: None,

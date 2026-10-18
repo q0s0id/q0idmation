@@ -127,7 +127,9 @@ pub const Q1S_VERSION_Q0RG_SPEED: u16 = 37;
 pub const Q1S_VERSION_SHARED_MEDIA: u16 = 38;
 /// Shape tweens: a keyframe's vector artwork morphs into the next keyframe's.
 pub const Q1S_VERSION_SHAPE_TWEENS: u16 = 39;
-pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_SHAPE_TWEENS;
+/// v40: physics setups, appended after library folders.
+pub const Q1S_VERSION_PHYSICS: u16 = 40;
+pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_PHYSICS;
 /// Kept as an alias so external code that imported the v2-era constant keeps
 /// compiling. It now means "the current write-out version".
 pub const Q1S_V2_VERSION: u16 = Q1S_VERSION_CURRENT;
@@ -1734,6 +1736,9 @@ pub struct ProjectRuntimeData {
     pub library_folders: Vec<String>,
     /// Library item placement within a folder. Missing entries belong to root.
     pub library_item_folders: HashMap<LibraryItemReference, String>,
+    /// Physics setups. Simulations are baked into keyframes, so players
+    /// never need this.
+    pub physics: crate::physics::PhysicsData,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -4506,7 +4511,9 @@ impl MediaPayloads {
 }
 
 pub fn write(project: &ProjectV2) -> Result<Vec<u8>, Error> {
-    let version = if uses_shape_tweens(project) {
+    let version = if !project.runtime.physics.is_empty() {
+        Q1S_VERSION_PHYSICS
+    } else if uses_shape_tweens(project) {
         Q1S_VERSION_SHAPE_TWEENS
     } else if !shared_media_references(project).is_empty() {
         Q1S_VERSION_SHARED_MEDIA
@@ -4665,8 +4672,14 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
         && version != Q1S_VERSION_Q0RG_SPEED
         && version != Q1S_VERSION_SHARED_MEDIA
         && version != Q1S_VERSION_SHAPE_TWEENS
+        && version != Q1S_VERSION_PHYSICS
     {
         return Err(Error::UnsupportedVersion(version));
+    }
+    if version < Q1S_VERSION_PHYSICS && !project.runtime.physics.is_empty() {
+        return Err(Error::Validation(
+            "legacy q1s versions cannot store physics",
+        ));
     }
     if version < Q1S_VERSION_LAYER_FOLDERS && !project.layer_metadata.is_empty() {
         return Err(Error::Validation(
@@ -5330,6 +5343,9 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
             }
             write_string_u16(&mut out, path)?;
         }
+    }
+    if version >= Q1S_VERSION_PHYSICS {
+        crate::physics::write(&mut out, &project.runtime.physics)?;
     }
     Ok(out)
 }
@@ -6294,6 +6310,7 @@ pub fn parse(bytes: &[u8]) -> Result<ProjectV2, Error> {
         && version != Q1S_VERSION_Q0RG_SPEED
         && version != Q1S_VERSION_SHARED_MEDIA
         && version != Q1S_VERSION_SHAPE_TWEENS
+        && version != Q1S_VERSION_PHYSICS
     {
         return Err(Error::UnsupportedVersion(version));
     }
@@ -6719,6 +6736,9 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
                 return Err(Error::Validation("duplicate library item folder entry"));
             }
         }
+    }
+    if version >= Q1S_VERSION_PHYSICS {
+        runtime.physics = crate::physics::read(&mut c)?;
     }
     c.finish()?;
 
@@ -7518,6 +7538,39 @@ mod compatibility_tests {
             .write_audio_pcm_i16(&vec![0; SAMPLE_FRAMES * 2])
             .expect("audio q0v pcm");
         writer.finish().expect("finish audio q0v").into_inner()
+    }
+
+    #[test]
+    fn physics_survives_a_q1s_round_trip() {
+        let mut project = legacy_project();
+        let q0rg = project.meta.entry_q0rg_id;
+        let mut scene = crate::physics::PhysicsScene::new(q0rg);
+        scene.gravity = [12.0, -300.0];
+        scene.walls = crate::physics::WALLS_ALL;
+        project.runtime.physics.scenes.push(scene);
+        let mut body = crate::physics::PhysicsBody::new(q0rg, 9);
+        body.kind = crate::physics::BodyKind::Animated;
+        body.shape = crate::physics::ColliderShape::Circle;
+        body.group = 4;
+        body.fixed_rotation = true;
+        body.momentum = crate::physics::Momentum::Manual {
+            velocity: [100.0, -50.0],
+            spin: 90.0,
+        };
+        project.runtime.physics.bodies.push(body);
+        project
+            .runtime
+            .physics
+            .bodies
+            .push(crate::physics::PhysicsBody::new(q0rg, 10));
+
+        let bytes = write(&project).unwrap();
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            Q1S_VERSION_PHYSICS
+        );
+        let parsed = parse(&bytes).unwrap();
+        assert_eq!(parsed.runtime.physics, project.runtime.physics);
     }
 
     fn legacy_project() -> ProjectV2 {

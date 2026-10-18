@@ -838,6 +838,7 @@ pub enum Action {
     ToggleCredits,
     ToggleSettings,
     ToggleProjectTree,
+    TogglePhysics,
     ZoomIn,
     ZoomOut,
     ZoomReset,
@@ -969,6 +970,7 @@ impl Action {
             Self::ToggleCredits => "toggle-credits",
             Self::ToggleSettings => "toggle-settings",
             Self::ToggleProjectTree => "toggle-project-tree",
+            Self::TogglePhysics => "toggle-physics",
             Self::ZoomIn => "zoom-in",
             Self::ZoomOut => "zoom-out",
             Self::ZoomReset => "zoom-reset",
@@ -4647,20 +4649,33 @@ impl EditorApp {
             Action::ToggleProjectTree => {
                 self.show_project_tree = !self.show_project_tree;
             }
+            Action::TogglePhysics => {
+                let physics = &mut self.session.physics;
+                if self.settings.physics_enabled {
+                    physics.open = !physics.open;
+                    if !physics.open {
+                        physics.stop_preview();
+                    }
+                } else {
+                    physics.open = false;
+                    self.session.status =
+                        "turn on the physics editor in Settings first".to_string();
+                }
+            }
             Action::ZoomIn => {
-                let z = (self.session.viewport.zoom * 1.25).clamp(0.05, 32.0);
-                self.session.viewport.zoom = z;
+                let z = self.session.viewport.glide_zoom(1.25);
                 self.session.status = format!("zoom {:.0}%", z * 100.0);
+                ctx.request_repaint();
             }
             Action::ZoomOut => {
-                let z = (self.session.viewport.zoom / 1.25).clamp(0.05, 32.0);
-                self.session.viewport.zoom = z;
+                let z = self.session.viewport.glide_zoom(1.0 / 1.25);
                 self.session.status = format!("zoom {:.0}%", z * 100.0);
+                ctx.request_repaint();
             }
             Action::ZoomReset => {
-                self.session.viewport.zoom = 1.0;
-                self.session.viewport.pan = q0s_format::v2::Vec2::new(0.0, 0.0);
+                self.session.viewport.glide_home();
                 self.session.status = "zoom 100% (fit)".to_string();
+                ctx.request_repaint();
             }
             Action::CopySelection => {
                 if self.session.pending_timeline_frame.is_some()
@@ -11438,6 +11453,21 @@ impl EditorApp {
                         .color(self.settings.theme.text_dim.to_color32()));
                 }
                 ui.add_space(10.0);
+                crate::theme::section_heading(ui, "Extra tools", "Bigger features that stay out of sight until you turn them on");
+                if ui
+                    .checkbox(&mut self.settings.physics_enabled, "Physics editor")
+                    .on_hover_text("Objects fall, bounce and collide, and the result is baked into keyframes. Adds Modify > Physics and a Physics button.")
+                    .changed()
+                {
+                    if !self.settings.physics_enabled {
+                        self.session.physics.open = false;
+                        self.session.physics.stop_preview();
+                    }
+                    if let Err(error) = self.settings.try_save() {
+                        self.session.status = format!("could not save the physics preference: {error}");
+                    }
+                }
+                ui.add_space(10.0);
                 crate::theme::section_heading(ui, "Appearance", "Choose a palette. Every panel follows your theme.");
                 ui.horizontal_wrapped(|ui| {
                     for preset in Theme::PRESETS {
@@ -12026,7 +12056,8 @@ impl EditorApp {
                 let missing = imported.missing_fonts();
                 if !missing.is_empty() {
                     if job.font_dialog.is_none() {
-                        job.font_dialog = Some(crate::font_replacement::FontReplacementDialog::new(missing));
+                        job.font_dialog =
+                            Some(crate::font_replacement::FontReplacementDialog::new(missing));
                     }
                     return;
                 }
@@ -12083,8 +12114,12 @@ impl EditorApp {
     }
 
     fn render_fla_font_dialog(&mut self, ctx: &Context) -> bool {
-        let Some(job) = self.fla_import_job.as_mut() else { return false; };
-        let Some(dialog) = job.font_dialog.as_mut() else { return false; };
+        let Some(job) = self.fla_import_job.as_mut() else {
+            return false;
+        };
+        let Some(dialog) = job.font_dialog.as_mut() else {
+            return false;
+        };
         match dialog.show(ctx, true) {
             Some(crate::font_replacement::DialogAction::Apply(choices)) => {
                 if let Some(Ok(imported)) = job.completed.as_mut() {
@@ -13570,6 +13605,7 @@ impl EditorApp {
         if self.session.show_settings {
             self.render_settings_dialog(ctx);
         }
+        crate::physics::render_window(self, ctx);
         if self.session.show_shortcuts {
             self.render_shortcuts_dialog(ctx);
         }
@@ -13652,8 +13688,16 @@ impl EditorApp {
         if self.media_import_job.is_some() {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
-        if self.session.playing || self.q0enc.queue_running {
+        if self.session.playing {
+            // Measured: sleeping between playback frames saved ~10% of the
+            // draws on Windows, whose coarse timers then made frames late.
             ctx.request_repaint();
+        }
+        if self.q0enc.queue_running {
+            // Progress needs a few updates a second, not one per screen
+            // refresh: every frame drawn here is time the export worker,
+            // and on a phone its share of the heat budget, does not get.
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
         crate::color_picker::finish_frame(ctx);
         self.perf.finish_frame();
@@ -15554,6 +15598,24 @@ mod tests {
         assert!(app.history.can_undo());
         q0s_format::v2::validate(&app.state.project).expect("clipboard bitmap paste remains valid");
     }
+    #[test]
+    fn physics_editor_stays_hidden_until_enabled() {
+        assert!(!crate::settings::Settings::default().physics_enabled);
+        let mut app = EditorApp::default();
+        app.settings.physics_enabled = false;
+        app.handle(&Context::default(), Action::TogglePhysics);
+        assert!(
+            !app.session.physics.open,
+            "no window while the feature is off"
+        );
+
+        app.settings.physics_enabled = true;
+        app.handle(&Context::default(), Action::TogglePhysics);
+        assert!(app.session.physics.open);
+        app.handle(&Context::default(), Action::TogglePhysics);
+        assert!(!app.session.physics.open);
+    }
+
     #[test]
     fn project_tree_window_is_independent_from_settings_and_credits() {
         let mut app = EditorApp::default();

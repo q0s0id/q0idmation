@@ -280,37 +280,78 @@ pub fn display_name(name: &str) -> Option<String> {
 pub(crate) fn missing_fonts(project: &ProjectV2) -> Vec<q0fla::MissingFont> {
     let mut rows = std::collections::BTreeMap::<String, q0fla::MissingFont>::new();
     for asset in &project.assets {
-        let Asset::Vector(vector) = asset else { continue; };
-        let Some(source) = project.asset_names.get(&vector.asset_id).and_then(|name| decode_text_source(name)) else { continue; };
-        if q0fla::fonts::find(&source.font).is_some() { continue; }
-        rows.entry(source.font.to_lowercase()).or_insert_with(|| q0fla::MissingFont {
-            name: source.font,
-            replacement: q0fla::fonts::default_name().unwrap_or_default().to_string(),
-            text_count: 0,
-        }).text_count += 1;
+        let Asset::Vector(vector) = asset else {
+            continue;
+        };
+        let Some(source) = project
+            .asset_names
+            .get(&vector.asset_id)
+            .and_then(|name| decode_text_source(name))
+        else {
+            continue;
+        };
+        if q0fla::fonts::find(&source.font).is_some() {
+            continue;
+        }
+        rows.entry(source.font.to_lowercase())
+            .or_insert_with(|| q0fla::MissingFont {
+                name: source.font,
+                replacement: q0fla::fonts::default_name().unwrap_or_default().to_string(),
+                text_count: 0,
+            })
+            .text_count += 1;
     }
     rows.into_values().collect()
 }
 
-pub(crate) fn replace_missing_fonts(app: &mut EditorApp, choices: &std::collections::BTreeMap<String, String>) -> Result<(), String> {
+pub(crate) fn replace_missing_fonts(
+    app: &mut EditorApp,
+    choices: &std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
     let mut prepared = Vec::new();
     for (index, asset) in app.state.project.assets.iter().enumerate() {
-        let Asset::Vector(vector) = asset else { continue; };
-        let Some(mut source) = app.state.project.asset_names.get(&vector.asset_id).and_then(|name| decode_text_source(name)) else { continue; };
-        let Some((_, replacement)) = choices.iter().find(|(name, _)| name.eq_ignore_ascii_case(&source.font)) else { continue; };
-        let (bytes, face) = q0fla::fonts::load(replacement).ok_or_else(|| format!("Font '{replacement}' is unavailable"))?;
+        let Asset::Vector(vector) = asset else {
+            continue;
+        };
+        let Some(mut source) = app
+            .state
+            .project
+            .asset_names
+            .get(&vector.asset_id)
+            .and_then(|name| decode_text_source(name))
+        else {
+            continue;
+        };
+        let Some((_, replacement)) = choices
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&source.font))
+        else {
+            continue;
+        };
+        let (bytes, face) = q0fla::fonts::load(replacement)
+            .ok_or_else(|| format!("Font '{replacement}' is unavailable"))?;
         let paths = outline_text(&bytes, face, &source.text, source.size)?;
         if paths.is_empty() && !source.text.trim().is_empty() {
-            return Err(format!("Font '{replacement}' has no outlines for this text"));
+            return Err(format!(
+                "Font '{replacement}' has no outlines for this text"
+            ));
         }
         source.font = replacement.clone();
-        let name = format!("{FONT_SOURCE_PREFIX}{}", serde_json::to_string(&source).map_err(|error| error.to_string())?);
+        let name = format!(
+            "{FONT_SOURCE_PREFIX}{}",
+            serde_json::to_string(&source).map_err(|error| error.to_string())?
+        );
         prepared.push((index, vector.asset_id, paths, name));
     }
-    if prepared.is_empty() { return Ok(()); }
-    app.history.snapshot_with_session(&app.state.project, &app.session);
+    if prepared.is_empty() {
+        return Ok(());
+    }
+    app.history
+        .snapshot_with_session(&app.state.project, &app.session);
     for (index, id, paths, name) in prepared {
-        if let Asset::Vector(vector) = &mut app.state.project.assets[index] { vector.paths = paths; }
+        if let Asset::Vector(vector) = &mut app.state.project.assets[index] {
+            vector.paths = paths;
+        }
         app.state.project.asset_names.insert(id, name);
     }
     app.session.text_inspector = None;

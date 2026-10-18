@@ -684,7 +684,7 @@ fn output_label(format: ExportFormat) -> &'static str {
 /// the place comes from the system picker once the export is done.
 fn in_app_output(ui: &mut egui::Ui, state: &mut Q0EncState, dim: egui::Color32) {
     let note = if state.selected_format == ExportFormat::PngSequence {
-        "when the frames are ready, you pick a folder to save them in."
+        "when the frames are ready they are packed into one zip, and you pick where to save it."
     } else {
         let output = Path::new(state.output_text.trim()).to_path_buf();
         let mut name = output

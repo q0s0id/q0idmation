@@ -4,6 +4,7 @@ mod io;
 pub mod migrate;
 pub mod model;
 pub mod parser;
+pub mod physics;
 pub mod q0lang;
 pub mod q0s_v2;
 pub mod q0s_writer;

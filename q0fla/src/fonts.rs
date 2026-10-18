@@ -1,9 +1,5 @@
 //! Installed outline fonts, including per-user fonts and collection faces.
-use std::{
-    collections::BTreeSet,
-    path::PathBuf,
-    sync::OnceLock,
-};
+use std::{collections::BTreeSet, path::PathBuf, sync::OnceLock};
 
 #[derive(Debug, Clone)]
 pub struct InstalledFont {
@@ -121,20 +117,49 @@ fn scan() -> Vec<InstalledFont> {
                 // Animate stores PostScript face names (e.g. MicrosoftTaiLe),
                 // while Windows pickers display full names with spaces.
                 // Keep all localized/full/PostScript aliases of this face.
-                let mut aliases: Vec<String> = face.names().into_iter()
-                    .filter(|n| matches!(n.name_id, ttf_parser::name_id::FULL_NAME | ttf_parser::name_id::POST_SCRIPT_NAME))
+                let mut aliases: Vec<String> = face
+                    .names()
+                    .into_iter()
+                    .filter(|n| {
+                        matches!(
+                            n.name_id,
+                            ttf_parser::name_id::FULL_NAME | ttf_parser::name_id::POST_SCRIPT_NAME
+                        )
+                    })
                     .filter_map(|n| n.to_string())
                     .map(|n| normalized_name(&n))
                     .collect();
-                let regular = face.names().into_iter()
-                    .filter(|n| matches!(n.name_id, ttf_parser::name_id::SUBFAMILY | ttf_parser::name_id::TYPOGRAPHIC_SUBFAMILY))
+                let regular = face
+                    .names()
+                    .into_iter()
+                    .filter(|n| {
+                        matches!(
+                            n.name_id,
+                            ttf_parser::name_id::SUBFAMILY
+                                | ttf_parser::name_id::TYPOGRAPHIC_SUBFAMILY
+                        )
+                    })
                     .filter_map(|n| n.to_string())
-                    .any(|n| matches!(n.to_lowercase().as_str(), "regular" | "normal" | "roman" | "book"));
+                    .any(|n| {
+                        matches!(
+                            n.to_lowercase().as_str(),
+                            "regular" | "normal" | "roman" | "book"
+                        )
+                    });
                 if regular {
-                    aliases.extend(face.names().into_iter()
-                        .filter(|n| matches!(n.name_id, ttf_parser::name_id::FAMILY | ttf_parser::name_id::TYPOGRAPHIC_FAMILY))
-                        .filter_map(|n| n.to_string())
-                        .map(|n| normalized_name(&n)));
+                    aliases.extend(
+                        face.names()
+                            .into_iter()
+                            .filter(|n| {
+                                matches!(
+                                    n.name_id,
+                                    ttf_parser::name_id::FAMILY
+                                        | ttf_parser::name_id::TYPOGRAPHIC_FAMILY
+                                )
+                            })
+                            .filter_map(|n| n.to_string())
+                            .map(|n| normalized_name(&n)),
+                    );
                 }
                 aliases.sort();
                 aliases.dedup();
@@ -158,13 +183,17 @@ pub fn installed() -> &'static [InstalledFont] {
 }
 
 fn normalized_name(name: &str) -> String {
-    name.chars().filter(|c| !c.is_whitespace() && *c != '-' && *c != '_')
-        .flat_map(char::to_lowercase).collect()
+    name.chars()
+        .filter(|c| !c.is_whitespace() && *c != '-' && *c != '_')
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 pub fn find(name: &str) -> Option<&'static InstalledFont> {
     let fonts = installed();
-    fonts.iter().find(|font| font.name.eq_ignore_ascii_case(name.trim()))
+    fonts
+        .iter()
+        .find(|font| font.name.eq_ignore_ascii_case(name.trim()))
         .or_else(|| {
             let key = normalized_name(name);
             fonts.iter().find(|font| font.aliases.contains(&key))
@@ -173,11 +202,22 @@ pub fn find(name: &str) -> Option<&'static InstalledFont> {
 
 pub fn load(name: &str) -> Option<(Vec<u8>, u32)> {
     let font = find(name)?;
-    std::fs::read(&font.path).ok().map(|bytes| (bytes, font.index))
+    std::fs::read(&font.path)
+        .ok()
+        .map(|bytes| (bytes, font.index))
 }
 
 pub fn default_name() -> Option<&'static str> {
-    ["Segoe UI", "Arial", "Tahoma", "DejaVu Sans", "Liberation Sans", "Roboto"].iter()
-        .find_map(|name| find(name)).or_else(|| installed().first())
-        .map(|font| font.name.as_str())
+    [
+        "Segoe UI",
+        "Arial",
+        "Tahoma",
+        "DejaVu Sans",
+        "Liberation Sans",
+        "Roboto",
+    ]
+    .iter()
+    .find_map(|name| find(name))
+    .or_else(|| installed().first())
+    .map(|font| font.name.as_str())
 }

@@ -442,7 +442,7 @@ fn create_variant_set_from_selection(
     Ok(variant_id)
 }
 
-fn target_label(project: &ProjectV2, target: Target) -> String {
+pub(crate) fn target_label(project: &ProjectV2, target: Target) -> String {
     match target {
         Target::Asset(id) => project
             .asset_names
@@ -799,7 +799,7 @@ fn selected_active_occurrence(
     None
 }
 
-fn ensure_selected_track_instance_id(
+pub(crate) fn ensure_selected_track_instance_id(
     project: &mut ProjectV2,
     q0rg_id: u16,
     layer_id: u16,

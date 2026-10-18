@@ -247,22 +247,6 @@ pub fn export_finished(path: &Path, mime_type: &str) -> Result<(), String> {
     })
 }
 
-/// Tells the activity that an export of several files finished in the
-/// folder at `path`. The person picks a folder to copy it into.
-pub fn export_folder_finished(path: &Path) -> Result<(), String> {
-    let path = path_text(path)?;
-    with_activity(|env, activity| {
-        let path = env.new_string(path)?;
-        env.call_method(
-            activity,
-            "exportFolderFinished",
-            "(Ljava/lang/String;)V",
-            &[JValue::Object(&path)],
-        )?;
-        Ok(())
-    })
-}
-
 /// An MP4 file written by the device's own H.264 encoder, one frame at a
 /// time. Dropping it before [`Mp4Encoder::finish`] abandons the file.
 pub struct Mp4Encoder {
