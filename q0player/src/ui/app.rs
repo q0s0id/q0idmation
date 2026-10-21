@@ -675,8 +675,7 @@ impl App for PlayerApp {
         let was_playing = self
             .player
             .as_ref()
-            .map(|p| p.is_playing())
-            .unwrap_or(false);
+            .is_some_and(|p| p.is_playing() || p.has_live_effects());
         self.maybe_advance();
         let keep_awake = was_playing || game_input_active;
         if keep_awake != self.screen_kept_on {
@@ -1110,6 +1109,19 @@ impl PlayerApp {
                                     player.rig_runtime_overrides(),
                                     player.scene_runtime(),
                                 );
+                                let live = player.live_draws();
+                                if !live.is_empty() {
+                                    crate::ui::render::paint_live_draws(
+                                        &painter,
+                                        ctx,
+                                        project,
+                                        canvas_rect,
+                                        &mut self.v2_textures,
+                                        &live,
+                                        player.rig_runtime_overrides(),
+                                        player.scene_runtime(),
+                                    );
+                                }
                             }
                         }
                     }

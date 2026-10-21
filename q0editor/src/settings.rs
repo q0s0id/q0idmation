@@ -18,7 +18,7 @@ use crate::brush::{BrushNib, BrushSettings};
 use crate::easing::EasingPreset;
 use crate::hotkeys::HotkeySettings;
 use crate::l10n::Language;
-use q0s_format::geom::CapShape;
+use q0s_format::geom::{CapShape, JoinShape};
 use q0s_format::v2::Rgba;
 
 const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
@@ -618,7 +618,7 @@ impl Theme {
             offset: egui::vec2(0.0, 4.0),
             blur: 14.0,
             spread: 0.0,
-            color: Color32::from_black_alpha(shadow * 3 / 4),
+            color: Color32::from_black_alpha(shadow / 4 * 3),
         };
 
         style.visuals = visuals;
@@ -783,6 +783,7 @@ fn store_q7s_backdrop(bytes: &[u8], extension: &str) -> std::io::Result<PathBuf>
 pub enum BrushCap {
     Round,
     Butt,
+    Square,
 }
 
 impl From<BrushCap> for CapShape {
@@ -790,6 +791,7 @@ impl From<BrushCap> for CapShape {
         match b {
             BrushCap::Round => CapShape::Round,
             BrushCap::Butt => CapShape::Butt,
+            BrushCap::Square => CapShape::Square,
         }
     }
 }
@@ -798,6 +800,35 @@ impl From<CapShape> for BrushCap {
         match c {
             CapShape::Round => BrushCap::Round,
             CapShape::Butt => BrushCap::Butt,
+            CapShape::Square => BrushCap::Square,
+        }
+    }
+}
+
+/// Serde mirror of [`JoinShape`]: how new strokes turn their corners.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum BrushJoin {
+    Miter,
+    #[default]
+    Round,
+    Bevel,
+}
+
+impl From<BrushJoin> for JoinShape {
+    fn from(join: BrushJoin) -> Self {
+        match join {
+            BrushJoin::Miter => JoinShape::Miter,
+            BrushJoin::Round => JoinShape::Round,
+            BrushJoin::Bevel => JoinShape::Bevel,
+        }
+    }
+}
+impl From<JoinShape> for BrushJoin {
+    fn from(join: JoinShape) -> Self {
+        match join {
+            JoinShape::Miter => BrushJoin::Miter,
+            JoinShape::Round => BrushJoin::Round,
+            JoinShape::Bevel => BrushJoin::Bevel,
         }
     }
 }
@@ -1091,6 +1122,9 @@ pub struct Settings {
     #[serde(default = "default_autosave_interval_secs")]
     pub autosave_interval_secs: u32,
     pub brush_cap: BrushCap,
+    /// Corners of new strokes.
+    #[serde(default)]
+    pub brush_join: BrushJoin,
     #[serde(default)]
     pub brush: BrushPreferences,
     /// Freehand pencil smoothing, independent of brush settings.
@@ -1150,6 +1184,15 @@ pub struct Settings {
     /// Opt-in physics editor. While off, nothing of it is shown.
     #[serde(default)]
     pub physics_enabled: bool,
+    /// Opt-in particle system. While off, nothing of it is shown.
+    #[serde(default)]
+    pub particles_enabled: bool,
+    /// Opt-in light editor. While off its window and gizmos stay hidden;
+    /// lights a project already has still shine.
+    #[serde(default)]
+    pub light_enabled: bool,
+    #[serde(default)]
+    pub sweeper: crate::sweeper::SweeperSettings,
 }
 
 fn default_q0lang_font_name() -> String {
@@ -1198,6 +1241,7 @@ impl Default for Settings {
             autosave_enabled: default_autosave_enabled(),
             autosave_interval_secs: default_autosave_interval_secs(),
             brush_cap: BrushCap::Round,
+            brush_join: BrushJoin::Round,
             brush: BrushPreferences::default(),
             pencil_smoothing: 50,
             brush_mode: PersistBrushMode::Classic,
@@ -1220,6 +1264,9 @@ impl Default for Settings {
             new_project_fps: default_new_project_fps(),
             new_project_frame_count: default_new_project_frame_count(),
             physics_enabled: false,
+            particles_enabled: false,
+            light_enabled: false,
+            sweeper: Default::default(),
         }
     }
 }

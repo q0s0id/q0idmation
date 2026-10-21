@@ -1,37 +1,56 @@
-# события
+# events
 
-[главная](README.md) · [host api](hosts.md) · [функции](syntax.md)
+[home](README.md) · [host api](hosts.md) · [functions](syntax.md)
 
-`listen event handler` добавляет имя обработчика в таблицу события. `xlisten event handler` удаляет его. это инструкции регистрации, без `!` и без скобок. повторная одинаковая подписка не создаёт дубликат; удаление отсутствующей подписки допустимо.
+`listen event handler` adds a handler's name to an event's list; `xlisten event handler` removes it. These are registration statements, without `!` and without parentheses. Subscribing the same handler twice keeps one entry; removing a subscription that is not there is fine.
 
 ```q0lang
 import q0.mouse
 
 pb func on_click target {
-  q0shell.print! "нажато", target
+  q0shell.print! "clicked", target
 }
 
 listen mouse.click on_click
 xlisten mouse.click on_click
 ```
 
-## распознаваемые имена
+## event names
 
-| имя | назначение имени |
+| name | when q0player sends it |
 | --- | --- |
-| `mouse.down` | нажатие кнопки мыши |
-| `mouse.up` | отпускание |
-| `mouse.move` | движение указателя |
-| `mouse.click` | щелчок |
-| `mouse.double` | двойной щелчок |
-| `mouse.wheel` | колесо |
-| `mouse.over` | вход указателя |
-| `mouse.out` | выход указателя |
+| `mouse.down` | a button is pressed |
+| `mouse.up` | a button is released |
+| `mouse.move` | the pointer moves |
+| `mouse.click` | a press and release |
+| `mouse.double` | a double click |
+| `mouse.wheel` | the wheel or a two-finger scroll turns |
+| `mouse.over` | the pointer enters an object (object scripts only) |
+| `mouse.out` | the pointer leaves an object (object scripts only) |
 
-это каталог для регистрации, **автоматическая доставка этих событий в q0editor, q0player и q0shell пока не подключена**. аргументы событий, координаты мыши, кнопки, цель и правила всплытия не определены публичным api. параметр `target` в примере является обычным параметром функции, а не гарантией готового события.
+Another event name gives a parser diagnostic. The runtime stores the names without checking that the handler exists or how many parameters it takes.
 
-runtime хранит имена, но при подписке не проверяет наличие функции и её число параметров. другой event вне этого списка выдаёт диагностику parser. таблица сохраняется между скриптами одного runtime. библиотека или пользовательский host могут сами читать таблицу и инициировать вызовы, однако стандартные программы этого ещё не делают.
+## delivery in q0player
 
-для работающего интерактивного управления сейчас используй [q0.input](hosts.md). ручной `on_click("button")` является обычным вызовом функции и не имитирует полноценную доставку mouse-события.
+q0player delivers events to vector v2 movies that import `q0.mouse` or have [object scripts](hosts.md). Each handler is called with one argument, `target`: `"stage"` in the movie's shared runtime, the object's name in an object script. On touch screens a tap counts as the mouse.
 
-источники: [каталог и parser подписок](../../q0s-format/src/q0lang/parser.rs), [таблица listeners qvm](../../q0vm/src/lib.rs), [player host](../../q0player/src/lib.rs).
+Before a handler runs, the shared runtime gets these values, in stage coordinates:
+
+| name | value |
+| --- | --- |
+| `mouse.x`, `mouse.y` | where the pointer is |
+| `mouse.inside` | the pointer is over the stage |
+| `mouse.wheel_x`, `mouse.wheel_y` | how far the wheel turned, for `mouse.wheel` |
+
+Object scripts receive events only when they concern them:
+
+- `mouse.down`, `mouse.double` and `mouse.wheel` go to the object under the pointer.
+- `mouse.up` goes to the object under the pointer, and to the one the press started on.
+- `mouse.click` needs the press and the release on the same object.
+- `mouse.over` and `mouse.out` are sent when the pointer crosses an object's bounds.
+
+Inside an object script, `self.hovered`, `self.mouse_x` and `self.mouse_y` tell where the pointer is relative to that object. Commands a handler issues are applied right after it, like any script's.
+
+The editor preview and q0shell keep the subscription table but deliver no events. Calling `on_click("button")` yourself is an ordinary function call, not a mouse event.
+
+Sources: [parser catalogue and subscriptions](../../q0s-format/src/q0lang/parser.rs), [qvm listener table](../../q0vm/src/lib.rs), [player delivery](../../q0player/src/lib.rs), [object delivery](../../q0player/src/objects.rs), [player input](../../q0player/src/ui/app.rs).

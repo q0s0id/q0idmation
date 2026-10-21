@@ -500,7 +500,10 @@ impl ObjectPass<'_> {
                         self.diagnostic(&object.name, format!("unknown frame label: {target:?}"));
                     }
                 }
-                RuntimeAction::SceneSwitch { .. } => self.scene_actions.push(action),
+                RuntimeAction::SceneSwitch { .. }
+                | RuntimeAction::Physics(_)
+                | RuntimeAction::Particles(_)
+                | RuntimeAction::Light(_) => self.scene_actions.push(action),
                 RuntimeAction::ShellCommand { .. } => {}
                 action => {
                     if let Err(message) =

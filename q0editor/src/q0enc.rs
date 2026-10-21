@@ -1695,6 +1695,7 @@ mod tests {
             rgba: vec![255, 0, 0, 255],
         }));
         project.q0rgs[0].layers[0].push_placement(Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
@@ -1963,6 +1964,7 @@ mod tests {
         project.assets.swap(0, 1);
         let layer = &mut project.q0rgs[0].layers[0];
         layer.push_placement(Placement {
+            pivot: None,
             instance_id: 0,
             frame: 6,
             target: Target::Asset(1),

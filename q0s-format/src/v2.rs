@@ -129,7 +129,12 @@ pub const Q1S_VERSION_SHARED_MEDIA: u16 = 38;
 pub const Q1S_VERSION_SHAPE_TWEENS: u16 = 39;
 /// v40: physics setups, appended after library folders.
 pub const Q1S_VERSION_PHYSICS: u16 = 40;
-pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_PHYSICS;
+/// v41: liquids, worlds q0player runs live, body bounds for it, and particle
+/// emitters, appended after the physics block.
+pub const Q1S_VERSION_PARTICLES: u16 = 41;
+/// v42: per-placement local transform anchors, used by motion interpolation.
+pub const Q1S_VERSION_TRANSFORM_PIVOTS: u16 = 42;
+pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_TRANSFORM_PIVOTS;
 /// Kept as an alias so external code that imported the v2-era constant keeps
 /// compiling. It now means "the current write-out version".
 pub const Q1S_V2_VERSION: u16 = Q1S_VERSION_CURRENT;
@@ -216,6 +221,16 @@ pub struct Stroke {
     /// load — see the `flag == 1` vs `flag == 2` branches in the
     /// parser/writer.
     pub cap: crate::geom::CapShape,
+    /// How corners are drawn. Strokes saved before joins could be chosen
+    /// load as `Bevel`, the way they were drawn.
+    pub join: crate::geom::JoinShape,
+}
+
+impl Stroke {
+    /// Whether this stroke needs q1s v41 to be stored as it is.
+    pub fn needs_v41(&self) -> bool {
+        self.cap == crate::geom::CapShape::Square || self.join != crate::geom::JoinShape::Bevel
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1470,6 +1485,9 @@ pub struct Placement {
     pub frame: u16,
     pub target: Target,
     pub transform: Transform2D,
+    /// Authored transform anchor in the target's local coordinates. None keeps
+    /// the legacy origin until the editor assigns its default artwork centre.
+    pub pivot: Option<Vec2>,
     pub tween: Tween,
     pub fx: PlacementFx,
 }
@@ -1736,9 +1754,13 @@ pub struct ProjectRuntimeData {
     pub library_folders: Vec<String>,
     /// Library item placement within a folder. Missing entries belong to root.
     pub library_item_folders: HashMap<LibraryItemReference, String>,
-    /// Physics setups. Simulations are baked into keyframes, so players
-    /// never need this.
+    /// Physics setups. Simulations are baked into keyframes; players only
+    /// need the worlds marked live, which q0lang drives.
     pub physics: crate::physics::PhysicsData,
+    /// Particle emitters, baked like physics; live ones run in q0player.
+    pub particles: crate::particles::ParticleData,
+    /// Lights. Never baked: every renderer lights the frame itself.
+    pub lighting: crate::lighting::LightingData,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -3788,6 +3810,11 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
                         "placement frame is out of layer frame_count bounds",
                     ));
                 }
+                if p.pivot
+                    .is_some_and(|point| !point.x.is_finite() || !point.y.is_finite())
+                {
+                    return Err(Error::Validation("transform anchor must be finite"));
+                }
                 if !p.transform.tx.is_finite() || !p.transform.ty.is_finite() {
                     return Err(Error::Validation("placement translation must be finite"));
                 }
@@ -4511,7 +4538,24 @@ impl MediaPayloads {
 }
 
 pub fn write(project: &ProjectV2) -> Result<Vec<u8>, Error> {
-    let version = if !project.runtime.physics.is_empty() {
+    let version = if project
+        .q0rgs
+        .iter()
+        .flat_map(|q| &q.layers)
+        .flat_map(|layer| &layer.placements)
+        .any(|placement| placement.pivot.is_some())
+    {
+        Q1S_VERSION_TRANSFORM_PIVOTS
+    } else if project.runtime.physics.uses_v41()
+        || !project.runtime.particles.is_empty()
+        || !project.runtime.lighting.is_empty()
+        || project.assets.iter().any(|asset| match asset {
+            Asset::Vector(vector) => vector.stroke.is_some_and(|stroke| stroke.needs_v41()),
+            _ => false,
+        })
+    {
+        Q1S_VERSION_PARTICLES
+    } else if !project.runtime.physics.is_empty() {
         Q1S_VERSION_PHYSICS
     } else if uses_shape_tweens(project) {
         Q1S_VERSION_SHAPE_TWEENS
@@ -4597,6 +4641,18 @@ fn uses_rig_pose_keys(project: &ProjectV2) -> bool {
 
 pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>, Error> {
     validate(project)?;
+    if version < Q1S_VERSION_TRANSFORM_PIVOTS
+        && project
+            .q0rgs
+            .iter()
+            .flat_map(|q| &q.layers)
+            .flat_map(|layer| &layer.placements)
+            .any(|placement| placement.pivot.is_some())
+    {
+        return Err(Error::Validation(
+            "legacy q1s version cannot store transform anchors",
+        ));
+    }
     if version < Q1S_VERSION_Q0RG_SPEED && uses_q0rg_speed(project) {
         return Err(Error::Validation(
             "legacy q1s versions cannot store q0rg playback speed",
@@ -4673,8 +4729,19 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
         && version != Q1S_VERSION_SHARED_MEDIA
         && version != Q1S_VERSION_SHAPE_TWEENS
         && version != Q1S_VERSION_PHYSICS
+        && version != Q1S_VERSION_PARTICLES
+        && version != Q1S_VERSION_TRANSFORM_PIVOTS
     {
         return Err(Error::UnsupportedVersion(version));
+    }
+    if version < Q1S_VERSION_PARTICLES
+        && (project.runtime.physics.uses_v41()
+            || !project.runtime.particles.is_empty()
+            || !project.runtime.lighting.is_empty())
+    {
+        return Err(Error::Validation(
+            "legacy q1s versions cannot store liquids, live physics, particles or lights",
+        ));
     }
     if version < Q1S_VERSION_PHYSICS && !project.runtime.physics.is_empty() {
         return Err(Error::Validation(
@@ -5345,7 +5412,15 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
         }
     }
     if version >= Q1S_VERSION_PHYSICS {
-        crate::physics::write(&mut out, &project.runtime.physics)?;
+        crate::physics::write(
+            &mut out,
+            &project.runtime.physics,
+            version >= Q1S_VERSION_PARTICLES,
+        )?;
+    }
+    if version >= Q1S_VERSION_PARTICLES {
+        crate::particles::write(&mut out, &project.runtime.particles)?;
+        crate::lighting::write(&mut out, &project.runtime.lighting)?;
     }
     Ok(out)
 }
@@ -5386,16 +5461,28 @@ fn write_asset(
             }
             match &v.stroke {
                 Some(s) => {
-                    // Flag 2 = "stroke + explicit cap byte". Flag 1 is
-                    // the legacy (round-cap-implicit) form, still
-                    // accepted by the reader but never emitted.
-                    out.push(2);
+                    // Flag 2 = "stroke + explicit cap byte"; flag 3 adds a
+                    // join byte (q1s v41). Flag 1 is the legacy
+                    // (round-cap-implicit) form, still accepted by the
+                    // reader but never emitted.
+                    let joins = version >= Q1S_VERSION_PARTICLES;
+                    out.push(if joins { 3 } else { 2 });
                     out.extend_from_slice(&[s.color.r, s.color.g, s.color.b, s.color.a]);
                     out.extend_from_slice(&s.width.to_le_bytes());
                     out.push(match s.cap {
                         crate::geom::CapShape::Round => 0,
                         crate::geom::CapShape::Butt => 1,
+                        // Older files know no square nib; flat is closest.
+                        crate::geom::CapShape::Square if !joins => 1,
+                        crate::geom::CapShape::Square => 2,
                     });
+                    if joins {
+                        out.push(match s.join {
+                            crate::geom::JoinShape::Bevel => 0,
+                            crate::geom::JoinShape::Miter => 1,
+                            crate::geom::JoinShape::Round => 2,
+                        });
+                    }
                 }
                 None => out.push(0),
             }
@@ -6237,6 +6324,13 @@ fn write_q0rg(out: &mut Vec<u8>, q0rg: &Q0rg, version: u16) -> Result<(), Error>
             if version >= Q1S_VERSION_PLACEMENT_FX {
                 write_placement_fx(out, p.fx, version);
             }
+            if version >= Q1S_VERSION_TRANSFORM_PIVOTS {
+                out.push(u8::from(p.pivot.is_some()));
+                if let Some(pivot) = p.pivot {
+                    out.extend_from_slice(&pivot.x.to_le_bytes());
+                    out.extend_from_slice(&pivot.y.to_le_bytes());
+                }
+            }
         }
 
         if version >= Q1S_VERSION_KEYFRAMES {
@@ -6311,6 +6405,8 @@ pub fn parse(bytes: &[u8]) -> Result<ProjectV2, Error> {
         && version != Q1S_VERSION_SHARED_MEDIA
         && version != Q1S_VERSION_SHAPE_TWEENS
         && version != Q1S_VERSION_PHYSICS
+        && version != Q1S_VERSION_PARTICLES
+        && version != Q1S_VERSION_TRANSFORM_PIVOTS
     {
         return Err(Error::UnsupportedVersion(version));
     }
@@ -6738,7 +6834,14 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
         }
     }
     if version >= Q1S_VERSION_PHYSICS {
-        runtime.physics = crate::physics::read(&mut c)?;
+        runtime.physics = crate::physics::read(&mut c, version >= Q1S_VERSION_PARTICLES)?;
+    }
+    if version >= Q1S_VERSION_PARTICLES {
+        runtime.particles = crate::particles::read(&mut c)?;
+        // The first particle builds wrote no lighting block.
+        if c.remaining() > 0 {
+            runtime.lighting = crate::lighting::read(&mut c)?;
+        }
     }
     c.finish()?;
 
@@ -6803,6 +6906,9 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
         }
     }
     validate(&project)?;
+    if version < Q1S_VERSION_TRANSFORM_PIVOTS {
+        crate::motion_tween::recover_legacy_pivots(&mut project);
+    }
     Ok(project)
 }
 
@@ -6863,10 +6969,12 @@ fn parse_asset(
                         color,
                         width,
                         cap: crate::geom::CapShape::Round,
+                        join: crate::geom::JoinShape::Bevel,
                     })
                 }
-                // Modern: explicit cap byte after width.
-                2 => {
+                // Modern: explicit cap byte after width, and from v41 a
+                // join byte after it.
+                flag @ (2 | 3) => {
                     let bytes = c.read_exact(4)?;
                     let color = Rgba {
                         r: bytes[0],
@@ -6878,9 +6986,25 @@ fn parse_asset(
                     let cap = match c.read_u8()? {
                         0 => crate::geom::CapShape::Round,
                         1 => crate::geom::CapShape::Butt,
+                        2 if flag == 3 => crate::geom::CapShape::Square,
                         _ => return Err(Error::Validation("invalid stroke cap byte")),
                     };
-                    Some(Stroke { color, width, cap })
+                    let join = if flag == 3 {
+                        match c.read_u8()? {
+                            0 => crate::geom::JoinShape::Bevel,
+                            1 => crate::geom::JoinShape::Miter,
+                            2 => crate::geom::JoinShape::Round,
+                            _ => return Err(Error::Validation("invalid stroke join byte")),
+                        }
+                    } else {
+                        crate::geom::JoinShape::Bevel
+                    };
+                    Some(Stroke {
+                        color,
+                        width,
+                        cap,
+                        join,
+                    })
                 }
                 _ => return Err(Error::Validation("invalid has_stroke flag")),
             };
@@ -7446,7 +7570,17 @@ fn parse_q0rg(c: &mut Cursor, version: u16) -> Result<Q0rg, Error> {
             } else {
                 PlacementFx::default()
             };
+            let pivot = if version >= Q1S_VERSION_TRANSFORM_PIVOTS {
+                match c.read_u8()? {
+                    0 => None,
+                    1 => Some(Vec2::new(c.read_f32()?, c.read_f32()?)),
+                    _ => return Err(Error::Validation("invalid transform anchor flag")),
+                }
+            } else {
+                None
+            };
             placements.push(Placement {
+                pivot,
                 instance_id,
                 frame,
                 target,
@@ -7541,6 +7675,110 @@ mod compatibility_tests {
     }
 
     #[test]
+    fn q0s_carries_physics_and_particles() {
+        // beta.5 labelled a q0s holding physics as v38, whose reader then
+        // found the physics block as trailing bytes.
+        let mut project = legacy_project();
+        let q0rg = project.meta.entry_q0rg_id;
+        project
+            .runtime
+            .physics
+            .scenes
+            .push(crate::physics::PhysicsScene::new(q0rg));
+        let bytes = crate::q0s_v2::write_q0s_v2(&project).unwrap();
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            crate::q0s_v2::Q0S_VERSION_PHYSICS
+        );
+        let parsed = crate::q0s_v2::parse_q0s_v2(&bytes).unwrap();
+        assert_eq!(parsed.runtime.physics, project.runtime.physics);
+
+        let mut scene = crate::physics::PhysicsScene::new(q0rg);
+        scene.live = true;
+        project.runtime.physics.scenes = vec![scene];
+        let mut body = crate::physics::PhysicsBody::new(q0rg, 3);
+        body.bounds = Some([-10.0, -5.0, 10.0, 5.0]);
+        project.runtime.physics.bodies.push(body);
+        project
+            .runtime
+            .physics
+            .liquids
+            .push(crate::physics::PhysicsLiquid::new(
+                q0rg,
+                1,
+                [0.0, 0.0, 40.0, 20.0],
+            ));
+        let mut emitter = crate::particles::ParticleEmitter::new(q0rg, 1, [10.0, 20.0]);
+        emitter.look = crate::particles::ParticleLook::Item(Target::Asset(1));
+        emitter.live = true;
+        emitter.layer_id = Some(4);
+        project.runtime.particles.emitters.push(emitter);
+        let bytes = crate::q0s_v2::write_q0s_v2(&project).unwrap();
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            crate::q0s_v2::Q0S_VERSION_PARTICLES
+        );
+        let parsed = crate::q0s_v2::parse_q0s_v2(&bytes).unwrap();
+        assert_eq!(parsed.runtime.physics, project.runtime.physics);
+        assert_eq!(parsed.runtime.particles, project.runtime.particles);
+        let q1s = parse(&write(&project).unwrap()).unwrap();
+        assert_eq!(q1s.runtime.particles, project.runtime.particles);
+    }
+
+    #[test]
+    fn stroke_ends_and_corners_survive_a_save() {
+        let mut project = legacy_project();
+        project.assets.push(Asset::Vector(VectorAsset {
+            asset_id: 999,
+            paths: Vec::new(),
+            fill: None,
+            stroke: None,
+        }));
+        let Some(Asset::Vector(vector)) = project.assets.last_mut() else {
+            unreachable!()
+        };
+        vector.stroke = Some(Stroke {
+            color: Rgba {
+                r: 1,
+                g: 2,
+                b: 3,
+                a: 255,
+            },
+            width: 6.0,
+            cap: crate::geom::CapShape::Square,
+            join: crate::geom::JoinShape::Miter,
+        });
+        let bytes = write(&project).unwrap();
+        let read = parse(&bytes).unwrap();
+        let stroke = read
+            .assets
+            .iter()
+            .find_map(|asset| match asset {
+                Asset::Vector(vector) => vector.stroke,
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(stroke.cap, crate::geom::CapShape::Square);
+        assert_eq!(stroke.join, crate::geom::JoinShape::Miter);
+    }
+
+    #[test]
+    fn baked_only_physics_keeps_the_older_q1s_version() {
+        let mut project = legacy_project();
+        let q0rg = project.meta.entry_q0rg_id;
+        project
+            .runtime
+            .physics
+            .scenes
+            .push(crate::physics::PhysicsScene::new(q0rg));
+        let bytes = write(&project).unwrap();
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            Q1S_VERSION_PHYSICS
+        );
+    }
+
+    #[test]
     fn physics_survives_a_q1s_round_trip() {
         let mut project = legacy_project();
         let q0rg = project.meta.entry_q0rg_id;
@@ -7610,6 +7848,7 @@ mod compatibility_tests {
                     name: "Layer".to_string(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![Placement {
+                        pivot: None,
                         instance_id: 0,
                         frame: 0,
                         target: Target::Asset(1),
@@ -7827,6 +8066,7 @@ mod compatibility_tests {
         project.q0rgs[0].frame_count = 4;
         let layer = &mut project.q0rgs[0].layers[0];
         layer.push_placement(Placement {
+            pivot: None,
             instance_id: 0,
             frame: 3,
             target: Target::Asset(1),
@@ -7854,6 +8094,7 @@ mod compatibility_tests {
         let layer = &mut project.q0rgs[0].layers[0];
         layer.placements = vec![
             Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 2,
                 target: Target::Asset(1),
@@ -7862,6 +8103,7 @@ mod compatibility_tests {
                 fx: Default::default(),
             },
             Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(2),
@@ -7870,6 +8112,7 @@ mod compatibility_tests {
                 fx: Default::default(),
             },
             Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(1),
@@ -8821,6 +9064,7 @@ mod compatibility_tests {
         project.q0rgs[0].frame_count = 4;
         project.q0rgs[0].layers[0].placements = vec![
             Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(1),
@@ -8829,6 +9073,7 @@ mod compatibility_tests {
                 fx: Default::default(),
             },
             Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(1),
@@ -8840,6 +9085,7 @@ mod compatibility_tests {
                 fx: Default::default(),
             },
             Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 2,
                 target: Target::Asset(1),
@@ -8851,6 +9097,7 @@ mod compatibility_tests {
                 fx: Default::default(),
             },
             Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 2,
                 target: Target::Asset(1),
@@ -9050,6 +9297,7 @@ mod compatibility_tests {
 
     fn add_test_bend_deformer(project: &mut ProjectV2) {
         project.q0rgs[0].layers[0].push_placement(Placement {
+            pivot: None,
             instance_id: 2,
             frame: 0,
             target: Target::Asset(1),
@@ -9326,6 +9574,7 @@ mod compatibility_tests {
             }],
         });
         project.q0rgs[1].layers[0].push_placement(Placement {
+            pivot: None,
             instance_id: 99,
             frame: 0,
             target: Target::Q0rg(1),

@@ -23,7 +23,7 @@ use egui::{
 use lyon_path::math::point as lyon_point;
 use lyon_tessellation::geometry_builder::{BuffersBuilder, Positions, VertexBuffers};
 use lyon_tessellation::{
-    FillOptions, FillRule as LyonFillRule, FillTessellator, LineJoin, StrokeOptions,
+    FillOptions, FillRule as LyonFillRule, FillTessellator, LineCap, LineJoin, StrokeOptions,
     StrokeTessellator,
 };
 use q0s_format::geom::flatten_path;
@@ -391,9 +391,14 @@ fn local_solid_meshes(vector: &q0s_format::v2::VectorAsset) -> Vec<std::sync::Ar
     }
     if let Some(stroke) = vector.stroke {
         for (points, closed) in &paths {
-            if let Some(mesh) =
-                bounded_stroke_mesh(points, stroke.width, *closed, rgba_to_color32(stroke.color))
-            {
+            if let Some(mesh) = styled_stroke_mesh(
+                points,
+                stroke.width,
+                *closed,
+                rgba_to_color32(stroke.color),
+                stroke.cap,
+                stroke.join,
+            ) {
                 meshes.push(std::sync::Arc::new(mesh));
             }
             if !closed
@@ -733,7 +738,45 @@ fn paint_q0rg(
             .unwrap_or(&[]);
         q0s_format::rig::evaluate_rig(rig, f32::from(local_frame), overrides)
     });
+    // Lights shine on the root timeline, after its light layer.
+    let stage_rect = Rect::from_min_size(
+        view.origin,
+        egui::vec2(
+            f32::from(project.meta.stage_width.max(1)) * view.scale,
+            f32::from(project.meta.stage_height.max(1)) * view.scale,
+        ),
+    );
+    let lighting = (depth == 0)
+        .then(|| q0s_format::raster::frame_lighting(project, q0rg_id, local_frame, scene_state))
+        .flatten()
+        .and_then(|lighting| {
+            let to_screen = Affine::compose(
+                Affine {
+                    a11: view.scale,
+                    a12: 0.0,
+                    a21: 0.0,
+                    a22: view.scale,
+                    tx: view.origin.x,
+                    ty: view.origin.y,
+                },
+                parent,
+            );
+            let back = to_screen.inverse()?;
+            Some(q0glblend::LightingPaint {
+                screen_to_world: [[back.a11, back.a12, back.tx], [back.a21, back.a22, back.ty]],
+                lighting,
+            })
+        });
+    let mut lit = lighting.is_none();
+    let mut previous_layer = None;
     for layer in &q.layers {
+        if let Some(paint) = lighting.as_ref().filter(|_| !lit) {
+            if previous_layer.is_some() && previous_layer == paint.lighting.layer_id {
+                q0glblend::paint_lighting(painter, stage_rect, paint.clone());
+                lit = true;
+            }
+        }
+        previous_layer = Some(layer.layer_id);
         if !project.layer_is_visible(q0rg_id, layer.layer_id) {
             continue;
         }
@@ -934,6 +977,9 @@ fn paint_q0rg(
                 _ => {}
             }
         }
+    }
+    if let Some(paint) = lighting.filter(|_| !lit) {
+        q0glblend::paint_lighting(painter, stage_rect, paint);
     }
 }
 
@@ -1498,12 +1544,21 @@ fn paint_asset(
                     ),
                     None => Stroke::NONE,
                 };
+                let shape = v.stroke.map_or(
+                    (
+                        q0s_format::geom::CapShape::Round,
+                        q0s_format::geom::JoinShape::Bevel,
+                    ),
+                    |s| (s.cap, s.join),
+                );
                 if stroke != Stroke::NONE {
-                    if let Some(mesh) = bounded_stroke_mesh(
+                    if let Some(mesh) = styled_stroke_mesh(
                         &polyline_screen,
                         stroke.width,
                         path.closed,
                         stroke.color,
+                        shape.0,
+                        shape.1,
                     ) {
                         q0glblend::paint_mesh_color(painter, mesh, color_transform);
                     }
@@ -1670,6 +1725,276 @@ fn emit_gradient_triangle(
     mesh.indices.extend_from_slice(&[base, base + 1, base + 2]);
 }
 
+/// Draws what live physics and particles add over the movie: liquid
+/// surfaces and particles, in the same stage space the frame was painted in.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_live_draws(
+    painter: &Painter,
+    ctx: &Context,
+    project: &ProjectV2,
+    target_rect: Rect,
+    cache: &mut TextureCache,
+    live: &crate::LiveDraws,
+    rig_overrides: &q0s_format::rig::RigRuntimeOverrides,
+    scene_state: &RuntimeSceneState,
+) {
+    use q0s_format::particles::ParticleLook;
+
+    let stage_w = project.meta.stage_width.max(1) as f32;
+    let stage_h = project.meta.stage_height.max(1) as f32;
+    let scale = (target_rect.width() / stage_w)
+        .min(target_rect.height() / stage_h)
+        .max(0.001);
+    let drawn = egui::vec2(stage_w * scale, stage_h * scale);
+    let origin = pos2(
+        target_rect.center().x - drawn.x * 0.5,
+        target_rect.center().y - drawn.y * 0.5,
+    );
+    let clipped = painter.with_clip_rect(
+        painter
+            .clip_rect()
+            .intersect(Rect::from_min_size(origin, drawn)),
+    );
+    let painter = &clipped;
+    let view = StageView { origin, scale };
+    let to_screen = |x: f32, y: f32| pos2(origin.x + x * scale, origin.y + y * scale);
+    let color_of = |rgba: Rgba| Color32::from_rgba_unmultiplied(rgba.r, rgba.g, rgba.b, rgba.a);
+
+    for (outlines, color) in &live.liquids {
+        let contours = outlines
+            .iter()
+            .map(|outline| outline.iter().map(|p| to_screen(p[0], p[1])).collect())
+            .collect::<Vec<Vec<Pos2>>>();
+        paint_complex_fill(painter, &contours, color_of(*color));
+    }
+
+    for (strokes, color) in &live.links {
+        for stroke in strokes {
+            let points = stroke
+                .points
+                .iter()
+                .map(|p| to_screen(p[0], p[1]))
+                .collect::<Vec<_>>();
+            if let Some(mesh) = styled_stroke_mesh(
+                &points,
+                stroke.width * scale,
+                stroke.closed,
+                color_of(*color),
+                q0s_format::geom::CapShape::Round,
+                q0s_format::geom::JoinShape::Round,
+            ) {
+                painter.add(Shape::mesh(mesh));
+            }
+            // The mesh leaves ends flat; round them like the baked drawings.
+            if let (false, Some(first), Some(last)) = (stroke.closed, points.first(), points.last())
+            {
+                for end in [*first, *last] {
+                    painter.circle_filled(end, stroke.width * scale * 0.5, color_of(*color));
+                }
+            }
+        }
+    }
+
+    for particle in &live.particles {
+        let style = particle.style;
+        let [x, y] = particle.position;
+        match particle.look {
+            // Library items keep their own colours; at runtime they are
+            // drawn at full opacity.
+            ParticleLook::Item(target) => {
+                let affine = Affine::from_transform(q0s_format::v2::Transform2D {
+                    tx: x,
+                    ty: y,
+                    sx: (style.size * style.stretch).max(0.001),
+                    sy: style.size.max(0.001),
+                    rotation: style.rotation,
+                    ..q0s_format::v2::Transform2D::IDENTITY
+                });
+                match target {
+                    Target::Asset(id) => {
+                        if let Some(asset) = project.assets.iter().find(|asset| asset.id() == id) {
+                            paint_asset(
+                                painter,
+                                ctx,
+                                asset,
+                                project.asset_appearances.get(&id),
+                                affine,
+                                &view,
+                                cache,
+                                0,
+                                project.meta.fps.max(1),
+                                q0glblend::ColorTransform::default(),
+                            );
+                        }
+                    }
+                    Target::Q0rg(id) => paint_q0rg(
+                        painter,
+                        ctx,
+                        project,
+                        id,
+                        0,
+                        affine,
+                        &view,
+                        0,
+                        cache,
+                        rig_overrides,
+                        scene_state,
+                        q0glblend::ColorTransform::default(),
+                    ),
+                }
+            }
+            look => {
+                painter.add(Shape::Mesh(particle_mesh(
+                    look,
+                    to_screen(x, y),
+                    style,
+                    scale,
+                )));
+            }
+        }
+    }
+}
+
+/// One built-in particle as a screen-space mesh. Additive particles carry
+/// no alpha: under premultiplied blending that adds their light to what is
+/// behind instead of covering it.
+fn particle_mesh(
+    look: q0s_format::particles::ParticleLook,
+    centre: Pos2,
+    style: q0physics::particles::ParticleStyle,
+    scale: f32,
+) -> Mesh {
+    use q0s_format::particles::ParticleLook;
+
+    let Rgba { r, g, b, a } = style.color;
+    let paint = |strength: f32| -> Color32 {
+        let alpha = (f32::from(a) * strength).round().clamp(0.0, 255.0) as u8;
+        let color = Color32::from_rgba_unmultiplied(r, g, b, alpha);
+        if style.additive {
+            let [pr, pg, pb, _] = color.to_array();
+            Color32::from_rgba_premultiplied(pr, pg, pb, 0)
+        } else {
+            color
+        }
+    };
+    let half = style.size * 0.5 * scale;
+    let stretch = style.stretch.max(0.01);
+    let (sin, cos) = style.rotation.sin_cos();
+    // Local units of half the particle's size, stretched along its x.
+    let at = |x: f32, y: f32| {
+        let (x, y) = (x * half * stretch, y * half);
+        pos2(centre.x + cos * x - sin * y, centre.y + sin * x + cos * y)
+    };
+    let segments = ((half * stretch * 0.8) as usize).clamp(12, 48);
+    let circle = |radius: f32| -> Vec<Pos2> {
+        (0..segments)
+            .map(|index| {
+                let angle = index as f32 * std::f32::consts::TAU / segments as f32;
+                at(angle.cos() * radius, angle.sin() * radius)
+            })
+            .collect()
+    };
+    let mut mesh = Mesh::default();
+    match look {
+        ParticleLook::Glow => {
+            // The same soft falloff the editor bakes as a radial gradient.
+            let rings = [(0.2, 0.9), (0.45, 0.55), (0.7, 0.2), (1.0, 0.0)];
+            mesh.colored_vertex(centre, paint(1.0));
+            let mut previous: Option<u32> = None;
+            for (radius, strength) in rings {
+                let first = mesh.vertices.len() as u32;
+                for point in circle(radius) {
+                    mesh.colored_vertex(point, paint(strength));
+                }
+                let n = segments as u32;
+                for i in 0..n {
+                    let j = (i + 1) % n;
+                    match previous {
+                        None => mesh.add_triangle(0, first + i, first + j),
+                        Some(inner) => {
+                            mesh.add_triangle(inner + i, first + i, first + j);
+                            mesh.add_triangle(inner + i, first + j, inner + j);
+                        }
+                    }
+                }
+                previous = Some(first);
+            }
+        }
+        ParticleLook::Ring => {
+            let feather = 1.0 / half.max(1.0);
+            let rings = [
+                (0.72 - feather, 0.0),
+                (0.72, 1.0),
+                (1.0, 1.0),
+                (1.0 + feather, 0.0),
+            ];
+            let n = segments as u32;
+            for (index, (radius, strength)) in rings.into_iter().enumerate() {
+                for point in circle(radius) {
+                    mesh.colored_vertex(point, paint(strength));
+                }
+                if index > 0 {
+                    let inner = (index as u32 - 1) * n;
+                    let outer = index as u32 * n;
+                    for i in 0..n {
+                        let j = (i + 1) % n;
+                        mesh.add_triangle(inner + i, outer + i, outer + j);
+                        mesh.add_triangle(inner + i, outer + j, inner + j);
+                    }
+                }
+            }
+        }
+        _ => {
+            let outline = match look {
+                ParticleLook::Square => {
+                    vec![at(-1.0, -1.0), at(1.0, -1.0), at(1.0, 1.0), at(-1.0, 1.0)]
+                }
+                ParticleLook::Star => (0..10)
+                    .map(|index| {
+                        let radius = if index % 2 == 0 { 1.0 } else { 0.4 };
+                        let angle = -std::f32::consts::FRAC_PI_2
+                            + index as f32 * std::f32::consts::PI / 5.0;
+                        at(angle.cos() * radius, angle.sin() * radius)
+                    })
+                    .collect(),
+                ParticleLook::Spark => {
+                    vec![at(1.0, 0.0), at(0.0, 0.3), at(-1.0, 0.0), at(0.0, -0.3)]
+                }
+                _ => circle(1.0),
+            };
+            fan_with_feather(&mut mesh, centre, &outline, paint(1.0));
+        }
+    }
+    mesh
+}
+
+/// Fills `outline`, which every ray from `centre` crosses once, with a
+/// one-pixel fade around its edge for antialiasing.
+fn fan_with_feather(mesh: &mut Mesh, centre: Pos2, outline: &[Pos2], color: Color32) {
+    let n = outline.len() as u32;
+    if n < 3 {
+        return;
+    }
+    let base = mesh.vertices.len() as u32;
+    mesh.colored_vertex(centre, color);
+    for point in outline {
+        mesh.colored_vertex(*point, color);
+    }
+    for point in outline {
+        let away = *point - centre;
+        let length = away.length().max(1.0e-3);
+        mesh.colored_vertex(*point + away / length, Color32::TRANSPARENT);
+    }
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let (edge_i, edge_j) = (base + 1 + i, base + 1 + j);
+        let (soft_i, soft_j) = (base + 1 + n + i, base + 1 + n + j);
+        mesh.add_triangle(base, edge_i, edge_j);
+        mesh.add_triangle(edge_i, edge_j, soft_j);
+        mesh.add_triangle(edge_i, soft_j, soft_i);
+    }
+}
+
 fn paint_complex_fill(painter: &Painter, contours: &[Vec<Pos2>], color: Color32) {
     let Some(buffers) = tessellate_complex_fill(contours) else {
         return;
@@ -1686,11 +2011,17 @@ fn paint_complex_fill(painter: &Painter, contours: &[Vec<Pos2>], color: Color32)
     painter.add(Shape::Mesh(mesh));
 }
 
-fn tessellate_bounded_stroke(
+/// An artwork stroke: its corners as the stroke says, its ends flat or
+/// square. Round ends are painted as circles by the callers, the same in the
+/// editor and q0player.
+fn styled_stroke_mesh(
     points: &[Pos2],
     width: f32,
     closed: bool,
-) -> Option<VertexBuffers<lyon_path::math::Point, u32>> {
+    color: Color32,
+    cap: q0s_format::geom::CapShape,
+    join: q0s_format::geom::JoinShape,
+) -> Option<Mesh> {
     if points.len() < 2 || !width.is_finite() || width <= 0.0 {
         return None;
     }
@@ -1704,27 +2035,32 @@ fn tessellate_bounded_stroke(
     }
     path_builder.end(closed);
     let path = path_builder.build();
-    let mut buffers: VertexBuffers<lyon_path::math::Point, u32> = VertexBuffers::new();
-    let mut tessellator = StrokeTessellator::new();
+    let line_join = match join {
+        q0s_format::geom::JoinShape::Miter => LineJoin::Miter,
+        q0s_format::geom::JoinShape::Round => LineJoin::Round,
+        q0s_format::geom::JoinShape::Bevel => LineJoin::Bevel,
+    };
+    let line_cap = match cap {
+        q0s_format::geom::CapShape::Square => LineCap::Square,
+        _ => LineCap::Butt,
+    };
     let options = StrokeOptions::default()
         .with_line_width(width)
-        .with_line_join(LineJoin::Bevel)
+        .with_line_join(line_join)
+        .with_miter_limit(q0s_format::geom::MITER_LIMIT)
+        .with_line_cap(line_cap)
         .with_tolerance(0.05);
-    tessellator
+    let mut buffers: VertexBuffers<lyon_path::math::Point, u32> = VertexBuffers::new();
+    StrokeTessellator::new()
         .tessellate_path(
             &path,
             &options,
             &mut BuffersBuilder::new(&mut buffers, Positions),
         )
         .ok()?;
-    Some(buffers)
-}
-
-fn bounded_stroke_mesh(points: &[Pos2], width: f32, closed: bool, color: Color32) -> Option<Mesh> {
-    let buffers = tessellate_bounded_stroke(points, width, closed)?;
     let mut mesh = Mesh::default();
     for point in buffers.vertices {
-        mesh.vertices.push(Vertex {
+        mesh.vertices.push(egui::epaint::Vertex {
             pos: Pos2::new(point.x, point.y),
             uv: Pos2::ZERO,
             color,
@@ -1841,11 +2177,34 @@ mod tests {
             pos2(2.70, 15.55),
             pos2(4.55, 16.10),
         ];
-        let buffers = tessellate_bounded_stroke(&points, 1.0, false).expect("bounded stroke");
-        assert!(buffers
-            .vertices
-            .iter()
-            .all(|p| p.x > 2.0 && p.x < 5.2 && p.y > 14.8 && p.y < 16.8));
+        for join in [
+            q0s_format::geom::JoinShape::Miter,
+            q0s_format::geom::JoinShape::Round,
+            q0s_format::geom::JoinShape::Bevel,
+        ] {
+            let mesh = styled_stroke_mesh(
+                &points,
+                1.0,
+                false,
+                Color32::WHITE,
+                q0s_format::geom::CapShape::Butt,
+                join,
+            )
+            .expect("bounded stroke");
+            // A miter may reach its limit past a corner, then turns flat.
+            let reach = if join == q0s_format::geom::JoinShape::Miter {
+                q0s_format::geom::MITER_LIMIT * 0.5
+            } else {
+                0.7
+            };
+            assert!(
+                mesh.vertices.iter().all(|v| v.pos.x > 2.7 - reach
+                    && v.pos.x < 4.55 + reach
+                    && v.pos.y > 15.55 - reach
+                    && v.pos.y < 16.10 + reach),
+                "{join:?} joins stay near the line"
+            );
+        }
     }
 
     #[test]
@@ -1996,6 +2355,7 @@ mod tests {
                         name: "player".into(),
                         explicit_keyframes: vec![0],
                         placements: vec![Placement {
+                            pivot: None,
                             instance_id: 7,
                             frame: 0,
                             target: Target::Q0rg(2),
@@ -2020,6 +2380,7 @@ mod tests {
                         name: "body".into(),
                         explicit_keyframes: vec![0],
                         placements: vec![Placement {
+                            pivot: None,
                             instance_id: 8,
                             frame: 0,
                             target: Target::Asset(1),
@@ -2129,6 +2490,7 @@ mod tests {
                     name: "art".into(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![Placement {
+                        pivot: None,
                         instance_id: 0,
                         frame: 0,
                         target: Target::Asset(1),

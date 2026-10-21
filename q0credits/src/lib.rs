@@ -28,7 +28,8 @@ const GRID_TOP: f32 = 190.0;
 const CARD_HEIGHT: f32 = 104.0;
 const GAP: f32 = 13.0;
 
-pub fn show(ui: &mut Ui, palette: &Palette, elapsed_seconds: f32) {
+/// Draws the credits; returns where the "q0" mark sits.
+pub fn show(ui: &mut Ui, palette: &Palette, elapsed_seconds: f32) -> Rect {
     let reveal = ease_out_cubic((elapsed_seconds / 0.65).clamp(0.0, 1.0));
     let width = ui.available_width().max(360.0);
     let columns = if width >= 600.0 { 2 } else { 1 };
@@ -43,7 +44,7 @@ pub fn show(ui: &mut Ui, palette: &Palette, elapsed_seconds: f32) {
     let inner = rect.shrink2(vec2(MARGIN, 0.0));
 
     paint_background(&painter, rect, palette, reveal);
-    paint_header(&painter, inner, palette, reveal);
+    let mark = paint_header(&painter, inner, palette, reveal);
 
     let card_width = (inner.width() - (columns - 1) as f32 * GAP) / columns as f32;
     for (index, name) in CONTRIBUTORS.iter().enumerate() {
@@ -92,6 +93,7 @@ pub fn show(ui: &mut Ui, palette: &Palette, elapsed_seconds: f32) {
     if reveal < 1.0 {
         ui.ctx().request_repaint_after(Duration::from_millis(16));
     }
+    mark
 }
 
 fn paint_background(painter: &egui::Painter, rect: Rect, palette: &Palette, reveal: f32) {
@@ -115,7 +117,7 @@ fn paint_background(painter: &egui::Painter, rect: Rect, palette: &Palette, reve
     );
 }
 
-fn paint_header(painter: &egui::Painter, inner: Rect, palette: &Palette, reveal: f32) {
+fn paint_header(painter: &egui::Painter, inner: Rect, palette: &Palette, reveal: f32) -> Rect {
     let top = inner.top();
     let mark = Rect::from_min_size(pos2(inner.left(), top + 22.0), vec2(35.0, 35.0));
     painter.rect_filled(
@@ -183,6 +185,7 @@ fn paint_header(painter: &egui::Painter, inner: Rect, palette: &Palette, reveal:
         ],
         Stroke::new(2.0_f32, alpha(palette.accent, (230.0 * reveal) as u8)),
     );
+    mark
 }
 
 #[allow(clippy::too_many_arguments)]

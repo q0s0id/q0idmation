@@ -154,6 +154,30 @@ impl Compiler {
                     self.chunk.emit_u8(argc);
                 }
             }
+            Statement::PhysicsCommand { command, args } => {
+                if let Some(argc) = self.compile_args(args, line, "q0.physics command", context) {
+                    let command = self.name_constant(command, line);
+                    self.chunk.emit_op(Opcode::Physics, line);
+                    self.chunk.emit_u32(command);
+                    self.chunk.emit_u8(argc);
+                }
+            }
+            Statement::ParticlesCommand { command, args } => {
+                if let Some(argc) = self.compile_args(args, line, "q0.particles command", context) {
+                    let command = self.name_constant(command, line);
+                    self.chunk.emit_op(Opcode::Particles, line);
+                    self.chunk.emit_u32(command);
+                    self.chunk.emit_u8(argc);
+                }
+            }
+            Statement::LightCommand { command, args } => {
+                if let Some(argc) = self.compile_args(args, line, "q0.light command", context) {
+                    let command = self.name_constant(command, line);
+                    self.chunk.emit_op(Opcode::Light, line);
+                    self.chunk.emit_u32(command);
+                    self.chunk.emit_u8(argc);
+                }
+            }
             Statement::Listen { event, handler } | Statement::Unlisten { event, handler } => {
                 let event = self.name_constant(event, line);
                 let handler = self.name_constant(handler, line);

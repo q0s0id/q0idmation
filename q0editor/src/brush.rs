@@ -2829,6 +2829,7 @@ fn append_raw_fill(
         })
     {
         layer.push_placement(Placement {
+            pivot: None,
             instance_id: 0,
             frame,
             target: Target::Asset(asset_id),
@@ -4573,6 +4574,7 @@ mod tests {
         ];
         app.state.project.q0rgs[0].layers[0].placements = vec![
             Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(1),
@@ -4581,6 +4583,7 @@ mod tests {
                 fx: Default::default(),
             },
             Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(2),
@@ -4620,6 +4623,7 @@ mod tests {
         ];
         app.state.project.q0rgs[0].layers[0].placements = vec![
             Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(1),
@@ -4628,6 +4632,7 @@ mod tests {
                 fx: Default::default(),
             },
             Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(2),
@@ -4698,6 +4703,7 @@ mod tests {
         ];
         app.state.project.q0rgs[0].layers[0].placements = vec![
             Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(1),
@@ -4706,6 +4712,7 @@ mod tests {
                 fx: Default::default(),
             },
             Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(2),
@@ -4775,6 +4782,7 @@ mod tests {
             stroke: None,
         })];
         app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
@@ -4822,6 +4830,7 @@ mod tests {
         ];
         app.state.project.q0rgs[0].layers[0].placements = vec![
             Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(1),
@@ -4830,6 +4839,7 @@ mod tests {
                 fx: Default::default(),
             },
             Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(2),
@@ -4918,6 +4928,7 @@ mod tests {
         ];
         app.state.project.q0rgs[0].layers[0].placements = (1..=3)
             .map(|asset_id| Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(asset_id),
@@ -4997,6 +5008,7 @@ mod tests {
         arch.anchors[1].in_handle = Some(Vec2::new(100.0, 0.0));
         app.state.project.assets = vec![raw_fill_asset(1, green, arch)];
         app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
@@ -5069,6 +5081,7 @@ mod tests {
         ];
         app.state.project.q0rgs[0].layers[0].placements = (1..=2)
             .map(|id| Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(id),
@@ -5325,6 +5338,7 @@ mod tests {
             stroke: None,
         })];
         app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
@@ -5536,6 +5550,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 1,
                 target: Target::Asset(shared_asset_id),
@@ -5731,6 +5746,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(original_asset_id),

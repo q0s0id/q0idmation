@@ -62,7 +62,12 @@ pub const Q0S_VERSION_Q0RG_CLOCK: u16 = 35;
 pub const Q0S_VERSION_Q0RG_SPEED: u16 = 36;
 pub const Q0S_VERSION_SHARED_MEDIA: u16 = 37;
 pub const Q0S_VERSION_SHAPE_TWEENS: u16 = 38;
-pub const Q0S_VERSION_CURRENT: u16 = Q0S_VERSION_SHAPE_TWEENS;
+/// Body of q1s v40: physics worlds.
+pub const Q0S_VERSION_PHYSICS: u16 = 39;
+/// Body of q1s v41: liquids, live physics and particle emitters.
+pub const Q0S_VERSION_PARTICLES: u16 = 40;
+pub const Q0S_VERSION_TRANSFORM_PIVOTS: u16 = 41;
+pub const Q0S_VERSION_CURRENT: u16 = Q0S_VERSION_TRANSFORM_PIVOTS;
 
 /// Serialise a `ProjectV2` as the current vector `.q0s` bytes. Internally we
 /// reuse the current `.q1s` writer and patch the magic+version header in-place
@@ -74,7 +79,13 @@ pub fn write_q0s_v2(project: &ProjectV2) -> Result<Vec<u8>, Error> {
     }
     bytes[0..4].copy_from_slice(&Q0S_V2_MAGIC);
     let q1s_version = u16::from_le_bytes([bytes[4], bytes[5]]);
-    let version = if q1s_version >= v2::Q1S_VERSION_SHAPE_TWEENS {
+    let version = if q1s_version >= v2::Q1S_VERSION_TRANSFORM_PIVOTS {
+        Q0S_VERSION_TRANSFORM_PIVOTS
+    } else if q1s_version >= v2::Q1S_VERSION_PARTICLES {
+        Q0S_VERSION_PARTICLES
+    } else if q1s_version >= v2::Q1S_VERSION_PHYSICS {
+        Q0S_VERSION_PHYSICS
+    } else if q1s_version >= v2::Q1S_VERSION_SHAPE_TWEENS {
         Q0S_VERSION_SHAPE_TWEENS
     } else if q1s_version >= v2::Q1S_VERSION_SHARED_MEDIA {
         Q0S_VERSION_SHARED_MEDIA
@@ -187,6 +198,11 @@ pub fn parse_q0s_v2(bytes: &[u8]) -> Result<ProjectV2, Error> {
         Q0S_VERSION_SHAPE_TWEENS => {
             v2::parse_body_after_header(bytes, v2::Q1S_VERSION_SHAPE_TWEENS)
         }
+        Q0S_VERSION_PHYSICS => v2::parse_body_after_header(bytes, v2::Q1S_VERSION_PHYSICS),
+        Q0S_VERSION_PARTICLES => v2::parse_body_after_header(bytes, v2::Q1S_VERSION_PARTICLES),
+        Q0S_VERSION_TRANSFORM_PIVOTS => {
+            v2::parse_body_after_header(bytes, v2::Q1S_VERSION_TRANSFORM_PIVOTS)
+        }
         Q0S_VERSION_Q0RG_SPEED => v2::parse_body_after_header(bytes, v2::Q1S_VERSION_Q0RG_SPEED),
         Q0S_VERSION_Q0RG_CLOCK => v2::parse_body_after_header(bytes, v2::Q1S_VERSION_Q0RG_CLOCK),
         Q0S_VERSION_AUDIO_EDITING => {
@@ -248,6 +264,9 @@ pub fn is_q0s_v2(bytes: &[u8]) -> bool {
             | Q0S_VERSION_Q0RG_SPEED
             | Q0S_VERSION_SHARED_MEDIA
             | Q0S_VERSION_SHAPE_TWEENS
+            | Q0S_VERSION_PHYSICS
+            | Q0S_VERSION_PARTICLES
+            | Q0S_VERSION_TRANSFORM_PIVOTS
     )
 }
 
@@ -367,6 +386,7 @@ mod tests {
                     name: "L".to_string(),
                     explicit_keyframes: vec![1],
                     placements: vec![Placement {
+                        pivot: None,
                         instance_id: 0,
                         frame: 0,
                         target: Target::Asset(1),
@@ -586,6 +606,7 @@ mod tests {
         project.q0rgs[0].frame_count = 5;
         let layer = &mut project.q0rgs[0].layers[0];
         layer.push_placement(v2::Placement {
+            pivot: None,
             instance_id: 0,
             frame: 4,
             target: Target::Asset(1),

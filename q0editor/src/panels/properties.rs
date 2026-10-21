@@ -1544,32 +1544,66 @@ fn stroke_tool_properties(
         });
 }
 
-fn cap_control(app: &mut EditorApp, ui: &mut Ui) {
-    ui.label("Cap");
-    let mut cap_idx = match app.session.brush_cap {
-        q0s_format::geom::CapShape::Round => 0,
-        q0s_format::geom::CapShape::Butt => 1,
-    };
-    let previous = cap_idx;
-    egui::ComboBox::from_id_source(format!("cap_{:?}", app.session.current_tool))
-        .selected_text(if cap_idx == 0 { "Round" } else { "Butt (flat)" })
+fn cap_label(cap: q0s_format::geom::CapShape) -> &'static str {
+    match cap {
+        q0s_format::geom::CapShape::Round => "Round",
+        q0s_format::geom::CapShape::Butt => "Flat",
+        q0s_format::geom::CapShape::Square => "Square",
+    }
+}
+
+fn join_label(join: q0s_format::geom::JoinShape) -> &'static str {
+    match join {
+        q0s_format::geom::JoinShape::Miter => "Sharp",
+        q0s_format::geom::JoinShape::Round => "Round",
+        q0s_format::geom::JoinShape::Bevel => "Cut",
+    }
+}
+
+/// Nib (end) and corner pickers; returns whether either changed.
+fn stroke_shape_pickers(
+    ui: &mut Ui,
+    id: impl std::fmt::Debug,
+    cap: &mut q0s_format::geom::CapShape,
+    join: &mut q0s_format::geom::JoinShape,
+) -> bool {
+    use q0s_format::geom::{CapShape, JoinShape};
+    let before = (*cap, *join);
+    ui.label("Ends");
+    egui::ComboBox::from_id_source(format!("stroke_cap_{id:?}"))
+        .selected_text(cap_label(*cap))
         .show_ui(ui, |ui| {
-            ui.selectable_value(&mut cap_idx, 0, "Round");
-            ui.selectable_value(&mut cap_idx, 1, "Butt (flat)");
-        });
-    if cap_idx != previous {
-        app.session.brush_cap = if cap_idx == 0 {
-            q0s_format::geom::CapShape::Round
-        } else {
-            q0s_format::geom::CapShape::Butt
-        };
-        app.settings.brush_cap = match app.session.brush_cap {
-            q0s_format::geom::CapShape::Round => crate::settings::BrushCap::Round,
-            q0s_format::geom::CapShape::Butt => crate::settings::BrushCap::Butt,
-        };
+            for option in [CapShape::Round, CapShape::Butt, CapShape::Square] {
+                ui.selectable_value(cap, option, cap_label(option));
+            }
+        })
+        .response
+        .on_hover_text("Round nib, flat cut at the end, or a square nib reaching past it");
+    ui.end_row();
+    ui.label("Corners");
+    egui::ComboBox::from_id_source(format!("stroke_join_{id:?}"))
+        .selected_text(join_label(*join))
+        .show_ui(ui, |ui| {
+            for option in [JoinShape::Miter, JoinShape::Round, JoinShape::Bevel] {
+                ui.selectable_value(join, option, join_label(option));
+            }
+        })
+        .response
+        .on_hover_text("Sharp points, rounded corners, or corners cut flat");
+    ui.end_row();
+    before != (*cap, *join)
+}
+
+fn cap_control(app: &mut EditorApp, ui: &mut Ui) {
+    let mut cap = app.session.brush_cap;
+    let mut join = app.session.brush_join;
+    if stroke_shape_pickers(ui, app.session.current_tool, &mut cap, &mut join) {
+        app.session.brush_cap = cap;
+        app.session.brush_join = join;
+        app.settings.brush_cap = cap.into();
+        app.settings.brush_join = join.into();
         app.settings.save();
     }
-    ui.end_row();
 }
 
 fn optional_fill_control(app: &mut EditorApp, ui: &mut Ui) {
@@ -1919,6 +1953,7 @@ fn asset_properties(app: &mut EditorApp, ui: &mut Ui, id: u16) {
                                 },
                                 width: 1.0,
                                 cap: q0s_format::geom::CapShape::Round,
+                                join: q0s_format::geom::JoinShape::Bevel,
                             })
                         } else {
                             None
@@ -1948,28 +1983,11 @@ fn asset_properties(app: &mut EditorApp, ui: &mut Ui, id: u16) {
                         }
                         ui.end_row();
 
-                        // Per-asset cap shape, persisted in project and export files.
-                        ui.label("Cap");
-                        let mut cap_idx = match s.cap {
-                            q0s_format::geom::CapShape::Round => 0,
-                            q0s_format::geom::CapShape::Butt => 1,
-                        };
-                        let prev = cap_idx;
-                        egui::ComboBox::from_id_source(format!("asset_cap_{id}"))
-                            .selected_text(if cap_idx == 0 { "Round" } else { "Butt (flat)" })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut cap_idx, 0, "Round");
-                                ui.selectable_value(&mut cap_idx, 1, "Butt (flat)");
-                            });
-                        if cap_idx != prev {
-                            s.cap = if cap_idx == 0 {
-                                q0s_format::geom::CapShape::Round
-                            } else {
-                                q0s_format::geom::CapShape::Butt
-                            };
+                        // Per-asset ends and corners, persisted in project and
+                        // export files.
+                        if stroke_shape_pickers(ui, ("asset", id), &mut s.cap, &mut s.join) {
                             dirty = true;
                         }
-                        ui.end_row();
                     }
 
                     ui.label("Fill");
@@ -2195,27 +2213,28 @@ fn placement_properties(
         placement_idx,
     };
     let current_frame = crate::frame_edit::frame_for(app, reference);
-    let Some((source_frame, playback_start_frame, target, transform, tween, mut fx)) = app
-        .state
-        .project
-        .q0rgs
-        .iter()
-        .find(|q| q.q0rg_id == q0rg_id)
-        .and_then(|q| q.layers.iter().find(|layer| layer.layer_id == layer_id))
-        .and_then(|layer| {
-            let source = layer.placements.get(placement_idx)?;
-            let active = q0s_format::raster::active_placement_states_at(layer, current_frame)
-                .into_iter()
-                .find(|active| active.index == placement_idx)?;
-            Some((
-                source.frame,
-                active.playback_start_frame,
-                source.target,
-                active.transform,
-                source.tween,
-                active.fx,
-            ))
-        })
+    let Some((source_frame, playback_start_frame, target, transform, source_pivot, tween, mut fx)) =
+        app.state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q| q.q0rg_id == q0rg_id)
+            .and_then(|q| q.layers.iter().find(|layer| layer.layer_id == layer_id))
+            .and_then(|layer| {
+                let source = layer.placements.get(placement_idx)?;
+                let active = q0s_format::raster::active_placement_states_at(layer, current_frame)
+                    .into_iter()
+                    .find(|active| active.index == placement_idx)?;
+                Some((
+                    source.frame,
+                    active.playback_start_frame,
+                    source.target,
+                    active.transform,
+                    source.pivot,
+                    source.tween,
+                    active.fx,
+                ))
+            })
     else {
         ui.label("Selection is no longer available");
         return;
@@ -2234,6 +2253,7 @@ fn placement_properties(
     let mut transform_dirty = false;
     let mut fx_dirty = false;
     let mut manual_playback_edit = None;
+    let mut rotation_pivot = None;
     ui.label(egui::RichText::new("Placement").strong());
     if rig_bound {
         ui.label(
@@ -2311,7 +2331,47 @@ fn placement_properties(
                 egui::DragValue::new(&mut rotation_degrees).speed(1.0),
             );
             if rotation_response.changed() {
-                transform.rotation = rotation_degrees.to_radians();
+                // Numeric rotation must use the same local anchor as the stage
+                // handles. Changing only the angle rotates off-origin artwork
+                // around empty target coordinates instead of its visible pivot.
+                let pivot = source_pivot
+                    .or_else(|| {
+                        app.session
+                            .transform_pivot
+                            .as_ref()
+                            .filter(|pivot| pivot.selection == app.session.selection)
+                            .and_then(|pivot| {
+                                Affine::from_transform(transform)
+                                    .inverse()
+                                    .map(|inverse| inverse.apply(pivot.point))
+                            })
+                    })
+                    .or_else(|| {
+                        let revision = (
+                            app.active_project_tab_id().unwrap_or(0),
+                            app.state.render_revision(),
+                        );
+                        app.textures.with_placement_bounds_cache(
+                            &app.state.project,
+                            revision,
+                            |bounds, _| {
+                                bounds.target_local_bbox(&app.state.project, target).map(
+                                    |(x0, y0, x1, y1)| {
+                                        q0s_format::v2::Vec2::new((x0 + x1) * 0.5, (y0 + y1) * 0.5)
+                                    },
+                                )
+                            },
+                        )
+                    })
+                    .unwrap_or(q0s_format::v2::Vec2::new(0.0, 0.0));
+                let world = Affine::from_transform(transform).apply(pivot);
+                transform = crate::tools::rotate_placement_about_local_point(
+                    transform,
+                    pivot,
+                    world,
+                    rotation_degrees.to_radians() - transform.rotation,
+                );
+                rotation_pivot = Some(pivot);
             }
         });
 
@@ -2613,6 +2673,7 @@ fn placement_properties(
     }
     if rig_bound && transform_dirty && !fx_dirty {
         if crate::frame_edit::set_transform_at_frame(app, reference, current_frame, transform) {
+            store_rotation_pivot(app, reference, rotation_pivot);
             app.mark_placement_transforms_changed(&[(q0rg_id, layer_id, placement_idx)]);
         } else {
             app.session.status = "could not update the rig-bound transform".to_string();
@@ -2632,6 +2693,14 @@ fn placement_properties(
         },
         fx,
     ) {
+        store_rotation_pivot(
+            app,
+            PlacementRef {
+                placement_idx: new_idx,
+                ..reference
+            },
+            rotation_pivot,
+        );
         if rig_bound && transform_dirty {
             if crate::frame_edit::set_transform_at_frame(
                 app,
@@ -3304,6 +3373,32 @@ fn propagate_manual_q0rg_playback(
     }
 }
 
+/// Persist only after the numeric edit succeeded (and a held key was isolated).
+fn store_rotation_pivot(
+    app: &mut EditorApp,
+    reference: PlacementRef,
+    pivot: Option<q0s_format::v2::Vec2>,
+) {
+    let Some(pivot) = pivot else {
+        return;
+    };
+    if let Some(placement) = app
+        .state
+        .project
+        .q0rgs
+        .iter_mut()
+        .find(|q| q.q0rg_id == reference.q0rg_id)
+        .and_then(|q| {
+            q.layers
+                .iter_mut()
+                .find(|layer| layer.layer_id == reference.layer_id)
+        })
+        .and_then(|layer| layer.placements.get_mut(reference.placement_idx))
+    {
+        placement.pivot = Some(pivot);
+    }
+}
+
 fn apply_placement_edit_at_frame(
     app: &mut EditorApp,
     q0rg_id: u16,
@@ -3390,6 +3485,7 @@ mod tests {
         let mut app = EditorApp::default();
         app.state.project.q0rgs[0].frame_count = 12;
         app.state.project.q0rgs[0].layers[0].placements = vec![q0s_format::v2::Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: q0s_format::v2::Target::Asset(77),

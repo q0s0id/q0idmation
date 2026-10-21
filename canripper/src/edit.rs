@@ -413,6 +413,7 @@ mod tests {
                     name: "Layer".into(),
                     explicit_keyframes: vec![0],
                     placements: vec![v2::Placement {
+                        pivot: None,
                         instance_id: 0,
                         frame: 0,
                         target: v2::Target::Asset(7),

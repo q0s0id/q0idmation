@@ -59,6 +59,7 @@ pub fn migrate_v1_to_v2(v1: Q1Project) -> Result<ProjectV2, Error> {
                         .placements
                         .into_iter()
                         .map(|p| Placement {
+                            pivot: None,
                             instance_id: 0,
                             frame: p.frame,
                             target: Target::Asset(p.asset_id),

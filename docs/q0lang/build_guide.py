@@ -69,7 +69,7 @@ def table_cells(line):
 
 def code_block(source, language="q0lang"):
     return ('<div class="code"><div class="codebar"><span>' + html.escape(language)
-            + '</span><button type="button" class="copy">копировать</button></div><pre><code>'
+            + '</span><button type="button" class="copy">copy</button></div><pre><code>'
             + html.escape(source) + '</code></pre></div>')
 
 
@@ -142,7 +142,7 @@ SCRIPT = """
 const input=document.querySelector('#search');
 input.addEventListener('input',()=>{const query=input.value.toLocaleLowerCase().trim();let shown=0;document.querySelectorAll('article').forEach(article=>{article.hidden=query&&!article.textContent.toLocaleLowerCase().includes(query);if(!article.hidden)shown++});document.querySelector('#empty').style.display=shown?'none':'block'});
 document.querySelectorAll('a[href^="#"]').forEach(link=>link.addEventListener('click',()=>{input.value='';input.dispatchEvent(new Event('input'))}));
-document.querySelectorAll('.copy').forEach(button=>button.addEventListener('click',async()=>{const code=button.closest('.code').querySelector('pre code');try{await navigator.clipboard.writeText(code.textContent);button.textContent='скопировано';setTimeout(()=>button.textContent='копировать',1500)}catch{const range=document.createRange();range.selectNodeContents(code);const selection=getSelection();selection.removeAllRanges();selection.addRange(range);button.textContent='ctrl+c: копировать выделенное'}}));
+document.querySelectorAll('.copy').forEach(button=>button.addEventListener('click',async()=>{const code=button.closest('.code').querySelector('pre code');try{await navigator.clipboard.writeText(code.textContent);button.textContent='copied';setTimeout(()=>button.textContent='copy',1500)}catch{const range=document.createRange();range.selectNodeContents(code);const selection=getSelection();selection.removeAllRanges();selection.addRange(range);button.textContent='ctrl+c to copy the selection'}}));
 """
 
 
@@ -157,15 +157,15 @@ def build():
     for example in sorted((ROOT / "examples").glob("*.q0lang")):
         articles.append(f'<article id="example-{slug(example.stem)}"><h2>{html.escape(example.name)}</h2>'
                         + code_block(example.read_text(encoding="utf-8")) + "</article>")
-    return ('<!doctype html><html lang="ru"><head><meta charset="utf-8">'
+    return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width,initial-scale=1">'
-            '<title>q0lang · справочник</title><style>' + STYLE + '</style></head><body>'
-            '<aside><div class="brand">q0lang</div><div class="subtitle">язык для q0idmation</div>'
-            '<label for="search" class="muted">поиск по разделам</label><input id="search" type="search" placeholder="например, range или q0rig">'
-            '<nav aria-label="разделы">' + "".join(nav) + '</nav></aside><main>'
-            '<header><div class="muted">справочник языка</div><h1>от первого скрипта<br>до живой сцены.</h1>'
-            '<p class="muted">синтаксис, библиотеки, среда исполнения и готовые примеры. весь справочник доступен без интернета.</p></header>'
-            '<p id="empty" role="status">совпадений нет. попробуй другое слово.</p>'
+            '<title>q0lang · reference</title><style>' + STYLE + '</style></head><body>'
+            '<aside><div class="brand">q0lang</div><div class="subtitle">the language of q0idmation</div>'
+            '<label for="search" class="muted">search the reference</label><input id="search" type="search" placeholder="for example, range or q0rig">'
+            '<nav aria-label="sections">' + "".join(nav) + '</nav></aside><main>'
+            '<header><div class="muted">language reference</div><h1>from a first script<br>to a living scene.</h1>'
+            '<p class="muted">syntax, libraries, the runtime and ready-made examples. the whole reference works offline.</p></header>'
+            '<p id="empty" role="status">nothing matches. try another word.</p>'
             + "".join(articles) + '</main><script>' + SCRIPT + '</script></body></html>\n')
 
 

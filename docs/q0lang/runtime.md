@@ -1,134 +1,79 @@
-# q0lang: runtime
+# runtime and qvm
 
-Runtime q0lang выполняет AST от parser в изолированное состояние и выдает host
-actions. Host сам решает, как применить эти actions.
+[home](README.md) · [syntax](syntax.md) · [host api](hosts.md)
 
-Текущий runtime лежит здесь:
+## from source to effect
 
-```text
-q0s-format/src/q0lang/runtime.rs
-```
+`source → parser → compiler → qvm bytecode → qvm → host actions → host`
 
-## Состояние runtime
+The parser turns source into a syntax tree and reports diagnostics with line numbers. The compiler turns the tree into qvm bytecode. qvm runs the bytecode and collects host actions: jumps, commands, rig changes and so on. qvm itself has no access to files, the editor or the player. The host decides which actions it carries out; see the [availability table](hosts.md).
 
-Runtime хранит:
+The shared runtime lives in `q0s-format/src/q0lang/runtime.rs` and qvm in `q0vm/src/lib.rs`. q0editor, q0player and q0shell all run code this way.
 
-- переменные;
-- импортированные библиотеки;
-- registrations слушателей;
-- public function signatures;
-- private function signatures;
-- timeline actions, которые скрипт сгенерировал при выполнении.
+## runtime state
 
-## Значения
+One runtime keeps, between the scripts it runs:
 
-Текущие типы значений:
+- shared variables;
+- imported libraries;
+- event subscriptions;
+- the signatures of public and private functions;
+- the compiled bodies of defined functions, so a function from the general script can be called by later frame code.
 
-- `Number`;
-- `String`;
-- `Ident`;
-- `Raw`.
+q0player keeps one shared runtime per movie and one more per placed copy of a symbol with an [object script](hosts.md). Switching scenes keeps the shared runtime. Each runtime caches compiled source: a script that runs on every frame is compiled once.
 
-`Number` сейчас хранится как floating-point значение, чтобы ядро могло считать
-анимационную и геометрическую математику без танцев вокруг целых чисел.
+## values
 
-Если assignment получает identifier, runtime пытается взять значение из уже
-существующих переменных.
+| value | holds |
+| --- | --- |
+| number | a 64-bit float; there is no separate integer type |
+| string | UTF-8 text |
+| bool | `true` or `false` |
+| null | nothing |
+| ident | the text of a name that was never assigned |
+| raw | an internal leftover of some errors |
 
-```q0lang
-start = 2
-copy = start + 3
-```
+The rules for operators, truthiness and conversion are in [syntax](syntax.md).
 
-`copy` станет `5`.
+## host actions
 
-Runtime вычисляет арифметику и базовые функции `q0.math`:
+| action | made by | host |
+| --- | --- | --- |
+| `GoRun(target)`, `GoStop(target)` | `gorun!`, `gostop!` | editor preview, player |
+| `ShellCommand` | `q0shell.*!` | shell |
+| `SceneSwitch` | `q0scene.switch!` | player |
+| `RigSetPosition`, `RigSetValue`, `RigReset`, `RigSetPose`, `RigResetPose` | `q0rig.*!` | player |
+| `Physics(...)` | `q0physics.*!` | player |
+| `Particles(...)` | `q0particles.*!` | player |
+| `Light(...)` | `q0light.*!` | player |
 
-```q0lang
-import q0.math
+A target is either a frame index or a label string. Actions are collected while the script runs; the host applies them in order once it ends. Writes to host names such as `player.x` or `self.x` are read back the same way, after the script.
 
-x = sin(pi / 2)
-y = clamp(lerp(0, 10, 0.75), 2, 6)
-name = "Q0" + " tools"
-```
+## diagnostics
 
-Этот слой не требует q0editor: editor только показывает диагностику и summary
-состояния, а parser/runtime живут отдельно в `q0s-format`.
+Every diagnostic carries the source line it came from. A parse or compile error that makes the program meaningless stops it before it runs. A runtime error, such as a type error, ends that run with a diagnostic; actions collected before it still apply. In q0player, diagnostics are warnings: the movie still opens and plays, and the status line summarises them. q0player keeps at most 256 of them.
 
-## Timeline actions
+## limits
 
-Runtime не управляет playback напрямую. Он выдает actions:
+| limit | value |
+| --- | --- |
+| instructions per run | 100,000 |
+| instructions per run in the editor's code analysis | 4,096 |
+| operand stack | 4,096 values |
+| call depth | 128 nested calls |
+| nested expressions | 64 levels |
+| nested blocks | 64 levels |
+| frame and scene jumps in one chain | 64 |
+| active objects with scripts in q0player | 4,096 |
 
-```text
-GoRun(target)
-GoStop(target)
-```
+A run that hits the instruction limit stops with a diagnostic; an endless `while` therefore cannot freeze the player. A recursive function shares the budget of the run that called it.
 
-Targets:
+## bytecode
 
-```text
-Frame(u16)
-Label(String)
-```
+qvm bytecode starts with the magic `QVM\0` and a version (currently 2), followed by a constant pool, the code and a table of source lines. Encoding is deterministic: the same program always gives the same bytes. Version 1 bytecode still loads. Opcodes 41, 42 and 43 carry the physics, particle and light commands and need a qvm that knows them.
 
-Так ядро языка можно использовать в разных местах: `q0editor` показывает
-summary, а `q0player` применяет actions к playback.
+## the editor
 
-Timeline здесь намеренно остается host action. Математическое ядро языка может
-работать без `q0.timeline`, а `q0.timeline` может быть недоступен в CLI, тестах
-или future sandbox-режимах.
+The q0lang editor window analyses the script being edited with its own small budget. It shows diagnostics, how many statements the script has, the libraries it imports, and a summary of the actions, variables and event subscriptions one run produces. The editor preview runs real frame code; see [host api](hosts.md).
 
-## Интеграция с q0player
-
-Для v2 `.q0s` файлов q0player сейчас выполняет script у entry-q0rg один раз,
-когда файл загружается.
-
-Рабочие примеры:
-
-```q0lang
-gostop! 2
-```
-
-Фильм загрузится на frame `2` и остановится.
-
-```q0lang
-gorun! 3
-```
-
-Фильм загрузится на frame `3` и продолжит playback.
-
-Важное ограничение: scripts сейчас хранятся на q0rg-символах, а не на отдельных
-кадрах. Поэтому Flash-style frame actions еще не подключены.
-
-## Интеграция с q0editor
-
-q0lang editor показывает:
-
-- diagnostics;
-- количество statements;
-- built-in libraries;
-- Script summary с количеством actions, variables и listener events.
-
-Этот summary использует тот же runtime, что и q0player.
-
-## Ограничения сейчас
-
-- Entry q0rg script выполняется только при загрузке.
-- Per-frame script execution еще не реализован.
-- Тела функций и вызовы функций еще не реализованы.
-- Пользовательские функции пока только регистрируются как signatures; вызовы
-  сейчас есть только для встроенной математики.
-- Event handlers регистрируются в runtime state, но dispatch mouse events в
-  q0player еще не подключен.
-- Named timeline labels уже представлены в runtime, но q0player пока разрешает
-  только номера кадров и numeric label strings.
-
-## Следующие шаги runtime
-
-1. Добавить script slots на frames или frame actions в project format.
-2. Выполнять frame actions при входе playback в кадр.
-3. Подключить dispatch `q0.mouse` событий к registered handlers.
-4. Добавить тела функций и вызовы функций.
-5. Добавить label tables для named timeline targets.
-6. Обобщить host actions, чтобы `q0.timeline` был одним модулем эффектов рядом
-   с будущими `q0.audio`, `q0.asset`, `q0.debug`.
+Sources: [runtime](../../q0s-format/src/q0lang/runtime.rs), [compiler](../../q0s-format/src/q0lang/compiler.rs), [qvm](../../q0vm/src/lib.rs), [player](../../q0player/src/lib.rs), [object scripts](../../q0player/src/objects.rs), [editor analysis](../../q0editor/src/q0lang/editor.rs).

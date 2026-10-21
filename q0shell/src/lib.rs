@@ -68,6 +68,13 @@ impl ShellHost {
                 | RuntimeAction::RigResetPose { .. } => {
                     log.push("rig actions are unavailable in q0shell".to_string());
                 }
+                RuntimeAction::Physics(_)
+                | RuntimeAction::Particles(_)
+                | RuntimeAction::Light(_) => {
+                    log.push(
+                        "physics, particles and lights run in q0player, not q0shell".to_string(),
+                    );
+                }
             }
         }
         Ok(log)

@@ -754,6 +754,7 @@ mod tests {
                 name: "child".to_string(),
                 explicit_keyframes: vec![0],
                 placements: vec![Placement {
+                    pivot: None,
                     instance_id: 0,
                     frame: 0,
                     target: Target::Asset(7),
@@ -774,6 +775,7 @@ mod tests {
                 name: "parent".to_string(),
                 explicit_keyframes: vec![0],
                 placements: vec![Placement {
+                    pivot: None,
                     instance_id: 0,
                     frame: 0,
                     target: Target::Q0rg(2),

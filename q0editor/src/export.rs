@@ -18,7 +18,7 @@ use q0s_format::v2::{ProjectDependencyKind, ProjectDependencySource, ProjectV2};
 
 /// Public entry: produce raw bytes for a `.q0s` v2 file.
 pub fn export_to_q0s_bytes(project: &ProjectV2) -> Result<Vec<u8>, q0s_format::Error> {
-    q0s_format::write_q0s_v2(project)
+    q0s_format::write_q0s_v2(&crate::physics::for_player(project))
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +190,8 @@ pub fn export_with_embedded_dependencies(
     source_project_path: Option<&Path>,
 ) -> Result<BundledProjectExport, String> {
     let mut active_movies = std::collections::HashSet::new();
+    // The player gets only the physics and particles it runs live.
+    let project = &crate::physics::for_player(project);
     let bundled = bundle_project_recursive(project, source_project_path, 0, &mut active_movies)?;
     let bytes = q0s_format::write_q0s_v2(&bundled)
         .map_err(|error| format!("serialize bundled q0s: {error}"))?;
@@ -308,6 +310,7 @@ mod tests {
                     name: "L".to_string(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![Placement {
+                        pivot: None,
                         instance_id: 0,
                         frame: 0,
                         target: Target::Asset(1),

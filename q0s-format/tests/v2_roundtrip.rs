@@ -74,6 +74,7 @@ fn sample_v2_project() -> ProjectV2 {
                     },
                     width: 1.5,
                     cap: q0s_format::geom::CapShape::Round,
+                    join: q0s_format::geom::JoinShape::Bevel,
                 }),
             }),
         ],
@@ -95,6 +96,7 @@ fn sample_v2_project() -> ProjectV2 {
                     explicit_keyframes: Vec::new(),
                     placements: vec![
                         Placement {
+                            pivot: None,
                             instance_id: 0,
                             frame: 0,
                             target: Target::Asset(1),
@@ -107,6 +109,7 @@ fn sample_v2_project() -> ProjectV2 {
                             fx: Default::default(),
                         },
                         Placement {
+                            pivot: None,
                             instance_id: 0,
                             frame: 0,
                             target: Target::Q0rg(2),
@@ -136,6 +139,7 @@ fn sample_v2_project() -> ProjectV2 {
                     name: "Layer 1".to_string(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![Placement {
+                        pivot: None,
                         instance_id: 0,
                         frame: 0,
                         target: Target::Asset(2),
@@ -167,6 +171,7 @@ fn q0rg_chain(edge_count: usize) -> ProjectV2 {
                 name: "Layer".to_string(),
                 explicit_keyframes: Vec::new(),
                 placements: vec![Placement {
+                    pivot: None,
                     instance_id: 0,
                     frame: 0,
                     target: Target::Q0rg(q0rg_id + 1),
@@ -498,6 +503,7 @@ fn v2_detects_q0rg_cycle() {
     let mut project = sample_v2_project();
     // q0rg 2 references q0rg 1, while q0rg 1 already references 2 → cycle.
     project.q0rgs[1].layers[0].push_placement(Placement {
+        pivot: None,
         instance_id: 0,
         frame: 0,
         target: Target::Q0rg(1),

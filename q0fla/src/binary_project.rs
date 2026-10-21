@@ -280,229 +280,19 @@ struct Converter<'a> {
 
 impl Converter<'_> {
     fn shape_targets(&mut self, shape: &RawShape) -> Result<Vec<Target>, ImportError> {
-        if !shape
-            .fills
-            .values()
-            .any(|fill| matches!(fill, RawFillStyle::Bitmap { .. }))
-        {
-            return Ok(xfl_content::shape_assets(
-                shape,
-                self.owner,
-                self.project,
-                self.next_asset,
-                self.warnings,
-            )?
-            .into_iter()
-            .map(Target::Asset)
-            .collect());
-        }
-        let mut targets = Vec::new();
-        let mut styles = shape.fills.keys().copied().collect::<Vec<_>>();
-        styles.sort_unstable();
-        for style in styles {
-            let fill = &shape.fills[&style];
-            let mut isolated = shape.clone();
-            isolated.fills.retain(|id, _| *id == style);
-            isolated.strokes.clear();
-            for edge in &mut isolated.edges {
-                edge.fill0 = edge.fill0.filter(|id| *id == style);
-                edge.fill1 = edge.fill1.filter(|id| *id == style);
-                edge.stroke = None;
-            }
-            let RawFillStyle::Bitmap {
-                reference,
-                transform,
-                tiled,
-            } = fill
-            else {
-                targets.extend(
-                    xfl_content::shape_assets(
-                        &isolated,
-                        self.owner,
-                        self.project,
-                        self.next_asset,
-                        self.warnings,
-                    )?
-                    .into_iter()
-                    .map(Target::Asset),
-                );
-                continue;
-            };
-            let Some(&bitmap) = self.bitmaps.get(reference) else {
-                self.warnings.push(format!(
-                    "{}: missing bitmap fill Media {reference}",
-                    self.owner
-                ));
-                continue;
-            };
-            let texture = Affine::compose(shape.affine, *transform);
-            let Some(transform) = xfl_content::affine_to_transform(texture) else {
-                self.warnings.push(format!(
-                    "{}: degenerate bitmap fill transform was skipped",
-                    self.owner
-                ));
-                continue;
-            };
-            isolated.fills.insert(
-                style,
-                RawFillStyle::Solid(Rgba {
-                    r: 255,
-                    g: 255,
-                    b: 255,
-                    a: 255,
-                }),
-            );
-            let mask_assets = xfl_content::shape_assets(
-                &isolated,
-                self.owner,
-                self.project,
-                self.next_asset,
-                self.warnings,
-            )?;
-            if mask_assets.is_empty() {
-                continue;
-            }
-            let id = self.allocate_group()?;
-            let mut content = empty_layer(1, "Bitmap");
-            let (mut min_x, mut min_y, mut max_x, mut max_y) = (0_i32, 0_i32, 1_i32, 1_i32);
-            let bitmap_size = self
-                .project
-                .assets
-                .iter()
-                .find_map(|asset| match asset {
-                    Asset::Bitmap(value) if value.asset_id == bitmap => {
-                        Some((f32::from(value.width), f32::from(value.height)))
-                    }
-                    _ => None,
-                })
-                .expect("allocated bitmap media");
-            if *tiled {
-                let inverse = texture.inverse().ok_or_else(|| {
-                    ImportError::Invalid("bitmap fill transform is not invertible".into())
-                })?;
-                let mut bounds = (
-                    f32::INFINITY,
-                    f32::INFINITY,
-                    f32::NEG_INFINITY,
-                    f32::NEG_INFINITY,
-                );
-                for asset in &self.project.assets {
-                    let Asset::Vector(vector) = asset else {
-                        continue;
-                    };
-                    if !mask_assets.contains(&vector.asset_id) {
-                        continue;
-                    }
-                    for path in &vector.paths {
-                        for anchor in &path.anchors {
-                            for point in [Some(anchor.point), anchor.in_handle, anchor.out_handle]
-                                .into_iter()
-                                .flatten()
-                            {
-                                let point = inverse.apply(point);
-                                bounds.0 = bounds.0.min(point.x);
-                                bounds.1 = bounds.1.min(point.y);
-                                bounds.2 = bounds.2.max(point.x);
-                                bounds.3 = bounds.3.max(point.y);
-                            }
-                        }
-                    }
-                }
-                min_x = (bounds.0 / bitmap_size.0).floor() as i32;
-                min_y = (bounds.1 / bitmap_size.1).floor() as i32;
-                max_x = (bounds.2 / bitmap_size.0).ceil() as i32;
-                max_y = (bounds.3 / bitmap_size.1).ceil() as i32;
-                let count = i64::from(max_x)
-                    .saturating_sub(i64::from(min_x))
-                    .saturating_mul(i64::from(max_y).saturating_sub(i64::from(min_y)));
-                if !(1..=4096).contains(&count) {
-                    return Err(ImportError::Unsupported(format!(
-                        "{}: bitmap fill repetition exceeds 4096 tiles",
-                        self.owner
-                    )));
-                }
-            }
-            for y in min_y..max_y {
-                for x in min_x..max_x {
-                    let transform = if *tiled {
-                        xfl_content::affine_to_transform(Affine::compose(
-                            texture,
-                            Affine {
-                                tx: x as f32 * bitmap_size.0,
-                                ty: y as f32 * bitmap_size.1,
-                                ..Affine::IDENTITY
-                            },
-                        ))
-                        .ok_or_else(|| {
-                            ImportError::Invalid(
-                                "bitmap tile transform is not representable".into(),
-                            )
-                        })?
-                    } else {
-                        transform
-                    };
-                    content.push_placement(Placement {
-                        instance_id: 0,
-                        frame: 0,
-                        target: Target::Asset(bitmap),
-                        transform,
-                        tween: Tween::None,
-                        fx: PlacementFx::default(),
-                    });
-                }
-            }
-            let mut mask = empty_layer(2, "Fill boundary");
-            for asset in mask_assets {
-                mask.push_placement(Placement {
-                    instance_id: 0,
-                    frame: 0,
-                    target: Target::Asset(asset),
-                    transform: Transform2D::IDENTITY,
-                    tween: Tween::None,
-                    fx: PlacementFx::default(),
-                });
-            }
-            self.project.layer_metadata.insert(
-                LayerKey::new(id, 1),
-                LayerMetadata {
-                    mask_layer_id: Some(2),
-                    ..Default::default()
-                },
-            );
-            self.project.layer_metadata.insert(
-                LayerKey::new(id, 2),
-                LayerMetadata {
-                    kind: LayerKind::Mask,
-                    ..Default::default()
-                },
-            );
-            self.project.q0rgs.push(Q0rg {
-                q0rg_id: id,
-                name: format!("{} / Bitmap fill {id}", self.owner),
-                frame_count: 1,
-                script: String::new(),
-                layers: vec![content, mask],
-            });
-            targets.push(Target::Q0rg(id));
-        }
-        let mut strokes = shape.clone();
-        strokes.fills.clear();
-        for edge in &mut strokes.edges {
-            edge.fill0 = None;
-            edge.fill1 = None;
-        }
-        targets.extend(
-            xfl_content::shape_assets(
-                &strokes,
-                self.owner,
-                self.project,
-                self.next_asset,
-                self.warnings,
-            )?
-            .into_iter()
-            .map(Target::Asset),
-        );
-        Ok(targets)
+        let bitmaps = self.bitmaps;
+        xfl_content::shape_targets(
+            shape,
+            self.owner,
+            self.project,
+            self.next_asset,
+            self.next_q0rg,
+            self.warnings,
+            &|fill| match fill {
+                RawFillStyle::Bitmap { reference, .. } => bitmaps.get(reference).copied(),
+                _ => None,
+            },
+        )
     }
 
     fn allocate_group(&mut self) -> Result<u16, ImportError> {
@@ -549,8 +339,14 @@ impl Converter<'_> {
                 },
                 locked: info.locked,
                 hidden: info.hidden,
+                // A masked layer points at its mask; it sits in the folder
+                // its mask sits in.
                 parent_folder_id: info
                     .parent
+                    .and_then(|parent| match &self.archive.nodes[parent].kind {
+                        Kind::Layer(mask) if mask.kind == 4 => mask.parent,
+                        _ => Some(parent),
+                    })
                     .filter(|parent| matches!(&self.archive.nodes[*parent].kind, Kind::Layer(info) if info.kind == 3))
                     .and_then(|parent| model_ids.get(&parent).copied()),
                 mask_layer_id: info
@@ -620,6 +416,7 @@ impl Converter<'_> {
             shape.affine = node.affine;
             for target in self.shape_targets(&shape)? {
                 layer.push_placement(Placement {
+                    pivot: None,
                     instance_id: 0,
                     frame,
                     target,
@@ -693,6 +490,7 @@ impl Converter<'_> {
                         let mut group = empty_layer(1, "Artwork");
                         for target in targets {
                             group.push_placement(Placement {
+                                pivot: None,
                                 instance_id: 0,
                                 frame: 0,
                                 target,
@@ -736,6 +534,7 @@ impl Converter<'_> {
                 first_frame,
                 mode,
                 opacity,
+                tint,
                 ..
             } = node.kind
             {
@@ -744,8 +543,10 @@ impl Converter<'_> {
                 fx.q0rg_playback.single_frame = first_frame;
                 fx.q0rg_playback.mode = mode;
                 fx.opacity = opacity;
+                fx.tint = tint;
             }
             layer.push_placement(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame,
                 target,

@@ -15,10 +15,13 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 
 pub const IMPORT_EXTENSIONS: &[&str] = &["fla", "xfl"];
-const MAX_FLA_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_ARCHIVE_ENTRIES: usize = 20_000;
-const MAX_ARCHIVE_UNCOMPRESSED_BYTES: u64 = 1024 * 1024 * 1024;
-const MAX_DOM_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
+// Guards against zip bombs, not against big projects: a sprite pack with
+// everything on its stage keeps it all in DOMDocument.xml, and libraries of
+// ten thousand symbols are ordinary.
+const MAX_FLA_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRIES: usize = 200_000;
+const MAX_ARCHIVE_UNCOMPRESSED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_DOM_DOCUMENT_BYTES: u64 = 768 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum ImportError {
@@ -304,15 +307,26 @@ pub fn is_import_path(path: &Path) -> bool {
         })
 }
 
+/// Notes in the report how many drawings did not fit the project.
+fn report_dropped(mut imported: ImportedProject) -> ImportedProject {
+    let dropped = xfl_content::dropped_drawings();
+    if dropped > 0 {
+        imported.report.warnings.push(format!(
+            "this file holds more separate drawings than one q1s project can (65535); {dropped} were left out, so some symbols miss parts"
+        ));
+    }
+    imported
+}
+
 pub fn import_path(path: &Path) -> Result<ImportedProject, ImportError> {
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
         .unwrap_or_default();
     if extension.eq_ignore_ascii_case("fla") {
-        import_fla(path)
+        import_fla(path).map(report_dropped)
     } else if extension.eq_ignore_ascii_case("xfl") {
-        import_xfl(path)
+        import_xfl(path).map(report_dropped)
     } else {
         Err(ImportError::Unsupported(format!(
             "expected .fla or .xfl, got {}",
@@ -322,6 +336,7 @@ pub fn import_path(path: &Path) -> Result<ImportedProject, ImportError> {
 }
 
 pub fn import_fla(path: &Path) -> Result<ImportedProject, ImportError> {
+    xfl_content::forget_drawings();
     let size = std::fs::metadata(path)?.len();
     if size > MAX_FLA_BYTES {
         return Err(ImportError::Invalid(format!(
@@ -506,6 +521,7 @@ fn repair_adobe_central_directory_size(bytes: &mut [u8]) -> bool {
 }
 
 pub fn import_xfl(path: &Path) -> Result<ImportedProject, ImportError> {
+    xfl_content::forget_drawings();
     let dom_path = if path
         .file_name()
         .and_then(|name| name.to_str())
@@ -799,7 +815,15 @@ fn import_dom_document(
                         ImportError::Invalid("parent layer id overflow".to_string())
                     })?)
                 } else if parent.kind == LayerKind::Mask {
-                    None
+                    // A masked layer sits in the folder its mask sits in.
+                    parent
+                        .parent_index
+                        .filter(|index| {
+                            layers
+                                .get(*index)
+                                .is_some_and(|folder| folder.kind == LayerKind::Folder)
+                        })
+                        .and_then(|index| u16::try_from(index + 1).ok())
                 } else {
                     warnings.push(format!(
                         "layer '{}' points at non-folder parent index {}; parent relation was dropped",
@@ -1585,5 +1609,365 @@ mod tests {
         let imported = import_xfl(&marker).expect("import uncompressed xfl");
         assert_eq!(imported.project.meta.stage_height, 720);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Imports an FLA zipped from `files`, path and contents.
+    fn import_files(name: &str, files: &[(&str, &[u8])]) -> ImportedProject {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (path, contents) in files {
+            writer.start_file(*path, FileOptions::default()).unwrap();
+            writer.write_all(contents).unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner();
+        let root = std::env::temp_dir().join(format!("q0fla-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(format!("{name}.fla"));
+        std::fs::write(&path, bytes).unwrap();
+        let imported = import_path(&path).expect("import test fla");
+        let _ = std::fs::remove_dir_all(root);
+        q0s_format::v2::validate(&imported.project).expect("imported project validates");
+        imported
+    }
+
+    fn symbol_xml(name: &str, elements: &str) -> String {
+        format!(
+            r##"<DOMSymbolItem xmlns="http://ns.adobe.com/xfl/2008/" name="{name}"><timeline><DOMTimeline name="{name}"><layers><DOMLayer name="art"><frames><DOMFrame index="0"><elements>{elements}</elements></DOMFrame></frames></DOMLayer></layers></DOMTimeline></timeline></DOMSymbolItem>"##
+        )
+    }
+
+    fn stage_xml(includes: &[&str], layers: &str) -> String {
+        let includes = includes
+            .iter()
+            .map(|href| format!(r#"<Include href="{href}"/>"#))
+            .collect::<String>();
+        format!(
+            r##"<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="320" height="180" frameRate="24"><symbols>{includes}</symbols><timelines><DOMTimeline name="Scene 1"><layers>{layers}</layers></DOMTimeline></timelines></DOMDocument>"##
+        )
+    }
+
+    fn square(color: &str) -> String {
+        format!(
+            r##"<DOMShape><fills><FillStyle index="1"><SolidColor color="{color}"/></FillStyle></fills><edges><Edge fillStyle1="1" edges="!0 0|200 0|200 200|0 200|0 0"/></edges></DOMShape>"##
+        )
+    }
+
+    fn vector_bounds(project: &ProjectV2, id: u16) -> [f32; 4] {
+        let vector = project
+            .assets
+            .iter()
+            .find_map(|asset| match asset {
+                q0s_format::v2::Asset::Vector(vector) if vector.asset_id == id => Some(vector),
+                _ => None,
+            })
+            .expect("vector asset");
+        vector.paths.iter().flat_map(|path| &path.anchors).fold(
+            [f32::MAX, f32::MAX, f32::MIN, f32::MIN],
+            |b, anchor| {
+                [
+                    b[0].min(anchor.point.x),
+                    b[1].min(anchor.point.y),
+                    b[2].max(anchor.point.x),
+                    b[3].max(anchor.point.y),
+                ]
+            },
+        )
+    }
+
+    fn only_asset(q0rg: &Q0rg) -> u16 {
+        match q0rg.layers[0].placements[0].target {
+            q0s_format::v2::Target::Asset(id) => id,
+            other => panic!("expected a drawing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_group_matrix_is_not_applied_on_top_of_its_members() {
+        // Animate stores the group's own matrix for reference only; the
+        // member carries the same move already.
+        let layers = r##"<DOMLayer name="art"><frames><DOMFrame index="0"><elements><DOMGroup><matrix><Matrix tx="100" ty="50"/></matrix><members><DOMShape><matrix><Matrix tx="100" ty="50"/></matrix><fills><FillStyle index="1"><SolidColor color="#00ff00"/></FillStyle></fills><edges><Edge fillStyle1="1" edges="!0 0|200 0|200 200|0 200|0 0"/></edges></DOMShape></members></DOMGroup></elements></DOMFrame></frames></DOMLayer>"##;
+        let imported = import_files(
+            "group",
+            &[("DOMDocument.xml", stage_xml(&[], layers).as_bytes())],
+        );
+        let stage = &imported.project.q0rgs[0];
+        let bounds = vector_bounds(&imported.project, only_asset(stage));
+        assert_eq!(bounds, [100.0, 50.0, 110.0, 60.0], "moved once, not twice");
+    }
+
+    #[test]
+    fn library_files_the_document_does_not_list_are_left_out() {
+        // A stale copy named like the real symbol must not stand in for it.
+        let layers = r##"<DOMLayer name="art"><frames><DOMFrame index="0"><elements><DOMSymbolInstance libraryItemName="Box"/></elements></DOMFrame></frames></DOMLayer>"##;
+        let real = symbol_xml("Box", &square("#ff0000"));
+        let stale = symbol_xml("Box", &square("#0000ff"));
+        let imported = import_files(
+            "orphans",
+            &[
+                (
+                    "DOMDocument.xml",
+                    stage_xml(&["Box.xml"], layers).as_bytes(),
+                ),
+                ("LIBRARY/Old Box.xml", stale.as_bytes()),
+                ("LIBRARY/Box.xml", real.as_bytes()),
+            ],
+        );
+        assert_eq!(
+            imported.project.q0rgs.len(),
+            2,
+            "the stale copy is not imported"
+        );
+        let fill = imported
+            .project
+            .assets
+            .iter()
+            .find_map(|asset| match asset {
+                q0s_format::v2::Asset::Vector(vector) => vector.fill,
+                _ => None,
+            });
+        assert_eq!(
+            fill.map(|fill| fill.r),
+            Some(255),
+            "the listed symbol is used"
+        );
+    }
+
+    #[test]
+    fn symbols_whose_names_differ_only_by_a_space_stay_apart() {
+        let layers = r##"<DOMLayer name="art"><frames><DOMFrame index="0"><elements><DOMSymbolInstance libraryItemName="Guns/G36"/></elements></DOMFrame></frames></DOMLayer>"##;
+        let outer = symbol_xml(
+            "Guns/G36",
+            r##"<DOMSymbolInstance libraryItemName="Guns/G36 "/>"##,
+        );
+        let inner = symbol_xml("Guns/G36 ", &square("#ff0000"));
+        let imported = import_files(
+            "spaces",
+            &[
+                ("DOMDocument.xml", stage_xml(&[], layers).as_bytes()),
+                ("LIBRARY/Guns/G36.xml", outer.as_bytes()),
+                ("LIBRARY/Guns/G36 .xml", inner.as_bytes()),
+            ],
+        );
+        let outer = imported
+            .project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.name == "G36")
+            .expect("outer symbol");
+        let target = outer.layers[0].placements[0].target;
+        assert_ne!(target, q0s_format::v2::Target::Q0rg(outer.q0rg_id));
+        assert!(imported
+            .report
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("itself")));
+    }
+
+    #[test]
+    fn rectangle_and_oval_primitives_import_as_drawings() {
+        let layers = r##"<DOMLayer name="art"><frames><DOMFrame index="0"><elements><DOMRectangleObject x="10" y="20" objectWidth="30" objectHeight="40"><fill><SolidColor color="#123456"/></fill><stroke><SolidStroke weight="2"><fill><SolidColor color="#ff0000"/></fill></SolidStroke></stroke></DOMRectangleObject><DOMOvalObject x="0" y="0" objectWidth="20" objectHeight="10"><matrix><Matrix tx="100"/></matrix><fill><SolidColor color="#00ff00"/></fill></DOMOvalObject></elements></DOMFrame></frames></DOMLayer>"##;
+        let imported = import_files(
+            "primitives",
+            &[("DOMDocument.xml", stage_xml(&[], layers).as_bytes())],
+        );
+        let stage = &imported.project.q0rgs[0];
+        let targets = stage.layers[0]
+            .placements
+            .iter()
+            .map(|placement| match placement.target {
+                q0s_format::v2::Target::Asset(id) => id,
+                other => panic!("{other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(targets.len(), 3, "rectangle fill and stroke, oval fill");
+        let fills = targets
+            .iter()
+            .map(|id| vector_bounds(&imported.project, *id))
+            .collect::<Vec<_>>();
+        assert!(fills.contains(&[10.0, 20.0, 40.0, 60.0]), "{fills:?}");
+        let oval = fills
+            .iter()
+            .find(|bounds| bounds[0] > 90.0)
+            .expect("the oval sits 100 px right");
+        assert!((oval[0] - 100.0).abs() < 0.01 && (oval[2] - 120.0).abs() < 0.01);
+        assert!((oval[3] - 10.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn buttons_rest_on_their_up_state_and_guide_layers_stay_hidden() {
+        let layers =
+            r##"<DOMLayer name="guide" layerType="guide"><frames><DOMFrame index="0"><elements>"##
+                .to_string()
+                + &square("#000000")
+                + r##"</elements></DOMFrame></frames></DOMLayer><DOMLayer name="art"><frames><DOMFrame index="0"><elements><DOMSymbolInstance libraryItemName="Button" symbolType="button"/></elements></DOMFrame></frames></DOMLayer>"##;
+        let button = r##"<DOMSymbolItem xmlns="http://ns.adobe.com/xfl/2008/" name="Button" symbolType="button"><timeline><DOMTimeline name="Button"><layers><DOMLayer name="art"><frames><DOMFrame index="0" duration="4"><elements></elements></DOMFrame></frames></DOMLayer></layers></DOMTimeline></timeline></DOMSymbolItem>"##;
+        let imported = import_files(
+            "button",
+            &[
+                ("DOMDocument.xml", stage_xml(&[], &layers).as_bytes()),
+                ("LIBRARY/Button.xml", button.as_bytes()),
+            ],
+        );
+        let project = &imported.project;
+        let stage = &project.q0rgs[0];
+        let guide = stage
+            .layers
+            .iter()
+            .find(|layer| layer.name == "guide")
+            .expect("guide layer");
+        assert!(!project.layer_is_visible(stage.q0rg_id, guide.layer_id));
+        let art = stage
+            .layers
+            .iter()
+            .find(|layer| layer.name == "art")
+            .unwrap();
+        assert_eq!(
+            art.placements[0].fx.q0rg_playback.mode,
+            q0s_format::v2::Q0rgPlaybackMode::SingleFrame
+        );
+    }
+
+    #[test]
+    fn brightness_and_stroke_ends_and_corners_survive() {
+        let layers = r##"<DOMLayer name="art"><frames><DOMFrame index="0"><elements><DOMSymbolInstance libraryItemName="Line"><color><Color brightness="-0.5"/></color></DOMSymbolInstance></elements></DOMFrame></frames></DOMLayer>"##;
+        let line = symbol_xml(
+            "Line",
+            r##"<DOMShape><strokes><StrokeStyle index="1"><SolidStroke weight="4" caps="square" joints="miter"><fill><SolidColor/></fill></SolidStroke></StrokeStyle></strokes><edges><Edge strokeStyle="1" edges="!0 0|200 0|200 200"/></edges></DOMShape>"##,
+        );
+        let imported = import_files(
+            "brightness",
+            &[
+                ("DOMDocument.xml", stage_xml(&[], layers).as_bytes()),
+                ("LIBRARY/Line.xml", line.as_bytes()),
+            ],
+        );
+        let stage = &imported.project.q0rgs[0];
+        let tint = stage.layers[0].placements[0]
+            .fx
+            .tint
+            .expect("brightness tints");
+        assert_eq!((tint.color.r, tint.amount), (0, 0.5), "half way to black");
+        let stroke = imported
+            .project
+            .assets
+            .iter()
+            .find_map(|asset| match asset {
+                q0s_format::v2::Asset::Vector(vector) => vector.stroke,
+                _ => None,
+            })
+            .expect("a stroke");
+        assert_eq!(stroke.cap, q0s_format::geom::CapShape::Square);
+        assert_eq!(stroke.join, q0s_format::geom::JoinShape::Miter);
+    }
+
+    #[test]
+    fn identical_drawings_share_one_asset() {
+        let layers = r##"<DOMLayer name="a"><frames><DOMFrame index="0"><elements>"##.to_string()
+            + &square("#ff0000")
+            + r##"</elements></DOMFrame></frames></DOMLayer><DOMLayer name="b"><frames><DOMFrame index="0"><elements>"##
+            + &square("#ff0000")
+            + r##"</elements></DOMFrame></frames></DOMLayer>"##;
+        let imported = import_files(
+            "shared",
+            &[("DOMDocument.xml", stage_xml(&[], &layers).as_bytes())],
+        );
+        assert_eq!(imported.project.assets.len(), 1);
+    }
+
+    #[test]
+    fn a_bitmap_fill_masks_its_bitmap_with_the_fill_outline() {
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&[255, 10, 20, 30]).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut dat = Vec::new();
+        dat.extend_from_slice(&[0x03, 0x05]);
+        dat.extend_from_slice(&4u16.to_le_bytes());
+        dat.extend_from_slice(&1u16.to_le_bytes());
+        dat.extend_from_slice(&1u16.to_le_bytes());
+        dat.extend_from_slice(&[0u8; 16]);
+        dat.extend_from_slice(&[0, 1]);
+        dat.extend_from_slice(&(compressed.len() as u16).to_le_bytes());
+        dat.extend_from_slice(&compressed);
+        dat.extend_from_slice(&0u16.to_le_bytes());
+        let stage = r##"<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="320" height="180" frameRate="24"><media><DOMBitmapItem name="Texture" bitmapDataHRef="M 1.dat"/></media><timelines><DOMTimeline name="Scene 1"><layers><DOMLayer name="art"><frames><DOMFrame index="0"><elements><DOMShape><fills><FillStyle index="1"><BitmapFill bitmapPath="Texture"><matrix><Matrix a="20" d="20"/></matrix></BitmapFill></FillStyle></fills><edges><Edge fillStyle1="1" edges="!0 0|200 0|200 200|0 200|0 0"/></edges></DOMShape></elements></DOMFrame></frames></DOMLayer></layers></DOMTimeline></timelines></DOMDocument>"##;
+        let imported = import_files(
+            "bitmap-fill",
+            &[("DOMDocument.xml", stage.as_bytes()), ("bin/M 1.dat", &dat)],
+        );
+        let project = &imported.project;
+        let stage = project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == project.meta.entry_q0rg_id)
+            .unwrap();
+        let q0s_format::v2::Target::Q0rg(group) = stage.layers[0].placements[0].target else {
+            panic!("a bitmap fill becomes a masked group");
+        };
+        let group = project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == group)
+            .unwrap();
+        assert_eq!(
+            group.layers[0].placements.len(),
+            100,
+            "a 1 px bitmap tiles over a 10 px square"
+        );
+        assert_eq!(
+            project.layer_metadata(group.q0rg_id, 2).kind,
+            q0s_format::v2::LayerKind::Mask
+        );
+    }
+
+    #[test]
+    fn a_tapered_line_becomes_the_shape_it_covers() {
+        // 10 px wide at its start, nothing at its end.
+        let layers = r##"<DOMLayer name="art"><frames><DOMFrame index="0"><elements><DOMShape><strokes><StrokeStyle index="1"><SolidStroke weight="10"><fill><SolidColor color="#000000"/></fill><VariablePointWidth><WidthMarker position="0" left="0.5" right="0.5" type="corner"/><WidthMarker position="1" left="0" right="0" type="corner"/></VariablePointWidth></SolidStroke></StrokeStyle></strokes><edges><Edge strokeStyle="1" edges="!0 0|2000 0"/></edges></DOMShape></elements></DOMFrame></frames></DOMLayer>"##;
+        let imported = import_files(
+            "taper",
+            &[("DOMDocument.xml", stage_xml(&[], layers).as_bytes())],
+        );
+        let vector = imported
+            .project
+            .assets
+            .iter()
+            .find_map(|asset| match asset {
+                q0s_format::v2::Asset::Vector(vector) => Some(vector),
+                _ => None,
+            })
+            .expect("a drawing");
+        assert!(vector.stroke.is_none() && vector.fill.is_some());
+        let points = vector.paths[0]
+            .anchors
+            .iter()
+            .map(|anchor| anchor.point)
+            .collect::<Vec<_>>();
+        let reach_near = |x: f32| {
+            points
+                .iter()
+                .filter(|point| (point.x - x).abs() < 1.0)
+                .fold(0.0_f32, |reach, point| reach.max(point.y.abs()))
+        };
+        assert!(
+            (reach_near(0.0) - 5.0).abs() < 0.01,
+            "full width at the start"
+        );
+        assert!(reach_near(100.0) < 0.01, "tapered away at the end");
+    }
+
+    #[test]
+    fn a_domdocument_past_64_mb_still_imports() {
+        // An ordinary document padded past the old 64 MB cap.
+        let padding = " ".repeat(70 * 1024 * 1024);
+        let layers = format!(
+            r##"<DOMLayer name="art">{padding}<frames><DOMFrame index="0"><elements>{}</elements></DOMFrame></frames></DOMLayer>"##,
+            square("#ff0000")
+        );
+        let imported = import_files(
+            "big-dom",
+            &[("DOMDocument.xml", stage_xml(&[], &layers).as_bytes())],
+        );
+        assert_eq!(imported.project.assets.len(), 1);
     }
 }

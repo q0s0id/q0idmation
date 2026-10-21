@@ -498,6 +498,7 @@ mod tests {
                 name: "child layer".into(),
                 explicit_keyframes: Vec::new(),
                 placements: vec![Placement {
+                    pivot: None,
                     instance_id: 200,
                     frame: 0,
                     target: Target::Asset(51),
@@ -519,6 +520,7 @@ mod tests {
                 explicit_keyframes: Vec::new(),
                 placements: vec![
                     Placement {
+                        pivot: None,
                         instance_id: 300,
                         frame: 0,
                         target: Target::Asset(50),
@@ -527,6 +529,7 @@ mod tests {
                         fx: Default::default(),
                     },
                     Placement {
+                        pivot: None,
                         instance_id: 301,
                         frame: 0,
                         target: Target::Q0rg(20),

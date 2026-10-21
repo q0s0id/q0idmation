@@ -50,6 +50,7 @@ fn seed_simple_shape(app: &mut EditorApp) -> u16 {
             },
             width: 1.0,
             cap: q0s_format::geom::CapShape::Round,
+            join: q0s_format::geom::JoinShape::Bevel,
         }),
     }));
     let q0rg_id = app.session.current_q0rg_id;
@@ -67,6 +68,7 @@ fn seed_simple_shape(app: &mut EditorApp) -> u16 {
         .find(|l| l.layer_id == layer_id)
         .unwrap();
     layer.push_placement(Placement {
+        pivot: None,
         instance_id: 0,
         frame: 0,
         target: Target::Asset(asset_id),
@@ -331,6 +333,7 @@ fn convert_clicked_raw_glow_to_q0rg_preserves_material_state() {
         },
     );
     app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+        pivot: None,
         instance_id: 0,
         frame: 0,
         target: Target::Asset(asset_id),
@@ -446,6 +449,7 @@ fn convert_raw_area_to_q0rg_preserves_resolved_glow_pixels() {
         },
     );
     app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+        pivot: None,
         instance_id: 0,
         frame: 0,
         target: Target::Asset(asset_id),
@@ -583,6 +587,7 @@ fn convert_halo_only_raw_area_to_q0rg_preserves_visible_glow_without_loss() {
         },
     );
     app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+        pivot: None,
         instance_id: 0,
         frame: 0,
         target: Target::Asset(asset_id),
@@ -848,6 +853,7 @@ fn place_q0rg_instance_rejects_indirect_cycle() {
             name: "Layer 1".to_string(),
             explicit_keyframes: Vec::new(),
             placements: vec![Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Q0rg(root_id),
@@ -1102,6 +1108,7 @@ fn convert_selected_raw_fill_to_q0rg_preserves_neighbouring_graphics() {
     app.state.project.q0rgs[0].layers[0]
         .placements
         .push(Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
@@ -1222,6 +1229,7 @@ fn delete_action_removes_selected_raw_fill_but_keeps_its_neighbour() {
     app.state.project.q0rgs[0].layers[0]
         .placements
         .push(Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
@@ -1319,6 +1327,7 @@ fn seed_mixed_raw_area(app: &mut EditorApp) -> (u16, u16, usize, usize) {
             name: "Layer 1".to_string(),
             explicit_keyframes: Vec::new(),
             placements: vec![Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(raw_asset_id),
@@ -1344,6 +1353,7 @@ fn seed_mixed_raw_area(app: &mut EditorApp) -> (u16, u16, usize, usize) {
         .unwrap();
     let raw_idx = layer.placements.len();
     layer.push_placement(Placement {
+        pivot: None,
         instance_id: 0,
         frame: 0,
         target: Target::Asset(raw_asset_id),
@@ -1353,6 +1363,7 @@ fn seed_mixed_raw_area(app: &mut EditorApp) -> (u16, u16, usize, usize) {
     });
     let object_idx = layer.placements.len();
     layer.push_placement(Placement {
+        pivot: None,
         instance_id: 0,
         frame: 0,
         target: Target::Q0rg(child_q0rg_id),
@@ -1486,6 +1497,7 @@ fn copy_paste_raw_glow_carries_appearance_with_fresh_asset_id() {
         },
     );
     app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+        pivot: None,
         instance_id: 0,
         frame: 0,
         target: Target::Asset(asset_id),

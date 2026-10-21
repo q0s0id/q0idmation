@@ -160,6 +160,7 @@ pub(crate) fn scene_preview(app: &EditorApp, ctx: &Context) -> Option<ScenePrevi
             .iter_mut()
             .find(|l| l.layer_id == draft.layer_id)?
             .push_placement(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: draft.frame,
                 target: Target::Asset(asset_id),
@@ -478,11 +479,7 @@ pub fn handle_stage(app: &mut EditorApp, response: &Response, cursor: Option<Vec
         return;
     }
     let Some(point) = cursor else { return };
-    if point.x < 0.0
-        || point.y < 0.0
-        || point.x > f32::from(app.state.project.meta.stage_width)
-        || point.y > f32::from(app.state.project.meta.stage_height)
-    {
+    if !point.x.is_finite() || !point.y.is_finite() {
         return;
     }
     if let Some(selection) = crate::tools::selection_at_point_pub(
@@ -646,18 +643,19 @@ pub(crate) fn render_canvas(
         .unwrap_or([1.0, 1.0]);
     origin.y += draft.size * scale * (1.0 - metrics[0]);
     let font = egui::FontId::new((draft.size * scale * metrics[1]).clamp(4.0, 1024.0), family);
-    let color =
-        Color32::from_rgba_unmultiplied(draft.color.r, draft.color.g, draft.color.b, draft.color.a);
-    let text_width = ui.fonts(|fonts| {
-        fonts
-            .layout_no_wrap(draft.text.clone(), font.clone(), color)
-            .size()
-            .x
-    });
-    let width = (text_width + 24.0)
-        .max(150.0)
-        .min((ui.clip_rect().right() - origin.x).max(150.0));
-    let rect = egui::Rect::from_min_size(origin, egui::vec2(width, font.size * 1.5));
+    let face_bytes = cached_font(&draft.font);
+    let lay_out = |text: &str| {
+        let (bytes, index) = face_bytes.as_ref()?;
+        let face = Face::parse(bytes, *index).ok()?;
+        Some(layout_lines(&face, text, draft.size))
+    };
+    // The box hugs the text: the caret's width past the widest line, and a
+    // little room to start typing into when it is empty.
+    let text_width = lay_out(&draft.text)
+        .map(|lines| line_widths(&lines).into_iter().fold(0.0f32, f32::max) * scale)
+        .unwrap_or(0.0);
+    let width = (text_width + 2.0).max(draft.size * scale * 0.3);
+    let rect = egui::Rect::from_min_size(origin, egui::vec2(width, font.size * 1.25));
     let mut entry_rect = rect;
     let mut editor_id = egui::Id::NULL;
     let mut editor_had_focus = false;
@@ -672,7 +670,15 @@ pub(crate) fn render_canvas(
         for section in &mut job.sections {
             section.format.line_height = Some(line_height);
         }
-        ui.fonts(|f| f.layout_job(job))
+        let galley = ui.fonts(|f| f.layout_job(job));
+        match lay_out(text) {
+            Some(lines) => {
+                let mut aligned = (*galley).clone();
+                align_galley(&mut aligned, &lines, scale);
+                std::sync::Arc::new(aligned)
+            }
+            None => galley,
+        }
     };
     let focus_requested = draft.focus_requested;
     ui.allocate_ui_at_rect(rect, |ui| {
@@ -703,6 +709,33 @@ pub(crate) fn render_canvas(
         );
     });
     // The visible glyphs are painted by the stage through scene_preview.
+    // On a touch screen a text box under the on-screen keyboard, or past
+    // the canvas edge, is moved into view: typing into something hidden is
+    // no use.
+    if editor_had_focus && crate::touch::ENABLED {
+        let visible = ui.clip_rect().shrink(8.0);
+        let shift = egui::vec2(
+            if entry_rect.width() > visible.width() || entry_rect.left() < visible.left() {
+                visible.left() - entry_rect.left()
+            } else if entry_rect.right() > visible.right() {
+                visible.right() - entry_rect.right()
+            } else {
+                0.0
+            },
+            if entry_rect.height() > visible.height() || entry_rect.top() < visible.top() {
+                visible.top() - entry_rect.top()
+            } else if entry_rect.bottom() > visible.bottom() {
+                visible.bottom() - entry_rect.bottom()
+            } else {
+                0.0
+            },
+        );
+        if visible.is_positive() && shift.length() > 0.5 {
+            app.session.viewport.pan.x += shift.x;
+            app.session.viewport.pan.y += shift.y;
+            ui.ctx().request_repaint();
+        }
+    }
     let escape = editor_had_focus && ui.input(|i| i.key_pressed(egui::Key::Escape));
     let properties_rect = ui
         .ctx()
@@ -1137,6 +1170,7 @@ fn commit(app: &mut EditorApp, draft: &TextDraft) -> Result<(), String> {
             .ok_or("Drawing layer no longer exists")?;
         let placement_idx = layer.placements.len();
         layer.push_placement(Placement {
+            pivot: None,
             instance_id: 0,
             frame,
             target: Target::Asset(asset_id),
@@ -1245,6 +1279,75 @@ impl OutlineBuilder for GlyphPaths {
     }
 }
 
+/// One character of laid-out text: where its advance starts and how wide
+/// it is, in pixels at the text's size.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Placed {
+    character: char,
+    x: f32,
+    advance: f32,
+}
+
+/// Where every character of `text` sits, line by line. The outlines and the
+/// inline editor's caret both follow this, so the caret always lands where
+/// the glyphs are drawn and a space is exactly as wide as it looks.
+fn layout_lines(face: &Face, text: &str, size: f32) -> Vec<Vec<Placed>> {
+    let scale = size / f32::from(face.units_per_em());
+    let mut lines = vec![Vec::new()];
+    let mut x = 0.0;
+    let mut previous_glyph = None;
+    for character in text.chars() {
+        if character == '\n' {
+            lines.push(Vec::new());
+            x = 0.0;
+            previous_glyph = None;
+            continue;
+        }
+        let line = lines.last_mut().expect("one line at least");
+        let Some(glyph) = face.glyph_index(character) else {
+            previous_glyph = None;
+            line.push(Placed {
+                character,
+                x,
+                advance: size * 0.5,
+            });
+            x += size * 0.5;
+            continue;
+        };
+        if let (Some(previous), Some(kern)) = (previous_glyph, face.tables().kern) {
+            for subtable in kern.subtables {
+                if subtable.horizontal
+                    && !subtable.variable
+                    && !subtable.has_cross_stream
+                    && !subtable.has_state_machine
+                {
+                    x += f32::from(subtable.glyphs_kerning(previous, glyph).unwrap_or(0)) * scale;
+                }
+            }
+        }
+        let advance = f32::from(
+            face.glyph_hor_advance(glyph)
+                .unwrap_or(face.units_per_em() / 2),
+        ) * scale;
+        line.push(Placed {
+            character,
+            x,
+            advance,
+        });
+        x += advance;
+        previous_glyph = Some(glyph);
+    }
+    lines
+}
+
+/// How wide each laid-out line is.
+fn line_widths(lines: &[Vec<Placed>]) -> Vec<f32> {
+    lines
+        .iter()
+        .map(|line| line.last().map_or(0.0, |last| last.x + last.advance))
+        .collect()
+}
+
 fn outline_text(font: &[u8], index: u32, text: &str, size: f32) -> Result<Vec<Path>, String> {
     let face = Face::parse(font, index).map_err(|_| "Unable to read the system font")?;
     let scale = size / f32::from(face.units_per_em());
@@ -1255,41 +1358,69 @@ fn outline_text(font: &[u8], index: u32, text: &str, size: f32) -> Result<Vec<Pa
         baseline: size,
         scale,
     };
-    let mut previous_glyph = None;
-    for character in text.chars() {
-        if character == '\n' {
-            builder.x = 0.0;
-            builder.baseline += size * 1.25;
-            previous_glyph = None;
-            continue;
-        }
-        if let Some(glyph) = face.glyph_index(character) {
-            if let (Some(previous), Some(kern)) = (previous_glyph, face.tables().kern) {
-                for subtable in kern.subtables {
-                    if subtable.horizontal
-                        && !subtable.variable
-                        && !subtable.has_cross_stream
-                        && !subtable.has_state_machine
-                    {
-                        builder.x +=
-                            f32::from(subtable.glyphs_kerning(previous, glyph).unwrap_or(0))
-                                * scale;
-                    }
-                }
+    for (row, line) in layout_lines(&face, text, size).iter().enumerate() {
+        builder.baseline = size + row as f32 * size * 1.25;
+        for placed in line {
+            if let Some(glyph) = face.glyph_index(placed.character) {
+                builder.x = placed.x;
+                face.outline_glyph(glyph, &mut builder);
             }
-            face.outline_glyph(glyph, &mut builder);
-            previous_glyph = Some(glyph);
-            builder.x += f32::from(
-                face.glyph_hor_advance(glyph)
-                    .unwrap_or(face.units_per_em() / 2),
-            ) * scale;
-        } else {
-            previous_glyph = None;
-            builder.x += size * 0.5;
         }
     }
     builder.flush();
     Ok(builder.paths)
+}
+
+/// Moves egui's carets onto `lines`, laid out at `scale` screen pixels per
+/// text pixel: egui measures with its own font engine, and its idea of
+/// where letters are drifts from the outlines the stage draws.
+fn align_galley(galley: &mut egui::Galley, lines: &[Vec<Placed>], scale: f32) {
+    if galley.rows.len() != lines.len()
+        || galley
+            .rows
+            .iter()
+            .zip(lines)
+            .any(|(row, line)| row.glyphs.len() != line.len())
+    {
+        return;
+    }
+    let mut widest = 0.0f32;
+    for ((row, line), width) in galley.rows.iter_mut().zip(lines).zip(line_widths(lines)) {
+        for (glyph, placed) in row.glyphs.iter_mut().zip(line) {
+            glyph.pos.x = placed.x * scale;
+            glyph.size.x = placed.advance * scale;
+        }
+        row.rect.max.x = row.rect.min.x + width * scale;
+        widest = widest.max(row.rect.max.x);
+    }
+    galley.rect.max.x = galley.rect.min.x + widest;
+}
+
+/// Font files, read once each; the inline editor lays text out every frame.
+fn cached_font(name: &str) -> Option<(std::sync::Arc<Vec<u8>>, u32)> {
+    type Entry = (String, std::sync::Arc<Vec<u8>>, u32);
+    thread_local! {
+        static FONTS: std::cell::RefCell<Vec<Entry>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    if let Some(found) = FONTS.with(|fonts| {
+        fonts
+            .borrow()
+            .iter()
+            .find(|(cached, ..)| cached == name)
+            .map(|(_, bytes, index)| (std::sync::Arc::clone(bytes), *index))
+    }) {
+        return Some(found);
+    }
+    let (bytes, index) = font_bytes(name)?;
+    let bytes = std::sync::Arc::new(bytes);
+    FONTS.with(|fonts| {
+        let mut fonts = fonts.borrow_mut();
+        if fonts.len() >= 4 {
+            fonts.remove(0);
+        }
+        fonts.push((name.to_owned(), std::sync::Arc::clone(&bytes), index));
+    });
+    Some((bytes, index))
 }
 
 #[cfg(test)]
@@ -1329,6 +1460,53 @@ mod tests {
                     });
             },
         );
+    }
+
+    #[test]
+    fn carets_sit_where_the_outlines_are_drawn() {
+        let Some((bytes, index)) = font_bytes(&default_font()) else {
+            return;
+        };
+        let face = Face::parse(&bytes, index).unwrap();
+        let text = "AV To 
+hi ";
+        let lines = layout_lines(&face, text, 48.0);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].len(), "AV To ".chars().count());
+        // A trailing space is real room, as wide as the font says.
+        let space = lines[0].last().unwrap();
+        assert_eq!(space.character, ' ');
+        assert!(space.advance > 1.0);
+
+        // The outlines start each glyph where the layout put it.
+        let paths = outline_text(&bytes, index, "V", 48.0).unwrap();
+        let min_x = paths
+            .iter()
+            .flat_map(|path| path.anchors.iter().map(|anchor| anchor.point.x))
+            .fold(f32::MAX, f32::min);
+        assert!((-1.0..48.0).contains(&min_x));
+
+        // egui's own layout is moved onto ours, so carets match the glyphs.
+        let ctx = Context::default();
+        let mut galley = None;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            galley = Some(ctx.fonts(|fonts| {
+                fonts.layout_no_wrap(
+                    text.to_owned(),
+                    egui::FontId::proportional(30.0),
+                    Color32::WHITE,
+                )
+            }));
+        });
+        let mut galley = (*galley.unwrap()).clone();
+        align_galley(&mut galley, &lines, 2.0);
+        for (row, line) in galley.rows.iter().zip(&lines) {
+            for (glyph, placed) in row.glyphs.iter().zip(line) {
+                assert_eq!(glyph.pos.x, placed.x * 2.0);
+            }
+            let width = line_widths(std::slice::from_ref(line))[0] * 2.0;
+            assert!((row.rect.right() - width).abs() < 1.0e-3);
+        }
     }
 
     #[test]

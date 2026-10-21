@@ -119,10 +119,20 @@ pub fn handle(
             .or_else(|| response.interact_pointer_pos())
     };
     let cursor_stage = cursor_screen.map(|p| screen_to_stage(p, view)).filter(|p| {
-        // Allow cursor while in-stage; tools clamp themselves to stage rect.
+        // The paper is not a drawing limit. The canvas response owns input;
+        // negative and off-paper coordinates are valid, including in symbols.
         p.x.is_finite() && p.y.is_finite()
     });
 
+    // Effect gizmos on the stage (hitboxes, emitters) take the pointer
+    // before any tool does.
+    if crate::physics::handle_stage(app, response, cursor_stage, view)
+        || crate::particles::handle_stage(app, response, cursor_stage, view)
+        || crate::lights::handle_stage(app, response, cursor_stage, view)
+    {
+        ctx.request_repaint();
+        return;
+    }
     if handle_curve_drag(app, response, cursor_stage) {
         return;
     }
@@ -157,18 +167,144 @@ pub fn handle(
     }
 }
 
+/// Screen pixels within which a straight line's end can be grabbed.
+const LINE_END_REACH: f32 = 10.0;
+
+/// The selected raw line when it is one straight segment, with its path.
+fn selected_straight_line(project: &ProjectV2, selection: &Selection) -> Option<(PathRef, VPath)> {
+    let path = match selection {
+        Selection::RawParts {
+            fills,
+            strokes,
+            stroke_segments,
+            objects,
+        } if fills.is_empty()
+            && stroke_segments.is_empty()
+            && objects.is_empty()
+            && strokes.len() == 1 =>
+        {
+            strokes[0]
+        }
+        Selection::StrokeSegment(segment) => segment.path,
+        Selection::Paths(refs) if refs.len() == 1 => refs[0],
+        _ => return None,
+    };
+    let vpath = raw_path_clone(
+        project,
+        path.q0rg_id,
+        path.layer_id,
+        path.placement_idx,
+        path.path_idx,
+    )?;
+    let straight = !vpath.closed
+        && vpath.anchors.len() == 2
+        && vpath
+            .anchors
+            .iter()
+            .all(|anchor| anchor.in_handle.is_none() && anchor.out_handle.is_none());
+    straight.then_some((path, vpath))
+}
+
+/// Starts dragging an end of the selected straight line when `screen` is on
+/// one. A line has no height for a transform box to grab, so its ends are
+/// how it turns and stretches.
+fn begin_dragging_line_end(
+    app: &mut EditorApp,
+    view: &StageView,
+    screen: egui::Pos2,
+    point: Vec2,
+) -> bool {
+    let Some((path, vpath)) = selected_straight_line(&app.state.project, &app.session.selection)
+    else {
+        return false;
+    };
+    let Some(anchor_idx) = vpath
+        .anchors
+        .iter()
+        .enumerate()
+        .map(|(index, anchor)| (index, view.stage_to_screen(anchor.point).distance(screen)))
+        .filter(|(_, distance)| *distance <= LINE_END_REACH)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(index, _)| index)
+    else {
+        return false;
+    };
+    app.history
+        .snapshot_with_session(&app.state.project, &app.session);
+    let Some(mut mapped) =
+        prepare_raw_path_refs_for_edit(&mut app.state.project, &[path], app.session.current_frame)
+    else {
+        return false;
+    };
+    let path = mapped.remove(0);
+    let Some(start_path) = raw_path_clone(
+        &app.state.project,
+        path.q0rg_id,
+        path.layer_id,
+        path.placement_idx,
+        path.path_idx,
+    ) else {
+        return false;
+    };
+    app.session.selection = Selection::RawParts {
+        fills: Vec::new(),
+        strokes: vec![path],
+        stroke_segments: Vec::new(),
+        objects: Vec::new(),
+    };
+    app.session.tool_state = ToolState::DraggingLineEnd {
+        path,
+        anchor_idx,
+        start_cursor: point,
+        start_path,
+    };
+    app.session.status = "Moving the line's end; Shift keeps 45 degree steps".to_string();
+    true
+}
+
+/// Round grips on both ends of a selected straight line.
+fn draw_line_ends(app: &EditorApp, response: &Response, painter: &Painter, view: &StageView) {
+    if app.session.current_tool != Tool::Select {
+        return;
+    }
+    let Some((_, vpath)) = selected_straight_line(&app.state.project, &app.session.selection)
+    else {
+        return;
+    };
+    let accent = app.settings.theme.accent.to_color32();
+    for anchor in &vpath.anchors {
+        let at = view.stage_to_screen(anchor.point);
+        painter.circle(
+            at,
+            5.0,
+            egui::Color32::WHITE,
+            egui::Stroke::new(1.5_f32, accent),
+        );
+        if response
+            .hover_pos()
+            .is_some_and(|hover| hover.distance(at) <= LINE_END_REACH)
+            && matches!(app.session.tool_state, ToolState::Idle)
+        {
+            response.ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
+    }
+}
+
 /// Paint transient tool UI only after the project scene has been rendered.
 /// Keeping model mutation in `handle` and visual overlays here ensures both
 /// the artwork and its selection/transform UI observe the same frame state.
 pub fn draw_overlay(app: &mut EditorApp, response: &Response, painter: &Painter, view: &StageView) {
     draw_in_progress_overlay(app, painter, view);
     crate::physics::paint_stage_overlay(app, painter, view);
+    crate::particles::paint_stage_overlay(app, painter, view);
+    crate::lights::paint_stage_overlay(app, painter, view);
     if app.session.viewport.hand_active || app.session.viewport.panning {
         return;
     }
     draw_brush_cursor(app, painter, view);
     draw_eraser_cursor(app, painter, view);
     draw_transform_cursor(app, response, painter, view);
+    draw_line_ends(app, response, painter, view);
     if app.session.current_tool == Tool::Rig {
         crate::rigging::paint_stage_overlay(app, painter, view);
     }
@@ -1026,6 +1162,7 @@ fn pick_cursor(
             | ToolState::DraggingPath { .. }
             | ToolState::DraggingPaths { .. }
             | ToolState::DraggingPathPoints { .. }
+            | ToolState::DraggingLineEnd { .. }
             | ToolState::DraggingSubselectHandle { .. }
             | ToolState::DraggingGroup {
                 operation: GroupTransformOperation::Move { .. },
@@ -1608,10 +1745,23 @@ fn selection_default_pivot(app: &EditorApp) -> Option<Vec2> {
             placement_idx,
             app.session.current_frame,
         )?;
-        let local_center = Vec2::new(
-            (local_bbox.0 + local_bbox.2) * 0.5,
-            (local_bbox.1 + local_bbox.3) * 0.5,
-        );
+        let placement = app
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q| q.q0rg_id == q0rg_id)?
+            .layers
+            .iter()
+            .find(|layer| layer.layer_id == layer_id)?
+            .placements
+            .get(placement_idx)?;
+        let local_center = placement.pivot.unwrap_or_else(|| {
+            Vec2::new(
+                (local_bbox.0 + local_bbox.2) * 0.5,
+                (local_bbox.1 + local_bbox.3) * 0.5,
+            )
+        });
         return Some(Affine::from_transform(transform).apply(local_center));
     }
     selection_transform_bounds(app)
@@ -1619,6 +1769,25 @@ fn selection_default_pivot(app: &EditorApp) -> Option<Vec2> {
 }
 
 fn selection_transform_pivot(app: &EditorApp) -> Option<Vec2> {
+    if let Selection::Placement {
+        q0rg_id,
+        layer_id,
+        placement_idx,
+    } = app.session.selection
+    {
+        if app
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q| q.q0rg_id == q0rg_id)
+            .and_then(|q| q.layers.iter().find(|layer| layer.layer_id == layer_id))
+            .and_then(|layer| layer.placements.get(placement_idx))
+            .is_some_and(|placement| placement.pivot.is_some())
+        {
+            return selection_default_pivot(app);
+        }
+    }
     app.session
         .transform_pivot
         .as_ref()
@@ -1628,6 +1797,63 @@ fn selection_transform_pivot(app: &EditorApp) -> Option<Vec2> {
 }
 
 fn set_selection_transform_pivot(app: &mut EditorApp, point: Vec2) {
+    let anchors =
+        crate::selection_edit::selected_object_refs(&app.state.project, &app.session.selection)
+            .into_iter()
+            .filter_map(|reference| {
+                let layer = app
+                    .state
+                    .project
+                    .q0rgs
+                    .iter()
+                    .find(|q| q.q0rg_id == reference.q0rg_id)?
+                    .layers
+                    .iter()
+                    .find(|layer| layer.layer_id == reference.layer_id)?;
+                let placement = layer.placements.get(reference.placement_idx)?;
+                let transform = if placement.frame == app.session.current_frame {
+                    placement.transform
+                } else {
+                    crate::render::active_transform_for_placement(
+                        layer,
+                        reference.placement_idx,
+                        app.session.current_frame,
+                    )?
+                };
+                let local = Affine::from_transform(transform).inverse()?.apply(point);
+                Some((reference, local))
+            })
+            .collect::<Vec<_>>();
+    let mut changed = Vec::new();
+    for (reference, local) in anchors {
+        if let Some(placement) = app
+            .state
+            .project
+            .q0rgs
+            .iter_mut()
+            .find(|q| q.q0rg_id == reference.q0rg_id)
+            .and_then(|q| {
+                q.layers
+                    .iter_mut()
+                    .find(|layer| layer.layer_id == reference.layer_id)
+            })
+            .and_then(|layer| layer.placements.get_mut(reference.placement_idx))
+        {
+            if placement.pivot.is_none_or(|saved| {
+                (saved.x - local.x).abs() > 1.0e-4 || (saved.y - local.y).abs() > 1.0e-4
+            }) {
+                placement.pivot = Some(local);
+                changed.push((
+                    reference.q0rg_id,
+                    reference.layer_id,
+                    reference.placement_idx,
+                ));
+            }
+        }
+    }
+    if !changed.is_empty() {
+        app.mark_placement_transforms_changed(&changed);
+    }
     app.session.transform_pivot = Some(TransformPivot {
         selection: app.session.selection.clone(),
         point,
@@ -1635,12 +1861,7 @@ fn set_selection_transform_pivot(app: &mut EditorApp, point: Vec2) {
 }
 
 fn selected_pivot_hit(app: &mut EditorApp, view: &StageView, cursor_screen: Pos2) -> bool {
-    let explicit_pivot = app
-        .session
-        .transform_pivot
-        .as_ref()
-        .filter(|pivot| pivot.selection == app.session.selection)
-        .map(|pivot| pivot.point);
+    let explicit_pivot = selection_transform_pivot(app);
     let pivot = explicit_pivot.or_else(|| {
         if matches!(app.session.selection, Selection::Multi(_)) {
             selection_transform_bounds_scoped(app)
@@ -2996,7 +3217,7 @@ fn lasso(
         .map(|p| screen_to_stage(p, view))
         .or(cursor);
     if response.drag_started_by(PointerButton::Primary) {
-        if let Some(point) = pointer.filter(|p| primitive_point_is_on_stage(app, *p)) {
+        if let Some(point) = pointer.filter(|p| drawing_point_is_finite(*p)) {
             app.session.tool_state = ToolState::LassoDrawing {
                 points: vec![point],
             };
@@ -3636,6 +3857,7 @@ fn cut_raw_areas_for_drag_prepared(
             layer.placements.insert(
                 insertion,
                 Placement {
+                    pivot: None,
                     instance_id: 0,
                     frame: app.session.current_frame,
                     target: Target::Asset(selected_asset_id),
@@ -6215,10 +6437,15 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 .map(|screen| screen_to_stage(screen, view))
                 .unwrap_or(current_cursor);
             if let Some(screen_pos) = cursor_screen {
+                if !alt_down && begin_dragging_line_end(app, view, screen_pos, p) {
+                    return;
+                }
                 // A normal drag through the centre moves the selected artwork.
                 // Moving the transform anchor is an explicit Alt gesture.
                 if alt_down && selected_pivot_hit(app, view, screen_pos) {
                     let selection = app.session.selection.clone();
+                    app.history
+                        .snapshot_with_session(&app.state.project, &app.session);
                     set_selection_transform_pivot(app, p);
                     app.session.tool_state = ToolState::DraggingTransformPivot { selection };
                     app.session.status = "Moving transform anchor".to_string();
@@ -7033,6 +7260,45 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                     }
                 }
             }
+            ToolState::DraggingLineEnd {
+                path,
+                anchor_idx,
+                start_cursor,
+                start_path,
+            } => {
+                if let (Some(p), Some(start), Some(other)) = (
+                    cursor,
+                    start_path.anchors.get(anchor_idx),
+                    start_path.anchors.get(1 - anchor_idx.min(1)),
+                ) {
+                    let mut end = Vec2::new(
+                        start.point.x + p.x - start_cursor.x,
+                        start.point.y + p.y - start_cursor.y,
+                    );
+                    if shift_down {
+                        // Shift keeps the line at a multiple of 45 degrees.
+                        end = constrain_primitive_end(PrimitiveKind::Line, other.point, end, true);
+                    }
+                    let delta = Vec2::new(end.x - start.point.x, end.y - start.point.y);
+                    if replace_raw_path_points_translated(
+                        &mut app.state.project,
+                        path,
+                        &[anchor_idx],
+                        &start_path,
+                        delta,
+                    ) {
+                        app.state.mark_artwork_dirty();
+                        if let Some(asset_id) = raw_placement_asset_id(
+                            &app.state.project,
+                            path.q0rg_id,
+                            path.layer_id,
+                            path.placement_idx,
+                        ) {
+                            app.textures.invalidate_asset(asset_id);
+                        }
+                    }
+                }
+            }
             ToolState::DraggingPathPoints {
                 path,
                 anchor_indices,
@@ -7293,6 +7559,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 | ToolState::DraggingRawRotate { .. }
                 | ToolState::DraggingRawSkew { .. }
                 | ToolState::DraggingPathPoints { .. }
+                | ToolState::DraggingLineEnd { .. }
                 | ToolState::DraggingHandle { .. }
                 | ToolState::DraggingPlacementRotate { .. }
                 | ToolState::DraggingPlacementSkew { .. }
@@ -7653,7 +7920,7 @@ fn raw_edit_assets(
                 );
             }
         }
-        ToolState::DraggingPathPoints { path, .. } => {
+        ToolState::DraggingPathPoints { path, .. } | ToolState::DraggingLineEnd { path, .. } => {
             add(path.q0rg_id, path.layer_id, path.placement_idx);
         }
         _ => {}
@@ -8848,6 +9115,7 @@ pub(crate) fn materialize_raw_paths_as_placements(
             layer.placements.insert(
                 insertion,
                 Placement {
+                    pivot: None,
                     instance_id: 0,
                     frame,
                     target: Target::Asset(selected_asset_id),
@@ -11763,6 +12031,7 @@ pub(crate) fn materialize_layer_keyframe_for_edit(
             let source_index = state.index;
             let source = &layer.placements[source_index];
             let placement = Placement {
+                pivot: source.pivot,
                 instance_id: source.instance_id,
                 frame,
                 target: source.target,
@@ -12230,7 +12499,7 @@ fn apply_handle_drag(
     true
 }
 
-fn rotate_placement_about_local_point(
+pub(crate) fn rotate_placement_about_local_point(
     start: Transform2D,
     center_local: Vec2,
     center_world: Vec2,
@@ -12373,11 +12642,8 @@ fn primitive_pointer(response: &Response, cursor: Option<Vec2>, view: &StageView
         .or(cursor)
 }
 
-fn primitive_point_is_on_stage(app: &EditorApp, point: Vec2) -> bool {
-    point.x >= 0.0
-        && point.y >= 0.0
-        && point.x <= app.state.project.meta.stage_width as f32
-        && point.y <= app.state.project.meta.stage_height as f32
+fn drawing_point_is_finite(point: Vec2) -> bool {
+    point.x.is_finite() && point.y.is_finite()
 }
 
 fn constrain_primitive_end(kind: PrimitiveKind, start: Vec2, end: Vec2, shift: bool) -> Vec2 {
@@ -12496,7 +12762,14 @@ fn primitive_drag(
     let shift = response.ctx.input(|input| input.modifiers.shift);
 
     if response.drag_started_by(PointerButton::Primary) {
-        if let Some(point) = pointer.filter(|point| primitive_point_is_on_stage(app, *point)) {
+        // egui starts a drag only once the pointer has travelled past its
+        // threshold; the shape starts where the pointer went down.
+        let pressed = response
+            .ctx
+            .input(|input| input.pointer.press_origin())
+            .map(|screen| screen_to_stage(screen, view))
+            .or(pointer);
+        if let Some(point) = pressed.filter(|point| drawing_point_is_finite(*point)) {
             app.session.tool_state = ToolState::PrimitiveDrawing {
                 start: point,
                 end: point,
@@ -12513,19 +12786,9 @@ fn primitive_drag(
     if response.dragged_by(PointerButton::Primary)
         || response.drag_stopped_by(PointerButton::Primary)
     {
-        let stage_width = app.state.project.meta.stage_width as f32;
-        let stage_height = app.state.project.meta.stage_height as f32;
         if let ToolState::PrimitiveDrawing { start, end } = &mut app.session.tool_state {
-            if let Some(point) = pointer {
-                let point = Vec2::new(
-                    point.x.clamp(0.0, stage_width),
-                    point.y.clamp(0.0, stage_height),
-                );
-                let constrained = constrain_primitive_end(kind, *start, point, shift);
-                *end = Vec2::new(
-                    constrained.x.clamp(0.0, stage_width),
-                    constrained.y.clamp(0.0, stage_height),
-                );
+            if let Some(point) = pointer.filter(|point| drawing_point_is_finite(*point)) {
+                *end = constrain_primitive_end(kind, *start, point, shift);
             }
         }
     }
@@ -12594,6 +12857,7 @@ fn commit_vector_path(app: &mut EditorApp, new_path: VPath, mode: DrawingMode) {
         color: app.session.stroke_color,
         width: app.session.stroke_width.max(0.1),
         cap: app.session.brush_cap,
+        join: app.session.brush_join,
     });
     let new_bbox = match path_bbox(&new_path) {
         Some(b) => b,
@@ -12671,6 +12935,7 @@ fn commit_vector_path(app: &mut EditorApp, new_path: VPath, mode: DrawingMode) {
     {
         if let Some(layer) = q.layers.iter_mut().find(|l| l.layer_id == layer_id) {
             layer.push_placement(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame,
                 target: Target::Asset(asset_id),
@@ -14144,6 +14409,7 @@ fn draw_in_progress_overlay(app: &EditorApp, painter: &Painter, view: &StageView
         | ToolState::DraggingRawRotate { .. }
         | ToolState::DraggingRawSkew { .. }
         | ToolState::DraggingPathPoints { .. }
+        | ToolState::DraggingLineEnd { .. }
         | ToolState::DraggingSubselectHandle { .. }
         | ToolState::DraggingCurve { .. }
         | ToolState::DraggingHandle { .. }
@@ -14414,10 +14680,19 @@ fn draw_selection_content_overlay(
             painter.circle_stroke(center, 8.0, Stroke::new(1.0_f32, accent));
             return;
         };
-        let local_center = Vec2::new(
-            (local_bbox.0 + local_bbox.2) * 0.5,
-            (local_bbox.1 + local_bbox.3) * 0.5,
-        );
+        let authored_pivot = project
+            .q0rgs
+            .iter()
+            .find(|q| q.q0rg_id == q0rg_id)
+            .and_then(|q| q.layers.iter().find(|layer| layer.layer_id == layer_id))
+            .and_then(|layer| layer.placements.get(placement_idx))
+            .and_then(|placement| placement.pivot);
+        let local_center = authored_pivot.unwrap_or_else(|| {
+            Vec2::new(
+                (local_bbox.0 + local_bbox.2) * 0.5,
+                (local_bbox.1 + local_bbox.3) * 0.5,
+            )
+        });
         *placement_pivot = Some(visual_affine.apply(local_center));
         let frame = affine_transform_frame(local_bbox, visual_affine);
         let outline: Vec<Pos2> = frame
@@ -14540,17 +14815,21 @@ fn draw_transform_pivot_overlay(
     if app.session.current_tool != Tool::Select || selection_bounds.is_none() {
         return;
     }
-    let pivot = app
-        .session
-        .transform_pivot
-        .as_ref()
-        .filter(|pivot| pivot.selection == app.session.selection)
-        .map(|pivot| pivot.point)
-        .or_else(|| match &app.session.selection {
-            Selection::Placement { .. } => placement_pivot,
-            _ => selection_bounds
-                .map(|bounds| Vec2::new((bounds.0 + bounds.2) * 0.5, (bounds.1 + bounds.3) * 0.5)),
-        });
+    let pivot = (matches!(app.session.selection, Selection::Placement { .. })
+        .then_some(placement_pivot)
+        .flatten())
+    .or_else(|| {
+        app.session
+            .transform_pivot
+            .as_ref()
+            .filter(|pivot| pivot.selection == app.session.selection)
+            .map(|pivot| pivot.point)
+    })
+    .or_else(|| match &app.session.selection {
+        Selection::Placement { .. } => placement_pivot,
+        _ => selection_bounds
+            .map(|bounds| Vec2::new((bounds.0 + bounds.2) * 0.5, (bounds.1 + bounds.3) * 0.5)),
+    });
     let Some(pivot) = pivot else {
         return;
     };
@@ -16563,6 +16842,7 @@ fn recolour_bucket_target(
             layer.placements.insert(
                 (placement_idx + 1).min(layer.placements.len()),
                 Placement {
+                    pivot: None,
                     instance_id: 0,
                     frame,
                     target: Target::Asset(new_asset_id),
@@ -16656,6 +16936,7 @@ fn recolour_bucket_face(
     }
 
     let mut additions = vec![Placement {
+        pivot: None,
         instance_id: 0,
         frame: app.session.current_frame,
         target: Target::Asset(fill_id),
@@ -16764,6 +17045,7 @@ fn fill_empty_bucket_region(
         layer.placements.insert(
             insertion.min(layer.placements.len()),
             Placement {
+                pivot: None,
                 instance_id: 0,
                 frame,
                 target: Target::Asset(new_asset_id),
@@ -17399,6 +17681,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(asset_id),
@@ -17725,11 +18008,13 @@ mod tests {
                 },
                 width: 1.0,
                 cap: q0s_format::geom::CapShape::Round,
+                join: q0s_format::geom::JoinShape::Bevel,
             }),
         }));
         let layer = &mut project.q0rgs[0].layers[0];
         for asset_id in [fill_id, stroke_id] {
             layer.push_placement(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(asset_id),
@@ -17813,6 +18098,7 @@ mod tests {
         ];
         project.q0rgs[0].layers[0].placements = (1..=3)
             .map(|asset_id| Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(asset_id),
@@ -17906,6 +18192,7 @@ mod tests {
                 explicit_keyframes: Vec::new(),
                 placements: vec![
                     Placement {
+                        pivot: None,
                         instance_id: 0,
                         frame: 0,
                         target: Target::Asset(77),
@@ -17914,6 +18201,7 @@ mod tests {
                         fx: Default::default(),
                     },
                     Placement {
+                        pivot: None,
                         instance_id: 0,
                         frame: 1,
                         target: Target::Asset(78),
@@ -17925,6 +18213,7 @@ mod tests {
             }],
         });
         project.q0rgs[0].layers[0].push_placement(Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Q0rg(2),
@@ -17991,6 +18280,7 @@ mod tests {
                 name: "art".into(),
                 explicit_keyframes: Vec::new(),
                 placements: vec![Placement {
+                    pivot: None,
                     instance_id: 0,
                     frame: 0,
                     target: Target::Asset(77),
@@ -18001,6 +18291,7 @@ mod tests {
             }],
         });
         project.q0rgs[0].layers[0].push_placement(Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Q0rg(2),
@@ -18053,6 +18344,7 @@ mod tests {
             color,
             width: 2.0,
             cap: q0s_format::geom::CapShape::Round,
+            join: q0s_format::geom::JoinShape::Bevel,
         };
         for (id, x) in [(1, 30.0), (2, 130.0)] {
             app.state.project.assets.push(Asset::Vector(VectorAsset {
@@ -18069,6 +18361,7 @@ mod tests {
             app.state.project.q0rgs[0].layers[0]
                 .placements
                 .push(Placement {
+                    pivot: None,
                     instance_id: 0,
                     frame: 0,
                     target: Target::Asset(id),
@@ -18216,6 +18509,7 @@ mod tests {
             }));
         for (x, y) in [(10.0, 10.0), (100.0, 100.0)] {
             project.q0rgs[0].layers[0].push_placement(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(1),
@@ -18275,6 +18569,7 @@ mod tests {
                 name: "Layer".into(),
                 explicit_keyframes: vec![],
                 placements: vec![Placement {
+                    pivot: None,
                     instance_id: 0,
                     frame: 0,
                     target: Target::Asset(1),
@@ -18285,6 +18580,7 @@ mod tests {
             }],
         });
         project.q0rgs[0].layers[0].push_placement(Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Q0rg(2),
@@ -18334,6 +18630,7 @@ mod tests {
             stroke: None,
         }));
         project.q0rgs[0].layers[0].push_placement(Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
@@ -18612,6 +18909,7 @@ mod tests {
             stroke: Some(blue_stroke()),
         }));
         project.q0rgs[0].layers[0].push_placement(Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
@@ -18711,6 +19009,7 @@ mod tests {
             stroke: Some(blue_stroke()),
         }));
         project.q0rgs[0].layers[0].push_placement(Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
@@ -18843,6 +19142,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(asset_id),
@@ -19374,21 +19674,18 @@ mod tests {
     }
 
     #[test]
-    fn primitive_start_must_be_inside_the_stage() {
+    fn primitive_start_can_be_outside_the_stage() {
         let app = EditorApp::default();
-        assert!(primitive_point_is_on_stage(&app, Vec2::new(0.0, 0.0)));
-        assert!(primitive_point_is_on_stage(
-            &app,
-            Vec2::new(
-                app.state.project.meta.stage_width as f32,
-                app.state.project.meta.stage_height as f32,
-            )
-        ));
-        assert!(!primitive_point_is_on_stage(&app, Vec2::new(-0.1, 10.0)));
-        assert!(!primitive_point_is_on_stage(
-            &app,
-            Vec2::new(app.state.project.meta.stage_width as f32 + 0.1, 10.0)
-        ));
+        assert!(drawing_point_is_finite(Vec2::new(0.0, 0.0)));
+        assert!(drawing_point_is_finite(Vec2::new(
+            app.state.project.meta.stage_width as f32,
+            app.state.project.meta.stage_height as f32,
+        )));
+        assert!(drawing_point_is_finite(Vec2::new(-0.1, 10.0)));
+        assert!(drawing_point_is_finite(Vec2::new(
+            app.state.project.meta.stage_width as f32 + 0.1,
+            10.0,
+        )));
     }
 
     #[test]
@@ -19409,6 +19706,7 @@ mod tests {
             },
             width: 2.0,
             cap: q0s_format::geom::CapShape::Round,
+            join: q0s_format::geom::JoinShape::Bevel,
         }
     }
     fn blue_stroke() -> VStroke {
@@ -19421,6 +19719,7 @@ mod tests {
             },
             width: 2.0,
             cap: q0s_format::geom::CapShape::Round,
+            join: q0s_format::geom::JoinShape::Bevel,
         }
     }
 
@@ -19446,6 +19745,7 @@ mod tests {
             stroke: Some(stroke),
         })];
         app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
@@ -20330,6 +20630,7 @@ mod tests {
                     name: "L1".into(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![Placement {
+                        pivot: None,
                         instance_id: 0,
                         frame,
                         target: Target::Asset(asset_id),
@@ -20340,6 +20641,203 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    /// A 100 by 100 stage with one raw line from (20, 50) to (80, 50).
+    fn project_with_line() -> ProjectV2 {
+        let mut project = project_with_held_display_object();
+        project.assets = vec![Asset::Vector(VectorAsset {
+            asset_id: 1,
+            paths: vec![VPath {
+                anchors: vec![anchor(Vec2::new(20.0, 50.0)), anchor(Vec2::new(80.0, 50.0))],
+                closed: false,
+            }],
+            fill: None,
+            stroke: Some(VStroke {
+                color: Rgba {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 255,
+                },
+                width: 4.0,
+                cap: q0s_format::geom::CapShape::Round,
+                join: q0s_format::geom::JoinShape::Bevel,
+            }),
+        })];
+        project.q0rgs.truncate(1);
+        let layer = &mut project.q0rgs[0].layers[0];
+        layer.placements.truncate(1);
+        let placement = &mut layer.placements[0];
+        placement.target = Target::Asset(1);
+        placement.instance_id = 0;
+        placement.transform = Transform2D::IDENTITY;
+        placement.tween = Tween::None;
+        layer.explicit_keyframes = vec![0];
+        project
+    }
+
+    /// Runs one stage frame of `tool` with `events`.
+    fn stage_frame(
+        ctx: &Context,
+        app: &mut EditorApp,
+        events: Vec<egui::Event>,
+        tool: fn(&mut EditorApp, &Response, Option<Vec2>, &StageView),
+    ) {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    Pos2::ZERO,
+                    egui::vec2(100.0, 100.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none())
+                    .show(ctx, |ui| {
+                        let (rect, response) = ui.allocate_exact_size(
+                            egui::vec2(100.0, 100.0),
+                            egui::Sense::click_and_drag(),
+                        );
+                        let view = StageView {
+                            origin: Pos2::ZERO,
+                            scale: 1.0,
+                            stage_rect: rect,
+                            edit_transform: q0s_format::transform::Affine::IDENTITY,
+                        };
+                        let cursor = response
+                            .interact_pointer_pos()
+                            .or_else(|| response.hover_pos())
+                            .map(|p| Vec2::new(p.x, p.y));
+                        tool(app, &response, cursor, &view);
+                    });
+            },
+        );
+    }
+
+    fn press(x: f32, y: f32, pressed: bool) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos2(x, y)),
+            egui::Event::PointerButton {
+                pos: pos2(x, y),
+                button: PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_line_starts_where_the_pointer_went_down() {
+        let mut app = EditorApp::default();
+        app.state.project = project_with_line();
+        app.state.project.assets.clear();
+        app.state.project.q0rgs[0].layers[0].placements.clear();
+        app.session.current_q0rg_id = 1;
+        app.session.current_layer_id = 1;
+        app.session.current_tool = Tool::Line;
+        let ctx = Context::default();
+        let line_tool =
+            |app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: &StageView| {
+                primitive_drag(app, response, cursor, view, PrimitiveKind::Line);
+            };
+        stage_frame(&ctx, &mut app, vec![], line_tool);
+        stage_frame(&ctx, &mut app, press(10.0, 30.0, true), line_tool);
+        stage_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(pos2(25.0, 30.0))],
+            line_tool,
+        );
+        stage_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(pos2(70.0, 30.0))],
+            line_tool,
+        );
+        stage_frame(&ctx, &mut app, press(70.0, 30.0, false), line_tool);
+        let Some(Asset::Vector(vector)) = app.state.project.assets.first() else {
+            panic!("a line was drawn");
+        };
+        let start = vector.paths[0].anchors[0].point;
+        assert!(
+            (start.x - 10.0).abs() < 0.01 && (start.y - 30.0).abs() < 0.01,
+            "starts at the press, not where the drag was noticed: {start:?}"
+        );
+    }
+
+    #[test]
+    fn dragging_a_line_end_turns_and_stretches_it() {
+        let mut app = EditorApp::default();
+        app.state.project = project_with_line();
+        app.session.current_q0rg_id = 1;
+        app.session.current_layer_id = 1;
+        app.session.current_frame = 0;
+        app.session.current_tool = Tool::Select;
+        app.session.selection = Selection::RawParts {
+            fills: Vec::new(),
+            strokes: vec![PathRef {
+                q0rg_id: 1,
+                layer_id: 1,
+                placement_idx: 0,
+                path_idx: 0,
+            }],
+            stroke_segments: Vec::new(),
+            objects: Vec::new(),
+        };
+        let ctx = Context::default();
+        let select_tool =
+            |app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: &StageView| {
+                select(app, response, cursor, view);
+            };
+        stage_frame(&ctx, &mut app, vec![], select_tool);
+        stage_frame(&ctx, &mut app, press(81.0, 51.0, true), select_tool);
+        stage_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(pos2(81.0, 70.0))],
+            select_tool,
+        );
+        assert!(
+            matches!(
+                app.session.tool_state,
+                ToolState::DraggingLineEnd { anchor_idx: 1, .. }
+            ),
+            "{:?} / {:?}",
+            app.session.tool_state,
+            app.session.selection
+        );
+        stage_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(pos2(81.0, 91.0))],
+            select_tool,
+        );
+        stage_frame(&ctx, &mut app, press(81.0, 91.0, false), select_tool);
+        let points = app
+            .state
+            .project
+            .assets
+            .iter()
+            .find_map(|asset| match asset {
+                Asset::Vector(vector) => Some(
+                    vector.paths[0]
+                        .anchors
+                        .iter()
+                        .map(|anchor| anchor.point)
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(points[0], Vec2::new(20.0, 50.0), "the other end stays");
+        assert!(
+            (points[1].x - 80.0).abs() < 0.01 && (points[1].y - 90.0).abs() < 0.01,
+            "{:?}",
+            points[1]
+        );
     }
 
     fn project_with_held_display_object() -> ProjectV2 {
@@ -20394,6 +20892,7 @@ mod tests {
                         name: "Layer".into(),
                         explicit_keyframes: Vec::new(),
                         placements: vec![Placement {
+                            pivot: None,
                             instance_id: 42,
                             frame: 0,
                             target: Target::Q0rg(2),
@@ -20414,6 +20913,7 @@ mod tests {
                         name: "Artwork".into(),
                         explicit_keyframes: Vec::new(),
                         placements: vec![Placement {
+                            pivot: None,
                             instance_id: 0,
                             frame: 0,
                             target: Target::Asset(1),
@@ -20501,6 +21001,7 @@ mod tests {
                     explicit_keyframes: Vec::new(),
                     placements: vec![
                         Placement {
+                            pivot: None,
                             instance_id: 0,
                             frame: 0,
                             target: Target::Asset(1),
@@ -20509,6 +21010,7 @@ mod tests {
                             fx: Default::default(),
                         },
                         Placement {
+                            pivot: None,
                             instance_id: 0,
                             frame: 0,
                             target: Target::Asset(2),
@@ -21098,6 +21600,7 @@ mod tests {
             stroke: None,
         })];
         project.q0rgs[0].layers[0].placements = vec![Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
@@ -21158,6 +21661,7 @@ mod tests {
             },
         );
         app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
@@ -21309,6 +21813,7 @@ mod tests {
             stroke: None,
         })];
         app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
@@ -21392,6 +21897,7 @@ mod tests {
                     name: "Layer".into(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![Placement {
+                        pivot: None,
                         instance_id: 0,
                         frame: 0,
                         target: Target::Asset(1),
@@ -21553,6 +22059,7 @@ mod tests {
                     explicit_keyframes: Vec::new(),
                     placements: vec![
                         Placement {
+                            pivot: None,
                             instance_id: 0,
                             frame: 0,
                             target: Target::Asset(1),
@@ -21561,6 +22068,7 @@ mod tests {
                             fx: Default::default(),
                         },
                         Placement {
+                            pivot: None,
                             instance_id: 0,
                             frame: 0,
                             target: Target::Asset(2),
@@ -21617,6 +22125,7 @@ mod tests {
             stroke: None,
         })];
         project.q0rgs[0].layers[0].placements = vec![Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
@@ -21735,6 +22244,7 @@ mod tests {
                     name: "Layer".into(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![Placement {
+                        pivot: None,
                         instance_id: 0,
                         frame: 0,
                         target: Target::Asset(1),
@@ -21868,6 +22378,7 @@ mod tests {
                     name: "Layer".into(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![Placement {
+                        pivot: None,
                         instance_id: 0,
                         frame: 0,
                         target: Target::Asset(1),
@@ -22022,9 +22533,11 @@ mod tests {
                 },
                 width: 4.0,
                 cap: q0s_format::geom::CapShape::Round,
+                join: q0s_format::geom::JoinShape::Bevel,
             }),
         }));
         project.q0rgs[0].layers[0].push_placement(Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(77),
@@ -22562,6 +23075,7 @@ mod tests {
             stroke: None,
         }));
         project.q0rgs[0].layers[0].push_placement(Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(2),
@@ -22634,6 +23148,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(asset_id),
@@ -23263,6 +23778,7 @@ mod tests {
                     name: "Layer".into(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![Placement {
+                        pivot: None,
                         instance_id: 0,
                         frame: 0,
                         target: Target::Asset(1),
@@ -23337,6 +23853,7 @@ mod tests {
                     },
                     width: 4.0,
                     cap: q0s_format::geom::CapShape::Round,
+                    join: q0s_format::geom::JoinShape::Bevel,
                 }),
             })],
             asset_names: std::collections::HashMap::new(),
@@ -23356,6 +23873,7 @@ mod tests {
                         name: "Layer".into(),
                         explicit_keyframes: Vec::new(),
                         placements: vec![Placement {
+                            pivot: None,
                             instance_id: 0,
                             frame: 0,
                             target: Target::Q0rg(2),
@@ -23376,6 +23894,7 @@ mod tests {
                         name: "Artwork".into(),
                         explicit_keyframes: Vec::new(),
                         placements: vec![Placement {
+                            pivot: None,
                             instance_id: 0,
                             frame: 0,
                             target: Target::Asset(1),
@@ -23487,6 +24006,7 @@ mod tests {
         let layer = &mut project.q0rgs[0].layers[0];
         layer.placements[0].tween = Tween::Linear { to_frame: 10 };
         layer.push_placement(Placement {
+            pivot: None,
             instance_id: 0,
             frame: 10,
             target: Target::Q0rg(2),
@@ -24332,6 +24852,7 @@ mod tests {
                     name: "L".into(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![Placement {
+                        pivot: None,
                         instance_id: 0,
                         frame: 0,
                         target: Target::Asset(7),
@@ -24396,6 +24917,7 @@ mod tests {
             stroke: None,
         })];
         app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
@@ -24475,6 +24997,7 @@ mod tests {
             stroke: None,
         })];
         app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
@@ -24576,6 +25099,7 @@ mod tests {
             stroke: None,
         })];
         app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
@@ -24635,6 +25159,7 @@ mod tests {
             stroke: Some(blue_stroke()),
         })];
         app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
@@ -24772,6 +25297,7 @@ mod tests {
             stroke: Some(blue_stroke()),
         })];
         app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
@@ -24845,6 +25371,7 @@ mod tests {
                 name: "active".into(),
                 explicit_keyframes: Vec::new(),
                 placements: vec![Placement {
+                    pivot: None,
                     instance_id: 0,
                     frame: 0,
                     target: Target::Asset(1),
@@ -24859,6 +25386,7 @@ mod tests {
                 name: "other".into(),
                 explicit_keyframes: Vec::new(),
                 placements: vec![Placement {
+                    pivot: None,
                     instance_id: 0,
                     frame: 0,
                     target: Target::Asset(2),
@@ -24926,6 +25454,7 @@ mod tests {
             stroke: None,
         })];
         app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
@@ -24985,6 +25514,7 @@ mod tests {
             stroke: Some(outline),
         })];
         app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
@@ -25053,6 +25583,7 @@ mod tests {
             stroke: None,
         })];
         app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
@@ -25132,6 +25663,7 @@ mod tests {
             stroke: None,
         })];
         app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
@@ -25245,6 +25777,7 @@ mod tests {
                     name: "Layer".into(),
                     explicit_keyframes: Vec::new(),
                     placements: vec![Placement {
+                        pivot: None,
                         instance_id: 0,
                         frame: 0,
                         target: Target::Asset(1),
@@ -25345,6 +25878,7 @@ mod tests {
                     explicit_keyframes: Vec::new(),
                     placements: vec![
                         Placement {
+                            pivot: None,
                             instance_id: 0,
                             frame: 0,
                             target: Target::Asset(1),
@@ -25353,6 +25887,7 @@ mod tests {
                             fx: Default::default(),
                         },
                         Placement {
+                            pivot: None,
                             instance_id: 0,
                             frame: 0,
                             target: Target::Asset(1),
@@ -25502,6 +26037,7 @@ mod tests {
                         explicit_keyframes: Vec::new(),
                         placements: vec![
                             Placement {
+                                pivot: None,
                                 instance_id: 0,
                                 frame: 0,
                                 target: Target::Asset(1),
@@ -25510,6 +26046,7 @@ mod tests {
                                 fx: Default::default(),
                             },
                             Placement {
+                                pivot: None,
                                 instance_id: 0,
                                 frame: 0,
                                 target: Target::Q0rg(2),
@@ -25535,6 +26072,7 @@ mod tests {
                         name: "Layer".into(),
                         explicit_keyframes: Vec::new(),
                         placements: vec![Placement {
+                            pivot: None,
                             instance_id: 0,
                             frame: 0,
                             target: Target::Asset(2),
@@ -25779,6 +26317,7 @@ mod tests {
         object_transform.tx = 100.0;
         app.state.project.q0rgs[0].layers[0].placements = vec![
             Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(1),
@@ -25787,6 +26326,7 @@ mod tests {
                 fx: Default::default(),
             },
             Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(2),
@@ -25841,6 +26381,7 @@ mod tests {
             stroke: None,
         })];
         app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
@@ -25971,6 +26512,7 @@ mod tests {
             stroke: None,
         })];
         app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(1),
@@ -26149,6 +26691,7 @@ mod tests {
         ];
         app.state.project.q0rgs[0].layers[0].placements = vec![
             Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(1),
@@ -26157,6 +26700,7 @@ mod tests {
                 fx: Default::default(),
             },
             Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(2),
@@ -26285,6 +26829,7 @@ mod tests {
         object_transform.tx = 100.0;
         app.state.project.q0rgs[0].layers[0].placements = vec![
             Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(1),
@@ -26293,6 +26838,7 @@ mod tests {
                 fx: Default::default(),
             },
             Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(2),
@@ -26538,6 +27084,7 @@ mod tests {
                     name: "objects".into(),
                     explicit_keyframes: vec![0],
                     placements: vec![Placement {
+                        pivot: None,
                         instance_id: 1,
                         frame: 0,
                         target: Target::Asset(1),
@@ -26598,6 +27145,7 @@ mod tests {
             stroke: None,
         }));
         app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(asset_id),

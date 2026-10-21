@@ -394,6 +394,31 @@ pub fn create_tweens_of_kind(
         return Err(TweenCreateError::NoTimelineCell);
     }
 
+    let pivots = plans
+        .iter()
+        .flat_map(|plan| {
+            let layer = q0rg
+                .layers
+                .iter()
+                .find(|layer| layer.layer_id == plan.layer_id)
+                .unwrap();
+            plan.placement_indices.iter().map(move |&index| {
+                (
+                    plan.layer_id,
+                    index,
+                    layer.placements[index].target,
+                    layer.placements[index].pivot,
+                )
+            })
+        })
+        .map(|(layer, index, target, pivot)| {
+            (
+                layer,
+                index,
+                pivot.or_else(|| q0s_format::motion_tween::default_pivot(project, target)),
+            )
+        })
+        .collect::<Vec<_>>();
     let q0rg = project
         .q0rgs
         .iter_mut()
@@ -407,6 +432,33 @@ pub fn create_tweens_of_kind(
             .find(|layer| layer.layer_id == plan.layer_id)
             .expect("selected tween layer still exists");
         for placement_idx in plan.placement_indices {
+            if kind == TweenKind::Motion {
+                let pivot = pivots
+                    .iter()
+                    .find(|(id, index, _)| *id == plan.layer_id && *index == placement_idx)
+                    .and_then(|(_, _, pivot)| *pivot);
+                layer.placements[placement_idx].pivot = pivot;
+                let source = &layer.placements[placement_idx];
+                let occurrence = layer.placements[..placement_idx]
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.frame == source.frame && candidate.target == source.target
+                    })
+                    .count();
+                let target = source.target;
+                if let Some(destination) = layer
+                    .placements
+                    .iter_mut()
+                    .filter(|placement| {
+                        placement.frame == plan.destination_frame && placement.target == target
+                    })
+                    .nth(occurrence)
+                {
+                    if destination.pivot.is_none() {
+                        destination.pivot = pivot;
+                    }
+                }
+            }
             layer.placements[placement_idx].tween = match kind {
                 TweenKind::Motion => Tween::Linear {
                     to_frame: plan.destination_frame,
@@ -1191,6 +1243,7 @@ mod tests {
         project.q0rgs[0].layers[0].explicit_keyframes.clear();
         project.q0rgs[0].layers[0].placements = vec![
             q0s_format::v2::Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: q0s_format::v2::Target::Asset(77),
@@ -1199,6 +1252,7 @@ mod tests {
                 fx: Default::default(),
             },
             q0s_format::v2::Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 6,
                 target: q0s_format::v2::Target::Asset(77),
@@ -1290,6 +1344,7 @@ mod tests {
             explicit_keyframes: Vec::new(),
             placements: vec![
                 q0s_format::v2::Placement {
+                    pivot: None,
                     instance_id: 0,
                     frame: 0,
                     target: q0s_format::v2::Target::Asset(88),
@@ -1298,6 +1353,7 @@ mod tests {
                     fx: Default::default(),
                 },
                 q0s_format::v2::Placement {
+                    pivot: None,
                     instance_id: 0,
                     frame: 6,
                     target: q0s_format::v2::Target::Asset(88),
@@ -1333,6 +1389,7 @@ mod tests {
                 explicit_keyframes: Vec::new(),
                 placements: vec![
                     q0s_format::v2::Placement {
+                        pivot: None,
                         instance_id: 0,
                         frame: 0,
                         target: q0s_format::v2::Target::Asset(88),
@@ -1341,6 +1398,7 @@ mod tests {
                         fx: Default::default(),
                     },
                     q0s_format::v2::Placement {
+                        pivot: None,
                         instance_id: 0,
                         frame: 6,
                         target: q0s_format::v2::Target::Asset(88),

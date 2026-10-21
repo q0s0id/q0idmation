@@ -1,27 +1,27 @@
-# синтаксис и типы
+# syntax and types
 
-[главная](README.md) · [библиотеки](builtins.md) · [runtime](runtime.md)
+[home](README.md) · [libraries](builtins.md) · [runtime](runtime.md)
 
-## строки и блоки
+## lines and blocks
 
-одна инструкция занимает одну строку. пустые строки разрешены. `#` вне кавычек начинает комментарий до конца строки. отступы нужны для читаемости; структуру определяют скобки.
+One statement takes one line. Blank lines are allowed. `#` outside quotes starts a comment that runs to the end of the line. Indentation is for readability; braces define the structure.
 
-открывающая `{` завершает строку заголовка. закрывающая `}` стоит на отдельной строке; для условия допустимо `} else {`. однострочных блоков, точек с запятой, многострочных выражений и комментариев `//` / `/* ... */` нет.
+An opening `{` ends the header line. A closing `}` stands on a line of its own; a condition may use `} else {`. There are no one-line blocks, no semicolons, no multi-line expressions and no `//` or `/* ... */` comments.
 
 ```q0lang
-# комментарий
-text = "в строке # остаётся символом"
+# a comment
+text = "inside a string # stays a character"
 do! {
   count = 2
   total = count * 3
 }
 ```
 
-`do!` выполняет инструкции сразу. собственной области переменных и отложенного запуска у него нет.
+`do!` runs its statements right away. It has no scope of its own and no deferred start.
 
-## имена и присваивание
+## names and assignment
 
-имя начинается с латинской буквы или `_`, затем допускает латинские буквы, цифры и `_`. регистр различается. части имени host api разделяются точками: `stage.width`, `player.x`. кириллица разрешена в строках, но не в именах.
+A name starts with a Latin letter or `_` and continues with Latin letters, digits and `_`. Case matters. Host api names join their parts with dots: `stage.width`, `player.x`. Non-Latin letters are fine inside strings but not in names.
 
 ```q0lang
 speed = 120
@@ -29,55 +29,55 @@ speed = speed + 30
 game.score = 0
 ```
 
-`=` сохраняет значение, `==` сравнивает. отдельного объявления переменной и аннотации типа нет. `+=`, `-=`, `++`, несколько присваиваний в одной строке не поддерживаются. ключевые слова не используй как имена.
+`=` stores a value, `==` compares. There is no separate declaration and no type annotation. `+=`, `-=`, `++` and several assignments on one line are not supported. Do not use keywords as names.
 
-`game.score` является цельным именем общей переменной. объект `game` при этом не создаётся. обращения через `[]` нет.
+`game.score` is a single name for a shared variable; no `game` object is created. There is no `[]` access.
 
-## значения
+## values
 
-| тип | запись | смысл |
+| type | written as | meaning |
 | --- | --- | --- |
-| число | `0`, `12`, `0.25`, `-4.5` | число двойной точности; отдельного целого типа нет |
-| строка | `"привет"`, `'привет'` | текст utf-8; оба вида кавычек равноправны |
-| логическое | `true`, `false` | также результат сравнений и логических операций |
-| пустое | `null` | также результат функции без возвращённого значения |
+| number | `0`, `12`, `0.25`, `-4.5` | a double-precision number; there is no separate integer type |
+| string | `"hello"`, `'hello'` | UTF-8 text; both quote styles are equivalent |
+| boolean | `true`, `false` | also the result of comparisons and logical operators |
+| null | `null` | also what a function returns when it returns nothing |
 
-число начинается с цифры: пиши `0.5`, а не `.5`. экспоненциальной записи `1e3`, шестнадцатеричных чисел и разделителей цифр нет. минус является унарной операцией.
+A number starts with a digit: write `0.5`, not `.5`. There is no exponent notation like `1e3`, no hexadecimal and no digit separators. Minus is a unary operator.
 
-строки поддерживают `\n`, `\r`, `\t`, `\\`, `\"`, `\'`. для остальных escape-последовательностей обратная косая черта не сохраняется. для путей удобнее `/` или `\\`. интерполяции и многострочных литералов нет. старый синтаксис `..."текст"` выдаёт диагностику.
+Strings understand `\n`, `\r`, `\t`, `\\`, `\"` and `\'`. For any other escape the backslash is dropped. For paths, `/` or `\\` is easiest. There is no interpolation and no multi-line literal. The old `..."text"` syntax gives a diagnostic.
 
 ```q0lang
-message = "кадр " + 12 + "\nготово"
+message = "frame " + 12 + "\ndone"
 path = "out/report.txt"
 ```
 
-неизвестное общее имя сейчас даёт служебное значение `ident` с текстом имени: `copy = missing` сохраняет символическое `missing`. оно не превращается в `null`. опечатка в арифметике обычно приводит к ошибке типа. имена ригов и целей лучше писать в кавычках. `raw` является внутренним значением после некоторых ошибок; отдельного литерала такого типа нет.
+An unknown shared name currently evaluates to the internal value `ident` holding the name's text: `copy = missing` stores the symbolic `missing`. It does not become `null`. A typo in arithmetic therefore usually ends in a type error. Rig and target names are best written in quotes. `raw` is an internal value left behind by some errors; it has no literal of its own.
 
-## операции
+## operators
 
-приоритет от самого высокого к самому низкому:
+From highest to lowest precedence:
 
-| уровень | операции | смысл |
+| level | operators | meaning |
 | --- | --- | --- |
-| 1 | `(...)`, `name(...)` | группировка и вызов |
-| 2 | `-value`, `not value`, `!value` | числовое и логическое отрицание |
-| 3 | `^` | степень, группировка справа |
-| 4 | `*`, `/`, `%` | умножение, деление, остаток |
-| 5 | `+`, `-` | сложение / соединение строк, вычитание |
-| 6 | `<`, `<=`, `>`, `>=` | упорядоченное сравнение |
-| 7 | `==`, `!=` | равенство и неравенство |
-| 8 | `and`, `&&` | логическое «и» |
-| 9 | `or`, `\|\|` | логическое «или» |
+| 1 | `(...)`, `name(...)` | grouping and calls |
+| 2 | `-value`, `not value`, `!value` | numeric and logical negation |
+| 3 | `^` | power, grouping from the right |
+| 4 | `*`, `/`, `%` | multiply, divide, remainder |
+| 5 | `+`, `-` | add or join strings, subtract |
+| 6 | `<`, `<=`, `>`, `>=` | ordering |
+| 7 | `==`, `!=` | equality and inequality |
+| 8 | `and`, `&&` | logical and |
+| 9 | `or`, `\|\|` | logical or |
 
-кроме степени, бинарные операции одного уровня группируются слева. унарный минус сильнее степени: `-2 ^ 2` равно `4`; для `-4` напиши `-(2 ^ 2)`. `2 ^ 3 ^ 2` равно `512`. побитовых операций нет.
+Apart from power, binary operators of one level group from the left. Unary minus binds tighter than power: `-2 ^ 2` is `4`; for `-4` write `-(2 ^ 2)`. `2 ^ 3 ^ 2` is `512`. There are no bitwise operators.
 
-арифметика принимает числа. если хотя бы один аргумент `+` является строкой, второй переводится в текст и соединяется с ней: `"2" + 3` даёт `"23"`. `2 + true` является ошибкой типа. `/` выполняет дробное деление; `%` имеет поведение остатка чисел с плавающей точкой. деление на ноль и недопустимая числовая область могут дать бесконечность или `nan`, не исключение.
+Arithmetic takes numbers. If either side of `+` is a string, the other side is turned into text and joined: `"2" + 3` gives `"23"`. `2 + true` is a type error. `/` divides with fractions; `%` behaves like the floating-point remainder. Dividing by zero or leaving a function's domain gives infinity or `nan`, not an exception.
 
-равенство не приводит типы: `1 == "1"` и `1 == true` дают `false`; `null == null` даёт `true`. порядок сравнивается для двух чисел или двух строк. строки сравниваются лексикографически, без языковой сортировки. пиши `0 <= x and x <= 1`, а не `0 <= x <= 1`.
+Equality never converts types: `1 == "1"` and `1 == true` are `false`; `null == null` is `true`. Ordering compares two numbers or two strings. Strings compare by code point, not by language rules. Write `0 <= x and x <= 1`, not `0 <= x <= 1`.
 
-ложными считаются `false`, `null`, ноль, `nan` и пустая строка. остальные числа и непустые строки истинны. служебные непустые `ident` / `raw` тоже истинны.
+`false`, `null`, zero, `nan` and the empty string are falsy. Every other number and every non-empty string is truthy, and so are the internal non-empty `ident` and `raw` values.
 
-`and` / `or` возвращают `true` или `false`, а правый аргумент вычисляют только при необходимости:
+`and` / `or` return `true` or `false` and evaluate their right side only when they need it:
 
 ```q0lang
 safe = false and missing_function()
@@ -85,18 +85,18 @@ ready = true or missing_function()
 within = 0 <= 0.5 and 0.5 <= 1
 ```
 
-## условия
+## conditions
 
 ```q0lang
 progress = 0.75
 if progress >= 1 {
-  state = "готово"
+  state = "done"
 } else {
-  state = "в процессе"
+  state = "in progress"
 }
 ```
 
-`else {` можно поставить на следующей строке после `}`. вместо `else if` помести вложенный `if` в `else`. блоки не создают областей переменных.
+`else {` may also go on the line after `}`. Instead of `else if`, put another `if` inside the `else`. Blocks do not create scopes.
 
 ## while
 
@@ -107,9 +107,9 @@ while count < 4 {
 }
 ```
 
-условие проверяется перед каждой итерацией. бесконечный цикл останавливается лимитом инструкций, а не продолжается на следующем кадре. для анимации по времени используй [код кадра](hosts.md).
+The condition is checked before every pass. An endless loop is stopped by the instruction limit; it does not continue on the next frame. For animation over time, use [frame code](hosts.md).
 
-## for и range
+## for and range
 
 ```q0lang
 sum = 0
@@ -122,19 +122,19 @@ for n in range(3, 0, -1) {
 }
 ```
 
-`sum` равен `15`, `countdown` равен `"321"`.
+`sum` is `15` and `countdown` is `"321"`.
 
-| заголовок | последовательность |
+| header | sequence |
 | --- | --- |
-| `for i in range(stop) {` | от `0` до `stop`, шаг `1` |
-| `for i in range(start, stop) {` | от `start` до `stop`, шаг `1` |
-| `for i in range(start, stop, step) {` | от `start` до `stop`, шаг `step` |
+| `for i in range(stop) {` | from `0` up to `stop`, step `1` |
+| `for i in range(start, stop) {` | from `start` up to `stop`, step `1` |
+| `for i in range(start, stop, step) {` | from `start` up to `stop`, step `step` |
 
-`stop` не включается. аргументы вычисляются один раз, слева направо, до цикла. допускаются дробные числа и отрицательный шаг. неверное направление даёт пустую последовательность. границы и шаг должны быть конечными числами; нулевой шаг недопустим.
+`stop` itself is not included. The arguments are evaluated once, left to right, before the loop. Fractions and negative steps are allowed. A step going the wrong way gives an empty sequence. Bounds and step must be finite numbers, and the step may not be zero.
 
-счётчик общий вне функции и локальный внутри. после цикла остаётся последнее выданное значение; пустой цикл не меняет прежнее значение. изменение счётчика в теле не меняет последовательность. `range` разрешён только в заголовке `for`, это не функция, возвращающая массив.
+The counter is shared outside a function and local inside one. After the loop it keeps the last value it was given; an empty loop leaves its previous value alone. Changing the counter in the body does not change the sequence. `range` only works in a `for` header; it is not a function that returns an array.
 
-## break и continue
+## break and continue
 
 ```q0lang
 sum = 0
@@ -149,34 +149,34 @@ for i in range(10) {
 }
 ```
 
-`sum` равен `8`. `break` выходит из ближайшего цикла. `continue` переходит к следующей итерации; у `for` счётчик продвигается автоматически, у `while` снова проверяется условие. обе инструкции занимают отдельную строку и недопустимы вне цикла. функция не может управлять циклом вызывающего кода через `break` / `continue`.
+`sum` is `8`. `break` leaves the innermost loop. `continue` moves on to the next pass: `for` advances its counter by itself, `while` checks its condition again. Both go on a line of their own and are not allowed outside a loop. A function cannot break or continue the loop of the code that called it.
 
-## функции
+## functions
 
 ```q0lang
 pb func distance x y {
   return sqrt(x * x + y * y)
 }
 pr func announce value {
-  q0shell.print! "расстояние", value
+  q0shell.print! "distance", value
 }
 result = distance(3, 4)
 announce(result)
 ```
 
-`pb` обозначает публичную функцию, `pr` приватную. параметры в определении разделены пробелами, без скобок и запятых. при вызове скобки и запятые обязательны. число аргументов должно точно совпадать; значений по умолчанию и переменного числа параметров нет.
+`pb` marks a public function, `pr` a private one. Parameters in the definition are separated by spaces, without parentheses or commas. Calls need the parentheses and commas. The number of arguments must match exactly; there are no defaults and no variable argument lists.
 
-`return value` немедленно завершает функцию, включая вложенные циклы. `return` без значения и конец тела возвращают `null`. вне функции `return` недопустим. вызов отдельной строкой отбрасывает возвращённое значение.
+`return value` ends the function at once, nested loops included. `return` without a value, or reaching the end of the body, returns `null`. `return` is not allowed outside a function. A call on a line of its own throws its result away.
 
-вариант `pb func handler target` без тела сохраняет совместимость: он регистрирует функцию, возвращающую `null`. следующий за ним `do!` является самостоятельным блоком, а не её телом.
+The form `pb func handler target` without a body is kept for compatibility: it registers a function that returns `null`. A `do!` after it is a block of its own, not its body.
 
-определение действует после того, как выполнение дошло до него. объявляй функцию до первого вызова. повторное определение заменяет исполняемую функцию. рекурсия поддерживается в пределах [лимитов](runtime.md). не называй свои функции `sin`, `clamp` и другими именами математики: такие вызовы всегда компилируются как встроенные.
+A definition takes effect once execution reaches it, so define a function before its first call. Defining it again replaces it. Recursion works within the [limits](runtime.md). Do not name your functions `sin`, `clamp` or any other math name: such calls always compile to the built-in.
 
-`pb` / `pr` сохраняются как метаданные; обе функции вызываются по имени в общем runtime. это не защита доступа и не модульные области. вложенное определение тоже регистрирует общее имя и не захватывает локальные значения внешней функции.
+`pb` / `pr` are kept as metadata; both kinds are called by name in the shared runtime. They are not access control and not module scopes. A nested definition also registers a shared name and does not capture the outer function's locals.
 
-## области видимости
+## scope
 
-переменные верхнего уровня сохраняются в одном runtime между скриптами. параметры и все простые имена, которым где-либо в теле функции присваивается значение, локальны **во всём теле функции**. учитываются вложенные `if`, `while`, `for`, `do!`. остальные имена читаются из общей области.
+Top-level variables live on in one runtime between scripts. Parameters, and every plain name the function body assigns anywhere, are local **in the whole body**. Nested `if`, `while`, `for` and `do!` count. Every other name is read from the shared scope.
 
 ```q0lang
 base = 10
@@ -187,8 +187,8 @@ pb func offset amount {
 answer = offset(5)
 ```
 
-`answer` равен `15`; локальные `amount` и `result` не становятся общими. если функция присваивает `base`, эта `base` уже локальна; её чтение до присваивания является ошибкой, а не обращением к общей `base`.
+`answer` is `15`; the locals `amount` and `result` do not become shared. If a function assigns `base`, that `base` is local; reading it before the assignment is an error, not a read of the shared `base`.
 
-имена с точкой исключены из локальных присваиваний: функция может писать `game.score` или `player.x` и менять общую переменную. обычное общее число удобно менять через результат: `score = add_points(score, 5)`.
+Dotted names are never local: a function may write `game.score` or `player.x` and change the shared variable. A plain shared number is easiest to change through a result: `score = add_points(score, 5)`.
 
-источники: [parser](../../q0s-format/src/q0lang/parser.rs), [compiler](../../q0s-format/src/q0lang/compiler.rs), [qvm](../../q0vm/src/lib.rs).
+Sources: [parser](../../q0s-format/src/q0lang/parser.rs), [compiler](../../q0s-format/src/q0lang/compiler.rs), [qvm](../../q0vm/src/lib.rs).

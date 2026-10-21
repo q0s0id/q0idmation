@@ -35,6 +35,7 @@ fn square(asset_id: u16, left: f32, color: (u8, u8, u8)) -> Asset {
 
 fn placement(frame: u16, asset_id: u16, tween: Tween) -> Placement {
     Placement {
+        pivot: None,
         instance_id: 0,
         frame,
         target: Target::Asset(asset_id),

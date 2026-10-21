@@ -1,0 +1,503 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>q0lang · reference</title><style>
+:root{color-scheme:dark;--bg:#101318;--panel:#181d25;--ink:#e3e7ed;--muted:#aab4c3;--accent:#c4dfa5;--line:#303a48}
+*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:24px}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.7 'Segoe UI',sans-serif}
+aside{position:fixed;inset:0 auto 0 0;width:280px;padding:32px 24px;overflow:auto;background:var(--panel);border-right:1px solid var(--line)}
+.brand{font-size:28px;font-weight:650;letter-spacing:-1px;margin-bottom:0}.subtitle{color:var(--muted);font-size:13px;margin-bottom:24px}nav a{display:block;padding:7px 0;color:var(--muted);text-decoration:none}nav a:hover{color:var(--accent)}
+input{width:100%;margin:0 0 18px;padding:11px 12px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);font:inherit}input:focus{outline:2px solid var(--accent)}
+main{max-width:1300px;margin-left:280px;padding:42px 64px 90px}header{padding:0 0 24px;border-bottom:1px solid var(--line)}h1{font-size:44px;line-height:1.15;letter-spacing:-1.5px;margin:12px 0}h2{font-size:30px;line-height:1.3;margin:0 0 24px}h3{font-size:22px;margin:38px 0 12px}h4{font-size:18px}
+article{padding:44px 0;border-bottom:1px solid var(--line)}a{color:var(--accent);text-underline-offset:3px}p{max-width:85ch}li{padding:3px 0}code{font:14px/1.7 Consolas,'Courier New',monospace;background:var(--panel);border-radius:4px;padding:2px 5px;overflow-wrap:anywhere}
+.code{margin:22px 0;background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}.codebar{display:flex;justify-content:space-between;align-items:center;padding:8px 14px;border-bottom:1px solid var(--line);font-size:12px;color:var(--muted)}button{background:transparent;color:var(--accent);border:1px solid var(--line);padding:4px 10px;border-radius:5px;cursor:pointer}button:focus-visible,a:focus-visible{outline:2px solid var(--accent)}pre{padding:18px;margin:0;overflow:auto}pre code{padding:0;white-space:pre;overflow-wrap:normal}
+.table{overflow:auto;margin:20px 0}table{width:100%;border-collapse:collapse;font-size:14px}td,th{text-align:left;vertical-align:top;padding:11px 14px;border:1px solid var(--line)}th{background:var(--panel);font-weight:600}.muted{color:var(--muted)}#empty{display:none;padding:30px 0}
+@media(max-width:850px){aside{position:static;width:auto;border-right:0;border-bottom:1px solid var(--line)}nav{display:flex;gap:10px 22px;flex-wrap:wrap}main{margin:0;padding:28px 22px}h1{font-size:34px}}
+@media print{aside,.codebar button,header,#empty{display:none}main{margin:0;max-width:none;padding:0}body{background:white;color:black}a{color:inherit}article{break-before:page}.code,code,th{background:#f5f5f5}pre{white-space:pre-wrap}}
+</style></head><body><aside><div class="brand">q0lang</div><div class="subtitle">the language of q0idmation</div><label for="search" class="muted">search the reference</label><input id="search" type="search" placeholder="for example, range or q0rig"><nav aria-label="sections"><a href="#overview">q0lang</a><a href="#syntax">syntax and types</a><a href="#builtins">built-in libraries</a><a href="#hosts">animation and host api</a><a href="#events">events</a><a href="#q0shell">q0shell: the terminal host for q0lang</a><a href="#runtime">runtime and qvm</a><a href="#examples">recipes</a></nav></aside><main><header><div class="muted">language reference</div><h1>from a first script<br>to a living scene.</h1><p class="muted">syntax, libraries, the runtime and ready-made examples. the whole reference works offline.</p></header><p id="empty" role="status">nothing matches. try another word.</p><article id="overview"><h2 id="overview-q0lang">q0lang</h2>
+<p>q0lang ties code to q0s animation: it computes values, calls functions, and drives frames, named instances, rigs, live physics, particles and lights. One compiler and one virtual machine (qvm) serve q0editor, q0player and the q0shell terminal host.</p>
+<p>This reference describes what the current repository implements. What a command does depends on the program running the script: file commands work in q0shell, moving instances and live physics work in q0player.</p>
+<h3 id="overview-quick-start">quick start</h3>
+<p>Save this as <code>hello.q0lang</code> or <code>hello.q0l</code>; both extensions mean the same plain UTF-8 text. The same file is in <a href="#example-hello">examples/hello.q0lang</a>.</p>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>import q0.math
+import q0shell
+
+pb func ease_out t {
+  return 1 - (1 - t) ^ 3
+}
+
+for i in range(5) {
+  progress = i / 4
+  x = lerp(0, 100, ease_out(progress))
+  q0shell.print! &quot;step&quot;, i, &quot;x =&quot;, x
+}</code></pre></div>
+<p>Run it from the repository root:</p>
+<div class="code"><div class="codebar"><span>powershell</span><button type="button" class="copy">copy</button></div><pre><code>cargo run -p q0shell -- docs/q0lang/examples/hello.q0lang</code></pre></div>
+<p>Output:</p>
+<div class="code"><div class="codebar"><span>text</span><button type="button" class="copy">copy</button></div><pre><code>step 0 x = 0
+step 1 x = 57.8125
+step 2 x = 87.5
+step 3 x = 98.4375
+step 4 x = 100</code></pre></div>
+<p><code>pb func</code> defines a function, <code>return</code> hands back its result, and <code>for</code> walks the numbers from zero to four. Calling a function uses parentheses. A command ending in <code>!</code> takes its arguments after a space, separated by commas.</p>
+<h3 id="overview-code-in-an-animation">code in an animation</h3>
+<p>A q0rg&#x27;s general script suits starting values and functions; it runs once when the timeline starts. Frame code runs every time playback enters that frame. Standalone <code>.q0l</code> / <code>.q0lang</code> files join through the project graph; for q0player they have to be part of a bundled export. A symbol (q0rg) placed on the stage that has code of its own gets its own runtime per placed copy, see <a href="#hosts">object scripts</a>.</p>
+<p>Put this in a q0rg&#x27;s general script:</p>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>import q0.timeline
+
+pb func start_frame {
+  return 12
+}
+
+gostop! start_frame()</code></pre></div>
+<p>The player jumps to the frame with index <code>12</code> and stops; in a shorter animation the index is clamped to the last frame. Frame indices in code start at <strong>zero</strong>, while the editor numbers frames from one. Do not put an unconditional <code>gostop! 12</code> into the code of frame <code>12</code> itself: the jump runs that frame&#x27;s code again.</p>
+<h3 id="overview-reference">reference</h3>
+<div class="table"><table><tr><th>page</th><th>contents</th></tr><tr><td><a href="#syntax">syntax and types</a></td><td>values, operators, conditions, loops, functions, scope</td></tr><tr><td><a href="#builtins">built-in libraries</a></td><td>every import, the math functions and all commands</td></tr><tr><td><a href="#hosts">animation and host api</a></td><td>frames, keyboard, instances, object scripts, rigs, scenes, physics, particles, lights</td></tr><tr><td><a href="#events">events</a></td><td>mouse subscriptions and how q0player delivers them</td></tr><tr><td><a href="#q0shell">q0shell</a></td><td>running files, command-line options, file commands</td></tr><tr><td><a href="#runtime">runtime and qvm</a></td><td>execution order, state, diagnostics, limits, bytecode</td></tr><tr><td><a href="#examples">recipes</a></td><td>animation math, player movement, physics, particles and lights from code</td></tr></table></div>
+<p>Ready-made sources are in <a href="examples">examples</a>. <code>q0s-format/tests/q0lang_docs.rs</code> checks that every example in this reference compiles without a diagnostic and that the quick start prints what it shows above.</p>
+<p>There are no arrays, objects, classes, closures, exceptions, async functions or user modules through <code>import</code> yet. Names like <code>player.x</code> are shared host api names, not fields of an object. Named frame labels do not resolve yet.</p>
+<p><a href="qvm_plan.md">qvm_plan.md</a> and <a href="q0lang_overhaul_plan.md">q0lang_overhaul_plan.md</a> keep the design history; their plans do not replace this reference.</p>
+<p>Sources: <a href="../../q0s-format/src/q0lang/parser.rs">parser</a>, <a href="../../q0s-format/src/q0lang/compiler.rs">compiler</a>, <a href="../../q0s-format/src/q0lang/runtime.rs">runtime</a>, <a href="../../q0vm/src/lib.rs">qvm</a>, <a href="../../q0player/src/lib.rs">player</a>, <a href="../../q0player/src/objects.rs">object scripts</a>, <a href="../../q0editor/src/app.rs">editor</a>, <a href="../../q0shell/src/lib.rs">shell</a>.</p></article><article id="syntax"><h2 id="syntax-syntax-and-types">syntax and types</h2>
+<p><a href="#overview">home</a> · <a href="#builtins">libraries</a> · <a href="#runtime">runtime</a></p>
+<h3 id="syntax-lines-and-blocks">lines and blocks</h3>
+<p>One statement takes one line. Blank lines are allowed. <code>#</code> outside quotes starts a comment that runs to the end of the line. Indentation is for readability; braces define the structure.</p>
+<p>An opening <code>{</code> ends the header line. A closing <code>}</code> stands on a line of its own; a condition may use <code>} else {</code>. There are no one-line blocks, no semicolons, no multi-line expressions and no <code>//</code> or <code>/* ... */</code> comments.</p>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code># a comment
+text = &quot;inside a string # stays a character&quot;
+do! {
+  count = 2
+  total = count * 3
+}</code></pre></div>
+<p><code>do!</code> runs its statements right away. It has no scope of its own and no deferred start.</p>
+<h3 id="syntax-names-and-assignment">names and assignment</h3>
+<p>A name starts with a Latin letter or <code>_</code> and continues with Latin letters, digits and <code>_</code>. Case matters. Host api names join their parts with dots: <code>stage.width</code>, <code>player.x</code>. Non-Latin letters are fine inside strings but not in names.</p>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>speed = 120
+speed = speed + 30
+game.score = 0</code></pre></div>
+<p><code>=</code> stores a value, <code>==</code> compares. There is no separate declaration and no type annotation. <code>+=</code>, <code>-=</code>, <code>++</code> and several assignments on one line are not supported. Do not use keywords as names.</p>
+<p><code>game.score</code> is a single name for a shared variable; no <code>game</code> object is created. There is no <code>[]</code> access.</p>
+<h3 id="syntax-values">values</h3>
+<div class="table"><table><tr><th>type</th><th>written as</th><th>meaning</th></tr><tr><td>number</td><td><code>0</code>, <code>12</code>, <code>0.25</code>, <code>-4.5</code></td><td>a double-precision number; there is no separate integer type</td></tr><tr><td>string</td><td><code>&quot;hello&quot;</code>, <code>&#x27;hello&#x27;</code></td><td>UTF-8 text; both quote styles are equivalent</td></tr><tr><td>boolean</td><td><code>true</code>, <code>false</code></td><td>also the result of comparisons and logical operators</td></tr><tr><td>null</td><td><code>null</code></td><td>also what a function returns when it returns nothing</td></tr></table></div>
+<p>A number starts with a digit: write <code>0.5</code>, not <code>.5</code>. There is no exponent notation like <code>1e3</code>, no hexadecimal and no digit separators. Minus is a unary operator.</p>
+<p>Strings understand <code>\n</code>, <code>\r</code>, <code>\t</code>, <code>\\</code>, <code>\&quot;</code> and <code>\&#x27;</code>. For any other escape the backslash is dropped. For paths, <code>/</code> or <code>\\</code> is easiest. There is no interpolation and no multi-line literal. The old <code>...&quot;text&quot;</code> syntax gives a diagnostic.</p>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>message = &quot;frame &quot; + 12 + &quot;\ndone&quot;
+path = &quot;out/report.txt&quot;</code></pre></div>
+<p>An unknown shared name currently evaluates to the internal value <code>ident</code> holding the name&#x27;s text: <code>copy = missing</code> stores the symbolic <code>missing</code>. It does not become <code>null</code>. A typo in arithmetic therefore usually ends in a type error. Rig and target names are best written in quotes. <code>raw</code> is an internal value left behind by some errors; it has no literal of its own.</p>
+<h3 id="syntax-operators">operators</h3>
+<p>From highest to lowest precedence:</p>
+<div class="table"><table><tr><th>level</th><th>operators</th><th>meaning</th></tr><tr><td>1</td><td><code>(...)</code>, <code>name(...)</code></td><td>grouping and calls</td></tr><tr><td>2</td><td><code>-value</code>, <code>not value</code>, <code>!value</code></td><td>numeric and logical negation</td></tr><tr><td>3</td><td><code>^</code></td><td>power, grouping from the right</td></tr><tr><td>4</td><td><code>*</code>, <code>/</code>, <code>%</code></td><td>multiply, divide, remainder</td></tr><tr><td>5</td><td><code>+</code>, <code>-</code></td><td>add or join strings, subtract</td></tr><tr><td>6</td><td><code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&gt;=</code></td><td>ordering</td></tr><tr><td>7</td><td><code>==</code>, <code>!=</code></td><td>equality and inequality</td></tr><tr><td>8</td><td><code>and</code>, <code>&amp;&amp;</code></td><td>logical and</td></tr><tr><td>9</td><td><code>or</code>, <code>\|\|</code></td><td>logical or</td></tr></table></div>
+<p>Apart from power, binary operators of one level group from the left. Unary minus binds tighter than power: <code>-2 ^ 2</code> is <code>4</code>; for <code>-4</code> write <code>-(2 ^ 2)</code>. <code>2 ^ 3 ^ 2</code> is <code>512</code>. There are no bitwise operators.</p>
+<p>Arithmetic takes numbers. If either side of <code>+</code> is a string, the other side is turned into text and joined: <code>&quot;2&quot; + 3</code> gives <code>&quot;23&quot;</code>. <code>2 + true</code> is a type error. <code>/</code> divides with fractions; <code>%</code> behaves like the floating-point remainder. Dividing by zero or leaving a function&#x27;s domain gives infinity or <code>nan</code>, not an exception.</p>
+<p>Equality never converts types: <code>1 == &quot;1&quot;</code> and <code>1 == true</code> are <code>false</code>; <code>null == null</code> is <code>true</code>. Ordering compares two numbers or two strings. Strings compare by code point, not by language rules. Write <code>0 &lt;= x and x &lt;= 1</code>, not <code>0 &lt;= x &lt;= 1</code>.</p>
+<p><code>false</code>, <code>null</code>, zero, <code>nan</code> and the empty string are falsy. Every other number and every non-empty string is truthy, and so are the internal non-empty <code>ident</code> and <code>raw</code> values.</p>
+<p><code>and</code> / <code>or</code> return <code>true</code> or <code>false</code> and evaluate their right side only when they need it:</p>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>safe = false and missing_function()
+ready = true or missing_function()
+within = 0 &lt;= 0.5 and 0.5 &lt;= 1</code></pre></div>
+<h3 id="syntax-conditions">conditions</h3>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>progress = 0.75
+if progress &gt;= 1 {
+  state = &quot;done&quot;
+} else {
+  state = &quot;in progress&quot;
+}</code></pre></div>
+<p><code>else {</code> may also go on the line after <code>}</code>. Instead of <code>else if</code>, put another <code>if</code> inside the <code>else</code>. Blocks do not create scopes.</p>
+<h3 id="syntax-while">while</h3>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>count = 0
+while count &lt; 4 {
+  count = count + 1
+}</code></pre></div>
+<p>The condition is checked before every pass. An endless loop is stopped by the instruction limit; it does not continue on the next frame. For animation over time, use <a href="#hosts">frame code</a>.</p>
+<h3 id="syntax-for-and-range">for and range</h3>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>sum = 0
+for i in range(1, 6) {
+  sum = sum + i
+}
+countdown = &quot;&quot;
+for n in range(3, 0, -1) {
+  countdown = countdown + n
+}</code></pre></div>
+<p><code>sum</code> is <code>15</code> and <code>countdown</code> is <code>&quot;321&quot;</code>.</p>
+<div class="table"><table><tr><th>header</th><th>sequence</th></tr><tr><td><code>for i in range(stop) {</code></td><td>from <code>0</code> up to <code>stop</code>, step <code>1</code></td></tr><tr><td><code>for i in range(start, stop) {</code></td><td>from <code>start</code> up to <code>stop</code>, step <code>1</code></td></tr><tr><td><code>for i in range(start, stop, step) {</code></td><td>from <code>start</code> up to <code>stop</code>, step <code>step</code></td></tr></table></div>
+<p><code>stop</code> itself is not included. The arguments are evaluated once, left to right, before the loop. Fractions and negative steps are allowed. A step going the wrong way gives an empty sequence. Bounds and step must be finite numbers, and the step may not be zero.</p>
+<p>The counter is shared outside a function and local inside one. After the loop it keeps the last value it was given; an empty loop leaves its previous value alone. Changing the counter in the body does not change the sequence. <code>range</code> only works in a <code>for</code> header; it is not a function that returns an array.</p>
+<h3 id="syntax-break-and-continue">break and continue</h3>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>sum = 0
+for i in range(10) {
+  if i == 2 {
+    continue
+  }
+  if i == 5 {
+    break
+  }
+  sum = sum + i
+}</code></pre></div>
+<p><code>sum</code> is <code>8</code>. <code>break</code> leaves the innermost loop. <code>continue</code> moves on to the next pass: <code>for</code> advances its counter by itself, <code>while</code> checks its condition again. Both go on a line of their own and are not allowed outside a loop. A function cannot break or continue the loop of the code that called it.</p>
+<h3 id="syntax-functions">functions</h3>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>pb func distance x y {
+  return sqrt(x * x + y * y)
+}
+pr func announce value {
+  q0shell.print! &quot;distance&quot;, value
+}
+result = distance(3, 4)
+announce(result)</code></pre></div>
+<p><code>pb</code> marks a public function, <code>pr</code> a private one. Parameters in the definition are separated by spaces, without parentheses or commas. Calls need the parentheses and commas. The number of arguments must match exactly; there are no defaults and no variable argument lists.</p>
+<p><code>return value</code> ends the function at once, nested loops included. <code>return</code> without a value, or reaching the end of the body, returns <code>null</code>. <code>return</code> is not allowed outside a function. A call on a line of its own throws its result away.</p>
+<p>The form <code>pb func handler target</code> without a body is kept for compatibility: it registers a function that returns <code>null</code>. A <code>do!</code> after it is a block of its own, not its body.</p>
+<p>A definition takes effect once execution reaches it, so define a function before its first call. Defining it again replaces it. Recursion works within the <a href="#runtime">limits</a>. Do not name your functions <code>sin</code>, <code>clamp</code> or any other math name: such calls always compile to the built-in.</p>
+<p><code>pb</code> / <code>pr</code> are kept as metadata; both kinds are called by name in the shared runtime. They are not access control and not module scopes. A nested definition also registers a shared name and does not capture the outer function&#x27;s locals.</p>
+<h3 id="syntax-scope">scope</h3>
+<p>Top-level variables live on in one runtime between scripts. Parameters, and every plain name the function body assigns anywhere, are local <strong>in the whole body</strong>. Nested <code>if</code>, <code>while</code>, <code>for</code> and <code>do!</code> count. Every other name is read from the shared scope.</p>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>base = 10
+pb func offset amount {
+  result = base + amount
+  return result
+}
+answer = offset(5)</code></pre></div>
+<p><code>answer</code> is <code>15</code>; the locals <code>amount</code> and <code>result</code> do not become shared. If a function assigns <code>base</code>, that <code>base</code> is local; reading it before the assignment is an error, not a read of the shared <code>base</code>.</p>
+<p>Dotted names are never local: a function may write <code>game.score</code> or <code>player.x</code> and change the shared variable. A plain shared number is easiest to change through a result: <code>score = add_points(score, 5)</code>.</p>
+<p>Sources: <a href="../../q0s-format/src/q0lang/parser.rs">parser</a>, <a href="../../q0s-format/src/q0lang/compiler.rs">compiler</a>, <a href="../../q0vm/src/lib.rs">qvm</a>.</p></article><article id="builtins"><h2 id="builtins-built-in-libraries">built-in libraries</h2>
+<p><a href="#overview">home</a> · <a href="#syntax">syntax</a> · <a href="#hosts">host api</a></p>
+<p><code>import name</code> takes exactly one known library name, without quotes. The import is recorded in the runtime. It loads no file, creates no namespace and grants no access to the system. The math functions work without an import. A few imports change how q0player runs the script: <code>import q0.input</code> switches on a game clock that ticks while the timeline is paused, and <code>q0.object</code>, <code>q0.input</code> or <code>q0.mouse</code> in an <a href="#hosts">object script</a> make its frame code run every tick.</p>
+<h3 id="builtins-all-libraries">all libraries</h3>
+<div class="table"><table><tr><th>library</th><th>symbols</th></tr><tr><td><code>q0.core</code></td><td><code>do!</code>, <code>listen</code>, <code>xlisten</code>, <code>pb</code>, <code>pr</code>, <code>func</code>, <code>if</code>, <code>else</code>, <code>while</code>, <code>for</code>, <code>in</code>, <code>range</code>, <code>break</code>, <code>continue</code>, <code>return</code>, <code>true</code>, <code>false</code>, <code>null</code>, <code>and</code>, <code>or</code>, <code>not</code></td></tr><tr><td><code>q0.math</code></td><td><code>pi</code>, <code>tau</code>, <code>sin</code>, <code>cos</code>, <code>tan</code>, <code>sqrt</code>, <code>abs</code>, <code>min</code>, <code>max</code>, <code>clamp</code>, <code>lerp</code>, <code>floor</code>, <code>ceil</code>, <code>round</code></td></tr><tr><td><code>q0.timeline</code></td><td><code>gorun!</code>, <code>gostop!</code>, <code>frame</code>, <code>label</code></td></tr><tr><td><code>q0.object</code></td><td><code>self.x</code>, <code>self.y</code>, <code>self.frame</code>, <code>self.playing</code>, <code>self.name</code>, <code>self.id</code>, <code>self.width</code>, <code>self.height</code>, <code>self.left</code>, <code>self.right</code>, <code>self.top</code>, <code>self.bottom</code>, <code>self.hovered</code>, <code>self.mouse_x</code>, <code>self.mouse_y</code></td></tr><tr><td><code>q0.mouse</code></td><td><code>mouse.down</code>, <code>mouse.up</code>, <code>mouse.move</code>, <code>mouse.click</code>, <code>mouse.double</code>, <code>mouse.wheel</code>, <code>mouse.over</code>, <code>mouse.out</code></td></tr><tr><td><code>q0.input</code></td><td><code>input.left</code>, <code>input.right</code>, <code>input.jump</code>, <code>input.jump_pressed</code></td></tr><tr><td><code>q0.scene</code></td><td><code>stage.width</code>, <code>stage.height</code>, <code>player.x</code>, <code>player.y</code>, <code>player.left</code>, <code>player.right</code>, <code>player.top</code>, <code>player.bottom</code>, <code>player.width</code>, <code>player.height</code>, <code>q0scene.switch!</code></td></tr><tr><td><code>q0.time</code></td><td><code>time.dt</code></td></tr><tr><td><code>q0.rig</code></td><td><code>q0rig.position!</code>, <code>q0rig.value!</code>, <code>q0rig.reset!</code>, <code>q0rig.pose!</code>, <code>q0rig.pose_reset!</code></td></tr><tr><td><code>q0.physics</code></td><td><code>q0physics.start!</code>, <code>q0physics.pause!</code>, <code>q0physics.reset!</code>, <code>q0physics.push!</code>, <code>q0physics.velocity!</code>, <code>q0physics.spin!</code>, <code>q0physics.teleport!</code>, <code>q0physics.gravity!</code>, <code>q0physics.cut!</code></td></tr><tr><td><code>q0.particles</code></td><td><code>q0particles.start!</code>, <code>q0particles.stop!</code>, <code>q0particles.burst!</code>, <code>q0particles.move!</code>, <code>q0particles.clear!</code></td></tr><tr><td><code>q0.light</code></td><td><code>q0light.on!</code>, <code>q0light.off!</code>, <code>q0light.move!</code>, <code>q0light.color!</code>, <code>q0light.brightness!</code>, <code>q0light.size!</code>, <code>q0light.darkness!</code></td></tr><tr><td><code>q0shell</code></td><td><code>q0shell.print!</code>, <code>q0shell.read!</code>, <code>q0shell.write!</code>, <code>q0shell.append!</code>, <code>q0shell.mkdir!</code>, <code>q0shell.list!</code>, <code>q0shell.move!</code>, <code>q0shell.delete!</code></td></tr></table></div>
+<p>This is the list of libraries the parser recognises, not a promise that every host implements every symbol. <code>frame</code> holds the current frame only inside object scripts; <code>label</code> has no value yet. <code>player</code> stands for an instance name you give in the project. The <a href="#hosts">availability table</a> explains which program supports what.</p>
+<h3 id="builtins-q0-math">q0.math</h3>
+<p>Every function takes exactly the listed number of number arguments and returns a number. Numeric strings and booleans are not converted. A wrong argument count or type gives a diagnostic. Arguments are evaluated left to right.</p>
+<div class="table"><table><tr><th>written as</th><th>does</th></tr><tr><td><code>pi</code></td><td>π, about 3.141592653589793</td></tr><tr><td><code>tau</code></td><td>2π, about 6.283185307179586</td></tr><tr><td><code>sin(x)</code></td><td>sine; x in radians</td></tr><tr><td><code>cos(x)</code></td><td>cosine; x in radians</td></tr><tr><td><code>tan(x)</code></td><td>tangent; x in radians</td></tr><tr><td><code>sqrt(x)</code></td><td>square root; negative x gives nan</td></tr><tr><td><code>abs(x)</code></td><td>absolute value</td></tr><tr><td><code>floor(x)</code></td><td>rounds down, floor(-1.2) = -2</td></tr><tr><td><code>ceil(x)</code></td><td>rounds up, ceil(-1.2) = -1</td></tr><tr><td><code>round(x)</code></td><td>nearest whole number; halves round away from zero</td></tr><tr><td><code>min(a, b)</code></td><td>the smaller of two numbers</td></tr><tr><td><code>max(a, b)</code></td><td>the larger of two numbers</td></tr><tr><td><code>clamp(x, lo, hi)</code></td><td>keeps x within the range; lo ≤ hi, neither bound nan</td></tr><tr><td><code>lerp(a, b, t)</code></td><td>a + (b - a) * t; t is not clamped</td></tr></table></div>
+<p><code>pi</code> and <code>tau</code> resolve as constants unless a shared variable has the same name; an assignment can shadow them. The built-in function names cannot be shadowed by your own functions.</p>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>import q0.math
+angle = 90 * pi / 180
+wave = sin(angle)
+position = lerp(10, 90, 0.25)
+limited = clamp(position, 0, 20)</code></pre></div>
+<p><code>wave</code> is about <code>1</code>, <code>position</code> is <code>30</code> and <code>limited</code> is <code>20</code>. There is no random number generator, no <code>str()</code> / <code>number()</code> conversion and no string function yet. Strings join with <code>+</code>.</p>
+<h3 id="builtins-commands">commands</h3>
+<p>Commands are statements; they never return a value into an expression. Put a space after the name ending in <code>!</code> and separate arguments with commas. Do not write <code>q0rig.pose!(...)</code> and do not assign a command&#x27;s result.</p>
+<div class="table"><table><tr><th>command</th><th>arguments</th><th>host</th></tr><tr><td><code>gorun! target</code></td><td>frame index or target string</td><td>editor preview, player</td></tr><tr><td><code>gostop! target</code></td><td>frame index or target string</td><td>editor preview, player</td></tr><tr><td><code>q0scene.switch! alias</code></td><td>the alias of a bundled scene, as a string</td><td>player</td></tr><tr><td><code>q0rig.position! control, x, y</code></td><td>name, two numbers</td><td>player</td></tr><tr><td><code>q0rig.value! control, value</code></td><td>name, number</td><td>player</td></tr><tr><td><code>q0rig.reset! control</code></td><td>name</td><td>player</td></tr><tr><td><code>q0rig.pose! pose, weight</code></td><td>name, finite number; clamped to 0…1</td><td>player</td></tr><tr><td><code>q0rig.pose_reset! pose</code></td><td>name</td><td>player</td></tr><tr><td><code>q0physics.start!</code>, <code>q0physics.pause!</code>, <code>q0physics.reset!</code></td><td>none</td><td>player</td></tr><tr><td><code>q0physics.push! body, x, y</code></td><td>instance name, two numbers in px/s</td><td>player</td></tr><tr><td><code>q0physics.velocity! body, x, y</code></td><td>instance name, two numbers in px/s</td><td>player</td></tr><tr><td><code>q0physics.spin! body, degrees</code></td><td>instance name, degrees per second, clockwise</td><td>player</td></tr><tr><td><code>q0physics.teleport! body, x, y</code></td><td>instance name, a stage point</td><td>player</td></tr><tr><td><code>q0physics.gravity! x, y</code></td><td>two numbers in px/s²</td><td>player</td></tr><tr><td><code>q0physics.cut! link</code></td><td>link name</td><td>player</td></tr><tr><td><code>q0particles.start! emitter</code>, <code>q0particles.stop! emitter</code>, <code>q0particles.clear! emitter</code></td><td>emitter name</td><td>player</td></tr><tr><td><code>q0particles.burst! emitter, count</code></td><td>emitter name, number of particles</td><td>player</td></tr><tr><td><code>q0particles.move! emitter, x, y</code></td><td>emitter name, a stage point</td><td>player</td></tr><tr><td><code>q0light.on! light</code>, <code>q0light.off! light</code></td><td>light name</td><td>player</td></tr><tr><td><code>q0light.move! light, x, y</code></td><td>light name, a stage point</td><td>player</td></tr><tr><td><code>q0light.color! light, red, green, blue</code></td><td>light name, three numbers 0…255</td><td>player</td></tr><tr><td><code>q0light.brightness! light, value</code></td><td>light name, number; 1 shows colours as drawn</td><td>player</td></tr><tr><td><code>q0light.size! light, radius</code></td><td>light name, pixels</td><td>player</td></tr><tr><td><code>q0light.darkness! value</code></td><td>number, 0 (day) to 1 (pitch dark)</td><td>player</td></tr><tr><td><code>q0shell.print! value, ...</code></td><td>zero to 255 values</td><td>shell</td></tr><tr><td><code>q0shell.read! path</code></td><td>path</td><td>shell</td></tr><tr><td><code>q0shell.write! path, text</code></td><td>path, value to write</td><td>shell</td></tr><tr><td><code>q0shell.append! path, text</code></td><td>path, value to append</td><td>shell</td></tr><tr><td><code>q0shell.mkdir! path</code></td><td>path</td><td>shell</td></tr><tr><td><code>q0shell.list!</code> or <code>q0shell.list! path</code></td><td>no path or one path</td><td>shell</td></tr><tr><td><code>q0shell.move! from, to</code></td><td>two paths</td><td>shell</td></tr><tr><td><code>q0shell.delete! path</code></td><td>path</td><td>shell</td></tr></table></div>
+<p>The detailed behaviour of frames, names, rigs, physics, particles and lights is in the <a href="#hosts">host api</a>; file operations, value conversion and path rules are in <a href="#q0shell">q0shell</a>. Keywords are covered in <a href="#syntax">syntax</a>, events in <a href="#events">events</a>.</p>
+<p>Sources: <a href="../../q0s-format/src/q0lang/parser.rs">parser catalogue</a>, <a href="../../q0vm/src/lib.rs">qvm evaluation</a>, <a href="../../q0s-format/src/q0lang/runtime.rs">command translation</a>.</p></article><article id="hosts"><h2 id="hosts-animation-and-host-api">animation and host api</h2>
+<p><a href="#overview">home</a> · <a href="#builtins">libraries</a> · <a href="#examples">recipes</a></p>
+<p>A host is the program that runs q0lang and applies what it asks for. The runtime itself never opens files or draws the stage.</p>
+<h3 id="hosts-availability">availability</h3>
+<div class="table"><table><tr><th>capability</th><th>editor: code analysis</th><th>editor: preview</th><th>q0player v2</th><th>q0shell</th></tr><tr><td>math, functions, conditions, loops</td><td>yes, with a small budget</td><td>yes</td><td>yes</td><td>yes</td></tr><tr><td>general script and frame code</td><td>analyses one text</td><td>yes</td><td>yes</td><td>one input text</td></tr><tr><td>frame jumps and stops</td><td>reported only</td><td>yes</td><td>yes</td><td>reports it is unavailable</td></tr><tr><td>named instances, keyboard, time.dt</td><td>no host values</td><td>no host values</td><td>yes</td><td>no host values</td></tr><tr><td>object scripts (<code>self.*</code>)</td><td>analyses one text</td><td>no</td><td>yes</td><td>no</td></tr><tr><td>rig commands</td><td>reported only</td><td>not applied</td><td>yes</td><td>reports it is unavailable</td></tr><tr><td>live physics, particles and lights</td><td>reported only</td><td>not applied</td><td>yes</td><td>reports it is unavailable</td></tr><tr><td>switching bundled scenes</td><td>reported only</td><td>not applied</td><td>yes</td><td>reports it is unavailable</td></tr><tr><td>file commands</td><td>reported only</td><td>not applied</td><td>ignored</td><td>yes</td></tr><tr><td>mouse subscription table</td><td>yes</td><td>yes</td><td>yes</td><td>yes</td></tr><tr><td>mouse events delivered to handlers</td><td>no</td><td>no</td><td>yes</td><td>no</td></tr></table></div>
+<p>Analysing a single script cannot reproduce the shared variables that dependencies and earlier frames will have set. Test interactive projects in q0player. Everything here applies to vector v2 movies; old bitmap v1 movies and q0v videos do not run q0lang.</p>
+<h3 id="hosts-start-up-order">start-up order</h3>
+<p>q0player first creates the shared runtime. The embedded q0lang dependencies of the root project graph run in ascending node id order, then the general script of the entry q0rg, then the code of the first frame. External q0lang dependencies do not run: the player reports that they need a bundled export. If the start-up script already jumped somewhere, the destination&#x27;s code is not run a second time.</p>
+<p>During normal playback, the code of every frame the playhead enters runs. Scripts of one frame run in ascending layer id order, then in stored order. Shared state and defined functions carry over. Frame code of nested q0rgs does not run in the root runtime; a placed symbol with code of its own runs in an <a href="#object-scripts">object script</a>.</p>
+<p>The editor preview runs the general script of the open q0rg and its frame code. Moving the editor&#x27;s playhead by hand is editing and runs no frame code; <code>seek</code> in the player does run the destination frame&#x27;s code.</p>
+<h3 id="hosts-q0-timeline">q0.timeline</h3>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>import q0.timeline
+start = 3
+gorun! start</code></pre></div>
+<p><code>gorun! target</code> starts playback and jumps to target. <code>gostop! target</code> stops playback and jumps to target. A jump runs the destination&#x27;s code and skips the frames in between. The command does not end the current script: the whole script runs first, then the host applies the collected actions in order.</p>
+<p>Frame indices in code start at zero. A non-negative numeric target becomes a u16: the fraction is dropped and values that are too large saturate at 65535. The host clamps it to the last frame. Use finite whole numbers within the timeline.</p>
+<p>A string target like <code>&quot;12&quot;</code> is taken as a numeric index. Named labels like <code>&quot;intro&quot;</code> do not resolve yet. Playback still starts or stops even when the target does not resolve. There is no automatic <code>frame</code> or <code>label</code> variable in the root runtime; inside an object script, <code>frame</code> holds that object&#x27;s own frame.</p>
+<p>An unconditional jump from a frame to itself runs the same code again. The editor and the player stop a chain of jumps after 64 transitions. To stop on a frame without looping, use a flag variable, or put the command in the general script.</p>
+<h3 id="hosts-q0-input-and-q0-time">q0.input and q0.time</h3>
+<div class="table"><table><tr><th>name</th><th>type</th><th>value in q0player</th></tr><tr><td><code>input.left</code></td><td>bool</td><td>A or the left arrow is held</td></tr><tr><td><code>input.right</code></td><td>bool</td><td>D or the right arrow is held</td></tr><tr><td><code>input.jump</code></td><td>bool</td><td>W, the up arrow or Space is held</td></tr><tr><td><code>input.jump_pressed</code></td><td>bool</td><td>jump went from released to pressed; cleared after the frame&#x27;s scripts run</td></tr><tr><td><code>time.dt</code></td><td>number</td><td>the fixed step in seconds, 1 / fps</td></tr></table></div>
+<p><code>import q0.input</code> switches on a game clock that runs independently of the animation&#x27;s pause button. While a frame is held, its code keeps running at the movie&#x27;s fps, even in a one-frame project, so controls and movement keep updating with the timeline stopped. Without the import, a paused animation runs no new ticks. On touch screens q0player shows on-screen left, right and jump buttons.</p>
+<p>The host refreshes these values before every script. Assigning <code>input.left</code> or <code>time.dt</code> changes neither the keyboard nor the clock, and the next refresh overwrites it. The api offers no other keys, no typed text, no timers and no system time.</p>
+<h3 id="hosts-q0-scene-size-and-instances">q0.scene: size and instances</h3>
+<div class="table"><table><tr><th>name</th><th>access</th><th>value</th></tr><tr><td><code>stage.width</code>, <code>stage.height</code></td><td>read</td><td>the stage size in stage units</td></tr><tr><td><code>name.x</code>, <code>name.y</code></td><td>read and write</td><td>moves the named instance</td></tr><tr><td><code>name.left</code>, <code>name.right</code>, <code>name.top</code>, <code>name.bottom</code></td><td>read</td><td>the instance&#x27;s bounds on the stage</td></tr><tr><td><code>name.width</code>, <code>name.height</code></td><td>read</td><td>the width and height of those bounds</td></tr><tr><td><code>name.frame</code>, <code>name.playing</code></td><td>read and write</td><td>the own timeline of a named instance that has an object script</td></tr></table></div>
+<p>Replace <code>name</code> with an instance name given in the project, such as <code>player</code>. The library creates no character by itself. The instance must belong to the current entry q0rg; an unknown name stays an ordinary symbolic identifier.</p>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>import q0.scene
+player.x = player.x + 10</code></pre></div>
+<p>The example needs an instance called <code>player</code> in q0player. Writes to x/y apply after the script ends, as a temporary runtime transform; the project itself never changes. Both values must be finite numbers. Writing width, height or the bounds does not scale the instance: those are measured again.</p>
+<p>Within one script, writing <code>player.x</code> does not update <code>player.right</code>; the geometry is measured between runs. Compute limits from the starting bounds plus your own offset, as in the <a href="#examples">movement recipe</a>.</p>
+<h3 id="hosts-object-scripts">object scripts</h3>
+<p>Every placed copy of a symbol (q0rg) that has code of its own, a general script or frame code, gets its own runtime in q0player. Each copy keeps separate variables, its own timeline position and its own handlers, so ten coins can each count their own score. The object&#x27;s name is its instance name, or <code>Symbol#id</code> when it has none.</p>
+<ul><li>The symbol&#x27;s general script runs once when the copy appears on stage.</li><li>Its frame code runs whenever the copy&#x27;s own frame changes. With <code>q0.object</code>, <code>q0.input</code> or <code>q0.mouse</code> imported, it runs every tick instead.</li><li><code>gorun!</code> and <code>gostop!</code> inside an object script drive that copy&#x27;s own timeline.</li><li>Mouse events reach the copy under the pointer, see <a href="#events">events</a>.</li></ul>
+<div class="table"><table><tr><th>name</th><th>access</th><th>value</th></tr><tr><td><code>self.x</code>, <code>self.y</code></td><td>read and write</td><td>position within the parent timeline; writing moves the copy</td></tr><tr><td><code>self.frame</code> / <code>frame</code></td><td>read</td><td>the copy&#x27;s current frame</td></tr><tr><td><code>self.playing</code></td><td>read and write</td><td>whether the copy&#x27;s timeline plays</td></tr><tr><td><code>self.name</code>, <code>self.id</code></td><td>read</td><td>instance name and instance id</td></tr><tr><td><code>self.left</code>, <code>self.right</code>, <code>self.top</code>, <code>self.bottom</code>, <code>self.width</code>, <code>self.height</code></td><td>read</td><td>the copy&#x27;s bounds</td></tr><tr><td><code>self.hovered</code></td><td>read</td><td>the pointer is over the copy</td></tr><tr><td><code>self.mouse_x</code>, <code>self.mouse_y</code></td><td>read</td><td>the pointer in the copy&#x27;s own coordinates</td></tr></table></div>
+<p>Named instances inside the symbol are reachable as <code>name.x</code> and so on, relative to the copy. q0player runs at most 4096 active objects, and each object run has its own budget of 100,000 instructions.</p>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>import q0.object
+import q0.mouse
+
+pb func on_click target {
+  self.playing = not self.playing
+}
+
+listen mouse.click on_click</code></pre></div>
+<h3 id="hosts-q0-scene-switching-scenes">q0.scene: switching scenes</h3>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>import q0.scene
+q0scene.switch! &quot;room_2&quot;</code></pre></div>
+<p>The alias must match the alias of a bundled movie in the root project&#x27;s graph. An unknown alias gives a diagnostic. This never loads an arbitrary path or opens an outside file.</p>
+<p>The player replaces the current scene and starts at frame zero. It drops temporary moves, rig changes, live physics and particles, and refreshes the sound. The shared runtime keeps its variables, functions and imports. Then the new scene&#x27;s general script and its first frame&#x27;s code run. The q0lang dependencies of the child scene&#x27;s graph do not run again, so keep shared logic in the root graph.</p>
+<h3 id="hosts-q0-rig">q0.rig</h3>
+<div class="table"><table><tr><th>command</th><th>does</th></tr><tr><td><code>q0rig.position! control, x, y</code></td><td>a temporary position for a control</td></tr><tr><td><code>q0rig.value! control, value</code></td><td>a temporary numeric value for a control</td></tr><tr><td><code>q0rig.reset! control</code></td><td>removes that control&#x27;s temporary position and value</td></tr><tr><td><code>q0rig.pose! pose, weight</code></td><td>blends in a saved pose with a weight clamped to 0…1</td></tr><tr><td><code>q0rig.pose_reset! pose</code></td><td>removes that pose&#x27;s temporary weight</td></tr></table></div>
+<p>Names are strings; position and value take numbers. The pose weight must be finite. The commands act on the entry q0rg&#x27;s rig. A control must be open to the runtime through its &quot;visible in simple&quot; setting; a hidden or missing control gives a diagnostic. Poses are looked up by name and need no such setting.</p>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>import q0.rig
+q0rig.position! &quot;look&quot;, 40, 25
+q0rig.value! &quot;arm blend&quot;, 0.75
+q0rig.pose! &quot;wave&quot;, 0.6</code></pre></div>
+<p>This example assumes a project with those controls and that pose. The commands store temporary values; what they do depends on the rig&#x27;s bindings. <code>reset</code> does not delete the authored control, and <code>pose_reset</code> does not delete the saved pose. Temporary settings survive frame jumps; switching scenes drops them.</p>
+<h3 id="hosts-q0-physics">q0.physics</h3>
+<p>The physics world of the main timeline, when &quot;Live in q0player&quot; is on in the physics editor. Without that switch, physics is only baked into keys and does not travel with the movie.</p>
+<div class="table"><table><tr><th>command</th><th>does</th></tr><tr><td><code>q0physics.start!</code></td><td>runs the world from the current frame, or resumes it after a pause</td></tr><tr><td><code>q0physics.pause!</code></td><td>holds the world; bodies stay where they are</td></tr><tr><td><code>q0physics.reset!</code></td><td>removes the world and hands the bodies back to the timeline</td></tr><tr><td><code>q0physics.push! body, x, y</code></td><td>adds to a body&#x27;s velocity, in px/s</td></tr><tr><td><code>q0physics.velocity! body, x, y</code></td><td>sets a body&#x27;s velocity, in px/s</td></tr><tr><td><code>q0physics.spin! body, degrees</code></td><td>sets the spin, in degrees per second, clockwise</td></tr><tr><td><code>q0physics.teleport! body, x, y</code></td><td>puts a body down at a stage point</td></tr><tr><td><code>q0physics.gravity! x, y</code></td><td>new gravity for the world, in px/s²; y points down</td></tr><tr><td><code>q0physics.cut! link</code></td><td>cuts a rope or chain in its middle, or undoes a spring, hinge or weld</td></tr></table></div>
+<p>A body is named by its instance name, set with the &quot;Script name&quot; field in the physics window; a link by the name it has in the window&#x27;s Links list. The world steps once per movie frame, even with the timeline paused. Animated bodies keep following the timeline, bodies tied on with links swing and bounce along, and liquids, ropes, chains and springs are drawn over the stage. Any command other than <code>start!</code> also builds the world but does not start it. Switching scenes drops the world.</p>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>import q0.physics
+q0physics.start!
+q0physics.push! &quot;ball&quot;, 300, -600
+q0physics.cut! &quot;rope1&quot;</code></pre></div>
+<h3 id="hosts-q0-particles">q0.particles</h3>
+<p>The emitters of the particle editor that have &quot;Live&quot; on. An emitter releases nothing until a command tells it to.</p>
+<div class="table"><table><tr><th>command</th><th>does</th></tr><tr><td><code>q0particles.start! emitter</code></td><td>starts emitting, beginning with the emitter&#x27;s burst</td></tr><tr><td><code>q0particles.stop! emitter</code></td><td>stops emitting; particles in flight live out their lives</td></tr><tr><td><code>q0particles.burst! emitter, count</code></td><td>releases count particles at once</td></tr><tr><td><code>q0particles.move! emitter, x, y</code></td><td>moves the emitter to a stage point</td></tr><tr><td><code>q0particles.clear! emitter</code></td><td>stops it and removes all its particles</td></tr></table></div>
+<p>Particles are drawn over the stage. Glowing (additive) emitters add their light to what is behind them. Particles that are library items are drawn at full opacity during playback; the built-in shapes fade with their colour. An emitter that follows an object in the particle editor follows it in the player too, wherever the timeline, live physics or a script has put it.</p>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>import q0.particles
+q0particles.move! &quot;sparks&quot;, player.x, player.y
+q0particles.burst! &quot;sparks&quot;, 40</code></pre></div>
+<h3 id="hosts-q0-light">q0.light</h3>
+<p>The lights of the light editor. Lights need no switch to travel: every movie with lights is lit while it plays, and these commands change them on the fly. A light is named by the name given in the light editor.</p>
+<div class="table"><table><tr><th>command</th><th>does</th></tr><tr><td><code>q0light.on! light</code></td><td>switches a light on</td></tr><tr><td><code>q0light.off! light</code></td><td>switches a light off</td></tr><tr><td><code>q0light.move! light, x, y</code></td><td>puts a light at a stage point; it stops following its object</td></tr><tr><td><code>q0light.color! light, red, green, blue</code></td><td>a new colour, each channel 0 to 255</td></tr><tr><td><code>q0light.brightness! light, value</code></td><td>1 shows colours as drawn, 2 doubles them, 0 is off</td></tr><tr><td><code>q0light.size! light, radius</code></td><td>how far it reaches, in pixels</td></tr><tr><td><code>q0light.darkness! value</code></td><td>how dark unlit places are, 0 (day) to 1 (pitch dark)</td></tr></table></div>
+<p>Lights shine on the main timeline&#x27;s layers up to its light layer; layers above it stay as drawn. A command that changes a light&#x27;s position, colour, brightness or size takes it over from its keyframes for the rest of the scene. Switching scenes drops every change.</p>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>import q0.light
+import q0.mouse
+
+pb func lights_out target {
+  q0light.off! &quot;lamp&quot;
+  q0light.darkness! 0.95
+}
+
+listen mouse.click lights_out</code></pre></div>
+<p>Sources: <a href="../../q0player/src/lib.rs">player</a>, <a href="../../q0player/src/objects.rs">object scripts</a>, <a href="../../q0player/src/live.rs">live physics, particles and lights</a>, <a href="../../q0s-format/src/lighting.rs">lighting</a>, <a href="../../q0player/src/ui/app.rs">player keys</a>, <a href="../../q0editor/src/app.rs">editor preview</a>, <a href="../../q0s-format/src/q0lang/runtime.rs">runtime commands</a>, <a href="../../q0physics/src/lib.rs">simulation</a>.</p></article><article id="events"><h2 id="events-events">events</h2>
+<p><a href="#overview">home</a> · <a href="#hosts">host api</a> · <a href="#syntax">functions</a></p>
+<p><code>listen event handler</code> adds a handler&#x27;s name to an event&#x27;s list; <code>xlisten event handler</code> removes it. These are registration statements, without <code>!</code> and without parentheses. Subscribing the same handler twice keeps one entry; removing a subscription that is not there is fine.</p>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>import q0.mouse
+
+pb func on_click target {
+  q0shell.print! &quot;clicked&quot;, target
+}
+
+listen mouse.click on_click
+xlisten mouse.click on_click</code></pre></div>
+<h3 id="events-event-names">event names</h3>
+<div class="table"><table><tr><th>name</th><th>when q0player sends it</th></tr><tr><td><code>mouse.down</code></td><td>a button is pressed</td></tr><tr><td><code>mouse.up</code></td><td>a button is released</td></tr><tr><td><code>mouse.move</code></td><td>the pointer moves</td></tr><tr><td><code>mouse.click</code></td><td>a press and release</td></tr><tr><td><code>mouse.double</code></td><td>a double click</td></tr><tr><td><code>mouse.wheel</code></td><td>the wheel or a two-finger scroll turns</td></tr><tr><td><code>mouse.over</code></td><td>the pointer enters an object (object scripts only)</td></tr><tr><td><code>mouse.out</code></td><td>the pointer leaves an object (object scripts only)</td></tr></table></div>
+<p>Another event name gives a parser diagnostic. The runtime stores the names without checking that the handler exists or how many parameters it takes.</p>
+<h3 id="events-delivery-in-q0player">delivery in q0player</h3>
+<p>q0player delivers events to vector v2 movies that import <code>q0.mouse</code> or have <a href="#hosts">object scripts</a>. Each handler is called with one argument, <code>target</code>: <code>&quot;stage&quot;</code> in the movie&#x27;s shared runtime, the object&#x27;s name in an object script. On touch screens a tap counts as the mouse.</p>
+<p>Before a handler runs, the shared runtime gets these values, in stage coordinates:</p>
+<div class="table"><table><tr><th>name</th><th>value</th></tr><tr><td><code>mouse.x</code>, <code>mouse.y</code></td><td>where the pointer is</td></tr><tr><td><code>mouse.inside</code></td><td>the pointer is over the stage</td></tr><tr><td><code>mouse.wheel_x</code>, <code>mouse.wheel_y</code></td><td>how far the wheel turned, for <code>mouse.wheel</code></td></tr></table></div>
+<p>Object scripts receive events only when they concern them:</p>
+<ul><li><code>mouse.down</code>, <code>mouse.double</code> and <code>mouse.wheel</code> go to the object under the pointer.</li><li><code>mouse.up</code> goes to the object under the pointer, and to the one the press started on.</li><li><code>mouse.click</code> needs the press and the release on the same object.</li><li><code>mouse.over</code> and <code>mouse.out</code> are sent when the pointer crosses an object&#x27;s bounds.</li></ul>
+<p>Inside an object script, <code>self.hovered</code>, <code>self.mouse_x</code> and <code>self.mouse_y</code> tell where the pointer is relative to that object. Commands a handler issues are applied right after it, like any script&#x27;s.</p>
+<p>The editor preview and q0shell keep the subscription table but deliver no events. Calling <code>on_click(&quot;button&quot;)</code> yourself is an ordinary function call, not a mouse event.</p>
+<p>Sources: <a href="../../q0s-format/src/q0lang/parser.rs">parser catalogue and subscriptions</a>, <a href="../../q0vm/src/lib.rs">qvm listener table</a>, <a href="../../q0player/src/lib.rs">player delivery</a>, <a href="../../q0player/src/objects.rs">object delivery</a>, <a href="../../q0player/src/ui/app.rs">player input</a>.</p></article><article id="q0shell"><h2 id="q0shell-q0shell-the-terminal-host-for-q0lang">q0shell: the terminal host for q0lang</h2>
+<p><code>q0shell</code> is the third program of the q0idmation family, next to q0player and q0editor. It is a plain terminal host: it runs q0lang files without the editor, computes through the shared runtime and applies <code>q0shell.*!</code> commands to the file system.</p>
+<h3 id="q0shell-running-it">running it</h3>
+<div class="code"><div class="codebar"><span>powershell</span><button type="button" class="copy">copy</button></div><pre><code>cargo run -p q0shell -- script.q0lang --root .</code></pre></div>
+<p><code>--root</code> sets the directory that file operations are allowed in. Without <code>--root</code>, the current directory is used.</p>
+<p>Short commands need no file:</p>
+<div class="code"><div class="codebar"><span>powershell</span><button type="button" class="copy">copy</button></div><pre><code>cargo run -p q0shell -- -e &quot;q0shell.print! &#x27;hi&#x27;&quot; --root .
+cargo run -p q0shell -- -e &quot;q0shell.mkdir! &#x27;out&#x27;&quot; -e &quot;q0shell.write! &#x27;out/a.txt&#x27;, &#x27;Q0&#x27;&quot; --root .</code></pre></div>
+<p>Each <code>-e</code> / <code>--eval</code> adds one line of q0lang; several <code>-e</code> join into one script. A script path and <code>-e</code> cannot be combined. Timeline, rig, scene, physics and particle commands only print that they are unavailable in q0shell.</p>
+<h3 id="q0shell-commands">commands</h3>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>q0shell.print! &quot;text&quot;, 123
+q0shell.read! &quot;path.txt&quot;
+q0shell.write! &quot;path.txt&quot;, &quot;text&quot;
+q0shell.append! &quot;path.txt&quot;, &quot;more&quot;
+q0shell.mkdir! &quot;dir&quot;
+q0shell.list! &quot;dir&quot;
+q0shell.move! &quot;from.txt&quot;, &quot;to.txt&quot;
+q0shell.delete! &quot;path.txt&quot;</code></pre></div>
+<p>Every argument is a q0lang expression:</p>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>import q0.math
+import q0shell
+
+slot = round(sin(pi / 2) * 7)
+path = &quot;out/&quot; + &quot;slot-&quot; + slot + &quot;.txt&quot;
+
+q0shell.mkdir! &quot;out&quot;
+q0shell.write! path, &quot;armed&quot;
+q0shell.read! path</code></pre></div>
+<p><code>print!</code> joins its values with spaces. <code>read!</code> prints the file, <code>list!</code> prints the folder&#x27;s entries. The longer example in <a href="#example-q0shell">examples/q0shell.q0lang</a> writes, appends, reads, moves and lists files.</p>
+<h3 id="q0shell-safety">safety</h3>
+<p>q0shell is deliberately low-level, but not blind:</p>
+<ul><li>absolute paths are refused;</li><li><code>..</code> is refused;</li><li>deleting the root directory is refused;</li><li>every operation resolves inside <code>--root</code>.</li></ul>
+<p>That covers the first layer of file management: create, write, read, move, delete and list. A movie played in q0player never gets these commands; the player ignores them.</p></article><article id="runtime"><h2 id="runtime-runtime-and-qvm">runtime and qvm</h2>
+<p><a href="#overview">home</a> · <a href="#syntax">syntax</a> · <a href="#hosts">host api</a></p>
+<h3 id="runtime-from-source-to-effect">from source to effect</h3>
+<p><code>source → parser → compiler → qvm bytecode → qvm → host actions → host</code></p>
+<p>The parser turns source into a syntax tree and reports diagnostics with line numbers. The compiler turns the tree into qvm bytecode. qvm runs the bytecode and collects host actions: jumps, commands, rig changes and so on. qvm itself has no access to files, the editor or the player. The host decides which actions it carries out; see the <a href="#hosts">availability table</a>.</p>
+<p>The shared runtime lives in <code>q0s-format/src/q0lang/runtime.rs</code> and qvm in <code>q0vm/src/lib.rs</code>. q0editor, q0player and q0shell all run code this way.</p>
+<h3 id="runtime-runtime-state">runtime state</h3>
+<p>One runtime keeps, between the scripts it runs:</p>
+<ul><li>shared variables;</li><li>imported libraries;</li><li>event subscriptions;</li><li>the signatures of public and private functions;</li><li>the compiled bodies of defined functions, so a function from the general script can be called by later frame code.</li></ul>
+<p>q0player keeps one shared runtime per movie and one more per placed copy of a symbol with an <a href="#hosts">object script</a>. Switching scenes keeps the shared runtime. Each runtime caches compiled source: a script that runs on every frame is compiled once.</p>
+<h3 id="runtime-values">values</h3>
+<div class="table"><table><tr><th>value</th><th>holds</th></tr><tr><td>number</td><td>a 64-bit float; there is no separate integer type</td></tr><tr><td>string</td><td>UTF-8 text</td></tr><tr><td>bool</td><td><code>true</code> or <code>false</code></td></tr><tr><td>null</td><td>nothing</td></tr><tr><td>ident</td><td>the text of a name that was never assigned</td></tr><tr><td>raw</td><td>an internal leftover of some errors</td></tr></table></div>
+<p>The rules for operators, truthiness and conversion are in <a href="#syntax">syntax</a>.</p>
+<h3 id="runtime-host-actions">host actions</h3>
+<div class="table"><table><tr><th>action</th><th>made by</th><th>host</th></tr><tr><td><code>GoRun(target)</code>, <code>GoStop(target)</code></td><td><code>gorun!</code>, <code>gostop!</code></td><td>editor preview, player</td></tr><tr><td><code>ShellCommand</code></td><td><code>q0shell.*!</code></td><td>shell</td></tr><tr><td><code>SceneSwitch</code></td><td><code>q0scene.switch!</code></td><td>player</td></tr><tr><td><code>RigSetPosition</code>, <code>RigSetValue</code>, <code>RigReset</code>, <code>RigSetPose</code>, <code>RigResetPose</code></td><td><code>q0rig.*!</code></td><td>player</td></tr><tr><td><code>Physics(...)</code></td><td><code>q0physics.*!</code></td><td>player</td></tr><tr><td><code>Particles(...)</code></td><td><code>q0particles.*!</code></td><td>player</td></tr><tr><td><code>Light(...)</code></td><td><code>q0light.*!</code></td><td>player</td></tr></table></div>
+<p>A target is either a frame index or a label string. Actions are collected while the script runs; the host applies them in order once it ends. Writes to host names such as <code>player.x</code> or <code>self.x</code> are read back the same way, after the script.</p>
+<h3 id="runtime-diagnostics">diagnostics</h3>
+<p>Every diagnostic carries the source line it came from. A parse or compile error that makes the program meaningless stops it before it runs. A runtime error, such as a type error, ends that run with a diagnostic; actions collected before it still apply. In q0player, diagnostics are warnings: the movie still opens and plays, and the status line summarises them. q0player keeps at most 256 of them.</p>
+<h3 id="runtime-limits">limits</h3>
+<div class="table"><table><tr><th>limit</th><th>value</th></tr><tr><td>instructions per run</td><td>100,000</td></tr><tr><td>instructions per run in the editor&#x27;s code analysis</td><td>4,096</td></tr><tr><td>operand stack</td><td>4,096 values</td></tr><tr><td>call depth</td><td>128 nested calls</td></tr><tr><td>nested expressions</td><td>64 levels</td></tr><tr><td>nested blocks</td><td>64 levels</td></tr><tr><td>frame and scene jumps in one chain</td><td>64</td></tr><tr><td>active objects with scripts in q0player</td><td>4,096</td></tr></table></div>
+<p>A run that hits the instruction limit stops with a diagnostic; an endless <code>while</code> therefore cannot freeze the player. A recursive function shares the budget of the run that called it.</p>
+<h3 id="runtime-bytecode">bytecode</h3>
+<p>qvm bytecode starts with the magic <code>QVM\0</code> and a version (currently 2), followed by a constant pool, the code and a table of source lines. Encoding is deterministic: the same program always gives the same bytes. Version 1 bytecode still loads. Opcodes 41, 42 and 43 carry the physics, particle and light commands and need a qvm that knows them.</p>
+<h3 id="runtime-the-editor">the editor</h3>
+<p>The q0lang editor window analyses the script being edited with its own small budget. It shows diagnostics, how many statements the script has, the libraries it imports, and a summary of the actions, variables and event subscriptions one run produces. The editor preview runs real frame code; see <a href="#hosts">host api</a>.</p>
+<p>Sources: <a href="../../q0s-format/src/q0lang/runtime.rs">runtime</a>, <a href="../../q0s-format/src/q0lang/compiler.rs">compiler</a>, <a href="../../q0vm/src/lib.rs">qvm</a>, <a href="../../q0player/src/lib.rs">player</a>, <a href="../../q0player/src/objects.rs">object scripts</a>, <a href="../../q0editor/src/q0lang/editor.rs">editor analysis</a>.</p></article><article id="examples"><h2 id="examples-recipes">recipes</h2>
+<p><a href="#overview">home</a> · <a href="#hosts">host api</a> · <a href="#events">events</a></p>
+<p>Short scripts for common jobs. Each one names where it goes: a q0rg&#x27;s general script, frame code, or a symbol&#x27;s object script. The instance, emitter and body names are examples; use the names in your project.</p>
+<h3 id="examples-shared-helpers-in-the-general-script">shared helpers in the general script</h3>
+<p>Functions defined in the main timeline&#x27;s general script stay available to all later frame code.</p>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>import q0.math
+
+pb func ease_in_out t {
+  return t * t * (3 - 2 * t)
+}
+
+pb func between a b t {
+  return lerp(a, b, ease_in_out(clamp(t, 0, 1)))
+}</code></pre></div>
+<p>Frame code can then call <code>between(0, 300, 0.5)</code>.</p>
+<h3 id="examples-a-wobble-that-runs-every-tick">a wobble that runs every tick</h3>
+<p>In a one-frame movie, <code>import q0.input</code> keeps the frame&#x27;s code running at the movie&#x27;s fps. Start the counter in the general script:</p>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>wobble = 0</code></pre></div>
+<p>and move a <code>logo</code> instance in the frame code:</p>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>import q0.input
+import q0.time
+import q0.math
+import q0.scene
+
+wobble = wobble + time.dt
+logo.y = stage.height / 2 + sin(wobble * 4) * 20</code></pre></div>
+<h3 id="examples-moving-a-player-with-the-keyboard">moving a player with the keyboard</h3>
+<p>Frame code of a held frame. The step is limited by the bounds measured before this run, so the instance stays on the stage.</p>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>import q0.input
+import q0.time
+import q0.math
+import q0.scene
+
+speed = 240
+dx = 0
+if input.left {
+  dx = dx - speed * time.dt
+}
+if input.right {
+  dx = dx + speed * time.dt
+}
+dx = clamp(dx, 0 - player.left, stage.width - player.right)
+player.x = player.x + dx</code></pre></div>
+<h3 id="examples-a-button-that-lights-up">a button that lights up</h3>
+<p>The object script of a button symbol whose frame 0 is the normal look and frame 1 the highlight. Every copy of the button reacts on its own.</p>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>import q0.object
+import q0.mouse
+import q0.timeline
+
+pb func on_over target {
+  gostop! 1
+}
+
+pb func on_out target {
+  gostop! 0
+}
+
+listen mouse.over on_over
+listen mouse.out on_out</code></pre></div>
+<h3 id="examples-kicking-a-ball-with-live-physics">kicking a ball with live physics</h3>
+<p>Turn on &quot;Live in q0player&quot; in the physics window and give the ball the script name <code>ball</code>. Then, in the main timeline&#x27;s general script:</p>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>import q0.mouse
+import q0.physics
+
+pb func kick target {
+  q0physics.start!
+  q0physics.push! &quot;ball&quot;, 0, -500
+}
+
+listen mouse.click kick</code></pre></div>
+<h3 id="examples-sparks-where-you-click">sparks where you click</h3>
+<p>Make an emitter called <code>sparks</code> in the particle window and turn on &quot;Live&quot;. Then, in the general script:</p>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>import q0.mouse
+import q0.particles
+
+pb func sparkle target {
+  q0particles.move! &quot;sparks&quot;, mouse.x, mouse.y
+  q0particles.burst! &quot;sparks&quot;, 25
+}
+
+listen mouse.down sparkle</code></pre></div>
+<h3 id="examples-a-torch-that-follows-the-player">a torch that follows the player</h3>
+<p>In the particle editor, start an emitter from the Fire preset, press &quot;Selected object&quot; next to Follows with the player selected, and turn on &quot;Live&quot;. In the light editor, add a Torch light that follows the player too. The fire and its glow then ride along on their own; a script only needs to light them:</p>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>import q0.particles
+import q0.light
+
+q0particles.start! &quot;fire&quot;
+q0light.on! &quot;torch&quot;</code></pre></div>
+<h3 id="examples-a-light-switch">a light switch</h3>
+<p>Frame code of a held frame. Space toggles the room&#x27;s lamp, and the room goes dark without it.</p>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>import q0.input
+import q0.light
+
+if input.jump_pressed {
+  lamp_on = not lamp_on
+  if lamp_on {
+    q0light.on! &quot;lamp&quot;
+    q0light.darkness! 0.4
+  } else {
+    q0light.off! &quot;lamp&quot;
+    q0light.darkness! 0.95
+  }
+}</code></pre></div>
+<p>Set <code>lamp_on = true</code> in the general script first.</p>
+<h3 id="examples-stopping-on-a-frame-once">stopping on a frame once</h3>
+<p>Frame code that jumps once, guarded by a flag so the jump does not repeat itself:</p>
+<div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code>import q0.timeline
+
+if not intro_done {
+  intro_done = true
+  gostop! 0
+}</code></pre></div>
+<p>Set <code>intro_done = false</code> in the general script first; an unassigned name is a truthy <code>ident</code>, so <code>not intro_done</code> would be false.</p></article><article id="example-basic"><h2>basic.q0lang</h2><div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code># q0lang basic example
+
+import q0.core
+import q0.timeline
+import q0.mouse
+import q0.math
+
+start = 2
+title = &quot;Intro&quot;
+beat = sin(pi / 2) * 4
+
+listen mouse.click onClick
+
+pb func onClick target
+pr func cacheFrame frame
+
+do! {
+  current = start + beat
+  gostop! current
+}
+</code></pre></div></article><article id="example-hello"><h2>hello.q0lang</h2><div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code># quick start: an easing curve printed by q0shell
+
+import q0.math
+import q0shell
+
+pb func ease_out t {
+  return 1 - (1 - t) ^ 3
+}
+
+for i in range(5) {
+  progress = i / 4
+  x = lerp(0, 100, ease_out(progress))
+  q0shell.print! &quot;step&quot;, i, &quot;x =&quot;, x
+}
+</code></pre></div></article><article id="example-q0shell"><h2>q0shell.q0lang</h2><div class="code"><div class="codebar"><span>q0lang</span><button type="button" class="copy">copy</button></div><pre><code># q0shell basic filesystem example
+
+import q0shell
+import q0.math
+
+slot = round(sin(pi / 2) * 7)
+path = &quot;out/&quot; + &quot;slot-&quot; + slot + &quot;.txt&quot;
+
+q0shell.print! &quot;q0shell online&quot;
+q0shell.mkdir! &quot;out&quot;
+q0shell.write! path, &quot;q0idmation&quot;
+q0shell.append! path, &quot;\nterminal host\n&quot;
+q0shell.read! path
+q0shell.move! path, &quot;out/done.txt&quot;
+q0shell.list! &quot;out&quot;
+</code></pre></div></article></main><script>
+const input=document.querySelector('#search');
+input.addEventListener('input',()=>{const query=input.value.toLocaleLowerCase().trim();let shown=0;document.querySelectorAll('article').forEach(article=>{article.hidden=query&&!article.textContent.toLocaleLowerCase().includes(query);if(!article.hidden)shown++});document.querySelector('#empty').style.display=shown?'none':'block'});
+document.querySelectorAll('a[href^="#"]').forEach(link=>link.addEventListener('click',()=>{input.value='';input.dispatchEvent(new Event('input'))}));
+document.querySelectorAll('.copy').forEach(button=>button.addEventListener('click',async()=>{const code=button.closest('.code').querySelector('pre code');try{await navigator.clipboard.writeText(code.textContent);button.textContent='copied';setTimeout(()=>button.textContent='copy',1500)}catch{const range=document.createRange();range.selectNodeContents(code);const selection=getSelection();selection.removeAllRanges();selection.addRange(range);button.textContent='ctrl+c to copy the selection'}}));
+</script></body></html>

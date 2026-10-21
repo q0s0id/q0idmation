@@ -1,9 +1,11 @@
 pub mod error;
 pub mod geom;
 mod io;
+pub mod lighting;
 pub mod migrate;
 pub mod model;
 pub mod parser;
+pub mod particles;
 pub mod physics;
 pub mod q0lang;
 pub mod q0s_v2;
@@ -29,3 +31,6 @@ pub use q1s::{
     Q1Placement, Q1Project, Q1ProjectMeta, Q1Scene, Q1S_MAGIC, Q1S_VERSION,
 };
 pub use v2::MAX_Q0RG_NESTING_DEPTH;
+
+/// Shared anchor-aware motion tween evaluation.
+pub mod motion_tween;

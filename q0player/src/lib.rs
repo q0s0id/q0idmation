@@ -1,5 +1,8 @@
+mod live;
 mod objects;
 pub mod ui;
+
+pub use live::{LiveDraws, ParticleDraw};
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -111,6 +114,8 @@ pub struct Player {
     initial_script_diagnostics: Vec<RuntimeDiagnostic>,
     rig_runtime_overrides: RigRuntimeOverrides,
     scene_runtime: RuntimeSceneState,
+    /// Physics and particles q0lang runs while the movie plays.
+    live: live::Live,
     runtime_bounds_cache: Option<(Arc<ProjectV2>, q0s_format::raster::RuntimeBoundsCache)>,
     objects: objects::ObjectWorld,
     scene_library: HashMap<String, Arc<ProjectV2>>,
@@ -377,6 +382,7 @@ impl Player {
             initial_script_diagnostics: Vec::new(),
             rig_runtime_overrides: RigRuntimeOverrides::new(),
             scene_runtime: RuntimeSceneState::new(),
+            live: Default::default(),
             runtime_bounds_cache: None,
             objects: objects::ObjectWorld::default(),
             scene_library: HashMap::new(),
@@ -434,6 +440,7 @@ impl Player {
                 initial_script_diagnostics,
                 rig_runtime_overrides: RigRuntimeOverrides::new(),
                 scene_runtime: RuntimeSceneState::new(),
+                live: Default::default(),
                 runtime_bounds_cache: None,
                 objects: objects::ObjectWorld::default(),
                 scene_library,
@@ -492,6 +499,7 @@ impl Player {
                 initial_script_diagnostics: Vec::new(),
                 rig_runtime_overrides: RigRuntimeOverrides::new(),
                 scene_runtime: RuntimeSceneState::new(),
+                live: Default::default(),
                 runtime_bounds_cache: None,
                 objects: objects::ObjectWorld::default(),
                 scene_library: HashMap::new(),
@@ -539,6 +547,79 @@ impl Player {
 
     pub fn scene_runtime(&self) -> &RuntimeSceneState {
         &self.scene_runtime
+    }
+
+    /// Liquids and particles that live physics and emitters draw over the
+    /// movie this frame.
+    pub fn live_draws(&self) -> LiveDraws {
+        match &self.inner {
+            Inner::V2 {
+                project,
+                frame_index,
+                ..
+            } => self
+                .live
+                .draws_for_scene(project, *frame_index, &self.scene_runtime),
+            _ => LiveDraws::default(),
+        }
+    }
+
+    /// Whether live physics or particles still move, so the window keeps
+    /// drawing even with the timeline paused.
+    pub fn has_live_effects(&self) -> bool {
+        self.live.is_active()
+    }
+
+    /// One movie frame of live physics and particles.
+    fn step_live(&mut self) {
+        let Inner::V2 {
+            project,
+            entry_q0rg_id,
+            frame_index,
+            ..
+        } = &self.inner
+        else {
+            return;
+        };
+        let (project, q0rg_id, frame) = (Arc::clone(project), *entry_q0rg_id, *frame_index);
+        if let Err(message) = self
+            .live
+            .step(&project, q0rg_id, frame, &mut self.scene_runtime)
+        {
+            self.initial_script_diagnostics
+                .push(RuntimeDiagnostic { line: 0, message });
+        }
+    }
+
+    fn apply_live_action(&mut self, action: &RuntimeAction) {
+        let Inner::V2 {
+            project,
+            entry_q0rg_id,
+            frame_index,
+            ..
+        } = &self.inner
+        else {
+            return;
+        };
+        let (project, q0rg_id, frame) = (Arc::clone(project), *entry_q0rg_id, *frame_index);
+        let result = match action {
+            RuntimeAction::Physics(command) => {
+                self.live
+                    .physics(command, &project, q0rg_id, frame, &mut self.scene_runtime)
+            }
+            RuntimeAction::Particles(command) => {
+                self.live
+                    .particles(command, &project, q0rg_id, frame, &self.scene_runtime)
+            }
+            RuntimeAction::Light(command) => {
+                live::light(command, &project, q0rg_id, &mut self.scene_runtime)
+            }
+            _ => Ok(()),
+        };
+        if let Err(message) = result {
+            self.initial_script_diagnostics
+                .push(RuntimeDiagnostic { line: 0, message });
+        }
     }
 
     pub fn set_input_state(&mut self, left: bool, right: bool, jump: bool) {
@@ -862,7 +943,11 @@ impl Player {
 
     pub fn tick(&mut self, delta_sec: f32) {
         let interactive_runtime = self.uses_game_input();
-        if !self.playing && !interactive_runtime && !self.objects.has_active_scripts() {
+        if !self.playing
+            && !interactive_runtime
+            && !self.objects.has_active_scripts()
+            && !self.live.is_active()
+        {
             return;
         }
         // A suspended window must not replay minutes of scripts in one UI
@@ -877,6 +962,7 @@ impl Player {
         while self.accumulator_sec >= frame_time && steps < 16 {
             steps += 1;
             self.accumulator_sec -= frame_time;
+            self.step_live();
 
             // q0.input marks an interactive runtime. Its fixed-step game clock
             // is independent from timeline transport: pausing/end-of-timeline
@@ -1233,6 +1319,11 @@ impl Player {
                         self.reset_rig_pose(owner, pose);
                     }
                 }
+                RuntimeAction::Physics(_)
+                | RuntimeAction::Particles(_)
+                | RuntimeAction::Light(_) => {
+                    self.apply_live_action(action);
+                }
             }
         }
     }
@@ -1291,6 +1382,7 @@ impl Player {
             frame_index: 0,
         };
         self.scene_runtime = RuntimeSceneState::new();
+        self.live.clear();
         self.objects = objects::ObjectWorld::default();
         self.rig_runtime_overrides.clear();
         self.audio_timeline = audio_timeline;
@@ -1721,6 +1813,60 @@ mod tests {
         q0s_format::write_q0s_v2(&project).expect("write q0s v2")
     }
 
+    #[test]
+    fn an_exported_movie_runs_its_live_physics_from_a_script() {
+        use q0s_format::physics::{PhysicsBody, PhysicsScene};
+        use q0s_format::v2::{InstanceKey, Placement, Target, Transform2D, Tween};
+
+        let bytes = q0s_v2_with_entry_script("import q0.physics\nq0physics.start!\n", 48);
+        let mut project = q0s_format::parse_q0s_v2(&bytes).expect("fixture");
+        project
+            .assets
+            .push(q0s_format::v2::Asset::Vector(q0s_format::v2::VectorAsset {
+                asset_id: 1,
+                paths: Vec::new(),
+                fill: None,
+                stroke: None,
+            }));
+        project.q0rgs[0].layers[0].explicit_keyframes = vec![0];
+        project.q0rgs[0].layers[0].placements.push(Placement {
+            pivot: None,
+            instance_id: 4,
+            frame: 0,
+            target: Target::Asset(1),
+            transform: Transform2D {
+                tx: 32.0,
+                ty: 8.0,
+                ..Transform2D::IDENTITY
+            },
+            tween: Tween::None,
+            fx: Default::default(),
+        });
+        let mut scene = PhysicsScene::new(1);
+        scene.live = true;
+        project.runtime.physics.scenes.push(scene);
+        let mut body = PhysicsBody::new(1, 4);
+        body.bounds = Some([-4.0, -4.0, 4.0, 4.0]);
+        project.runtime.physics.bodies.push(body);
+        let bytes = q0s_format::write_q0s_v2(&project).expect("write live movie");
+
+        let mut player = Player::from_bytes(&bytes).expect("load live movie");
+        player.set_playing(false);
+        assert!(
+            player.has_live_effects(),
+            "the entry script started the world"
+        );
+        player.tick(0.5);
+        let key = InstanceKey::new(1, 4);
+        let moved = player
+            .scene_runtime()
+            .effective_transform(key, Transform2D::IDENTITY);
+        assert!(
+            moved.ty > 8.0,
+            "it falls even with the timeline paused: {moved:?}"
+        );
+    }
+
     fn q0s_v2_with_frame_scripts(frame_count: u16, scripts: &[(u16, u16, &str)]) -> Vec<u8> {
         q0s_v2_with_entry_and_frame_scripts("", frame_count, scripts)
     }
@@ -1867,6 +2013,7 @@ mod tests {
                         name: "player".into(),
                         explicit_keyframes: vec![0],
                         placements: vec![Placement {
+                            pivot: None,
                             instance_id: 11,
                             frame: 0,
                             target: Target::Q0rg(2),
@@ -1891,6 +2038,7 @@ mod tests {
                         name: "body".into(),
                         explicit_keyframes: vec![0],
                         placements: vec![Placement {
+                            pivot: None,
                             instance_id: 22,
                             frame: 0,
                             target: Target::Asset(1),
@@ -2264,6 +2412,7 @@ pb func update current_vy {
                     name: "art".into(),
                     explicit_keyframes: vec![0],
                     placements: vec![VPlacement {
+                        pivot: None,
                         instance_id: 1,
                         frame: 0,
                         target: Target::Asset(1),
@@ -3110,6 +3259,7 @@ pb func update current_vy {
                     name: "art".into(),
                     explicit_keyframes: vec![0],
                     placements: vec![VPlacement {
+                        pivot: None,
                         instance_id: 7,
                         frame: 0,
                         target: Target::Asset(1),
@@ -3308,6 +3458,7 @@ pb func update current_vy {
                     name: "art".into(),
                     explicit_keyframes: vec![0],
                     placements: vec![VPlacement {
+                        pivot: None,
                         instance_id: 7,
                         frame: 0,
                         target: Target::Asset(1),

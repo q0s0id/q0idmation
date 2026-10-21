@@ -6,7 +6,7 @@
 use super::{parse_shape_tail, read_color, read_matrix, valid_affine, ByteReader};
 use crate::xfl_content::{RawShape, RawText};
 use q0s_format::transform::Affine;
-use q0s_format::v2::{Q0rgPlaybackMode, Rgba, Vec2};
+use q0s_format::v2::{Q0rgPlaybackMode, Rgba, TintFx, Vec2};
 
 #[derive(Clone, Default)]
 pub(super) struct LayerInfo {
@@ -29,6 +29,7 @@ pub(super) enum Kind {
         first_frame: u16,
         mode: Q0rgPlaybackMode,
         opacity: f32,
+        tint: Option<TintFx>,
     },
     Bitmap {
         reference: u32,
@@ -228,23 +229,28 @@ impl Decoder<'_> {
                 let first_frame = self.reader.u16()?;
                 let loop_code = if version > 1 { self.reader.u16()? } else { 0 };
                 let mut opacity = 1.0;
+                let mut tint = None;
                 let reference;
                 if version == 19 {
                     self.reader.u8()?; // color-transform marker
                     let alpha_multiplier = self.reader.u16()?;
-                    let alpha_offset = self.reader.s16()?;
+                    let _alpha_offset = self.reader.s16()?;
                     opacity = (f32::from(alpha_multiplier) / 256.0).clamp(0.0, 1.0);
-                    let mut advanced_color = alpha_offset != 0;
-                    for _ in 0..3 {
-                        advanced_color |= self.reader.u16()? != 256;
-                        advanced_color |= self.reader.s16()? != 0;
+                    let mut channels = [(1.0_f32, 0.0_f32); 3];
+                    for channel in &mut channels {
+                        *channel = (
+                            f32::from(self.reader.u16()?) / 256.0,
+                            f32::from(self.reader.s16()?),
+                        );
                     }
                     self.reader.u16()?; // color effect type
                     self.reader.u16()?; // effect percent
                     self.reader.u32()?; // effect color
-                    if advanced_color {
+                    let (fitted, exact) = color_transform_tint(channels);
+                    tint = fitted;
+                    if !exact {
                         self.warnings.push(format!(
-                            "{class}: advanced color transform is not imported yet"
+                            "{class}: an advanced color transform was approximated with a tint"
                         ));
                     }
                     self.cstring()?;
@@ -274,6 +280,7 @@ impl Decoder<'_> {
                 Kind::Symbol {
                     reference,
                     first_frame,
+                    tint,
                     mode: if class == "CPicSprite" {
                         Q0rgPlaybackMode::Loop
                     } else {
@@ -516,15 +523,23 @@ impl Decoder<'_> {
         Some(info)
     }
 
-    fn text_run(&mut self) -> Option<(String, Rgba)> {
+    /// One style run: its version, font, colour and font size in pixels.
+    fn text_run(&mut self) -> Option<(u8, String, Rgba, f32)> {
         let version = self.reader.u8()?;
         if !(2..=20).contains(&version) {
             return None;
         }
-        self.reader.u16()?;
+        // The font size, in twips.
+        let height = f32::from(self.reader.u16()?) / 20.0;
         let length = usize::from(self.reader.u8()?);
         let font = self.string(length, version >= 10)?;
         let color = read_color(self.reader.u32()?);
+        if version >= 12 {
+            // Flash CS4 on: the style, spacing and paragraph settings that
+            // follow are one fixed block, link and target included.
+            self.reader.skip(35)?;
+            return Some((version, font, color, height));
+        }
         self.reader.skip(2)?;
         self.reader.skip(if version >= 3 { 4 } else { 1 })?;
         self.reader.skip(11)?;
@@ -542,7 +557,7 @@ impl Decoder<'_> {
             let count = usize::from(self.reader.u8()?);
             self.string(count, version >= 10)?;
         }
-        Some((font, color))
+        Some((version, font, color, height))
     }
 
     fn text(&mut self) -> Option<RawText> {
@@ -577,21 +592,33 @@ impl Decoder<'_> {
         if flags & 0x4000 != 0 {
             self.text_run()?;
         }
-        let count = usize::from(self.reader.u16()?);
-        let (font, color) = if count > 0 {
-            self.text_run()?
-        } else {
-            (
-                "Arial".to_string(),
-                Rgba {
-                    r: 0,
-                    g: 0,
-                    b: 0,
-                    a: 255,
-                },
-            )
-        };
-        let text = self.string(count, version >= 10)?;
+        let mut count = usize::from(self.reader.u16()?);
+        let mut style = None;
+        let mut text = String::new();
+        while count > 0 {
+            let (run_version, font, color, height) = self.text_run()?;
+            text.push_str(&self.string(count, version >= 10)?);
+            style.get_or_insert((font, color, height));
+            // Newer runs follow one another, each with its characters, until
+            // a count of zero; older texts hold a single run.
+            if run_version < 12 {
+                break;
+            }
+            count = usize::from(self.reader.u16()?);
+        }
+        let (font, color, height) = style.unwrap_or((
+            "Arial".to_string(),
+            Rgba {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255,
+            },
+            size,
+        ));
+        // Texts from Flash CS4 on leave their own size field empty; the run
+        // holds it.
+        let size = if size > 0.0 { size } else { height };
         Some(RawText {
             affine,
             offset: Vec2::new(left as f32 / 20.0, top as f32 / 20.0),
@@ -674,5 +701,83 @@ impl Decoder<'_> {
             return Some(());
         }
         None
+    }
+}
+
+/// The tint matching a colour transform that multiplies each channel by
+/// `m` and adds `o` (0 to 255): tints and brightness are exactly that with
+/// one multiplier for all three channels. Returns the tint, if any, and
+/// whether it is exact.
+fn color_transform_tint(channels: [(f32, f32); 3]) -> (Option<TintFx>, bool) {
+    if channels
+        .iter()
+        .all(|(m, o)| (m - 1.0).abs() < 1.0 / 512.0 && o.abs() < 0.5)
+    {
+        return (None, true);
+    }
+    let same = channels
+        .iter()
+        .all(|(m, _)| (m - channels[0].0).abs() < 1.0 / 256.0);
+    let multiplier = channels.iter().map(|(m, _)| *m).sum::<f32>() / 3.0;
+    let amount = (1.0 - multiplier).clamp(0.0, 1.0);
+    if amount < 1.0 / 256.0 {
+        // Pure offsets: lighten toward the offset colour by its strength.
+        let strength = channels
+            .iter()
+            .map(|(_, o)| o.abs())
+            .fold(0.0_f32, f32::max)
+            / 255.0;
+        let channel = |o: f32| if o >= 0.0 { 255 } else { 0 };
+        return (
+            Some(TintFx {
+                color: Rgba {
+                    r: channel(channels[0].1),
+                    g: channel(channels[1].1),
+                    b: channel(channels[2].1),
+                    a: 255,
+                },
+                amount: strength.clamp(0.0, 1.0),
+            }),
+            false,
+        );
+    }
+    let channel = |o: f32| (o / amount).round().clamp(0.0, 255.0) as u8;
+    (
+        Some(TintFx {
+            color: Rgba {
+                r: channel(channels[0].1),
+                g: channel(channels[1].1),
+                b: channel(channels[2].1),
+                a: 255,
+            },
+            amount,
+        }),
+        same && channels
+            .iter()
+            .all(|(_, o)| (0.0..=255.0 * amount + 0.5).contains(o)),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tints_and_brightness_become_exact_tints() {
+        // A 40% red tint: every channel times 0.6, red plus 0.4 * 255.
+        let (tint, exact) = color_transform_tint([(0.6, 102.0), (0.6, 0.0), (0.6, 0.0)]);
+        let tint = tint.unwrap();
+        assert!(exact);
+        assert!((tint.amount - 0.4).abs() < 1.0e-4);
+        assert_eq!((tint.color.r, tint.color.g, tint.color.b), (255, 0, 0));
+        // Brightness -50%: every channel halved, nothing added.
+        let (dark, exact) = color_transform_tint([(0.5, 0.0), (0.5, 0.0), (0.5, 0.0)]);
+        assert!(exact);
+        assert_eq!(dark.unwrap().color.r, 0);
+        // No change at all.
+        assert_eq!(
+            color_transform_tint([(1.0, 0.0), (1.0, 0.0), (1.0, 0.0)]),
+            (None, true)
+        );
     }
 }

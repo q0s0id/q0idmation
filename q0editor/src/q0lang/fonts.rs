@@ -94,6 +94,7 @@ pub fn load_font_bytes(display_name: &str) -> Option<Vec<u8>> {
 /// in the status bar.
 pub fn install(ctx: &Context, display_name: &str) -> bool {
     let mut defs = FontDefinitions::default();
+    add_script_fallbacks(&mut defs);
     let mut installed_real_font = false;
 
     if let Some(bytes) = load_font_bytes(display_name) {
@@ -124,6 +125,44 @@ pub fn install(ctx: &Context, display_name: &str) -> bool {
     }
     ctx.set_fonts(defs);
     installed_real_font
+}
+
+/// System fonts covering scripts egui's own fonts lack, file and face
+/// index: Chinese, Japanese and Korean names in imported FLA files, and
+/// symbols. Windows first, then Android's system fonts.
+const SCRIPT_FALLBACKS: [(&str, u32); 7] = [
+    ("msyh.ttc", 0),
+    ("YuGothR.ttc", 0),
+    ("malgun.ttf", 0),
+    ("seguisym.ttf", 0),
+    ("/system/fonts/NotoSansCJK-Regular.ttc", 0),
+    ("/system/fonts/NotoSansSymbols-Regular-Subsetted.ttf", 0),
+    ("/system/fonts/DroidSansFallback.ttf", 0),
+];
+
+/// Puts the installed fonts of [`SCRIPT_FALLBACKS`] at the end of every
+/// family, so characters the UI fonts lack still show instead of boxes.
+pub fn add_script_fallbacks(defs: &mut FontDefinitions) {
+    let dirs = font_dirs();
+    for (file, index) in SCRIPT_FALLBACKS {
+        let path = std::path::Path::new(file);
+        let bytes = if path.is_absolute() {
+            std::fs::read(path).ok()
+        } else {
+            dirs.iter()
+                .find_map(|dir| std::fs::read(dir.join(file)).ok())
+        };
+        let Some(bytes) = bytes else {
+            continue;
+        };
+        let key = format!("q0_fallback_{file}");
+        let mut data = FontData::from_owned(bytes);
+        data.index = index;
+        defs.font_data.insert(key.clone(), data);
+        for family in [FontFamily::Proportional, FontFamily::Monospace] {
+            defs.families.entry(family).or_default().push(key.clone());
+        }
+    }
 }
 
 /// What's actually available on this machine — used to populate the font

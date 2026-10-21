@@ -42,6 +42,7 @@ fn commit_stroke(app: &mut EditorApp, anchors: Vec<Anchor>, closed: bool) -> u16
             },
             width: 1.0,
             cap: q0s_format::geom::CapShape::Round,
+            join: q0s_format::geom::JoinShape::Bevel,
         }),
     }));
     let q0rg_id = app.session.current_q0rg_id;
@@ -60,6 +61,7 @@ fn commit_stroke(app: &mut EditorApp, anchors: Vec<Anchor>, closed: bool) -> u16
         .find(|l| l.layer_id == layer_id)
         .expect("layer");
     layer.push_placement(Placement {
+        pivot: None,
         instance_id: 0,
         frame,
         target: Target::Asset(asset_id),

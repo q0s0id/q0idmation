@@ -1,0 +1,14 @@
+# quick start: an easing curve printed by q0shell
+
+import q0.math
+import q0shell
+
+pb func ease_out t {
+  return 1 - (1 - t) ^ 3
+}
+
+for i in range(5) {
+  progress = i / 4
+  x = lerp(0, 100, ease_out(progress))
+  q0shell.print! "step", i, "x =", x
+}

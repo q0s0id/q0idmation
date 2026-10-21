@@ -162,6 +162,15 @@ impl Runtime {
                 HostAction::SceneCommand { command, args } => {
                     emit_scene_command(&command, &args, &mut report);
                 }
+                HostAction::PhysicsCommand { command, args } => {
+                    emit_physics_command(&command, &args, &mut report);
+                }
+                HostAction::ParticlesCommand { command, args } => {
+                    emit_particles_command(&command, &args, &mut report);
+                }
+                HostAction::LightCommand { command, args } => {
+                    emit_light_command(&command, &args, &mut report);
+                }
             }
         }
         report
@@ -224,6 +233,163 @@ fn emit_scene_command(command: &str, args: &[RuntimeValue], report: &mut Executi
             0,
             format!("unknown q0.scene command `q0scene.{command}!`"),
         )),
+    }
+}
+
+fn finite_number(value: &RuntimeValue) -> Option<f64> {
+    match value {
+        RuntimeValue::Number(number) if number.is_finite() => Some(*number),
+        _ => None,
+    }
+}
+
+fn emit_physics_command(command: &str, args: &[RuntimeValue], report: &mut ExecutionReport) {
+    let named_pair = |args: &[RuntimeValue]| match args {
+        [name, x, y] => Some((runtime_name(name)?, finite_number(x)?, finite_number(y)?)),
+        _ => None,
+    };
+    let action = match command {
+        "start" if args.is_empty() => Some(PhysicsCommand::Start),
+        "pause" if args.is_empty() => Some(PhysicsCommand::Pause),
+        "reset" if args.is_empty() => Some(PhysicsCommand::Reset),
+        "push" => named_pair(args).map(|(body, x, y)| PhysicsCommand::Push { body, x, y }),
+        "velocity" => named_pair(args).map(|(body, x, y)| PhysicsCommand::Velocity { body, x, y }),
+        "teleport" => named_pair(args).map(|(body, x, y)| PhysicsCommand::Teleport { body, x, y }),
+        "spin" => match args {
+            [name, degrees] => runtime_name(name)
+                .zip(finite_number(degrees))
+                .map(|(body, degrees)| PhysicsCommand::Spin { body, degrees }),
+            _ => None,
+        },
+        "gravity" => match args {
+            [x, y] => finite_number(x)
+                .zip(finite_number(y))
+                .map(|(x, y)| PhysicsCommand::Gravity { x, y }),
+            _ => None,
+        },
+        "cut" => match args {
+            [name] => runtime_name(name).map(|link| PhysicsCommand::Cut { link }),
+            _ => None,
+        },
+        _ => {
+            report.diagnostics.push(RuntimeDiagnostic::at_line(
+                0,
+                format!("unknown q0.physics command `q0physics.{command}!`"),
+            ));
+            return;
+        }
+    };
+    match action {
+        Some(action) => report.actions.push(RuntimeAction::Physics(action)),
+        None => {
+            let usage = match command {
+                "push" | "velocity" | "teleport" => {
+                    format!("q0physics.{command}! expects: q0physics.{command}! name, x, y")
+                }
+                "spin" => {
+                    "q0physics.spin! expects: q0physics.spin! name, degrees_per_second".to_string()
+                }
+                "gravity" => "q0physics.gravity! expects: q0physics.gravity! x, y".to_string(),
+                "cut" => "q0physics.cut! expects: q0physics.cut! link".to_string(),
+                _ => format!("q0physics.{command}! takes no arguments"),
+            };
+            report
+                .diagnostics
+                .push(RuntimeDiagnostic::at_line(0, usage));
+        }
+    }
+}
+
+fn emit_light_command(command: &str, args: &[RuntimeValue], report: &mut ExecutionReport) {
+    let action = match (command, args) {
+        ("on", [name]) => runtime_name(name).map(|light| LightCommand::On { light }),
+        ("off", [name]) => runtime_name(name).map(|light| LightCommand::Off { light }),
+        ("move", [name, x, y]) => match (runtime_name(name), finite_number(x), finite_number(y)) {
+            (Some(light), Some(x), Some(y)) => Some(LightCommand::Move { light, x, y }),
+            _ => None,
+        },
+        ("color", [name, r, g, b]) => match (
+            runtime_name(name),
+            finite_number(r),
+            finite_number(g),
+            finite_number(b),
+        ) {
+            (Some(light), Some(r), Some(g), Some(b)) => {
+                Some(LightCommand::Color { light, r, g, b })
+            }
+            _ => None,
+        },
+        ("brightness", [name, value]) => runtime_name(name)
+            .zip(finite_number(value))
+            .map(|(light, value)| LightCommand::Brightness { light, value }),
+        ("size", [name, value]) => runtime_name(name)
+            .zip(finite_number(value))
+            .map(|(light, radius)| LightCommand::Size { light, radius }),
+        ("darkness", [value]) => finite_number(value).map(|value| LightCommand::Darkness { value }),
+        ("on" | "off" | "move" | "color" | "brightness" | "size" | "darkness", _) => None,
+        _ => {
+            report.diagnostics.push(RuntimeDiagnostic::at_line(
+                0,
+                format!("unknown q0.light command `q0light.{command}!`"),
+            ));
+            return;
+        }
+    };
+    match action {
+        Some(action) => report.actions.push(RuntimeAction::Light(action)),
+        None => {
+            let usage = match command {
+                "move" => "q0light.move! expects: q0light.move! light, x, y",
+                "color" => {
+                    "q0light.color! expects: q0light.color! light, red, green, blue (0 to 255)"
+                }
+                "brightness" => "q0light.brightness! expects: q0light.brightness! light, value",
+                "size" => "q0light.size! expects: q0light.size! light, radius",
+                "darkness" => "q0light.darkness! expects: q0light.darkness! value (0 to 1)",
+                _ => "expects the light's name",
+            };
+            report
+                .diagnostics
+                .push(RuntimeDiagnostic::at_line(0, usage.to_string()));
+        }
+    }
+}
+
+fn emit_particles_command(command: &str, args: &[RuntimeValue], report: &mut ExecutionReport) {
+    let action = match (command, args) {
+        ("start", [name]) => runtime_name(name).map(|emitter| ParticlesCommand::Start { emitter }),
+        ("stop", [name]) => runtime_name(name).map(|emitter| ParticlesCommand::Stop { emitter }),
+        ("clear", [name]) => runtime_name(name).map(|emitter| ParticlesCommand::Clear { emitter }),
+        ("burst", [name, count]) => runtime_name(name)
+            .zip(finite_number(count))
+            .map(|(emitter, count)| ParticlesCommand::Burst { emitter, count }),
+        ("move", [name, x, y]) => match (runtime_name(name), finite_number(x), finite_number(y)) {
+            (Some(emitter), Some(x), Some(y)) => Some(ParticlesCommand::Move { emitter, x, y }),
+            _ => None,
+        },
+        ("start" | "stop" | "clear" | "burst" | "move", _) => None,
+        _ => {
+            report.diagnostics.push(RuntimeDiagnostic::at_line(
+                0,
+                format!("unknown q0.particles command `q0particles.{command}!`"),
+            ));
+            return;
+        }
+    };
+    match action {
+        Some(action) => report.actions.push(RuntimeAction::Particles(action)),
+        None => {
+            let usage = match command {
+                "burst" => "q0particles.burst! expects: q0particles.burst! emitter, count",
+                "move" => "q0particles.move! expects: q0particles.move! emitter, x, y",
+                "start" => "q0particles.start! expects: q0particles.start! emitter",
+                "stop" => "q0particles.stop! expects: q0particles.stop! emitter",
+                _ => "q0particles.clear! expects: q0particles.clear! emitter",
+            };
+            report
+                .diagnostics
+                .push(RuntimeDiagnostic::at_line(0, usage));
+        }
     }
 }
 
@@ -354,6 +520,96 @@ pub enum RuntimeAction {
     RigResetPose {
         pose: String,
     },
+    /// Drives the live physics world of the movie (q0.physics).
+    Physics(PhysicsCommand),
+    /// Drives a live particle emitter (q0.particles).
+    Particles(ParticlesCommand),
+    /// Changes the lights while the movie plays (q0.light).
+    Light(LightCommand),
+}
+
+/// Lights are named by the name given in the light editor; colours run 0
+/// to 255 and darkness 0 to 1.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LightCommand {
+    On {
+        light: String,
+    },
+    Off {
+        light: String,
+    },
+    Move {
+        light: String,
+        x: f64,
+        y: f64,
+    },
+    Color {
+        light: String,
+        r: f64,
+        g: f64,
+        b: f64,
+    },
+    Brightness {
+        light: String,
+        value: f64,
+    },
+    Size {
+        light: String,
+        radius: f64,
+    },
+    Darkness {
+        value: f64,
+    },
+}
+
+/// Bodies are named by their instance names; velocities are in stage pixels
+/// per second and spins in degrees per second, clockwise.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PhysicsCommand {
+    /// Runs the world from where everything is now; resumes after a pause.
+    Start,
+    /// Holds every body where it is.
+    Pause,
+    /// Stops the world and hands the bodies back to the timeline.
+    Reset,
+    /// Adds to a body's velocity.
+    Push {
+        body: String,
+        x: f64,
+        y: f64,
+    },
+    Velocity {
+        body: String,
+        x: f64,
+        y: f64,
+    },
+    Spin {
+        body: String,
+        degrees: f64,
+    },
+    Teleport {
+        body: String,
+        x: f64,
+        y: f64,
+    },
+    Gravity {
+        x: f64,
+        y: f64,
+    },
+    /// Cuts a rope in its middle, or undoes any other link.
+    Cut {
+        link: String,
+    },
+}
+
+/// Emitters are named by the name given in the particle editor.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParticlesCommand {
+    Start { emitter: String },
+    Stop { emitter: String },
+    Burst { emitter: String, count: f64 },
+    Move { emitter: String, x: f64, y: f64 },
+    Clear { emitter: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

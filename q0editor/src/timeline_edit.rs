@@ -2736,6 +2736,7 @@ mod tests {
 
     fn placement(frame: u16, x: f32, tween: Tween) -> Placement {
         Placement {
+            pivot: None,
             instance_id: 0,
             frame,
             target: Target::Q0rg(u16::MAX),

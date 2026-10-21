@@ -82,6 +82,9 @@ pub enum HostAction {
     ShellCommand { command: String, args: Vec<Value> },
     RigCommand { command: String, args: Vec<Value> },
     SceneCommand { command: String, args: Vec<Value> },
+    PhysicsCommand { command: String, args: Vec<Value> },
+    ParticlesCommand { command: String, args: Vec<Value> },
+    LightCommand { command: String, args: Vec<Value> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +163,9 @@ pub enum Opcode {
     RangeStart = 38,
     RangeNext = 39,
     RangeEnd = 40,
+    Physics = 41,
+    Particles = 42,
+    Light = 43,
 }
 
 impl TryFrom<u8> for Opcode {
@@ -205,6 +211,9 @@ impl TryFrom<u8> for Opcode {
             35 => Self::CallUser,
             36 => Self::Return,
             37 => Self::Scene,
+            41 => Self::Physics,
+            42 => Self::Particles,
+            43 => Self::Light,
             38 => Self::RangeStart,
             39 => Self::RangeNext,
             40 => Self::RangeEnd,
@@ -639,6 +648,9 @@ impl Vm {
                 Opcode::Shell => self.op_host_call(chunk, HostChannel::Shell, report),
                 Opcode::Rig => self.op_host_call(chunk, HostChannel::Rig, report),
                 Opcode::Scene => self.op_host_call(chunk, HostChannel::Scene, report),
+                Opcode::Physics => self.op_host_call(chunk, HostChannel::Physics, report),
+                Opcode::Particles => self.op_host_call(chunk, HostChannel::Particles, report),
+                Opcode::Light => self.op_host_call(chunk, HostChannel::Light, report),
                 Opcode::Listen => self.op_listener(chunk, false),
                 Opcode::Unlisten => self.op_listener(chunk, true),
                 Opcode::Import => self.op_import(chunk),
@@ -1042,6 +1054,9 @@ impl Vm {
             HostChannel::Shell => HostAction::ShellCommand { command, args },
             HostChannel::Rig => HostAction::RigCommand { command, args },
             HostChannel::Scene => HostAction::SceneCommand { command, args },
+            HostChannel::Physics => HostAction::PhysicsCommand { command, args },
+            HostChannel::Particles => HostAction::ParticlesCommand { command, args },
+            HostChannel::Light => HostAction::LightCommand { command, args },
         });
         Ok(())
     }
@@ -1199,6 +1214,9 @@ enum HostChannel {
     Shell,
     Rig,
     Scene,
+    Physics,
+    Particles,
+    Light,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

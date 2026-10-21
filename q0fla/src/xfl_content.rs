@@ -104,6 +104,10 @@ pub(crate) struct RawShape {
     pub(crate) fills: HashMap<u16, RawFillStyle>,
     pub(crate) strokes: HashMap<u16, Stroke>,
     pub(crate) edges: Vec<RawEdge>,
+    /// Variable width strokes by style: markers of position along the line
+    /// (0 to 1) and the left and right half widths there, as shares of the
+    /// stroke's weight.
+    pub(crate) widths: HashMap<u16, Vec<[f32; 3]>>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,7 +115,11 @@ pub(crate) enum RawFillStyle {
     Solid(Rgba),
     Gradient(GradientFill),
     Bitmap {
+        /// The bitmap's number in a legacy binary FLA.
         reference: u32,
+        /// The bitmap's library name in an XFL document.
+        name: Option<String>,
+        /// Maps bitmap pixels into the shape's local space.
         transform: Affine,
         tiled: bool,
     },
@@ -169,6 +177,202 @@ struct ShapeState {
     fill_style: Option<(usize, u16)>,
     stroke_style: Option<(usize, u16)>,
     gradient: Option<GradientState>,
+    bitmap: Option<BitmapFillState>,
+    /// Set for a rectangle or oval drawn with Animate's primitive tools.
+    primitive: Option<Primitive>,
+    widths: HashMap<u16, Vec<[f32; 3]>>,
+}
+
+impl ShapeState {
+    fn new(depth: usize) -> Self {
+        Self {
+            depth,
+            affine: Affine::IDENTITY,
+            fills: HashMap::new(),
+            strokes: HashMap::new(),
+            edges: Vec::new(),
+            fill_style: None,
+            stroke_style: None,
+            gradient: None,
+            bitmap: None,
+            primitive: None,
+            widths: HashMap::new(),
+        }
+    }
+}
+
+/// A `BitmapFill` being read inside a fill style.
+#[derive(Debug)]
+struct BitmapFillState {
+    depth: usize,
+    style_index: u16,
+    name: String,
+    tiled: bool,
+    matrix: Affine,
+}
+
+/// An Animate rectangle or oval primitive, in its own local space.
+#[derive(Debug, Clone, Copy)]
+enum Primitive {
+    Rectangle {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        /// Top left, top right, bottom right, bottom left.
+        radii: [f32; 4],
+    },
+    Oval {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        /// Degrees clockwise from three o'clock; equal angles draw it whole.
+        start: f32,
+        end: f32,
+        /// The hole in the middle, as a share of the size.
+        inner: f32,
+        close: bool,
+    },
+}
+
+impl Primitive {
+    fn read(reader: &Reader<&[u8]>, element: &BytesStart<'_>) -> Result<Self, ImportError> {
+        let number = |name: &[u8], fallback: f32| parse_f32_attr(reader, element, name, fallback);
+        let (x, y) = (number(b"x", 0.0)?, number(b"y", 0.0)?);
+        let (width, height) = (
+            number(b"objectWidth", 0.0)?.max(0.0),
+            number(b"objectHeight", 0.0)?.max(0.0),
+        );
+        if element.name().as_ref() == b"DOMRectangleObject" {
+            let top_left = number(b"topLeftRadius", 0.0)?.abs();
+            // A locked rectangle stores one radius for all four corners.
+            let locked = attr(reader, element, b"lockFlag")?.as_deref() == Some("true");
+            let corner = |name: &[u8]| -> Result<f32, ImportError> {
+                Ok(if locked {
+                    top_left
+                } else {
+                    number(name, 0.0)?.abs()
+                })
+            };
+            Ok(Self::Rectangle {
+                x,
+                y,
+                width,
+                height,
+                radii: [
+                    top_left,
+                    corner(b"topRightRadius")?,
+                    corner(b"bottomRightRadius")?,
+                    corner(b"bottomLeftRadius")?,
+                ],
+            })
+        } else {
+            Ok(Self::Oval {
+                x,
+                y,
+                width,
+                height,
+                start: number(b"startAngle", 0.0)?,
+                end: number(b"endAngle", 0.0)?,
+                inner: (number(b"innerRadius", 0.0)? / 100.0).clamp(0.0, 0.99),
+                close: attr(reader, element, b"closePath")?.as_deref() != Some("false"),
+            })
+        }
+    }
+
+    /// Its outline as closed loops of straight segments.
+    fn loops(self) -> Vec<Vec<Vec2>> {
+        const STEPS: usize = 48;
+        match self {
+            Self::Rectangle {
+                x,
+                y,
+                width,
+                height,
+                radii,
+            } => {
+                let limit = (width.min(height) * 0.5).max(0.0);
+                let radii = radii.map(|radius| radius.min(limit));
+                // Corner centres and the angle each corner's arc starts at.
+                let corners = [
+                    (x + radii[0], y + radii[0], radii[0], 180.0_f32),
+                    (x + width - radii[1], y + radii[1], radii[1], 270.0),
+                    (x + width - radii[2], y + height - radii[2], radii[2], 0.0),
+                    (x + radii[3], y + height - radii[3], radii[3], 90.0),
+                ];
+                let mut points = Vec::new();
+                for (cx, cy, radius, from) in corners {
+                    if radius <= 0.0 {
+                        let (dx, dy) = match from as i32 {
+                            180 => (-0.0, -0.0),
+                            _ => (0.0, 0.0),
+                        };
+                        points.push(Vec2::new(cx + dx, cy + dy));
+                        continue;
+                    }
+                    for step in 0..=STEPS / 4 {
+                        let angle = (from + 90.0 * step as f32 / (STEPS / 4) as f32).to_radians();
+                        points.push(Vec2::new(
+                            cx + radius * angle.cos(),
+                            cy + radius * angle.sin(),
+                        ));
+                    }
+                }
+                vec![points]
+            }
+            Self::Oval {
+                x,
+                y,
+                width,
+                height,
+                start,
+                end,
+                inner,
+                close,
+            } => {
+                let (rx, ry) = (width * 0.5, height * 0.5);
+                let (cx, cy) = (x + rx, y + ry);
+                let point = |angle: f32, scale: f32| {
+                    let radians = angle.to_radians();
+                    Vec2::new(
+                        cx + rx * scale * radians.cos(),
+                        cy + ry * scale * radians.sin(),
+                    )
+                };
+                let mut sweep = (end - start).rem_euclid(360.0);
+                let whole = sweep.abs() < 1.0e-3;
+                if whole {
+                    sweep = 360.0;
+                }
+                let steps = ((STEPS as f32 * sweep / 360.0).ceil() as usize).max(2);
+                let arc = |scale: f32| {
+                    (0..=steps)
+                        .map(|step| point(start + sweep * step as f32 / steps as f32, scale))
+                        .collect::<Vec<_>>()
+                };
+                let mut outer = arc(1.0);
+                if whole {
+                    outer.pop();
+                    if inner > 0.0 {
+                        let mut hole = arc(inner);
+                        hole.pop();
+                        hole.reverse();
+                        return vec![outer, hole];
+                    }
+                    return vec![outer];
+                }
+                if inner > 0.0 {
+                    let mut hole = arc(inner);
+                    hole.reverse();
+                    outer.extend(hole);
+                } else if close {
+                    outer.push(Vec2::new(cx, cy));
+                }
+                vec![outer]
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -195,10 +399,12 @@ struct TextState {
     run_count: usize,
 }
 
+/// A `DOMGroup` being read. Its own `<matrix>` only records where the group
+/// as a whole sits: every member already carries its full transform, so it
+/// must not be applied again.
 #[derive(Debug, Clone, Copy)]
 struct GroupState {
     depth: usize,
-    affine: Affine,
 }
 
 pub(crate) fn enrich_project(
@@ -214,8 +420,15 @@ pub(crate) fn enrich_project(
         ));
     }
 
+    // Files left in LIBRARY/ that the document no longer lists are not part
+    // of the library; Animate ignores them, and so must the import, or a
+    // stale copy can stand in for the real symbol of the same name.
+    let listed = listed_library_items(dom_xml)?;
     let mut symbols = Vec::new();
     for (entry_path, xml) in library_docs {
+        if !listed.is_empty() && !listed.contains(&library_item_path(entry_path).to_lowercase()) {
+            continue;
+        }
         if let Some(timeline) = parse_timeline(xml, true)? {
             if !timeline.name.trim().is_empty() {
                 symbols.push((library_item_path(entry_path), timeline));
@@ -223,27 +436,41 @@ pub(crate) fn enrich_project(
         }
     }
 
-    let mut symbol_ids = HashMap::<String, u16>::new();
-    let mut symbol_frame_counts_by_id = HashMap::<u16, u16>::new();
+    let mut symbol_index = SymbolIndex::default();
     let mut symbols_by_name = HashMap::<String, Vec<u16>>::new();
     let mut symbol_ids_by_path = Vec::with_capacity(symbols.len());
     for (path, symbol) in &symbols {
         let next = u16::try_from(symbol_ids_by_path.len() + document_scenes.len() + 1)
             .map_err(|_| ImportError::Invalid("too many fla symbols for q0rg ids".to_string()))?;
-        symbol_ids.insert(normalize_library_reference(path), next);
+        // Instances name symbols exactly as the library does, spaces and
+        // case included; "G36" and "G36 " are two different symbols.
+        symbol_index
+            .exact
+            .entry(symbol.name.replace('\\', "/"))
+            .or_insert(next);
+        symbol_index.exact.entry(path.clone()).or_insert(next);
+        symbol_index
+            .normalized
+            .entry(normalize_library_reference(path))
+            .or_insert(next);
         symbols_by_name
             .entry(normalize_library_reference(&symbol.name))
             .or_default()
             .push(next);
         symbol_ids_by_path.push(next);
-        symbol_frame_counts_by_id.insert(next, symbol.frame_count.max(1));
+        symbol_index
+            .frame_counts
+            .insert(next, symbol.frame_count.max(1));
     }
-    // Bare names remain supported when they uniquely identify a library item;
-    // folder-qualified references always resolve to their own symbol.
+    // Loosely written names still resolve when they point at one library
+    // item only.
     for (name, ids) in symbols_by_name {
         if ids.len() == 1 {
-            symbol_ids.entry(name).or_insert(ids[0]);
-        } else {
+            symbol_index.normalized.entry(name).or_insert(ids[0]);
+        } else if !ids
+            .iter()
+            .all(|id| symbol_index.exact.values().any(|exact| exact == id))
+        {
             imported.report.warnings.push(format!(
                 "library contains {} symbols named '{}'; folder-qualified references are used",
                 ids.len(),
@@ -251,14 +478,6 @@ pub(crate) fn enrich_project(
             ));
         }
     }
-    let symbol_frame_counts: HashMap<String, u16> = symbol_ids
-        .iter()
-        .filter_map(|(name, id)| {
-            symbol_frame_counts_by_id
-                .get(id)
-                .map(|count| (name.clone(), *count))
-        })
-        .collect();
 
     imported.project.assets.clear();
     imported.project.asset_names.clear();
@@ -319,6 +538,9 @@ pub(crate) fn enrich_project(
     }
     let mut bitmap_asset_ids = HashMap::<String, u16>::new();
     let mut next_asset_id = 1u16;
+    // Groups made while importing, such as bitmap fills, follow the symbols.
+    let mut next_q0rg_id = u16::try_from(document_scenes.len() + symbol_ids_by_path.len() + 1)
+        .map_err(|_| ImportError::Invalid("too many fla symbols for q0rg ids".to_string()))?;
     for media in parse_bitmap_media(dom_xml)? {
         let archive_name =
             format!("bin/{}", media.data_href.replace('\\', "/")).to_ascii_lowercase();
@@ -383,11 +605,11 @@ pub(crate) fn enrich_project(
             &scene,
             scene_id,
             &scene_name,
-            &symbol_ids,
-            &symbol_frame_counts,
+            &symbol_index,
             &bitmap_asset_ids,
             &mut imported.project,
             &mut next_asset_id,
+            &mut next_q0rg_id,
         )?;
         imported.project.q0rgs.push(scene_built.q0rg);
         imported.project.layer_metadata.extend(scene_built.metadata);
@@ -412,11 +634,11 @@ pub(crate) fn enrich_project(
             &symbol,
             q0rg_id,
             &symbol_name,
-            &symbol_ids,
-            &symbol_frame_counts,
+            &symbol_index,
             &bitmap_asset_ids,
             &mut imported.project,
             &mut next_asset_id,
+            &mut next_q0rg_id,
         )?;
         imported.project.q0rgs.push(built.q0rg);
         imported.project.layer_metadata.extend(built.metadata);
@@ -452,11 +674,34 @@ pub(crate) fn enrich_project(
         !warning.contains("first q0fla pass imports document/timeline structure only")
     });
     dedup_warnings(&mut imported.report.warnings);
+    // Scenes first, then library symbols, then groups made on the way.
+    imported.project.q0rgs.sort_by_key(|q0rg| q0rg.q0rg_id);
 
     q0s_format::v2::validate(&imported.project).map_err(|error| {
         ImportError::Invalid(format!("enriched q1s model failed validation: {error}"))
     })?;
     Ok(())
+}
+
+/// The library files `DOMDocument.xml` includes, without `.xml`, lowercase.
+fn listed_library_items(dom_xml: &[u8]) -> Result<HashSet<String>, ImportError> {
+    let mut reader = Reader::from_reader(dom_xml);
+    let mut listed = HashSet::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element) | Event::Empty(element))
+                if element.name().as_ref() == b"Include" =>
+            {
+                if let Some(href) = attr(&reader, &element, b"href")? {
+                    listed.insert(library_item_path(&href).to_lowercase());
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(error) => return Err(ImportError::Invalid(format!("library list: {error}"))),
+            _ => {}
+        }
+    }
+    Ok(listed)
 }
 
 fn library_item_path(entry_path: &str) -> String {
@@ -501,10 +746,26 @@ fn library_folder_from_item_path(item_path: &str) -> Option<String> {
 }
 
 fn normalize_library_folder_path(path: &str) -> Option<String> {
+    // Folder names may carry control characters or be "." or "..", which no
+    // q1s folder can be called.
     let segments = path
         .split('/')
-        .map(str::trim)
-        .filter(|segment| !segment.is_empty())
+        .map(|segment| {
+            segment
+                .chars()
+                .filter(|character| !character.is_control())
+                .collect::<String>()
+                .trim()
+                .to_string()
+        })
+        .filter(|segment| !segment.is_empty() && segment != ".")
+        .map(|segment| {
+            if segment == ".." {
+                "_".to_string()
+            } else {
+                segment
+            }
+        })
         .collect::<Vec<_>>();
     (!segments.is_empty()).then(|| segments.join("/"))
 }
@@ -742,16 +1003,39 @@ fn camera_track_from_timeline(timeline: &RawTimeline, warnings: &mut Vec<String>
     track
 }
 
+/// Library symbols by the names instances use for them.
+#[derive(Default)]
+struct SymbolIndex {
+    exact: HashMap<String, u16>,
+    normalized: HashMap<String, u16>,
+    frame_counts: HashMap<u16, u16>,
+}
+
+impl SymbolIndex {
+    /// The symbol `name` means: the one called exactly that, or else the one
+    /// it names once case, spaces and slashes are tidied.
+    fn find(&self, name: &str) -> Option<u16> {
+        self.exact
+            .get(&name.replace('\\', "/"))
+            .or_else(|| self.normalized.get(&normalize_library_reference(name)))
+            .copied()
+    }
+
+    fn frame_count(&self, id: u16) -> u16 {
+        self.frame_counts.get(&id).copied().unwrap_or(1).max(1)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_q0rg(
     timeline: &RawTimeline,
     q0rg_id: u16,
     q0rg_name: &str,
-    symbol_ids: &HashMap<String, u16>,
-    symbol_frame_counts: &HashMap<String, u16>,
+    symbols: &SymbolIndex,
     bitmap_asset_ids: &HashMap<String, u16>,
     project: &mut ProjectV2,
     next_asset_id: &mut u16,
+    next_q0rg_id: &mut u16,
 ) -> Result<BuiltQ0rg, ImportError> {
     let mut layers = Vec::with_capacity(timeline.layers.len());
     let mut metadata = HashMap::new();
@@ -793,9 +1077,15 @@ fn build_q0rg(
                 for element in &frame.elements {
                     match element {
                         RawElement::Symbol(instance) => {
-                            let reference =
-                                normalize_library_reference(&instance.library_item_name);
-                            if let Some(&target_id) = symbol_ids.get(&reference) {
+                            let target = symbols.find(&instance.library_item_name);
+                            if target == Some(q0rg_id) {
+                                // Animate refuses to nest a symbol in itself;
+                                // a file that does anyway would loop forever.
+                                warnings.push(format!(
+                                    "symbol '{}' contains an instance of itself; that instance was skipped",
+                                    instance.library_item_name
+                                ));
+                            } else if let Some(target_id) = target {
                                 let transform =
                                     affine_to_transform(instance.affine).ok_or_else(|| {
                                         ImportError::Invalid(format!(
@@ -804,11 +1094,7 @@ fn build_q0rg(
                                         ))
                                     })?;
                                 let mut playback = instance.playback;
-                                let frame_count = symbol_frame_counts
-                                    .get(&reference)
-                                    .copied()
-                                    .unwrap_or(1)
-                                    .max(1);
+                                let frame_count = symbols.frame_count(target_id);
                                 let max_frame = frame_count - 1;
                                 let original_playback = playback;
                                 playback.first_frame = playback.first_frame.min(max_frame);
@@ -839,6 +1125,7 @@ fn build_q0rg(
                                     ));
                                 }
                                 placements.push(Placement {
+                                    pivot: None,
                                     instance_id: 0,
                                     frame: frame.index,
                                     target: Target::Q0rg(target_id),
@@ -873,6 +1160,7 @@ fn build_q0rg(
                                         ))
                                     })?;
                                 placements.push(Placement {
+                                    pivot: None,
                                     instance_id: 0,
                                     frame: frame.index,
                                     target: Target::Asset(target_id),
@@ -888,19 +1176,35 @@ fn build_q0rg(
                             }
                         }
                         RawElement::Shape(shape) => {
-                            for target in shape_assets(
+                            let bitmap = |fill: &RawFillStyle| match fill {
+                                RawFillStyle::Bitmap {
+                                    name: Some(name), ..
+                                } => bitmap_asset_ids
+                                    .get(&normalize_library_reference(name))
+                                    .copied(),
+                                _ => None,
+                            };
+                            for target in shape_targets(
                                 shape,
                                 q0rg_name,
                                 project,
                                 next_asset_id,
+                                next_q0rg_id,
                                 &mut warnings,
+                                &bitmap,
                             )? {
                                 placements.push(Placement {
+                                    pivot: None,
                                     instance_id: 0,
                                     frame: frame.index,
-                                    target: Target::Asset(target),
+                                    target,
                                     transform: Transform2D::IDENTITY,
-                                    tween: shape_tween,
+                                    // Shape tweens morph drawings; a bitmap
+                                    // fill group holds still.
+                                    tween: match target {
+                                        Target::Asset(_) => shape_tween,
+                                        Target::Q0rg(_) => Tween::None,
+                                    },
                                     fx: PlacementFx::default(),
                                 });
                             }
@@ -915,6 +1219,7 @@ fn build_q0rg(
                                 &mut pending_text,
                             )? {
                                 placements.push(Placement {
+                                    pivot: None,
                                     instance_id: 0,
                                     frame: frame.index,
                                     target: Target::Asset(target),
@@ -951,12 +1256,22 @@ fn build_q0rg(
             placements,
         });
 
-        let parent_folder_id = raw_layer.parent_index.and_then(|parent_index| {
+        // A masked layer points at its mask; it sits in the folder its mask
+        // sits in.
+        let folder_of = |index: usize| {
             timeline
                 .layers
-                .get(parent_index)
+                .get(index)
                 .filter(|parent| parent.kind == LayerKind::Folder)
-                .and_then(|_| u16::try_from(parent_index + 1).ok())
+                .and_then(|_| u16::try_from(index + 1).ok())
+        };
+        let parent_folder_id = raw_layer.parent_index.and_then(|parent_index| {
+            match timeline.layers.get(parent_index) {
+                Some(parent) if parent.kind == LayerKind::Mask => {
+                    parent.parent_index.and_then(folder_of)
+                }
+                _ => folder_of(parent_index),
+            }
         });
         let layer_metadata = LayerMetadata {
             kind: raw_layer.kind,
@@ -1085,27 +1400,25 @@ pub(crate) fn shape_assets(
                 (fallback, Some(gradient))
             }
         };
-        let id = allocate_asset_id(next_asset_id)?;
-        project.assets.push(Asset::Vector(VectorAsset {
-            asset_id: id,
-            paths,
-            fill: Some(fallback),
-            stroke: None,
-        }));
-        if let Some(fill_gradient) = gradient {
-            project.asset_appearances.insert(
-                id,
-                VectorAppearance {
-                    material: VectorMaterial::Solid,
-                    erase_mask: Vec::new(),
-                    material_source: Vec::new(),
-                    clip_mask: Vec::new(),
-                    field_transform: Affine::IDENTITY,
-                    fill_gradient: Some(fill_gradient),
-                },
-            );
-        }
-        result.push(id);
+        let appearance = gradient.map(|fill_gradient| VectorAppearance {
+            material: VectorMaterial::Solid,
+            erase_mask: Vec::new(),
+            material_source: Vec::new(),
+            clip_mask: Vec::new(),
+            field_transform: Affine::IDENTITY,
+            fill_gradient: Some(fill_gradient),
+        });
+        result.extend(push_vector(
+            project,
+            next_asset_id,
+            VectorAsset {
+                asset_id: 0,
+                paths,
+                fill: Some(fallback),
+                stroke: None,
+            },
+            appearance,
+        ));
     }
 
     for (style, segments) in stroke_segments {
@@ -1126,16 +1439,423 @@ pub(crate) fn shape_assets(
         if paths.is_empty() {
             continue;
         }
-        let id = allocate_asset_id(next_asset_id)?;
-        project.assets.push(Asset::Vector(VectorAsset {
-            asset_id: id,
-            paths,
-            fill: None,
-            stroke: Some(stroke),
-        }));
-        result.push(id);
+        // A tapered line is drawn as the shape it covers.
+        if let Some(markers) = shape
+            .widths
+            .get(&style)
+            .filter(|markers| markers.len() >= 2)
+        {
+            let outlines = paths
+                .iter()
+                .flat_map(|path| tapered_outline(path, markers, stroke.width))
+                .collect::<Vec<_>>();
+            if !outlines.is_empty() {
+                result.extend(push_vector(
+                    project,
+                    next_asset_id,
+                    VectorAsset {
+                        asset_id: 0,
+                        paths: outlines,
+                        fill: Some(stroke.color),
+                        stroke: None,
+                    },
+                    None,
+                ));
+            }
+            continue;
+        }
+        result.extend(push_vector(
+            project,
+            next_asset_id,
+            VectorAsset {
+                asset_id: 0,
+                paths,
+                fill: None,
+                stroke: Some(stroke),
+            },
+            None,
+        ));
     }
     Ok(result)
+}
+
+/// The area a line along `path` covers when its half widths follow
+/// `markers` (position 0 to 1, left and right shares of `weight`), as
+/// closed outlines: one for an open line, two for a closed one.
+fn tapered_outline(path: &VectorPath, markers: &[[f32; 3]], weight: f32) -> Vec<VectorPath> {
+    let mut points = q0s_format::geom::flatten_path(path, 8);
+    points.dedup_by(|a, b| (a.x - b.x).hypot(a.y - b.y) < 1.0e-4);
+    if path.closed && points.len() > 2 {
+        points.push(points[0]);
+    }
+    if points.len() < 2 {
+        return Vec::new();
+    }
+    let mut lengths = vec![0.0_f32];
+    for pair in points.windows(2) {
+        let step = (pair[1].x - pair[0].x).hypot(pair[1].y - pair[0].y);
+        lengths.push(lengths.last().copied().unwrap_or(0.0) + step);
+    }
+    let total = lengths.last().copied().unwrap_or(0.0).max(1.0e-6);
+    let mut sorted = markers.to_vec();
+    sorted.sort_by(|a, b| a[0].total_cmp(&b[0]));
+    let width_at = |t: f32| -> (f32, f32) {
+        let after = sorted.partition_point(|marker| marker[0] <= t);
+        let (a, b) = match after {
+            0 => (sorted[0], sorted[0]),
+            n if n >= sorted.len() => (sorted[n - 1], sorted[n - 1]),
+            n => (sorted[n - 1], sorted[n]),
+        };
+        let span = (b[0] - a[0]).max(1.0e-6);
+        let k = ((t - a[0]) / span).clamp(0.0, 1.0);
+        (
+            (a[1] + (b[1] - a[1]) * k) * weight,
+            (a[2] + (b[2] - a[2]) * k) * weight,
+        )
+    };
+    let count = points.len();
+    let mut left = Vec::with_capacity(count);
+    let mut right = Vec::with_capacity(count);
+    for index in 0..count {
+        let previous = points[index.saturating_sub(1)];
+        let next = points[(index + 1).min(count - 1)];
+        let (dx, dy) = (next.x - previous.x, next.y - previous.y);
+        let length = dx.hypot(dy).max(1.0e-6);
+        let normal = Vec2::new(-dy / length, dx / length);
+        let (half_left, half_right) = width_at(lengths[index] / total);
+        let point = points[index];
+        left.push(Vec2::new(
+            point.x + normal.x * half_left,
+            point.y + normal.y * half_left,
+        ));
+        right.push(Vec2::new(
+            point.x - normal.x * half_right,
+            point.y - normal.y * half_right,
+        ));
+    }
+    let loop_of = |points: Vec<Vec2>| VectorPath {
+        anchors: points
+            .into_iter()
+            .map(|point| Anchor {
+                point,
+                in_handle: None,
+                out_handle: None,
+            })
+            .collect(),
+        closed: true,
+    };
+    if path.closed {
+        right.reverse();
+        vec![loop_of(left), loop_of(right)]
+    } else {
+        right.reverse();
+        left.extend(right);
+        vec![loop_of(left)]
+    }
+}
+
+thread_local! {
+    /// Drawings imported so far, by a hash of what they hold, as the index
+    /// of their asset in the project. Weapon packs repeat parts across
+    /// hundreds of symbols; sharing them keeps big files within the asset
+    /// id space.
+    static DRAWN: std::cell::RefCell<HashMap<u64, Vec<usize>>> = Default::default();
+    /// Drawings the current import had no asset id left for.
+    static DROPPED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Forgets the drawings of an earlier import.
+pub(crate) fn forget_drawings() {
+    DRAWN.with(|drawn| drawn.borrow_mut().clear());
+    DROPPED.with(|dropped| dropped.set(0));
+}
+
+fn drawing_key(vector: &VectorAsset, appearance: Option<&VectorAppearance>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let point = |value: Vec2, hasher: &mut std::collections::hash_map::DefaultHasher| {
+        value.x.to_bits().hash(hasher);
+        value.y.to_bits().hash(hasher);
+    };
+    for path in &vector.paths {
+        path.closed.hash(&mut hasher);
+        path.anchors.len().hash(&mut hasher);
+        for anchor in &path.anchors {
+            point(anchor.point, &mut hasher);
+            for handle in [anchor.in_handle, anchor.out_handle] {
+                match handle {
+                    Some(handle) => point(handle, &mut hasher),
+                    None => u8::MAX.hash(&mut hasher),
+                }
+            }
+        }
+    }
+    format!("{:?}{:?}{:?}", vector.fill, vector.stroke, appearance).hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Adds `vector`, or reuses an identical drawing already in the project;
+/// returns its asset id, or none once the project has no ids left.
+fn push_vector(
+    project: &mut ProjectV2,
+    next_asset_id: &mut u16,
+    mut vector: VectorAsset,
+    appearance: Option<VectorAppearance>,
+) -> Option<u16> {
+    let key = drawing_key(&vector, appearance.as_ref());
+    let reused = DRAWN.with(|drawn| {
+        drawn.borrow().get(&key).and_then(|indices| {
+            indices
+                .iter()
+                .find_map(|index| match project.assets.get(*index) {
+                    Some(Asset::Vector(existing))
+                        if existing.paths == vector.paths
+                            && existing.fill == vector.fill
+                            && existing.stroke == vector.stroke
+                            && project.asset_appearances.get(&existing.asset_id)
+                                == appearance.as_ref() =>
+                    {
+                        Some(existing.asset_id)
+                    }
+                    _ => None,
+                })
+        })
+    });
+    if let Some(id) = reused {
+        return Some(id);
+    }
+    let id = allocate_asset_id(next_asset_id)?;
+    vector.asset_id = id;
+    let index = project.assets.len();
+    project.assets.push(Asset::Vector(vector));
+    if let Some(appearance) = appearance {
+        project.asset_appearances.insert(id, appearance);
+    }
+    DRAWN.with(|drawn| drawn.borrow_mut().entry(key).or_default().push(index));
+    Some(id)
+}
+
+/// What a shape is drawn with: vector assets for its fills and strokes, and
+/// for each bitmap fill a group that masks the bitmap, tiled when the fill
+/// repeats, with the fill's outline. `bitmap` names the bitmap asset a
+/// bitmap fill uses.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn shape_targets(
+    shape: &RawShape,
+    owner_name: &str,
+    project: &mut ProjectV2,
+    next_asset_id: &mut u16,
+    next_q0rg_id: &mut u16,
+    warnings: &mut Vec<String>,
+    bitmap: &dyn Fn(&RawFillStyle) -> Option<u16>,
+) -> Result<Vec<Target>, ImportError> {
+    if !shape
+        .fills
+        .values()
+        .any(|fill| matches!(fill, RawFillStyle::Bitmap { .. }))
+    {
+        return Ok(
+            shape_assets(shape, owner_name, project, next_asset_id, warnings)?
+                .into_iter()
+                .map(Target::Asset)
+                .collect(),
+        );
+    }
+    let mut targets = Vec::new();
+    let mut styles = shape.fills.keys().copied().collect::<Vec<_>>();
+    styles.sort_unstable();
+    for style in styles {
+        let fill = &shape.fills[&style];
+        let mut isolated = shape.clone();
+        isolated.fills.retain(|id, _| *id == style);
+        isolated.strokes.clear();
+        for edge in &mut isolated.edges {
+            edge.fill0 = edge.fill0.filter(|id| *id == style);
+            edge.fill1 = edge.fill1.filter(|id| *id == style);
+            edge.stroke = None;
+        }
+        let RawFillStyle::Bitmap {
+            transform, tiled, ..
+        } = fill
+        else {
+            targets.extend(
+                shape_assets(&isolated, owner_name, project, next_asset_id, warnings)?
+                    .into_iter()
+                    .map(Target::Asset),
+            );
+            continue;
+        };
+        let Some(bitmap_id) = bitmap(fill) else {
+            warnings.push(format!(
+                "{owner_name}: a bitmap fill's bitmap is missing; the fill was skipped"
+            ));
+            continue;
+        };
+        let Some(bitmap_size) = project.assets.iter().find_map(|asset| match asset {
+            Asset::Bitmap(value) if value.asset_id == bitmap_id => {
+                Some((f32::from(value.width), f32::from(value.height)))
+            }
+            _ => None,
+        }) else {
+            continue;
+        };
+        let texture = Affine::compose(shape.affine, *transform);
+        let Some(single) = affine_to_transform(texture) else {
+            warnings.push(format!(
+                "{owner_name}: degenerate bitmap fill transform was skipped"
+            ));
+            continue;
+        };
+        isolated.fills.insert(
+            style,
+            RawFillStyle::Solid(Rgba {
+                r: 255,
+                g: 255,
+                b: 255,
+                a: 255,
+            }),
+        );
+        let mask_assets = shape_assets(&isolated, owner_name, project, next_asset_id, warnings)?;
+        if mask_assets.is_empty() {
+            continue;
+        }
+        // Tiles over the fill's outline, in bitmap pixels.
+        let mut tiles = (0_i32, 0_i32, 1_i32, 1_i32);
+        if *tiled {
+            if let Some(inverse) = texture.inverse() {
+                let mut bounds = (
+                    f32::INFINITY,
+                    f32::INFINITY,
+                    f32::NEG_INFINITY,
+                    f32::NEG_INFINITY,
+                );
+                for asset in &project.assets {
+                    let Asset::Vector(vector) = asset else {
+                        continue;
+                    };
+                    if !mask_assets.contains(&vector.asset_id) {
+                        continue;
+                    }
+                    for anchor in vector.paths.iter().flat_map(|path| &path.anchors) {
+                        for point in [Some(anchor.point), anchor.in_handle, anchor.out_handle]
+                            .into_iter()
+                            .flatten()
+                        {
+                            let point = inverse.apply(point);
+                            bounds.0 = bounds.0.min(point.x);
+                            bounds.1 = bounds.1.min(point.y);
+                            bounds.2 = bounds.2.max(point.x);
+                            bounds.3 = bounds.3.max(point.y);
+                        }
+                    }
+                }
+                let candidate = (
+                    (bounds.0 / bitmap_size.0).floor() as i32,
+                    (bounds.1 / bitmap_size.1).floor() as i32,
+                    (bounds.2 / bitmap_size.0).ceil() as i32,
+                    (bounds.3 / bitmap_size.1).ceil() as i32,
+                );
+                let count = i64::from(candidate.2 - candidate.0)
+                    .saturating_mul(i64::from(candidate.3 - candidate.1));
+                if (1..=4096).contains(&count) {
+                    tiles = candidate;
+                } else {
+                    warnings.push(format!(
+                        "{owner_name}: a bitmap fill repeats more than 4096 times; it shows once"
+                    ));
+                }
+            }
+        }
+        let id = *next_q0rg_id;
+        *next_q0rg_id = id
+            .checked_add(1)
+            .ok_or_else(|| ImportError::Invalid("bitmap fills exceed q0rg id space".into()))?;
+        let mut content = Layer {
+            layer_id: 1,
+            timeline_frame_count: Some(1),
+            name: "Bitmap".to_string(),
+            explicit_keyframes: vec![0],
+            placements: Vec::new(),
+        };
+        for y in tiles.1..tiles.3 {
+            for x in tiles.0..tiles.2 {
+                let transform = if *tiled {
+                    affine_to_transform(Affine::compose(
+                        texture,
+                        Affine {
+                            tx: x as f32 * bitmap_size.0,
+                            ty: y as f32 * bitmap_size.1,
+                            ..Affine::IDENTITY
+                        },
+                    ))
+                    .unwrap_or(single)
+                } else {
+                    single
+                };
+                content.push_placement(Placement {
+                    pivot: None,
+                    instance_id: 0,
+                    frame: 0,
+                    target: Target::Asset(bitmap_id),
+                    transform,
+                    tween: Tween::None,
+                    fx: PlacementFx::default(),
+                });
+            }
+        }
+        let mut mask = Layer {
+            layer_id: 2,
+            timeline_frame_count: Some(1),
+            name: "Fill boundary".to_string(),
+            explicit_keyframes: vec![0],
+            placements: Vec::new(),
+        };
+        for asset in mask_assets {
+            mask.push_placement(Placement {
+                pivot: None,
+                instance_id: 0,
+                frame: 0,
+                target: Target::Asset(asset),
+                transform: Transform2D::IDENTITY,
+                tween: Tween::None,
+                fx: PlacementFx::default(),
+            });
+        }
+        project.layer_metadata.insert(
+            LayerKey::new(id, 1),
+            LayerMetadata {
+                mask_layer_id: Some(2),
+                ..Default::default()
+            },
+        );
+        project.layer_metadata.insert(
+            LayerKey::new(id, 2),
+            LayerMetadata {
+                kind: LayerKind::Mask,
+                ..Default::default()
+            },
+        );
+        project.q0rgs.push(Q0rg {
+            q0rg_id: id,
+            name: format!("{owner_name} / Bitmap fill {id}"),
+            frame_count: 1,
+            script: String::new(),
+            layers: vec![content, mask],
+        });
+        targets.push(Target::Q0rg(id));
+    }
+    let mut strokes = shape.clone();
+    strokes.fills.clear();
+    for edge in &mut strokes.edges {
+        edge.fill0 = None;
+        edge.fill1 = None;
+    }
+    targets.extend(
+        shape_assets(&strokes, owner_name, project, next_asset_id, warnings)?
+            .into_iter()
+            .map(Target::Asset),
+    );
+    Ok(targets)
 }
 
 /// Add the smallest practical perpendicular basis needed to make a collapsed
@@ -1259,32 +1979,43 @@ pub(crate) fn text_asset(
         return Ok(None);
     }
     let mut replacement = None;
+    // A text that cannot be drawn is left out with a warning; it never
+    // stops the rest of the file from importing.
     let paths = match text_paths(text) {
         Ok(paths) => paths,
         Err(error) => {
-            let fallback = crate::fonts::default_name().ok_or_else(|| {
-                ImportError::Invalid(format!(
-                    "{owner_name}: {error}; no outline font is available for replacement"
-                ))
-            })?;
+            let Some(fallback) = crate::fonts::default_name() else {
+                warnings.push(format!(
+                    "{owner_name}: {error}; no outline font is installed, so the text was left out"
+                ));
+                return Ok(None);
+            };
             let mut source = text.clone();
             source.font = fallback.to_string();
-            let paths = text_paths(&source).map_err(|fallback_error| {
-                ImportError::Invalid(format!(
-                    "{owner_name}: {error}; fallback failed: {fallback_error}"
-                ))
-            })?;
-            warnings.push(format!(
-                "{owner_name}: {error}; text preserved using '{fallback}' pending font replacement"
-            ));
-            replacement = Some(fallback.to_string());
-            paths
+            match text_paths(&source) {
+                Ok(paths) => {
+                    warnings.push(format!(
+                        "{owner_name}: {error}; text preserved using '{fallback}' pending font replacement"
+                    ));
+                    replacement = Some(fallback.to_string());
+                    paths
+                }
+                Err(fallback_error) => {
+                    warnings.push(format!(
+                        "{owner_name}: {error}; {fallback_error}; the text {:?} was left out",
+                        text.text
+                    ));
+                    return Ok(None);
+                }
+            }
         }
     };
     if paths.is_empty() {
         return Ok(None);
     }
-    let id = allocate_asset_id(next_asset_id)?;
+    let Some(id) = allocate_asset_id(next_asset_id) else {
+        return Ok(None);
+    };
     project.assets.push(Asset::Vector(VectorAsset {
         asset_id: id,
         paths,
@@ -1327,15 +2058,21 @@ pub(crate) fn text_paths(text: &RawText) -> Result<Vec<VectorPath>, String> {
     Ok(paths)
 }
 
-fn allocate_asset_id(next_asset_id: &mut u16) -> Result<u16, ImportError> {
+/// The next free asset id, or none once all 65535 are taken; the drawings
+/// that then find no id are counted for the import's report.
+fn allocate_asset_id(next_asset_id: &mut u16) -> Option<u16> {
     if *next_asset_id == 0 {
-        return Err(ImportError::Invalid(
-            "fla contains too many vector assets".to_string(),
-        ));
+        DROPPED.with(|dropped| dropped.set(dropped.get() + 1));
+        return None;
     }
     let id = *next_asset_id;
     *next_asset_id = next_asset_id.checked_add(1).unwrap_or(0);
-    Ok(id)
+    Some(id)
+}
+
+/// How many drawings of the current import found no asset id.
+pub(crate) fn dropped_drawings() -> usize {
+    DROPPED.with(std::cell::Cell::get)
 }
 
 fn parse_timeline(xml: &[u8], symbol_document: bool) -> Result<Option<RawTimeline>, ImportError> {
@@ -1421,10 +2158,7 @@ fn parse_timeline_index(
                         read_frame_ease(&reader, &element, frame, &mut unsupported)?;
                     }
                 } else if current_frame.is_some() && name == b"DOMGroup" {
-                    groups.push(GroupState {
-                        depth,
-                        affine: Affine::IDENTITY,
-                    });
+                    groups.push(GroupState { depth });
                 } else if current_frame.is_some()
                     && name == b"DOMSymbolInstance"
                     && instance.is_none()
@@ -1442,16 +2176,14 @@ fn parse_timeline_index(
                         instance: raw_bitmap_instance(&reader, &element)?,
                     });
                 } else if current_frame.is_some() && name == b"DOMShape" && shape.is_none() {
-                    shape = Some(ShapeState {
-                        depth,
-                        affine: Affine::IDENTITY,
-                        fills: HashMap::new(),
-                        strokes: HashMap::new(),
-                        edges: Vec::new(),
-                        fill_style: None,
-                        stroke_style: None,
-                        gradient: None,
-                    });
+                    shape = Some(ShapeState::new(depth));
+                } else if current_frame.is_some()
+                    && matches!(name, b"DOMRectangleObject" | b"DOMOvalObject")
+                    && shape.is_none()
+                {
+                    let mut state = ShapeState::new(depth);
+                    state.primitive = Some(Primitive::read(&reader, &element)?);
+                    shape = Some(state);
                 } else if current_frame.is_some() && name == b"DOMStaticText" && text.is_none() {
                     let offset = Vec2::new(
                         parse_f32_attr(&reader, &element, b"left", 0.0)?,
@@ -1527,8 +2259,7 @@ fn parse_timeline_index(
                     && name == b"DOMSymbolInstance"
                     && instance.is_none()
                 {
-                    let mut raw = raw_instance(&reader, &element)?;
-                    raw.affine = Affine::compose(group_affine(&groups), raw.affine);
+                    let raw = raw_instance(&reader, &element)?;
                     if let Some((_, frame)) = current_frame.as_mut() {
                         frame.elements.push(RawElement::Symbol(raw));
                     }
@@ -1536,8 +2267,7 @@ fn parse_timeline_index(
                     && name == b"DOMBitmapInstance"
                     && bitmap.is_none()
                 {
-                    let mut raw = raw_bitmap_instance(&reader, &element)?;
-                    raw.affine = Affine::compose(group_affine(&groups), raw.affine);
+                    let raw = raw_bitmap_instance(&reader, &element)?;
                     if let Some((_, frame)) = current_frame.as_mut() {
                         frame.elements.push(RawElement::Bitmap(raw));
                     }
@@ -1583,11 +2313,24 @@ fn parse_timeline_index(
                                 amount: amount.clamp(0.0, 1.0),
                             });
                         }
-                        if attr(&reader, &element, b"brightness")?.is_some() {
-                            unsupported.insert(
-                                "symbol brightness color transforms are not imported yet"
-                                    .to_string(),
-                            );
+                        if let Some(brightness) = attr(&reader, &element, b"brightness")? {
+                            let brightness = brightness.parse::<f32>().map_err(|_| {
+                                ImportError::Invalid(format!("invalid brightness '{brightness}'"))
+                            })?;
+                            // Brightness blends toward white when above zero
+                            // and toward black below it, exactly like a tint.
+                            if brightness.is_finite() && brightness != 0.0 {
+                                let level = if brightness > 0.0 { 255 } else { 0 };
+                                state.instance.tint = Some(q0s_format::v2::TintFx {
+                                    color: Rgba {
+                                        r: level,
+                                        g: level,
+                                        b: level,
+                                        a: 255,
+                                    },
+                                    amount: brightness.abs().clamp(0.0, 1.0),
+                                });
+                            }
                         }
                     }
                 } else if name == b"DOMTextAttrs" {
@@ -1598,7 +2341,17 @@ fn parse_timeline_index(
                     }
                 } else if name == b"Matrix" {
                     let matrix = parse_matrix(&reader, &element)?;
-                    if let Some(gradient) = shape.as_mut().and_then(|state| state.gradient.as_mut())
+                    if let Some(fill) = shape.as_mut().and_then(|state| state.bitmap.as_mut()) {
+                        // Bitmap fill bases map bitmap pixels to twips.
+                        fill.matrix = Affine {
+                            a11: matrix.a11 / 20.0,
+                            a12: matrix.a12 / 20.0,
+                            a21: matrix.a21 / 20.0,
+                            a22: matrix.a22 / 20.0,
+                            ..matrix
+                        };
+                    } else if let Some(gradient) =
+                        shape.as_mut().and_then(|state| state.gradient.as_mut())
                     {
                         gradient.matrix = matrix;
                     } else if let Some(state) = instance.as_mut() {
@@ -1609,8 +2362,6 @@ fn parse_timeline_index(
                         state.affine = matrix;
                     } else if let Some(state) = text.as_mut() {
                         state.affine = matrix;
-                    } else if let Some(group) = groups.last_mut() {
-                        group.affine = matrix;
                     }
                 }
                 handle_shape_empty(&reader, &element, &mut shape, &mut unsupported)?;
@@ -1674,8 +2425,7 @@ fn parse_timeline_index(
                 } else if name == b"DOMStaticText"
                     && text.as_ref().is_some_and(|state| state.depth == depth)
                 {
-                    if let Some(mut state) = text.take() {
-                        state.affine = Affine::compose(group_affine(&groups), state.affine);
+                    if let Some(state) = text.take() {
                         if let Some((_, frame)) = current_frame.as_mut() {
                             frame.elements.push(RawElement::Text(RawText {
                                 affine: state.affine,
@@ -1690,9 +2440,7 @@ fn parse_timeline_index(
                 } else if name == b"DOMSymbolInstance"
                     && instance.as_ref().is_some_and(|state| state.depth == depth)
                 {
-                    if let Some(mut state) = instance.take() {
-                        state.instance.affine =
-                            Affine::compose(group_affine(&groups), state.instance.affine);
+                    if let Some(state) = instance.take() {
                         if let Some((_, frame)) = current_frame.as_mut() {
                             frame.elements.push(RawElement::Symbol(state.instance));
                         }
@@ -1700,24 +2448,49 @@ fn parse_timeline_index(
                 } else if name == b"DOMBitmapInstance"
                     && bitmap.as_ref().is_some_and(|state| state.depth == depth)
                 {
-                    if let Some(mut state) = bitmap.take() {
-                        state.instance.affine =
-                            Affine::compose(group_affine(&groups), state.instance.affine);
+                    if let Some(state) = bitmap.take() {
                         if let Some((_, frame)) = current_frame.as_mut() {
                             frame.elements.push(RawElement::Bitmap(state.instance));
                         }
                     }
-                } else if name == b"DOMShape"
+                } else if matches!(name, b"DOMShape" | b"DOMRectangleObject" | b"DOMOvalObject")
                     && shape.as_ref().is_some_and(|state| state.depth == depth)
                 {
                     if let Some(mut state) = shape.take() {
-                        state.affine = Affine::compose(group_affine(&groups), state.affine);
+                        if let Some(primitive) = state.primitive {
+                            let stroke = state.strokes.contains_key(&1).then_some(1);
+                            let fill = state.fills.contains_key(&1).then_some(1);
+                            for points in primitive.loops() {
+                                let mut segments = points
+                                    .windows(2)
+                                    .map(|pair| Segment {
+                                        start: pair[0],
+                                        end: pair[1],
+                                        control: None,
+                                    })
+                                    .collect::<Vec<_>>();
+                                if let (Some(first), Some(last)) = (points.first(), points.last()) {
+                                    segments.push(Segment {
+                                        start: *last,
+                                        end: *first,
+                                        control: None,
+                                    });
+                                }
+                                state.edges.push(RawEdge {
+                                    fill0: None,
+                                    fill1: fill,
+                                    stroke,
+                                    segments,
+                                });
+                            }
+                        }
                         if let Some((_, frame)) = current_frame.as_mut() {
                             frame.elements.push(RawElement::Shape(RawShape {
                                 affine: state.affine,
                                 fills: state.fills,
                                 strokes: state.strokes,
                                 edges: state.edges,
+                                widths: state.widths,
                             }));
                         }
                     }
@@ -1818,12 +2591,6 @@ fn note_unsupported_frame_element(
     }
 }
 
-fn group_affine(groups: &[GroupState]) -> Affine {
-    groups.iter().fold(Affine::IDENTITY, |parent, group| {
-        Affine::compose(parent, group.affine)
-    })
-}
-
 fn raw_layer(
     reader: &Reader<&[u8]>,
     element: &BytesStart<'_>,
@@ -1847,10 +2614,11 @@ fn raw_layer(
                 .map_err(|_| ImportError::Invalid(format!("invalid parentLayerIndex '{value}'")))
         })
         .transpose()?;
+    // Guide layers are for the animator only and never show in a movie.
     let hidden = matches!(
         attr(reader, element, b"visible")?.as_deref(),
         Some("false") | Some("0")
-    );
+    ) || layer_type.eq_ignore_ascii_case("guide");
     let locked = matches!(
         attr(reader, element, b"locked")?.as_deref(),
         Some("true") | Some("1")
@@ -1951,6 +2719,9 @@ fn parse_bitmap_media(xml: &[u8]) -> Result<Vec<RawBitmapMedia>, ImportError> {
 }
 
 pub(crate) fn decode_lossless_bitmap_dat(bytes: &[u8]) -> Result<(u16, u16, Vec<u8>), ImportError> {
+    if bytes.starts_with(&[0xFF, 0xD8]) {
+        return decode_jpeg(bytes);
+    }
     if bytes.len() < 28 {
         return Err(ImportError::Unsupported(
             "bitmap .dat header is truncated".to_string(),
@@ -2086,6 +2857,55 @@ pub(crate) fn decode_lossless_bitmap_dat(bytes: &[u8]) -> Result<(u16, u16, Vec<
     }
     Ok((width, height, rgba))
 }
+/// A JPEG bitmap, which Animate keeps in `bin/` exactly as imported.
+fn decode_jpeg(bytes: &[u8]) -> Result<(u16, u16, Vec<u8>), ImportError> {
+    let mut decoder = jpeg_decoder::Decoder::new(bytes);
+    let pixels = decoder
+        .decode()
+        .map_err(|error| ImportError::Unsupported(format!("jpeg bitmap: {error}")))?;
+    let info = decoder
+        .info()
+        .ok_or_else(|| ImportError::Unsupported("jpeg bitmap without a header".into()))?;
+    let (width, height) = (info.width, info.height);
+    let count = usize::from(width) * usize::from(height);
+    let mut rgba = Vec::with_capacity(count * 4);
+    match info.pixel_format {
+        jpeg_decoder::PixelFormat::RGB24 => {
+            for pixel in pixels.chunks_exact(3).take(count) {
+                rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
+            }
+        }
+        jpeg_decoder::PixelFormat::L8 => {
+            for value in pixels.iter().take(count) {
+                rgba.extend_from_slice(&[*value, *value, *value, 255]);
+            }
+        }
+        jpeg_decoder::PixelFormat::L16 => {
+            for value in pixels.chunks_exact(2).take(count) {
+                rgba.extend_from_slice(&[value[0], value[0], value[0], 255]);
+            }
+        }
+        jpeg_decoder::PixelFormat::CMYK32 => {
+            for pixel in pixels.chunks_exact(4).take(count) {
+                let k = u16::from(255 - pixel[3]);
+                let channel = |value: u8| ((u16::from(255 - value) * k) / 255) as u8;
+                rgba.extend_from_slice(&[
+                    channel(pixel[0]),
+                    channel(pixel[1]),
+                    channel(pixel[2]),
+                    255,
+                ]);
+            }
+        }
+    }
+    if width == 0 || height == 0 || rgba.len() != count * 4 {
+        return Err(ImportError::Unsupported(
+            "jpeg bitmap is empty or truncated".into(),
+        ));
+    }
+    Ok((width, height, rgba))
+}
+
 fn raw_instance(
     reader: &Reader<&[u8]>,
     element: &BytesStart<'_>,
@@ -2096,7 +2916,12 @@ fn raw_instance(
     let loop_mode = attr(reader, element, b"loop")?
         .unwrap_or_else(|| "loop".to_string())
         .to_ascii_lowercase();
+    // A button shows its up state, its first frame, until the pointer
+    // reaches it; over, down and hit must not play as an animation.
+    let button = attr(reader, element, b"symbolType")?
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("button"));
     let mode = match loop_mode.as_str() {
+        _ if button => Q0rgPlaybackMode::SingleFrame,
         "single frame" | "singleframe" => Q0rgPlaybackMode::SingleFrame,
         "play once" | "playonce" => Q0rgPlaybackMode::PlayOnce,
         "loop reverse" | "loop reversed" | "reverse loop" => Q0rgPlaybackMode::LoopReversed,
@@ -2343,6 +3168,7 @@ fn handle_shape_start(
                 },
                 width: 1.0,
                 cap: CapShape::Round,
+                join: q0s_format::geom::JoinShape::Round,
             });
         }
         b"SolidStroke" => apply_solid_stroke(reader, element, shape)?,
@@ -2363,7 +3189,37 @@ fn handle_shape_start(
             }
         }
         b"BitmapFill" => {
-            unsupported.insert("bitmap fills are not imported yet".to_string());
+            if let Some((_, style_index)) = shape.fill_style {
+                shape.bitmap = Some(BitmapFillState {
+                    depth,
+                    style_index,
+                    name: attr(reader, element, b"bitmapPath")?.unwrap_or_default(),
+                    tiled: attr(reader, element, b"bitmapIsClipped")?.as_deref() != Some("true"),
+                    matrix: Affine::IDENTITY,
+                });
+            } else {
+                unsupported
+                    .insert("bitmap fills outside a fill style are not imported".to_string());
+            }
+        }
+        // A primitive's own paint: `<fill>` directly, and `<stroke>` whose
+        // `<fill>` colours the line.
+        b"fill" if shape.primitive.is_some() && shape.stroke_style.is_none() => {
+            shape.fill_style = Some((depth, 1));
+        }
+        b"stroke" if shape.primitive.is_some() => {
+            shape.stroke_style = Some((depth, 1));
+            shape.strokes.entry(1).or_insert(Stroke {
+                color: Rgba {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 255,
+                },
+                width: 1.0,
+                cap: CapShape::Round,
+                join: q0s_format::geom::JoinShape::Round,
+            });
         }
         _ => {}
     }
@@ -2383,6 +3239,18 @@ fn handle_shape_empty(
         b"SolidStroke" => apply_solid_stroke(reader, element, shape)?,
         b"SolidColor" => apply_solid_color(reader, element, shape)?,
         b"GradientEntry" => apply_gradient_entry(reader, element, shape)?,
+        b"WidthMarker" => {
+            if let Some((_, index)) = shape.stroke_style {
+                let marker = [
+                    parse_f32_attr(reader, element, b"position", 0.0)?.clamp(0.0, 1.0),
+                    parse_f32_attr(reader, element, b"left", 0.5)?.abs(),
+                    parse_f32_attr(reader, element, b"right", 0.5)?.abs(),
+                ];
+                if marker.iter().all(|value| value.is_finite()) {
+                    shape.widths.entry(index).or_default().push(marker);
+                }
+            }
+        }
         b"Edge" => {
             let fill0 = optional_u16_attr(reader, element, b"fillStyle0")?;
             let fill1 = optional_u16_attr(reader, element, b"fillStyle1")?;
@@ -2396,7 +3264,21 @@ fn handle_shape_empty(
             });
         }
         b"BitmapFill" => {
-            unsupported.insert("bitmap fills are not imported yet".to_string());
+            if let Some((_, style_index)) = shape.fill_style {
+                shape.fills.insert(
+                    style_index,
+                    RawFillStyle::Bitmap {
+                        reference: 0,
+                        name: attr(reader, element, b"bitmapPath")?,
+                        transform: Affine::IDENTITY,
+                        tiled: attr(reader, element, b"bitmapIsClipped")?.as_deref()
+                            != Some("true"),
+                    },
+                );
+            } else {
+                unsupported
+                    .insert("bitmap fills outside a fill style are not imported".to_string());
+            }
         }
         _ => {}
     }
@@ -2441,10 +3323,30 @@ fn handle_shape_end(name: &[u8], depth: usize, shape: &mut Option<ShapeState>) {
             }
         }
     }
-    if name == b"FillStyle" && shape.fill_style.is_some_and(|(d, _)| d == depth) {
+    if name == b"BitmapFill"
+        && shape
+            .bitmap
+            .as_ref()
+            .is_some_and(|fill| fill.depth == depth)
+    {
+        if let Some(fill) = shape.bitmap.take() {
+            shape.fills.insert(
+                fill.style_index,
+                RawFillStyle::Bitmap {
+                    reference: 0,
+                    name: Some(fill.name),
+                    transform: fill.matrix,
+                    tiled: fill.tiled,
+                },
+            );
+        }
+    }
+    if matches!(name, b"FillStyle" | b"fill") && shape.fill_style.is_some_and(|(d, _)| d == depth) {
         shape.fill_style = None;
     }
-    if name == b"StrokeStyle" && shape.stroke_style.is_some_and(|(d, _)| d == depth) {
+    if matches!(name, b"StrokeStyle" | b"stroke")
+        && shape.stroke_style.is_some_and(|(d, _)| d == depth)
+    {
         shape.stroke_style = None;
     }
 }
@@ -2513,6 +3415,7 @@ fn apply_solid_color(
                 color,
                 width: 1.0,
                 cap: CapShape::Round,
+                join: q0s_format::geom::JoinShape::Round,
             })
             .color = color;
     } else if let Some((_, index)) = shape.fill_style {
@@ -2539,8 +3442,15 @@ fn apply_solid_stroke(
         .unwrap_or(1.0)
         .max(0.01);
     let cap = match attr(reader, element, b"caps")?.as_deref() {
-        Some("none") | Some("square") => CapShape::Butt,
+        Some("none") => CapShape::Butt,
+        Some("square") => CapShape::Square,
         _ => CapShape::Round,
+    };
+    // Animate rounds corners unless told otherwise.
+    let join = match attr(reader, element, b"joints")?.as_deref() {
+        Some("miter") => q0s_format::geom::JoinShape::Miter,
+        Some("bevel") => q0s_format::geom::JoinShape::Bevel,
+        _ => q0s_format::geom::JoinShape::Round,
     };
     let stroke = shape.strokes.entry(index).or_insert(Stroke {
         color: Rgba {
@@ -2551,9 +3461,11 @@ fn apply_solid_stroke(
         },
         width,
         cap,
+        join,
     });
     stroke.width = width;
     stroke.cap = cap;
+    stroke.join = join;
     Ok(())
 }
 

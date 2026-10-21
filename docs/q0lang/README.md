@@ -1,12 +1,12 @@
 # q0lang
 
-q0lang связывает код с анимацией q0s: вычисляет значения, вызывает функции, управляет кадрами, экземплярами и ригами. один компилятор и виртуальная машина используются редактором, плеером и терминальной программой q0shell.
+q0lang ties code to q0s animation: it computes values, calls functions, and drives frames, named instances, rigs, live physics, particles and lights. One compiler and one virtual machine (qvm) serve q0editor, q0player and the q0shell terminal host.
 
-этот справочник описывает реализацию в текущем репозитории. доступность команд зависит от программы, которая запускает скрипт: файловые команды работают в q0shell, перемещение экземпляров работает в q0player.
+This reference describes what the current repository implements. What a command does depends on the program running the script: file commands work in q0shell, moving instances and live physics work in q0player.
 
-## быстрый старт
+## quick start
 
-сохрани следующий текст как `hello.q0lang` или `hello.q0l`. оба расширения обозначают обычный текст utf-8.
+Save this as `hello.q0lang` or `hello.q0l`; both extensions mean the same plain UTF-8 text. The same file is in [examples/hello.q0lang](examples/hello.q0lang).
 
 ```q0lang
 import q0.math
@@ -19,39 +19,33 @@ pb func ease_out t {
 for i in range(5) {
   progress = i / 4
   x = lerp(0, 100, ease_out(progress))
-  q0shell.print! "шаг", i, "x =", x
+  q0shell.print! "step", i, "x =", x
 }
 ```
 
-запусти из корня репозитория:
+Run it from the repository root:
 
 ```powershell
-cargo run -p q0shell -- hello.q0lang
+cargo run -p q0shell -- docs/q0lang/examples/hello.q0lang
 ```
 
-готовый такой же пример лежит в [examples/basic.q0lang](examples/basic.q0lang):
-
-```powershell
-cargo run -p q0shell -- docs/q0lang/examples/basic.q0lang
-```
-
-результат:
+Output:
 
 ```text
-шаг 0 x = 0
-шаг 1 x = 57.8125
-шаг 2 x = 87.5
-шаг 3 x = 98.4375
-шаг 4 x = 100
+step 0 x = 0
+step 1 x = 57.8125
+step 2 x = 87.5
+step 3 x = 98.4375
+step 4 x = 100
 ```
 
-`pb func` определяет функцию, `return` возвращает результат, `for` проходит значения от нуля до четырёх. у обычного вызова функции используются скобки. у команды с `!` аргументы идут после пробела и разделяются запятыми.
+`pb func` defines a function, `return` hands back its result, and `for` walks the numbers from zero to four. Calling a function uses parentheses. A command ending in `!` takes its arguments after a space, separated by commas.
 
-## код в анимации
+## code in an animation
 
-общий скрипт q0rg подходит для начальных значений и функций. код отдельного кадра запускается при входе в кадр. отдельные `.q0l` / `.q0lang` файлы подключаются через граф проекта; для плеера их нужно включить в bundled-экспорт.
+A q0rg's general script suits starting values and functions; it runs once when the timeline starts. Frame code runs every time playback enters that frame. Standalone `.q0l` / `.q0lang` files join through the project graph; for q0player they have to be part of a bundled export. A symbol (q0rg) placed on the stage that has code of its own gets its own runtime per placed copy, see [object scripts](hosts.md).
 
-в общий скрипт q0rg можно поместить:
+Put this in a q0rg's general script:
 
 ```q0lang
 import q0.timeline
@@ -63,24 +57,24 @@ pb func start_frame {
 gostop! start_frame()
 ```
 
-плеер перейдёт на кадр с индексом `12` и остановится; в короткой анимации индекс ограничится последним кадром. индексы в коде начинаются с **нуля**, хотя редактор показывает номера с единицы. не ставь безусловный `gostop! 12` в код самого кадра `12`: переход снова запускает его код.
+The player jumps to the frame with index `12` and stops; in a shorter animation the index is clamped to the last frame. Frame indices in code start at **zero**, while the editor numbers frames from one. Do not put an unconditional `gostop! 12` into the code of frame `12` itself: the jump runs that frame's code again.
 
-## справочник
+## reference
 
-| страница | содержание |
+| page | contents |
 | --- | --- |
-| [синтаксис и типы](syntax.md) | значения, операции, условия, циклы, функции, области видимости |
-| [встроенные библиотеки](builtins.md) | все импорты, математические функции и команды |
-| [анимация и host api](hosts.md) | кадры, клавиатура, экземпляры, риги, сцены, доступность |
-| [события](events.md) | подписки и текущие границы поддержки |
-| [q0shell](q0shell.md) | запуск файлов, параметры командной строки, файловые команды |
-| [runtime и qvm](runtime.md) | порядок выполнения, состояние, диагностика, лимиты, байткод |
-| [рецепты](examples.md) | математика анимации, управление игроком, организация скриптов |
+| [syntax and types](syntax.md) | values, operators, conditions, loops, functions, scope |
+| [built-in libraries](builtins.md) | every import, the math functions and all commands |
+| [animation and host api](hosts.md) | frames, keyboard, instances, object scripts, rigs, scenes, physics, particles, lights |
+| [events](events.md) | mouse subscriptions and how q0player delivers them |
+| [q0shell](q0shell.md) | running files, command-line options, file commands |
+| [runtime and qvm](runtime.md) | execution order, state, diagnostics, limits, bytecode |
+| [recipes](examples.md) | animation math, player movement, physics, particles and lights from code |
 
-готовые исходники лежат в [examples](examples). `q0s-format/tests/q0lang_docs.rs` проверяет разбор и компиляцию примеров актуального справочника и выполняет самостоятельные примеры с проверкой результата.
+Ready-made sources are in [examples](examples). `q0s-format/tests/q0lang_docs.rs` checks that every example in this reference compiles without a diagnostic and that the quick start prints what it shows above.
 
-массивов, объектов, классов, замыканий, исключений, асинхронных функций и пользовательских модулей через `import` пока нет. имена вида `player.x` являются общими именами host api, а не полями обычного объекта. именные метки кадров и автоматический вызов обработчиков мыши ещё не подключены.
+There are no arrays, objects, classes, closures, exceptions, async functions or user modules through `import` yet. Names like `player.x` are shared host api names, not fields of an object. Named frame labels do not resolve yet.
 
-[qvm_plan.md](qvm_plan.md) и [q0lang_overhaul_plan.md](q0lang_overhaul_plan.md) сохраняют историю проектирования; их планы не заменяют текущий справочник.
+[qvm_plan.md](qvm_plan.md) and [q0lang_overhaul_plan.md](q0lang_overhaul_plan.md) keep the design history; their plans do not replace this reference.
 
-источники: [parser](../../q0s-format/src/q0lang/parser.rs), [compiler](../../q0s-format/src/q0lang/compiler.rs), [runtime](../../q0s-format/src/q0lang/runtime.rs), [qvm](../../q0vm/src/lib.rs), [player](../../q0player/src/lib.rs), [editor](../../q0editor/src/app.rs), [shell](../../q0shell/src/lib.rs).
+Sources: [parser](../../q0s-format/src/q0lang/parser.rs), [compiler](../../q0s-format/src/q0lang/compiler.rs), [runtime](../../q0s-format/src/q0lang/runtime.rs), [qvm](../../q0vm/src/lib.rs), [player](../../q0player/src/lib.rs), [object scripts](../../q0player/src/objects.rs), [editor](../../q0editor/src/app.rs), [shell](../../q0shell/src/lib.rs).

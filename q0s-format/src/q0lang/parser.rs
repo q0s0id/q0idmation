@@ -41,6 +41,18 @@ pub enum Statement {
         command: String,
         args: Vec<Value>,
     },
+    PhysicsCommand {
+        command: String,
+        args: Vec<Value>,
+    },
+    ParticlesCommand {
+        command: String,
+        args: Vec<Value>,
+    },
+    LightCommand {
+        command: String,
+        args: Vec<Value>,
+    },
     Listen {
         event: String,
         handler: String,
@@ -259,6 +271,42 @@ pub const BUILTIN_LIBRARIES: &[BuiltinLibrary] = &[
         ],
     },
     BuiltinLibrary {
+        name: "q0.physics",
+        symbols: &[
+            "q0physics.start!",
+            "q0physics.pause!",
+            "q0physics.reset!",
+            "q0physics.push!",
+            "q0physics.velocity!",
+            "q0physics.spin!",
+            "q0physics.teleport!",
+            "q0physics.gravity!",
+            "q0physics.cut!",
+        ],
+    },
+    BuiltinLibrary {
+        name: "q0.particles",
+        symbols: &[
+            "q0particles.start!",
+            "q0particles.stop!",
+            "q0particles.burst!",
+            "q0particles.move!",
+            "q0particles.clear!",
+        ],
+    },
+    BuiltinLibrary {
+        name: "q0.light",
+        symbols: &[
+            "q0light.on!",
+            "q0light.off!",
+            "q0light.move!",
+            "q0light.color!",
+            "q0light.brightness!",
+            "q0light.size!",
+            "q0light.darkness!",
+        ],
+    },
+    BuiltinLibrary {
         name: "q0.core",
         symbols: &[
             "do!", "listen", "xlisten", "pb", "pr", "func", "if", "else", "while", "return",
@@ -276,6 +324,9 @@ enum HostCommandKind {
     Shell,
     Rig,
     Scene,
+    Physics,
+    Particles,
+    Light,
 }
 
 struct Parser<'a> {
@@ -413,6 +464,15 @@ impl<'a> Parser<'a> {
             _ if first.starts_with("q0scene.") && first.ends_with('!') => {
                 self.parse_host_command(line_no, &line, first, HostCommandKind::Scene)
             }
+            _ if first.starts_with("q0physics.") && first.ends_with('!') => {
+                self.parse_host_command(line_no, &line, first, HostCommandKind::Physics)
+            }
+            _ if first.starts_with("q0light.") && first.ends_with('!') => {
+                self.parse_host_command(line_no, &line, first, HostCommandKind::Light)
+            }
+            _ if first.starts_with("q0particles.") && first.ends_with('!') => {
+                self.parse_host_command(line_no, &line, first, HostCommandKind::Particles)
+            }
             _ if find_assignment_operator(&line).is_some() => self.parse_assignment(line_no, &line),
             _ if first.ends_with('!') => Some(Statement::Unknown { text: line }),
             _ => {
@@ -522,6 +582,9 @@ impl<'a> Parser<'a> {
             HostCommandKind::Shell => "q0shell.",
             HostCommandKind::Rig => "q0rig.",
             HostCommandKind::Scene => "q0scene.",
+            HostCommandKind::Physics => "q0physics.",
+            HostCommandKind::Particles => "q0particles.",
+            HostCommandKind::Light => "q0light.",
         };
         let command = first
             .trim_start_matches(prefix)
@@ -540,6 +603,9 @@ impl<'a> Parser<'a> {
             HostCommandKind::Shell => Statement::ShellCommand { command, args },
             HostCommandKind::Rig => Statement::RigCommand { command, args },
             HostCommandKind::Scene => Statement::SceneCommand { command, args },
+            HostCommandKind::Physics => Statement::PhysicsCommand { command, args },
+            HostCommandKind::Particles => Statement::ParticlesCommand { command, args },
+            HostCommandKind::Light => Statement::LightCommand { command, args },
         })
     }
 
@@ -1471,6 +1537,83 @@ q0shell.move! 'out.txt', 'done.txt'
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn physics_and_particle_commands_reach_the_host() {
+        let mut runtime = crate::q0lang::runtime::Runtime::new();
+        let report = runtime.execute_source(
+            "import q0.physics\nimport q0.particles\nq0physics.start!\nq0physics.push! \"ball\", 10, -20 * 2\nq0physics.gravity! 0, 300\nq0particles.burst! \"sparks\", 12\nq0particles.move! \"sparks\", 40, 50\n",
+        );
+        assert_eq!(report.diagnostics, Vec::new());
+        use crate::q0lang::runtime::{ParticlesCommand, PhysicsCommand, RuntimeAction};
+        assert_eq!(
+            report.actions,
+            vec![
+                RuntimeAction::Physics(PhysicsCommand::Start),
+                RuntimeAction::Physics(PhysicsCommand::Push {
+                    body: "ball".into(),
+                    x: 10.0,
+                    y: -40.0
+                }),
+                RuntimeAction::Physics(PhysicsCommand::Gravity { x: 0.0, y: 300.0 }),
+                RuntimeAction::Particles(ParticlesCommand::Burst {
+                    emitter: "sparks".into(),
+                    count: 12.0
+                }),
+                RuntimeAction::Particles(ParticlesCommand::Move {
+                    emitter: "sparks".into(),
+                    x: 40.0,
+                    y: 50.0
+                }),
+            ]
+        );
+        let report =
+            runtime.execute_source("q0physics.push! \"ball\"\nq0particles.explode! \"x\"\n");
+        assert_eq!(report.actions, Vec::new());
+        assert_eq!(report.diagnostics.len(), 2, "{:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn light_commands_reach_the_host() {
+        let mut runtime = crate::q0lang::runtime::Runtime::new();
+        let report = runtime.execute_source(
+            "import q0.light
+q0light.off! \"lamp\"
+q0light.color! \"lamp\", 255, 120, 40
+q0light.move! \"lamp\", 10, 20
+q0light.darkness! 0.5
+",
+        );
+        assert_eq!(report.diagnostics, Vec::new());
+        use crate::q0lang::runtime::{LightCommand, RuntimeAction};
+        assert_eq!(
+            report.actions,
+            vec![
+                RuntimeAction::Light(LightCommand::Off {
+                    light: "lamp".into()
+                }),
+                RuntimeAction::Light(LightCommand::Color {
+                    light: "lamp".into(),
+                    r: 255.0,
+                    g: 120.0,
+                    b: 40.0
+                }),
+                RuntimeAction::Light(LightCommand::Move {
+                    light: "lamp".into(),
+                    x: 10.0,
+                    y: 20.0
+                }),
+                RuntimeAction::Light(LightCommand::Darkness { value: 0.5 }),
+            ]
+        );
+        let report = runtime.execute_source(
+            "q0light.size! \"lamp\"
+q0light.dance! \"lamp\"
+",
+        );
+        assert_eq!(report.actions, Vec::new());
+        assert_eq!(report.diagnostics.len(), 2, "{:?}", report.diagnostics);
     }
 
     #[test]

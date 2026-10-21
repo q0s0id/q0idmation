@@ -36,6 +36,7 @@ fn sample_project(frames: u16) -> ProjectV2 {
         }));
         for (frame, shift) in [(0, 0.0), (frames - 1, 65.0)] {
             scene.layers[0].placements.push(Placement {
+                pivot: None,
                 instance_id: u32::from(i + 1),
                 frame,
                 target: Target::Asset(i + 1),

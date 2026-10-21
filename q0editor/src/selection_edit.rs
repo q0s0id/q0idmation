@@ -577,6 +577,7 @@ pub fn paste_payload_with_depth(
         };
         let placement_idx = layer.placements.len();
         layer.push_placement(Placement {
+            pivot: None,
             instance_id: 0,
             frame,
             target: Target::Asset(asset_id),
@@ -1321,6 +1322,7 @@ mod tests {
                     name: "Layer 1".into(),
                     explicit_keyframes: vec![0],
                     placements: vec![Placement {
+                        pivot: None,
                         instance_id: 0,
                         frame: 0,
                         target: Target::Asset(1),
@@ -1403,6 +1405,7 @@ mod tests {
                 name: "Child Layer".into(),
                 explicit_keyframes: vec![0],
                 placements: vec![Placement {
+                    pivot: None,
                     instance_id: 0,
                     frame: 0,
                     target: Target::Asset(2),
@@ -1413,6 +1416,7 @@ mod tests {
             }],
         });
         project.q0rgs[0].layers[0].push_placement(Placement {
+            pivot: None,
             instance_id: 42,
             frame: 0,
             target: Target::Q0rg(2),

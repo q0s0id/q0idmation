@@ -63,6 +63,22 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     app.queue(Action::TogglePhysics);
                 }
             }
+            if app.settings.particles_enabled && app.has_active_project() && !app.home_visible() {
+                let particles_resp = ui
+                    .selectable_label(app.session.particles.open, "Particles")
+                    .on_hover_text("Open or close the particle system");
+                if particles_resp.clicked() {
+                    app.queue(Action::ToggleParticles);
+                }
+            }
+            if app.settings.light_enabled && app.has_active_project() && !app.home_visible() {
+                let light_resp = ui
+                    .selectable_label(app.session.lights.open, "Light")
+                    .on_hover_text("Open or close the light editor");
+                if light_resp.clicked() {
+                    app.queue(Action::ToggleLight);
+                }
+            }
             let q0fla_resp = ui
                 .selectable_label(app.q0fla_open, "q0fla")
                 .on_hover_text("Open or close the FLA/XFL import workshop");
@@ -352,15 +368,35 @@ pub fn menus(app: &mut EditorApp, ui: &mut Ui) {
                 app.queue(Action::BreakApartSelection);
                 ui.close_menu();
             }
-            if app.settings.physics_enabled {
+            if app.settings.physics_enabled
+                || app.settings.particles_enabled
+                || app.settings.light_enabled
+            {
                 ui.separator();
-                if ui
+            }
+            if app.settings.physics_enabled
+                && ui
                     .selectable_label(app.session.physics.open, "Physics...")
                     .clicked()
-                {
-                    app.queue(Action::TogglePhysics);
-                    ui.close_menu();
-                }
+            {
+                app.queue(Action::TogglePhysics);
+                ui.close_menu();
+            }
+            if app.settings.particles_enabled
+                && ui
+                    .selectable_label(app.session.particles.open, "Particles...")
+                    .clicked()
+            {
+                app.queue(Action::ToggleParticles);
+                ui.close_menu();
+            }
+            if app.settings.light_enabled
+                && ui
+                    .selectable_label(app.session.lights.open, "Light...")
+                    .clicked()
+            {
+                app.queue(Action::ToggleLight);
+                ui.close_menu();
             }
         });
 
@@ -470,6 +506,10 @@ pub fn menus(app: &mut EditorApp, ui: &mut Ui) {
     ui.menu_button("Help", |ui| {
         if ui.button("Credits...").clicked() {
             app.queue(Action::ToggleCredits);
+            ui.close_menu();
+        }
+        if app.settings.sweeper.unlocked && ui.button("q0sweeper").clicked() {
+            app.queue(Action::ToggleSweeper);
             ui.close_menu();
         }
         ui.separator();
@@ -1063,6 +1103,7 @@ mod shortcut_tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(1),

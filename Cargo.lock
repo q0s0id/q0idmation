@@ -769,7 +769,7 @@ dependencies = [
 
 [[package]]
 name = "canripper"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.5.1"
 dependencies = [
  "eframe",
  "egui",
@@ -3371,7 +3371,7 @@ dependencies = [
 
 [[package]]
 name = "q0android"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.5.1"
 dependencies = [
  "egui",
  "glutin",
@@ -3383,14 +3383,14 @@ dependencies = [
 
 [[package]]
 name = "q0credits"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.5.1"
 dependencies = [
  "egui",
 ]
 
 [[package]]
 name = "q0editor"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.5.1"
 dependencies = [
  "base64",
  "clipboard-win",
@@ -3410,10 +3410,10 @@ dependencies = [
  "q0fla",
  "q0glblend",
  "q0icon",
+ "q0physics",
  "q0s-format",
  "q0theme",
  "q0video",
- "rapier2d",
  "rfd",
  "rodio",
  "serde",
@@ -3428,7 +3428,7 @@ dependencies = [
 
 [[package]]
 name = "q0editor-android"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.5.1"
 dependencies = [
  "android_logger",
  "egui",
@@ -3441,10 +3441,11 @@ dependencies = [
 
 [[package]]
 name = "q0fla"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.5.1"
 dependencies = [
  "cfb",
  "flate2",
+ "jpeg-decoder",
  "q0s-format",
  "quick-xml",
  "ttf-parser",
@@ -3454,7 +3455,7 @@ dependencies = [
 
 [[package]]
 name = "q0glblend"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.5.1"
 dependencies = [
  "egui",
  "egui_glow",
@@ -3464,11 +3465,19 @@ dependencies = [
 
 [[package]]
 name = "q0icon"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.5.1"
+
+[[package]]
+name = "q0physics"
+version = "0.1.0-beta.5.1"
+dependencies = [
+ "q0s-format",
+ "rapier2d",
+]
 
 [[package]]
 name = "q0player"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.5.1"
 dependencies = [
  "dirs",
  "eframe",
@@ -3481,6 +3490,7 @@ dependencies = [
  "q0credits",
  "q0glblend",
  "q0icon",
+ "q0physics",
  "q0s-format",
  "q0theme",
  "q0video",
@@ -3494,7 +3504,7 @@ dependencies = [
 
 [[package]]
 name = "q0player-android"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.5.1"
 dependencies = [
  "android_logger",
  "log",
@@ -3505,7 +3515,7 @@ dependencies = [
 
 [[package]]
 name = "q0s-format"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.5.1"
 dependencies = [
  "q0video",
  "q0vm",
@@ -3513,14 +3523,14 @@ dependencies = [
 
 [[package]]
 name = "q0shell"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.5.1"
 dependencies = [
  "q0s-format",
 ]
 
 [[package]]
 name = "q0term"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.5.1"
 dependencies = [
  "eframe",
  "egui",
@@ -3529,11 +3539,11 @@ dependencies = [
 
 [[package]]
 name = "q0theme"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.5.1"
 
 [[package]]
 name = "q0video"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.5.1"
 dependencies = [
  "image",
  "windows 0.58.0",
@@ -3541,7 +3551,7 @@ dependencies = [
 
 [[package]]
 name = "q0vm"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.5.1"
 
 [[package]]
 name = "quick-xml"

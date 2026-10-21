@@ -1,0 +1,13 @@
+[package]
+name = "q0physics"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Rigid bodies, liquids and particles for q0idmation, shared by q0editor and q0player."
+
+[dependencies]
+q0s-format = { path = "../q0s-format" }
+rapier2d = "0.36"

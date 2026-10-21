@@ -20,7 +20,7 @@ mod archive;
 mod project;
 
 pub(crate) const OLE2_MAGIC: [u8; 8] = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
-const MAX_STREAM_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_STREAM_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_BINARY_SHAPES: usize = 100_000;
 const MAX_STYLE_COUNT: usize = 16_384;
 const MAX_EDGE_COUNT: usize = 2_000_000;
@@ -251,6 +251,7 @@ fn add_shapes_to_layer(
             xfl_content::shape_assets(&recovered.shape, owner, project, next_asset_id, warnings)?;
         for asset_id in asset_ids {
             layer.push_placement(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame,
                 target: Target::Asset(asset_id),
@@ -396,6 +397,7 @@ fn parse_shape_tail(reader: &mut ByteReader<'_>, gradient_extra: usize) -> Optio
                     color,
                     width,
                     cap: CapShape::Round,
+                    join: q0s_format::geom::JoinShape::Bevel,
                 },
             );
         }
@@ -433,6 +435,7 @@ fn parse_shape_tail(reader: &mut ByteReader<'_>, gradient_extra: usize) -> Optio
         fills,
         strokes,
         edges,
+        widths: HashMap::new(),
     };
 
     Some(shape)
@@ -513,6 +516,7 @@ fn parse_fill_style(
         transform.a22 /= 20.0;
         return Some(RawFillStyle::Bitmap {
             reference,
+            name: None,
             transform,
             tiled: subtype & 1 == 0,
         });

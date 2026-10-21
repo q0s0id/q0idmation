@@ -1910,6 +1910,7 @@ fn draw_preview(app: &mut EditorApp, ui: &mut Ui, selection: Option<LibrarySelec
                 LibraryKey::Asset(id) => placement_bbox(
                     project,
                     &Placement {
+                        pivot: None,
                         instance_id: 0,
                         frame: 0,
                         target: Target::Asset(id),
@@ -2362,6 +2363,7 @@ mod tests {
         let layer = &mut project.q0rgs[0].layers[0];
         layer.placements.extend([
             Placement {
+                pivot: None,
                 instance_id: 1,
                 frame: 0,
                 target: Target::Q0rg(2),
@@ -2370,6 +2372,7 @@ mod tests {
                 fx: Default::default(),
             },
             Placement {
+                pivot: None,
                 instance_id: 2,
                 frame: 0,
                 target: Target::Q0rg(2),
@@ -2378,6 +2381,7 @@ mod tests {
                 fx: Default::default(),
             },
             Placement {
+                pivot: None,
                 instance_id: 3,
                 frame: 0,
                 target: Target::Asset(77),

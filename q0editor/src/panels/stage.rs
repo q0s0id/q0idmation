@@ -333,7 +333,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     // A running physics preview draws its baked copy of the project instead.
     let physics_preview = text_preview
         .is_none()
-        .then(|| crate::physics::stage_preview(app))
+        .then(|| crate::sim_preview::stage_project(app))
         .flatten();
     let preview_state_id = egui::Id::new("painted_text_scene_preview");
     let previous_preview = ctx.data(|data| data.get_temp::<(u64, u16)>(preview_state_id));
@@ -719,6 +719,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         Some(render_revision),
                     );
                     let preview = q0s_format::v2::Placement {
+                        pivot: None,
                         instance_id: 0,
                         frame,
                         target,

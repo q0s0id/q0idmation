@@ -15,6 +15,7 @@ path = "src/main.rs"
 q0credits = { path = "../q0credits" }
 q0glblend = { path = "../q0glblend" }
 q0s-format = { path = "../q0s-format" }
+q0physics = { path = "../q0physics" }
 q0video = { path = "../q0video" }
 q0theme = { path = "../q0theme" }
 eframe = "0.27"

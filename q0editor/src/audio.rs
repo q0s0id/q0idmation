@@ -1028,6 +1028,7 @@ mod tests {
         project.q0rgs[0].layers[0]
             .placements
             .push(q0s_format::v2::Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 3,
                 target: Target::Asset(7),

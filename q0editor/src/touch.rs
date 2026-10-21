@@ -109,6 +109,49 @@ fn main_menu(app: &mut EditorApp, ui: &mut Ui) {
                         ui.close_menu();
                     }
                 }
+                if app.has_active_project() && !app.home_visible() {
+                    ui.separator();
+                    // Phones have no room for the desktop's tool buttons, so
+                    // the extra tools live here; one that is off in Settings
+                    // switches on when picked.
+                    for (label, on, action) in [
+                        (
+                            "Physics",
+                            app.settings.physics_enabled,
+                            Action::TogglePhysics,
+                        ),
+                        (
+                            "Particles",
+                            app.settings.particles_enabled,
+                            Action::ToggleParticles,
+                        ),
+                        ("Light", app.settings.light_enabled, Action::ToggleLight),
+                    ] {
+                        let open = match action {
+                            Action::TogglePhysics => app.session.physics.open,
+                            Action::ToggleParticles => app.session.particles.open,
+                            _ => app.session.lights.open,
+                        };
+                        if ui
+                            .selectable_label(on && open, format!("{label}..."))
+                            .clicked()
+                        {
+                            if !on {
+                                match action {
+                                    Action::TogglePhysics => app.settings.physics_enabled = true,
+                                    Action::ToggleParticles => {
+                                        app.settings.particles_enabled = true;
+                                    }
+                                    _ => app.settings.light_enabled = true,
+                                }
+                                let _ = app.settings.try_save();
+                            }
+                            app.queue(action);
+                            ui.close_menu();
+                        }
+                    }
+                    ui.separator();
+                }
                 if ui.button("Import Animate files (q0fla)...").clicked() {
                     app.queue(Action::ToggleQ0Fla);
                     ui.close_menu();

@@ -1156,6 +1156,60 @@ fn runtime_action_label(action: &super::runtime::RuntimeAction) -> String {
             format!("q0rig.pose! {:?}, {weight}", pose)
         }
         RuntimeAction::RigResetPose { pose } => format!("q0rig.pose_reset! {:?}", pose),
+        RuntimeAction::Physics(command) => {
+            use super::runtime::PhysicsCommand;
+            match command {
+                PhysicsCommand::Start => "q0physics.start!".to_string(),
+                PhysicsCommand::Pause => "q0physics.pause!".to_string(),
+                PhysicsCommand::Reset => "q0physics.reset!".to_string(),
+                PhysicsCommand::Push { body, x, y } => {
+                    format!("q0physics.push! {body:?}, {x}, {y}")
+                }
+                PhysicsCommand::Velocity { body, x, y } => {
+                    format!("q0physics.velocity! {body:?}, {x}, {y}")
+                }
+                PhysicsCommand::Spin { body, degrees } => {
+                    format!("q0physics.spin! {body:?}, {degrees}")
+                }
+                PhysicsCommand::Teleport { body, x, y } => {
+                    format!("q0physics.teleport! {body:?}, {x}, {y}")
+                }
+                PhysicsCommand::Gravity { x, y } => format!("q0physics.gravity! {x}, {y}"),
+                PhysicsCommand::Cut { link } => format!("q0physics.cut! {link:?}"),
+            }
+        }
+        RuntimeAction::Particles(command) => {
+            use super::runtime::ParticlesCommand;
+            match command {
+                ParticlesCommand::Start { emitter } => format!("q0particles.start! {emitter:?}"),
+                ParticlesCommand::Stop { emitter } => format!("q0particles.stop! {emitter:?}"),
+                ParticlesCommand::Burst { emitter, count } => {
+                    format!("q0particles.burst! {emitter:?}, {count}")
+                }
+                ParticlesCommand::Move { emitter, x, y } => {
+                    format!("q0particles.move! {emitter:?}, {x}, {y}")
+                }
+                ParticlesCommand::Clear { emitter } => format!("q0particles.clear! {emitter:?}"),
+            }
+        }
+        RuntimeAction::Light(command) => {
+            use super::runtime::LightCommand;
+            match command {
+                LightCommand::On { light } => format!("q0light.on! {light:?}"),
+                LightCommand::Off { light } => format!("q0light.off! {light:?}"),
+                LightCommand::Move { light, x, y } => format!("q0light.move! {light:?}, {x}, {y}"),
+                LightCommand::Color { light, r, g, b } => {
+                    format!("q0light.color! {light:?}, {r}, {g}, {b}")
+                }
+                LightCommand::Brightness { light, value } => {
+                    format!("q0light.brightness! {light:?}, {value}")
+                }
+                LightCommand::Size { light, radius } => {
+                    format!("q0light.size! {light:?}, {radius}")
+                }
+                LightCommand::Darkness { value } => format!("q0light.darkness! {value}"),
+            }
+        }
     }
 }
 

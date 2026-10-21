@@ -1,22 +1,27 @@
-//! The physics editor: objects on a timeline fall, bounce and collide in a
-//! rapier2d world, and the result is baked into ordinary keyframes.
+//! The physics editor: objects on a timeline fall, bounce and collide,
+//! hang on ropes, springs and hinges, and liquids pour around them; the
+//! result is baked into ordinary keyframes.
+//! The simulation itself lives in `q0physics`, shared with q0player.
 //!
 //! It is an opt-in tool. While `Settings::physics_enabled` is off nothing of
 //! it shows: no menu entry, no window, no stage overlay.
 
-use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use egui::{Color32, Context, Painter, RichText, Stroke, Ui};
+use q0physics::{
+    body_collider, fit_bounds, posed_transform, BodyPose, BodyStart, ColliderGeometry, Fit,
+    LinkStart, World,
+};
 use q0s_format::physics::{
-    BodyKind, ColliderShape, Momentum, PhysicsBody, PhysicsScene, MAX_COLLISION_GROUP, WALL_BOTTOM,
-    WALL_LEFT, WALL_RIGHT, WALL_TOP,
+    BodyKind, ColliderShape, LiquidSource, Momentum, PhysicsBody, PhysicsLiquid, PhysicsScene,
+    MAX_COLLISION_GROUP, WALLS_ALL, WALL_BOTTOM, WALL_LEFT, WALL_RIGHT, WALL_TOP,
 };
 use q0s_format::transform::Affine;
-use q0s_format::v2::{Asset, ProjectV2, Target, Transform2D, Tween, Vec2};
-use rapier2d::prelude::{
-    ColliderBuilder, Group, InteractionGroups, InteractionTestMode, PhysicsWorld, Pose,
-    RigidBodyBuilder, RigidBodyHandle, Vector,
+use q0s_format::v2::{
+    Asset, InstanceKey, Placement, ProjectV2, Rgba, Target, Transform2D, Tween, Vec2,
 };
 
 use crate::app::EditorApp;
@@ -24,32 +29,58 @@ use crate::render::StageView;
 use crate::state::{RigMode, Selection, TimelineSelection};
 use crate::ui::FitToScreen;
 
-/// Stage pixels in one rapier length unit, so its tolerances suit objects a
-/// few dozen to a few hundred pixels across.
-const PIXELS_PER_UNIT: f32 = 100.0;
-/// Colliders never shrink below this, so lines and dots still collide.
-const MIN_HALF_EXTENT: f32 = 0.5;
 /// Longest stretch one bake simulates.
 const MAX_SIMULATED_FRAMES: u32 = 20_000;
+/// The body list scrolls past this height instead of growing the window.
+const LIST_HEIGHT: f32 = 190.0;
 
-/// Window and preview state. Lives in the session, never in the project.
+/// Window state. Lives in the session, never in the project.
 #[derive(Default)]
 pub struct PhysicsSession {
     pub open: bool,
     pub mode: RigMode,
     pub selected_body: Option<u32>,
+    pub selected_liquid: Option<u16>,
+    pub selected_link: Option<u16>,
     /// Shows the simulation on the stage with the real artwork, kept up to
     /// date while the setup changes. Nothing is keyed until a bake.
     pub previewing: bool,
-    preview: Option<Preview>,
-    preview_serial: u64,
     /// Bake only the selected body; the others still bump into it.
     pub only_selected: bool,
     /// A key every this many frames, tweened in between; 0 and 1 key every
     /// frame.
     pub key_step: u16,
+    /// Narrows the body list.
+    pub filter: String,
     /// The last result, shown in the window.
-    message: String,
+    pub(crate) message: String,
+    cache: RefCell<FitCache>,
+    /// A hitbox handle being dragged on the stage.
+    drag: Option<HitboxDrag>,
+    /// A link end being dragged on the stage.
+    pub(crate) link_drag: Option<crate::physics_links::LinkDrag>,
+}
+
+/// Which part of a hitbox the pointer holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Handle {
+    Move,
+    Width,
+    Height,
+    Radius,
+    Turn,
+}
+
+/// A hitbox handle drag, with what it started from.
+#[derive(Debug, Clone, Copy)]
+struct HitboxDrag {
+    instance_id: u32,
+    handle: Handle,
+    press: Vec2,
+    center: [f32; 2],
+    angle: f32,
+    fit_half: [f32; 2],
+    offset: [f32; 2],
 }
 
 impl PhysicsSession {
@@ -62,27 +93,14 @@ impl PhysicsSession {
 
     pub fn stop_preview(&mut self) {
         self.previewing = false;
-        self.preview = None;
     }
-}
-
-/// A disposable copy of the project with the simulation baked in, drawn on
-/// the stage in place of the real one.
-struct Preview {
-    simulation: Arc<Simulation>,
-    project: Arc<ProjectV2>,
-    /// Render revision of the copy; never one the real project reaches.
-    revision: u64,
-    /// Revision of the real project it was made from.
-    source_revision: u64,
-    options: BakeOptions,
-    q0rg_id: u16,
 }
 
 /// What a bake keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BakeOptions {
-    /// Key only this body; the others still push it around.
+    /// Key only this body; the others still push it around. Liquids are
+    /// left alone then.
     pub only: Option<u32>,
     /// A key every this many frames, with motion tweens in between.
     pub key_step: u16,
@@ -97,33 +115,51 @@ impl Default for BakeOptions {
     }
 }
 
-/// Where a collider sits and how far it is turned on one frame.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct BodyPose {
-    pub center: [f32; 2],
-    pub angle: f32,
-}
-
 /// An object found on the timeline, with its collider fitted to it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BodyFit {
     pub layer_id: u16,
     pub transform: Transform2D,
-    pub pose: BodyPose,
-    /// Half the width and height of its bounds as they show on the stage.
-    pub half_extents: [f32; 2],
+    pub fit: Fit,
+    /// Its bounds in its own space.
+    pub bounds: [f32; 4],
+}
+
+impl BodyFit {
+    pub fn pose(&self) -> BodyPose {
+        self.fit.pose
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Track {
     pub instance_id: u32,
     pub kind: BodyKind,
-    pub shape: ColliderShape,
-    /// Collider size, shape scale included.
-    pub half_extents: [f32; 2],
+    /// The collider as it starts, in the body's frame.
+    pub geometry: ColliderGeometry,
     pub start: BodyFit,
+    /// Where the collider starts: the object's middle moved by the offset.
+    pub start_pose: BodyPose,
     /// One pose per frame; the first is the start frame.
     pub poses: Vec<BodyPose>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LiquidTrack {
+    pub liquid_id: u16,
+    /// Particle positions per frame; the first is the start frame.
+    pub frames: Vec<Vec<[f32; 2]>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LinkTrack {
+    pub link_id: u16,
+    /// Where the link runs on each frame, as lines from point to point
+    /// (more than one once it has snapped); the first is the start frame.
+    pub frames: Vec<Vec<Vec<[f32; 2]>>>,
+    /// Per-frame runs still attached at the original first/last end; broken
+    /// tips must remain free when the rendered objects differ from the solver.
+    pub attached_ends: Vec<Vec<[bool; 2]>>,
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +167,8 @@ pub struct Simulation {
     pub q0rg_id: u16,
     pub start_frame: u16,
     pub tracks: Vec<Track>,
+    pub liquids: Vec<LiquidTrack>,
+    pub links: Vec<LinkTrack>,
     /// Bodies whose object is not on the start frame.
     pub missing: usize,
 }
@@ -146,6 +184,8 @@ impl Simulation {
             .tracks
             .iter()
             .map(|track| track.poses.len())
+            .chain(self.liquids.iter().map(|liquid| liquid.frames.len()))
+            .chain(self.links.iter().map(|link| link.frames.len()))
             .max()
             .unwrap_or(1);
         self.start_frame
@@ -153,12 +193,33 @@ impl Simulation {
     }
 }
 
+/// Artwork bounds by target, so one pass over the timeline measures each
+/// drawing or symbol once. Measuring a symbol walks its whole contents.
+pub type Bounds = HashMap<(bool, u16), Option<[f32; 4]>>;
+
+fn target_bounds(project: &ProjectV2, target: Target, bounds: &mut Bounds) -> Option<[f32; 4]> {
+    let key = match target {
+        Target::Asset(id) => (false, id),
+        Target::Q0rg(id) => (true, id),
+    };
+    *bounds.entry(key).or_insert_with(|| {
+        crate::render::target_local_bbox(project, target, None)
+            .map(|(min_x, min_y, max_x, max_y)| [min_x, min_y, max_x, max_y])
+            .filter(|[min_x, min_y, max_x, max_y]| {
+                [min_x, min_y, max_x, max_y].iter().all(|v| v.is_finite())
+                    && max_x >= min_x
+                    && max_y >= min_y
+            })
+    })
+}
+
 /// Finds the object `instance_id` on `frame` and fits a collider to it.
-pub fn fit_body(
+pub fn fit_body_with(
     project: &ProjectV2,
     q0rg_id: u16,
     instance_id: u32,
     frame: u16,
+    bounds: &mut Bounds,
 ) -> Option<BodyFit> {
     if instance_id == 0 {
         return None;
@@ -172,105 +233,191 @@ pub fn fit_body(
             if placement.instance_id != instance_id {
                 continue;
             }
-            let (min_x, min_y, max_x, max_y) =
-                crate::render::placement_local_bbox(project, placement)
-                    .filter(|(min_x, min_y, max_x, max_y)| {
-                        [min_x, min_y, max_x, max_y].iter().all(|v| v.is_finite())
-                            && max_x >= min_x
-                            && max_y >= min_y
-                    })
-                    .unwrap_or((-5.0, -5.0, 5.0, 5.0));
-            let affine = Affine::from_transform(state.transform);
-            let center = affine.apply(Vec2::new((min_x + max_x) * 0.5, (min_y + max_y) * 0.5));
-            let x_axis = affine.a11.hypot(affine.a21);
-            let y_axis = affine.a12.hypot(affine.a22);
+            let own =
+                target_bounds(project, placement.target, bounds).unwrap_or([-5.0, -5.0, 5.0, 5.0]);
             return Some(BodyFit {
                 layer_id: layer.layer_id,
                 transform: state.transform,
-                pose: BodyPose {
-                    center: [center.x, center.y],
-                    angle: affine.a21.atan2(affine.a11),
-                },
-                half_extents: [
-                    ((max_x - min_x) * 0.5 * x_axis).max(MIN_HALF_EXTENT),
-                    ((max_y - min_y) * 0.5 * y_axis).max(MIN_HALF_EXTENT),
-                ],
+                fit: fit_bounds(own, Affine::from_transform(state.transform)),
+                bounds: own,
             });
         }
     }
     None
 }
 
-/// The collider of `body` around an object fitted as `fit`.
-pub fn collider_half_extents(body: &PhysicsBody, fit: &BodyFit) -> [f32; 2] {
-    let [hx, hy] = fit.half_extents;
-    match body.shape {
-        ColliderShape::Box => [
-            (hx * body.shape_scale).max(MIN_HALF_EXTENT),
-            (hy * body.shape_scale).max(MIN_HALF_EXTENT),
-        ],
-        ColliderShape::Circle => {
-            let radius = (hx.max(hy) * body.shape_scale).max(MIN_HALF_EXTENT);
-            [radius, radius]
-        }
-    }
+pub fn fit_body(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    instance_id: u32,
+    frame: u16,
+) -> Option<BodyFit> {
+    fit_body_with(project, q0rg_id, instance_id, frame, &mut Bounds::new())
 }
 
-/// How the timeline moves `instance_id` into `scene`'s start frame, as stage
-/// pixels per second and radians per second of simulated time.
+/// Fits and names for the window and the stage overlay, which ask for them
+/// every frame. Any change to the project starts afresh.
+#[derive(Default)]
+struct FitCache {
+    revision: u64,
+    q0rg_id: u16,
+    bounds: Bounds,
+    fits: HashMap<(u32, u16), Option<BodyFit>>,
+    colliders: HashMap<(u32, u16), Option<(BodyPose, ColliderGeometry)>>,
+    names: HashMap<u32, String>,
+}
+
+fn with_cache<R>(app: &EditorApp, work: impl FnOnce(&mut FitCache, &ProjectV2) -> R) -> R {
+    let mut cache = app.session.physics.cache.borrow_mut();
+    let q0rg_id = app.session.current_q0rg_id;
+    if cache.revision != app.state.revision || cache.q0rg_id != q0rg_id {
+        *cache = FitCache {
+            revision: app.state.revision,
+            q0rg_id,
+            ..FitCache::default()
+        };
+    }
+    work(&mut cache, &app.state.project)
+}
+
+pub(crate) fn cached_fit(app: &EditorApp, instance_id: u32, frame: u16) -> Option<BodyFit> {
+    let q0rg_id = app.session.current_q0rg_id;
+    with_cache(app, |cache, project| {
+        if let Some(fit) = cache.fits.get(&(instance_id, frame)) {
+            return *fit;
+        }
+        let fit = fit_body_with(project, q0rg_id, instance_id, frame, &mut cache.bounds);
+        cache.fits.insert((instance_id, frame), fit);
+        fit
+    })
+}
+
+/// The fit, collider pose and collider shape of `body` on `frame`.
+pub(crate) fn cached_collider(
+    app: &EditorApp,
+    body: &PhysicsBody,
+    frame: u16,
+) -> Option<(BodyFit, BodyPose, ColliderGeometry)> {
+    let fit = cached_fit(app, body.instance_id, frame)?;
+    let collider = with_cache(app, |cache, project| {
+        cache
+            .colliders
+            .entry((body.instance_id, frame))
+            .or_insert_with(|| {
+                let parts = body_parts(project, body, frame);
+                Some(collider_of(body, &fit, &parts))
+            })
+            .clone()
+    })?;
+    Some((fit, collider.0, collider.1))
+}
+
+/// The artwork parts a hull or outline collider of `body` takes on `frame`,
+/// in the object's own space; nothing for other shapes.
+pub fn body_parts(project: &ProjectV2, body: &PhysicsBody, frame: u16) -> Vec<Vec<[f32; 2]>> {
+    if !body.shape.follows_artwork() {
+        return Vec::new();
+    }
+    let loops = crate::hitbox::object_loops(project, body.q0rg_id, body.instance_id, frame);
+    crate::hitbox::collider_parts(body.shape, &loops)
+}
+
+/// Where `body`'s collider sits around the object fitted with `fit`, and
+/// its shape.
+fn collider_of(
+    body: &PhysicsBody,
+    fit: &BodyFit,
+    parts: &[Vec<[f32; 2]>],
+) -> (BodyPose, ColliderGeometry) {
+    body_collider(body, fit.fit, Affine::from_transform(fit.transform), parts)
+}
+
+/// Where `body`'s collider sits around the object fitted with `fit`.
+fn collider_pose(body: &PhysicsBody, fit: &BodyFit) -> BodyPose {
+    collider_of(body, fit, &[]).0
+}
+
+/// What the window calls object `instance_id` of the open timeline.
+pub(crate) fn object_name(app: &EditorApp, instance_id: u32) -> String {
+    cached_name(app, instance_id)
+}
+
+fn cached_name(app: &EditorApp, instance_id: u32) -> String {
+    let q0rg_id = app.session.current_q0rg_id;
+    with_cache(app, |cache, project| {
+        cache
+            .names
+            .entry(instance_id)
+            .or_insert_with(|| body_name(project, q0rg_id, instance_id))
+            .clone()
+    })
+}
+
+/// How the timeline moves an object into the start frame, as stage pixels
+/// per second and radians per second of simulated time.
+fn motion_between(
+    fps: u16,
+    scene: &PhysicsScene,
+    before: Option<BodyPose>,
+    now: Option<BodyPose>,
+) -> ([f32; 2], f32) {
+    let (Some(a), Some(b)) = (before, now) else {
+        return ([0.0, 0.0], 0.0);
+    };
+    // One frame of timeline is `time_scale / fps` seconds of world time.
+    let per_second = f32::from(fps.max(1)) / scene.time_scale;
+    (
+        [
+            (b.center[0] - a.center[0]) * per_second,
+            (b.center[1] - a.center[1]) * per_second,
+        ],
+        wrap_angle(b.angle - a.angle) * per_second,
+    )
+}
+
+/// How the timeline moves `instance_id` into `scene`'s start frame.
 pub fn motion_into_start(
     project: &ProjectV2,
     scene: &PhysicsScene,
     instance_id: u32,
 ) -> ([f32; 2], f32) {
-    let start = scene.start_frame;
-    let (Some(previous_frame), Some(now)) = (
-        start.checked_sub(1),
-        fit_body(project, scene.q0rg_id, instance_id, start),
-    ) else {
-        return ([0.0, 0.0], 0.0);
-    };
-    let Some(before) = fit_body(project, scene.q0rg_id, instance_id, previous_frame) else {
-        return ([0.0, 0.0], 0.0);
-    };
-    // One frame of timeline is `time_scale / fps` seconds of world time.
-    let per_second = f32::from(project.meta.fps.max(1)) / scene.time_scale;
-    (
-        [
-            (now.pose.center[0] - before.pose.center[0]) * per_second,
-            (now.pose.center[1] - before.pose.center[1]) * per_second,
-        ],
-        wrap_angle(now.pose.angle - before.pose.angle) * per_second,
+    let mut bounds = Bounds::new();
+    let default_body = PhysicsBody::new(scene.q0rg_id, instance_id);
+    let body = project
+        .runtime
+        .physics
+        .body(scene.q0rg_id, instance_id)
+        .unwrap_or(&default_body);
+    let now = fit_body_with(
+        project,
+        scene.q0rg_id,
+        instance_id,
+        scene.start_frame,
+        &mut bounds,
+    );
+    let before = scene
+        .start_frame
+        .checked_sub(1)
+        .and_then(|frame| fit_body_with(project, scene.q0rg_id, instance_id, frame, &mut bounds));
+    motion_between(
+        project.meta.fps,
+        scene,
+        before.map(|fit| collider_pose(body, &fit)),
+        now.map(|fit| collider_pose(body, &fit)),
     )
 }
 
-fn start_velocity(
-    project: &ProjectV2,
-    scene: &PhysicsScene,
-    body: &PhysicsBody,
-) -> ([f32; 2], f32) {
-    match body.momentum {
-        Momentum::FromMotion => motion_into_start(project, scene, body.instance_id),
-        Momentum::Manual { velocity, spin } => (velocity, spin.to_radians()),
-    }
-}
-
-/// Collision groups as rapier sees them: walls are the last bit and meet
-/// every body that collides at all; a body meets only its own group.
-fn body_groups(group: u8) -> InteractionGroups {
-    if group == 0 || group > MAX_COLLISION_GROUP {
-        return InteractionGroups::new(Group::NONE, Group::NONE, InteractionTestMode::And);
-    }
-    let own = Group::from_bits_truncate(1 << (group - 1));
-    InteractionGroups::new(own, own | Group::GROUP_32, InteractionTestMode::And)
-}
-
-fn wall_groups() -> InteractionGroups {
-    InteractionGroups::new(Group::GROUP_32, Group::ALL, InteractionTestMode::And)
+pub fn simulate(project: &ProjectV2, q0rg_id: u16) -> Result<Simulation, String> {
+    simulate_with(project, q0rg_id, None)
 }
 
 /// Runs the physics of `q0rg_id` from its start frame to its end frame.
-pub fn simulate(project: &ProjectV2, q0rg_id: u16) -> Result<Simulation, String> {
+/// Setting `cancel` stops it early with an error.
+pub fn simulate_with(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    cancel: Option<&AtomicBool>,
+) -> Result<Simulation, String> {
     let scene = project
         .runtime
         .physics
@@ -283,18 +430,17 @@ pub fn simulate(project: &ProjectV2, q0rg_id: u16) -> Result<Simulation, String>
             "simulate at most {MAX_SIMULATED_FRAMES} frames at once"
         ));
     }
-    let substeps = u32::from(scene.substeps.max(1));
-    let fps = f32::from(project.meta.fps.max(1));
-
-    let mut world = PhysicsWorld::new();
-    world.gravity = Vector::new(scene.gravity[0], scene.gravity[1]);
-    world.integration_parameters.length_unit = PIXELS_PER_UNIT;
-    world.integration_parameters.dt = scene.time_scale / fps / substeps as f32;
-    add_walls(&mut world, project, scene);
-
+    let fps = project.meta.fps.max(1);
+    let stage = [
+        f32::from(project.meta.stage_width.max(1)),
+        f32::from(project.meta.stage_height.max(1)),
+    ];
+    let mut world = World::new(scene, stage, f32::from(fps));
+    let mut bounds = Bounds::new();
     let mut tracks = Vec::new();
-    let mut handles = Vec::<RigidBodyHandle>::new();
-    let mut animated = Vec::<Option<Vec<BodyPose>>>::new();
+    let mut animated = Vec::<(usize, Vec<BodyPose>)>::new();
+    // Bodies whose collider takes the artwork's shape again every frame.
+    let mut reshaping = Vec::<(usize, &PhysicsBody, BodyFit)>::new();
     let mut missing = 0;
     for body in project
         .runtime
@@ -303,180 +449,162 @@ pub fn simulate(project: &ProjectV2, q0rg_id: u16) -> Result<Simulation, String>
         .iter()
         .filter(|body| body.q0rg_id == q0rg_id)
     {
-        let Some(fit) = fit_body(project, q0rg_id, body.instance_id, start) else {
+        let Some(fit) = fit_body_with(project, q0rg_id, body.instance_id, start, &mut bounds)
+        else {
             missing += 1;
             continue;
         };
-        let half_extents = collider_half_extents(body, &fit);
-        let [x, y] = fit.pose.center;
-        let builder = match body.kind {
-            BodyKind::Dynamic => {
-                let (velocity, spin) = start_velocity(project, scene, body);
-                let builder = RigidBodyBuilder::dynamic()
-                    .linvel(Vector::new(velocity[0], velocity[1]))
-                    .angvel(spin)
-                    .linear_damping(body.linear_damping + scene.air_drag)
-                    .angular_damping(body.angular_damping + scene.air_drag)
-                    .gravity_scale(body.gravity_scale)
-                    .ccd_enabled(true);
-                if body.fixed_rotation {
-                    builder.lock_rotations()
-                } else {
-                    builder
-                }
+        let parts = body_parts(project, body, start);
+        let (pose, geometry) = collider_of(body, &fit, &parts);
+        let (velocity, spin) = match body.momentum {
+            Momentum::FromMotion => {
+                let before = start.checked_sub(1).and_then(|frame| {
+                    fit_body_with(project, q0rg_id, body.instance_id, frame, &mut bounds)
+                });
+                motion_between(
+                    fps,
+                    scene,
+                    before.map(|before| collider_pose(body, &before)),
+                    Some(pose),
+                )
             }
-            BodyKind::Static => RigidBodyBuilder::fixed(),
-            BodyKind::Animated => RigidBodyBuilder::kinematic_position_based(),
-        }
-        .translation(Vector::new(x, y))
-        .rotation(fit.pose.angle);
-        let collider = match body.shape {
-            ColliderShape::Box => ColliderBuilder::cuboid(half_extents[0], half_extents[1]),
-            ColliderShape::Circle => ColliderBuilder::ball(half_extents[0]),
-        }
-        .restitution(body.bounce)
-        .friction(body.friction)
-        .mass(body.mass)
-        .collision_groups(body_groups(body.group));
-        let (handle, _) = world.insert(builder, collider);
-        handles.push(handle);
-        animated.push((body.kind == BodyKind::Animated).then(|| {
+            Momentum::Manual { velocity, spin } => (velocity, spin.to_radians()),
+        };
+        let index = world.add_body(BodyStart {
+            body,
+            geometry: geometry.clone(),
+            pose,
+            velocity,
+            spin,
+        });
+        if body.kind == BodyKind::Animated {
             // Animated bodies follow the timeline; a frame where the object
             // is gone holds its last pose.
             let mut poses = Vec::with_capacity(frames as usize);
-            let mut last = fit.pose;
+            let mut last = pose;
             for offset in 0..frames {
-                if let Some(now) =
-                    fit_body(project, q0rg_id, body.instance_id, start + offset as u16)
-                {
-                    last = now.pose;
+                if let Some(now) = fit_body_with(
+                    project,
+                    q0rg_id,
+                    body.instance_id,
+                    start + offset as u16,
+                    &mut bounds,
+                ) {
+                    last = collider_pose(body, &now);
                 }
                 poses.push(last);
             }
-            poses
-        }));
+            animated.push((index, poses));
+        }
+        if body.follow_art && body.shape.follows_artwork() {
+            reshaping.push((index, body, fit));
+        }
         tracks.push(Track {
             instance_id: body.instance_id,
             kind: body.kind,
-            shape: body.shape,
-            half_extents,
+            geometry,
             start: fit,
-            poses: vec![fit.pose],
+            start_pose: pose,
+            poses: vec![pose],
         });
     }
-    if tracks.is_empty() {
+    let mut liquids = Vec::new();
+    for liquid in project
+        .runtime
+        .physics
+        .liquids
+        .iter()
+        .filter(|liquid| liquid.q0rg_id == q0rg_id)
+    {
+        let index = world.add_liquid(liquid);
+        liquids.push(LiquidTrack {
+            liquid_id: liquid.liquid_id,
+            frames: vec![world.liquid_particles(index).to_vec()],
+        });
+    }
+    // Links tie bodies that made it into the world; one whose object is
+    // gone from the start frame waits for it.
+    let mut links = Vec::new();
+    for link in project
+        .runtime
+        .physics
+        .links
+        .iter()
+        .filter(|link| link.q0rg_id == q0rg_id)
+    {
+        let Some(to) = world.index_of(link.to) else {
+            continue;
+        };
+        let from = match link.from {
+            0 => None,
+            from => match world.index_of(from) {
+                Some(index) => Some(index),
+                None => continue,
+            },
+        };
+        let index = world.add_link(LinkStart { link, from, to });
+        links.push(LinkTrack {
+            link_id: link.link_id,
+            frames: vec![world.link_lines(index)],
+            attached_ends: vec![world.link_attached_ends(index)],
+        });
+    }
+    if tracks.is_empty() && liquids.is_empty() {
         return Err(if missing > 0 {
             "none of the bodies is on the start frame".to_string()
         } else {
-            "add an object to the physics first".to_string()
+            "add an object or a liquid to the physics first".to_string()
         });
     }
 
     for offset in 1..frames as usize {
-        for substep in 1..=substeps {
-            let t = substep as f32 / substeps as f32;
-            for (handle, poses) in handles.iter().zip(&animated) {
-                let Some(poses) = poses else {
-                    continue;
-                };
-                let from = poses[offset - 1];
-                let to = poses[offset];
-                let center = Vector::new(
-                    from.center[0] + (to.center[0] - from.center[0]) * t,
-                    from.center[1] + (to.center[1] - from.center[1]) * t,
-                );
-                let angle = from.angle + wrap_angle(to.angle - from.angle) * t;
-                if let Some(body) = world.bodies.get_mut(*handle) {
-                    body.set_next_kinematic_position(Pose::new(center, angle));
-                }
-            }
-            world.step();
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            return Err("cancelled".to_string());
         }
-        for (track, handle) in tracks.iter_mut().zip(&handles) {
-            let Some(body) = world.bodies.get(*handle) else {
-                continue;
+        for (index, poses) in &animated {
+            world.drive(*index, poses[offset]);
+        }
+        let frame = start + offset as u16;
+        for (index, body, start_fit) in &reshaping {
+            // Animated bodies take the timeline's placement each frame; the
+            // others keep the frame they started in, which moves with them.
+            let fit = match body.kind {
+                BodyKind::Animated => {
+                    fit_body_with(project, q0rg_id, body.instance_id, frame, &mut bounds)
+                        .unwrap_or(*start_fit)
+                }
+                _ => *start_fit,
             };
-            let center = body.translation();
-            // Angles carry on past a half turn instead of wrapping, so the
-            // keys spin the way the body did and tweens between them do too.
-            let previous = track.poses.last().map_or(0.0, |pose| pose.angle);
-            let pose = BodyPose {
-                center: [center.x, center.y],
-                angle: previous + wrap_angle(body.rotation().angle() - previous),
-            };
-            if !pose.center.iter().all(|v| v.is_finite()) || !pose.angle.is_finite() {
-                return Err("the simulation blew up; try more steps per frame".to_string());
+            let parts = body_parts(project, body, frame);
+            if !parts.is_empty() {
+                world.set_geometry(*index, collider_of(body, &fit, &parts).1);
             }
-            track.poses.push(pose);
+        }
+        world.step_frame()?;
+        for (index, track) in tracks.iter_mut().enumerate() {
+            track.poses.push(world.pose(index));
+        }
+        for (index, liquid) in liquids.iter_mut().enumerate() {
+            liquid.frames.push(world.liquid_particles(index).to_vec());
+        }
+        for (index, link) in links.iter_mut().enumerate() {
+            link.frames.push(world.link_lines(index));
+            link.attached_ends.push(world.link_attached_ends(index));
         }
     }
     Ok(Simulation {
         q0rg_id,
         start_frame: start,
         tracks,
+        liquids,
+        links,
         missing,
     })
 }
 
-fn add_walls(world: &mut PhysicsWorld, project: &ProjectV2, scene: &PhysicsScene) {
-    let width = f32::from(project.meta.stage_width.max(1));
-    let height = f32::from(project.meta.stage_height.max(1));
-    // Thick walls that run well past the corners, so nothing slips out
-    // between two of them or punches through one.
-    let thick = width.max(height);
-    let walls = [
-        (
-            WALL_LEFT,
-            [-thick * 0.5, height * 0.5],
-            [thick * 0.5, height * 0.5 + thick],
-        ),
-        (
-            WALL_RIGHT,
-            [width + thick * 0.5, height * 0.5],
-            [thick * 0.5, height * 0.5 + thick],
-        ),
-        (
-            WALL_TOP,
-            [width * 0.5, -thick * 0.5],
-            [width * 0.5 + thick, thick * 0.5],
-        ),
-        (
-            WALL_BOTTOM,
-            [width * 0.5, height + thick * 0.5],
-            [width * 0.5 + thick, thick * 0.5],
-        ),
-    ];
-    for (bit, [x, y], [hx, hy]) in walls {
-        if scene.walls & bit == 0 {
-            continue;
-        }
-        world.insert(
-            RigidBodyBuilder::fixed().translation(Vector::new(x, y)),
-            ColliderBuilder::cuboid(hx, hy)
-                .restitution(scene.wall_bounce)
-                .friction(scene.wall_friction)
-                .collision_groups(wall_groups()),
-        );
-    }
-}
-
-/// The transform that shows an object fitted as `start` with its collider
-/// moved and turned to `pose`.
-pub fn posed_transform(start: &BodyFit, pose: BodyPose) -> Transform2D {
-    let turn = pose.angle - start.pose.angle;
-    let (sin, cos) = turn.sin_cos();
-    let offset_x = start.transform.tx - start.pose.center[0];
-    let offset_y = start.transform.ty - start.pose.center[1];
-    Transform2D {
-        tx: pose.center[0] + cos * offset_x - sin * offset_y,
-        ty: pose.center[1] + sin * offset_x + cos * offset_y,
-        rotation: start.transform.rotation + turn,
-        ..start.transform
-    }
-}
-
-/// Keys the simulated frames of the falling bodies. Returns how many object
-/// keys were written.
+/// Keys the simulated frames: falling bodies, and every liquid as a drawing
+/// per frame on a layer of its own. Returns how many object keys and liquid
+/// frames were written.
 pub fn bake(
     project: &mut ProjectV2,
     simulation: &Simulation,
@@ -494,11 +622,20 @@ pub fn bake(
                 && options.only.is_none_or(|only| only == track.instance_id)
         })
         .collect::<Vec<_>>();
-    if moving.is_empty() {
+    let with_liquids = options.only.is_none() && !simulation.liquids.is_empty();
+    let with_links = options.only.is_none()
+        && simulation.links.iter().any(|track| {
+            project
+                .runtime
+                .physics
+                .link(q0rg_id, track.link_id)
+                .is_some_and(|link| link.is_drawn())
+        });
+    if moving.is_empty() && !with_liquids && !with_links {
         return Err(if options.only.is_some() {
             "the selected body does not fall: set it to Falls".to_string()
         } else {
-            "nothing moves: make at least one body fall".to_string()
+            "nothing moves: make at least one body fall or add a liquid".to_string()
         });
     }
     let layers = moving
@@ -514,64 +651,147 @@ pub fn bake(
             layer_name(project, q0rg_id, *locked)
         ));
     }
-    let cells = moving
-        .iter()
-        .flat_map(|track| {
-            let last = start + (track.poses.len() - 1) as u16;
-            key_frames(start, last, step).map(move |frame| (track.start.layer_id, frame))
-        })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    crate::timeline_edit::materialize_keyframes_at_cells(project, q0rg_id, &cells)
-        .ok_or("could not add keyframes there")?;
-    let q0rg = project
-        .q0rgs
-        .iter_mut()
-        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
-        .ok_or("the timeline is gone")?;
     let mut keyed = 0;
-    for track in moving {
-        let Some(layer) = q0rg
-            .layers
-            .iter_mut()
-            .find(|layer| layer.layer_id == track.start.layer_id)
-        else {
-            continue;
-        };
-        let last = start + (track.poses.len() - 1) as u16;
-        // Every key of the body in the range follows the simulation, keys
-        // that were there already included, and tweens to the next one.
-        // An authored blank key leaves the object gone on that frame.
-        let mut keys = layer
-            .placements
+    if !moving.is_empty() {
+        let cells = moving
             .iter()
-            .enumerate()
-            .filter(|(_, placement)| {
-                placement.instance_id == track.instance_id
-                    && (start..=last).contains(&placement.frame)
+            .flat_map(|track| {
+                let last = start + (track.poses.len() - 1) as u16;
+                key_frames(start, last, step).map(move |frame| (track.start.layer_id, frame))
             })
-            .map(|(index, placement)| (placement.frame, index))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect::<Vec<_>>();
-        keys.sort_unstable();
-        for (position, &(frame, index)) in keys.iter().enumerate() {
-            let placement = &mut layer.placements[index];
-            if frame > start {
-                let pose = track.poses[usize::from(frame - start)];
-                placement.transform = posed_transform(&track.start, pose);
-                keyed += 1;
-            }
-            if frame < last {
-                let next = keys.get(position + 1).map_or(last, |(next, _)| *next);
-                placement.tween = if next > frame + 1 {
-                    Tween::Linear { to_frame: next }
-                } else {
-                    Tween::None
-                };
+        crate::timeline_edit::materialize_keyframes_at_cells(project, q0rg_id, &cells)
+            .ok_or("could not add keyframes there")?;
+        let q0rg = project
+            .q0rgs
+            .iter_mut()
+            .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+            .ok_or("the timeline is gone")?;
+        for track in moving {
+            let Some(layer) = q0rg
+                .layers
+                .iter_mut()
+                .find(|layer| layer.layer_id == track.start.layer_id)
+            else {
+                continue;
+            };
+            let last = start + (track.poses.len() - 1) as u16;
+            // Every key of the body in the range follows the simulation, keys
+            // that were there already included, and tweens to the next one.
+            // An authored blank key leaves the object gone on that frame.
+            let mut keys = layer
+                .placements
+                .iter()
+                .enumerate()
+                .filter(|(_, placement)| {
+                    placement.instance_id == track.instance_id
+                        && (start..=last).contains(&placement.frame)
+                })
+                .map(|(index, placement)| (placement.frame, index))
+                .collect::<Vec<_>>();
+            keys.sort_unstable();
+            for (position, &(frame, index)) in keys.iter().enumerate() {
+                let placement = &mut layer.placements[index];
+                if frame > start {
+                    let pose = track.poses[usize::from(frame - start)];
+                    placement.transform =
+                        posed_transform(track.start.transform, track.start_pose, pose);
+                    keyed += 1;
+                }
+                if frame < last {
+                    let next = keys.get(position + 1).map_or(last, |(next, _)| *next);
+                    placement.tween = if next > frame + 1 {
+                        Tween::Linear { to_frame: next }
+                    } else {
+                        Tween::None
+                    };
+                }
             }
         }
     }
+    if with_liquids {
+        keyed += bake_liquids(project, simulation)?;
+    }
+    if with_links {
+        keyed += crate::physics_links::bake_links(project, simulation)?;
+    }
     Ok(keyed)
+}
+
+/// Draws every liquid of `simulation` on its own layer, a filled drawing per
+/// frame, replacing what an earlier bake drew over the same frames.
+fn bake_liquids(project: &mut ProjectV2, simulation: &Simulation) -> Result<usize, String> {
+    use crate::sim_bake;
+    let q0rg_id = simulation.q0rg_id;
+    let start = simulation.start_frame;
+    let mut ids = sim_bake::AssetIds::new(project);
+    let mut drawn = 0;
+    for track in &simulation.liquids {
+        let Some(liquid) = project
+            .runtime
+            .physics
+            .liquids
+            .iter()
+            .find(|liquid| liquid.q0rg_id == q0rg_id && liquid.liquid_id == track.liquid_id)
+            .cloned()
+        else {
+            continue;
+        };
+        let layer_id = sim_bake::effect_layer(project, q0rg_id, liquid.layer_id, &liquid.name)?;
+        if let Some(stored) = project
+            .runtime
+            .physics
+            .liquid_mut(q0rg_id, liquid.liquid_id)
+        {
+            stored.layer_id = Some(layer_id);
+        }
+        let last = start + (track.frames.len().max(1) - 1) as u16;
+        let folder = format!("{}/{}", sim_bake::PHYSICS_FOLDER, liquid.name);
+        sim_bake::clear_range(
+            project,
+            q0rg_id,
+            layer_id,
+            start,
+            last,
+            sim_bake::PHYSICS_FOLDER,
+        );
+        for (offset, particles) in track.frames.iter().enumerate() {
+            let frame = start + offset as u16;
+            let outlines =
+                q0physics::contour::liquid_outline(particles, liquid.spacing, liquid.smoothness);
+            let placements = if outlines.is_empty() {
+                Vec::new()
+            } else {
+                let paths = outlines
+                    .iter()
+                    .map(|outline| sim_bake::polygon_path(outline))
+                    .collect();
+                let asset_id = sim_bake::add_drawing(
+                    project,
+                    &mut ids,
+                    paths,
+                    liquid.color,
+                    format!("{} {}", liquid.name, u32::from(frame) + 1),
+                    &folder,
+                )?;
+                vec![Placement {
+                    pivot: None,
+                    instance_id: 0,
+                    frame,
+                    target: Target::Asset(asset_id),
+                    transform: Transform2D::IDENTITY,
+                    tween: Tween::None,
+                    fx: Default::default(),
+                }]
+            };
+            sim_bake::key_frame(project, q0rg_id, layer_id, frame, placements);
+            drawn += 1;
+        }
+        sim_bake::reach_frame(project, q0rg_id, layer_id, last);
+    }
+    Ok(drawn)
 }
 
 /// The frames a bake keys: every frame after the start, or with a wider
@@ -588,7 +808,7 @@ fn key_frames(start: u16, last: u16, step: u16) -> impl Iterator<Item = u16> {
 }
 
 /// Removes the keys after the start frame on the layers of falling bodies,
-/// or of `only` that one.
+/// or of `only` that one, and the liquids drawn over the same frames.
 pub fn clear_baked(
     project: &mut ProjectV2,
     q0rg_id: u16,
@@ -601,9 +821,7 @@ pub fn clear_baked(
         .cloned()
         .ok_or("this timeline has no physics")?;
     let first = scene.start_frame.saturating_add(1);
-    if first > scene.end_frame {
-        return Ok(0);
-    }
+    let mut bounds = Bounds::new();
     let layers = project
         .runtime
         .physics
@@ -614,7 +832,15 @@ pub fn clear_baked(
                 && body.kind == BodyKind::Dynamic
                 && only.is_none_or(|only| only == body.instance_id)
         })
-        .filter_map(|body| fit_body(project, q0rg_id, body.instance_id, scene.start_frame))
+        .filter_map(|body| {
+            fit_body_with(
+                project,
+                q0rg_id,
+                body.instance_id,
+                scene.start_frame,
+                &mut bounds,
+            )
+        })
         .map(|fit| fit.layer_id)
         .collect::<BTreeSet<_>>();
     if let Some(locked) = layers
@@ -627,20 +853,54 @@ pub fn clear_baked(
         ));
     }
     let mut removed = 0;
-    for layer_id in layers {
-        removed += crate::timeline_edit::remove_selected_keyframes(
-            project,
-            q0rg_id,
-            TimelineSelection {
-                anchor_layer_id: layer_id,
-                anchor_frame: first,
-                focus_layer_id: layer_id,
-                focus_frame: scene.end_frame,
-            },
-        )
-        .unwrap_or(0);
+    if first <= scene.end_frame {
+        for layer_id in layers {
+            removed += crate::timeline_edit::remove_selected_keyframes(
+                project,
+                q0rg_id,
+                TimelineSelection {
+                    anchor_layer_id: layer_id,
+                    anchor_frame: first,
+                    focus_layer_id: layer_id,
+                    focus_frame: scene.end_frame,
+                },
+            )
+            .unwrap_or(0);
+        }
+    }
+    if only.is_none() {
+        let mut liquid_layers = project
+            .runtime
+            .physics
+            .liquids
+            .iter()
+            .filter(|liquid| liquid.q0rg_id == q0rg_id)
+            .filter_map(|liquid| liquid.layer_id)
+            .collect::<Vec<_>>();
+        liquid_layers.extend(crate::physics_links::baked_layers(project, q0rg_id));
+        for layer_id in liquid_layers {
+            let before = keyframe_count(project, q0rg_id, layer_id);
+            crate::sim_bake::clear_range(
+                project,
+                q0rg_id,
+                layer_id,
+                scene.start_frame,
+                scene.end_frame,
+                crate::sim_bake::PHYSICS_FOLDER,
+            );
+            removed += before.saturating_sub(keyframe_count(project, q0rg_id, layer_id));
+        }
     }
     Ok(removed)
+}
+
+fn keyframe_count(project: &ProjectV2, q0rg_id: u16, layer_id: u16) -> usize {
+    project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+        .and_then(|q0rg| q0rg.layers.iter().find(|layer| layer.layer_id == layer_id))
+        .map_or(0, |layer| layer.keyframe_frames().len())
 }
 
 fn layer_name(project: &ProjectV2, q0rg_id: u16, layer_id: u16) -> String {
@@ -658,6 +918,37 @@ fn layer_name(project: &ProjectV2, q0rg_id: u16, layer_id: u16) -> String {
 fn wrap_angle(angle: f32) -> f32 {
     let wrapped = (angle + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU);
     wrapped - std::f32::consts::PI
+}
+
+/// A copy of `project` for q0player: only the physics worlds and particle
+/// emitters it runs live, with the bounds of the bodies it cannot measure.
+pub fn for_player(project: &ProjectV2) -> ProjectV2 {
+    let mut copy = project.clone();
+    copy.runtime.physics.retain_live();
+    copy.runtime.particles.retain_live();
+    let mut bounds = Bounds::new();
+    let physics = &mut copy.runtime.physics;
+    for body in &mut physics.bodies {
+        let target = project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == body.q0rg_id)
+            .and_then(|q0rg| {
+                q0rg.layers
+                    .iter()
+                    .flat_map(|layer| &layer.placements)
+                    .find(|placement| placement.instance_id == body.instance_id)
+            })
+            .map(|placement| placement.target);
+        body.bounds = target.and_then(|target| target_bounds(project, target, &mut bounds));
+        let frame = physics
+            .scenes
+            .iter()
+            .find(|scene| scene.q0rg_id == body.q0rg_id)
+            .map_or(0, |scene| scene.start_frame);
+        body.outline = body_parts(project, body, frame);
+    }
+    copy
 }
 
 /// Makes the selected objects of the open timeline physics bodies. Returns
@@ -691,7 +982,77 @@ fn add_selected(app: &mut EditorApp) -> usize {
     added
 }
 
+/// The selected object of `q0rg_id`, given an instance id of its own if it
+/// has none yet, so lights and emitters can follow it.
+pub(crate) fn follow_target(app: &mut EditorApp, q0rg_id: u16) -> Option<u32> {
+    let reference =
+        crate::selection_edit::selected_object_refs(&app.state.project, &app.session.selection)
+            .into_iter()
+            .find(|reference| reference.q0rg_id == q0rg_id)?;
+    crate::rigging::ensure_selected_track_instance_id(
+        &mut app.state.project,
+        q0rg_id,
+        reference.layer_id,
+        reference.placement_idx,
+        app.session.current_frame,
+    )
+    .map(|(instance_id, _)| instance_id)
+}
+
+/// Whether an object of `q0rg_id` is selected.
+pub(crate) fn has_selection_on(app: &EditorApp, q0rg_id: u16) -> bool {
+    crate::selection_edit::selected_object_refs(&app.state.project, &app.session.selection)
+        .into_iter()
+        .any(|reference| reference.q0rg_id == q0rg_id)
+}
+
+/// The stage area the selected object covers, min x, min y, width, height.
+pub fn selection_area(app: &EditorApp) -> Option<[f32; 4]> {
+    let project = &app.state.project;
+    let reference = crate::selection_edit::selected_object_refs(project, &app.session.selection)
+        .into_iter()
+        .next()?;
+    let placement = project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == reference.q0rg_id)?
+        .layers
+        .iter()
+        .find(|layer| layer.layer_id == reference.layer_id)?
+        .placements
+        .get(reference.placement_idx)?;
+    let [min_x, min_y, max_x, max_y] =
+        target_bounds(project, placement.target, &mut Bounds::new())?;
+    let affine = Affine::from_transform(placement.transform);
+    let corners = [
+        Vec2::new(min_x, min_y),
+        Vec2::new(max_x, min_y),
+        Vec2::new(max_x, max_y),
+        Vec2::new(min_x, max_y),
+    ]
+    .map(|corner| affine.apply(corner));
+    let left = corners.iter().map(|c| c.x).fold(f32::INFINITY, f32::min);
+    let top = corners.iter().map(|c| c.y).fold(f32::INFINITY, f32::min);
+    let right = corners
+        .iter()
+        .map(|c| c.x)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let bottom = corners
+        .iter()
+        .map(|c| c.y)
+        .fold(f32::NEG_INFINITY, f32::max);
+    Some([left, top, (right - left).max(1.0), (bottom - top).max(1.0)])
+}
+
 fn body_name(project: &ProjectV2, q0rg_id: u16, instance_id: u32) -> String {
+    if let Some(name) = project
+        .runtime
+        .instance_names
+        .get(&InstanceKey::new(q0rg_id, instance_id))
+        .filter(|name| !name.is_empty())
+    {
+        return name.clone();
+    }
     let target = project
         .q0rgs
         .iter()
@@ -719,12 +1080,12 @@ fn body_name(project: &ProjectV2, q0rg_id: u16, instance_id: u32) -> String {
 
 /// Names for `instance_ids`, numbered where several copies of one symbol or
 /// drawing would otherwise read the same.
-fn body_names(project: &ProjectV2, q0rg_id: u16, instance_ids: &[u32]) -> Vec<String> {
+fn body_names(app: &EditorApp, instance_ids: &[u32]) -> Vec<String> {
     let names = instance_ids
         .iter()
-        .map(|instance_id| body_name(project, q0rg_id, *instance_id))
+        .map(|instance_id| cached_name(app, *instance_id))
         .collect::<Vec<_>>();
-    let mut seen = std::collections::HashMap::<&str, usize>::new();
+    let mut seen = HashMap::<&str, usize>::new();
     names
         .iter()
         .map(|name| {
@@ -810,26 +1171,115 @@ fn shape_label(shape: ColliderShape) -> &'static str {
     match shape {
         ColliderShape::Box => "Box",
         ColliderShape::Circle => "Circle",
+        ColliderShape::Capsule => "Capsule",
+        ColliderShape::Hull => "Hull",
+        ColliderShape::Outline => "Outline",
     }
+}
+
+fn shape_hint(shape: ColliderShape) -> &'static str {
+    match shape {
+        ColliderShape::Box => "the object's bounds",
+        ColliderShape::Circle => "rolls; as wide as the longer side",
+        ColliderShape::Capsule => "a pill: rolls on its ends, rests on its sides",
+        ColliderShape::Hull => "shrink-wrapped around the drawing's points",
+        ColliderShape::Outline => "follows every dent and hole of the drawing",
+    }
+}
+
+/// Shape, size, offset and turn of a body's collider.
+fn render_hitbox(
+    ui: &mut Ui,
+    edit: &mut Edit,
+    body: &mut PhysicsBody,
+    mode: RigMode,
+    dim: Color32,
+) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("Hitbox").strong());
+        for shape in ColliderShape::ALL {
+            edit.choice(ui, &mut body.shape, shape, shape_label(shape));
+        }
+    });
+    ui.label(RichText::new(shape_hint(body.shape)).small().color(dim));
+    egui::Grid::new(("physics_hitbox", mode == RigMode::Pro))
+        .num_columns(2)
+        .spacing([10.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("Size");
+            ui.horizontal(|ui| {
+                edit.slider(ui, &mut body.shape_scale, 0.2..=3.0, false);
+            });
+            ui.end_row();
+            if mode == RigMode::Pro {
+                ui.label("Width, height");
+                ui.horizontal(|ui| {
+                    edit.drag(ui, &mut body.size[0], 0.01, 0.05..=20.0, "× w");
+                    edit.drag(ui, &mut body.size[1], 0.01, 0.05..=20.0, "× h");
+                });
+                ui.end_row();
+            }
+            ui.label("Offset");
+            ui.horizontal(|ui| {
+                edit.drag(ui, &mut body.offset[0], 0.5, -100_000.0..=100_000.0, " x");
+                edit.drag(ui, &mut body.offset[1], 0.5, -100_000.0..=100_000.0, " y");
+            });
+            ui.end_row();
+            if mode == RigMode::Pro {
+                ui.label("Turn");
+                edit.drag(ui, &mut body.turn, 1.0, -36_000.0..=36_000.0, "°");
+                ui.end_row();
+            }
+            if body.shape.follows_artwork() {
+                ui.label("");
+                edit.checkbox(ui, &mut body.follow_art, "Reshapes as the drawing changes");
+                ui.end_row();
+            }
+        });
+    ui.horizontal(|ui| {
+        let plain = body.shape_scale == 1.0
+            && body.size == [1.0, 1.0]
+            && body.offset == [0.0, 0.0]
+            && body.turn == 0.0;
+        if ui
+            .add_enabled(!plain, egui::Button::new("Reset hitbox").small())
+            .clicked()
+        {
+            body.shape_scale = 1.0;
+            body.size = [1.0, 1.0];
+            body.offset = [0.0, 0.0];
+            body.turn = 0.0;
+            edit.snapshot = true;
+            edit.changed = true;
+        }
+        ui.label(
+            RichText::new("or drag it on the stage: middle moves, edges resize, the dot turns")
+                .small()
+                .color(dim),
+        );
+    });
 }
 
 /// Collects what the widgets of one frame did, so a whole drag is one undo
 /// step and a click is one too.
 #[derive(Default)]
-struct Edit {
-    snapshot: bool,
-    changed: bool,
+pub(crate) struct Edit {
+    pub(crate) snapshot: bool,
+    pub(crate) changed: bool,
+    /// "Follow the selected object" was pressed; the window attaches it
+    /// once it may change the project.
+    pub(crate) follow_selection: bool,
 }
 
 impl Edit {
-    fn note(&mut self, response: &egui::Response) {
+    pub(crate) fn note(&mut self, response: &egui::Response) {
         self.snapshot |= response.drag_started()
             || response.gained_focus()
             || (response.changed() && !response.dragged() && !response.has_focus());
         self.changed |= response.changed();
     }
 
-    fn drag(
+    pub(crate) fn drag(
         &mut self,
         ui: &mut Ui,
         value: &mut f32,
@@ -847,7 +1297,7 @@ impl Edit {
         self.note(&response);
     }
 
-    fn slider(
+    pub(crate) fn slider(
         &mut self,
         ui: &mut Ui,
         value: &mut f32,
@@ -858,13 +1308,38 @@ impl Edit {
         self.note(&response);
     }
 
-    fn checkbox(&mut self, ui: &mut Ui, value: &mut bool, label: &str) {
+    pub(crate) fn checkbox(&mut self, ui: &mut Ui, value: &mut bool, label: &str) {
         let response = ui.checkbox(value, label);
         self.note(&response);
     }
 
-    fn choice<T: PartialEq>(&mut self, ui: &mut Ui, value: &mut T, option: T, label: &str) {
+    pub(crate) fn choice<T: PartialEq>(
+        &mut self,
+        ui: &mut Ui,
+        value: &mut T,
+        option: T,
+        label: &str,
+    ) {
         let response = ui.selectable_value(value, option, label);
+        self.note(&response);
+    }
+
+    pub(crate) fn text(&mut self, ui: &mut Ui, value: &mut String, width: f32) {
+        let response = ui.add(egui::TextEdit::singleline(value).desired_width(width));
+        self.note(&response);
+    }
+
+    pub(crate) fn color(&mut self, ui: &mut Ui, value: &mut Rgba) {
+        let mut color = Color32::from_rgba_unmultiplied(value.r, value.g, value.b, value.a);
+        let response = egui::color_picker::color_edit_button_srgba(
+            ui,
+            &mut color,
+            egui::color_picker::Alpha::OnlyBlend,
+        );
+        if response.changed() {
+            let [r, g, b, a] = color.to_srgba_unmultiplied();
+            *value = Rgba { r, g, b, a };
+        }
         self.note(&response);
     }
 }
@@ -874,12 +1349,11 @@ pub fn render_window(app: &mut EditorApp, ctx: &Context) {
     if !app.settings.physics_enabled || !app.session.physics.open {
         return;
     }
-    refresh_preview(app, ctx);
     let mut open = true;
     egui::Window::new("Physics")
         .open(&mut open)
-        .default_size([380.0, 600.0])
-        .default_pos(ctx.screen_rect().right_top() + egui::vec2(-420.0, 80.0))
+        .default_size([390.0, 620.0])
+        .default_pos(ctx.screen_rect().right_top() + egui::vec2(-430.0, 80.0))
         .max_height((ctx.screen_rect().height() - 110.0).max(320.0))
         .resizable(true)
         .fit_to_screen(ctx)
@@ -890,62 +1364,15 @@ pub fn render_window(app: &mut EditorApp, ctx: &Context) {
     }
 }
 
-/// The real project with the simulation baked in, for the stage to draw
-/// while previewing. `None` while the preview is out of date.
-pub fn stage_preview(app: &EditorApp) -> Option<(Arc<ProjectV2>, u64)> {
-    if !app.settings.physics_enabled || !app.session.physics.open {
-        return None;
-    }
-    let preview = app.session.physics.preview.as_ref()?;
-    (preview.source_revision == app.state.revision)
-        .then(|| (Arc::clone(&preview.project), preview.revision))
-}
-
-/// Re-simulates the preview after any change, once a drag has let go.
-fn refresh_preview(app: &mut EditorApp, ctx: &Context) {
-    let q0rg_id = app.session.current_q0rg_id;
+/// What the preview job should bake for physics right now, if anything.
+pub fn preview_request(app: &EditorApp) -> Option<(u16, BakeOptions)> {
     let physics = &app.session.physics;
-    if !physics.previewing {
-        return;
-    }
-    let options = physics.bake_options();
-    let fresh = physics.preview.as_ref().is_some_and(|preview| {
-        preview.source_revision == app.state.revision
-            && preview.options == options
-            && preview.q0rg_id == q0rg_id
-    });
-    if fresh || ctx.input(|input| input.pointer.any_down()) {
-        return;
-    }
-    let result = simulate(&app.state.project, q0rg_id).and_then(|simulation| {
-        let mut project = app.state.project.clone();
-        let keyed = bake(&mut project, &simulation, options)?;
-        Ok((simulation, project, keyed))
-    });
-    let physics = &mut app.session.physics;
-    match result {
-        Ok((simulation, project, keyed)) => {
-            physics.preview_serial = physics.preview_serial.wrapping_add(1);
-            physics.message = format!(
-                "Previewing {keyed} keys on frames {} to {}. Play or scrub to watch; nothing is keyed until you bake.",
-                u32::from(simulation.start_frame) + 2,
-                u32::from(simulation.last_frame()) + 1
-            );
-            physics.preview = Some(Preview {
-                simulation: Arc::new(simulation),
-                project: Arc::new(project),
-                revision: (1 << 62) | physics.preview_serial,
-                source_revision: app.state.revision,
-                options,
-                q0rg_id,
-            });
-        }
-        Err(error) => {
-            physics.stop_preview();
-            physics.message = format!("Preview stopped: {error}");
-        }
-    }
-    ctx.request_repaint();
+    let q0rg_id = app.session.current_q0rg_id;
+    (app.settings.physics_enabled
+        && physics.open
+        && physics.previewing
+        && app.state.project.runtime.physics.scene(q0rg_id).is_some())
+    .then(|| (q0rg_id, physics.bake_options()))
 }
 
 fn render_contents(app: &mut EditorApp, ui: &mut Ui) {
@@ -961,7 +1388,7 @@ fn render_contents(app: &mut EditorApp, ui: &mut Ui) {
     ui.label(
         RichText::new(match mode {
             RigMode::Simple => "pick objects, say how they behave, bake them into keys",
-            RigMode::Pro => "every number of the world and of each body",
+            RigMode::Pro => "every number of the world, each body and each liquid",
         })
         .small()
         .color(dim),
@@ -979,7 +1406,7 @@ fn render_contents(app: &mut EditorApp, ui: &mut Ui) {
         ui.label(format!("\"{timeline}\" has no physics yet."));
         ui.label(
             RichText::new(
-                "Objects fall from the current frame on; the result becomes ordinary keyframes.",
+                "Objects fall and liquids pour from the current frame on; the result becomes ordinary keyframes.",
             )
             .small()
             .color(dim),
@@ -1004,6 +1431,7 @@ fn render_contents(app: &mut EditorApp, ui: &mut Ui) {
     render_bake_controls(app, ui, q0rg_id, &scene, dim);
     ui.separator();
     egui::ScrollArea::vertical()
+        .id_source("physics_setup")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             let Some(mut scene) = app.state.project.runtime.physics.scene(q0rg_id).cloned() else {
@@ -1015,7 +1443,10 @@ fn render_contents(app: &mut EditorApp, ui: &mut Ui) {
                 "World",
                 "What pulls on the bodies and what holds them in",
             );
-            render_scene(ui, &mut edit, &mut scene, mode, dim);
+            let world_ui_id = (app.active_project_tab_id(), q0rg_id);
+            ui.push_id(world_ui_id, |ui| {
+                render_scene(ui, &mut edit, &mut scene, mode, dim);
+            });
             if edit.changed || edit.snapshot {
                 store_scene(app, &edit, scene.clone());
             }
@@ -1028,12 +1459,30 @@ fn render_contents(app: &mut EditorApp, ui: &mut Ui) {
             );
             render_bodies(app, ui, q0rg_id, &scene, dim);
 
+            ui.add_space(8.0);
+            crate::theme::section_heading(
+                ui,
+                "Links",
+                "Ropes, chains, springs and hinges that tie objects together",
+            );
+            crate::physics_links::render_links(app, ui, q0rg_id, mode, dim);
+
+            ui.add_space(8.0);
+            crate::theme::section_heading(
+                ui,
+                "Liquids",
+                "Water, honey or slime that pours, splashes and floats things",
+            );
+            render_liquids(app, ui, q0rg_id, mode, dim);
+
             if mode == RigMode::Pro {
                 ui.add_space(8.0);
                 ui.separator();
                 if ui
                     .small_button("Remove physics from this timeline")
-                    .on_hover_text("Forget the world and its bodies; keys already baked stay")
+                    .on_hover_text(
+                        "Forget the world, its bodies, links and liquids; keys already baked stay",
+                    )
                     .clicked()
                 {
                     app.history
@@ -1041,6 +1490,8 @@ fn render_contents(app: &mut EditorApp, ui: &mut Ui) {
                     let physics = &mut app.state.project.runtime.physics;
                     physics.scenes.retain(|scene| scene.q0rg_id != q0rg_id);
                     physics.bodies.retain(|body| body.q0rg_id != q0rg_id);
+                    physics.liquids.retain(|liquid| liquid.q0rg_id != q0rg_id);
+                    physics.links.retain(|link| link.q0rg_id != q0rg_id);
                     app.state.mark_dirty();
                     app.session.physics.stop_preview();
                     app.session.status = "physics removed from this timeline".to_string();
@@ -1065,7 +1516,7 @@ fn store_scene(app: &mut EditorApp, edit: &Edit, scene: PhysicsScene) {
 }
 
 /// The frames selected on the timeline of `q0rg_id`, first and last.
-fn selected_timeline_frames(app: &EditorApp, q0rg_id: u16) -> Option<(u16, u16)> {
+pub(crate) fn selected_timeline_frames(app: &EditorApp, q0rg_id: u16) -> Option<(u16, u16)> {
     if let Some((selected_q0rg, cells)) = &app.session.timeline_cell_selection {
         if *selected_q0rg == q0rg_id && !cells.is_empty() {
             let first = cells.iter().map(|(_, frame)| *frame).min()?;
@@ -1080,13 +1531,15 @@ fn selected_timeline_frames(app: &EditorApp, q0rg_id: u16) -> Option<(u16, u16)>
     ))
 }
 
-fn render_bake_controls(
-    app: &mut EditorApp,
+/// The "Frames from to" row and its shortcuts. Returns the picked range when
+/// it changed, and whether the change wants an undo step of its own.
+pub(crate) fn render_range(
+    app: &EditorApp,
     ui: &mut Ui,
     q0rg_id: u16,
-    scene: &PhysicsScene,
+    range: (u16, u16),
     dim: Color32,
-) {
+) -> (Option<(u16, u16)>, Edit) {
     let fps = app.state.project.meta.fps.max(1);
     let timeline_last = app
         .state
@@ -1095,24 +1548,22 @@ fn render_bake_controls(
         .iter()
         .find(|q0rg| q0rg.q0rg_id == q0rg_id)
         .map_or(0, |q0rg| q0rg.frame_count.saturating_sub(1));
-    let mut range = scene.clone();
     let mut edit = Edit::default();
+    let (mut start, mut end) = range;
     ui.horizontal_wrapped(|ui| {
         // Frames are numbered from 1, the way the timeline shows them.
         ui.label("Frames");
-        let mut first = u32::from(range.start_frame) + 1;
-        let mut last = u32::from(range.end_frame) + 1;
+        let mut first = u32::from(start) + 1;
+        let mut last = u32::from(end) + 1;
         let response =
             ui.add(egui::DragValue::new(&mut first).clamp_range(1..=u32::from(u16::MAX)));
         edit.note(&response);
         ui.label("to");
         let response = ui.add(egui::DragValue::new(&mut last).clamp_range(1..=u32::from(u16::MAX)));
         edit.note(&response);
-        range.start_frame = u16::try_from(first - 1).unwrap_or(u16::MAX - 1);
-        range.end_frame = u16::try_from(last - 1)
-            .unwrap_or(u16::MAX - 1)
-            .max(range.start_frame);
-        let frames = u32::from(range.end_frame - range.start_frame) + 1;
+        start = u16::try_from(first - 1).unwrap_or(u16::MAX - 1);
+        end = u16::try_from(last - 1).unwrap_or(u16::MAX - 1).max(start);
+        let frames = u32::from(end - start) + 1;
         ui.label(
             RichText::new(format!(
                 "{frames} frames, {:.1} s",
@@ -1131,15 +1582,14 @@ fn render_bake_controls(
             .on_hover_text("Start on the current frame and keep the length")
             .clicked()
         {
-            let length = range.end_frame - range.start_frame;
-            pick = Some((current, current.saturating_add(length)));
+            pick = Some((current, current.saturating_add(end - start)));
         }
         if ui
             .small_button("To the end")
             .on_hover_text("Run on to the last frame of the timeline")
             .clicked()
         {
-            pick = Some((range.start_frame, timeline_last));
+            pick = Some((start, timeline_last));
         }
         if ui
             .small_button("Whole timeline")
@@ -1159,14 +1609,30 @@ fn render_bake_controls(
         {
             pick = selection;
         }
-        if let Some((start, end)) = pick {
-            range.start_frame = start.min(u16::MAX - 1);
-            range.end_frame = end.max(range.start_frame);
+        if let Some((first, last)) = pick {
+            start = first.min(u16::MAX - 1);
+            end = last.max(start);
             edit.snapshot = true;
-            edit.changed = range != *scene;
+            edit.changed = true;
         }
     });
-    if edit.changed || edit.snapshot {
+    let changed = (start, end) != range;
+    edit.changed &= changed;
+    ((changed || edit.snapshot).then_some((start, end)), edit)
+}
+
+fn render_bake_controls(
+    app: &mut EditorApp,
+    ui: &mut Ui,
+    q0rg_id: u16,
+    scene: &PhysicsScene,
+    dim: Color32,
+) {
+    let (picked, edit) = render_range(app, ui, q0rg_id, (scene.start_frame, scene.end_frame), dim);
+    if let Some((start, end)) = picked {
+        let mut range = scene.clone();
+        range.start_frame = start;
+        range.end_frame = end;
         store_scene(app, &edit, range);
     }
 
@@ -1189,7 +1655,7 @@ fn render_bake_controls(
         }
         if ui
             .button(RichText::new("Bake keys").strong())
-            .on_hover_text("Simulate and key the falling bodies over these frames")
+            .on_hover_text("Simulate and key the falling bodies and liquids over these frames")
             .clicked()
         {
             bake_into_project(app, q0rg_id);
@@ -1197,7 +1663,7 @@ fn render_bake_controls(
         if ui
             .button("Remove keys")
             .on_hover_text(
-                "Remove the keyframes after the start frame, over these frames, on the layers of the falling bodies",
+                "Remove the keyframes after the start frame, over these frames, on the layers of the falling bodies, and the liquids drawn there",
             )
             .clicked()
         {
@@ -1208,7 +1674,7 @@ fn render_bake_controls(
         let has_selected = app.session.physics.selected_body.is_some();
         ui.add_enabled_ui(has_selected, |ui| {
             ui.checkbox(&mut app.session.physics.only_selected, "Only the selected body")
-                .on_hover_text("Key just the body picked below; the others still bump into it");
+                .on_hover_text("Key just the body picked below; the others still bump into it, and liquids stay as they are");
         });
         if app.session.physics.mode == RigMode::Pro {
             ui.label("Key every");
@@ -1225,12 +1691,13 @@ fn render_bake_controls(
             app.session.physics.key_step = step;
         }
     });
+    let note = crate::sim_preview::status_note(app, crate::sim_preview::Part::Physics);
     let message = &app.session.physics.message;
-    let message = if message.is_empty() {
+    let message = note.as_deref().unwrap_or(if message.is_empty() {
         "Put falling objects on their own layers: a bake keys everything on their layers."
     } else {
         message.as_str()
-    };
+    });
     ui.label(RichText::new(message).small().color(dim));
 }
 
@@ -1256,8 +1723,8 @@ fn bake_into_project(app: &mut EditorApp, q0rg_id: u16) {
             report(
                 app,
                 format!(
-                    "Baked {keyed} keys on frames {} to {}. Undo takes them back.",
-                    u32::from(start) + 2,
+                    "Baked {keyed} keys and liquid frames on frames {} to {}. Undo takes them back.",
+                    u32::from(start) + 1,
                     u32::from(last) + 1
                 ),
             );
@@ -1287,7 +1754,7 @@ fn clear_from_project(app: &mut EditorApp, q0rg_id: u16) {
     }
 }
 
-fn apply_edit(app: &mut EditorApp, edit: &Edit, change: impl FnOnce(&mut ProjectV2)) {
+pub(crate) fn apply_edit(app: &mut EditorApp, edit: &Edit, change: impl FnOnce(&mut ProjectV2)) {
     if edit.snapshot {
         app.history
             .snapshot_with_session(&app.state.project, &app.session);
@@ -1314,6 +1781,8 @@ fn render_scene(
     mode: RigMode,
     dim: Color32,
 ) {
+    render_canvas_collisions(ui, edit, scene, mode);
+    ui.add_space(4.0);
     egui::Grid::new("physics_scene")
         .num_columns(2)
         .spacing([10.0, 6.0])
@@ -1333,23 +1802,6 @@ fn render_scene(
                     }
                 });
                 ui.end_row();
-                ui.label("Walls");
-                ui.horizontal_wrapped(|ui| {
-                    wall_checkbox(ui, edit, &mut scene.walls, WALL_BOTTOM, "Floor");
-                    let mut sides =
-                        scene.walls & (WALL_LEFT | WALL_RIGHT) == WALL_LEFT | WALL_RIGHT;
-                    let before = sides;
-                    edit.checkbox(ui, &mut sides, "Sides");
-                    if sides != before {
-                        scene.walls = if sides {
-                            scene.walls | WALL_LEFT | WALL_RIGHT
-                        } else {
-                            scene.walls & !(WALL_LEFT | WALL_RIGHT)
-                        };
-                    }
-                    wall_checkbox(ui, edit, &mut scene.walls, WALL_TOP, "Ceiling");
-                });
-                ui.end_row();
             }
             RigMode::Pro => {
                 ui.label("Gravity");
@@ -1365,18 +1817,22 @@ fn render_scene(
                 ui.label("Time scale");
                 edit.drag(ui, &mut scene.time_scale, 0.01, 0.05..=8.0, "×");
                 ui.end_row();
-                ui.label("Steps per frame");
-                let response =
-                    ui.add(egui::DragValue::new(&mut scene.substeps).clamp_range(1..=16));
+                ui.label("Simulation rate");
+                let mut step_rate = u16::from(scene.substeps.clamp(1, 16)) * 60;
+                let response = ui
+                    .add(
+                        egui::DragValue::new(&mut step_rate)
+                            .speed(60.0)
+                            .clamp_range(60..=960)
+                            .suffix(" Hz"),
+                    )
+                    .on_hover_text(
+                        "Steps per simulated second, independent of the movie's fps. Higher rates improve collisions, ropes and liquids; gravity and speed stay the same.",
+                    );
                 edit.note(&response);
-                ui.end_row();
-                ui.label("Walls");
-                ui.horizontal_wrapped(|ui| {
-                    wall_checkbox(ui, edit, &mut scene.walls, WALL_LEFT, "Left");
-                    wall_checkbox(ui, edit, &mut scene.walls, WALL_RIGHT, "Right");
-                    wall_checkbox(ui, edit, &mut scene.walls, WALL_TOP, "Top");
-                    wall_checkbox(ui, edit, &mut scene.walls, WALL_BOTTOM, "Bottom");
-                });
+                if response.changed() {
+                    scene.substeps = ((step_rate + 30) / 60).clamp(1, 16) as u8;
+                }
                 ui.end_row();
                 ui.label("Wall bounce");
                 edit.slider(ui, &mut scene.wall_bounce, 0.0..=1.0, false);
@@ -1400,6 +1856,69 @@ fn render_scene(
             .color(dim),
         );
     }
+    edit.checkbox(ui, &mut scene.live, "Live in q0player");
+    ui.label(
+        RichText::new(if scene.live {
+            "q0lang can run this world while the movie plays: import q0.physics, then q0physics.start!, push!, gravity!…"
+        } else {
+            "On, q0lang scripts can run this world live in q0player instead of playing baked keys."
+        })
+        .small()
+        .color(dim),
+    );
+}
+
+fn render_canvas_collisions(ui: &mut Ui, edit: &mut Edit, scene: &mut PhysicsScene, mode: RigMode) {
+    let memory_id = ui.make_persistent_id("physics_canvas_collision_sides");
+    if scene.walls != 0 {
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(memory_id, scene.walls));
+    }
+    let mut enabled = scene.walls != 0;
+    let response = ui
+        .checkbox(&mut enabled, "Collide with canvas edges")
+        .on_hover_text(
+            "Use the original canvas borders as colliders. Turn off to let bodies, ropes and liquids move outside the canvas. Other object collisions stay enabled.",
+        );
+    edit.note(&response);
+    if response.changed() {
+        scene.walls = if enabled {
+            ui.ctx()
+                .data(|data| data.get_temp::<u8>(memory_id))
+                .filter(|walls| *walls != 0)
+                .unwrap_or(WALLS_ALL)
+        } else {
+            0
+        };
+    }
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.horizontal_wrapped(|ui| match mode {
+            RigMode::Simple => {
+                wall_checkbox(ui, edit, &mut scene.walls, WALL_BOTTOM, "Floor");
+                let mut sides = scene.walls & (WALL_LEFT | WALL_RIGHT) == WALL_LEFT | WALL_RIGHT;
+                let before = sides;
+                edit.checkbox(ui, &mut sides, "Sides");
+                if sides != before {
+                    scene.walls = if sides {
+                        scene.walls | WALL_LEFT | WALL_RIGHT
+                    } else {
+                        scene.walls & !(WALL_LEFT | WALL_RIGHT)
+                    };
+                }
+                wall_checkbox(ui, edit, &mut scene.walls, WALL_TOP, "Ceiling");
+            }
+            RigMode::Pro => {
+                wall_checkbox(ui, edit, &mut scene.walls, WALL_LEFT, "Left");
+                wall_checkbox(ui, edit, &mut scene.walls, WALL_RIGHT, "Right");
+                wall_checkbox(ui, edit, &mut scene.walls, WALL_TOP, "Top");
+                wall_checkbox(ui, edit, &mut scene.walls, WALL_BOTTOM, "Bottom");
+            }
+        });
+    });
+    if scene.walls != 0 {
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(memory_id, scene.walls));
+    }
 }
 
 fn wall_checkbox(ui: &mut Ui, edit: &mut Edit, walls: &mut u8, bit: u8, label: &str) {
@@ -1419,22 +1938,25 @@ fn render_bodies(
     scene: &PhysicsScene,
     dim: Color32,
 ) {
-    if ui
-        .button("Add selected objects")
-        .on_hover_text("Selected objects of this timeline join the physics")
-        .clicked()
-    {
-        let before = app.state.project.clone();
-        let added = add_selected(app);
-        if added > 0 {
-            app.history.snapshot_with_session(&before, &app.session);
-            app.state.mark_dirty();
-            app.session.status = format!("{added} physics bodies added");
-        } else {
-            app.state.project = before;
-            app.session.status = "select objects on the stage that are not bodies yet".to_string();
+    ui.horizontal(|ui| {
+        if ui
+            .button("Add selected objects")
+            .on_hover_text("Selected objects of this timeline join the physics")
+            .clicked()
+        {
+            let before = app.state.project.clone();
+            let added = add_selected(app);
+            if added > 0 {
+                app.history.snapshot_with_session(&before, &app.session);
+                app.state.mark_dirty();
+                app.session.status = format!("{added} physics bodies added");
+            } else {
+                app.state.project = before;
+                app.session.status =
+                    "select objects on the stage that are not bodies yet".to_string();
+            }
         }
-    }
+    });
 
     let bodies = app
         .state
@@ -1464,41 +1986,73 @@ fn render_bodies(
     }
     let mode = app.session.physics.mode;
     let ids = bodies.iter().map(|(id, _, _)| *id).collect::<Vec<_>>();
-    let names = body_names(&app.state.project, q0rg_id, &ids);
+    let names = body_names(app, &ids);
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut app.session.physics.filter)
+                .hint_text("Search bodies")
+                .desired_width(ui.available_width() - 70.0),
+        );
+        ui.label(
+            RichText::new(format!("{} bodies", bodies.len()))
+                .small()
+                .color(dim),
+        );
+    });
+    let filter = app.session.physics.filter.trim().to_lowercase();
     let mut remove = None;
-    for ((instance_id, kind, group), name) in bodies.iter().zip(&names) {
-        ui.horizontal(|ui| {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-            ui.painter()
-                .circle_filled(rect.center(), 4.5, group_color(*group));
-            let selected = app.session.physics.selected_body == Some(*instance_id);
-            let on_stage =
-                fit_body(&app.state.project, q0rg_id, *instance_id, scene.start_frame).is_some();
-            let label = if on_stage {
-                format!("{name} · {}", kind_label(*kind, mode))
-            } else {
-                format!("{name} · not on the start frame")
-            };
-            if ui.selectable_label(selected, label).clicked() {
-                app.session.physics.selected_body = Some(*instance_id);
-                select_on_stage(app, *instance_id);
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("Remove").clicked() {
-                    remove = Some(*instance_id);
+    let mut shown = 0;
+    egui::ScrollArea::vertical()
+        .id_source("physics_body_list")
+        .max_height(LIST_HEIGHT)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            for ((instance_id, kind, group), name) in bodies.iter().zip(&names) {
+                if !filter.is_empty()
+                    && !name.to_lowercase().contains(&filter)
+                    && !kind_label(*kind, mode).to_lowercase().contains(&filter)
+                {
+                    continue;
                 }
-            });
+                shown += 1;
+                ui.horizontal(|ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter()
+                        .circle_filled(rect.center(), 4.5, group_color(*group));
+                    let selected = app.session.physics.selected_body == Some(*instance_id);
+                    let on_stage = cached_fit(app, *instance_id, scene.start_frame).is_some();
+                    let label = if on_stage {
+                        format!("{name} · {}", kind_label(*kind, mode))
+                    } else {
+                        format!("{name} · not on the start frame")
+                    };
+                    if ui.selectable_label(selected, label).clicked() {
+                        app.session.physics.selected_body = Some(*instance_id);
+                        select_on_stage(app, *instance_id);
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Remove").clicked() {
+                            remove = Some(*instance_id);
+                        }
+                    });
+                });
+            }
+            if shown == 0 {
+                ui.label(RichText::new("No body matches.").small().color(dim));
+            }
         });
-    }
     if let Some(instance_id) = remove {
         app.history
             .snapshot_with_session(&app.state.project, &app.session);
-        app.state
-            .project
-            .runtime
-            .physics
+        let physics = &mut app.state.project.runtime.physics;
+        physics
             .bodies
             .retain(|body| !(body.q0rg_id == q0rg_id && body.instance_id == instance_id));
+        // Links tied to it go with it.
+        physics.links.retain(|link| {
+            !(link.q0rg_id == q0rg_id && (link.from == instance_id || link.to == instance_id))
+        });
         app.state.mark_dirty();
         return;
     }
@@ -1517,13 +2071,27 @@ fn render_bodies(
         return;
     };
     ui.add_space(6.0);
+    ui.separator();
     let name = ids
         .iter()
         .position(|id| *id == instance_id)
         .map_or_else(String::new, |index| names[index].clone());
     ui.label(RichText::new(name).strong());
-    let auto = motion_into_start(&app.state.project, scene, instance_id);
+    let fps = app.state.project.meta.fps;
+    let auto = motion_between(
+        fps,
+        scene,
+        scene
+            .start_frame
+            .checked_sub(1)
+            .and_then(|frame| cached_fit(app, instance_id, frame))
+            .map(|fit| collider_pose(&body, &fit)),
+        cached_fit(app, instance_id, scene.start_frame).map(|fit| collider_pose(&body, &fit)),
+    );
     let mut edit = Edit::default();
+    if scene.live {
+        render_script_name(app, ui, q0rg_id, instance_id, dim);
+    }
     match mode {
         RigMode::Simple => render_body_simple(ui, &mut edit, &mut body, auto, dim),
         RigMode::Pro => render_body_pro(ui, &mut edit, &mut body, auto, dim),
@@ -1533,6 +2101,49 @@ fn render_bodies(
             if let Some(stored) = project.runtime.physics.body_mut(q0rg_id, instance_id) {
                 *stored = body.clone();
                 project.runtime.physics.sanitize();
+            }
+        });
+    }
+}
+
+/// The instance name q0lang uses for the body.
+fn render_script_name(
+    app: &mut EditorApp,
+    ui: &mut Ui,
+    q0rg_id: u16,
+    instance_id: u32,
+    dim: Color32,
+) {
+    let key = InstanceKey::new(q0rg_id, instance_id);
+    let mut name = app
+        .state
+        .project
+        .runtime
+        .instance_names
+        .get(&key)
+        .cloned()
+        .unwrap_or_default();
+    let mut edit = Edit::default();
+    ui.horizontal(|ui| {
+        ui.label("Script name");
+        edit.text(ui, &mut name, 160.0);
+    });
+    if name.trim().is_empty() {
+        ui.label(
+            RichText::new(
+                "give it a name to push it from q0lang: q0physics.push! \"name\", 200, -300",
+            )
+            .small()
+            .color(dim),
+        );
+    }
+    if edit.changed || edit.snapshot {
+        apply_edit(app, &edit, |project| {
+            let name = name.trim();
+            if name.is_empty() {
+                project.runtime.instance_names.remove(&key);
+            } else {
+                project.runtime.instance_names.insert(key, name.to_string());
             }
         });
     }
@@ -1611,15 +2222,8 @@ fn render_body_simple(
             ui.label("");
             ui.label(RichText::new(kind_hint(body.kind)).small().color(dim));
             ui.end_row();
-            ui.label("Shape");
-            ui.horizontal(|ui| {
-                for shape in ColliderShape::ALL {
-                    edit.choice(ui, &mut body.shape, shape, shape_label(shape));
-                }
-            });
-            ui.end_row();
             ui.label("Collides with");
-            group_picker(ui, edit, &mut body.group);
+            group_picker(ui, edit, &mut body.group, "physics_body_group");
             ui.end_row();
             if body.kind == BodyKind::Dynamic {
                 ui.label("Material");
@@ -1655,6 +2259,8 @@ fn render_body_simple(
                 ui.end_row();
             }
         });
+    ui.add_space(4.0);
+    render_hitbox(ui, edit, body, RigMode::Simple, dim);
     if body.kind == BodyKind::Dynamic {
         render_momentum(ui, edit, body, auto, RigMode::Simple, dim);
     }
@@ -1678,22 +2284,8 @@ fn render_body_pro(
                 }
             });
             ui.end_row();
-            ui.label("Collider");
-            ui.horizontal(|ui| {
-                for shape in ColliderShape::ALL {
-                    edit.choice(ui, &mut body.shape, shape, shape_label(shape));
-                }
-                edit.drag(ui, &mut body.shape_scale, 0.01, 0.05..=20.0, "× size");
-            });
-            ui.end_row();
             ui.label("Collision group");
-            ui.horizontal(|ui| {
-                let response = ui.add(
-                    egui::DragValue::new(&mut body.group).clamp_range(0..=MAX_COLLISION_GROUP),
-                );
-                edit.note(&response);
-                ui.label(RichText::new(group_label(body.group)).color(group_color(body.group)));
-            });
+            group_number(ui, edit, &mut body.group);
             ui.end_row();
             ui.label("Mass");
             edit.drag(ui, &mut body.mass, 0.01, 0.001..=100_000.0, "");
@@ -1717,6 +2309,8 @@ fn render_body_pro(
             edit.checkbox(ui, &mut body.fixed_rotation, "Locked");
             ui.end_row();
         });
+    ui.add_space(4.0);
+    render_hitbox(ui, edit, body, RigMode::Pro, dim);
     if body.kind == BodyKind::Dynamic {
         render_momentum(ui, edit, body, auto, RigMode::Pro, dim);
     } else {
@@ -1724,8 +2318,8 @@ fn render_body_pro(
     }
 }
 
-fn group_picker(ui: &mut Ui, edit: &mut Edit, group: &mut u8) {
-    let response = egui::ComboBox::from_id_source("physics_group")
+fn group_picker(ui: &mut Ui, edit: &mut Edit, group: &mut u8, id: &str) {
+    let response = egui::ComboBox::from_id_source(id)
         .selected_text(RichText::new(group_label(*group)).color(group_color(*group)))
         .show_ui(ui, |ui| {
             for candidate in 0..=8 {
@@ -1735,6 +2329,14 @@ fn group_picker(ui: &mut Ui, edit: &mut Edit, group: &mut u8) {
     response.response.on_hover_text(
         "Bodies collide only with bodies of the same group. Every group hits the walls.",
     );
+}
+
+pub(crate) fn group_number(ui: &mut Ui, edit: &mut Edit, group: &mut u8) {
+    ui.horizontal(|ui| {
+        let response = ui.add(egui::DragValue::new(group).clamp_range(0..=MAX_COLLISION_GROUP));
+        edit.note(&response);
+        ui.label(RichText::new(group_label(*group)).color(group_color(*group)));
+    });
 }
 
 fn render_momentum(
@@ -1817,6 +2419,335 @@ fn render_momentum(
     }
 }
 
+struct LiquidPreset {
+    name: &'static str,
+    color: Rgba,
+    viscosity: f32,
+    stiffness: f32,
+    cohesion: f32,
+}
+
+const LIQUID_PRESETS: [LiquidPreset; 5] = [
+    LiquidPreset {
+        name: "Water",
+        color: Rgba {
+            r: 60,
+            g: 140,
+            b: 230,
+            a: 220,
+        },
+        viscosity: 0.1,
+        stiffness: 1.0,
+        cohesion: 0.5,
+    },
+    LiquidPreset {
+        name: "Honey",
+        color: Rgba {
+            r: 235,
+            g: 160,
+            b: 30,
+            a: 235,
+        },
+        viscosity: 6.0,
+        stiffness: 1.2,
+        cohesion: 1.5,
+    },
+    LiquidPreset {
+        name: "Slime",
+        color: Rgba {
+            r: 110,
+            g: 220,
+            b: 70,
+            a: 230,
+        },
+        viscosity: 3.0,
+        stiffness: 0.8,
+        cohesion: 3.0,
+    },
+    LiquidPreset {
+        name: "Oil",
+        color: Rgba {
+            r: 40,
+            g: 35,
+            b: 30,
+            a: 235,
+        },
+        viscosity: 1.0,
+        stiffness: 1.0,
+        cohesion: 0.8,
+    },
+    LiquidPreset {
+        name: "Lava",
+        color: Rgba {
+            r: 255,
+            g: 90,
+            b: 20,
+            a: 245,
+        },
+        viscosity: 10.0,
+        stiffness: 1.5,
+        cohesion: 2.0,
+    },
+];
+
+const DETAIL_PRESETS: [(&str, f32); 3] = [("Coarse", 12.0), ("Medium", 8.0), ("Fine", 5.0)];
+
+fn render_liquids(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16, mode: RigMode, dim: Color32) {
+    if ui
+        .button("Add liquid")
+        .on_hover_text("A block of water in the upper middle of the stage; drag its numbers or use a selected shape's area")
+        .clicked()
+    {
+        let stage = [
+            f32::from(app.state.project.meta.stage_width.max(1)),
+            f32::from(app.state.project.meta.stage_height.max(1)),
+        ];
+        let region = selection_area(app)
+            .unwrap_or([stage[0] * 0.3, stage[1] * 0.1, stage[0] * 0.4, stage[1] * 0.25]);
+        app.history
+            .snapshot_with_session(&app.state.project, &app.session);
+        let physics = &mut app.state.project.runtime.physics;
+        let liquid_id = physics.next_liquid_id(q0rg_id);
+        physics
+            .liquids
+            .push(PhysicsLiquid::new(q0rg_id, liquid_id, region));
+        app.session.physics.selected_liquid = Some(liquid_id);
+        app.state.mark_dirty();
+    }
+    let liquids = app
+        .state
+        .project
+        .runtime
+        .physics
+        .liquids
+        .iter()
+        .filter(|liquid| liquid.q0rg_id == q0rg_id)
+        .map(|liquid| (liquid.liquid_id, liquid.name.clone(), liquid.color))
+        .collect::<Vec<_>>();
+    if liquids.is_empty() {
+        ui.label(
+            RichText::new("No liquids yet. A liquid is drawn as one filled shape per frame on a layer of its own.")
+                .small()
+                .color(dim),
+        );
+        return;
+    }
+    if app
+        .session
+        .physics
+        .selected_liquid
+        .is_none_or(|selected| !liquids.iter().any(|(id, _, _)| *id == selected))
+    {
+        app.session.physics.selected_liquid = Some(liquids[0].0);
+    }
+    let mut remove = None;
+    for (liquid_id, name, color) in &liquids {
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+            ui.painter().rect_filled(
+                rect,
+                3.0,
+                Color32::from_rgba_unmultiplied(color.r, color.g, color.b, 255),
+            );
+            let selected = app.session.physics.selected_liquid == Some(*liquid_id);
+            if ui.selectable_label(selected, name.as_str()).clicked() {
+                app.session.physics.selected_liquid = Some(*liquid_id);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Remove").clicked() {
+                    remove = Some(*liquid_id);
+                }
+            });
+        });
+    }
+    if let Some(liquid_id) = remove {
+        app.history
+            .snapshot_with_session(&app.state.project, &app.session);
+        app.state
+            .project
+            .runtime
+            .physics
+            .liquids
+            .retain(|liquid| !(liquid.q0rg_id == q0rg_id && liquid.liquid_id == liquid_id));
+        app.state.mark_dirty();
+        return;
+    }
+    let Some(liquid_id) = app.session.physics.selected_liquid else {
+        return;
+    };
+    let Some(mut liquid) = app
+        .state
+        .project
+        .runtime
+        .physics
+        .liquids
+        .iter()
+        .find(|liquid| liquid.q0rg_id == q0rg_id && liquid.liquid_id == liquid_id)
+        .cloned()
+    else {
+        return;
+    };
+    let area = selection_area(app);
+    ui.add_space(4.0);
+    let mut edit = Edit::default();
+    egui::Grid::new("physics_liquid")
+        .num_columns(2)
+        .spacing([10.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("Name");
+            edit.text(ui, &mut liquid.name, 150.0);
+            ui.end_row();
+            ui.label("Pours");
+            ui.horizontal(|ui| {
+                for source in LiquidSource::ALL {
+                    let label = match source {
+                        LiquidSource::Block => "All at once",
+                        LiquidSource::Stream => "As a stream",
+                    };
+                    edit.choice(ui, &mut liquid.source, source, label);
+                }
+            });
+            ui.end_row();
+            ui.label(match liquid.source {
+                LiquidSource::Block => "Area",
+                LiquidSource::Stream => "Spout",
+            });
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    edit.drag(ui, &mut liquid.region[0], 1.0, -100_000.0..=100_000.0, " x");
+                    edit.drag(ui, &mut liquid.region[1], 1.0, -100_000.0..=100_000.0, " y");
+                });
+                ui.horizontal(|ui| {
+                    edit.drag(ui, &mut liquid.region[2], 1.0, 1.0..=100_000.0, " w");
+                    edit.drag(ui, &mut liquid.region[3], 1.0, 1.0..=100_000.0, " h");
+                    if ui
+                        .add_enabled(area.is_some(), egui::Button::new("Selection").small())
+                        .on_hover_text("Fill the area the selected object covers")
+                        .on_disabled_hover_text("Select a shape on the stage to use its area")
+                        .clicked()
+                    {
+                        if let Some(area) = area {
+                            liquid.region = area;
+                            edit.snapshot = true;
+                            edit.changed = true;
+                        }
+                    }
+                });
+            });
+            ui.end_row();
+            ui.label("Colour");
+            edit.color(ui, &mut liquid.color);
+            ui.end_row();
+            if mode == RigMode::Simple {
+                ui.label("Like");
+                ui.horizontal_wrapped(|ui| {
+                    for preset in &LIQUID_PRESETS {
+                        if ui.small_button(preset.name).clicked() {
+                            liquid.color = preset.color;
+                            liquid.viscosity = preset.viscosity;
+                            liquid.stiffness = preset.stiffness;
+                            liquid.cohesion = preset.cohesion;
+                            edit.snapshot = true;
+                            edit.changed = true;
+                        }
+                    }
+                });
+                ui.end_row();
+                ui.label("Detail");
+                ui.horizontal(|ui| {
+                    for (label, spacing) in DETAIL_PRESETS {
+                        edit.choice(ui, &mut liquid.spacing, spacing, label);
+                    }
+                });
+                ui.end_row();
+                ui.label("Thickness");
+                edit.slider(ui, &mut liquid.viscosity, 0.0..=20.0, false);
+                ui.end_row();
+                ui.label("Stickiness");
+                edit.slider(ui, &mut liquid.cohesion, 0.0..=5.0, false);
+                ui.end_row();
+                ui.label("Floats things");
+                edit.slider(ui, &mut liquid.buoyancy, 0.0..=3.0, false);
+                ui.end_row();
+                ui.label("Touches");
+                group_picker(ui, &mut edit, &mut liquid.group, "physics_liquid_group");
+                ui.end_row();
+            } else {
+                ui.label("Particle spacing");
+                edit.drag(ui, &mut liquid.spacing, 0.1, 1.0..=200.0, " px");
+                ui.end_row();
+                ui.label("Most particles");
+                let response =
+                    ui.add(egui::DragValue::new(&mut liquid.max_particles).clamp_range(1..=20_000));
+                edit.note(&response);
+                ui.end_row();
+                ui.label("Viscosity");
+                edit.drag(ui, &mut liquid.viscosity, 0.01, 0.0..=20.0, "");
+                ui.end_row();
+                ui.label("Stiffness");
+                edit.drag(ui, &mut liquid.stiffness, 0.01, 0.05..=20.0, "");
+                ui.end_row();
+                ui.label("Cohesion");
+                edit.drag(ui, &mut liquid.cohesion, 0.01, 0.0..=5.0, "");
+                ui.end_row();
+                ui.label("Gravity scale");
+                edit.drag(ui, &mut liquid.gravity_scale, 0.01, -20.0..=20.0, "×");
+                ui.end_row();
+                ui.label("Buoyancy");
+                edit.drag(ui, &mut liquid.buoyancy, 0.01, 0.0..=10.0, "");
+                ui.end_row();
+                ui.label("Surface smoothness");
+                edit.drag(ui, &mut liquid.smoothness, 0.01, 0.3..=4.0, "");
+                ui.end_row();
+                ui.label("Collision group");
+                group_number(ui, &mut edit, &mut liquid.group);
+                ui.end_row();
+            }
+            if liquid.source == LiquidSource::Stream {
+                ui.label("Stream");
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        edit.drag(
+                            ui,
+                            &mut liquid.stream_velocity[0],
+                            2.0,
+                            -100_000.0..=100_000.0,
+                            " x",
+                        );
+                        edit.drag(
+                            ui,
+                            &mut liquid.stream_velocity[1],
+                            2.0,
+                            -100_000.0..=100_000.0,
+                            " y",
+                        );
+                        ui.label(RichText::new("px/s").small().color(dim));
+                    });
+                    ui.horizontal(|ui| {
+                        edit.drag(ui, &mut liquid.stream_rate, 1.0, 0.0..=10_000.0, " drops/s");
+                    });
+                });
+                ui.end_row();
+                if mode == RigMode::Simple {
+                    ui.label("Most particles");
+                    let response = ui.add(
+                        egui::DragValue::new(&mut liquid.max_particles).clamp_range(1..=20_000),
+                    );
+                    edit.note(&response);
+                    ui.end_row();
+                }
+            }
+        });
+    if edit.changed || edit.snapshot {
+        apply_edit(app, &edit, |project| {
+            if let Some(stored) = project.runtime.physics.liquid_mut(q0rg_id, liquid_id) {
+                *stored = liquid.clone();
+                project.runtime.physics.sanitize();
+            }
+        });
+    }
+}
+
 /// Collider outlines on the stage while the window is open; while
 /// previewing, the path each body takes.
 pub fn paint_stage_overlay(app: &EditorApp, painter: &Painter, view: &StageView) {
@@ -1824,17 +2755,17 @@ pub fn paint_stage_overlay(app: &EditorApp, painter: &Painter, view: &StageView)
         return;
     }
     let q0rg_id = app.session.current_q0rg_id;
-    let preview = app.session.physics.preview.as_ref().filter(|preview| {
-        preview.source_revision == app.state.revision && preview.q0rg_id == q0rg_id
-    });
-    match preview {
-        Some(preview) => paint_preview(app, painter, view, preview),
+    let simulation = crate::sim_preview::physics_simulation(app)
+        .filter(|simulation| simulation.q0rg_id == q0rg_id);
+    match &simulation {
+        Some(simulation) => paint_preview(app, painter, view, simulation),
         None => paint_live_colliders(app, painter, view),
     }
+    crate::physics_links::paint_links(app, painter, view, simulation.as_deref());
+    paint_liquid_sources(app, painter, view);
 }
 
-fn paint_preview(app: &EditorApp, painter: &Painter, view: &StageView, preview: &Preview) {
-    let simulation = &preview.simulation;
+fn paint_preview(app: &EditorApp, painter: &Painter, view: &StageView, simulation: &Simulation) {
     let frame = app.session.current_frame;
     let selected = app.session.physics.selected_body;
     let project = &app.state.project;
@@ -1851,15 +2782,15 @@ fn paint_preview(app: &EditorApp, painter: &Painter, view: &StageView, preview: 
                 .iter()
                 .map(|pose| view.stage_to_screen(Vec2::new(pose.center[0], pose.center[1])))
                 .collect::<Vec<_>>();
-            painter.add(egui::Shape::line(
-                points.clone(),
-                Stroke::new(1.5_f32, color.gamma_multiply(0.7)),
-            ));
             if points.len() <= 400 {
                 for point in &points {
                     painter.circle_filled(*point, 1.6, color.gamma_multiply(0.7));
                 }
             }
+            painter.add(egui::Shape::line(
+                points,
+                Stroke::new(1.5_f32, color.gamma_multiply(0.7)),
+            ));
         }
         if let Some(pose) = simulation.pose_at(track, frame) {
             let width = if selected == Some(track.instance_id) {
@@ -1870,23 +2801,13 @@ fn paint_preview(app: &EditorApp, painter: &Painter, view: &StageView, preview: 
             paint_collider(
                 painter,
                 view,
-                track.shape,
-                track.half_extents,
+                &track.geometry,
                 pose,
                 Stroke::new(width, color),
-                false,
             );
         }
     }
-    let galley = painter.layout_no_wrap(
-        "Physics preview: bake to keep it".to_string(),
-        egui::FontId::proportional(13.0),
-        Color32::WHITE,
-    );
-    let at = view.stage_rect.left_top() + egui::vec2(8.0, 8.0);
-    let backdrop = egui::Rect::from_min_size(at, galley.size()).expand2(egui::vec2(6.0, 3.0));
-    painter.rect_filled(backdrop, 4.0, Color32::from_black_alpha(170));
-    painter.galley(at, galley, Color32::WHITE);
+    crate::sim_preview::paint_banner(painter, view, "Physics preview: bake to keep it", 0);
 }
 
 fn paint_live_colliders(app: &EditorApp, painter: &Painter, view: &StageView) {
@@ -1907,10 +2828,9 @@ fn paint_live_colliders(app: &EditorApp, painter: &Painter, view: &StageView) {
         } else {
             1.5_f32
         };
-        let Some(fit) = fit_body(project, q0rg_id, body.instance_id, frame) else {
+        let Some((fit, pose, geometry)) = cached_collider(app, body, frame) else {
             continue;
         };
-        let half_extents = collider_half_extents(body, &fit);
         let stroke = Stroke::new(
             width,
             if body.kind == BodyKind::Dynamic {
@@ -1919,15 +2839,10 @@ fn paint_live_colliders(app: &EditorApp, painter: &Painter, view: &StageView) {
                 color.gamma_multiply(0.55)
             },
         );
-        paint_collider(
-            painter,
-            view,
-            body.shape,
-            half_extents,
-            fit.pose,
-            stroke,
-            false,
-        );
+        paint_collider(painter, view, &geometry, pose, stroke);
+        if selected == Some(body.instance_id) && !preview_running(app) {
+            paint_handles(painter, view, body, &fit, pose, color);
+        }
         if let (BodyKind::Dynamic, Momentum::Manual { velocity, .. }, Some(scene)) = (
             body.kind,
             body.momentum,
@@ -1935,7 +2850,7 @@ fn paint_live_colliders(app: &EditorApp, painter: &Painter, view: &StageView) {
         ) {
             if frame == scene.start_frame && velocity[0].hypot(velocity[1]) > 0.5 {
                 // Where a quarter second of the throw would take it.
-                let from = Vec2::new(fit.pose.center[0], fit.pose.center[1]);
+                let from = Vec2::new(fit.pose().center[0], fit.pose().center[1]);
                 let to = Vec2::new(from.x + velocity[0] * 0.25, from.y + velocity[1] * 0.25);
                 painter.arrow(
                     view.stage_to_screen(from),
@@ -1947,45 +2862,463 @@ fn paint_live_colliders(app: &EditorApp, painter: &Painter, view: &StageView) {
     }
 }
 
+/// Where each liquid starts: its area, or its spout and the way it pours.
+fn paint_liquid_sources(app: &EditorApp, painter: &Painter, view: &StageView) {
+    let q0rg_id = app.session.current_q0rg_id;
+    let selected = app.session.physics.selected_liquid;
+    for liquid in app
+        .state
+        .project
+        .runtime
+        .physics
+        .liquids
+        .iter()
+        .filter(|liquid| liquid.q0rg_id == q0rg_id)
+    {
+        let color =
+            Color32::from_rgba_unmultiplied(liquid.color.r, liquid.color.g, liquid.color.b, 255);
+        let width = if selected == Some(liquid.liquid_id) {
+            2.0_f32
+        } else {
+            1.0_f32
+        };
+        let [x, y, w, h] = liquid.region;
+        let corners = [
+            Vec2::new(x, y),
+            Vec2::new(x + w, y),
+            Vec2::new(x + w, y + h),
+            Vec2::new(x, y + h),
+        ]
+        .map(|corner| view.stage_to_screen(corner));
+        for side in 0..4 {
+            let dashes = egui::Shape::dashed_line(
+                &[corners[side], corners[(side + 1) % 4]],
+                Stroke::new(width, color),
+                6.0,
+                4.0,
+            );
+            painter.extend(dashes);
+        }
+        if liquid.source == LiquidSource::Stream {
+            let from = Vec2::new(x + w * 0.5, y + h * 0.5);
+            let to = Vec2::new(
+                from.x + liquid.stream_velocity[0] * 0.2,
+                from.y + liquid.stream_velocity[1] * 0.2,
+            );
+            painter.arrow(
+                view.stage_to_screen(from),
+                view.stage_to_screen(to) - view.stage_to_screen(from),
+                Stroke::new(2.0_f32, color),
+            );
+        }
+        painter.text(
+            corners[0] + egui::vec2(3.0, 2.0),
+            egui::Align2::LEFT_TOP,
+            &liquid.name,
+            egui::FontId::proportional(11.0),
+            color,
+        );
+    }
+}
+
+/// Whether the stage shows a running preview instead of the setup.
+fn preview_running(app: &EditorApp) -> bool {
+    crate::sim_preview::physics_simulation(app).is_some()
+}
+
+/// Screen pixels within which a handle catches the pointer.
+pub(crate) const HANDLE_REACH: f32 = 9.0;
+/// How far above the hitbox its turn handle floats, in screen pixels.
+const TURN_LIFT: f32 = 22.0;
+
+/// The hitbox handles of `body` and where they are on the stage.
+fn handle_points(
+    body: &PhysicsBody,
+    fit: &BodyFit,
+    pose: BodyPose,
+    view: &StageView,
+) -> Vec<(Handle, Vec2)> {
+    let scale = [
+        body.shape_scale * body.size[0],
+        body.shape_scale * body.size[1],
+    ];
+    let half = [
+        fit.fit.half_extents[0] * scale[0],
+        fit.fit.half_extents[1] * scale[1],
+    ];
+    let mut handles = vec![(Handle::Move, Vec2::new(pose.center[0], pose.center[1]))];
+    if body.shape == ColliderShape::Circle {
+        handles.push((
+            Handle::Radius,
+            body_point(pose, [half[0].max(half[1]), 0.0]),
+        ));
+        return handles;
+    }
+    let turned = BodyPose {
+        center: pose.center,
+        angle: pose.angle + body.turn.to_radians(),
+    };
+    let lift = TURN_LIFT / view.effective_scale().abs().max(1.0e-3);
+    handles.extend([
+        (Handle::Width, body_point(turned, [half[0], 0.0])),
+        (Handle::Width, body_point(turned, [-half[0], 0.0])),
+        (Handle::Height, body_point(turned, [0.0, half[1]])),
+        (Handle::Height, body_point(turned, [0.0, -half[1]])),
+        (Handle::Turn, body_point(turned, [0.0, -half[1] - lift])),
+    ]);
+    handles
+}
+
+fn paint_handles(
+    painter: &Painter,
+    view: &StageView,
+    body: &PhysicsBody,
+    fit: &BodyFit,
+    pose: BodyPose,
+    color: Color32,
+) {
+    let outline = Stroke::new(1.5_f32, color);
+    for (handle, point) in handle_points(body, fit, pose, view) {
+        let at = view.stage_to_screen(point);
+        match handle {
+            Handle::Move => {
+                painter.rect(
+                    egui::Rect::from_center_size(at, egui::vec2(9.0, 9.0)),
+                    1.0,
+                    Color32::from_black_alpha(140),
+                    outline,
+                );
+            }
+            Handle::Turn => {
+                painter.circle(at, 5.0, Color32::from_black_alpha(140), outline);
+            }
+            Handle::Width | Handle::Height | Handle::Radius => {
+                painter.rect(
+                    egui::Rect::from_center_size(at, egui::vec2(7.0, 7.0)),
+                    0.0,
+                    color,
+                    Stroke::new(1.0_f32, Color32::from_black_alpha(180)),
+                );
+            }
+        }
+    }
+}
+
+/// Drags the selected body's hitbox handles on the stage. Returns whether
+/// the pointer is busy with them, so the tools leave it alone.
+pub fn handle_stage(
+    app: &mut EditorApp,
+    response: &egui::Response,
+    cursor: Option<Vec2>,
+    view: &StageView,
+) -> bool {
+    if !app.settings.physics_enabled || !app.session.physics.open || preview_running(app) {
+        app.session.physics.drag = None;
+        app.session.physics.link_drag = None;
+        return false;
+    }
+    if app.session.physics.drag.is_none()
+        && crate::physics_links::handle_stage(app, response, cursor, view)
+    {
+        return true;
+    }
+    let q0rg_id = app.session.current_q0rg_id;
+    let frame = app.session.current_frame;
+    let Some(body) = app
+        .session
+        .physics
+        .selected_body
+        .and_then(|id| app.state.project.runtime.physics.body(q0rg_id, id))
+        .cloned()
+    else {
+        app.session.physics.drag = None;
+        return false;
+    };
+    let Some((fit, pose, _)) = cached_collider(app, &body, frame) else {
+        return false;
+    };
+    let near = |screen: egui::Pos2| {
+        handle_points(&body, &fit, pose, view)
+            .into_iter()
+            .map(|(handle, point)| (handle, view.stage_to_screen(point).distance(screen)))
+            .filter(|(_, distance)| *distance <= HANDLE_REACH)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(handle, _)| handle)
+    };
+    if response.drag_started_by(egui::PointerButton::Primary) {
+        let press = response
+            .ctx
+            .input(|input| input.pointer.press_origin())
+            .or_else(|| response.interact_pointer_pos());
+        if let Some(handle) = press.and_then(near) {
+            app.history
+                .snapshot_with_session(&app.state.project, &app.session);
+            app.session.physics.drag = Some(HitboxDrag {
+                instance_id: body.instance_id,
+                handle,
+                press: press.map_or(Vec2::new(0.0, 0.0), |press| view.screen_to_stage(press)),
+                center: pose.center,
+                angle: pose.angle,
+                fit_half: fit.fit.half_extents,
+                offset: body.offset,
+            });
+            return true;
+        }
+        return false;
+    }
+    let Some(drag) = app.session.physics.drag else {
+        if let Some(handle) = response.hover_pos().and_then(near) {
+            response.ctx.set_cursor_icon(match handle {
+                Handle::Move => egui::CursorIcon::Move,
+                Handle::Turn => egui::CursorIcon::Alias,
+                _ => egui::CursorIcon::Crosshair,
+            });
+        }
+        return false;
+    };
+    if response.drag_stopped() || !response.dragged() {
+        app.session.physics.drag = None;
+        return true;
+    }
+    let Some(cursor) = cursor else {
+        return true;
+    };
+    let snap = response.ctx.input(|input| input.modifiers.shift);
+    let mut changed = body.clone();
+    let (sin, cos) = drag.angle.sin_cos();
+    let away = [cursor.x - drag.center[0], cursor.y - drag.center[1]];
+    match drag.handle {
+        Handle::Move => {
+            let delta = [cursor.x - drag.press.x, cursor.y - drag.press.y];
+            changed.offset = [
+                drag.offset[0] + cos * delta[0] + sin * delta[1],
+                drag.offset[1] - sin * delta[0] + cos * delta[1],
+            ];
+            if snap {
+                changed.offset = changed.offset.map(|value| value.round());
+            }
+        }
+        Handle::Width | Handle::Height => {
+            let turn = drag.angle + body.turn.to_radians();
+            let (turn_sin, turn_cos) = turn.sin_cos();
+            let (axis, along) = if drag.handle == Handle::Width {
+                (0, away[0] * turn_cos + away[1] * turn_sin)
+            } else {
+                (1, -away[0] * turn_sin + away[1] * turn_cos)
+            };
+            let base = (drag.fit_half[axis] * body.shape_scale).max(1.0e-3);
+            changed.size[axis] = (along.abs() / base).clamp(0.05, 20.0);
+            if snap {
+                changed.size[axis] = (changed.size[axis] * 20.0).round() / 20.0;
+            }
+        }
+        Handle::Radius => {
+            let distance = away[0].hypot(away[1]);
+            let base = (drag.fit_half[0] * body.size[0])
+                .max(drag.fit_half[1] * body.size[1])
+                .max(1.0e-3);
+            changed.shape_scale = (distance / base).clamp(0.05, 20.0);
+        }
+        Handle::Turn => {
+            let pointing = away[1].atan2(away[0]) + std::f32::consts::FRAC_PI_2 - drag.angle;
+            let mut degrees = pointing.to_degrees();
+            degrees = (degrees + 180.0).rem_euclid(360.0) - 180.0;
+            if snap {
+                degrees = (degrees / 15.0).round() * 15.0;
+            }
+            changed.turn = degrees;
+        }
+    }
+    if changed != body {
+        if let Some(stored) = app
+            .state
+            .project
+            .runtime
+            .physics
+            .body_mut(q0rg_id, drag.instance_id)
+        {
+            *stored = changed;
+        }
+        app.state.project.runtime.physics.sanitize();
+        app.state.mark_dirty();
+    }
+    true
+}
+
+/// A straight stretch of outline, from one point to another.
+type Edge = [[f32; 2]; 2];
+
+thread_local! {
+    /// Outer edges of the part shapes drawn lately, by a hash of the parts.
+    static BOUNDARIES: RefCell<Vec<(u64, Vec<Edge>)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// [`part_boundary`] of `parts`, remembered while the parts stay the same.
+fn cached_boundary(parts: &[Vec<[f32; 2]>]) -> Vec<Edge> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for part in parts {
+        part.len().hash(&mut hasher);
+        for [x, y] in part {
+            x.to_bits().hash(&mut hasher);
+            y.to_bits().hash(&mut hasher);
+        }
+    }
+    let key = hasher.finish();
+    BOUNDARIES.with(|boundaries| {
+        let mut boundaries = boundaries.borrow_mut();
+        if let Some(at) = boundaries.iter().position(|(stored, _)| *stored == key) {
+            let entry = boundaries.remove(at);
+            let edges = entry.1.clone();
+            boundaries.push(entry);
+            return edges;
+        }
+        let edges = part_boundary(parts);
+        if boundaries.len() >= 32 {
+            boundaries.remove(0);
+        }
+        boundaries.push((key, edges.clone()));
+        edges
+    })
+}
+
+/// The stretches of the parts' edges on the outside of the shape they make
+/// together: seams where parts touch and edges buried in another part are
+/// left out, so the drawing shows one outline.
+fn part_boundary(parts: &[Vec<[f32; 2]>]) -> Vec<Edge> {
+    let parts = parts
+        .iter()
+        .filter(|part| part.len() >= 3)
+        .map(|part| {
+            let doubled_area = part
+                .iter()
+                .zip(part.iter().cycle().skip(1))
+                .map(|(a, b)| a[0] * b[1] - b[0] * a[1])
+                .sum::<f32>();
+            let bounds = part
+                .iter()
+                .fold([f32::MAX, f32::MAX, f32::MIN, f32::MIN], |b, p| {
+                    [
+                        b[0].min(p[0]),
+                        b[1].min(p[1]),
+                        b[2].max(p[0]),
+                        b[3].max(p[1]),
+                    ]
+                });
+            (part, doubled_area.signum(), bounds)
+        })
+        .filter(|(_, turn, _)| *turn != 0.0)
+        .collect::<Vec<_>>();
+    let extent = parts
+        .iter()
+        .map(|(_, _, b)| (b[2] - b[0]).max(b[3] - b[1]))
+        .fold(0.0f32, f32::max)
+        .max(1.0e-3);
+    // How far past an edge to look for a neighbouring part, and how finely
+    // edges are cut to find the stretches another part covers.
+    let probe = extent * 2.0e-3;
+    let piece = extent / 96.0;
+    let covered = |own: usize, point: [f32; 2]| {
+        parts.iter().enumerate().any(|(index, (part, turn, b))| {
+            index != own
+                && point[0] >= b[0]
+                && point[0] <= b[2]
+                && point[1] >= b[1]
+                && point[1] <= b[3]
+                && (0..part.len()).all(|i| {
+                    let (a, c) = (part[i], part[(i + 1) % part.len()]);
+                    let side =
+                        (c[0] - a[0]) * (point[1] - a[1]) - (c[1] - a[1]) * (point[0] - a[0]);
+                    side * turn >= 0.0
+                })
+        })
+    };
+    let mut edges = Vec::new();
+    for (own, (part, turn, _)) in parts.iter().enumerate() {
+        for i in 0..part.len() {
+            let (a, b) = (part[i], part[(i + 1) % part.len()]);
+            let length = (b[0] - a[0]).hypot(b[1] - a[1]);
+            if length <= 1.0e-6 {
+                continue;
+            }
+            // Outward: to the right of the edge when the part turns left.
+            let out = [
+                (b[1] - a[1]) / length * turn * probe,
+                -(b[0] - a[0]) / length * turn * probe,
+            ];
+            let pieces = ((length / piece).ceil() as usize).clamp(1, 256);
+            let at = |t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+            let mut run: Option<f32> = None;
+            for k in 0..pieces {
+                let middle = at((k as f32 + 0.5) / pieces as f32);
+                let outside = !covered(own, [middle[0] + out[0], middle[1] + out[1]]);
+                let start = k as f32 / pieces as f32;
+                match (outside, run) {
+                    (true, None) => run = Some(start),
+                    (false, Some(from)) => {
+                        edges.push([at(from), at(start)]);
+                        run = None;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(from) = run {
+                edges.push([at(from), b]);
+            }
+        }
+    }
+    edges
+}
+
+/// A point of the body's frame on the stage.
+fn body_point(pose: BodyPose, [x, y]: [f32; 2]) -> Vec2 {
+    let (sin, cos) = pose.angle.sin_cos();
+    Vec2::new(
+        pose.center[0] + cos * x - sin * y,
+        pose.center[1] + sin * x + cos * y,
+    )
+}
+
 fn paint_collider(
     painter: &Painter,
     view: &StageView,
-    shape: ColliderShape,
-    half_extents: [f32; 2],
+    geometry: &ColliderGeometry,
     pose: BodyPose,
     stroke: Stroke,
-    ghost: bool,
 ) {
-    let [cx, cy] = pose.center;
-    let center = view.stage_to_screen(Vec2::new(cx, cy));
-    let fill = if ghost {
-        stroke.color.gamma_multiply(0.18)
+    let center = view.stage_to_screen(Vec2::new(pose.center[0], pose.center[1]));
+    let parts = geometry.outline();
+    let to_screen = |point: [f32; 2]| view.stage_to_screen(body_point(pose, point));
+    if let ColliderGeometry::Parts(parts) = geometry {
+        // Tinted inside, so a shape made of parts reads as one solid. Plain
+        // triangles and separate edges: egui's outlines and soft edges
+        // stretch sharp corners into long spikes.
+        let tint = stroke.color.gamma_multiply(0.18);
+        let mut mesh = egui::Mesh::default();
+        for part in parts.iter().filter(|part| part.len() >= 3) {
+            let first = mesh.vertices.len() as u32;
+            for point in part {
+                mesh.colored_vertex(to_screen(*point), tint);
+            }
+            for i in 1..part.len() as u32 - 1 {
+                mesh.add_triangle(first, first + i, first + i + 1);
+            }
+        }
+        painter.add(egui::Shape::mesh(mesh));
+        let edge = Stroke::new(stroke.width * 0.75, stroke.color);
+        for [from, to] in cached_boundary(parts) {
+            painter.line_segment([to_screen(from), to_screen(to)], edge);
+        }
     } else {
-        Color32::TRANSPARENT
-    };
-    match shape {
-        ColliderShape::Circle => {
-            let edge = view.stage_to_screen(Vec2::new(cx + half_extents[0], cy));
-            let radius = center.distance(edge);
-            painter.circle(center, radius, fill, stroke);
-            let (sin, cos) = pose.angle.sin_cos();
-            let spoke = view.stage_to_screen(Vec2::new(
-                cx + cos * half_extents[0],
-                cy + sin * half_extents[0],
-            ));
-            painter.line_segment([center, spoke], stroke);
+        for part in &parts {
+            let points = part.iter().map(|point| to_screen(*point)).collect();
+            painter.add(egui::Shape::closed_line(points, stroke));
         }
-        ColliderShape::Box => {
-            let (sin, cos) = pose.angle.sin_cos();
-            let [hx, hy] = half_extents;
-            let points = [(-hx, -hy), (hx, -hy), (hx, hy), (-hx, hy)]
-                .into_iter()
-                .map(|(x, y)| {
-                    view.stage_to_screen(Vec2::new(cx + cos * x - sin * y, cy + sin * x + cos * y))
-                })
-                .collect::<Vec<_>>();
-            painter.add(egui::Shape::convex_polygon(points, fill, stroke));
-        }
+    }
+    if let ColliderGeometry::Circle { radius } = geometry {
+        // A spoke shows how far a round body has turned.
+        let spoke = view.stage_to_screen(body_point(pose, [*radius, 0.0]));
+        painter.line_segment([center, spoke], stroke);
     }
     painter.circle_filled(center, 2.5, stroke.color);
 }
@@ -1995,7 +3328,8 @@ mod tests {
     use super::*;
     use q0s_format::physics::PhysicsScene;
     use q0s_format::v2::{
-        Anchor, Asset, Layer, Path, Placement, ProjectMeta, Q0rg, Rgba, Target, Tween, VectorAsset,
+        Anchor, Asset, Layer, LibraryItemReference, Path, Placement, ProjectMeta, Q0rg, Rgba,
+        Target, Tween, VectorAsset,
     };
 
     /// A 20×20 square drawing.
@@ -2028,6 +3362,7 @@ mod tests {
 
     fn placed(instance_id: u32, frame: u16, x: f32, y: f32) -> Placement {
         Placement {
+            pivot: None,
             instance_id,
             frame,
             target: Target::Asset(1),
@@ -2104,6 +3439,89 @@ mod tests {
         assert!(poses[3].center[1] > poses[0].center[1], "it falls");
         let rest = poses.last().unwrap().center[1];
         assert!((rest - 290.0).abs() < 2.0, "rests on the floor, got {rest}");
+    }
+
+    #[test]
+    fn an_offset_hitbox_lands_the_object_higher() {
+        let rest = |offset: [f32; 2]| {
+            let mut project = project(vec![layer(1, vec![placed(7, 0, 200.0, 50.0)])]);
+            project.runtime.physics.scenes.push(scene(47));
+            let mut body = PhysicsBody::new(1, 7);
+            body.bounce = 0.0;
+            body.offset = offset;
+            project.runtime.physics.bodies.push(body);
+            let simulation = simulate(&project, 1).unwrap();
+            bake(&mut project, &simulation, BakeOptions::default()).unwrap();
+            project.q0rgs[0].layers[0]
+                .placements
+                .iter()
+                .find(|placement| placement.frame == 47)
+                .unwrap()
+                .transform
+                .ty
+        };
+        let plain = rest([0.0, 0.0]);
+        let lowered = rest([0.0, 15.0]);
+        assert!((plain - 290.0).abs() < 2.0, "{plain}");
+        assert!(
+            (plain - lowered - 15.0).abs() < 2.0,
+            "a hitbox moved down 15 px holds the drawing 15 px up: {plain} vs {lowered}"
+        );
+    }
+
+    #[test]
+    fn outline_hitboxes_follow_the_drawing_and_travel_to_the_player() {
+        // A U-shaped cup drawing.
+        let corner = |x: f32, y: f32| Anchor {
+            point: Vec2::new(x, y),
+            in_handle: None,
+            out_handle: None,
+        };
+        let mut project = project(vec![layer(1, vec![placed(7, 0, 200.0, 240.0)])]);
+        project.assets[0] = Asset::Vector(VectorAsset {
+            asset_id: 1,
+            paths: vec![Path {
+                anchors: [
+                    (-50.0, -30.0),
+                    (-40.0, -30.0),
+                    (-40.0, 20.0),
+                    (40.0, 20.0),
+                    (40.0, -30.0),
+                    (50.0, -30.0),
+                    (50.0, 30.0),
+                    (-50.0, 30.0),
+                ]
+                .into_iter()
+                .map(|(x, y)| corner(x, y))
+                .collect(),
+                closed: true,
+            }],
+            fill: Some(Rgba {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255,
+            }),
+            stroke: None,
+        });
+        let mut scene = scene(23);
+        scene.live = true;
+        project.runtime.physics.scenes.push(scene);
+        let mut cup = PhysicsBody::new(1, 7);
+        cup.kind = BodyKind::Static;
+        cup.shape = ColliderShape::Outline;
+        project.runtime.physics.bodies.push(cup);
+
+        let simulation = simulate(&project, 1).unwrap();
+        let ColliderGeometry::Parts(parts) = &simulation.tracks[0].geometry else {
+            panic!("an outline is made of parts");
+        };
+        assert!(parts.len() >= 3, "a U needs three convex parts at least");
+
+        let exported = for_player(&project);
+        let body = &exported.runtime.physics.bodies[0];
+        assert!(body.outline.len() >= 3, "the parts travel with the movie");
+        assert!(body.bounds.is_some());
     }
 
     #[test]
@@ -2204,34 +3622,6 @@ mod tests {
     }
 
     #[test]
-    fn turning_keeps_the_object_around_its_collider() {
-        let start = BodyFit {
-            layer_id: 1,
-            transform: Transform2D {
-                tx: 10.0,
-                ty: 0.0,
-                ..Transform2D::IDENTITY
-            },
-            pose: BodyPose {
-                center: [20.0, 0.0],
-                angle: 0.0,
-            },
-            half_extents: [10.0, 10.0],
-        };
-        let turned = posed_transform(
-            &start,
-            BodyPose {
-                center: [20.0, 0.0],
-                angle: std::f32::consts::FRAC_PI_2,
-            },
-        );
-        // The origin sat 10 px left of the center; a quarter turn puts it above.
-        assert!((turned.tx - 20.0).abs() < 1.0e-4);
-        assert!((turned.ty + 10.0).abs() < 1.0e-4);
-        assert!((turned.rotation - std::f32::consts::FRAC_PI_2).abs() < 1.0e-5);
-    }
-
-    #[test]
     fn a_wider_key_step_keys_fewer_frames_and_tweens_between() {
         let mut project = project(vec![layer(1, vec![placed(1, 0, 200.0, 50.0)])]);
         project.runtime.physics.scenes.push(scene(11));
@@ -2310,5 +3700,166 @@ mod tests {
             (total - 23.0 / 24.0 * 4.0 * std::f32::consts::PI).abs() < 0.05,
             "two turns a second, got {total}"
         );
+    }
+
+    #[test]
+    fn liquids_bake_into_one_drawing_per_frame_on_their_own_layer() {
+        let mut project = project(vec![layer(1, Vec::new())]);
+        project.runtime.physics.scenes.push(scene(5));
+        project
+            .runtime
+            .physics
+            .liquids
+            .push(PhysicsLiquid::new(1, 1, [150.0, 50.0, 100.0, 60.0]));
+        let simulation = simulate(&project, 1).unwrap();
+        assert_eq!(simulation.liquids[0].frames.len(), 6);
+        assert_eq!(
+            bake(&mut project, &simulation, BakeOptions::default()).unwrap(),
+            6
+        );
+        let layer_id = project.runtime.physics.liquids[0]
+            .layer_id
+            .expect("bake made a layer");
+        let liquid_layer = project.q0rgs[0]
+            .layers
+            .iter()
+            .find(|layer| layer.layer_id == layer_id)
+            .unwrap();
+        assert_eq!(liquid_layer.name, "liquid1");
+        assert_eq!(liquid_layer.keyframe_frames(), (0..=5).collect::<Vec<_>>());
+        assert_eq!(liquid_layer.placements.len(), 6);
+        let drawings = project.assets.len();
+        assert_eq!(drawings, 7, "one drawing a frame beside the square");
+        let first = match liquid_layer.placements[0].target {
+            Target::Asset(id) => id,
+            Target::Q0rg(_) => panic!("drawings, not symbols"),
+        };
+        assert_eq!(
+            project
+                .runtime
+                .library_item_folders
+                .get(&LibraryItemReference::Asset(first)),
+            Some(&"q0 physics/liquid1".to_string())
+        );
+
+        // Baking again replaces the drawings instead of piling them up.
+        let again = simulate(&project, 1).unwrap();
+        bake(&mut project, &again, BakeOptions::default()).unwrap();
+        assert_eq!(project.assets.len(), drawings);
+
+        assert!(clear_baked(&mut project, 1, None).unwrap() > 0);
+        assert_eq!(project.assets.len(), 1, "only the square is left");
+    }
+
+    #[test]
+    fn the_player_copy_keeps_live_worlds_with_measured_bodies() {
+        let mut project = project(vec![layer(1, vec![placed(1, 0, 200.0, 50.0)])]);
+        project.runtime.physics.scenes.push(scene(5));
+        project.runtime.physics.bodies.push(PhysicsBody::new(1, 1));
+        let baked_only = for_player(&project);
+        assert!(
+            baked_only.runtime.physics.is_empty(),
+            "baked physics stays behind"
+        );
+
+        project.runtime.physics.scenes[0].live = true;
+        let live = for_player(&project);
+        assert_eq!(live.runtime.physics.bodies.len(), 1);
+        assert_eq!(
+            live.runtime.physics.bodies[0].bounds,
+            Some([-10.0, -10.0, 10.0, 10.0])
+        );
+    }
+
+    #[test]
+    fn a_shape_made_of_parts_is_outlined_without_its_seams() {
+        // A 20 wide square cut into two triangles, and a sliver poking out.
+        let parts = vec![
+            vec![[0.0, 0.0], [20.0, 0.0], [20.0, 20.0]],
+            vec![[0.0, 0.0], [20.0, 20.0], [0.0, 20.0]],
+        ];
+        let edges = part_boundary(&parts);
+        let total = edges
+            .iter()
+            .map(|[a, b]| (b[0] - a[0]).hypot(b[1] - a[1]))
+            .sum::<f32>();
+        assert!((total - 80.0).abs() < 0.5, "only the four sides: {total}");
+        for [a, b] in &edges {
+            let middle = [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
+            let on_side = middle[0].abs() < 1.0e-3
+                || middle[1].abs() < 1.0e-3
+                || (middle[0] - 20.0).abs() < 1.0e-3
+                || (middle[1] - 20.0).abs() < 1.0e-3;
+            assert!(on_side, "no diagonal seam: {a:?} {b:?}");
+        }
+        // A part buried in another adds no outline.
+        let mut buried = parts.clone();
+        buried.push(vec![[5.0, 5.0], [10.0, 5.0], [10.0, 10.0]]);
+        let total_buried = part_boundary(&buried)
+            .iter()
+            .map(|[a, b]| (b[0] - a[0]).hypot(b[1] - a[1]))
+            .sum::<f32>();
+        assert!((total_buried - 80.0).abs() < 0.5, "{total_buried}");
+    }
+
+    #[test]
+    fn a_rope_holds_a_falling_box_and_bakes_into_a_drawing_per_frame() {
+        let mut project = project(vec![
+            layer(1, vec![placed(7, 0, 200.0, 40.0)]),
+            layer(2, vec![placed(8, 0, 200.0, 100.0)]),
+        ]);
+        project.runtime.physics.scenes.push(scene(23));
+        let mut holder = PhysicsBody::new(1, 7);
+        holder.kind = BodyKind::Static;
+        project.runtime.physics.bodies.push(holder);
+        project.runtime.physics.bodies.push(PhysicsBody::new(1, 8));
+        let mut rope =
+            q0s_format::physics::PhysicsLink::new(1, 1, q0s_format::physics::LinkKind::Rope, 7, 8);
+        rope.from_anchor = [0.0, 10.0];
+        rope.to_anchor = [0.0, -10.0];
+        rope.length = 100.0;
+        project.runtime.physics.links.push(rope);
+
+        let simulation = simulate(&project, 1).unwrap();
+        let hang = simulation.tracks[1].poses.last().unwrap().center[1];
+        assert!(
+            (hang - 160.0).abs() < 6.0,
+            "hangs a rope's length below: {hang}"
+        );
+        assert_eq!(simulation.links[0].frames.len(), 24);
+
+        bake(&mut project, &simulation, BakeOptions::default()).unwrap();
+        let link = &project.runtime.physics.links[0];
+        let layer_id = link.layer_id.expect("the rope got a layer");
+        let layer = project.q0rgs[0]
+            .layers
+            .iter()
+            .find(|layer| layer.layer_id == layer_id)
+            .unwrap();
+        assert_eq!(layer.name, "rope1");
+        let keyed = layer.placements.iter().filter(|p| p.frame == 12).count();
+        assert_eq!(keyed, 1, "a drawing on every frame");
+        let Target::Asset(asset_id) = layer.placements[0].target else {
+            panic!("a drawing");
+        };
+        let Some(Asset::Vector(drawing)) = project.assets.iter().find(|a| a.id() == asset_id)
+        else {
+            panic!("a vector drawing");
+        };
+        assert!(drawing.fill.is_none() && drawing.stroke.is_some());
+
+        // Baking again reuses the layer and its drawings' folder.
+        let layers = project.q0rgs[0].layers.len();
+        let assets = project.assets.len();
+        bake(&mut project, &simulation, BakeOptions::default()).unwrap();
+        assert_eq!(project.q0rgs[0].layers.len(), layers);
+        assert_eq!(project.assets.len(), assets);
+        clear_baked(&mut project, 1, None).unwrap();
+        let layer = project.q0rgs[0]
+            .layers
+            .iter()
+            .find(|layer| layer.layer_id == layer_id)
+            .unwrap();
+        assert!(layer.placements.iter().all(|p| p.frame == 0));
     }
 }

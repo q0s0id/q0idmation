@@ -528,6 +528,7 @@ mod tests {
         project.q0rgs[0].frame_count = 5;
         project.q0rgs[0].layers[0].placements = vec![
             q0s_format::v2::Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 4,
                 target: q0s_format::v2::Target::Asset(1),
@@ -536,6 +537,7 @@ mod tests {
                 fx: Default::default(),
             },
             q0s_format::v2::Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: q0s_format::v2::Target::Asset(2),
@@ -660,6 +662,7 @@ mod tests {
         project.q0rgs[0].layers[0]
             .placements
             .push(q0s_format::v2::Placement {
+                pivot: None,
                 instance_id: 123,
                 frame: 0,
                 target: q0s_format::v2::Target::Asset(77),

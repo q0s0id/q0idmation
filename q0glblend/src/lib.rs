@@ -7,6 +7,9 @@ use egui::{pos2, Color32, Mesh, PaintCallback, Painter, Pos2, Rect, Shape, Textu
 use glow::HasContext as _;
 use q0s_format::v2::{BlendMode, GradientKind, GradientStop};
 
+mod lighting;
+pub use lighting::{paint_lighting, LightingPaint};
+
 #[cfg(not(target_arch = "wasm32"))]
 thread_local! {
     static GL_RESOURCES: RefCell<HashMap<usize, GlResources>> = RefCell::new(HashMap::new());
@@ -240,7 +243,7 @@ fn record_paint_callback(painter: &Painter, rect: Rect, fx: Option<VectorGroupFx
 
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct CallbackRegion {
+pub(crate) struct CallbackRegion {
     left: i32,
     bottom: i32,
     width: i32,
@@ -250,7 +253,7 @@ struct CallbackRegion {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn callback_region(
+pub(crate) fn callback_region(
     viewport: Rect,
     clip_rect: Rect,
     pixels_per_point: f32,
@@ -493,6 +496,7 @@ struct GlResources {
     gradient_stop_count_uniform: Option<glow::UniformLocation>,
     gradient_stops_uniform: Option<glow::UniformLocation>,
     gradient_tint_uniform: Option<glow::UniformLocation>,
+    gradient_additive_uniform: Option<glow::UniformLocation>,
     gradient_color_scale_uniform: Option<glow::UniformLocation>,
     gradient_color_offset_uniform: Option<glow::UniformLocation>,
     gradient_screen_offset_uniform: Option<glow::UniformLocation>,
@@ -890,6 +894,8 @@ pub struct GradientMeshPaint {
     pub stops: Arc<Vec<GradientStop>>,
     pub tint: Color32,
     pub color_transform: ColorTransform,
+    /// Adds its light to what is behind instead of covering it.
+    pub additive: bool,
 }
 
 /// An affine RGB effect. Offsets are multiplied by coverage in premultiplied
@@ -974,6 +980,62 @@ pub fn transform_primitive_colors(primitives: &mut [VectorGroupPrimitive], effec
             VectorGroupPrimitive::Gradient { paint, .. } => {
                 paint.color_transform = paint.color_transform.then(effect);
             }
+        }
+    }
+}
+
+/// Fades primitives by `opacity`. Painting them directly afterwards matches
+/// a faded group only while they do not overlap one another.
+pub fn fade_primitives(primitives: &mut [VectorGroupPrimitive], opacity: f32) {
+    let opacity = opacity.clamp(0.0, 1.0);
+    if opacity >= 1.0 {
+        return;
+    }
+    for primitive in primitives {
+        match primitive {
+            VectorGroupPrimitive::Solid(mesh) => {
+                for vertex in &mut mesh.vertices {
+                    vertex.color = vertex.color.gamma_multiply(opacity);
+                }
+            }
+            VectorGroupPrimitive::Textured { mesh, .. } => {
+                for vertex in &mut Arc::make_mut(mesh).vertices {
+                    vertex.color = vertex.color.gamma_multiply(opacity);
+                }
+            }
+            VectorGroupPrimitive::Gradient { paint, .. } => {
+                let [r, g, b, a] = paint.tint.to_srgba_unmultiplied();
+                paint.tint = Color32::from_rgba_unmultiplied(
+                    r,
+                    g,
+                    b,
+                    (f32::from(a) * opacity).round().clamp(0.0, 255.0) as u8,
+                );
+            }
+        }
+    }
+}
+
+/// Makes primitives add their light to what is behind them: premultiplied
+/// colour with no alpha blends as a plain sum.
+pub fn make_primitives_additive(primitives: &mut [VectorGroupPrimitive]) {
+    let additive = |color: Color32| {
+        let [r, g, b, _] = color.to_array();
+        Color32::from_rgba_premultiplied(r, g, b, 0)
+    };
+    for primitive in primitives {
+        match primitive {
+            VectorGroupPrimitive::Solid(mesh) => {
+                for vertex in &mut mesh.vertices {
+                    vertex.color = additive(vertex.color);
+                }
+            }
+            VectorGroupPrimitive::Textured { mesh, .. } => {
+                for vertex in &mut Arc::make_mut(mesh).vertices {
+                    vertex.color = additive(vertex.color);
+                }
+            }
+            VectorGroupPrimitive::Gradient { paint, .. } => paint.additive = true,
         }
     }
 }
@@ -1974,6 +2036,7 @@ impl GlResources {
         let gradient_stop_count_uniform = gl.get_uniform_location(gradient_program, "u_stop_count");
         let gradient_stops_uniform = gl.get_uniform_location(gradient_program, "u_stops");
         let gradient_tint_uniform = gl.get_uniform_location(gradient_program, "u_tint");
+        let gradient_additive_uniform = gl.get_uniform_location(gradient_program, "u_additive");
         let gradient_color_scale_uniform =
             gl.get_uniform_location(gradient_program, "u_color_scale");
         let gradient_color_offset_uniform =
@@ -2073,6 +2136,7 @@ impl GlResources {
             gradient_stop_count_uniform,
             gradient_stops_uniform,
             gradient_tint_uniform,
+            gradient_additive_uniform,
             gradient_color_scale_uniform,
             gradient_color_offset_uniform,
             gradient_screen_offset_uniform,
@@ -2575,6 +2639,10 @@ impl GlResources {
         );
         gl.uniform_1_i32(self.gradient_stop_count_uniform.as_ref(), stop_count as i32);
         gl.uniform_1_i32(self.gradient_stops_uniform.as_ref(), 0);
+        gl.uniform_1_i32(
+            self.gradient_additive_uniform.as_ref(),
+            i32::from(paint.additive),
+        );
         let [tr, tg, tb, ta] = paint.tint.to_srgba_unmultiplied();
         gl.uniform_4_f32(
             self.gradient_tint_uniform.as_ref(),
@@ -3387,6 +3455,10 @@ impl GlResources {
                     );
                     gl.uniform_1_i32(self.gradient_stop_count_uniform.as_ref(), stop_count as i32);
                     gl.uniform_1_i32(self.gradient_stops_uniform.as_ref(), 0);
+                    gl.uniform_1_i32(
+                        self.gradient_additive_uniform.as_ref(),
+                        i32::from(paint.additive),
+                    );
                     let [tr, tg, tb, ta] = paint.tint.to_srgba_unmultiplied();
                     gl.uniform_4_f32(
                         self.gradient_tint_uniform.as_ref(),
@@ -4107,10 +4179,13 @@ vec4 source_straight_gamma() {
     vec4 sampled = texture(u_source, v_source_uv);
     float sa = clamp(sampled.a, 0.0, 1.0);
     if (sa <= 0.00001) return vec4(0.0);
-    vec3 linear_premul = u_source_srgb != 0
-        ? sampled.rgb
-        : srgb_linear_from_gamma(sampled.rgb);
-    vec3 straight_linear = clamp(linear_premul / sa, 0.0, 1.0);
+    if (u_source_srgb == 0) {
+        // Group targets hold gamma-space premultiplied colour, blended the
+        // way the software renderer blends, so antialiased edges keep
+        // their colour instead of darkening.
+        return vec4(clamp(sampled.rgb / sa, 0.0, 1.0), sa);
+    }
+    vec3 straight_linear = clamp(sampled.rgb / sa, 0.0, 1.0);
     return vec4(srgb_gamma_from_linear(straight_linear), sa);
 }
 
@@ -4188,7 +4263,7 @@ void main() {
 /// code once the version line names its dialect and the default precisions
 /// that ES leaves unset are declared.
 #[cfg(not(target_arch = "wasm32"))]
-fn glsl_for(gl: &glow::Context, source: &str) -> String {
+pub(crate) fn glsl_for(gl: &glow::Context, source: &str) -> String {
     if !gl.version().is_embedded {
         return source.to_owned();
     }
@@ -4210,13 +4285,31 @@ uniform float u_pixels_per_point;
 uniform vec2 u_region_origin_px;
 uniform vec2 u_region_size_px;
 out vec4 v_color;
+vec3 srgb_linear_from_gamma(vec3 rgb) {
+    bvec3 cutoff = lessThanEqual(rgb, vec3(0.04045));
+    vec3 lower = rgb / vec3(12.92);
+    vec3 higher = pow((rgb + vec3(0.055)) / vec3(1.055), vec3(2.4));
+    return mix(higher, lower, vec3(cutoff));
+}
+vec3 srgb_gamma_from_linear(vec3 rgb) {
+    bvec3 cutoff = lessThan(rgb, vec3(0.0031308));
+    vec3 lower = rgb * vec3(12.92);
+    vec3 higher = vec3(1.055) * pow(max(rgb, vec3(0.0)), vec3(1.0 / 2.4)) - vec3(0.055);
+    return mix(higher, lower, vec3(cutoff));
+}
 void main() {
     vec2 pixel = a_pos * u_pixels_per_point;
     vec2 local = (pixel - u_region_origin_px) / u_region_size_px;
     // Store screen-top at texture v=0 so the existing texture compositor and
     // CPU-uploaded egui textures share one orientation.
     gl_Position = vec4(local.x * 2.0 - 1.0, local.y * 2.0 - 1.0, 0.0, 1.0);
-    v_color = a_color;
+    // egui premultiplies in linear light; the group works in gamma-space
+    // premultiplied colour, so coverage blends without darkening edges.
+    float a = a_color.a;
+    vec3 straight = a > 0.00001
+        ? srgb_gamma_from_linear(clamp(srgb_linear_from_gamma(a_color.rgb) / a, 0.0, 1.0))
+        : vec3(0.0);
+    v_color = vec4(straight * a, a);
 }
 "#;
     const FRAGMENT: &str = r#"#version 140
@@ -4319,7 +4412,16 @@ void main() {
     }
     vec4 color = v_color * sampled;
     if (color.a <= 0.00001 && dot(color.rgb, color.rgb) <= 0.0000001) discard;
-    out_color = apply_color_effect(color);
+    vec4 effected = apply_color_effect(color);
+    // The group works in gamma-space premultiplied colour.
+    if (effected.a <= 0.00001) {
+        out_color = vec4(effected.rgb, 0.0);
+        return;
+    }
+    vec3 straight = srgb_gamma_from_linear(
+        clamp(srgb_linear_from_gamma(effected.rgb) / effected.a, 0.0, 1.0)
+    );
+    out_color = vec4(straight * effected.a, effected.a);
 }
 "#;
     let vertex = gl
@@ -4398,6 +4500,7 @@ uniform int u_gradient_kind;
 uniform int u_stop_count;
 uniform sampler2D u_stops;
 uniform vec4 u_tint;
+uniform int u_additive;
 in vec2 v_local;
 uniform vec3 u_color_scale;
 uniform vec3 u_color_offset;
@@ -4441,8 +4544,8 @@ void main() {
     vec4 color = sample_gradient(t);
     color *= u_tint;
     color.rgb = color.rgb * u_color_scale + u_color_offset;
-    // q0/egui compositing is premultiplied-alpha.
-    out_color = vec4(color.rgb * color.a, color.a);
+    // q0/egui compositing is premultiplied-alpha; no alpha adds the light.
+    out_color = vec4(color.rgb * color.a, u_additive != 0 ? 0.0 : color.a);
 }
 "#;
     let vertex = gl
@@ -4858,6 +4961,7 @@ mod tests {
             }]),
             tint: Color32::WHITE,
             color_transform: ColorTransform::default(),
+            additive: false,
         };
         let primitive = VectorGroupPrimitive::Gradient {
             mesh: Arc::new(Mesh::default()),

@@ -1,30 +1,25 @@
-# q0shell: терминальный host q0lang
+# q0shell: the terminal host for q0lang
 
-`q0shell` - третья программа q0idmation-линейки после q0player и q0editor. Это
-чистый терминальный host: он запускает q0lang-файлы без редактора, выполняет
-чистые вычисления через общий runtime и применяет `q0shell.*!` actions к
-файловой системе.
+`q0shell` is the third program of the q0idmation family, next to q0player and q0editor. It is a plain terminal host: it runs q0lang files without the editor, computes through the shared runtime and applies `q0shell.*!` commands to the file system.
 
-## Запуск
+## running it
 
 ```powershell
 cargo run -p q0shell -- script.q0lang --root .
 ```
 
-`--root` задает директорию, внутри которой разрешены файловые операции. Если
-`--root` не указан, используется текущая директория.
+`--root` sets the directory that file operations are allowed in. Without `--root`, the current directory is used.
 
-Для быстрых команд без файла есть inline-режим:
+Short commands need no file:
 
 ```powershell
 cargo run -p q0shell -- -e "q0shell.print! 'hi'" --root .
 cargo run -p q0shell -- -e "q0shell.mkdir! 'out'" -e "q0shell.write! 'out/a.txt', 'Q0'" --root .
 ```
 
-Каждый `-e` / `--eval` добавляет одну строку q0lang; несколько `-e`
-склеиваются в один скрипт.
+Each `-e` / `--eval` adds one line of q0lang; several `-e` join into one script. A script path and `-e` cannot be combined. Timeline, rig, scene, physics and particle commands only print that they are unavailable in q0shell.
 
-## Команды
+## commands
 
 ```q0lang
 q0shell.print! "text", 123
@@ -37,7 +32,7 @@ q0shell.move! "from.txt", "to.txt"
 q0shell.delete! "path.txt"
 ```
 
-Все аргументы - q0lang expressions:
+Every argument is a q0lang expression:
 
 ```q0lang
 import q0.math
@@ -51,16 +46,15 @@ q0shell.write! path, "armed"
 q0shell.read! path
 ```
 
-## Безопасность v0
+`print!` joins its values with spaces. `read!` prints the file, `list!` prints the folder's entries. The longer example in [examples/q0shell.q0lang](examples/q0shell.q0lang) writes, appends, reads, moves and lists files.
 
-q0shell намеренно низкоуровневый, но не слепой:
+## safety
 
-- абсолютные пути запрещены;
-- `..` запрещен;
-- удаление root-директории запрещено;
-- все операции резолвятся относительно `--root`.
+q0shell is deliberately low-level, but not blind:
 
-Этого достаточно для первого слоя системного менеджмента: создать, записать,
-прочитать, переместить, удалить, вывести список. Позже этот же host можно
-встроить в q0editor как debug-terminal: editor будет показывать тот же stdout,
-stderr, diagnostics и список host actions.
+- absolute paths are refused;
+- `..` is refused;
+- deleting the root directory is refused;
+- every operation resolves inside `--root`.
+
+That covers the first layer of file management: create, write, read, move, delete and list. A movie played in q0player never gets these commands; the player ignores them.

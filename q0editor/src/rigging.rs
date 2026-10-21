@@ -5666,6 +5666,7 @@ mod tests {
                     name: "parts".into(),
                     explicit_keyframes: vec![0],
                     placements: vec![Placement {
+                        pivot: None,
                         instance_id: 0,
                         frame: 0,
                         target: Target::Asset(1),

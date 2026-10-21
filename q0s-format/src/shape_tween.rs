@@ -816,11 +816,16 @@ fn lerp_stroke(
         ),
         (None, None) => return None,
     };
-    let cap: CapShape = if t < 0.5 { from.cap } else { to.cap };
+    let (cap, join): (CapShape, _) = if t < 0.5 {
+        (from.cap, from.join)
+    } else {
+        (to.cap, to.join)
+    };
     Some(Stroke {
         color: lerp_rgba(from.color, to.color, t),
         width: lerp(from.width, to.width, t) / local_scale,
         cap,
+        join,
     })
 }
 
@@ -863,6 +868,7 @@ mod tests {
 
     fn placement(frame: u16, asset_id: u16, tween: Tween) -> Placement {
         Placement {
+            pivot: None,
             instance_id: 0,
             frame,
             target: Target::Asset(asset_id),
@@ -1289,6 +1295,7 @@ mod tests {
                 },
                 width,
                 cap: CapShape::Round,
+                join: crate::geom::JoinShape::Bevel,
             })
         };
         let assets = [

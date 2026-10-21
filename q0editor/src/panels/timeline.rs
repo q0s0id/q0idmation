@@ -4601,6 +4601,7 @@ mod tests {
 
     fn placement(frame: u16) -> Placement {
         Placement {
+            pivot: None,
             instance_id: 0,
             frame,
             target: Target::Asset(1),

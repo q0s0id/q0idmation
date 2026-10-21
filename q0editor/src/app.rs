@@ -411,6 +411,7 @@ pub struct EditorApp {
     /// Whether a text field was being edited at the end of the last frame.
     pub(crate) text_field_focused: bool,
     show_project_tree: bool,
+    pub(crate) sweeper: crate::sweeper::Sweeper,
     pub(crate) library_source: Option<LibrarySource>,
     pub(crate) library_selection: Option<LibrarySelection>,
     pub(crate) library_multi_selection: Vec<LibrarySelection>,
@@ -836,9 +837,12 @@ pub enum Action {
     BreadcrumbJumpTo(usize),
     ExitQ0rg,
     ToggleCredits,
+    ToggleSweeper,
     ToggleSettings,
     ToggleProjectTree,
     TogglePhysics,
+    ToggleParticles,
+    ToggleLight,
     ZoomIn,
     ZoomOut,
     ZoomReset,
@@ -968,9 +972,12 @@ impl Action {
             Self::BreadcrumbJumpTo(_) => "breadcrumb-jump-to",
             Self::ExitQ0rg => "exit-q0rg",
             Self::ToggleCredits => "toggle-credits",
+            Self::ToggleSweeper => "toggle-sweeper",
             Self::ToggleSettings => "toggle-settings",
             Self::ToggleProjectTree => "toggle-project-tree",
             Self::TogglePhysics => "toggle-physics",
+            Self::ToggleParticles => "toggle-particles",
+            Self::ToggleLight => "toggle-light",
             Self::ZoomIn => "zoom-in",
             Self::ZoomOut => "zoom-out",
             Self::ZoomReset => "zoom-reset",
@@ -1185,6 +1192,7 @@ impl Default for EditorApp {
         );
         // Mirror persisted drawing defaults into the in-memory session.
         session.brush_cap = settings.brush_cap.into();
+        session.brush_join = settings.brush_join.into();
         session.brush = settings.brush.to_runtime();
         session.brush_mode = settings.brush_mode.into();
         session.advanced_brush = settings.advanced_brush.to_runtime();
@@ -1233,6 +1241,7 @@ impl Default for EditorApp {
             touch: crate::touch::TouchLayout::default(),
             text_field_focused: false,
             show_project_tree: false,
+            sweeper: crate::sweeper::Sweeper::default(),
             library_source: None,
             library_selection: None,
             library_multi_selection: Vec::new(),
@@ -1694,6 +1703,7 @@ impl EditorApp {
         let repaired = crate::timeline_edit::sync_project_folder_timelines(&mut project);
         let mut session = Session::for_project(&project);
         session.brush_cap = self.settings.brush_cap.into();
+        session.brush_join = self.settings.brush_join.into();
         session.brush = self.settings.brush.to_runtime();
         session.brush_mode = self.settings.brush_mode.into();
         session.advanced_brush = self.settings.advanced_brush.to_runtime();
@@ -4643,6 +4653,13 @@ impl EditorApp {
                     self.session.credits_opened_at = Instant::now();
                 }
             }
+            Action::ToggleSweeper => {
+                if self.sweeper.open {
+                    self.sweeper.open = false;
+                } else if self.settings.sweeper.unlocked {
+                    self.sweeper.show(self.settings.sweeper.level);
+                }
+            }
             Action::ToggleSettings => {
                 self.session.show_settings = !self.session.show_settings;
             }
@@ -4660,6 +4677,28 @@ impl EditorApp {
                     physics.open = false;
                     self.session.status =
                         "turn on the physics editor in Settings first".to_string();
+                }
+            }
+            Action::ToggleLight => {
+                let lights = &mut self.session.lights;
+                if self.settings.light_enabled {
+                    lights.open = !lights.open;
+                } else {
+                    lights.open = false;
+                    self.session.status = "turn on the light editor in Settings first".to_string();
+                }
+            }
+            Action::ToggleParticles => {
+                let particles = &mut self.session.particles;
+                if self.settings.particles_enabled {
+                    particles.open = !particles.open;
+                    if !particles.open {
+                        particles.stop_preview();
+                    }
+                } else {
+                    particles.open = false;
+                    self.session.status =
+                        "turn on the particle system in Settings first".to_string();
                 }
             }
             Action::ZoomIn => {
@@ -5775,6 +5814,7 @@ impl EditorApp {
                 for (depth, active) in active.into_iter().enumerate() {
                     let source = layer.placements.get(active.index)?;
                     let placement = Placement {
+                        pivot: source.pivot,
                         instance_id: source.instance_id,
                         frame,
                         target: source.target,
@@ -7444,6 +7484,7 @@ impl EditorApp {
         layer.placements.insert(
             placement_idx,
             Placement {
+                pivot: None,
                 instance_id: 0,
                 frame,
                 target: Target::Q0rg(new_q0rg_id),
@@ -7682,6 +7723,7 @@ impl EditorApp {
         };
         let placement_idx = layer.placements.len();
         layer.push_placement(Placement {
+            pivot: None,
             instance_id: 0,
             frame,
             target: Target::Asset(asset_id),
@@ -8241,6 +8283,7 @@ impl EditorApp {
                                 pending_assets.push(Asset::Vector(baked));
                                 pieces.push(BreakApartPiece {
                                     placement: Placement {
+                                        pivot: None,
                                         instance_id: 0,
                                         frame: self.session.current_frame,
                                         target: Target::Asset(next_asset_id),
@@ -8266,6 +8309,7 @@ impl EditorApp {
                                 };
                                 pieces.push(BreakApartPiece {
                                     placement: Placement {
+                                        pivot: None,
                                         instance_id: 0,
                                         frame: self.session.current_frame,
                                         target: Target::Asset(asset_id),
@@ -8287,6 +8331,7 @@ impl EditorApp {
                         };
                         pieces.push(BreakApartPiece {
                             placement: Placement {
+                                pivot: None,
                                 instance_id: 0,
                                 frame: self.session.current_frame,
                                 target: Target::Q0rg(nested_id),
@@ -8656,6 +8701,7 @@ impl EditorApp {
                 name,
                 explicit_keyframes,
                 placements: vec![Placement {
+                    pivot: None,
                     instance_id: 0,
                     frame,
                     target,
@@ -8798,6 +8844,7 @@ impl EditorApp {
         {
             let next_idx = layer.placements.len();
             layer.push_placement(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame,
                 target,
@@ -11072,6 +11119,7 @@ impl EditorApp {
                     continue;
                 }
                 let copy = Placement {
+                    pivot: src.pivot,
                     instance_id: src.instance_id,
                     frame,
                     target: src.target,
@@ -11340,7 +11388,7 @@ impl EditorApp {
                     .id_source("q0editor_credits_scroll")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        q0credits::show(
+                        let mark = q0credits::show(
                             ui,
                             &q0credits::Palette {
                                 accent: self.settings.theme.accent.to_color32(),
@@ -11352,6 +11400,15 @@ impl EditorApp {
                             },
                             self.session.credits_opened_at.elapsed().as_secs_f32(),
                         );
+                        if crate::sweeper::knock_on_mark(&mut self.sweeper.knock, ui, mark) {
+                            let first_time = !self.settings.sweeper.unlocked;
+                            self.settings.sweeper.unlocked = true;
+                            self.settings.save();
+                            self.sweeper.show(self.settings.sweeper.level);
+                            if first_time {
+                                self.session.status = "something woke up under Help...".to_string();
+                            }
+                        }
                     });
             });
         self.session.show_credits = open;
@@ -11465,6 +11522,31 @@ impl EditorApp {
                     }
                     if let Err(error) = self.settings.try_save() {
                         self.session.status = format!("could not save the physics preference: {error}");
+                    }
+                }
+                if ui
+                    .checkbox(&mut self.settings.particles_enabled, "Particle system")
+                    .on_hover_text("Emitters spray fire, smoke, sparks, snow or library items, baked into keyframes. Adds Modify > Particles and a Particles button.")
+                    .changed()
+                {
+                    if !self.settings.particles_enabled {
+                        self.session.particles.open = false;
+                        self.session.particles.stop_preview();
+                    }
+                    if let Err(error) = self.settings.try_save() {
+                        self.session.status = format!("could not save the particles preference: {error}");
+                    }
+                }
+                if ui
+                    .checkbox(&mut self.settings.light_enabled, "Light editor")
+                    .on_hover_text("Real lights: darken the scene and drop lamps, torches and spotlights on it. Nothing is baked; exports and q0player light every frame. Adds Modify > Light and a Light button.")
+                    .changed()
+                {
+                    if !self.settings.light_enabled {
+                        self.session.lights.open = false;
+                    }
+                    if let Err(error) = self.settings.try_save() {
+                        self.session.status = format!("could not save the light preference: {error}");
                     }
                 }
                 ui.add_space(10.0);
@@ -12082,6 +12164,19 @@ impl EditorApp {
                     if !self.activate_new_workspace(workspace) {
                         return;
                     }
+                    // A mask layer locked in the FLA opens with its mask
+                    // preview on, so it clips as it did there; the layer
+                    // itself stays locked.
+                    let tab = self.active_project_tab_id().unwrap_or(0);
+                    let locked_masks = self
+                        .state
+                        .project
+                        .layer_metadata
+                        .iter()
+                        .filter(|(_, metadata)| metadata.kind == LayerKind::Mask && metadata.locked)
+                        .map(|(key, _)| (tab, key.q0rg_id, key.layer_id))
+                        .collect::<Vec<_>>();
+                    self.session.hidden_mask_art_layers.extend(locked_masks);
                     self.new_project_dialog = None;
                     self.session.status = format!(
                         "q0fla imported {} as an unsaved q1s project; {summary}",
@@ -13271,7 +13366,12 @@ impl EditorApp {
                 | RuntimeAction::RigSetValue { .. }
                 | RuntimeAction::RigReset { .. }
                 | RuntimeAction::RigSetPose { .. }
-                | RuntimeAction::RigResetPose { .. } => {
+                | RuntimeAction::RigResetPose { .. }
+                | RuntimeAction::Physics(_)
+                | RuntimeAction::Particles(_)
+                | RuntimeAction::Light(_) => {
+                    // Live physics and particles run in q0player; the editor
+                    // previews them through their own windows instead.
                     // Preview intentionally exposes no shell/filesystem capability and
                     // does not mutate authored rig data. Runtime scene overrides are
                     // introduced by the host-api phase rather than by writing the project.
@@ -13438,8 +13538,12 @@ impl App for EditorApp {
             std::panic::resume_unwind(panic);
         }
         // egui reports an input-method target only while a text field is
-        // being edited, which is exactly when a soft keyboard is wanted.
-        let text_field_focused = ctx.output(|output| output.ime.is_some());
+        // being edited, which is exactly when a soft keyboard is wanted. It
+        // stops reporting while the field is out of sight, as when the
+        // keyboard it opened covers it: keep the keyboard up while the field
+        // keeps its focus, or showing and hiding it would flicker forever.
+        let text_field_focused = ctx.output(|output| output.ime.is_some())
+            || (self.text_field_focused && ctx.memory(|memory| memory.focused().is_some()));
         if text_field_focused != self.text_field_focused {
             self.text_field_focused = text_field_focused;
             if self.soft_keyboard.is_some() {
@@ -13474,6 +13578,7 @@ impl EditorApp {
             .record(crate::perf::PerfSpan::AppStartup, startup_started.elapsed());
 
         let ingress_started = Instant::now();
+        crate::sweeper::take_keys(self, ctx);
         self.poll_external_open_requests(ctx);
         self.poll_platform(ctx);
         if self.project_active {
@@ -13605,7 +13710,11 @@ impl EditorApp {
         if self.session.show_settings {
             self.render_settings_dialog(ctx);
         }
+        crate::sweeper::render_window(self, ctx);
+        crate::sim_preview::update(self, ctx);
         crate::physics::render_window(self, ctx);
+        crate::particles::render_window(self, ctx);
+        crate::lights::render_window(self, ctx);
         if self.session.show_shortcuts {
             self.render_shortcuts_dialog(ctx);
         }
@@ -14106,6 +14215,7 @@ mod tests {
         app.state.project.q0rgs[0].frame_count = 12;
         app.state.project.q0rgs[0].layers[0].placements = vec![
             Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(1),
@@ -14114,6 +14224,7 @@ mod tests {
                 fx: Default::default(),
             },
             Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(2),
@@ -14232,6 +14343,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 5,
                 target: Target::Asset(77),
@@ -14266,6 +14378,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(78),
@@ -14901,6 +15014,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 4,
                 target: Target::Asset(77),
@@ -14955,6 +15069,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 4,
                 target: Target::Asset(77),
@@ -15064,6 +15179,7 @@ mod tests {
         let mut app = EditorApp::default();
         app.state.project.q0rgs[0].frame_count = frame_count;
         app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(77),
@@ -15084,6 +15200,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 6,
                 target: Target::Asset(77),
@@ -15116,6 +15233,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 6,
                 target: Target::Asset(77),
@@ -15272,6 +15390,7 @@ mod tests {
             name: "Layer 2".to_string(),
             explicit_keyframes: Vec::new(),
             placements: vec![Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(88),
@@ -15307,6 +15426,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 5,
                 target: Target::Asset(77),
@@ -15360,6 +15480,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 6,
                 target: Target::Asset(77),
@@ -15429,6 +15550,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 3,
                 target: Target::Asset(77),
@@ -15463,6 +15585,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 7,
                 target: Target::Asset(77),
@@ -15617,6 +15740,30 @@ mod tests {
     }
 
     #[test]
+    fn particle_system_stays_hidden_until_enabled() {
+        assert!(!crate::settings::Settings::default().particles_enabled);
+        let mut app = EditorApp::default();
+        app.settings.particles_enabled = false;
+        app.handle(&Context::default(), Action::ToggleParticles);
+        assert!(!app.session.particles.open);
+        app.settings.particles_enabled = true;
+        app.handle(&Context::default(), Action::ToggleParticles);
+        assert!(app.session.particles.open);
+    }
+
+    #[test]
+    fn light_editor_stays_hidden_until_enabled() {
+        assert!(!crate::settings::Settings::default().light_enabled);
+        let mut app = EditorApp::default();
+        app.settings.light_enabled = false;
+        app.handle(&Context::default(), Action::ToggleLight);
+        assert!(!app.session.lights.open);
+        app.settings.light_enabled = true;
+        app.handle(&Context::default(), Action::ToggleLight);
+        assert!(app.session.lights.open);
+    }
+
+    #[test]
     fn project_tree_window_is_independent_from_settings_and_credits() {
         let mut app = EditorApp::default();
         app.session.show_settings = true;
@@ -15678,6 +15825,62 @@ mod tests {
         assert!(!app.q0enc.open);
         assert!(app.session.show_settings);
         assert!(app.session.show_credits);
+    }
+
+    #[test]
+    fn a_locked_fla_mask_opens_with_its_preview_on_and_stays_locked() {
+        let root = std::env::temp_dir().join(format!(
+            "q0editor-q0fla-mask-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("create xfl fixture dir");
+        let marker = root.join("masked.xfl");
+        std::fs::write(&marker, b"PROXY-CS5").expect("write xfl marker");
+        std::fs::write(
+            root.join("DOMDocument.xml"),
+            br#"<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="320" height="180" frameRate="24"><timelines><DOMTimeline name="Scene 1"><layers><DOMLayer name="Locked mask" layerType="mask" locked="true"><frames><DOMFrame index="0"/></frames></DOMLayer><DOMLayer name="Clipped" parentLayerIndex="0"><frames><DOMFrame index="0"/></frames></DOMLayer><DOMLayer name="Open mask" layerType="mask"><frames><DOMFrame index="0"/></frames></DOMLayer></layers></DOMTimeline></timelines></DOMDocument>"#,
+        )
+        .expect("write DOMDocument.xml");
+
+        let mut app = EditorApp::default();
+        let ctx = Context::default();
+        assert!(app.open_from_path(&ctx, &marker));
+        for _ in 0..100 {
+            app.poll_fla_import(&ctx);
+            if app.fla_import_job.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let tab = app.active_project_tab_id().unwrap_or(0);
+        let q0rg = &app.state.project.q0rgs[0];
+        let layer = |name: &str| {
+            q0rg.layers
+                .iter()
+                .find(|layer| layer.name == name)
+                .expect("imported layer")
+                .layer_id
+        };
+        let (locked, open) = (layer("Locked mask"), layer("Open mask"));
+        assert!(
+            app.state
+                .project
+                .layer_metadata(q0rg.q0rg_id, locked)
+                .locked
+        );
+        assert!(app
+            .session
+            .hidden_mask_art_layers
+            .contains(&(tab, q0rg.q0rg_id, locked)));
+        assert!(!app
+            .session
+            .hidden_mask_art_layers
+            .contains(&(tab, q0rg.q0rg_id, open)));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -15818,6 +16021,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(77),
@@ -15932,6 +16136,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(77),
@@ -15986,6 +16191,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(77),
@@ -16072,6 +16278,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(77),
@@ -16128,6 +16335,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(77),
@@ -16189,6 +16397,7 @@ mod tests {
                 name: "Art".to_string(),
                 explicit_keyframes: Vec::new(),
                 placements: vec![Placement {
+                    pivot: None,
                     instance_id: 0,
                     frame: 0,
                     target: Target::Asset(77),
@@ -16208,6 +16417,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Q0rg(2),
@@ -16255,6 +16465,7 @@ mod tests {
                 name: "Art".to_string(),
                 explicit_keyframes: Vec::new(),
                 placements: vec![Placement {
+                    pivot: None,
                     instance_id: 0,
                     frame: 0,
                     target: Target::Asset(77),
@@ -16271,6 +16482,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Q0rg(2),
@@ -16438,6 +16650,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 12,
                 target: Target::Asset(1),
@@ -16529,6 +16742,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Q0rg(2),
@@ -16964,9 +17178,11 @@ mod tests {
                 },
                 width: 2.0,
                 cap: q0s_format::geom::CapShape::Round,
+                join: q0s_format::geom::JoinShape::Bevel,
             }),
         }));
         app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(asset_id),
@@ -17751,6 +17967,7 @@ mod tests {
         app.state.project.q0rgs[0].layers[0]
             .placements
             .push(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 6,
                 target: Target::Asset(78),
@@ -17912,6 +18129,7 @@ mod tests {
         }));
         let layer = &mut app.state.project.q0rgs[0].layers[0];
         layer.push_placement(Placement {
+            pivot: None,
             instance_id: 0,
             frame,
             target: Target::Asset(asset_id),

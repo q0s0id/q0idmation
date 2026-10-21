@@ -729,6 +729,14 @@ pub enum ToolState {
         start_bounds_min: Vec2,
         start_bounds_max: Vec2,
     },
+    /// Drags one end of a selected straight line while the other end stays:
+    /// moving, turning and stretching the line in one gesture.
+    DraggingLineEnd {
+        path: PathRef,
+        anchor_idx: usize,
+        start_cursor: Vec2,
+        start_path: VPath,
+    },
     /// Direct-selection drag of one authored Bezier control handle. The source
     /// path snapshot keeps each pointer tick absolute, so dragging cannot
     /// accumulate numeric drift or mutate the opposite handle accidentally.
@@ -1065,11 +1073,19 @@ pub struct Session {
     /// stroke-to-fill conversions in the right-click menu. Per-session, so
     /// the user picks once and forgets.
     pub brush_cap: CapShape,
+    /// How new strokes turn their corners.
+    pub brush_join: q0s_format::geom::JoinShape,
     /// Rigging uses one project/runtime model; this is only the editor presentation mode.
     pub rig_mode: RigMode,
     pub rig_edit_mode: RigEditMode,
     /// Physics editor window and preview; hidden unless enabled in Settings.
     pub physics: crate::physics::PhysicsSession,
+    /// Particle editor window; hidden unless enabled in Settings.
+    pub particles: crate::particles::ParticleSession,
+    /// Light editor window; hidden unless enabled in Settings.
+    pub lights: crate::lights::LightSession,
+    /// The background preview both windows share.
+    pub sim_preview: crate::sim_preview::SimPreview,
     pub rig_auto_key: bool,
     pub rig_selected_node: Option<u16>,
     pub rig_selected_control: Option<u16>,
@@ -1301,9 +1317,13 @@ impl Session {
             advanced_brush_library_filter: BrushLibraryFilter::All,
             eraser_size: 18.0,
             brush_cap: CapShape::Round,
+            brush_join: q0s_format::geom::JoinShape::Round,
             rig_mode: RigMode::Simple,
             rig_edit_mode: RigEditMode::Pose,
             physics: Default::default(),
+            particles: Default::default(),
+            lights: Default::default(),
+            sim_preview: Default::default(),
             rig_auto_key: true,
             rig_selected_node: None,
             rig_selected_control: None,
@@ -2671,6 +2691,7 @@ mod default_project_tests {
             stroke: None,
         }));
         before.q0rgs[0].layers[0].push_placement(Placement {
+            pivot: None,
             instance_id: 41,
             frame: 0,
             target: Target::Asset(7),

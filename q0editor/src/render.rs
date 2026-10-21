@@ -41,7 +41,9 @@ pub struct StageView {
     pub origin: Pos2,
     /// pixels-per-stage-unit; same on x and y (square pixels).
     pub scale: f32,
-    /// Stage rect in screen pixels, used to clip if desired.
+    /// The document's paper rectangle in screen points. Artwork is clipped by
+    /// the painter's canvas, so moving a camera or drawing past the paper does
+    /// not crop vectors, gradients, masks or lighting.
     pub stage_rect: Rect,
     /// Maps the active symbol's local stage coordinates into the document stage.
     /// Identity for ordinary editing; set to the selected instance chain for
@@ -920,12 +922,92 @@ struct MaskFrameKey {
     editing_q0rg_id: Option<u16>,
     mask_visibility_revision: u64,
     layer_filter_hash: u64,
+    lighting: bool,
 }
 
+#[derive(Clone)]
 struct CachedMaskFrame {
     texture: TextureHandle,
     stage_origin: Pos2,
     screen_rect: Rect,
+    /// The rendered area in view space, `(screen - origin) / scale`, so an
+    /// old picture can stand in, aligned, after a zoom or pan.
+    view_rect: Rect,
+    edit_transform: Affine,
+    revision: Option<(u64, u64)>,
+    /// What else must match for the picture to stand in for another frame.
+    compat: (u16, Option<u16>, u64, u64, bool),
+}
+
+/// Everything a masked frame is drawn with, owned, so the drawing can run on
+/// a worker thread.
+#[derive(Clone)]
+struct MaskRasterArgs {
+    q0rg_id: u16,
+    frame: u16,
+    width: u32,
+    height: u32,
+    background: [u8; 4],
+    root: Affine,
+    lighting: bool,
+    hidden_artwork: Option<HashSet<(u16, u16)>>,
+    excluded_layers: Option<HashSet<u16>>,
+    background_regions: Vec<[Vec2; 4]>,
+}
+
+impl MaskRasterArgs {
+    /// The frame's pixels, drawn `factor` times as fine as asked.
+    fn rasterize(&self, project: &ProjectV2, factor: f32) -> (Vec<u8>, u32, u32) {
+        let width = ((self.width as f32 * factor).round() as u32).max(1);
+        let height = ((self.height as f32 * factor).round() as u32).max(1);
+        let scale_x = width as f32 / self.width.max(1) as f32;
+        let scale_y = height as f32 / self.height.max(1) as f32;
+        let shrink = Affine {
+            a11: scale_x,
+            a12: 0.0,
+            a21: 0.0,
+            a22: scale_y,
+            tx: 0.0,
+            ty: 0.0,
+        };
+        let regions = self
+            .background_regions
+            .iter()
+            .map(|quad| quad.map(|point| Vec2::new(point.x * scale_x, point.y * scale_y)))
+            .collect::<Vec<_>>();
+        let mut scene_state = q0s_format::runtime_scene::RuntimeSceneState::new();
+        if !self.lighting {
+            // As in the GPU path, onion skins and partial renders do not
+            // carry darkness or light glows of their own.
+            scene_state.lighting = Some(Default::default());
+        }
+        let rgba = q0s_format::raster::rasterize_q0rg_frame_with_mask_preview(
+            project,
+            self.q0rg_id,
+            self.frame,
+            width,
+            height,
+            1,
+            self.background,
+            Affine::compose(shrink, self.root),
+            &q0s_format::rig::RigRuntimeOverrides::new(),
+            &scene_state,
+            Some(q0s_format::raster::MaskEditingPreview {
+                q0rg_id: self.q0rg_id,
+                hidden_artwork: self.hidden_artwork.as_ref(),
+                excluded_layers: self.excluded_layers.as_ref(),
+                background_regions: self.lighting.then_some(regions.as_slice()),
+            }),
+        );
+        (rgba, width, height)
+    }
+}
+
+/// A masked frame being drawn on a worker thread.
+struct MaskJob {
+    key: MaskFrameKey,
+    receiver: std::sync::mpsc::Receiver<(Vec<u8>, u32, u32)>,
+    frame: CachedMaskFrame,
 }
 
 struct ScopedPlacementBoundsCache {
@@ -988,6 +1070,13 @@ pub struct TextureCache {
     fx_placement_textures: HashMap<FxPlacementKey, FxPlacementTexture>,
     mask_frame_revision: Option<(u64, u64)>,
     mask_frame_textures: HashMap<MaskFrameKey, CachedMaskFrame>,
+    /// The project as of `revision`, shared with masked-frame workers.
+    mask_project: Option<((u64, u64), Arc<ProjectV2>)>,
+    /// The masked frame drawing in the background, if any.
+    mask_job: Option<MaskJob>,
+    /// The last masked picture shown per timeline, kept across edits to
+    /// stand in while the next one draws.
+    mask_stale: HashMap<u16, CachedMaskFrame>,
     fx_serial: u64,
     classic_brush_preview: Option<ClassicBrushPreviewTexture>,
     #[cfg(test)]
@@ -2837,6 +2926,12 @@ fn tessellate_cached_asset_strokes(
     let line_cap = match stroke.cap {
         q0s_format::geom::CapShape::Round => LineCap::Round,
         q0s_format::geom::CapShape::Butt => LineCap::Butt,
+        q0s_format::geom::CapShape::Square => LineCap::Square,
+    };
+    let line_join = match stroke.join {
+        q0s_format::geom::JoinShape::Miter => LineJoin::Miter,
+        q0s_format::geom::JoinShape::Round => LineJoin::Round,
+        q0s_format::geom::JoinShape::Bevel => LineJoin::Bevel,
     };
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
@@ -2862,7 +2957,8 @@ fn tessellate_cached_asset_strokes(
         let mut buffers: VertexBuffers<lyon_path::math::Point, u32> = VertexBuffers::new();
         let options = StrokeOptions::default()
             .with_line_width(width)
-            .with_line_join(LineJoin::Bevel)
+            .with_line_join(line_join)
+            .with_miter_limit(q0s_format::geom::MITER_LIMIT)
             .with_line_cap(line_cap)
             .with_tolerance(0.05);
         let mut tessellator = StrokeTessellator::new();
@@ -3206,6 +3302,7 @@ fn gradient_mesh_paint(
         stops: Arc::clone(&geometry.stops),
         tint,
         color_transform: q0glblend::ColorTransform::default(),
+        additive: false,
     })
 }
 
@@ -3242,6 +3339,7 @@ fn solid_vector_group_paint(
         stops: Arc::clone(&geometry.stops),
         tint: Color32::WHITE,
         color_transform: q0glblend::ColorTransform::default(),
+        additive: false,
     }
 }
 
@@ -3260,7 +3358,7 @@ fn paint_cached_vector_gradient_color(
         return;
     };
     paint.color_transform = color_transform;
-    q0glblend::paint_gradient_mesh(painter, view.stage_rect, Arc::clone(mesh), paint);
+    q0glblend::paint_gradient_mesh(painter, painter.clip_rect(), Arc::clone(mesh), paint);
 }
 
 fn paint_cached_vector_fill(
@@ -4250,8 +4348,35 @@ fn try_render_gpu_vector_filter_placement(
             offset: [0.0; 3],
         };
         q0glblend::transform_primitive_colors(&mut primitives, effect.then(modulation));
-        if placement_fx_is_visual_identity(placement_fx_without_tint(fx)) && tint.a() == 255 {
+        let rest = placement_fx_without_tint(fx);
+        if placement_fx_is_visual_identity(rest) && tint.a() == 255 {
             q0glblend::transform_primitive_colors(&mut primitives, inherited_color);
+            q0glblend::paint_vector_primitives(painter, primitives);
+            return true;
+        }
+        // One shape cannot overlap itself, so fading it directly looks the
+        // same as fading it as a group, without an offscreen pass per object
+        // (hundreds of tinted particles) and without the group resolve that
+        // darkened antialiased edges into a thin outline. Added light needs
+        // no group either: premultiplied colour without alpha sums.
+        let additive = rest.blend_mode == BlendMode::Add;
+        let plain = PlacementFx {
+            blend_mode: BlendMode::Normal,
+            ..rest
+        };
+        if matches!(placement.target, Target::Asset(_))
+            && primitives.len() == 1
+            && matches!(rest.blend_mode, BlendMode::Normal | BlendMode::Add)
+            && (placement_fx_is_visual_identity(plain) || placement_fx_is_pure_opacity(plain))
+        {
+            q0glblend::transform_primitive_colors(&mut primitives, inherited_color);
+            q0glblend::fade_primitives(
+                &mut primitives,
+                fx.opacity.clamp(0.0, 1.0) * (f32::from(tint.a()) / 255.0),
+            );
+            if additive {
+                q0glblend::make_primitives_additive(&mut primitives);
+            }
             q0glblend::paint_vector_primitives(painter, primitives);
             return true;
         }
@@ -4671,6 +4796,7 @@ fn paint_transformed_fx_tile(
 pub(crate) struct StageRenderPass<'a> {
     project: &'a ProjectV2,
     lookup: RenderLookup<'a>,
+    revision: Option<(u64, u64)>,
 }
 
 #[derive(Clone, Copy)]
@@ -4733,6 +4859,7 @@ impl<'a> StageRenderPass<'a> {
         Self {
             project,
             lookup: RenderLookup::new(project, render_index, revision.is_none()),
+            revision,
         }
     }
 
@@ -4794,7 +4921,7 @@ impl<'a> StageRenderPass<'a> {
             )
         {
             let canvas_rect = painter.clip_rect();
-            let visible_rect = view.stage_rect.intersect(canvas_rect);
+            let visible_rect = canvas_rect;
             if visible_rect.width() > 0.0 && visible_rect.height() > 0.0 {
                 // Keep the established exact renderer for artwork the GPU
                 // primitive collector cannot represent yet. Supported vector,
@@ -4820,6 +4947,27 @@ impl<'a> StageRenderPass<'a> {
                     ty: (view.origin.y - raster_rect.min.y) * raster_scale_y,
                 };
                 let root = Affine::compose(screen_to_raster, view.edit_transform);
+                let lighting = tint == Color32::WHITE
+                    && excluded_layers.is_none()
+                    && self
+                        .project
+                        .runtime
+                        .lighting
+                        .setup(q0rg_id)
+                        .is_some_and(|setup| {
+                            setup.enabled
+                                && (!setup.lights.is_empty() || setup.darkness > 0.0)
+                                && setup.layer_id.is_none_or(|layer_id| {
+                                    let layer_exists =
+                                        self.lookup.q0rg(q0rg_id).is_some_and(|q0rg| {
+                                            q0rg.layers
+                                                .iter()
+                                                .any(|layer| layer.layer_id == layer_id)
+                                        });
+                                    !layer_exists
+                                        || self.project.layer_is_visible(q0rg_id, layer_id)
+                                })
+                        });
                 let key = MaskFrameKey {
                     q0rg_id,
                     frame,
@@ -4834,76 +4982,206 @@ impl<'a> StageRenderPass<'a> {
                     editing_q0rg_id: textures.editing_mask_q0rg_id,
                     mask_visibility_revision: textures.mask_visibility_revision,
                     layer_filter_hash,
+                    lighting,
                 };
-                let translation = view.origin
-                    - textures
+                let usable = |textures: &TextureCache| {
+                    textures
                         .mask_frame_textures
                         .get(&key)
-                        .map(|cached| cached.stage_origin)
-                        .unwrap_or(view.origin);
-                let tile_is_usable = textures
-                    .mask_frame_textures
-                    .get(&key)
-                    .is_some_and(|cached| {
-                        let shifted = cached.screen_rect.translate(translation);
-                        shifted.min.x <= visible_rect.min.x
-                            && shifted.min.y <= visible_rect.min.y
-                            && shifted.max.x >= visible_rect.max.x
-                            && shifted.max.y >= visible_rect.max.y
-                    });
+                        .is_some_and(|cached| {
+                            let shifted = cached
+                                .screen_rect
+                                .translate(view.origin - cached.stage_origin);
+                            shifted.min.x <= visible_rect.min.x
+                                && shifted.min.y <= visible_rect.min.y
+                                && shifted.max.x >= visible_rect.max.x
+                                && shifted.max.y >= visible_rect.max.y
+                        })
+                };
+                collect_mask_job(textures, ctx);
+                let tile_is_usable = usable(textures);
 
                 if !tile_is_usable {
-                    if textures.mask_frame_textures.len() >= 13 {
-                        if let Some(oldest) = textures
-                            .mask_frame_textures
-                            .keys()
-                            .copied()
-                            .max_by_key(|cached| cached.frame.abs_diff(frame))
+                    let mut background_regions = Vec::new();
+                    if lighting {
+                        let paper = view.stage_rect;
+                        background_regions.push([
+                            paper.min,
+                            pos2(paper.max.x, paper.min.y),
+                            paper.max,
+                            pos2(paper.min.x, paper.max.y),
+                        ]);
+                        if q0rg_id == self.project.meta.entry_q0rg_id
+                            && self.project.runtime.camera.enabled
                         {
-                            textures.mask_frame_textures.remove(&oldest);
+                            if let Some(camera_to_world) =
+                                self.project.camera_affine_at(frame).inverse()
+                            {
+                                let w = f32::from(self.project.meta.stage_width);
+                                let h = f32::from(self.project.meta.stage_height);
+                                background_regions.push(
+                                    [
+                                        Vec2::new(0.0, 0.0),
+                                        Vec2::new(w, 0.0),
+                                        Vec2::new(w, h),
+                                        Vec2::new(0.0, h),
+                                    ]
+                                    .map(|point| {
+                                        view.stage_to_screen(camera_to_world.apply(point))
+                                    }),
+                                );
+                            }
                         }
                     }
-                    let mask_started = std::time::Instant::now();
-                    let rgba = q0s_format::raster::rasterize_q0rg_frame_with_mask_preview(
-                        self.project,
+                    let bg = self.project.meta.background_color;
+                    let args = MaskRasterArgs {
                         q0rg_id,
                         frame,
                         width,
                         height,
-                        1,
-                        [0, 0, 0, 0],
-                        root,
-                        &q0s_format::rig::RigRuntimeOverrides::new(),
-                        &q0s_format::runtime_scene::RuntimeSceneState::new(),
-                        (excluded_layers.is_some()
-                            || textures.editing_mask_q0rg_id == Some(q0rg_id))
-                        .then_some(q0s_format::raster::MaskEditingPreview {
-                            q0rg_id,
-                            hidden_artwork: (textures.editing_mask_q0rg_id == Some(q0rg_id))
-                                .then_some(&textures.hidden_mask_art_layers),
-                            excluded_layers,
-                        }),
-                    );
-                    textures.stage_work_timings.mask_raster += mask_started.elapsed();
-                    let image = ColorImage::from_rgba_unmultiplied(
-                        [width as usize, height as usize],
-                        &rgba,
-                    );
-                    let texture = ctx.load_texture(
-                        format!("masked-q0rg-{q0rg_id}-frame-{frame}"),
-                        image,
-                        TextureOptions::LINEAR,
-                    );
-                    textures.mask_frame_textures.insert(
-                        key,
-                        CachedMaskFrame {
-                            texture,
-                            stage_origin: view.origin,
-                            screen_rect: raster_rect,
+                        background: if lighting {
+                            [bg.r, bg.g, bg.b, bg.a]
+                        } else {
+                            [0, 0, 0, 0]
                         },
-                    );
+                        root,
+                        lighting,
+                        hidden_artwork: (textures.editing_mask_q0rg_id == Some(q0rg_id))
+                            .then(|| textures.hidden_mask_art_layers.clone()),
+                        excluded_layers: excluded_layers.cloned(),
+                        background_regions: background_regions
+                            .into_iter()
+                            .map(|quad| {
+                                quad.map(|point| {
+                                    Vec2::new(
+                                        (point.x - raster_rect.min.x) * raster_scale_x,
+                                        (point.y - raster_rect.min.y) * raster_scale_y,
+                                    )
+                                })
+                            })
+                            .collect(),
+                    };
+                    let scale = view.scale.max(1.0e-6);
+                    let picture = |texture: TextureHandle| CachedMaskFrame {
+                        texture,
+                        stage_origin: view.origin,
+                        screen_rect: raster_rect,
+                        view_rect: Rect::from_min_max(
+                            pos2(
+                                (raster_rect.min.x - view.origin.x) / scale,
+                                (raster_rect.min.y - view.origin.y) / scale,
+                            ),
+                            pos2(
+                                (raster_rect.max.x - view.origin.x) / scale,
+                                (raster_rect.max.y - view.origin.y) / scale,
+                            ),
+                        ),
+                        edit_transform: view.edit_transform,
+                        revision: self.revision,
+                        compat: (
+                            q0rg_id,
+                            textures.editing_mask_q0rg_id,
+                            textures.mask_visibility_revision,
+                            layer_filter_hash,
+                            lighting,
+                        ),
+                    };
+                    let upload = |ctx: &Context, rgba: &[u8], w: u32, h: u32| {
+                        ctx.load_texture(
+                            format!("masked-q0rg-{q0rg_id}-frame-{frame}"),
+                            ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba),
+                            TextureOptions::LINEAR,
+                        )
+                    };
+                    match self.revision {
+                        // Drawn right away when the project has no revision to
+                        // share it by.
+                        None => {
+                            let mask_started = std::time::Instant::now();
+                            let (rgba, w, h) = args.rasterize(self.project, 1.0);
+                            textures.stage_work_timings.mask_raster += mask_started.elapsed();
+                            let texture = upload(ctx, &rgba, w, h);
+                            insert_mask_frame(textures, key, picture(texture));
+                        }
+                        // Drawn on a worker thread; meanwhile the last picture
+                        // stands in, or a quick coarse one.
+                        Some(revision) => {
+                            if textures.mask_job.is_none() {
+                                let project = match &textures.mask_project {
+                                    Some((cached, project)) if *cached == revision => {
+                                        Arc::clone(project)
+                                    }
+                                    _ => {
+                                        let project = Arc::new(self.project.clone());
+                                        textures.mask_project =
+                                            Some((revision, Arc::clone(&project)));
+                                        project
+                                    }
+                                };
+                                let (sender, receiver) = std::sync::mpsc::channel();
+                                let job_args = args.clone();
+                                let waker = ctx.clone();
+                                let spawned = std::thread::Builder::new()
+                                    .name("q0 masked frame".into())
+                                    .spawn(move || {
+                                        let _ = sender.send(job_args.rasterize(&project, 1.0));
+                                        waker.request_repaint();
+                                    });
+                                if spawned.is_ok() {
+                                    // The picture's texture comes when the
+                                    // drawing does; this one only holds the
+                                    // placement.
+                                    let placeholder = upload(ctx, &[0, 0, 0, 0], 1, 1);
+                                    textures.mask_job = Some(MaskJob {
+                                        key,
+                                        receiver,
+                                        frame: picture(placeholder),
+                                    });
+                                }
+                            }
+                            let stale = textures.mask_stale.get(&q0rg_id).filter(|stale| {
+                                stale.compat
+                                    == (
+                                        q0rg_id,
+                                        textures.editing_mask_q0rg_id,
+                                        textures.mask_visibility_revision,
+                                        layer_filter_hash,
+                                        lighting,
+                                    )
+                                    && stale.edit_transform == view.edit_transform
+                                    && stale.revision == self.revision
+                            });
+                            if let Some(stale) = stale {
+                                let rect = Rect::from_min_max(
+                                    view.origin + stale.view_rect.min.to_vec2() * scale,
+                                    view.origin + stale.view_rect.max.to_vec2() * scale,
+                                );
+                                painter.with_clip_rect(visible_rect).image(
+                                    stale.texture.id(),
+                                    rect,
+                                    Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
+                                    tint,
+                                );
+                            } else {
+                                // An edit changed the frame: a coarse picture
+                                // shows it at once.
+                                let mask_started = std::time::Instant::now();
+                                let (rgba, w, h) = args.rasterize(self.project, 0.25);
+                                textures.stage_work_timings.mask_raster += mask_started.elapsed();
+                                let coarse = picture(upload(ctx, &rgba, w, h));
+                                painter.with_clip_rect(visible_rect).image(
+                                    coarse.texture.id(),
+                                    raster_rect,
+                                    Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
+                                    tint,
+                                );
+                                textures.mask_stale.insert(q0rg_id, coarse);
+                            }
+                            ctx.request_repaint_after(std::time::Duration::from_millis(30));
+                        }
+                    }
                 }
-                if let Some(cached) = textures.mask_frame_textures.get(&key) {
+                if let Some(cached) = textures.mask_frame_textures.get(&key).cloned() {
                     let translation = view.origin - cached.stage_origin;
                     let screen_rect = cached.screen_rect.translate(translation);
                     painter.with_clip_rect(visible_rect).image(
@@ -4912,6 +5190,7 @@ impl<'a> StageRenderPass<'a> {
                         Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
                         tint,
                     );
+                    textures.mask_stale.insert(q0rg_id, cached);
                 }
             }
         } else {
@@ -5262,6 +5541,53 @@ fn q0rg_group_supported_for_gpu_masks(
     }
     visited.remove(&q0rg_id);
     supported
+}
+
+/// Keeps a finished masked picture, making room among at most 13.
+fn insert_mask_frame(textures: &mut TextureCache, key: MaskFrameKey, frame: CachedMaskFrame) {
+    if textures.mask_frame_textures.len() >= 13 {
+        if let Some(oldest) = textures
+            .mask_frame_textures
+            .keys()
+            .copied()
+            .max_by_key(|cached| cached.frame.abs_diff(key.frame))
+        {
+            textures.mask_frame_textures.remove(&oldest);
+        }
+    }
+    textures.mask_frame_textures.insert(key, frame);
+}
+
+/// Takes in the masked picture the worker finished, if it has; a picture of
+/// an older revision is dropped.
+fn collect_mask_job(textures: &mut TextureCache, ctx: &Context) {
+    let Some(job) = textures.mask_job.as_ref() else {
+        return;
+    };
+    let started = std::time::Instant::now();
+    match job.receiver.try_recv() {
+        Ok((rgba, width, height)) => {
+            let job = textures.mask_job.take().expect("checked above");
+            if job.frame.revision == textures.mask_frame_revision {
+                let texture = ctx.load_texture(
+                    format!("masked-q0rg-{}-frame-{}", job.key.q0rg_id, job.key.frame),
+                    ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba),
+                    TextureOptions::LINEAR,
+                );
+                insert_mask_frame(
+                    textures,
+                    job.key,
+                    CachedMaskFrame {
+                        texture,
+                        ..job.frame
+                    },
+                );
+            }
+            textures.stage_work_timings.mask_raster += started.elapsed();
+        }
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => textures.mask_job = None,
+        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+    }
 }
 
 fn q0rg_masks_supported_by_gpu(
@@ -5895,6 +6221,21 @@ pub fn render_stage_tinted(
         .render_tinted(painter, q0rg_id, frame, view, textures, ctx, tint);
 }
 
+/// `lighting` as the GPU draws it on this view, through `parent` from the
+/// lit timeline's own space to the stage.
+pub(crate) fn lighting_paint(
+    view: &StageView,
+    parent: Affine,
+    lighting: q0s_format::lighting::FrameLighting,
+) -> Option<q0glblend::LightingPaint> {
+    let to_screen = Affine::compose(view.screen_transform(), parent);
+    let back = to_screen.inverse()?;
+    Some(q0glblend::LightingPaint {
+        screen_to_world: [[back.a11, back.a12, back.tx], [back.a21, back.a22, back.ty]],
+        lighting,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_q0rg(
     painter: &Painter,
@@ -5967,7 +6308,30 @@ fn render_q0rg_with_vector_batch(
     let rig = lookup.rig(q0rg_id);
     let rig_pose = lookup.rig_pose(q0rg_id, local_frame);
 
+    // Lights shine on the root timeline after its light layer; onion skins
+    // and partial renders stay unlit.
+    let lighting = (depth == 0 && tint == Color32::WHITE && root_layer_filter.is_none())
+        .then(|| {
+            q0s_format::raster::frame_lighting(
+                project,
+                q0rg_id,
+                local_frame,
+                &q0s_format::runtime_scene::RuntimeSceneState::new(),
+            )
+        })
+        .flatten()
+        .and_then(|lighting| lighting_paint(view, parent, lighting));
+    let mut lit = lighting.is_none();
+    let mut previous_layer = None;
     for layer in &q0rg.layers {
+        if let Some(paint) = lighting.as_ref().filter(|_| !lit) {
+            if previous_layer.is_some() && previous_layer == paint.lighting.layer_id {
+                vector_batch.flush(painter);
+                q0glblend::paint_lighting(painter, painter.clip_rect(), paint.clone());
+                lit = true;
+            }
+        }
+        previous_layer = Some(layer.layer_id);
         if depth == 0 && root_layer_filter.is_some_and(|filter| !filter.includes(layer.layer_id)) {
             continue;
         }
@@ -6305,6 +6669,10 @@ fn render_q0rg_with_vector_batch(
             }
         }
     }
+    if let Some(paint) = lighting.filter(|_| !lit) {
+        vector_batch.flush(painter);
+        q0glblend::paint_lighting(painter, painter.clip_rect(), paint);
+    }
 }
 
 /// In-between artwork of a shape tween on this layer frame, if there is one.
@@ -6419,19 +6787,6 @@ struct LayerFrameIndex {
     placements_by_frame: HashMap<u16, Vec<usize>>,
     tween_destinations: HashMap<(u16, u8, u16), Vec<usize>>,
     resolved_frame: Option<(u16, Arc<Vec<q0s_format::raster::ActivePlacementState>>)>,
-}
-
-fn lerp_render_transform(left: Transform2D, right: Transform2D, t: f32) -> Transform2D {
-    let lerp = |a: f32, b: f32| a + (b - a) * t;
-    Transform2D {
-        tx: lerp(left.tx, right.tx),
-        ty: lerp(left.ty, right.ty),
-        sx: lerp(left.sx, right.sx),
-        sy: lerp(left.sy, right.sy),
-        rotation: lerp(left.rotation, right.rotation),
-        skew_x: lerp(left.skew_x, right.skew_x),
-        skew_y: lerp(left.skew_y, right.skew_y),
-    }
 }
 
 impl LayerFrameIndex {
@@ -6559,14 +6914,15 @@ impl LayerFrameIndex {
                         let denominator = f32::from(to_frame - keyframe);
                         let raw_t = (f32::from(frame - keyframe) / denominator).clamp(0.0, 1.0);
                         let t = placement.tween.easing().sample(raw_t);
-                        let target_transform = destination
-                            .map(|candidate| candidate.transform)
-                            .unwrap_or(placement.transform);
                         let target_fx = destination
                             .map(|candidate| candidate.fx)
                             .unwrap_or(placement.fx);
                         (
-                            lerp_render_transform(placement.transform, target_transform, t),
+                            q0s_format::motion_tween::interpolate(
+                                placement,
+                                destination.unwrap_or(placement),
+                                t,
+                            ),
                             placement.fx.lerp_to(target_fx, t),
                         )
                     }
@@ -6724,11 +7080,13 @@ fn render_asset_color(
                                 .iter()
                                 .map(|point| stage_to_screen(transform.apply(*point), view))
                                 .collect();
-                            if let Some(mesh) = bounded_stroke_mesh(
+                            if let Some(mesh) = styled_stroke_mesh(
                                 &polyline_screen,
                                 stroke.width,
                                 *closed,
                                 stroke.color,
+                                stroke_style.cap,
+                                stroke_style.join,
                             ) {
                                 q0glblend::paint_mesh_color(painter, mesh, color_transform);
                             }
@@ -6798,11 +7156,13 @@ fn render_asset_color(
                             .iter()
                             .map(|point| stage_to_screen(transform.apply(*point), view))
                             .collect();
-                        if let Some(mesh) = bounded_stroke_mesh(
+                        if let Some(mesh) = styled_stroke_mesh(
                             &polyline_screen,
                             stroke.width,
                             *closed,
                             stroke.color,
+                            stroke_style.cap,
+                            stroke_style.join,
                         ) {
                             q0glblend::paint_mesh_color(painter, mesh, color_transform);
                         }
@@ -6911,11 +7271,13 @@ fn render_asset_color(
                             .iter()
                             .map(|point| stage_to_screen(transform.apply(*point), view))
                             .collect();
-                        if let Some(mesh) = bounded_stroke_mesh(
+                        if let Some(mesh) = styled_stroke_mesh(
                             &polyline_screen,
                             stroke.width,
                             *closed,
                             stroke.color,
+                            s.cap,
+                            s.join,
                         ) {
                             q0glblend::paint_mesh_color(painter, mesh, color_transform);
                         }
@@ -6994,6 +7356,65 @@ fn tessellate_closed_bevel_stroke(
     width: f32,
 ) -> Option<VertexBuffers<lyon_path::math::Point, u32>> {
     tessellate_bounded_stroke(points, width, true)
+}
+
+/// An artwork stroke: its corners as the stroke says, its ends flat or
+/// square. Round ends are painted as circles by the callers, the same in the
+/// editor and q0player.
+fn styled_stroke_mesh(
+    points: &[Pos2],
+    width: f32,
+    closed: bool,
+    color: Color32,
+    cap: q0s_format::geom::CapShape,
+    join: q0s_format::geom::JoinShape,
+) -> Option<Mesh> {
+    if points.len() < 2 || !width.is_finite() || width <= 0.0 {
+        return None;
+    }
+    let mut path_builder = lyon_path::Path::builder();
+    path_builder.begin(lyon_point(points[0].x, points[0].y));
+    for point in &points[1..] {
+        if !point.x.is_finite() || !point.y.is_finite() {
+            return None;
+        }
+        path_builder.line_to(lyon_point(point.x, point.y));
+    }
+    path_builder.end(closed);
+    let path = path_builder.build();
+    let line_join = match join {
+        q0s_format::geom::JoinShape::Miter => LineJoin::Miter,
+        q0s_format::geom::JoinShape::Round => LineJoin::Round,
+        q0s_format::geom::JoinShape::Bevel => LineJoin::Bevel,
+    };
+    let line_cap = match cap {
+        q0s_format::geom::CapShape::Square => LineCap::Square,
+        _ => LineCap::Butt,
+    };
+    let options = StrokeOptions::default()
+        .with_line_width(width)
+        .with_line_join(line_join)
+        .with_miter_limit(q0s_format::geom::MITER_LIMIT)
+        .with_line_cap(line_cap)
+        .with_tolerance(0.05);
+    let mut buffers: VertexBuffers<lyon_path::math::Point, u32> = VertexBuffers::new();
+    StrokeTessellator::new()
+        .tessellate_path(
+            &path,
+            &options,
+            &mut BuffersBuilder::new(&mut buffers, Positions),
+        )
+        .ok()?;
+    let mut mesh = Mesh::default();
+    for point in buffers.vertices {
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: Pos2::new(point.x, point.y),
+            uv: Pos2::ZERO,
+            color,
+        });
+    }
+    mesh.indices = buffers.indices;
+    Some(mesh)
 }
 
 fn bounded_stroke_mesh(points: &[Pos2], width: f32, closed: bool, color: Color32) -> Option<Mesh> {
@@ -8368,6 +8789,7 @@ pub fn centered_target_transform(
     position: Vec2,
 ) -> Transform2D {
     let provisional = Placement {
+        pivot: None,
         instance_id: 0,
         frame: 0,
         target,
@@ -9855,6 +10277,7 @@ mod tests {
                 name: "art".into(),
                 explicit_keyframes: Vec::new(),
                 placements: vec![Placement {
+                    pivot: None,
                     instance_id: 0,
                     frame: 0,
                     target: Target::Asset(77),
@@ -9865,6 +10288,7 @@ mod tests {
             }],
         });
         project.q0rgs[0].layers[0].push_placement(Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Q0rg(2),
@@ -9963,6 +10387,7 @@ mod tests {
             (4, 78, Tween::None),
         ] {
             project.q0rgs[0].layers[0].push_placement(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame,
                 target: Target::Asset(asset_id),
@@ -10073,6 +10498,7 @@ mod tests {
                 stroke: None,
             }));
             let placement = Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(90),
@@ -10190,6 +10616,7 @@ mod tests {
             explicit_keyframes: vec![0, 4, 9],
             placements: vec![
                 Placement {
+                    pivot: None,
                     instance_id: 0,
                     frame: 0,
                     target: Target::Asset(1),
@@ -10198,6 +10625,7 @@ mod tests {
                     fx: PlacementFx::default(),
                 },
                 Placement {
+                    pivot: None,
                     instance_id: 0,
                     frame: 0,
                     target: Target::Asset(2),
@@ -10206,6 +10634,7 @@ mod tests {
                     fx: PlacementFx::default(),
                 },
                 Placement {
+                    pivot: None,
                     instance_id: 0,
                     frame: 3,
                     target: Target::Asset(1),
@@ -10214,6 +10643,7 @@ mod tests {
                     fx: PlacementFx::default(),
                 },
                 Placement {
+                    pivot: None,
                     instance_id: 0,
                     frame: 7,
                     target: Target::Asset(3),
@@ -10341,6 +10771,7 @@ mod tests {
                 timeline_frame_count: None,
                 name: "child art".to_string(),
                 placements: vec![Placement {
+                    pivot: None,
                     instance_id: 0,
                     frame: 0,
                     target: Target::Asset(87),
@@ -10352,6 +10783,7 @@ mod tests {
             }],
         });
         project.q0rgs[0].layers[0].push_placement(Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Q0rg(2),
@@ -10448,6 +10880,7 @@ mod tests {
             .asset_names
             .insert(91, crate::text_tool::encode_source("opacity text", 48.0));
         project.q0rgs[0].layers[0].push_placement(Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Asset(91),
@@ -10584,6 +11017,7 @@ mod tests {
                 timeline_frame_count: None,
                 name: "gradient".to_string(),
                 placements: vec![Placement {
+                    pivot: None,
                     instance_id: 0,
                     frame: 0,
                     target: Target::Asset(92),
@@ -10595,6 +11029,7 @@ mod tests {
             }],
         });
         project.q0rgs[0].layers[0].push_placement(Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Q0rg(2),
@@ -10687,6 +11122,7 @@ mod tests {
                     timeline_frame_count: None,
                     name: "bitmap".to_string(),
                     placements: vec![Placement {
+                        pivot: None,
                         instance_id: 0,
                         frame: 0,
                         target: Target::Asset(93),
@@ -10702,6 +11138,7 @@ mod tests {
                 }],
             });
             project.q0rgs[0].layers[0].push_placement(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Q0rg(2),
@@ -10813,6 +11250,7 @@ mod tests {
                     timeline_frame_count: None,
                     name: "child art".to_string(),
                     placements: vec![Placement {
+                        pivot: None,
                         instance_id: 0,
                         frame: 0,
                         target: Target::Asset(88),
@@ -10824,6 +11262,7 @@ mod tests {
                 }],
             });
             project.q0rgs[0].layers[0].push_placement(Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Q0rg(2),
@@ -10936,6 +11375,7 @@ mod tests {
                 timeline_frame_count: None,
                 name: "source".to_string(),
                 placements: vec![Placement {
+                    pivot: None,
                     instance_id: 0,
                     frame: 0,
                     target: Target::Asset(89),
@@ -10948,6 +11388,7 @@ mod tests {
         });
         project.q0rgs[0].layers[0].placements.extend([
             Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Q0rg(2),
@@ -10967,6 +11408,7 @@ mod tests {
                 },
             },
             Placement {
+                pivot: None,
                 instance_id: 0,
                 frame: 0,
                 target: Target::Asset(89),
@@ -11084,6 +11526,7 @@ mod tests {
                 timeline_frame_count: None,
                 name: "child art".to_string(),
                 placements: vec![Placement {
+                    pivot: None,
                     instance_id: 0,
                     frame: 0,
                     target: Target::Asset(77),
@@ -11095,6 +11538,7 @@ mod tests {
             }],
         });
         project.q0rgs[0].layers[0].push_placement(Placement {
+            pivot: None,
             instance_id: 0,
             frame: 0,
             target: Target::Q0rg(2),
@@ -11517,6 +11961,7 @@ mod tests {
 
     fn test_placement(frame: u16, asset_id: u16, tx: f32, tween: Tween) -> Placement {
         Placement {
+            pivot: None,
             instance_id: 0,
             frame,
             target: Target::Asset(asset_id),
@@ -11584,6 +12029,7 @@ mod tests {
                 },
                 width: 2.0,
                 cap: q0s_format::geom::CapShape::Round,
+                join: q0s_format::geom::JoinShape::Bevel,
             }),
         }));
         let clip = Rect::from_min_max(Pos2::ZERO, Pos2::new(100.0, 100.0));
@@ -12682,6 +13128,7 @@ mod tests {
     fn incremental_transform_sync_advances_fx_snapshot_for_live_drag() {
         let mut project = crate::state::default_project();
         project.q0rgs[0].layers[0].push_placement(Placement {
+            pivot: None,
             instance_id: 5,
             frame: 0,
             target: Target::Asset(99),
@@ -12748,6 +13195,7 @@ mod tests {
                 },
                 width: 1.0,
                 cap: q0s_format::geom::CapShape::Round,
+                join: q0s_format::geom::JoinShape::Bevel,
             }),
         };
         let mut cache = TextureCache::default();

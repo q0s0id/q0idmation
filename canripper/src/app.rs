@@ -913,10 +913,17 @@ fn paint_vector_geometry(painter: &egui::Painter, rect: egui::Rect, vector: &Vec
         let cap = match stroke.cap {
             q0s_format::geom::CapShape::Round => LineCap::Round,
             q0s_format::geom::CapShape::Butt => LineCap::Butt,
+            q0s_format::geom::CapShape::Square => LineCap::Square,
+        };
+        let join = match stroke.join {
+            q0s_format::geom::JoinShape::Miter => LineJoin::Miter,
+            q0s_format::geom::JoinShape::Round => LineJoin::Round,
+            q0s_format::geom::JoinShape::Bevel => LineJoin::Bevel,
         };
         let options = StrokeOptions::default()
             .with_line_width((stroke.width * scale).max(0.5))
-            .with_line_join(LineJoin::Round)
+            .with_line_join(join)
+            .with_miter_limit(q0s_format::geom::MITER_LIMIT)
             .with_start_cap(cap)
             .with_end_cap(cap)
             .with_tolerance(0.05);

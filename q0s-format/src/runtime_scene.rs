@@ -12,6 +12,8 @@ use crate::v2::{InstanceKey, Transform2D};
 pub struct PlacementTransformOverride {
     pub tx: Option<f32>,
     pub ty: Option<f32>,
+    /// Radians; live physics turns bodies with it.
+    pub rotation: Option<f32>,
 }
 
 impl PlacementTransformOverride {
@@ -21,6 +23,9 @@ impl PlacementTransformOverride {
         }
         if let Some(ty) = self.ty.filter(|value| value.is_finite()) {
             transform.ty = ty;
+        }
+        if let Some(rotation) = self.rotation.filter(|value| value.is_finite()) {
+            transform.rotation = rotation;
         }
         transform
     }
@@ -32,6 +37,16 @@ impl PlacementTransformOverride {
         if let Some(ty) = self.ty.filter(|value| value.is_finite()) {
             affine.ty = ty;
         }
+        if let Some(rotation) = self.rotation.filter(|value| value.is_finite()) {
+            // Turn the whole linear part, so scale and skew ride along.
+            let turn = rotation - affine.a21.atan2(affine.a11);
+            let (sin, cos) = turn.sin_cos();
+            let (a11, a12, a21, a22) = (affine.a11, affine.a12, affine.a21, affine.a22);
+            affine.a11 = cos * a11 - sin * a21;
+            affine.a12 = cos * a12 - sin * a22;
+            affine.a21 = sin * a11 + cos * a21;
+            affine.a22 = sin * a12 + cos * a22;
+        }
         affine
     }
 }
@@ -42,6 +57,8 @@ pub struct RuntimeSceneState {
     children: HashMap<InstanceKey, RuntimeChildState>,
     playback_requests: HashMap<InstanceKey, PlaybackRequest>,
     pub rig_overrides: crate::rig::RigRuntimeOverrides,
+    /// Lights as scripts have changed them; `None` lights as authored.
+    pub lighting: Option<crate::lighting::LightingData>,
 }
 
 /// State below one *placement*, rather than below a shared symbol definition.
@@ -108,12 +125,36 @@ impl RuntimeSceneState {
         let next = PlacementTransformOverride {
             tx: Some(x),
             ty: Some(y),
+            rotation: None,
         };
         if self.placement_transforms.get(&key).copied() == Some(next) {
             return false;
         }
         self.placement_transforms.insert(key, next);
         true
+    }
+
+    /// Places an object outright: live physics moves and turns its bodies
+    /// with this every step.
+    pub fn set_transform(&mut self, key: InstanceKey, x: f32, y: f32, rotation: f32) -> bool {
+        if !x.is_finite() || !y.is_finite() || !rotation.is_finite() || key.instance_id == 0 {
+            return false;
+        }
+        let next = PlacementTransformOverride {
+            tx: Some(x),
+            ty: Some(y),
+            rotation: Some(rotation),
+        };
+        if self.placement_transforms.get(&key).copied() == Some(next) {
+            return false;
+        }
+        self.placement_transforms.insert(key, next);
+        true
+    }
+
+    /// Hands an object's placement back to the timeline.
+    pub fn clear_transform(&mut self, key: InstanceKey) -> bool {
+        self.placement_transforms.remove(&key).is_some()
     }
 
     pub fn clear_instance(&mut self, key: InstanceKey) -> bool {
@@ -126,6 +167,7 @@ impl RuntimeSceneState {
         self.placement_transforms.is_empty()
             && self.children.is_empty()
             && self.rig_overrides.is_empty()
+            && self.lighting.is_none()
     }
 }
 
@@ -155,6 +197,36 @@ mod tests {
         assert_eq!(effective.rotation, authored.rotation);
         assert_eq!(effective.skew_x, authored.skew_x);
         assert_eq!(effective.skew_y, authored.skew_y);
+    }
+
+    #[test]
+    fn a_turned_override_turns_the_affine_like_the_transform() {
+        let key = InstanceKey::new(1, 7);
+        let authored = Transform2D {
+            tx: 10.0,
+            ty: 20.0,
+            sx: 2.0,
+            sy: 3.0,
+            rotation: 0.4,
+            skew_x: 0.0,
+            skew_y: 0.0,
+        };
+        let mut state = RuntimeSceneState::new();
+        assert!(state.set_transform(key, 30.0, 40.0, 1.3));
+        let by_transform = Affine::from_transform(state.effective_transform(key, authored));
+        let by_affine = state.effective_affine(key, Affine::from_transform(authored));
+        for (a, b) in [
+            (by_transform.a11, by_affine.a11),
+            (by_transform.a12, by_affine.a12),
+            (by_transform.a21, by_affine.a21),
+            (by_transform.a22, by_affine.a22),
+            (by_transform.tx, by_affine.tx),
+            (by_transform.ty, by_affine.ty),
+        ] {
+            assert!((a - b).abs() < 1.0e-5, "{by_transform:?} vs {by_affine:?}");
+        }
+        assert!(state.clear_transform(key));
+        assert!(state.is_empty());
     }
 
     #[test]
