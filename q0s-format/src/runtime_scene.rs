@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use crate::transform::Affine;
-use crate::v2::{InstanceKey, Transform2D};
+use crate::v2::{InstanceKey, ProjectV2, Transform2D};
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct PlacementTransformOverride {
@@ -51,11 +51,65 @@ impl PlacementTransformOverride {
     }
 }
 
+/// What scripts have done to one whole layer of this timeline.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayerOverride {
+    /// `Some` decides whether the layer shows; `None` keeps the editor's eye.
+    pub hidden: Option<bool>,
+    pub dx: f32,
+    pub dy: f32,
+    pub alpha: f32,
+}
+
+impl Default for LayerOverride {
+    fn default() -> Self {
+        Self {
+            hidden: None,
+            dx: 0.0,
+            dy: 0.0,
+            alpha: 1.0,
+        }
+    }
+}
+
+/// How a layer shows once scripts have had their say, folders included:
+/// a folder that is moved, faded or hidden takes what is in it along.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayerLook {
+    pub visible: bool,
+    pub dx: f32,
+    pub dy: f32,
+    pub alpha: f32,
+}
+
+impl LayerLook {
+    pub fn is_moved(self) -> bool {
+        self.dx != 0.0 || self.dy != 0.0
+    }
+
+    /// `parent` with the layer's shift applied inside it.
+    pub fn shift(self, parent: Affine) -> Affine {
+        if !self.is_moved() {
+            return parent;
+        }
+        Affine::compose(
+            parent,
+            Affine {
+                tx: self.dx,
+                ty: self.dy,
+                ..Affine::IDENTITY
+            },
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct RuntimeSceneState {
     placement_transforms: HashMap<InstanceKey, PlacementTransformOverride>,
     children: HashMap<InstanceKey, RuntimeChildState>,
     playback_requests: HashMap<InstanceKey, PlaybackRequest>,
+    /// Layers of this timeline that scripts hid, showed, moved or faded.
+    layers: HashMap<u16, LayerOverride>,
     pub rig_overrides: crate::rig::RigRuntimeOverrides,
     /// Lights as scripts have changed them; `None` lights as authored.
     pub lighting: Option<crate::lighting::LightingData>,
@@ -168,6 +222,76 @@ impl RuntimeSceneState {
             && self.children.is_empty()
             && self.rig_overrides.is_empty()
             && self.lighting.is_none()
+            && self.layers.is_empty()
+    }
+
+    pub fn layer_override(&self, layer_id: u16) -> Option<LayerOverride> {
+        self.layers.get(&layer_id).copied()
+    }
+
+    pub fn has_layer_overrides(&self) -> bool {
+        !self.layers.is_empty()
+    }
+
+    pub fn set_layer_hidden(&mut self, layer_id: u16, hidden: bool) {
+        self.layers.entry(layer_id).or_default().hidden = Some(hidden);
+    }
+
+    /// Shifts the layer this far from where it is drawn.
+    pub fn set_layer_offset(&mut self, layer_id: u16, dx: f32, dy: f32) {
+        if dx.is_finite() && dy.is_finite() {
+            let layer = self.layers.entry(layer_id).or_default();
+            layer.dx = dx;
+            layer.dy = dy;
+        }
+    }
+
+    pub fn set_layer_alpha(&mut self, layer_id: u16, alpha: f32) {
+        if alpha.is_finite() {
+            self.layers.entry(layer_id).or_default().alpha = alpha.clamp(0.0, 1.0);
+        }
+    }
+
+    pub fn reset_layer(&mut self, layer_id: u16) {
+        self.layers.remove(&layer_id);
+    }
+
+    /// How layer `layer_id` of q0rg `q0rg_id` shows, when this state belongs
+    /// to that q0rg's timeline.
+    pub fn layer_look(&self, project: &ProjectV2, q0rg_id: u16, layer_id: u16) -> LayerLook {
+        if self.layers.is_empty() {
+            return LayerLook {
+                visible: project.layer_is_visible(q0rg_id, layer_id),
+                dx: 0.0,
+                dy: 0.0,
+                alpha: 1.0,
+            };
+        }
+        let mut look = LayerLook {
+            visible: true,
+            dx: 0.0,
+            dy: 0.0,
+            alpha: 1.0,
+        };
+        let mut current = Some(layer_id);
+        let mut steps = 0;
+        while let Some(id) = current {
+            steps += 1;
+            if steps > 64 {
+                look.visible = false;
+                break;
+            }
+            let metadata = project.layer_metadata(q0rg_id, id);
+            let layer = self.layers.get(&id).copied().unwrap_or_default();
+            if layer.hidden.unwrap_or(metadata.hidden) {
+                look.visible = false;
+            }
+            look.dx += layer.dx;
+            look.dy += layer.dy;
+            look.alpha *= layer.alpha;
+            current = metadata.parent_folder_id;
+        }
+        look
     }
 }
 

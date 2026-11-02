@@ -27,6 +27,17 @@ fn state_id() -> Id {
     Id::new("screen_color_picker")
 }
 
+/// On a touch screen a tap outside a popup means "close it", so picking a
+/// colour off the screen waits until the person asks for it.
+fn armed_id(owner: Id) -> Id {
+    owner.with("screen_pick_armed")
+}
+
+fn picks_from_screen(ctx: &Context, owner: Id) -> bool {
+    !crate::touch::ENABLED
+        || ctx.data(|data| data.get_temp::<bool>(armed_id(owner)).unwrap_or(false))
+}
+
 pub(crate) fn set_scope(ctx: &Context, scope: PickerScope) {
     let closed = ctx.data_mut(|data| {
         let state = data.get_temp_mut_or_default::<PickerState>(state_id());
@@ -108,6 +119,19 @@ pub(crate) fn update(ctx: &Context, scope: PickerScope) {
             _ => None,
         })
     });
+    if point.is_some() && !picks_from_screen(ctx, request.owner) {
+        // A tap outside closes the palette, and goes no further: it must
+        // not also draw on the canvas behind it.
+        clear_request(ctx);
+        ctx.memory_mut(|memory| memory.close_popup());
+        ctx.input_mut(|input| {
+            input.pointer = Default::default();
+            input
+                .events
+                .retain(|event| !matches!(event, egui::Event::PointerButton { .. }));
+        });
+        return;
+    }
     if let Some(point) = point {
         let screen = ctx.screen_rect();
         let viewport = ctx.viewport_id();
@@ -147,6 +171,7 @@ fn finish_pick(ctx: &Context, request: &PickRequest, color: Color32) {
         let state = data.get_temp_mut_or_default::<PickerState>(state_id());
         state.result = Some((request.owner, request.scope, color));
         state.request = None;
+        data.remove::<bool>(armed_id(request.owner));
     });
     ctx.memory_mut(|memory| memory.close_popup());
     ctx.request_repaint();
@@ -167,9 +192,10 @@ pub(crate) fn finish_frame(ctx: &Context) {
             }
             return;
         }
-        if ctx
-            .pointer_hover_pos()
-            .is_some_and(|point| !request.rect.contains(point))
+        if picks_from_screen(ctx, request.owner)
+            && ctx
+                .pointer_hover_pos()
+                .is_some_and(|point| !request.rect.contains(point))
         {
             ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
         }
@@ -242,10 +268,41 @@ fn color_edit_button(
             .show(ui.ctx(), |ui| {
                 ui.spacing_mut().slider_width = 275.0;
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if crate::touch::ENABLED {
+                            let armed_key = armed_id(owner);
+                            let mut armed =
+                                ui.data(|data| data.get_temp::<bool>(armed_key).unwrap_or(false));
+                            if ui
+                                .selectable_label(armed, "Pick from screen")
+                                .on_hover_text("Then tap anywhere to take its colour")
+                                .clicked()
+                            {
+                                armed = !armed;
+                                ui.data_mut(|data| data.insert_temp(armed_key, armed));
+                            }
+                        } else {
+                            ui.small("Click outside to pick a screen color · Esc to close");
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("✕").on_hover_text("Close").clicked() {
+                                ui.memory_mut(|memory| memory.close_popup());
+                                ui.data_mut(|data| data.remove::<bool>(armed_id(owner)));
+                            }
+                        });
+                    });
                     if egui::color_picker::color_picker_color32(ui, color, alpha) {
                         response.mark_changed();
                     }
-                    ui.small("Click outside to pick a screen color · Esc to close");
+                    if crate::touch::ENABLED {
+                        let armed =
+                            ui.data(|data| data.get_temp::<bool>(armed_id(owner)).unwrap_or(false));
+                        ui.small(if armed {
+                            "Tap anywhere to take its colour"
+                        } else {
+                            "Tap outside to close"
+                        });
+                    }
                 });
             })
             .response;

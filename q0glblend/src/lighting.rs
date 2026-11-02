@@ -19,18 +19,12 @@ pub struct LightingPaint {
     pub lighting: FrameLighting,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 thread_local! {
     static PROGRAMS: RefCell<HashMap<usize, Option<LightingProgram>>> = RefCell::new(HashMap::new());
 }
 
 /// Lights everything painted so far inside `rect`.
 pub fn paint_lighting(painter: &Painter, rect: Rect, paint: LightingPaint) {
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = (painter, rect, paint);
-    }
-    #[cfg(not(target_arch = "wasm32"))]
     {
         let rect = rect.intersect(painter.clip_rect());
         if !rect.is_positive() {
@@ -78,7 +72,6 @@ pub fn paint_lighting(painter: &Painter, rect: Rect, paint: LightingPaint) {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 struct LightingProgram {
     program: glow::Program,
     vao: glow::VertexArray,
@@ -95,7 +88,6 @@ struct LightingProgram {
     max_gain: Option<glow::UniformLocation>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 const VERTEX: &str = r#"#version 140
 void main() {
     vec2 p;
@@ -107,7 +99,6 @@ void main() {
 }
 "#;
 
-#[cfg(not(target_arch = "wasm32"))]
 const FRAGMENT: &str = r#"#version 140
 uniform vec3 u_shade;
 uniform vec4 u_light_a[32];
@@ -168,7 +159,6 @@ void main() {
 }
 "#;
 
-#[cfg(not(target_arch = "wasm32"))]
 impl LightingProgram {
     unsafe fn new(gl: &glow::Context) -> Result<Self, String> {
         let compile = |kind: u32, source: &str| -> Result<glow::Shader, String> {

@@ -27,8 +27,24 @@ xlisten mouse.click on_click
 | `mouse.wheel` | the wheel or a two-finger scroll turns |
 | `mouse.over` | the pointer enters an object (object scripts only) |
 | `mouse.out` | the pointer leaves an object (object scripts only) |
+| `time.tick` | every tick of the movie, after the frame's code: each frame of a playing timeline, or each step of a `q0.input` game clock (the movie's own script only) |
 
-Another event name gives a parser diagnostic. The runtime stores the names without checking that the handler exists or how many parameters it takes.
+Another event name gives a parser diagnostic.
+
+`time.tick` is for games whose timeline plays: the timeline animates (bones flying across a box, say) while one handler moves the player every frame, whichever frame is showing. Its handler gets `"stage"` like the others, and sees `input.jump_pressed` and `input.action_pressed` before they are cleared.
+
+```q0lang
+import q0.time
+import q0.input
+
+pb func update target {
+  if input.right {
+    hero.x = hero.x + 200 * time.dt
+  }
+}
+
+listen time.tick update
+``` The runtime stores the names without checking that the handler exists or how many parameters it takes.
 
 ## delivery in q0player
 

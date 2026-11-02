@@ -53,6 +53,14 @@ pub enum Statement {
         command: String,
         args: Vec<Value>,
     },
+    LayerCommand {
+        command: String,
+        args: Vec<Value>,
+    },
+    WindowCommand {
+        command: String,
+        args: Vec<Value>,
+    },
     Listen {
         event: String,
         handler: String,
@@ -218,6 +226,10 @@ pub const BUILTIN_LIBRARIES: &[BuiltinLibrary] = &[
             "input.right",
             "input.jump",
             "input.jump_pressed",
+            "input.up",
+            "input.down",
+            "input.action",
+            "input.action_pressed",
         ],
     },
     BuiltinLibrary {
@@ -238,7 +250,7 @@ pub const BUILTIN_LIBRARIES: &[BuiltinLibrary] = &[
     },
     BuiltinLibrary {
         name: "q0.time",
-        symbols: &["time.dt"],
+        symbols: &["time.dt", "time.tick"],
     },
     BuiltinLibrary {
         name: "q0.math",
@@ -307,6 +319,52 @@ pub const BUILTIN_LIBRARIES: &[BuiltinLibrary] = &[
         ],
     },
     BuiltinLibrary {
+        name: "q0.layer",
+        symbols: &[
+            "q0layer.hide!",
+            "q0layer.show!",
+            "q0layer.move!",
+            "q0layer.alpha!",
+            "q0layer.reset!",
+            "q0layer.solid!",
+            "q0layer.unsolid!",
+            "q0layer.touches",
+            "q0layer.which",
+            "q0layer.hit",
+            "q0layer.circle",
+            "q0layer.box",
+            "q0layer.visible",
+            "q0layer.count",
+        ],
+    },
+    BuiltinLibrary {
+        name: "q0.window",
+        symbols: &[
+            "q0window.fullscreen!",
+            "q0window.ui!",
+            "q0window.hotkeys!",
+            "q0window.move!",
+            "q0window.size!",
+            "q0window.center!",
+            "q0window.title!",
+            "q0window.decorations!",
+            "q0window.titlebar!",
+            "q0window.icon!",
+            "q0window.top!",
+            "q0window.minimize!",
+            "q0window.perf!",
+            "q0window.quit!",
+            "window.x",
+            "window.y",
+            "window.width",
+            "window.height",
+            "window.fullscreen",
+            "window.ui",
+            "screen.width",
+            "screen.height",
+        ],
+    },
+    BuiltinLibrary {
         name: "q0.core",
         symbols: &[
             "do!", "listen", "xlisten", "pb", "pr", "func", "if", "else", "while", "return",
@@ -315,8 +373,45 @@ pub const BUILTIN_LIBRARIES: &[BuiltinLibrary] = &[
     },
 ];
 
+/// Functions the host answers while a script runs, with how many values
+/// each takes. They work in expressions, unlike commands.
+pub const HOST_FUNCTIONS: &[(&str, usize)] = &[
+    ("q0layer.touches", 2),
+    ("q0layer.which", 2),
+    ("q0layer.hit", 3),
+    ("q0layer.circle", 4),
+    ("q0layer.box", 5),
+    ("q0layer.visible", 1),
+    ("q0layer.count", 1),
+];
+
+/// Whether `name` belongs to a host library's functions, known or not.
+pub fn is_host_function_name(name: &str) -> bool {
+    name.starts_with("q0layer.")
+}
+
 pub fn parse(src: &str) -> Program {
     Parser::new(src).parse_program()
+}
+
+/// One value on its own, such as what a block editor's field holds.
+pub fn parse_expression(src: &str) -> Result<Value, String> {
+    let mut diagnostics = Vec::new();
+    let value = parse_value(src.trim(), 1, &mut diagnostics);
+    match diagnostics.into_iter().next() {
+        Some(diagnostic) => Err(diagnostic.message),
+        None => Ok(value),
+    }
+}
+
+/// Whether `name` can be a variable or function name.
+pub fn is_name(name: &str) -> bool {
+    is_plain_ident(name)
+}
+
+/// Whether `name` can be assigned: a name, or dotted names like `soul.x`.
+pub fn is_member_name(name: &str) -> bool {
+    is_member_ident(name)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -327,6 +422,8 @@ enum HostCommandKind {
     Physics,
     Particles,
     Light,
+    Layer,
+    Window,
 }
 
 struct Parser<'a> {
@@ -473,6 +570,12 @@ impl<'a> Parser<'a> {
             _ if first.starts_with("q0particles.") && first.ends_with('!') => {
                 self.parse_host_command(line_no, &line, first, HostCommandKind::Particles)
             }
+            _ if first.starts_with("q0layer.") && first.ends_with('!') => {
+                self.parse_host_command(line_no, &line, first, HostCommandKind::Layer)
+            }
+            _ if first.starts_with("q0window.") && first.ends_with('!') => {
+                self.parse_host_command(line_no, &line, first, HostCommandKind::Window)
+            }
             _ if find_assignment_operator(&line).is_some() => self.parse_assignment(line_no, &line),
             _ if first.ends_with('!') => Some(Statement::Unknown { text: line }),
             _ => {
@@ -552,10 +655,12 @@ impl<'a> Parser<'a> {
             return None;
         }
         let event = parts[1].to_string();
-        if !is_mouse_event(&event) {
+        if !is_event(&event) {
             self.diagnostics.push(Diagnostic {
                 line: line_no,
-                message: format!("event `{event}` is not in q0.mouse built-ins yet"),
+                message: format!(
+                    "unknown event `{event}`; events are time.tick and the q0.mouse ones"
+                ),
             });
         }
         Some(if remove {
@@ -585,6 +690,8 @@ impl<'a> Parser<'a> {
             HostCommandKind::Physics => "q0physics.",
             HostCommandKind::Particles => "q0particles.",
             HostCommandKind::Light => "q0light.",
+            HostCommandKind::Layer => "q0layer.",
+            HostCommandKind::Window => "q0window.",
         };
         let command = first
             .trim_start_matches(prefix)
@@ -606,6 +713,8 @@ impl<'a> Parser<'a> {
             HostCommandKind::Physics => Statement::PhysicsCommand { command, args },
             HostCommandKind::Particles => Statement::ParticlesCommand { command, args },
             HostCommandKind::Light => Statement::LightCommand { command, args },
+            HostCommandKind::Layer => Statement::LayerCommand { command, args },
+            HostCommandKind::Window => Statement::WindowCommand { command, args },
         })
     }
 
@@ -1022,12 +1131,13 @@ fn is_ident_continue(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'.'
 }
 
-fn is_mouse_event(src: &str) -> bool {
-    BUILTIN_LIBRARIES
-        .iter()
-        .find(|library| library.name == "q0.mouse")
-        .map(|library| library.symbols.contains(&src))
-        .unwrap_or(false)
+fn is_event(src: &str) -> bool {
+    src == "time.tick"
+        || BUILTIN_LIBRARIES
+            .iter()
+            .find(|library| library.name == "q0.mouse")
+            .map(|library| library.symbols.contains(&src))
+            .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, PartialEq)]

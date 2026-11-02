@@ -35,7 +35,8 @@ fn sample_v2_project() -> ProjectV2 {
                 height: 2,
                 rgba: vec![
                     255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
-                ],
+                ]
+                .into(),
             }),
             Asset::Vector(VectorAsset {
                 asset_id: 2,
@@ -250,6 +251,7 @@ fn placement_fx_survive_q1s_roundtrip_without_touching_symbol_contents() {
             quality: 3,
         }),
         shadow: Some(DropShadowFx {
+            quality: 3,
             color: Rgba {
                 r: 10,
                 g: 20,
@@ -264,6 +266,7 @@ fn placement_fx_survive_q1s_roundtrip_without_touching_symbol_contents() {
         audio_gain: 1.0,
         audio_muted: false,
         q0rg_playback: Default::default(),
+        three: None,
     };
 
     let decoded = parse(&write(&project).expect("write placement fx")).expect("parse placement fx");

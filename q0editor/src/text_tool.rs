@@ -278,6 +278,16 @@ pub fn display_name(name: &str) -> Option<String> {
     Some(format!("Text: {first}"))
 }
 
+/// Checking whether a font audit is needed must not discover system fonts.
+pub(crate) fn has_editable_text(project: &ProjectV2) -> bool {
+    project.assets.iter().any(|asset| {
+        matches!(asset, Asset::Vector(_))
+            && project.asset_names.get(&asset.id()).is_some_and(|name| {
+                name.starts_with(SOURCE_PREFIX) || name.starts_with(FONT_SOURCE_PREFIX)
+            })
+    })
+}
+
 pub(crate) fn missing_fonts(project: &ProjectV2) -> Vec<q0fla::MissingFont> {
     let mut rows = std::collections::BTreeMap::<String, q0fla::MissingFont>::new();
     for asset in &project.assets {
@@ -588,10 +598,7 @@ fn canvas_font(ctx: &Context, name: &str) -> egui::FontFamily {
             ctx.data_mut(|d| {
                 d.insert_temp(
                     id.with("metrics"),
-                    [
-                        f32::from(face.ascender()) / em,
-                        (f32::from(face.ascender()) - f32::from(face.descender())) / em,
-                    ],
+                    (f32::from(face.ascender()) - f32::from(face.descender())) / em,
                 )
             });
         }
@@ -639,23 +646,27 @@ pub(crate) fn render_canvas(
     let family = canvas_font(ui.ctx(), &draft.font);
     let metrics = ui
         .ctx()
-        .data(|d| d.get_temp::<[f32; 2]>(egui::Id::new("q0text_canvas_font").with("metrics")))
-        .unwrap_or([1.0, 1.0]);
-    origin.y += draft.size * scale * (1.0 - metrics[0]);
-    let font = egui::FontId::new((draft.size * scale * metrics[1]).clamp(4.0, 1024.0), family);
+        .data(|d| d.get_temp::<f32>(egui::Id::new("q0text_canvas_font").with("metrics")))
+        .unwrap_or(1.0);
+    let font = egui::FontId::new((draft.size * scale * metrics).clamp(4.0, 1024.0), family);
     let face_bytes = cached_font(&draft.font);
     let lay_out = |text: &str| {
         let (bytes, index) = face_bytes.as_ref()?;
         let face = Face::parse(bytes, *index).ok()?;
-        Some(layout_lines(&face, text, draft.size))
+        Some(CanvasTextLayout::new(&face, text, draft.size))
     };
     // The box hugs the text: the caret's width past the widest line, and a
     // little room to start typing into when it is empty.
-    let text_width = lay_out(&draft.text)
-        .map(|lines| line_widths(&lines).into_iter().fold(0.0f32, f32::max) * scale)
-        .unwrap_or(0.0);
+    let layout = lay_out(&draft.text);
+    let text_width = layout.as_ref().map_or(0.0, |layout| layout.width * scale);
+    let height = layout.as_ref().map_or(draft.size * scale, |layout| {
+        (layout.bottom - layout.top) * scale
+    });
+    if let Some(layout) = &layout {
+        origin.y += layout.top * scale;
+    }
     let width = (text_width + 2.0).max(draft.size * scale * 0.3);
-    let rect = egui::Rect::from_min_size(origin, egui::vec2(width, font.size * 1.25));
+    let rect = egui::Rect::from_min_size(origin, egui::vec2(width, height));
     let mut entry_rect = rect;
     let mut editor_id = egui::Id::NULL;
     let mut editor_had_focus = false;
@@ -672,9 +683,9 @@ pub(crate) fn render_canvas(
         }
         let galley = ui.fonts(|f| f.layout_job(job));
         match lay_out(text) {
-            Some(lines) => {
+            Some(layout) => {
                 let mut aligned = (*galley).clone();
-                align_galley(&mut aligned, &lines, scale);
+                align_galley(&mut aligned, &layout, scale);
                 std::sync::Arc::new(aligned)
             }
             None => galley,
@@ -686,7 +697,9 @@ pub(crate) fn render_canvas(
         let response = ui.add(
             egui::TextEdit::multiline(&mut draft.text)
                 .id_source("canvas_text_entry")
-                .font(font.clone())
+                // The layouter supplies the real row/caret metrics. TextEdit's
+                // separate minimum row height must not add the font's em box back.
+                .font(egui::FontId::new(1.0, font.family.clone()))
                 .layouter(&mut layouter)
                 .text_color(Color32::TRANSPARENT)
                 .frame(false)
@@ -1348,6 +1361,63 @@ fn line_widths(lines: &[Vec<Placed>]) -> Vec<f32> {
         .collect()
 }
 
+/// Ink bounds in the same coordinates as outline_text. Blank lines still need
+/// a useful caret, but occupied lines should not reserve unused font leading.
+struct CanvasTextLayout {
+    lines: Vec<Vec<Placed>>,
+    rows: Vec<[f32; 2]>,
+    size: f32,
+    width: f32,
+    top: f32,
+    bottom: f32,
+}
+
+impl CanvasTextLayout {
+    fn new(face: &Face, text: &str, size: f32) -> Self {
+        let lines = layout_lines(face, text, size);
+        let scale = size / f32::from(face.units_per_em());
+        let empty_height = face
+            .capital_height()
+            .map(|height| f32::from(height) * scale)
+            .filter(|height| *height > 0.0)
+            .unwrap_or(size * 0.75);
+        let rows: Vec<_> = lines
+            .iter()
+            .enumerate()
+            .map(|(row, line)| {
+                let baseline = size + row as f32 * size * 1.25;
+                let mut top = f32::INFINITY;
+                let mut bottom = f32::NEG_INFINITY;
+                for placed in line {
+                    if let Some(bounds) = face
+                        .glyph_index(placed.character)
+                        .and_then(|glyph| face.glyph_bounding_box(glyph))
+                    {
+                        top = top.min(baseline - f32::from(bounds.y_max) * scale);
+                        bottom = bottom.max(baseline - f32::from(bounds.y_min) * scale);
+                    }
+                }
+                if bottom <= top {
+                    [baseline - empty_height, baseline]
+                } else {
+                    [top, bottom]
+                }
+            })
+            .collect();
+        Self {
+            size,
+            width: line_widths(&lines).into_iter().fold(0.0f32, f32::max),
+            top: rows.iter().map(|row| row[0]).fold(f32::INFINITY, f32::min),
+            bottom: rows
+                .iter()
+                .map(|row| row[1])
+                .fold(f32::NEG_INFINITY, f32::max),
+            lines,
+            rows,
+        }
+    }
+}
+
 fn outline_text(font: &[u8], index: u32, text: &str, size: f32) -> Result<Vec<Path>, String> {
     let face = Face::parse(font, index).map_err(|_| "Unable to read the system font")?;
     let scale = size / f32::from(face.units_per_em());
@@ -1371,29 +1441,46 @@ fn outline_text(font: &[u8], index: u32, text: &str, size: f32) -> Result<Vec<Pa
     Ok(builder.paths)
 }
 
-/// Moves egui's carets onto `lines`, laid out at `scale` screen pixels per
+/// Moves egui's carets onto `layout`, laid out at `scale` screen pixels per
 /// text pixel: egui measures with its own font engine, and its idea of
 /// where letters are drifts from the outlines the stage draws.
-fn align_galley(galley: &mut egui::Galley, lines: &[Vec<Placed>], scale: f32) {
-    if galley.rows.len() != lines.len()
+fn align_galley(galley: &mut egui::Galley, layout: &CanvasTextLayout, scale: f32) {
+    if galley.rows.len() != layout.lines.len()
         || galley
             .rows
             .iter()
-            .zip(lines)
+            .zip(&layout.lines)
             .any(|(row, line)| row.glyphs.len() != line.len())
     {
         return;
     }
-    let mut widest = 0.0f32;
-    for ((row, line), width) in galley.rows.iter_mut().zip(lines).zip(line_widths(lines)) {
+    for (index, (row, line)) in galley.rows.iter_mut().zip(&layout.lines).enumerate() {
+        let [top, bottom] = layout.rows[index];
+        let baseline = layout.size + index as f32 * layout.size * 1.25;
         for (glyph, placed) in row.glyphs.iter_mut().zip(line) {
             glyph.pos.x = placed.x * scale;
             glyph.size.x = placed.advance * scale;
+            glyph.pos.y = (baseline - layout.top) * scale;
+            glyph.ascent = (baseline - top) * scale;
+            glyph.size.y = (bottom - top) * scale;
         }
-        row.rect.max.x = row.rect.min.x + width * scale;
-        widest = widest.max(row.rect.max.x);
+        row.rect = egui::Rect::from_min_max(
+            egui::pos2(0.0, (top - layout.top) * scale),
+            egui::pos2(
+                line.last().map_or(0.0, |last| last.x + last.advance) * scale,
+                (bottom - layout.top) * scale,
+            ),
+        );
+        // Only the stage paints glyphs; this galley supplies editing geometry.
+        row.visuals = Default::default();
     }
-    galley.rect.max.x = galley.rect.min.x + widest;
+    galley.rect = egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(layout.width * scale, (layout.bottom - layout.top) * scale),
+    );
+    galley.mesh_bounds = egui::Rect::NOTHING;
+    galley.num_vertices = 0;
+    galley.num_indices = 0;
 }
 
 /// Font files, read once each; the inline editor lays text out every frame.
@@ -1426,8 +1513,41 @@ fn cached_font(name: &str) -> Option<(std::sync::Arc<Vec<u8>>, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn canvas_frame(app: &mut EditorApp, ctx: &Context, events: Vec<egui::Event>) {
-        let _ = ctx.run(
+
+    #[test]
+    fn font_audit_is_only_needed_for_editable_text_assets() {
+        let mut project = crate::state::default_project();
+        assert!(!has_editable_text(&project));
+        project.asset_names.insert(1, encode_source("hello", 48.0));
+        assert!(
+            !has_editable_text(&project),
+            "an unused name is not a text object"
+        );
+        project.assets.push(Asset::Vector(VectorAsset {
+            asset_id: 1,
+            paths: Vec::new(),
+            fill: None,
+            stroke: None,
+        }));
+        assert!(has_editable_text(&project));
+        project.asset_names.insert(1, "drawing".into());
+        assert!(
+            !has_editable_text(&project),
+            "ordinary drawings need no font scan"
+        );
+        project.asset_names.insert(
+            1,
+            format!("{FONT_SOURCE_PREFIX}{{\"text\":\"hello\",\"size\":48,\"font\":\"Arial\"}}"),
+        );
+        assert!(has_editable_text(&project));
+    }
+
+    fn canvas_frame(
+        app: &mut EditorApp,
+        ctx: &Context,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -1459,7 +1579,115 @@ mod tests {
                         }
                     });
             },
+        )
+    }
+
+    #[test]
+    fn canvas_text_box_and_selection_hug_the_visible_letters() {
+        for font in ["Segoe UI", "Arial", "Times New Roman"] {
+            let Some((bytes, index)) = font_bytes(font) else {
+                continue;
+            };
+            let face = Face::parse(&bytes, index).unwrap();
+            for scale in [0.5, 1.0, 2.0] {
+                for text in ["aaaaaaa", "Ágj", "Ёру"] {
+                    let mut app = EditorApp::default();
+                    let origin = Vec2::new(30.0, 40.0);
+                    let size = 48.0;
+                    app.session.text_editor = Some(TextDraft {
+                        origin,
+                        transform: Affine::from_uniform_scale(scale),
+                        text: text.into(),
+                        size,
+                        font: font.into(),
+                        ..Default::default()
+                    });
+                    let ctx = Context::default();
+                    for _ in 0..3 {
+                        canvas_frame(&mut app, &ctx, vec![]);
+                    }
+                    let editor_id = ctx.memory(|memory| memory.focused()).unwrap();
+                    let mut state = egui::TextEdit::load_state(&ctx, editor_id).unwrap();
+                    state
+                        .cursor
+                        .set_char_range(Some(egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(0),
+                            egui::text::CCursor::new(text.chars().count()),
+                        )));
+                    state.store(&ctx, editor_id);
+                    let output = canvas_frame(&mut app, &ctx, vec![]);
+                    let accent = app.settings.theme.accent.to_color32();
+                    let field = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::Shape::Rect(rect)
+                                if rect.stroke == egui::Stroke::new(1.0_f32, accent) =>
+                            {
+                                Some(rect.rect)
+                            }
+                            _ => None,
+                        })
+                        .expect("canvas text field outline");
+                    let bounds: Vec<_> = text
+                        .chars()
+                        .filter_map(|character| {
+                            face.glyph_index(character)
+                                .and_then(|glyph| face.glyph_bounding_box(glyph))
+                        })
+                        .collect();
+                    let em_scale = size / f32::from(face.units_per_em());
+                    let top = bounds.iter().map(|bounds| bounds.y_max).max().unwrap();
+                    let bottom = bounds.iter().map(|bounds| bounds.y_min).min().unwrap();
+                    let expected_top = origin.y + (size - f32::from(top) * em_scale) * scale;
+                    let expected_bottom = origin.y + (size - f32::from(bottom) * em_scale) * scale;
+                    assert!(
+                        (field.top() - expected_top).abs() < 0.1,
+                        "{font} {text}: {field:?}"
+                    );
+                    assert!(
+                        (field.bottom() - expected_bottom).abs() < 0.1,
+                        "{font} {text}: {field:?}"
+                    );
+                    let selection_color =
+                        ctx.style().visuals.selection.bg_fill.linear_multiply(0.5);
+                    let selection = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::Shape::Rect(rect) if rect.fill == selection_color => {
+                                Some(rect.rect)
+                            }
+                            _ => None,
+                        })
+                        .expect("text selection highlight");
+                    assert!((selection.top() - field.top()).abs() < 0.1);
+                    assert!((selection.bottom() - field.bottom()).abs() < 0.1);
+                    assert_eq!(app.session.text_editor.as_ref().unwrap().origin, origin);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multiline_text_keeps_baselines_and_room_for_blank_lines() {
+        let Some((bytes, index)) = font_bytes(&default_font()) else {
+            return;
+        };
+        let face = Face::parse(&bytes, index).unwrap();
+        let size = 48.0;
+        let layout = CanvasTextLayout::new(&face, "a\n\ngj\n", size);
+        assert_eq!(layout.rows.len(), 4);
+        assert!(layout.rows.iter().all(|row| row[1] > row[0]));
+        assert_eq!(layout.rows[1][1], size * 2.25);
+        assert_eq!(layout.rows[3][1], size * 4.75);
+        assert!(
+            layout.rows[2][1] > size * 3.5,
+            "descenders must fit below their baseline"
         );
+        assert!(layout.bottom >= layout.rows[3][1]);
+        let empty = CanvasTextLayout::new(&face, "", size);
+        assert!(empty.top.is_finite() && empty.bottom > empty.top);
     }
 
     #[test]
@@ -1499,7 +1727,7 @@ hi ";
             }));
         });
         let mut galley = (*galley.unwrap()).clone();
-        align_galley(&mut galley, &lines, 2.0);
+        align_galley(&mut galley, &CanvasTextLayout::new(&face, text, 48.0), 2.0);
         for (row, line) in galley.rows.iter().zip(&lines) {
             for (glyph, placed) in row.glyphs.iter().zip(line) {
                 assert_eq!(glyph.pos.x, placed.x * 2.0);

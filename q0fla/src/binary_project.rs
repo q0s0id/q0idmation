@@ -142,7 +142,7 @@ pub(super) fn import(path: &Path) -> Result<ImportedProject, ImportError> {
                     asset_id: id,
                     width,
                     height,
-                    rgba,
+                    rgba: rgba.into(),
                 }));
                 project.asset_names.insert(id, stream.name.clone());
                 bitmaps.insert(number, id);
@@ -275,7 +275,9 @@ struct Converter<'a> {
     warnings: &'a mut Vec<String>,
     pending_text: &'a mut Vec<crate::PendingText>,
     owner: &'a str,
-    targets: HashMap<usize, Vec<Target>>,
+    /// What each node became, and the matrix its placement adds on top of
+    /// its parent's.
+    targets: HashMap<usize, (Vec<Target>, Affine)>,
 }
 
 impl Converter<'_> {
@@ -446,10 +448,11 @@ impl Converter<'_> {
             ));
         }
         let node = &self.archive.nodes[id];
-        let targets = if let Some(targets) = self.targets.get(&id) {
-            targets.clone()
+        let (targets, own) = if let Some(cached) = self.targets.get(&id) {
+            cached.clone()
         } else {
             let mut targets = Vec::new();
+            let mut own = node.affine;
             match &node.kind {
                 Kind::Symbol { reference, .. } => {
                     if let Some(id) = self.symbols.get(reference) {
@@ -486,15 +489,30 @@ impl Converter<'_> {
                         targets.extend(self.shape_targets(shape)?);
                     }
                     if !node.children.is_empty() || targets.len() > 1 {
+                        // Like Animate's XFL groups, a group's matrix is kept
+                        // for reference: moving a group moves its members'
+                        // own matrices too. Only the group's own artwork is
+                        // drawn through it.
+                        let shape_transform = if targets.is_empty() {
+                            Some(Transform2D::IDENTITY)
+                        } else {
+                            xfl_content::affine_to_transform(node.affine)
+                        };
+                        if shape_transform.is_none() {
+                            self.warnings.push(format!(
+                                "{}: degenerate group artwork transform was skipped",
+                                self.owner
+                            ));
+                        }
                         let group_id = self.allocate_group()?;
                         let mut group = empty_layer(1, "Artwork");
-                        for target in targets {
+                        for target in shape_transform.map(|_| targets).unwrap_or_default() {
                             group.push_placement(Placement {
                                 pivot: None,
                                 instance_id: 0,
                                 frame: 0,
                                 target,
-                                transform: Transform2D::IDENTITY,
+                                transform: shape_transform.unwrap_or(Transform2D::IDENTITY),
                                 tween: Tween::None,
                                 fx: PlacementFx::default(),
                             });
@@ -510,18 +528,17 @@ impl Converter<'_> {
                             layers: vec![group],
                         });
                         targets = vec![Target::Q0rg(group_id)];
+                        own = Affine::IDENTITY;
                     }
                 }
             }
-            self.targets.insert(id, targets.clone());
-            targets
+            self.targets.insert(id, (targets.clone(), own));
+            (targets, own)
         };
         if targets.is_empty() {
             return Ok(());
         }
-        let Some(transform) =
-            xfl_content::affine_to_transform(Affine::compose(parent, node.affine))
-        else {
+        let Some(transform) = xfl_content::affine_to_transform(Affine::compose(parent, own)) else {
             self.warnings.push(format!(
                 "{}: degenerate display-object transform was skipped",
                 self.owner
@@ -556,5 +573,108 @@ impl Converter<'_> {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use archive::Node;
+
+    fn moved(tx: f32, ty: f32) -> Affine {
+        Affine {
+            tx,
+            ty,
+            ..Affine::IDENTITY
+        }
+    }
+
+    #[test]
+    fn a_group_matrix_is_not_applied_on_top_of_its_members() {
+        // A group copied across the stage: Flash moved the member and kept
+        // the move on the group as well.
+        let archive = Archive {
+            nodes: vec![
+                Node {
+                    kind: Kind::Shape,
+                    children: vec![1],
+                    affine: moved(-734.5, 218.2),
+                    shape: None,
+                },
+                Node {
+                    kind: Kind::Symbol {
+                        reference: 7,
+                        first_frame: 0,
+                        mode: q0s_format::v2::Q0rgPlaybackMode::Loop,
+                        opacity: 1.0,
+                        tint: None,
+                    },
+                    children: Vec::new(),
+                    affine: moved(79.8, 241.4),
+                    shape: None,
+                },
+            ],
+            root: 0,
+            warnings: Vec::new(),
+        };
+        let mut project = ProjectV2 {
+            meta: ProjectMeta {
+                name: "groups".into(),
+                fps: 24,
+                stage_width: 550,
+                stage_height: 400,
+                background_color: Rgba {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                },
+                entry_q0rg_id: 1,
+            },
+            assets: Vec::new(),
+            asset_names: HashMap::new(),
+            asset_appearances: HashMap::new(),
+            layer_metadata: HashMap::new(),
+            audio_clips: Vec::new(),
+            runtime: ProjectRuntimeData::default(),
+            q0rgs: Vec::new(),
+        };
+        let symbols = BTreeMap::from([(7, 2)]);
+        let bitmaps = HashMap::new();
+        let (mut next_asset, mut next_q0rg) = (1, 3);
+        let (mut warnings, mut pending_text) = (Vec::new(), Vec::new());
+        let mut converter = Converter {
+            archive: &archive,
+            project: &mut project,
+            symbols: &symbols,
+            bitmaps: &bitmaps,
+            next_asset: &mut next_asset,
+            next_q0rg: &mut next_q0rg,
+            warnings: &mut warnings,
+            pending_text: &mut pending_text,
+            owner: "Scene 1",
+            targets: HashMap::new(),
+        };
+        let mut layer = empty_layer(1, "art");
+        converter
+            .place(0, 0, &mut layer, Affine::IDENTITY, 0)
+            .unwrap();
+        let group = &layer.placements[0];
+        assert_eq!((group.transform.tx, group.transform.ty), (0.0, 0.0));
+        let Target::Q0rg(group_id) = group.target else {
+            panic!("the group becomes a q0rg");
+        };
+        let group = project
+            .q0rgs
+            .iter()
+            .find(|q| q.q0rg_id == group_id)
+            .unwrap();
+        let member = &group.layers[0].placements[0];
+        assert_eq!(member.target, Target::Q0rg(2));
+        assert_eq!(
+            (member.transform.tx, member.transform.ty),
+            (79.8, 241.4),
+            "the member lands where Flash shows it"
+        );
     }
 }

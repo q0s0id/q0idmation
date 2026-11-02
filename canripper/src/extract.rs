@@ -7,8 +7,10 @@ use std::{
 use q0s_format::v2::{Asset, ProjectDependencyKind, ProjectDependencySource, ProjectV2, Rgba};
 
 use crate::{
-    document::{Document, DocumentData},
+    document::{Document, DocumentData, PreviewRef},
+    preview::{PreviewContent, VectorLayer},
     swf::{SwfMovie, SwfTag},
+    swf_assets::{self, Category, Library},
 };
 
 pub fn extract_document(document: &Document, output: &Path) -> Result<ExtractionReport, String> {
@@ -102,6 +104,14 @@ fn extract_q_project(project: &ProjectV2, output: &Path) -> Result<usize, String
             Asset::Q0v(media) => {
                 let path = assets_dir.join(format!("{id:05}_{friendly}.q0v"));
                 fs::write(&path, media.bytes.as_slice())
+                    .map_err(|error| format!("write {}: {error}", path.display()))?;
+                files += 1;
+            }
+            Asset::Model(model) => {
+                let path = assets_dir.join(format!("{id:05}_{friendly}.q0model"));
+                let bytes = q0s_format::three::wire::model_to_bytes(&model.data)
+                    .map_err(|error| format!("encode model {id}: {error}"))?;
+                fs::write(&path, bytes)
                     .map_err(|error| format!("write {}: {error}", path.display()))?;
                 files += 1;
             }
@@ -252,93 +262,273 @@ fn extract_q0v(media: &q0video::q0v::Q0vFile, output: &Path) -> Result<usize, St
             &path,
             media.spec.audio_sample_rate,
             media.spec.audio_channels,
-            media.audio_pcm_le_bytes(),
+            media.audio_pcm_le_bytes()?,
         )?;
         files += 1;
     }
     Ok(files)
 }
 
+/// The decompressed movie, then every character decoded into a folder for
+/// its kind, the way JPEXS exports: images as PNG, shapes, sprites and
+/// buttons as SVG, sounds as MP3 or WAV, scripts as P-code or ABC. What
+/// cannot be decoded is kept as raw tag payloads. Timeline tags are left
+/// out: the movie holds them.
 fn extract_swf(movie: &SwfMovie, output: &Path) -> Result<usize, String> {
     let mut files = 0usize;
     let movie_path = output.join("movie.fws.swf");
     fs::write(&movie_path, &movie.normalized_fws)
         .map_err(|error| format!("write {}: {error}", movie_path.display()))?;
     files += 1;
-
-    let tags_dir = output.join("tags");
-    fs::create_dir_all(&tags_dir).map_err(|error| format!("create tags directory: {error}"))?;
+    let library = Library::new(movie);
     for tag in &movie.tags {
-        let path = tags_dir.join(format!(
-            "{:05}_{:03}_{}.bin",
-            tag.index,
-            tag.code,
-            safe_component(tag.name)
-        ));
-        fs::write(&path, &tag.payload)
-            .map_err(|error| format!("write {}: {error}", path.display()))?;
-        files += 1;
-        files += extract_known_swf_payload(tag, output)?;
+        if Category::of(tag.code) == Category::Control {
+            continue;
+        }
+        if let Some((folder, name, bytes)) = export_swf_tag(&library, tag, 0) {
+            let dir = output.join(folder);
+            fs::create_dir_all(&dir)
+                .map_err(|error| format!("create {}: {error}", dir.display()))?;
+            let path = dir.join(name);
+            fs::write(&path, bytes)
+                .map_err(|error| format!("write {}: {error}", path.display()))?;
+            files += 1;
+        }
     }
     Ok(files)
 }
 
-fn extract_known_swf_payload(tag: &SwfTag, output: &Path) -> Result<usize, String> {
-    match tag.code {
-        21 => {
-            if tag.payload.len() < 2 {
-                return Ok(0);
-            }
-            let character_id = u16::from_le_bytes([tag.payload[0], tag.payload[1]]);
-            let image = &tag.payload[2..];
-            let ext = sniff_image_extension(image).unwrap_or("img");
-            let dir = output.join("images");
-            fs::create_dir_all(&dir)
-                .map_err(|error| format!("create images directory: {error}"))?;
-            let path = dir.join(format!("jpeg2_{character_id:05}.{ext}"));
-            fs::write(&path, image)
-                .map_err(|error| format!("write {}: {error}", path.display()))?;
-            Ok(1)
+/// A tag as the file it exports to: its folder, file name and bytes.
+fn export_swf_tag(
+    library: &Library,
+    tag: &SwfTag,
+    frame: u32,
+) -> Option<(&'static str, String, Vec<u8>)> {
+    let id = swf_assets::character_id(tag);
+    let stem = match id {
+        Some(id) => match library.name(id) {
+            Some(name) => format!("{id}_{}", safe_component(name)),
+            None => id.to_string(),
+        },
+        None => format!("{:05}_{}", tag.index, safe_component(tag.name)),
+    };
+    let raw = || Some(("tags", format!("{stem}.bin"), tag.payload.clone()));
+    match Category::of(tag.code) {
+        Category::Image => match library.decode_image(tag) {
+            Ok((width, height, rgba)) => png_bytes(width, height, &rgba)
+                .ok()
+                .map(|png| ("images", format!("{stem}.png"), png)),
+            Err(_) => raw(),
+        },
+        category @ (Category::Shape | Category::Sprite | Category::Button) => {
+            let layers = library.draw(tag, frame).ok()?;
+            let bounds = swf_assets::layer_bounds(&layers)?;
+            let svg = layers_to_svg(
+                &layers,
+                (bounds.x_min, bounds.y_min, bounds.x_max, bounds.y_max),
+                None,
+            );
+            Some((category.folder(), format!("{stem}.svg"), svg.into_bytes()))
         }
-        82 => {
-            if tag.payload.len() < 4 {
-                return Ok(0);
-            }
-            let name_end = tag.payload[4..]
-                .iter()
-                .position(|byte| *byte == 0)
-                .map(|position| position + 4)
-                .unwrap_or(tag.payload.len());
-            let abc_start = name_end.saturating_add(1).min(tag.payload.len());
-            if abc_start >= tag.payload.len() {
-                return Ok(0);
-            }
-            let name = String::from_utf8_lossy(&tag.payload[4..name_end]);
-            let dir = output.join("abc");
-            fs::create_dir_all(&dir).map_err(|error| format!("create abc directory: {error}"))?;
-            let path = dir.join(format!(
-                "{:05}_{}.abc",
-                tag.index,
-                safe_component(if name.is_empty() { "unnamed" } else { &name })
-            ));
-            fs::write(&path, &tag.payload[abc_start..])
-                .map_err(|error| format!("write {}: {error}", path.display()))?;
-            Ok(1)
+        Category::Sound => {
+            let sound = swf_assets::parse_sound(tag).ok()?;
+            let (extension, bytes) = sound.file(tag);
+            Some(("sounds", format!("{stem}.{extension}"), bytes))
         }
-        87 => {
-            if tag.payload.len() < 6 {
-                return Ok(0);
-            }
-            let character_id = u16::from_le_bytes([tag.payload[0], tag.payload[1]]);
-            let dir = output.join("binary");
-            fs::create_dir_all(&dir)
-                .map_err(|error| format!("create binary directory: {error}"))?;
-            let path = dir.join(format!("binary_{character_id:05}.bin"));
-            fs::write(&path, &tag.payload[6..])
-                .map_err(|error| format!("write {}: {error}", path.display()))?;
-            Ok(1)
+        Category::BinaryData => {
+            let data = tag.payload.get(6..)?;
+            let extension = sniff_extension(data).unwrap_or("bin");
+            Some(("binaryData", format!("{stem}.{extension}"), data.to_vec()))
         }
-        _ => Ok(0),
+        Category::Script => {
+            if let Some(code) = swf_assets::action_code(tag) {
+                return Some((
+                    "scripts",
+                    format!("{stem}.pcode.txt"),
+                    swf_assets::disassemble(code).into_bytes(),
+                ));
+            }
+            let mut reader = swf_assets::Reader::new(&tag.payload);
+            reader.u32().ok()?;
+            let name = reader.string().ok()?;
+            let abc = reader.rest().to_vec();
+            let name = if name.is_empty() {
+                stem.clone()
+            } else {
+                safe_component(&name)
+            };
+            Some(("scripts", format!("{name}.abc"), abc))
+        }
+        Category::Text if tag.code == 37 => {
+            let text = swf_assets::parse_edit_text(tag).ok()?;
+            Some((
+                "texts",
+                format!("{stem}.txt"),
+                text.text.unwrap_or_default().into_bytes(),
+            ))
+        }
+        Category::Control => None,
+        _ => raw(),
+    }
+}
+
+/// What the selected node saves as: a suggested file name and its bytes.
+pub struct Exported {
+    pub name: String,
+    pub bytes: Vec<u8>,
+}
+
+/// The selected node as a file of its own: decoded where CanRipper can
+/// decode it, else as what its preview shows.
+pub fn export_selection(
+    document: &Document,
+    reference: &PreviewRef,
+    frame: u32,
+    label: &str,
+) -> Result<Exported, String> {
+    let stem = {
+        let cleaned = safe_component(label);
+        if cleaned.is_empty() {
+            "export".to_string()
+        } else {
+            cleaned.chars().take(60).collect()
+        }
+    };
+    if let (PreviewRef::SwfTag(index), DocumentData::Swf(movie))
+    | (PreviewRef::SwfTag(index), DocumentData::Projector { movie, .. }) =
+        (reference, &document.data)
+    {
+        let library = Library::new(movie);
+        let tag = movie.tags.get(*index).ok_or("this tag is missing")?;
+        if let Some((_, name, bytes)) = export_swf_tag(&library, tag, frame) {
+            return Ok(Exported { name, bytes });
+        }
+    }
+    let (bytes, _, what) = crate::preview::node_bytes(document, Some(reference));
+    if what == "q0v media" || what == "embedded file" {
+        let extension = sniff_extension(&bytes).unwrap_or("bin");
+        return Ok(Exported {
+            name: format!("{stem}.{extension}"),
+            bytes: bytes.into_owned(),
+        });
+    }
+    match crate::preview::build_preview(document, reference, frame)? {
+        PreviewContent::Image {
+            width,
+            height,
+            rgba,
+            ..
+        } => Ok(Exported {
+            name: format!("{stem}.png"),
+            bytes: png_bytes(width as u32, height as u32, &rgba)?,
+        }),
+        PreviewContent::Vector(vector) => Ok(Exported {
+            name: format!("{stem}.svg"),
+            bytes: layers_to_svg(&vector.layers, vector.bounds, vector.background).into_bytes(),
+        }),
+        PreviewContent::Text { text, .. } => Ok(Exported {
+            name: format!("{stem}.txt"),
+            bytes: text.into_bytes(),
+        }),
+    }
+}
+
+pub fn png_bytes(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
+    let image = image::RgbaImage::from_raw(width, height, rgba.to_vec())
+        .ok_or("image size does not match its pixels")?;
+    let mut out = std::io::Cursor::new(Vec::new());
+    image
+        .write_to(&mut out, image::ImageOutputFormat::Png)
+        .map_err(|error| format!("encode png: {error}"))?;
+    Ok(out.into_inner())
+}
+
+/// Vector layers as an SVG document showing `bounds`.
+pub fn layers_to_svg(
+    layers: &[VectorLayer],
+    bounds: (f32, f32, f32, f32),
+    background: Option<Rgba>,
+) -> String {
+    let (min_x, min_y, max_x, max_y) = bounds;
+    let (width, height) = ((max_x - min_x).max(1.0), (max_y - min_y).max(1.0));
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"{min_x} {min_y} {width} {height}\" width=\"{width}\" height=\"{height}\">"
+    );
+    if let Some(color) = background {
+        let _ = writeln!(
+            out,
+            "  <rect x=\"{min_x}\" y=\"{min_y}\" width=\"{width}\" height=\"{height}\" fill=\"{}\"/>",
+            svg_color(color)
+        );
+    }
+    for layer in layers {
+        let mut data = String::new();
+        for path in &layer.paths {
+            let Some(first) = path.anchors.first() else {
+                continue;
+            };
+            let _ = write!(data, "M {} {}", first.point.x, first.point.y);
+            for pair in path.anchors.windows(2) {
+                append_svg_segment(&mut data, &pair[0], &pair[1]);
+            }
+            if path.closed {
+                if let Some(last) = path.anchors.last() {
+                    append_svg_segment(&mut data, last, first);
+                }
+                data.push_str(" Z ");
+            } else {
+                data.push(' ');
+            }
+        }
+        if data.is_empty() {
+            continue;
+        }
+        let fill = layer.fill.map_or("none".to_string(), |color| {
+            format!(
+                "{}\" fill-opacity=\"{:.3}",
+                svg_color(color),
+                f32::from(color.a) / 255.0
+            )
+        });
+        let stroke = layer.stroke.map_or(String::new(), |stroke| {
+            format!(
+                " stroke=\"{}\" stroke-opacity=\"{:.3}\" stroke-width=\"{}\" stroke-linecap=\"round\" stroke-linejoin=\"round\"",
+                svg_color(stroke.color),
+                f32::from(stroke.color.a) / 255.0,
+                stroke.width
+            )
+        });
+        let _ = writeln!(
+            out,
+            "  <path d=\"{}\" fill=\"{fill}\" fill-rule=\"nonzero\"{stroke}/>",
+            data.trim_end()
+        );
+    }
+    out.push_str("</svg>\n");
+    out
+}
+
+/// The extension a file's first bytes say it is.
+fn sniff_extension(bytes: &[u8]) -> Option<&'static str> {
+    if let Some(image) = sniff_image_extension(bytes) {
+        return Some(image);
+    }
+    if bytes.starts_with(b"Q0S\0") {
+        Some("q0s")
+    } else if bytes.starts_with(b"Q1S\0") {
+        Some("q1s")
+    } else if bytes.starts_with(b"Q0V\0") {
+        Some("q0v")
+    } else if bytes.starts_with(b"FWS") || bytes.starts_with(b"CWS") || bytes.starts_with(b"ZWS") {
+        Some("swf")
+    } else if bytes.starts_with(b"ID3") || bytes.starts_with(&[0xff, 0xfb]) {
+        Some("mp3")
+    } else if bytes.starts_with(b"<?xml") {
+        Some("xml")
+    } else {
+        None
     }
 }
 
@@ -534,6 +724,50 @@ mod tests {
             Some("jpg")
         );
         assert_eq!(sniff_image_extension(b"\x89PNG\r\n\x1a\nxxx"), Some("png"));
+    }
+
+    #[test]
+    fn exported_files_are_named_for_what_their_bytes_hold() {
+        assert_eq!(sniff_extension(b"Q0S\0\x2a\0"), Some("q0s"));
+        assert_eq!(sniff_extension(b"CWS\x08...."), Some("swf"));
+        assert_eq!(sniff_extension(b"ID3\x03"), Some("mp3"));
+        assert_eq!(sniff_extension(b"nothing known"), None);
+    }
+
+    #[test]
+    fn vector_layers_become_svg_paths_in_their_colours() {
+        use q0s_format::v2::{Anchor, Path as VPath, Vec2};
+        let corner = |x: f32, y: f32| Anchor {
+            point: Vec2::new(x, y),
+            in_handle: None,
+            out_handle: None,
+        };
+        let layer = VectorLayer {
+            paths: vec![VPath {
+                anchors: vec![corner(0.0, 0.0), corner(10.0, 0.0), corner(10.0, 10.0)],
+                closed: true,
+            }],
+            fill: Some(Rgba {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 128,
+            }),
+            stroke: None,
+        };
+        let white = Rgba {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 255,
+        };
+        let svg = layers_to_svg(&[layer], (0.0, 0.0, 10.0, 10.0), Some(white));
+        assert!(svg.contains("<rect"), "{svg}");
+        assert!(
+            svg.contains("fill=\"#ff0000\" fill-opacity=\"0.502\""),
+            "{svg}"
+        );
+        assert!(svg.contains("M 0 0 L 10 0 L 10 10 L 0 0 Z"), "{svg}");
     }
 
     #[test]

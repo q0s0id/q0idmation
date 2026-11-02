@@ -20,6 +20,7 @@ enum ToolIcon {
     Pencil,
     Brush,
     Eraser,
+    Knife,
     Line,
     Rectangle,
     Oval,
@@ -40,6 +41,7 @@ impl ToolIcon {
             Tool::Pencil => Self::Pencil,
             Tool::Brush => Self::Brush,
             Tool::Eraser => Self::Eraser,
+            Tool::Knife => Self::Knife,
             Tool::Line => Self::Line,
             Tool::Rectangle => Self::Rectangle,
             Tool::Oval => Self::Oval,
@@ -52,6 +54,7 @@ impl ToolIcon {
 }
 
 pub fn render(app: &mut EditorApp, ui: &mut Ui) {
+    let three = crate::tools3d::offered(&app.state.project);
     if ui.available_width() >= 90.0 {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
@@ -59,6 +62,16 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 render_tool_button(app, ui, tool);
             }
         });
+        if three {
+            ui.add_space(4.0);
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                for tool in crate::tools3d::Tool3d::ALL {
+                    render_tool3d_button(app, ui, tool);
+                }
+            });
+        }
     } else {
         ui.vertical_centered(|ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
@@ -70,8 +83,136 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 }
                 render_tool_button(app, ui, tool);
             }
+            if three {
+                ui.add_space(3.0);
+                ui.separator();
+                ui.label(
+                    egui::RichText::new("3D")
+                        .small()
+                        .color(app.settings.theme.text_dim.to_color32()),
+                );
+                for tool in crate::tools3d::Tool3d::ALL {
+                    render_tool3d_button(app, ui, tool);
+                }
+            }
             ui.add_space(8.0);
         });
+    }
+}
+
+/// The magnet in the stage's header: snapping on or off.
+pub(crate) fn render_snap_button(app: &mut EditorApp, ui: &mut Ui) {
+    let size = if crate::touch::ENABLED { 30.0 } else { 22.0 };
+    let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::click());
+    let on = app.settings.aids.snap;
+    let text = app.settings.theme.text.to_color32();
+    let accent = app.settings.theme.accent.to_color32();
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter_at(rect);
+        let fill = if on {
+            accent.gamma_multiply(0.35)
+        } else if response.hovered() {
+            app.settings.theme.panel.to_color32().gamma_multiply(1.4)
+        } else {
+            Color32::TRANSPARENT
+        };
+        painter.rect(
+            rect.shrink(1.0),
+            4.0,
+            fill,
+            Stroke::new(1.0_f32, if on { accent } else { Color32::TRANSPARENT }),
+        );
+        paint_magnet(
+            &painter,
+            rect.center(),
+            rect.width() * 0.3,
+            if on { accent } else { text },
+        );
+    }
+    let hint = app.settings.hotkeys.hint(
+        crate::hotkeys::ShortcutCommand::ToggleSnap,
+        if on { "Snapping: on" } else { "Snapping: off" },
+    );
+    let response = response.on_hover_text(format!("{hint}\nwithin 10 screen pixels: anchors, line ends, outlines, object corners and centers. a ring marks a point snap; a square marks an outline snap."));
+    response.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, on, "Snapping"));
+    if response.clicked() {
+        app.queue(Action::ToggleSnap);
+    }
+}
+
+/// A horseshoe magnet opening downwards.
+fn paint_magnet(painter: &Painter, center: Pos2, radius: f32, color: Color32) {
+    let width = radius * 0.55;
+    let arc: Vec<Pos2> = (0..=16)
+        .map(|step| {
+            let angle = std::f32::consts::PI * (1.0 + step as f32 / 16.0);
+            center + vec2(angle.cos(), angle.sin()) * radius * 0.75
+        })
+        .collect();
+    let mut points = vec![pos2(center.x - radius * 0.75, center.y + radius * 0.9)];
+    points.extend(arc);
+    points.push(pos2(center.x + radius * 0.75, center.y + radius * 0.9));
+    painter.add(Shape::line(points, Stroke::new(width, color)));
+    for side in [-1.0, 1.0] {
+        let tip = Rect::from_center_size(
+            pos2(center.x + side * radius * 0.75, center.y + radius * 0.95),
+            vec2(width, width * 0.7),
+        );
+        painter.rect_filled(tip, 0.0, color.gamma_multiply(0.55));
+    }
+}
+
+/// A 3D tool's button, styled like the 2D ones.
+fn render_tool3d_button(app: &mut EditorApp, ui: &mut Ui, tool: crate::tools3d::Tool3d) {
+    let selected = app.session.tools3d.tool == Some(tool);
+    let size = tool_button_size();
+    let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::click());
+    response
+        .widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, selected, tool.label()));
+    let text = app.settings.theme.text.to_color32();
+    let panel = app.settings.theme.panel.to_color32();
+    let accent = app.settings.theme.accent.to_color32();
+    if ui.is_rect_visible(rect) {
+        if selected {
+            ui.painter().rect(
+                rect.shrink(1.0),
+                6.0,
+                blend_rgb(panel, accent, 0.30),
+                Stroke::new(1.5_f32, accent),
+            );
+            ui.painter().rect_filled(
+                Rect::from_min_max(
+                    pos2(rect.left() + 1.0, rect.top() + 4.0),
+                    pos2(rect.left() + 3.5, rect.bottom() - 4.0),
+                ),
+                1.25,
+                accent,
+            );
+        } else if response.hovered() || response.has_focus() {
+            let visuals = ui.style().interact(&response);
+            ui.painter().rect(
+                rect.shrink(1.0),
+                visuals.rounding,
+                visuals.weak_bg_fill,
+                visuals.bg_stroke,
+            );
+        }
+        let icon = Rect::from_center_size(
+            rect.center(),
+            vec2(TOOL_ICON_SIZE, TOOL_ICON_SIZE) * (size / TOOL_BUTTON_SIZE),
+        );
+        crate::tools3d::paint_icon(
+            ui.painter(),
+            icon,
+            tool,
+            if selected { accent } else { text },
+            accent,
+        );
+    }
+    if response.on_hover_text(tool.hint()).clicked() && crate::text_tool::finish_edit(app) {
+        app.plugins.active_tool = None;
+        app.session.tools3d.tool = Some(tool);
+        app.session.tool_state = crate::state::ToolState::Idle;
     }
 }
 
@@ -79,7 +220,7 @@ fn render_tool_button(app: &mut EditorApp, ui: &mut Ui, tool: Tool) {
     let response = tool_button(
         ui,
         tool,
-        app.session.current_tool == tool,
+        app.session.current_tool == tool && !app.session.tools3d.active(),
         app.settings.theme.text.to_color32(),
         app.settings.theme.panel.to_color32(),
         app.settings.theme.accent.to_color32(),
@@ -105,6 +246,7 @@ fn tool_shortcut(tool: Tool) -> Option<crate::hotkeys::ShortcutCommand> {
         Tool::Pencil => C::ToolPencil,
         Tool::Brush => C::ToolBrush,
         Tool::Eraser => C::ToolEraser,
+        Tool::Knife => C::ToolKnife,
         Tool::Line => C::ToolLine,
         Tool::Rectangle => C::ToolRectangle,
         Tool::Oval => C::ToolOval,
@@ -268,6 +410,7 @@ fn draw_tool_icon(
         ToolIcon::Pencil => draw_pencil(painter, c, primary, secondary),
         ToolIcon::Brush => draw_brush(painter, c, primary, secondary),
         ToolIcon::Eraser => draw_eraser(painter, c, primary, secondary),
+        ToolIcon::Knife => draw_knife(painter, c, primary, secondary),
         ToolIcon::Line => {
             painter.line_segment([c.point(0.15, 0.82), c.point(0.85, 0.18)], line);
             painter.circle_filled(c.point(0.15, 0.82), 1.7, secondary);
@@ -453,6 +596,31 @@ fn draw_eraser(painter: &Painter, c: IconCanvas, primary: Color32, accent: Color
         [c.point(0.13, 0.91), c.point(0.57, 0.91)],
         Stroke::new(1.15_f32, accent),
     );
+}
+
+fn draw_knife(painter: &Painter, c: IconCanvas, primary: Color32, accent: Color32) {
+    // A blade leaning right, its handle below, over a zigzag cut.
+    c.polygon(
+        painter,
+        &[(0.80, 0.10), (0.86, 0.16), (0.44, 0.62), (0.34, 0.56)],
+        Color32::TRANSPARENT,
+        Stroke::new(1.45_f32, primary),
+    );
+    painter.line_segment(
+        [c.point(0.38, 0.60), c.point(0.20, 0.80)],
+        Stroke::new(3.2_f32, primary),
+    );
+    painter.add(Shape::line(
+        vec![
+            c.point(0.10, 0.92),
+            c.point(0.26, 0.84),
+            c.point(0.38, 0.94),
+            c.point(0.52, 0.84),
+            c.point(0.64, 0.94),
+            c.point(0.80, 0.86),
+        ],
+        Stroke::new(1.15_f32, accent),
+    ));
 }
 
 fn draw_bucket(painter: &Painter, c: IconCanvas, primary: Color32, accent: Color32) {

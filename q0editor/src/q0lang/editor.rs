@@ -104,6 +104,9 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
     let mut new_font_size: Option<f32> = None;
     let mut new_tab_width: Option<u8> = None;
     let mut new_show_lines: Option<bool> = None;
+    let mut simple = app.settings.q0lang_simple;
+    let names = super::blocks::Names::of_project(&app.state.project, q0rg_id);
+    let mut blocks_changed = false;
 
     // The TextEdit gets a stable id so we can reach into its state from
     // the auto-indent / smart-tab pre-passes below.
@@ -134,6 +137,8 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
         .show(ctx, |ui| {
             // ------ top toolbar: font picker, size, tab width, gutter toggle ------
             ui.horizontal(|ui| {
+                super::blocks::mode_switch(ui, &mut simple);
+                ui.separator();
                 ui.label(
                     egui::RichText::new("font")
                         .color(theme.text_dim.to_color32())
@@ -205,98 +210,117 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
             });
             ui.separator();
 
-            super::authoring::tools_ui(ui, text_edit_id, &mut owned_script);
-            ui.separator();
-
-            // ------ main body: gutter + text edit, both inside one ScrollArea
-            // so vertical / horizontal scroll stays in lockstep.
-            let line_count = owned_script.lines().count().max(1)
-                + if owned_script.ends_with('\n') { 1 } else { 0 };
-            // Layouter for the TextEdit — closure borrows `theme` and `font_id`.
-            let theme_for_layouter = theme.clone();
-            let font_for_layouter = font_id.clone();
-            let mut layouter = move |ui: &egui::Ui, text: &str, _wrap_width: f32| {
-                let job = super::syntax::layout_line(
-                    text,
-                    &theme_for_layouter,
-                    font_for_layouter.clone(),
-                    f32::INFINITY,
-                );
-                ui.fonts(|f| f.layout_job(job))
-            };
-
-            // Approximate row height — used to draw the line-number column
-            // so each number sits next to its row.  We pull it from the
-            // font metrics on the current ctx.
-            let row_height = ctx.fonts(|f| f.row_height(&font_id));
-
-            egui::ScrollArea::both()
-                .id_source(text_edit_id.with("scroll"))
-                .auto_shrink([false, false])
-                .max_height((ui.available_height() - 170.0).max(140.0))
-                .show(ui, |ui| {
-                    ui.horizontal_top(|ui| {
-                        if show_lines {
-                            // ----- Gutter: per-row line numbers, right-aligned.
-                            let max_label = line_count.to_string().len().max(2);
-                            let gutter_char_w = ctx.fonts(|f| f.glyph_width(&font_id, '0'));
-                            let gutter_width = gutter_char_w * (max_label as f32) + 14.0;
-                            let total_height = row_height * line_count as f32 + 4.0;
-                            let (rect, _resp) = ui.allocate_exact_size(
-                                Vec2::new(gutter_width, total_height),
-                                Sense::hover(),
-                            );
-                            let painter = ui.painter_at(rect);
-                            painter.rect_filled(rect, 0.0, theme.syntax_gutter_bg.to_color32());
-                            let right_pad = 6.0;
-                            for n in visible_lines(
-                                rect.top() + 2.0,
-                                row_height,
-                                line_count,
-                                ui.clip_rect(),
-                            ) {
-                                let y = rect.top() + 2.0 + (n - 1) as f32 * row_height;
-                                let pos = egui::pos2(rect.right() - right_pad, y);
-                                painter.text(
-                                    pos,
-                                    egui::Align2::RIGHT_TOP,
-                                    n.to_string(),
-                                    font_id.clone(),
-                                    theme.syntax_gutter_fg.to_color32(),
-                                );
-                            }
-                            // Faint vertical separator between gutter and text.
-                            painter.line_segment(
-                                [
-                                    egui::pos2(rect.right() - 0.5, rect.top()),
-                                    egui::pos2(rect.right() - 0.5, rect.bottom()),
-                                ],
-                                Stroke::new(1.0_f32, theme.stroke_dark.to_color32()),
-                            );
-                            ui.add_space(4.0);
-                        }
-
-                        // ----- The actual TextEdit (custom layouter).
-                        let avail = ui.available_width().max(200.0);
-                        let edit = TextEdit::multiline(&mut owned_script)
-                            .id(text_edit_id)
-                            .desired_rows(line_count.max(20))
-                            .desired_width(avail)
-                            .frame(false)
-                            .layouter(&mut layouter);
-                        let output = edit.font(font_id.clone()).show(ui);
-                        super::authoring::scroll_to_selection(ui, &output);
-                        let resp = output.response;
-                        if resp.gained_focus() {
-                            text_gained_focus = true;
-                        }
-                        if resp.changed() {
-                            // Force a repaint so the gutter line count tracks
-                            // the buffer immediately after typing.
-                            ctx.request_repaint();
-                        }
-                    });
+            if simple {
+                let issues = super::authoring::analyze(ctx, &owned_script)
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.line)
+                    .collect::<Vec<_>>();
+                let height = (ui.available_height() - 170.0).max(220.0);
+                ui.allocate_ui(egui::vec2(ui.available_width(), height), |ui| {
+                    ui.set_min_height(height);
+                    blocks_changed = super::blocks::show(
+                        ui,
+                        text_edit_id.with("blocks"),
+                        &mut owned_script,
+                        &names,
+                        &issues,
+                    );
                 });
+            } else {
+                super::authoring::tools_ui(ui, text_edit_id, &mut owned_script);
+                ui.separator();
+
+                // ------ main body: gutter + text edit, both inside one ScrollArea
+                // so vertical / horizontal scroll stays in lockstep.
+                let line_count = owned_script.lines().count().max(1)
+                    + if owned_script.ends_with('\n') { 1 } else { 0 };
+                // Layouter for the TextEdit — closure borrows `theme` and `font_id`.
+                let theme_for_layouter = theme.clone();
+                let font_for_layouter = font_id.clone();
+                let mut layouter = move |ui: &egui::Ui, text: &str, _wrap_width: f32| {
+                    let job = super::syntax::layout_line(
+                        text,
+                        &theme_for_layouter,
+                        font_for_layouter.clone(),
+                        f32::INFINITY,
+                    );
+                    ui.fonts(|f| f.layout_job(job))
+                };
+
+                // Approximate row height — used to draw the line-number column
+                // so each number sits next to its row.  We pull it from the
+                // font metrics on the current ctx.
+                let row_height = ctx.fonts(|f| f.row_height(&font_id));
+
+                egui::ScrollArea::both()
+                    .id_source(text_edit_id.with("scroll"))
+                    .auto_shrink([false, false])
+                    .max_height((ui.available_height() - 170.0).max(140.0))
+                    .show(ui, |ui| {
+                        ui.horizontal_top(|ui| {
+                            if show_lines {
+                                // ----- Gutter: per-row line numbers, right-aligned.
+                                let max_label = line_count.to_string().len().max(2);
+                                let gutter_char_w = ctx.fonts(|f| f.glyph_width(&font_id, '0'));
+                                let gutter_width = gutter_char_w * (max_label as f32) + 14.0;
+                                let total_height = row_height * line_count as f32 + 4.0;
+                                let (rect, _resp) = ui.allocate_exact_size(
+                                    Vec2::new(gutter_width, total_height),
+                                    Sense::hover(),
+                                );
+                                let painter = ui.painter_at(rect);
+                                painter.rect_filled(rect, 0.0, theme.syntax_gutter_bg.to_color32());
+                                let right_pad = 6.0;
+                                for n in visible_lines(
+                                    rect.top() + 2.0,
+                                    row_height,
+                                    line_count,
+                                    ui.clip_rect(),
+                                ) {
+                                    let y = rect.top() + 2.0 + (n - 1) as f32 * row_height;
+                                    let pos = egui::pos2(rect.right() - right_pad, y);
+                                    painter.text(
+                                        pos,
+                                        egui::Align2::RIGHT_TOP,
+                                        n.to_string(),
+                                        font_id.clone(),
+                                        theme.syntax_gutter_fg.to_color32(),
+                                    );
+                                }
+                                // Faint vertical separator between gutter and text.
+                                painter.line_segment(
+                                    [
+                                        egui::pos2(rect.right() - 0.5, rect.top()),
+                                        egui::pos2(rect.right() - 0.5, rect.bottom()),
+                                    ],
+                                    Stroke::new(1.0_f32, theme.stroke_dark.to_color32()),
+                                );
+                                ui.add_space(4.0);
+                            }
+
+                            // ----- The actual TextEdit (custom layouter).
+                            let avail = ui.available_width().max(200.0);
+                            let edit = TextEdit::multiline(&mut owned_script)
+                                .id(text_edit_id)
+                                .desired_rows(line_count.max(20))
+                                .desired_width(avail)
+                                .frame(false)
+                                .layouter(&mut layouter);
+                            let output = edit.font(font_id.clone()).show(ui);
+                            super::authoring::scroll_to_selection(ui, &output);
+                            let resp = output.response;
+                            if resp.gained_focus() {
+                                text_gained_focus = true;
+                            }
+                            if resp.changed() {
+                                // Force a repaint so the gutter line count tracks
+                                // the buffer immediately after typing.
+                                ctx.request_repaint();
+                            }
+                        });
+                    });
+            }
 
             let analysis = super::authoring::analyze(ctx, &owned_script);
             let diagnostics = &analysis.diagnostics;
@@ -450,8 +474,12 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
     // Re-arm the snapshot trigger whenever the editor gets focus — that
     // marks the start of a fresh edit session (user clicked back in
     // after navigating away).
-    if text_gained_focus {
+    if text_gained_focus || blocks_changed {
         app.session.q0lang_edit_armed = true;
+    }
+    if simple != app.settings.q0lang_simple {
+        app.settings.q0lang_simple = simple;
+        app.settings.save();
     }
     if needs_write {
         if app.session.q0lang_edit_armed {
@@ -512,6 +540,21 @@ pub fn render_standalone(app: &mut EditorApp, ui: &mut egui::Ui) {
     let tab_width = app.settings.q0lang_tab_width.max(1) as usize;
     let show_lines = app.settings.q0lang_show_line_numbers;
 
+    // The switch lands next frame: the document borrows the app below.
+    let pending_id = egui::Id::new("q0lang_simple_pending");
+    if let Some(pending) = ui
+        .ctx()
+        .data_mut(|data| data.remove_temp::<bool>(pending_id))
+    {
+        if pending != app.settings.q0lang_simple {
+            app.settings.q0lang_simple = pending;
+            app.settings.save();
+        }
+    }
+    let mut simple = app.settings.q0lang_simple;
+    let was_simple = simple;
+    let entry = app.state.project.meta.entry_q0rg_id;
+    let names = super::blocks::Names::of_project(&app.state.project, entry);
     let Some(document) = app.active_q0lang_document_mut() else {
         ui.centered_and_justified(|ui| ui.label("no q0lang document"));
         return;
@@ -526,6 +569,8 @@ pub fn render_standalone(app: &mut EditorApp, ui: &mut egui::Ui) {
     let path_text = document.path.display().to_string();
 
     ui.horizontal(|ui| {
+        super::blocks::mode_switch(ui, &mut simple);
+        ui.separator();
         ui.label(egui::RichText::new("q0lang").strong());
         ui.separator();
         ui.label(
@@ -554,6 +599,34 @@ pub fn render_standalone(app: &mut EditorApp, ui: &mut egui::Ui) {
             );
         });
     });
+
+    if simple {
+        let issues = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.line)
+            .collect::<Vec<_>>();
+        ui.separator();
+        let height = (ui.available_height() - 40.0).max(220.0);
+        ui.allocate_ui(egui::vec2(ui.available_width(), height), |ui| {
+            ui.set_min_height(height);
+            document.dirty |= super::blocks::show(
+                ui,
+                text_edit_id.with("blocks"),
+                &mut document.text,
+                &names,
+                &issues,
+            );
+        });
+        if simple != was_simple {
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(pending_id, simple));
+        }
+        return;
+    }
+    if simple != was_simple {
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(pending_id, simple));
+    }
 
     document.dirty |= super::authoring::tools_ui(ui, text_edit_id, &mut document.text);
 
@@ -1208,6 +1281,43 @@ fn runtime_action_label(action: &super::runtime::RuntimeAction) -> String {
                     format!("q0light.size! {light:?}, {radius}")
                 }
                 LightCommand::Darkness { value } => format!("q0light.darkness! {value}"),
+            }
+        }
+        RuntimeAction::Layer(command) => {
+            use super::runtime::LayerCommand;
+            match command {
+                LayerCommand::Hide { layer } => format!("q0layer.hide! {layer}"),
+                LayerCommand::Show { layer } => format!("q0layer.show! {layer}"),
+                LayerCommand::Move { layer, x, y } => format!("q0layer.move! {layer}, {x}, {y}"),
+                LayerCommand::Alpha { layer, value } => format!("q0layer.alpha! {layer}, {value}"),
+                LayerCommand::Reset { layer } => format!("q0layer.reset! {layer}"),
+                LayerCommand::Solid { layer, thing } => {
+                    format!("q0layer.solid! {layer}, {thing:?}")
+                }
+                LayerCommand::Unsolid { layer, thing } => {
+                    format!("q0layer.unsolid! {layer}, {thing:?}")
+                }
+            }
+        }
+        RuntimeAction::Window(command) => {
+            use super::runtime::WindowCommand;
+            match command {
+                WindowCommand::Fullscreen(on) => format!("q0window.fullscreen! {on}"),
+                WindowCommand::Ui(on) => format!("q0window.ui! {on}"),
+                WindowCommand::Hotkeys(on) => format!("q0window.hotkeys! {on}"),
+                WindowCommand::OnTop(on) => format!("q0window.top! {on}"),
+                WindowCommand::Move { x, y } => format!("q0window.move! {x}, {y}"),
+                WindowCommand::Size { width, height } => {
+                    format!("q0window.size! {width}, {height}")
+                }
+                WindowCommand::Center => "q0window.center!".to_string(),
+                WindowCommand::Title(text) => format!("q0window.title! {text:?}"),
+                WindowCommand::Decorations(on) => format!("q0window.decorations! {on}"),
+                WindowCommand::Icon(Some(asset)) => format!("q0window.icon! {asset:?}"),
+                WindowCommand::Icon(None) => "q0window.icon! null".to_string(),
+                WindowCommand::Minimize => "q0window.minimize!".to_string(),
+                WindowCommand::PerformanceLog => "q0window.perf!".to_string(),
+                WindowCommand::Quit => "q0window.quit!".to_string(),
             }
         }
     }

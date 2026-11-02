@@ -957,7 +957,7 @@ fn export_q0v(
             },
             audio_channels: if job.options.q0v_streams.audio { 2 } else { 0 },
         };
-        let mut writer = q0video::q0v::Q0vWriter::new(file, spec)?;
+        let mut writer = q0video::q0v::Q0vWriter::new_compressed(file, spec)?;
         if spec.video {
             // Held drawings render the same frame again; those skip encoding.
             let mut previous: Option<Vec<u8>> = None;
@@ -990,7 +990,7 @@ fn export_q0v(
             progress(
                 if spec.video { total } else { 0 },
                 total,
-                "writing q0v pcm audio",
+                "compressing q0v audio",
             );
             let source_start = u64::from(*range.start()) * 48_000 / u64::from(spec.fps);
             let samples = spec.expected_audio_samples_per_channel();
@@ -1156,7 +1156,23 @@ fn export_mp4(
             fps: u32::from(job.snapshot().meta.fps.max(1)),
             bitrate: job.options.mp4_bitrate,
         };
+        #[cfg(windows)]
+        let has_audio =
+            crate::audio::has_audible_timeline_audio(job.snapshot(), job.options.source_q0rg_id);
+        #[cfg(windows)]
+        let mut encoder = Mp4Encoder::create_with_audio(
+            &staging,
+            spec,
+            has_audio.then(q0video::mp4::Mp4AudioSpec::default),
+        )?;
+        #[cfg(target_os = "android")]
         let mut encoder = Mp4Encoder::create(&staging, spec)?;
+        #[cfg(windows)]
+        let source_start = u64::from(*range.start())
+            * u64::from(crate::audio::EDITOR_AUDIO_SAMPLE_RATE)
+            / u64::from(spec.fps);
+        #[cfg(windows)]
+        let mut audio_written = 0_u64;
         progress(0, total, "rendering and encoding h.264 frames");
         let outcome = ordered_render_frames(
             range,
@@ -1175,6 +1191,31 @@ fn export_mp4(
             },
             |offset, nv12| {
                 encoder.write_nv12_frame(&nv12)?;
+                #[cfg(windows)]
+                if has_audio {
+                    let audio_end = (u64::from(offset + 1)
+                        * u64::from(crate::audio::EDITOR_AUDIO_SAMPLE_RATE))
+                    .div_ceil(u64::from(spec.fps));
+                    let frames = (audio_end - audio_written) as usize;
+                    let mixed = crate::audio::mix_timeline_audio_chunk(
+                        job.snapshot(),
+                        job.options.source_q0rg_id,
+                        source_start + audio_written,
+                        frames,
+                    )
+                    .ok_or("cannot mix mp4 timeline audio")?;
+                    let pcm: Vec<i16> = mixed
+                        .iter()
+                        .map(|sample| {
+                            (sample * 32768.0)
+                                .round()
+                                .clamp(i16::MIN as f32, i16::MAX as f32)
+                                as i16
+                        })
+                        .collect();
+                    encoder.write_audio_pcm_i16(&pcm)?;
+                    audio_written = audio_end;
+                }
                 progress(offset + 1, total, "rendering and encoding h.264 frames");
                 Ok(())
             },
@@ -1692,7 +1733,7 @@ mod tests {
             asset_id: 1,
             width: 1,
             height: 1,
-            rgba: vec![255, 0, 0, 255],
+            rgba: vec![255, 0, 0, 255].into(),
         }));
         project.q0rgs[0].layers[0].push_placement(Placement {
             pivot: None,
@@ -1959,7 +2000,7 @@ mod tests {
             asset_id: 2,
             width: 1,
             height: 1,
-            rgba: vec![0, 255, 0, 255],
+            rgba: vec![0, 255, 0, 255].into(),
         }));
         project.assets.swap(0, 1);
         let layer = &mut project.q0rgs[0].layers[0];
@@ -2390,7 +2431,58 @@ mod tests {
             state.queue[0].state
         );
         verify_mp4(&output).expect("verify exported mp4");
+        let bytes = std::fs::read(&output).unwrap();
+        assert!(!bytes.windows(4).any(|data| data == b"mp4a"));
         std::fs::remove_file(output).expect("cleanup mp4");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mp4_job_exports_compressed_timeline_audio_and_omits_muted_audio() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../q0video/tests/fixtures/tone.mp3");
+        let bytes = crate::audio::transcode_audio_to_q0v(&source).unwrap();
+        for muted in [false, true] {
+            let mut project = visual_project(24);
+            project
+                .assets
+                .push(q0s_format::v2::Asset::Q0v(q0s_format::v2::Q0vAsset {
+                    asset_id: 77,
+                    bytes: bytes.clone().into(),
+                }));
+            project.audio_clips.push(q0s_format::v2::AudioClip {
+                q0rg_id: 1,
+                layer_id: 1,
+                asset_id: 77,
+                start_frame: 6,
+                gain: 0.5,
+                muted,
+                ..Default::default()
+            });
+            let output = unique_output(if muted { "muted-audio" } else { "aac-audio" })
+                .with_extension("mp4");
+            let mut state = Q0EncState::default();
+            state.open_for_project(&project, None);
+            state.select_format(ExportFormat::Mp4, None);
+            state.width = 64;
+            state.height = 64;
+            state.supersampling = 1;
+            state.entire_timeline = false;
+            state.first_frame = 6;
+            state.last_frame = 17;
+            state.output_text = output.display().to_string();
+            state.enqueue(&project).unwrap();
+            state.start_queue();
+            wait_for_queue(&mut state);
+            assert!(
+                matches!(state.queue[0].state, JobState::Completed),
+                "{:?}",
+                state.queue[0].state
+            );
+            let bytes = std::fs::read(&output).unwrap();
+            assert_eq!(bytes.windows(4).any(|data| data == b"mp4a"), !muted);
+            std::fs::remove_file(output).unwrap();
+        }
     }
 
     #[test]

@@ -13,14 +13,8 @@ pub struct Palette {
 }
 
 pub const GLORIOUS_MESSAGE: &str = "thanks to our glorious contributers! you guys keep Q0E alive.";
-pub const FIRST_PATRON: &str = "karma";
 pub const CONTRIBUTORS: [&str; 6] = [
-    "karma",
-    "Loonmoon",
-    "Poisonous943",
-    "Lapki",
-    "francrafteador",
-    "5feetman",
+    "Walibite", "ykenomad", "PoBoi", "XENON", "Dodonse", "AerAgain",
 ];
 
 const MARGIN: f32 = 28.0;
@@ -202,17 +196,8 @@ fn paint_card(
     let hover = ui
         .ctx()
         .animate_bool_with_time(Id::new(("q0credits_hover", name)), hovered, 0.18);
-    let featured = name == FIRST_PATRON;
-    let fill = if featured {
-        mix(palette.panel, palette.accent, 0.15 + hover * 0.04)
-    } else {
-        mix(palette.panel, palette.window, 0.50 + hover * 0.12)
-    };
-    let border = if featured {
-        mix(palette.text_dim, palette.accent, 0.58 + hover * 0.20)
-    } else {
-        mix(palette.text_dim, palette.panel, 0.63 - hover * 0.17)
-    };
+    let fill = mix(palette.panel, palette.window, 0.50 + hover * 0.12);
+    let border = mix(palette.text_dim, palette.panel, 0.63 - hover * 0.17);
     painter.rect_filled(
         rect,
         Rounding::same(10.0),
@@ -229,14 +214,7 @@ fn paint_card(
             vec2(3.0, rect.height() - 30.0),
         ),
         1.0,
-        alpha(
-            if featured {
-                palette.accent
-            } else {
-                palette.text_dim
-            },
-            ((180.0 + hover * 40.0) * progress) as u8,
-        ),
+        alpha(palette.text_dim, ((180.0 + hover * 40.0) * progress) as u8),
     );
 
     let left = rect.left() + 20.0;
@@ -254,31 +232,16 @@ fn paint_card(
         name,
         FontId::proportional(name_size),
         alpha(
-            mix(
-                palette.text,
-                palette.accent,
-                if featured { 0.24 } else { hover * 0.11 },
-            ),
+            mix(palette.text, palette.accent, hover * 0.11),
             (255.0 * progress) as u8,
         ),
     );
     painter.text(
         pos2(left, rect.bottom() - 23.0),
         Align2::LEFT_TOP,
-        if featured {
-            "FIRST PATRON"
-        } else {
-            "CONTRIBUTOR"
-        },
+        "CONTRIBUTOR",
         FontId::proportional(10.0),
-        alpha(
-            if featured {
-                palette.accent
-            } else {
-                palette.text_dim
-            },
-            (215.0 * progress) as u8,
-        ),
+        alpha(palette.text_dim, (215.0 * progress) as u8),
     );
 
     let jewel = pos2(rect.right() - 27.0, rect.center().y);
@@ -287,14 +250,7 @@ fn paint_card(
         13.0,
         Stroke::new(
             1.0_f32,
-            alpha(
-                if featured {
-                    palette.accent
-                } else {
-                    palette.text_dim
-                },
-                ((112.0 + hover * 65.0) * progress) as u8,
-            ),
+            alpha(palette.text_dim, ((112.0 + hover * 65.0) * progress) as u8),
         ),
     );
     let diamond = [
@@ -368,26 +324,11 @@ mod tests {
     fn contributors_match_the_public_credits() {
         assert_eq!(
             CONTRIBUTORS,
-            [
-                "karma",
-                "Loonmoon",
-                "Poisonous943",
-                "Lapki",
-                "francrafteador",
-                "5feetman"
-            ]
+            ["Walibite", "ykenomad", "PoBoi", "XENON", "Dodonse", "AerAgain"]
         );
         assert_eq!(
             CONTRIBUTORS.iter().copied().collect::<HashSet<_>>().len(),
             CONTRIBUTORS.len()
-        );
-        assert_eq!(FIRST_PATRON, "karma");
-        assert_eq!(
-            CONTRIBUTORS
-                .iter()
-                .filter(|name| **name == FIRST_PATRON)
-                .count(),
-            1
         );
         assert_eq!(
             GLORIOUS_MESSAGE,

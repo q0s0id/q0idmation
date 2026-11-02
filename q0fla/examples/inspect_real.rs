@@ -111,8 +111,21 @@ fn main() {
                 || name.to_ascii_lowercase().contains("bitmap 17")
                 || name.to_ascii_lowercase().contains("bitmap 18")
             {
-                let nonzero = b.rgba.chunks_exact(4).filter(|p| p[3] != 0).count();
-                let maxa = b.rgba.chunks_exact(4).map(|p| p[3]).max().unwrap_or(0);
+                let nonzero = b
+                    .rgba
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .filter(|p| p[3] != 0)
+                    .count();
+                let maxa = b
+                    .rgba
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|p| p[3])
+                    .max()
+                    .unwrap_or(0);
                 println!(
                     "bitmap id={} name={:?} {}x{} nonzero={}/{} maxa={}",
                     b.asset_id,

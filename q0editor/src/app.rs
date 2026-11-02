@@ -360,6 +360,7 @@ pub struct EditorApp {
     pub state: ProjectState,
     pub session: Session,
     pub history: History,
+    pub online: crate::online::Online,
     pub textures: TextureCache,
     pub(crate) animation_preview_textures: TextureCache,
     pub(crate) fast_preview: crate::fast_preview::FastPreview,
@@ -378,6 +379,8 @@ pub struct EditorApp {
     pub q0enc: crate::q0enc::Q0EncState,
     /// FLA/XFL import/conversion workshop. Global because it can create a project from Home.
     pub q0fla_open: bool,
+    /// The model editor, when open: it takes the whole window.
+    pub model_studio: Option<Box<crate::model_studio::ModelStudio>>,
     /// Rolling low-overhead performance history copied with Ctrl+Shift+`.
     pub perf: crate::perf::PerfLog,
     pub(crate) release_feed: crate::release_feed::ReleaseFeedState,
@@ -412,6 +415,7 @@ pub struct EditorApp {
     pub(crate) text_field_focused: bool,
     show_project_tree: bool,
     pub(crate) sweeper: crate::sweeper::Sweeper,
+    pub(crate) plugins: crate::plugins::Plugins,
     pub(crate) library_source: Option<LibrarySource>,
     pub(crate) library_selection: Option<LibrarySelection>,
     pub(crate) library_multi_selection: Vec<LibrarySelection>,
@@ -616,6 +620,8 @@ enum DocumentKind {
         workspace: Option<Box<ProjectWorkspace>>,
     },
     Q0lang(Q0langDocument),
+    /// The Plugin Studio; what it edits lives in `EditorApp::plugins`.
+    PluginStudio,
 }
 
 struct DocumentTab {
@@ -627,6 +633,7 @@ struct DocumentTab {
 pub enum DocumentKindSummary {
     Project,
     Q0lang,
+    PluginStudio,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -778,6 +785,8 @@ pub enum Action {
     TogglePlay,
     ToggleTimeline,
     ToggleOutlineMode,
+    /// Snapping on or off.
+    ToggleSnap,
     FirstFrame,
     PreviousFrame,
     NextFrame,
@@ -823,6 +832,8 @@ pub enum Action {
     ConvertSelectionToQ0rg,
     BreakApartSelection,
     ConvertStrokeToFill,
+    /// Move the current layer's outlines to a new layer above it.
+    StrokesToOwnLayer,
     PlaceQ0rgInstance(u16),
     PlaceLibraryItemAt(LibraryItem, q0s_format::v2::Vec2),
     PlaceLibraryItemOnTimeline(LibraryItem, u16, u16),
@@ -838,11 +849,28 @@ pub enum Action {
     ExitQ0rg,
     ToggleCredits,
     ToggleSweeper,
+    TogglePlugins,
+    InstallPlugin,
+    InstallPluginFromPath(PathBuf),
+    PluginStudioPickPicture,
+    PluginStudioPicture(PathBuf),
     ToggleSettings,
     ToggleProjectTree,
     TogglePhysics,
     ToggleParticles,
     ToggleLight,
+    /// Show or hide the 3D window (camera and 3D lights).
+    ToggleScene3d,
+    /// Pick a 3D model file to add to the library and the stage.
+    ImportModel,
+    ImportModelFromPath(PathBuf),
+    /// A new model, started from a cube, opened in the model editor.
+    NewModel,
+    /// Open library model `asset_id` in the model editor.
+    EditModel(u16),
+    /// Pick a picture for the model editor's current material.
+    StudioPickTexture,
+    StudioTextureFromPath(PathBuf),
     ZoomIn,
     ZoomOut,
     ZoomReset,
@@ -852,6 +880,12 @@ pub enum Action {
     PasteInPlace,
     DuplicateSelection,
     DuplicateSymbol(u16, u16, usize),
+    /// Copy an instance's symbol as a variant of it, put the copy in its
+    /// place and start editing it there.
+    MakeVariant(u16, u16, usize),
+    /// Show the next (+1) or previous (-1) variant of its symbol in an
+    /// instance.
+    SwapVariant(u16, u16, usize, i8),
     AltDragDuplicateSelection(q0s_format::v2::Vec2),
     BringToFront,
     SendToBack,
@@ -880,6 +914,157 @@ pub enum Action {
     RelinkProjectDependency(u16, PathBuf),
     EmbedProjectDependency(u16),
     OpenProjectDependency(u16),
+}
+
+/// Editor commands a plugin can run by name with `editor.action!`.
+pub(crate) const PLUGIN_ACTIONS: &[&str] = &[
+    "new-project",
+    "show-home",
+    "resume-project",
+    "open-file-dialog",
+    "import-bitmap-dialog",
+    "import-media-dialog",
+    "save-project",
+    "save-project-as-dialog",
+    "open-q0enc",
+    "toggle-q0enc",
+    "open-q0fla",
+    "toggle-q0fla",
+    "import-fla-dialog",
+    "convert-fla-dialog",
+    "exit",
+    "undo",
+    "redo",
+    "toggle-play",
+    "toggle-timeline",
+    "toggle-outline-mode",
+    "toggle-snap",
+    "strokes-to-own-layer",
+    "first-frame",
+    "previous-frame",
+    "next-frame",
+    "last-frame",
+    "insert-frame",
+    "insert-keyframe",
+    "insert-blank-keyframe",
+    "add-layer",
+    "add-layer-folder",
+    "add-layer-mask",
+    "add-q0rg",
+    "add-scene",
+    "delete-selection",
+    "remove-selected-timeline-frames",
+    "convert-selection-to-q0rg",
+    "break-apart-selection",
+    "convert-stroke-to-fill",
+    "exit-q0rg",
+    "toggle-credits",
+    "toggle-sweeper",
+    "toggle-settings",
+    "toggle-project-tree",
+    "toggle-physics",
+    "toggle-particles",
+    "toggle-light",
+    "zoom-in",
+    "zoom-out",
+    "zoom-reset",
+    "copy-selection",
+    "cut-selection",
+    "paste",
+    "paste-in-place",
+    "duplicate-selection",
+    "bring-to-front",
+    "send-to-back",
+    "bring-forward",
+    "send-backward",
+    "spread-between-layers",
+    "spread-between-keyframes",
+    "flip-horizontal",
+    "flip-vertical",
+    "remove-frame",
+    "clear-keyframe",
+    "create-motion-tween",
+    "create-shape-tween",
+    "close-q0lang-editor",
+    "toggle-plugins",
+];
+
+impl Action {
+    /// The command `editor.action!` names, if it takes no values.
+    pub(crate) fn from_plugin_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "new-project" => Self::NewProject,
+            "show-home" => Self::ShowHome,
+            "resume-project" => Self::ResumeProject,
+            "open-file-dialog" => Self::OpenProject,
+            "import-bitmap-dialog" => Self::ImportBitmap,
+            "import-media-dialog" => Self::ImportMedia,
+            "save-project" => Self::SaveProject,
+            "save-project-as-dialog" => Self::SaveProjectAs,
+            "open-q0enc" => Self::OpenQ0Enc,
+            "toggle-q0enc" => Self::ToggleQ0Enc,
+            "open-q0fla" => Self::OpenQ0Fla,
+            "toggle-q0fla" => Self::ToggleQ0Fla,
+            "import-fla-dialog" => Self::ImportFlaProject,
+            "convert-fla-dialog" => Self::ConvertFlaToQ1s,
+            "exit" => Self::Exit,
+            "undo" => Self::Undo,
+            "redo" => Self::Redo,
+            "toggle-play" => Self::TogglePlay,
+            "toggle-timeline" => Self::ToggleTimeline,
+            "toggle-outline-mode" => Self::ToggleOutlineMode,
+            "toggle-snap" => Self::ToggleSnap,
+            "first-frame" => Self::FirstFrame,
+            "previous-frame" => Self::PreviousFrame,
+            "next-frame" => Self::NextFrame,
+            "last-frame" => Self::LastFrame,
+            "insert-frame" => Self::InsertFrame,
+            "insert-keyframe" => Self::InsertKeyframe,
+            "insert-blank-keyframe" => Self::InsertBlankKeyframe,
+            "add-layer" => Self::AddLayer,
+            "add-layer-folder" => Self::AddLayerFolder,
+            "add-layer-mask" => Self::AddLayerMask,
+            "add-q0rg" => Self::AddQ0rg,
+            "add-scene" => Self::AddScene,
+            "delete-selection" => Self::DeleteSelection,
+            "remove-selected-timeline-frames" => Self::RemoveSelectedTimelineFrames,
+            "convert-selection-to-q0rg" => Self::ConvertSelectionToQ0rg,
+            "break-apart-selection" => Self::BreakApartSelection,
+            "convert-stroke-to-fill" => Self::ConvertStrokeToFill,
+            "strokes-to-own-layer" => Self::StrokesToOwnLayer,
+            "exit-q0rg" => Self::ExitQ0rg,
+            "toggle-credits" => Self::ToggleCredits,
+            "toggle-sweeper" => Self::ToggleSweeper,
+            "toggle-settings" => Self::ToggleSettings,
+            "toggle-project-tree" => Self::ToggleProjectTree,
+            "toggle-physics" => Self::TogglePhysics,
+            "toggle-particles" => Self::ToggleParticles,
+            "toggle-light" => Self::ToggleLight,
+            "zoom-in" => Self::ZoomIn,
+            "zoom-out" => Self::ZoomOut,
+            "zoom-reset" => Self::ZoomReset,
+            "copy-selection" => Self::CopySelection,
+            "cut-selection" => Self::CutSelection,
+            "paste" => Self::Paste,
+            "paste-in-place" => Self::PasteInPlace,
+            "duplicate-selection" => Self::DuplicateSelection,
+            "bring-to-front" => Self::BringToFront,
+            "send-to-back" => Self::SendToBack,
+            "bring-forward" => Self::BringForward,
+            "send-backward" => Self::SendBackward,
+            "spread-between-layers" => Self::SpreadBetweenLayers,
+            "spread-between-keyframes" => Self::SpreadBetweenKeyframes,
+            "flip-horizontal" => Self::FlipHorizontal,
+            "flip-vertical" => Self::FlipVertical,
+            "remove-frame" => Self::RemoveFrame,
+            "clear-keyframe" => Self::ClearKeyframe,
+            "create-motion-tween" => Self::CreateMotionTween,
+            "create-shape-tween" => Self::CreateShapeTween,
+            "close-q0lang-editor" => Self::CloseQ0langEditor,
+            "toggle-plugins" => Self::TogglePlugins,
+            _ => return None,
+        })
+    }
 }
 
 impl Action {
@@ -917,6 +1102,8 @@ impl Action {
             Self::TogglePlay => "toggle-play",
             Self::ToggleTimeline => "toggle-timeline",
             Self::ToggleOutlineMode => "toggle-outline-mode",
+            Self::ToggleSnap => "toggle-snap",
+            Self::StrokesToOwnLayer => "strokes-to-own-layer",
             Self::FirstFrame => "first-frame",
             Self::PreviousFrame => "previous-frame",
             Self::NextFrame => "next-frame",
@@ -973,11 +1160,23 @@ impl Action {
             Self::ExitQ0rg => "exit-q0rg",
             Self::ToggleCredits => "toggle-credits",
             Self::ToggleSweeper => "toggle-sweeper",
+            Self::TogglePlugins => "toggle-plugins",
+            Self::InstallPlugin => "install-plugin",
+            Self::InstallPluginFromPath(_) => "install-plugin-from-path",
+            Self::PluginStudioPickPicture => "plugin-studio-pick-picture",
+            Self::PluginStudioPicture(_) => "plugin-studio-picture",
             Self::ToggleSettings => "toggle-settings",
             Self::ToggleProjectTree => "toggle-project-tree",
             Self::TogglePhysics => "toggle-physics",
             Self::ToggleParticles => "toggle-particles",
             Self::ToggleLight => "toggle-light",
+            Self::ToggleScene3d => "toggle-scene-3d",
+            Self::ImportModel => "import-model",
+            Self::ImportModelFromPath(_) => "import-model-from-path",
+            Self::NewModel => "new-model",
+            Self::EditModel(_) => "edit-model",
+            Self::StudioPickTexture => "studio-pick-texture",
+            Self::StudioTextureFromPath(_) => "studio-texture-from-path",
             Self::ZoomIn => "zoom-in",
             Self::ZoomOut => "zoom-out",
             Self::ZoomReset => "zoom-reset",
@@ -987,6 +1186,8 @@ impl Action {
             Self::PasteInPlace => "paste-in-place",
             Self::DuplicateSelection => "duplicate-selection",
             Self::DuplicateSymbol(..) => "duplicate-symbol",
+            Self::MakeVariant(..) => "make-variant",
+            Self::SwapVariant(..) => "swap-variant",
             Self::AltDragDuplicateSelection(_) => "alt-drag-duplicate-selection",
             Self::BringToFront => "bring-to-front",
             Self::SendToBack => "send-to-back",
@@ -1207,6 +1408,7 @@ impl Default for EditorApp {
             },
             session,
             history: History::new(),
+            online: crate::online::Online::default(),
             textures: TextureCache::default(),
             animation_preview_textures: TextureCache::default(),
             fast_preview: crate::fast_preview::FastPreview::default(),
@@ -1217,6 +1419,7 @@ impl Default for EditorApp {
             settings,
             q0enc,
             q0fla_open: false,
+            model_studio: None,
             perf: crate::perf::PerfLog::default(),
             release_feed: crate::release_feed::ReleaseFeedState::default(),
             theme_applied: false,
@@ -1242,6 +1445,7 @@ impl Default for EditorApp {
             text_field_focused: false,
             show_project_tree: false,
             sweeper: crate::sweeper::Sweeper::default(),
+            plugins: crate::plugins::Plugins::default(),
             library_source: None,
             library_selection: None,
             library_multi_selection: Vec::new(),
@@ -1267,6 +1471,50 @@ impl Default for EditorApp {
 }
 
 impl EditorApp {
+    /// Open a room in a separate document, preserving every local unsaved tab.
+    pub(crate) fn open_online_project(&mut self, project: ProjectV2) -> Option<u64> {
+        let workspace = self.workspace_for_project(project, None);
+        if !self.activate_new_workspace(workspace) {
+            return None;
+        }
+        self.state.mark_dirty();
+        self.active_project_tab_id()
+    }
+
+    /// Open an explicitly requested unshared copy as an ordinary dirty tab.
+    /// Background rejections are kept by the online recovery controller.
+    pub(crate) fn preserve_online_draft(
+        &mut self,
+        previous: Option<u64>,
+        project: ProjectV2,
+    ) -> u64 {
+        let mut workspace = self.workspace_for_project(project, None);
+        workspace.state.mark_dirty();
+        if let Some(id) = previous {
+            if let Some(tab) = self.document_tabs.iter_mut().find(|tab| tab.id == id) {
+                if self.active_document_tab != Some(id) {
+                    tab.kind = DocumentKind::Project {
+                        workspace: Some(Box::new(workspace)),
+                    };
+                    return id;
+                }
+            }
+        }
+        let id = self.next_document_tab_id;
+        self.next_document_tab_id = self.next_document_tab_id.saturating_add(1);
+        self.document_tabs.push(DocumentTab {
+            id,
+            kind: DocumentKind::Project {
+                workspace: Some(Box::new(workspace)),
+            },
+        });
+        id
+    }
+
+    pub(crate) fn open_preserved_online_draft(&mut self, id: u64) -> bool {
+        self.switch_to_document_tab(id)
+    }
+
     pub(crate) fn has_clipboard(&self) -> bool {
         self.editor_clipboard
             .as_ref()
@@ -1475,6 +1723,66 @@ impl EditorApp {
             .any(|tab| tab.id == active_id && matches!(tab.kind, DocumentKind::Q0lang(_)))
     }
 
+    pub(crate) fn active_document_is_plugin_studio(&self) -> bool {
+        let Some(active_id) = self.active_document_tab else {
+            return false;
+        };
+        !self.show_home
+            && self
+                .document_tabs
+                .iter()
+                .any(|tab| tab.id == active_id && matches!(tab.kind, DocumentKind::PluginStudio))
+    }
+
+    /// A mask layer previews its masking while it is locked, as in Animate:
+    /// locking it cuts what it masks, unlocking shows its shape to draw on.
+    /// True when `layer_id` is a mask.
+    fn follow_mask_lock(&mut self, q0rg_id: u16, layer_id: u16, locked: bool) -> bool {
+        if self.state.project.layer_metadata(q0rg_id, layer_id).kind != LayerKind::Mask {
+            return false;
+        }
+        let key = (self.active_project_tab_id().unwrap_or(0), q0rg_id, layer_id);
+        if locked {
+            self.session.hidden_mask_art_layers.insert(key);
+        } else {
+            self.session.hidden_mask_art_layers.remove(&key);
+        }
+        true
+    }
+
+    /// Shows the Plugin Studio's tab, opening it the first time.
+    pub(crate) fn open_plugin_studio_tab(&mut self) {
+        if let Some(tab_id) = self
+            .document_tabs
+            .iter()
+            .find(|tab| matches!(tab.kind, DocumentKind::PluginStudio))
+            .map(|tab| tab.id)
+        {
+            self.switch_to_document_tab(tab_id);
+            return;
+        }
+        if self.active_workspace_busy() {
+            self.session.status =
+                "finish or cancel the active import/export before opening the plugin studio"
+                    .to_string();
+            return;
+        }
+        self.stop_audio_playback();
+        self.deactivate_active_document();
+        let tab_id = self.next_document_tab_id;
+        self.next_document_tab_id = self.next_document_tab_id.saturating_add(1);
+        self.document_tabs.push(DocumentTab {
+            id: tab_id,
+            kind: DocumentKind::PluginStudio,
+        });
+        self.active_document_tab = Some(tab_id);
+        self.last_document_tab = Some(tab_id);
+        self.project_active = false;
+        self.show_home = false;
+        self.session.playing = false;
+        self.session.status = "plugin studio".to_string();
+    }
+
     pub fn has_open_projects(&self) -> bool {
         self.document_tabs
             .iter()
@@ -1530,6 +1838,14 @@ impl EditorApp {
                         active,
                         kind: DocumentKindSummary::Q0lang,
                     }),
+                    DocumentKind::PluginStudio => Some(DocumentTabSummary {
+                        id: tab.id,
+                        title: self.plugins.studio.tab_title(),
+                        path: None,
+                        dirty: self.plugins.studio.dirty(),
+                        active,
+                        kind: DocumentKindSummary::PluginStudio,
+                    }),
                 }
             })
             .collect()
@@ -1581,7 +1897,7 @@ impl EditorApp {
             DocumentKind::Project { workspace } => {
                 workspace.as_ref().map(|workspace| &workspace.state.project)
             }
-            DocumentKind::Q0lang(_) => None,
+            DocumentKind::Q0lang(_) | DocumentKind::PluginStudio => None,
         }
     }
 
@@ -1594,7 +1910,7 @@ impl EditorApp {
             DocumentKind::Project { workspace } => workspace
                 .as_ref()
                 .map(|workspace| workspace.state.library_revision()),
-            DocumentKind::Q0lang(_) => None,
+            DocumentKind::Q0lang(_) | DocumentKind::PluginStudio => None,
         }
     }
 
@@ -1607,7 +1923,7 @@ impl EditorApp {
             DocumentKind::Project { workspace } => workspace
                 .as_ref()
                 .map(|workspace| workspace.state.revision()),
-            DocumentKind::Q0lang(_) => None,
+            DocumentKind::Q0lang(_) | DocumentKind::PluginStudio => None,
         }
     }
 
@@ -1624,7 +1940,7 @@ impl EditorApp {
             .find(|tab| tab.id == tab_id)
             .and_then(|tab| match &tab.kind {
                 DocumentKind::Project { workspace } => workspace.as_ref(),
-                DocumentKind::Q0lang(_) => None,
+                DocumentKind::Q0lang(_) | DocumentKind::PluginStudio => None,
             })
             .map(|workspace| {
                 if workspace.session.current_q0rg_id == q0rg_id {
@@ -1670,7 +1986,7 @@ impl EditorApp {
                     workspace.state.render_revision(),
                 ))
             }
-            DocumentKind::Q0lang(_) => None,
+            DocumentKind::Q0lang(_) | DocumentKind::PluginStudio => None,
         }
     }
 
@@ -1682,7 +1998,7 @@ impl EditorApp {
             .find(|tab| tab.id == active_id)?;
         match &mut tab.kind {
             DocumentKind::Q0lang(document) => Some(document),
-            DocumentKind::Project { .. } => None,
+            _ => None,
         }
     }
 
@@ -1691,7 +2007,7 @@ impl EditorApp {
         let tab = self.document_tabs.iter().find(|tab| tab.id == active_id)?;
         match &tab.kind {
             DocumentKind::Q0lang(document) => Some(document),
-            DocumentKind::Project { .. } => None,
+            _ => None,
         }
     }
 
@@ -1886,7 +2202,7 @@ impl EditorApp {
         if is_project {
             let workspace = match &mut self.document_tabs[target_index].kind {
                 DocumentKind::Project { workspace } => workspace.take(),
-                DocumentKind::Q0lang(_) => None,
+                DocumentKind::Q0lang(_) | DocumentKind::PluginStudio => None,
             };
             let Some(workspace) = workspace else {
                 return false;
@@ -1896,7 +2212,10 @@ impl EditorApp {
         } else {
             self.project_active = false;
             self.session.playing = false;
-            self.session.status = "q0lang source".to_string();
+            self.session.status = match self.document_tabs[target_index].kind {
+                DocumentKind::PluginStudio => "plugin studio".to_string(),
+                _ => "q0lang source".to_string(),
+            };
         }
         self.active_document_tab = Some(tab_id);
         self.last_document_tab = Some(tab_id);
@@ -1962,6 +2281,7 @@ impl EditorApp {
                 }
             }
             DocumentKind::Q0lang(document) => document.dirty,
+            DocumentKind::PluginStudio => self.plugins.studio.dirty(),
         }
     }
 
@@ -2047,6 +2367,7 @@ impl EditorApp {
                     stamp: hasher.finish(),
                 })
             }
+            DocumentKind::PluginStudio => None,
         }
     }
 
@@ -2075,6 +2396,7 @@ impl EditorApp {
                 Payload::Project(Box::new(state.project.clone()))
             }
             DocumentKind::Q0lang(document) => Payload::Q0lang(document.text.clone()),
+            DocumentKind::PluginStudio => return None,
         };
         Some((info, payload))
     }
@@ -2169,6 +2491,7 @@ impl EditorApp {
                 }
             }
             DocumentKind::Q0lang(document) => Some(document.path.clone()),
+            DocumentKind::PluginStudio => None,
         }
     }
 
@@ -2824,7 +3147,14 @@ impl EditorApp {
         self.drain_actions(&ctx);
     }
 
-    fn handle(&mut self, ctx: &Context, action: Action) {
+    pub(crate) fn handle(&mut self, ctx: &Context, action: Action) {
+        if self.online.editing_tab(self.active_project_tab_id())
+            && matches!(&action, Action::Undo | Action::Redo)
+        {
+            self.online.request_history(matches!(&action, Action::Redo));
+            ctx.request_repaint();
+            return;
+        }
         let timeline_edit = matches!(
             &action,
             Action::InsertFrame
@@ -2892,6 +3222,8 @@ impl EditorApp {
                     | Action::CutSelection
                     | Action::DuplicateSelection
                     | Action::DuplicateSymbol(..)
+                    | Action::MakeVariant(..)
+                    | Action::SwapVariant(..)
                     | Action::AltDragDuplicateSelection(_)
                     | Action::ConvertSelectionToQ0rg
                     | Action::BreakApartSelection
@@ -2981,7 +3313,11 @@ impl EditorApp {
                 }
             }
             Action::OpenProjectFromPath(path) => {
-                self.open_from_path(ctx, &path);
+                if q0ex::is_plugin_path(&path) {
+                    crate::plugins::offer_install(self, &path);
+                } else {
+                    self.open_from_path(ctx, &path);
+                }
             }
             Action::ImportBitmap => {
                 if let Some(action) = crate::platform::pick_file_then(
@@ -3009,7 +3345,9 @@ impl EditorApp {
                 if !crate::text_tool::finish_edit(self) {
                     return;
                 }
-                if self.active_document_is_q0lang() {
+                if self.active_document_is_plugin_studio() {
+                    crate::plugins::studio::save_from_tab(self);
+                } else if self.active_document_is_q0lang() {
                     self.save_current_q0lang();
                 } else if self.project_active {
                     let path = self.state.file_path.clone();
@@ -3194,6 +3532,8 @@ impl EditorApp {
                 crate::fast_preview::start(self, ctx, current_scene_only);
             }
             Action::SelectTool(tool) => {
+                self.plugins.active_tool = None;
+                self.session.tools3d.leave();
                 if !crate::text_tool::finish_edit(self) {
                     return;
                 }
@@ -3264,6 +3604,39 @@ impl EditorApp {
             Action::ToggleTimeline => {
                 self.workspace_layout
                     .toggle(crate::workspace::Panel::Timeline);
+            }
+            Action::StrokesToOwnLayer => {
+                let q0rg_id = self.session.current_q0rg_id;
+                let layer_id = self.session.current_layer_id;
+                if self.state.project.layer_is_locked(q0rg_id, layer_id) {
+                    self.session.status = "layer is locked".to_string();
+                    return;
+                }
+                let before = self.state.project.clone();
+                match crate::split_layers::strokes_to_own_layer(
+                    &mut self.state.project,
+                    q0rg_id,
+                    layer_id,
+                ) {
+                    Ok(lines) => {
+                        self.history.snapshot_with_session(&before, &self.session);
+                        self.session.selection = Selection::None;
+                        self.session.current_layer_id = lines;
+                        self.textures.invalidate();
+                        self.state.mark_dirty();
+                        self.session.status = "Lines moved to their own layer".to_string();
+                    }
+                    Err(error) => self.session.status = error,
+                }
+            }
+            Action::ToggleSnap => {
+                self.settings.aids.snap = !self.settings.aids.snap;
+                self.settings.save();
+                self.session.status = if self.settings.aids.snap {
+                    "snapping on".to_string()
+                } else {
+                    "snapping off".to_string()
+                };
             }
             Action::ToggleOutlineMode => {
                 self.session.outline_mode = !self.session.outline_mode;
@@ -3595,7 +3968,8 @@ impl EditorApp {
                 );
                 self.session.current_layer_id = next_id;
                 self.state.mark_dirty();
-                self.session.status = "mask layer added".to_string();
+                self.session.status =
+                    "mask layer added: draw its shape, then lock it to see the masking".to_string();
             }
             Action::RenameLayer(q0rg_id, layer_id, requested_name) => {
                 let name = requested_name.trim().to_string();
@@ -3812,10 +4186,12 @@ impl EditorApp {
                 );
                 self.session.selection = Selection::None;
                 self.state.mark_dirty();
-                self.session.status = if metadata.locked {
-                    "layer unlocked"
-                } else {
-                    "layer locked"
+                let mask = self.follow_mask_lock(q0rg_id, layer_id, !metadata.locked);
+                self.session.status = match (mask, metadata.locked) {
+                    (true, false) => "mask locked: it now cuts what it masks",
+                    (true, true) => "mask unlocked: its shape shows again for drawing",
+                    (false, true) => "layer unlocked",
+                    (false, false) => "layer locked",
                 }
                 .to_string();
             }
@@ -3953,11 +4329,17 @@ impl EditorApp {
                 let lock = any_unlocked;
                 self.history
                     .snapshot_with_session(&self.state.project, &self.session);
-                for layer in &q0rg.layers {
-                    let key = LayerKey::new(q0rg_id, layer.layer_id);
-                    let mut metadata = self.state.project.layer_metadata(q0rg_id, layer.layer_id);
+                let layer_ids = q0rg
+                    .layers
+                    .iter()
+                    .map(|layer| layer.layer_id)
+                    .collect::<Vec<_>>();
+                for layer_id in layer_ids {
+                    let key = LayerKey::new(q0rg_id, layer_id);
+                    let mut metadata = self.state.project.layer_metadata(q0rg_id, layer_id);
                     metadata.locked = lock;
                     self.state.project.layer_metadata.insert(key, metadata);
+                    self.follow_mask_lock(q0rg_id, layer_id, lock);
                 }
                 self.session.selection = Selection::None;
                 self.state.mark_dirty();
@@ -4653,6 +5035,32 @@ impl EditorApp {
                     self.session.credits_opened_at = Instant::now();
                 }
             }
+            Action::TogglePlugins => {
+                self.plugins.manager_open = !self.plugins.manager_open;
+            }
+            Action::InstallPlugin => {
+                let dialog = crate::platform::FileDialog::new()
+                    .add_filter("q0ex plugin (.qx, .q0ex)", &q0ex::EXTENSIONS);
+                if let Some(action) =
+                    crate::platform::pick_file_then(dialog, Action::InstallPluginFromPath)
+                {
+                    self.handle(ctx, action);
+                }
+            }
+            Action::InstallPluginFromPath(path) => {
+                crate::plugins::offer_install(self, &path);
+            }
+            Action::PluginStudioPickPicture => {
+                if let Some(action) = crate::platform::pick_file_then(
+                    file_io::bitmap_import_dialog(),
+                    Action::PluginStudioPicture,
+                ) {
+                    self.handle(ctx, action);
+                }
+            }
+            Action::PluginStudioPicture(path) => {
+                crate::plugins::studio::add_picture(self, path);
+            }
             Action::ToggleSweeper => {
                 if self.sweeper.open {
                     self.sweeper.open = false;
@@ -4677,6 +5085,54 @@ impl EditorApp {
                     physics.open = false;
                     self.session.status =
                         "turn on the physics editor in Settings first".to_string();
+                }
+            }
+            Action::ToggleScene3d => {
+                self.session.scene3d.open = !self.session.scene3d.open;
+            }
+            Action::ImportModel => {
+                if let Some(action) = crate::platform::pick_file_then(
+                    file_io::model_import_dialog(),
+                    Action::ImportModelFromPath,
+                ) {
+                    self.handle(ctx, action);
+                }
+            }
+            Action::ImportModelFromPath(path) => {
+                self.import_model_from_path(&path);
+            }
+            Action::NewModel => {
+                let height = f32::from(self.state.project.meta.stage_height.max(1));
+                let model = q0model::new_model(q0model::prim::Primitive::Cube, height * 0.35);
+                let count = self
+                    .state
+                    .project
+                    .assets
+                    .iter()
+                    .filter(|asset| matches!(asset, Asset::Model(_)))
+                    .count();
+                if let Some(asset_id) =
+                    crate::scene3d::add_model(self, &format!("Model {}", count + 1), model)
+                {
+                    let centre = crate::scene3d::stage_centre(self);
+                    self.place_library_item_at(LibraryItem::Asset(asset_id), centre);
+                    crate::model_studio::open(self, asset_id);
+                }
+            }
+            Action::EditModel(asset_id) => {
+                crate::model_studio::open(self, asset_id);
+            }
+            Action::StudioPickTexture => {
+                if let Some(action) = crate::platform::pick_file_then(
+                    file_io::bitmap_import_dialog(),
+                    Action::StudioTextureFromPath,
+                ) {
+                    self.handle(ctx, action);
+                }
+            }
+            Action::StudioTextureFromPath(path) => {
+                if let Some(studio) = self.model_studio.as_mut() {
+                    studio.load_texture(&path);
                 }
             }
             Action::ToggleLight => {
@@ -5220,6 +5676,12 @@ impl EditorApp {
             }
             Action::DuplicateSymbol(q0rg_id, layer_id, placement_idx) => {
                 self.duplicate_symbol_instance(q0rg_id, layer_id, placement_idx);
+            }
+            Action::MakeVariant(q0rg_id, layer_id, placement_idx) => {
+                self.make_variant(q0rg_id, layer_id, placement_idx);
+            }
+            Action::SwapVariant(q0rg_id, layer_id, placement_idx, step) => {
+                self.swap_variant(q0rg_id, layer_id, placement_idx, step);
             }
             Action::AltDragDuplicateSelection(start_cursor) => {
                 if self.current_layer_is_folder() {
@@ -7755,6 +8217,42 @@ impl EditorApp {
             self.paste_bitmap_from_clipboard(bitmap);
         }
     }
+    fn import_model_from_path(&mut self, path: &std::path::Path) {
+        let height = f32::from(self.state.project.meta.stage_height.max(1));
+        match q0model::import_path(path, height * 0.5) {
+            Ok(imported) => {
+                let warnings = imported.warnings.len();
+                let clips = imported.model.clips.len();
+                let Some(asset_id) =
+                    crate::scene3d::add_model(self, &imported.name, imported.model)
+                else {
+                    self.session.status =
+                        "model import failed: asset id space exhausted".to_string();
+                    return;
+                };
+                let centre = crate::scene3d::stage_centre(self);
+                self.place_library_item_at(LibraryItem::Asset(asset_id), centre);
+                self.session.status = format!(
+                    "imported {} as a 3D model{}{}",
+                    imported.name,
+                    if clips > 0 {
+                        format!(" with {clips} clip(s)")
+                    } else {
+                        String::new()
+                    },
+                    if warnings > 0 {
+                        format!(" ({})", imported.warnings.join("; "))
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+            Err(error) => {
+                self.session.status = format!("model import failed: {error}");
+            }
+        }
+    }
+
     fn import_bitmap_from_path(&mut self, path: &std::path::Path) {
         let Some(asset_id) = self
             .state
@@ -8300,7 +8798,7 @@ impl EditorApp {
                                 };
                                 next_asset_id = incremented;
                             }
-                            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => {
+                            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) | Asset::Model(_) => {
                                 let Some(transform) = affine_to_transform(composed) else {
                                     self.session.status =
                                         "Break Apart cannot represent a singular bitmap transform"
@@ -9649,7 +10147,7 @@ impl EditorApp {
                     })
                     .and_then(|asset| match asset {
                         Asset::Vector(vector) => vector.paths.get(path.path_idx),
-                        Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => None,
+                        Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) | Asset::Model(_) => None,
                     })
                     .cloned();
                 let Some(source_path) = source_path else {
@@ -9706,7 +10204,7 @@ impl EditorApp {
                     .find(|asset| asset.id() == asset_id)
                     .and_then(|asset| match asset {
                         Asset::Vector(vector) => vector.paths.get_mut(path.path_idx),
-                        Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => None,
+                        Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) | Asset::Model(_) => None,
                     })
                     .is_some_and(|raw_path| {
                         crate::tools::delete_path_anchors_safely(raw_path, &anchor_indices)
@@ -10626,7 +11124,7 @@ impl EditorApp {
         }
     }
 
-    fn go_to_frame(&mut self, requested: u16) {
+    pub(crate) fn go_to_frame(&mut self, requested: u16) {
         let previous_frame = self.session.current_frame;
         self.session.pending_timeline_frame = None;
         let last_frame = self
@@ -12035,6 +12533,8 @@ impl EditorApp {
                 self.state.dirty = false;
                 self.state.file_path = Some(path.to_path_buf());
                 self.settings.push_recent(path);
+                self.plugins
+                    .notify("saved", vec![q0ex::Value::str(path.display().to_string())]);
                 self.session.status = match self.settings.try_save() {
                     Ok(()) => format!("saved {}", path.display()),
                     Err(error) => format!(
@@ -12327,10 +12827,14 @@ impl EditorApp {
             .extension()
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| extension.eq_ignore_ascii_case(file_io::Q1S_EXTENSION));
-        if is_project || q0fla::is_import_path(path) || file_io::is_q0lang_path(path) {
+        if q0ex::is_plugin_path(path) {
+            self.queue(Action::InstallPluginFromPath(path.clone()));
+        } else if is_project || q0fla::is_import_path(path) || file_io::is_q0lang_path(path) {
             self.queue(Action::OpenProjectFromPath(path.clone()));
         } else if self.show_home || !self.project_active {
             self.session.status = "open or create a project before importing media".to_string();
+        } else if q0model::is_model_path(path) {
+            self.queue(Action::ImportModelFromPath(path.clone()));
         } else if crate::bitmap_import::is_supported_bitmap_path(path)
             || file_io::is_supported_video_import_path(path)
             || crate::audio::is_supported_audio_path(path)
@@ -12407,7 +12911,9 @@ impl EditorApp {
     }
 
     fn save_current_document(&mut self) -> bool {
-        if self.active_document_is_q0lang() {
+        if self.active_document_is_plugin_studio() {
+            crate::plugins::studio::save_from_tab(self)
+        } else if self.active_document_is_q0lang() {
             self.save_current_q0lang()
         } else if self.project_active {
             self.save_current_project()
@@ -12688,6 +13194,140 @@ impl EditorApp {
             self.library_selection_anchor = Some(selection);
         }
         self.session.status = format!("independent symbol: {name}");
+    }
+
+    /// Copies the symbol shown by an instance as a new variant of its
+    /// family, shows the copy there instead and opens it in place, ready to
+    /// be broken, dented or wounded.
+    fn make_variant(&mut self, q0rg_id: u16, layer_id: u16, placement_idx: usize) {
+        self.duplicate_symbol_instance(q0rg_id, layer_id, placement_idx);
+        let Selection::Placement {
+            placement_idx: new_idx,
+            ..
+        } = self.session.selection
+        else {
+            return;
+        };
+        let Some(Target::Q0rg(copied_id)) = self
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q| q.q0rg_id == q0rg_id)
+            .and_then(|q| q.layers.iter().find(|layer| layer.layer_id == layer_id))
+            .and_then(|layer| layer.placements.get(new_idx))
+            .map(|placement| placement.target)
+        else {
+            return;
+        };
+        let Some(copied_name) = self
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q| q.q0rg_id == copied_id)
+            .map(|q| q.name.clone())
+        else {
+            return;
+        };
+        // The copy is named after what it was copied from, not "... copy".
+        let source_name = copied_name
+            .strip_suffix(" copy")
+            .or_else(|| copied_name.rsplit_once(" copy #").map(|(name, _)| name))
+            .unwrap_or(&copied_name)
+            .to_string();
+        let name = crate::variants::new_variant_name(&self.state.project, &source_name);
+        if let Some(copied) = self
+            .state
+            .project
+            .q0rgs
+            .iter_mut()
+            .find(|q| q.q0rg_id == copied_id)
+        {
+            copied.name = name.clone();
+        }
+        self.state.mark_dirty();
+        self.session.status = format!("variant {name}: draw on it, then step back out");
+        self.queue(Action::EnterQ0rgInPlace {
+            q0rg_id: copied_id,
+            layer_id,
+            placement_idx: new_idx,
+        });
+    }
+
+    /// Shows the next or previous variant of its symbol in an instance.
+    fn swap_variant(&mut self, q0rg_id: u16, layer_id: u16, placement_idx: usize, step: i8) {
+        if self.state.project.layer_is_locked(q0rg_id, layer_id) {
+            self.session.status = "layer is locked".to_string();
+            return;
+        }
+        let frame = self.session.current_frame;
+        let Some(Target::Q0rg(shown)) = self
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q| q.q0rg_id == q0rg_id)
+            .and_then(|q| q.layers.iter().find(|layer| layer.layer_id == layer_id))
+            .and_then(|layer| layer.placements.get(placement_idx))
+            .map(|placement| placement.target)
+        else {
+            return;
+        };
+        let family = crate::variants::family(&self.state.project, shown);
+        let Some(index) = family.iter().position(|id| *id == shown) else {
+            return;
+        };
+        if family.len() < 2 {
+            self.session.status = "this symbol has no variants yet".to_string();
+            return;
+        }
+        let next =
+            family[(index as isize + isize::from(step)).rem_euclid(family.len() as isize) as usize];
+        let mut candidate = self.state.project.clone();
+        let Some(new_idx) = crate::tools::materialize_placement_keyframe_for_edit(
+            &mut candidate,
+            q0rg_id,
+            layer_id,
+            placement_idx,
+            frame,
+        ) else {
+            self.session.status = "could not key the swap on this frame".to_string();
+            return;
+        };
+        let Some(placement) = candidate
+            .q0rgs
+            .iter_mut()
+            .find(|q| q.q0rg_id == q0rg_id)
+            .and_then(|q| q.layers.iter_mut().find(|layer| layer.layer_id == layer_id))
+            .and_then(|layer| layer.placements.get_mut(new_idx))
+        else {
+            return;
+        };
+        placement.target = Target::Q0rg(next);
+        if let Err(error) = q0s_format::v2::validate(&candidate) {
+            self.session.status = format!("could not swap: {error}");
+            return;
+        }
+        self.history
+            .snapshot_with_session(&self.state.project, &self.session);
+        self.state.project = candidate;
+        self.state.mark_dirty();
+        self.textures.invalidate();
+        self.session.selection = Selection::Placement {
+            q0rg_id,
+            layer_id,
+            placement_idx: new_idx,
+        };
+        let name = self
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q| q.q0rg_id == next)
+            .map(|q| q.name.clone())
+            .unwrap_or_default();
+        self.session.status = format!("showing {name}");
     }
 
     pub(crate) fn open_replace_q0rg_dialog(
@@ -13369,7 +14009,9 @@ impl EditorApp {
                 | RuntimeAction::RigResetPose { .. }
                 | RuntimeAction::Physics(_)
                 | RuntimeAction::Particles(_)
-                | RuntimeAction::Light(_) => {
+                | RuntimeAction::Light(_)
+                | RuntimeAction::Layer(_)
+                | RuntimeAction::Window(_) => {
                     // Live physics and particles run in q0player; the editor
                     // previews them through their own windows instead.
                     // Preview intentionally exposes no shell/filesystem capability and
@@ -13469,6 +14111,8 @@ fn color_row(ui: &mut egui::Ui, label: &str, target: &mut crate::settings::Color
 
 impl App for EditorApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.online.shutdown();
+        crate::plugins::shutdown(self);
         self.workspace_layout.save_on_exit(&mut self.settings);
         crate::autosave::shutdown(self);
     }
@@ -13579,6 +14223,7 @@ impl EditorApp {
 
         let ingress_started = Instant::now();
         crate::sweeper::take_keys(self, ctx);
+        crate::plugins::update(self, ctx);
         self.poll_external_open_requests(ctx);
         self.poll_platform(ctx);
         if self.project_active {
@@ -13636,7 +14281,7 @@ impl EditorApp {
         self.handle_dropped_files(ctx);
         if self.show_home {
             panels::menu::handle_home_shortcuts(self, ctx);
-        } else {
+        } else if self.model_studio.is_none() {
             panels::menu::handle_global_shortcuts(self, ctx);
         }
         if self.project_active {
@@ -13675,6 +14320,12 @@ impl EditorApp {
             egui::CentralPanel::default().show(ctx, |ui| {
                 crate::q0lang::editor::render_standalone(self, ui);
             });
+        } else if self.model_studio.is_some() && self.project_active {
+            crate::model_studio::render(self, ctx);
+        } else if self.active_document_is_plugin_studio() {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                crate::plugins::studio::render_tab(self, ui);
+            });
         } else {
             if crate::touch::ENABLED {
                 crate::touch::workspace(self, ctx);
@@ -13711,10 +14362,14 @@ impl EditorApp {
             self.render_settings_dialog(ctx);
         }
         crate::sweeper::render_window(self, ctx);
+        crate::plugins::render(self, ctx);
         crate::sim_preview::update(self, ctx);
         crate::physics::render_window(self, ctx);
         crate::particles::render_window(self, ctx);
         crate::lights::render_window(self, ctx);
+        if self.model_studio.is_none() {
+            crate::scene3d::render_window(self, ctx);
+        }
         if self.session.show_shortcuts {
             self.render_shortcuts_dialog(ctx);
         }
@@ -13731,6 +14386,8 @@ impl EditorApp {
         // Update window title
         let title = if self.show_home {
             "q0editor - home".to_string()
+        } else if self.active_document_is_plugin_studio() {
+            format!("q0editor - {}", self.plugins.studio.tab_title())
         } else if let Some(document) = self.active_q0lang_document() {
             let name = document
                 .path
@@ -13787,6 +14444,7 @@ impl EditorApp {
                 self.history.snapshot_selection(before);
             }
         }
+        crate::online::tick(self, ctx);
         crate::workspace::persist(self, ctx);
         crate::autosave::tick(self, ctx);
         self.perf.record(
@@ -15664,7 +16322,7 @@ mod tests {
             panic!("import must create a bitmap asset");
         };
         assert_eq!((bitmap.width, bitmap.height), (2, 1));
-        assert_eq!(bitmap.rgba, vec![255, 0, 0, 255, 0, 255, 0, 128]);
+        assert_eq!(*bitmap.rgba, vec![255, 0, 0, 255, 0, 255, 0, 128]);
         assert!(matches!(app.session.selection, Selection::Asset(id) if id == bitmap.asset_id));
         assert!(app.state.dirty);
     }
@@ -15825,6 +16483,40 @@ mod tests {
         assert!(!app.q0enc.open);
         assert!(app.session.show_settings);
         assert!(app.session.show_credits);
+    }
+
+    #[test]
+    fn locking_a_mask_previews_it_and_hiding_it_only_stops_the_masking() {
+        let ctx = Context::default();
+        let mut app = EditorApp::default();
+        app.handle(&ctx, Action::CreateProject(NewProjectSpec::default()));
+        let q0rg_id = app.session.current_q0rg_id;
+        let art = app.session.current_layer_id;
+        app.handle(&ctx, Action::AddLayerMask);
+        let mask = app.session.current_layer_id;
+        assert_ne!(art, mask);
+        let tab = app.active_project_tab_id().unwrap_or(0);
+        app.handle(&ctx, Action::ToggleLayerLock(q0rg_id, mask));
+        assert!(app
+            .session
+            .hidden_mask_art_layers
+            .contains(&(tab, q0rg_id, mask)));
+        app.handle(&ctx, Action::ToggleLayerLock(q0rg_id, mask));
+        assert!(!app
+            .session
+            .hidden_mask_art_layers
+            .contains(&(tab, q0rg_id, mask)));
+        app.handle(&ctx, Action::ToggleLayerVisibility(q0rg_id, mask));
+        assert!(!app.state.project.layer_is_visible(q0rg_id, mask));
+        assert!(
+            app.state.project.layer_is_visible(q0rg_id, art),
+            "hiding a mask must not hide what it masks"
+        );
+        assert!(app
+            .state
+            .project
+            .layer_clipping_masks(q0rg_id, art)
+            .is_empty());
     }
 
     #[test]
@@ -16625,7 +17317,7 @@ mod tests {
                 asset_id: 77,
                 width: 20,
                 height: 10,
-                rgba: vec![255; 20 * 10 * 4],
+                rgba: vec![255; 20 * 10 * 4].into(),
             }));
         let drop = q0s_format::v2::Vec2::new(100.0, 80.0);
 

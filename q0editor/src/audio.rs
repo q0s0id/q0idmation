@@ -1,10 +1,9 @@
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::{BufReader, Cursor};
+use std::io::Cursor;
 use std::path::Path;
 
 use q0s_format::v2::{Asset, AudioClip, ProjectV2, Target};
-use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
+use rodio::{OutputStream, OutputStreamHandle, Sink};
 
 pub const EDITOR_AUDIO_SAMPLE_RATE: u32 = 48_000;
 pub const EDITOR_AUDIO_CHANNELS: u16 = 2;
@@ -63,32 +62,15 @@ pub fn library_item_is_audio_only(project: &ProjectV2, item: crate::state::Libra
 }
 
 pub fn transcode_audio_to_q0v(path: &Path) -> Result<Vec<u8>, String> {
-    let file = File::open(path).map_err(|error| format!("open audio file: {error}"))?;
-    let decoder = Decoder::new(BufReader::new(file))
-        .map_err(|error| format!("decode audio file: {error}"))?;
-    let input_channels = decoder.channels();
-    let input_sample_rate = decoder.sample_rate();
-    if input_channels == 0 || input_sample_rate == 0 {
-        return Err("audio decoder returned an invalid stream format".to_string());
+    let length = std::fs::metadata(path)
+        .map_err(|error| format!("open audio file: {error}"))?
+        .len();
+    if length > MAX_IMPORTED_Q0V_BYTES as u64 {
+        return Err("audio import exceeds the 240 MiB project media limit".into());
     }
-
-    // The project media ceiling applies to the final q0v PCM payload. Keep the
-    // temporary decode bounded too, so a malformed or gigantic file cannot make
-    // the import worker allocate without limit before conversion.
-    let max_input_samples = MAX_IMPORTED_Q0V_BYTES / std::mem::size_of::<i16>();
-    let mut input = Vec::new();
-    for sample in decoder {
-        if input.len() >= max_input_samples {
-            return Err("audio import exceeds the 240 MiB project media limit".to_string());
-        }
-        input.push(sample);
-    }
-    if input.is_empty() {
-        return Err("audio file contains no decodable samples".to_string());
-    }
-
-    let pcm = resample_to_editor_stereo(&input, input_channels, input_sample_rate)?;
-    let frames = pcm.len() / usize::from(EDITOR_AUDIO_CHANNELS);
+    let source = std::fs::read(path).map_err(|error| format!("read audio file: {error}"))?;
+    let decoded = q0video::audio::decode_source(&source)?;
+    let frames = decoded.samples_per_channel();
     let timeline_frames = u32::try_from(frames)
         .map_err(|_| "audio is too long for the q0v timeline clock".to_string())?;
     if timeline_frames == 0 {
@@ -98,15 +80,38 @@ pub fn transcode_audio_to_q0v(path: &Path) -> Result<Vec<u8>, String> {
     let spec = q0video::q0v::Q0vSpec {
         width: 0,
         height: 0,
-        fps: EDITOR_AUDIO_SAMPLE_RATE,
+        fps: decoded.sample_rate,
         timeline_frames,
         video: false,
         audio: true,
-        audio_sample_rate: EDITOR_AUDIO_SAMPLE_RATE,
-        audio_channels: EDITOR_AUDIO_CHANNELS,
+        audio_sample_rate: decoded.sample_rate,
+        audio_channels: decoded.channels,
     };
-    let mut writer = q0video::q0v::Q0vWriter::new(Cursor::new(Vec::new()), spec)?;
-    writer.write_audio_pcm_i16(&pcm)?;
+    let mut writer = q0video::q0v::Q0vWriter::new_compressed(Cursor::new(Vec::new()), spec)?;
+    let compressed_source = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            ["mp3", "ogg", "flac"]
+                .iter()
+                .any(|kind| extension.eq_ignore_ascii_case(kind))
+        });
+    if compressed_source {
+        writer.write_audio_encoded(&source, frames)?;
+    } else {
+        for bytes in decoded
+            .pcm_le_bytes
+            .chunks(16_384 * usize::from(decoded.channels))
+        {
+            let samples: Vec<i16> = bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|raw| i16::from_le_bytes([raw[0], raw[1]]))
+                .collect();
+            writer.write_audio_pcm_i16(&samples)?;
+        }
+    }
     let bytes = writer.finish()?.into_inner();
     if bytes.len() > MAX_IMPORTED_Q0V_BYTES {
         return Err("audio import exceeds the 240 MiB project media limit".to_string());
@@ -119,56 +124,12 @@ pub fn transcode_audio_to_q0v(path: &Path) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn resample_to_editor_stereo(
-    input: &[i16],
-    input_channels: u16,
-    input_sample_rate: u32,
-) -> Result<Vec<i16>, String> {
-    let channels = usize::from(input_channels);
-    if channels == 0 || !input.len().is_multiple_of(channels) {
-        return Err("decoded audio is not aligned to whole channel frames".to_string());
-    }
-    let input_frames = input.len() / channels;
-    if input_frames == 0 {
-        return Ok(Vec::new());
-    }
-    let output_frames = (u64::try_from(input_frames)
-        .unwrap_or(u64::MAX)
-        .saturating_mul(u64::from(EDITOR_AUDIO_SAMPLE_RATE))
-        .div_ceil(u64::from(input_sample_rate))) as usize;
-    let max_output_frames =
-        MAX_IMPORTED_Q0V_BYTES / std::mem::size_of::<i16>() / usize::from(EDITOR_AUDIO_CHANNELS);
-    if output_frames > max_output_frames {
-        return Err("audio import exceeds the 240 MiB project media limit".to_string());
-    }
-
-    let mut output = Vec::with_capacity(output_frames.saturating_mul(2));
-    for out_frame in 0..output_frames {
-        let numerator = (out_frame as u64).saturating_mul(u64::from(input_sample_rate));
-        let source_index = (numerator / u64::from(EDITOR_AUDIO_SAMPLE_RATE)) as usize;
-        let remainder = numerator % u64::from(EDITOR_AUDIO_SAMPLE_RATE);
-        let fraction = remainder as f32 / EDITOR_AUDIO_SAMPLE_RATE as f32;
-        let next_index = (source_index + 1).min(input_frames - 1);
-        for output_channel in 0..2 {
-            let input_channel = if channels == 1 {
-                0
-            } else {
-                output_channel.min(channels - 1)
-            };
-            let a = input[source_index.min(input_frames - 1) * channels + input_channel] as f32;
-            let b = input[next_index * channels + input_channel] as f32;
-            let value = a + (b - a) * fraction;
-            output.push(value.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16);
-        }
-    }
-    Ok(output)
-}
-
 #[derive(Debug)]
 pub struct AudioWaveformBuilder {
     waveform: AudioWaveform,
     source_frames: usize,
     next_bin: usize,
+    decoded_pcm: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 impl AudioWaveformBuilder {
@@ -193,6 +154,7 @@ impl AudioWaveformBuilder {
             },
             source_frames,
             next_bin: 0,
+            decoded_pcm: audio.decoded_pcm(),
         })
     }
 
@@ -210,16 +172,28 @@ impl AudioWaveformBuilder {
         if self.is_complete() || max_bins == 0 {
             return self.is_complete();
         }
-        let Ok(audio) = q0video::q0v::audio_view(bytes) else {
+        let Ok(header) = q0video::q0v::probe_header(bytes) else {
             return false;
         };
-        if audio.spec.audio_channels != self.waveform.channels
-            || audio.samples_per_channel != self.waveform.samples_per_channel
+        if header.spec.audio_channels != self.waveform.channels
+            || header.audio_samples_per_channel != self.waveform.samples_per_channel
         {
             return false;
         }
         let channels = usize::from(self.waveform.channels);
-        let pcm = audio.pcm_le_bytes();
+        let audio = if self.decoded_pcm.is_none() {
+            q0video::q0v::audio_view(bytes).ok()
+        } else {
+            None
+        };
+        let Some(pcm) = self
+            .decoded_pcm
+            .as_ref()
+            .map(|pcm| pcm.as_slice())
+            .or_else(|| audio.as_ref().map(|audio| audio.pcm_le_bytes()))
+        else {
+            return false;
+        };
         let bin_count = self.waveform.bins.len();
         let end_bin = self.next_bin.saturating_add(max_bins).min(bin_count);
         for bin in self.next_bin..end_bin {
@@ -259,10 +233,15 @@ pub struct AudioWaveformCache {
 impl AudioWaveformCache {
     pub fn new(bytes: std::sync::Arc<Vec<u8>>) -> Option<Self> {
         let source = std::sync::Arc::downgrade(&bytes);
-        let builder = AudioWaveformBuilder::new(&bytes)?;
+        let header = q0video::q0v::probe_header(&bytes).ok()?;
+        if !header.spec.audio {
+            return None;
+        }
         let waveform = AudioWaveform {
             bins: Vec::new(),
-            ..builder.waveform().clone()
+            samples_per_channel: header.audio_samples_per_channel,
+            channels: header.spec.audio_channels,
+            sample_rate: header.spec.audio_sample_rate,
         };
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::Builder::new()
@@ -505,7 +484,7 @@ fn timeline_total_sample_frames(project: &ProjectV2, q0rg_id: u16) -> Option<u64
     )
 }
 
-fn pcm_sample(view: q0video::q0v::Q0vAudioView<'_>, frame: u64, channel: u16) -> f32 {
+fn pcm_sample(view: &q0video::q0v::Q0vAudioView<'_>, frame: u64, channel: u16) -> f32 {
     if frame >= view.samples_per_channel || view.spec.audio_channels == 0 {
         return 0.0;
     }
@@ -530,7 +509,7 @@ fn pcm_sample(view: q0video::q0v::Q0vAudioView<'_>, frame: u64, channel: u16) ->
 }
 
 fn sample_audio_view_at_editor_frame(
-    view: q0video::q0v::Q0vAudioView<'_>,
+    view: &q0video::q0v::Q0vAudioView<'_>,
     output_frame: u64,
     output_channel: u16,
 ) -> f32 {
@@ -550,7 +529,7 @@ fn sample_audio_view_at_editor_frame(
     a + (b - a) * fraction
 }
 
-fn audio_view_duration_at_editor_rate(view: q0video::q0v::Q0vAudioView<'_>) -> u64 {
+fn audio_view_duration_at_editor_rate(view: &q0video::q0v::Q0vAudioView<'_>) -> u64 {
     view.samples_per_channel
         .saturating_mul(u64::from(EDITOR_AUDIO_SAMPLE_RATE))
         .div_ceil(u64::from(view.spec.audio_sample_rate.max(1)))
@@ -591,7 +570,7 @@ fn mix_timeline_audio_chunk_inner(
         else {
             continue;
         };
-        let Ok(view) = q0video::q0v::audio_view(&media.bytes) else {
+        let Ok(view) = q0video::q0v::audio_view_shared(&media.bytes) else {
             continue;
         };
         if view.spec.video || !view.spec.audio {
@@ -608,7 +587,8 @@ fn mix_timeline_audio_chunk_inner(
             / host_fps;
         let clip_end = clip_start
             .saturating_add(
-                audio_view_duration_at_editor_rate(view).saturating_sub(clip.source_offset_samples),
+                audio_view_duration_at_editor_rate(&view)
+                    .saturating_sub(clip.source_offset_samples),
             )
             .min(boundary_sample)
             .min(total_sample_frames);
@@ -650,7 +630,7 @@ fn mix_timeline_audio_chunk_inner(
             let base = output_frame * usize::from(EDITOR_AUDIO_CHANNELS);
             for channel in 0..EDITOR_AUDIO_CHANNELS {
                 output[base + usize::from(channel)] += sample_audio_view_at_editor_frame(
-                    view,
+                    &view,
                     local_frame + clip.source_offset_samples,
                     channel,
                 ) * q0s_format::v2::audio_clip_channel_gain(
@@ -928,10 +908,61 @@ mod tests {
         let media = q0video::q0v::Q0vFile::parse(bytes).expect("parse imported q0v");
         assert!(media.spec.audio);
         assert!(!media.spec.video);
-        assert_eq!(media.spec.audio_sample_rate, EDITOR_AUDIO_SAMPLE_RATE);
-        assert_eq!(media.spec.audio_channels, EDITOR_AUDIO_CHANNELS);
-        assert!(media.audio_samples_per_channel > 0);
+        assert_eq!(media.spec.audio_sample_rate, 24_000);
+        assert_eq!(media.spec.audio_channels, 1);
+        assert_eq!(media.audio_samples_per_channel, samples.len() as u64);
+        let restored: Vec<i16> = media
+            .audio_pcm_le_bytes()
+            .unwrap()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|raw| i16::from_le_bytes([raw[0], raw[1]]))
+            .collect();
+        assert_eq!(restored, samples);
         std::fs::remove_file(path).expect("cleanup wav fixture");
+    }
+
+    #[test]
+    fn compressed_import_keeps_the_original_bitstream_and_plays_at_editor_rate() {
+        for extension in ["mp3", "ogg", "flac"] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("../q0video/tests/fixtures/tone.{extension}"));
+            let original = std::fs::read(&path).unwrap();
+            let bytes = transcode_audio_to_q0v(&path).unwrap();
+            assert_eq!(bytes.len(), original.len() + 80);
+            assert_eq!(&bytes[80..], original);
+            let media = q0video::q0v::Q0vFile::parse(bytes.clone()).unwrap();
+            assert_eq!(media.audio_codec(), q0video::q0v::AudioCodec::Source);
+            assert_eq!(media.spec.audio_sample_rate, 44_100);
+            assert_eq!(media.spec.audio_channels, 1);
+            let project = project_with_audio(bytes, 1);
+            let chunk = mix_timeline_audio_chunk(&project, 1, 2000, 12_000).unwrap();
+            assert!(chunk.iter().any(|sample| sample.abs() > 0.05));
+            assert!(chunk
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|pair| pair[0] == pair[1]));
+            let waveform = waveform_from_q0v_bytes(&media_bytes_arc(&project)).unwrap();
+            assert!(waveform.bins.iter().any(|(_, max)| *max > 0.05));
+            let first = q0video::q0v::audio_view_shared(&media_bytes_arc(&project))
+                .unwrap()
+                .decoded_pcm()
+                .unwrap();
+            let second = q0video::q0v::audio_view_shared(&media_bytes_arc(&project))
+                .unwrap()
+                .decoded_pcm()
+                .unwrap();
+            assert!(std::sync::Arc::ptr_eq(&first, &second));
+        }
+    }
+
+    fn media_bytes_arc(project: &ProjectV2) -> std::sync::Arc<Vec<u8>> {
+        let Asset::Q0v(media) = &project.assets[0] else {
+            panic!("audio fixture")
+        };
+        std::sync::Arc::clone(&media.bytes)
     }
 
     #[test]

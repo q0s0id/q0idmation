@@ -156,6 +156,10 @@ pub(crate) fn render_animation_preview(app: &mut EditorApp, ctx: &egui::Context)
 }
 
 pub fn render(app: &mut EditorApp, ui: &mut Ui) {
+    render_view(app, ui, true);
+}
+
+pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
     let stage_started = std::time::Instant::now();
     if !crate::touch::ENABLED {
         ui.horizontal(|ui| {
@@ -178,9 +182,10 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     // this, egui keeps keyboard focus in the last text box and correctly blocks
     // Backspace/Ctrl+G as text-editing shortcuts even though the user is already
     // manipulating artwork on the canvas.
-    let canvas_interacted = response.clicked_by(PointerButton::Primary)
-        || response.drag_started_by(PointerButton::Primary)
-        || response.secondary_clicked();
+    let canvas_interacted = interactive
+        && (response.clicked_by(PointerButton::Primary)
+            || response.drag_started_by(PointerButton::Primary)
+            || response.secondary_clicked());
     release_canvas_keyboard_focus(
         ui.ctx(),
         canvas_interacted && app.session.text_editor.is_none(),
@@ -230,7 +235,10 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         .min(canvas_rect.height() * 0.9 / stage_h)
         .max(ZOOM_MIN);
 
-    handle_viewport_input(app, &response, canvas_rect, fit_scale, ui.ctx());
+    // The free 3D view has its own way of coming closer and sliding.
+    if interactive && app.session.tools3d.orbit.is_none() {
+        handle_viewport_input(app, &response, canvas_rect, fit_scale, ui.ctx());
+    }
     let frame_time = ui.ctx().input(|input| input.predicted_dt);
     if app.session.viewport.step_glide(frame_time) {
         ui.ctx().request_repaint();
@@ -245,26 +253,29 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         scaled,
     );
 
-    // Drop shadow — fixed translucent black, theme-independent.
-    painter.rect_filled(
-        stage_rect.translate(vec2(2.0, 2.0)),
-        0.0,
-        Color32::from_black_alpha(110),
-    );
-    // Stage paper — always white (it's the user's drawing canvas, not
-    // chrome). The border colour does follow the theme so dark/light
-    // backdrops can frame it appropriately.
-    let bg = app.state.project.meta.background_color;
-    painter.rect_filled(
-        stage_rect,
-        0.0,
-        Color32::from_rgba_unmultiplied(bg.r, bg.g, bg.b, bg.a),
-    );
-    painter.rect_stroke(
-        stage_rect,
-        0.0,
-        Stroke::new(1.0_f32, app.settings.theme.stage_border.to_color32()),
-    );
+    let free_view = crate::tools3d::free_view(app);
+    if free_view.is_none() {
+        // Drop shadow — fixed translucent black, theme-independent.
+        painter.rect_filled(
+            stage_rect.translate(vec2(2.0, 2.0)),
+            0.0,
+            Color32::from_black_alpha(110),
+        );
+        // Stage paper — always white (it's the user's drawing canvas, not
+        // chrome). The border colour does follow the theme so dark/light
+        // backdrops can frame it appropriately.
+        let bg = app.state.project.meta.background_color;
+        painter.rect_filled(
+            stage_rect,
+            0.0,
+            Color32::from_rgba_unmultiplied(bg.r, bg.g, bg.b, bg.a),
+        );
+        painter.rect_stroke(
+            stage_rect,
+            0.0,
+            Stroke::new(1.0_f32, app.settings.theme.stage_border.to_color32()),
+        );
+    }
 
     let view = StageView {
         origin: stage_rect.min,
@@ -278,10 +289,13 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             .unwrap_or(q0s_format::transform::Affine::IDENTITY),
     };
     app.textures.editing_mask_q0rg_id = Some(app.session.current_q0rg_id);
-    if let Some(pointer) = ui
-        .ctx()
-        .pointer_hover_pos()
-        .filter(|pointer| canvas_rect.contains(*pointer))
+    if let Some(pointer) = interactive
+        .then(|| {
+            ui.ctx()
+                .pointer_hover_pos()
+                .filter(|pointer| canvas_rect.contains(*pointer))
+        })
+        .flatten()
     {
         let stage_cursor = view.screen_to_stage(pointer);
         if stage_cursor.x.is_finite() && stage_cursor.y.is_finite() {
@@ -297,7 +311,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     let library_drag_active = library_payload.is_some();
     let ctx = ui.ctx().clone();
     let camera_editing = app.camera_track_is_selected();
-    if camera_editing && !library_drag_active && !editing_text {
+    if interactive && camera_editing && !library_drag_active && !editing_text {
         handle_camera_stage_input(app, &response, &view, &ctx);
     }
     if app.session.current_q0rg_id == app.state.project.meta.entry_q0rg_id
@@ -311,9 +325,13 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             app.session.current_frame,
         );
     }
-    if !library_drag_active && !editing_text && !camera_editing {
+    if interactive && !library_drag_active && !editing_text && !camera_editing {
         let tools_started = std::time::Instant::now();
-        if !crate::frame_edit::handle(app, &response, &view, &ctx) {
+        if app.session.tools3d.active() {
+            crate::tools3d::handle(app, &response, &view);
+        } else if !crate::frame_edit::handle(app, &response, &view, &ctx)
+            && !crate::plugins::stage_input(app, &response, &view)
+        {
             crate::tools::handle(app, &response, &painter, &view, &ctx);
         }
         app.perf
@@ -428,7 +446,12 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             context.placement_idx,
         );
     }
-    if app.session.outline_mode {
+    // Seen from aside, everything goes through the 3D pass.
+    let _free_view = q0glblend::FreeViewGuard::set(free_view);
+    if free_view.is_some() {
+        crate::tools3d::paint_ground(app, &painter, &view);
+        render_pass.render(&painter, q0rg_id, frame, &view, &mut app.textures, ui.ctx());
+    } else if app.session.outline_mode {
         crate::render::render_stage_outline(
             &painter,
             &render_pass,
@@ -625,6 +648,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             );
         }
     }
+    drop(_free_view);
     let scene_elapsed = scene_started.elapsed();
     let traversal = app.textures.stage_traversal_stats();
     app.textures.record_stage_work_timings(&mut app.perf);
@@ -687,7 +711,10 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     app.perf
         .record(crate::perf::PerfSpan::SceneRender, scene_elapsed);
 
-    if q0rg_id == app.state.project.meta.entry_q0rg_id && app.state.project.runtime.camera.enabled {
+    if q0rg_id == app.state.project.meta.entry_q0rg_id
+        && app.state.project.runtime.camera.enabled
+        && free_view.is_none()
+    {
         draw_camera_overlay(app, &painter, &view, frame);
     }
 
@@ -776,7 +803,10 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             }
         }
     }
-    if let Some(payload) = response.dnd_release_payload::<LibraryDragPayload>() {
+    if let Some(payload) = interactive
+        .then(|| response.dnd_release_payload::<LibraryDragPayload>())
+        .flatten()
+    {
         if crate::panels::library::library_drag_item_is_audio_only(app, *payload) {
             app.session.status = "drop audio onto a timeline frame".to_string();
         } else if let Some(pointer) = ui.ctx().pointer_interact_pos() {
@@ -786,11 +816,15 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     }
 
     // Canvas text UI and transient overlays stay above the freshly rendered scene.
-    let editing_text = crate::text_tool::render_canvas(app, ui, &view);
+    let editing_text = interactive && crate::text_tool::render_canvas(app, ui, &view);
     if !editing_text && app.session.onion.edit_frames {
         crate::frame_edit::draw_overlay(app, &painter, &view);
+    } else if app.session.tools3d.active() {
+        crate::tools3d::draw_overlay(app, &response, &painter, &view);
     } else if !editing_text {
-        crate::tools::draw_overlay(app, &response, &painter, &view);
+        if interactive {
+            crate::tools::draw_overlay(app, &response, &painter, &view);
+        }
         let selection_started = std::time::Instant::now();
         crate::tools::draw_selection_overlay(app, &painter, &view);
         app.perf.record(
@@ -799,10 +833,18 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         );
     }
     crate::tools::draw_brush_size_preview(app, &painter, &view);
+    crate::plugins::paint_stage(app, &painter, &view);
+    if interactive && !editing_text {
+        crate::tools3d::view_bar(app, ui, canvas_rect);
+    }
 
     // Right-click context menu — pre-select the placement under cursor so the
     // menu's actions act on what the user actually right-clicked.
-    if response.secondary_clicked() && !app.session.onion.edit_frames && !editing_text {
+    if interactive
+        && response.secondary_clicked()
+        && !app.session.onion.edit_frames
+        && !editing_text
+    {
         if let Some(p) = response.interact_pointer_pos() {
             let stage_pos = view.screen_to_stage(p);
             let clicked_selection = crate::tools::selection_at_point_cached_for_scale(
@@ -829,7 +871,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             }
         }
     }
-    if !editing_text {
+    if interactive && !editing_text {
         response.context_menu(|ui| stage_context_menu(app, ui));
     }
 
@@ -1225,7 +1267,8 @@ fn touch_gesture_effect(state: &crate::state::ToolState) -> TouchGestureEffect {
         | ToolState::AdvancedBrushDrawing { .. }
         | ToolState::EraserDrawing { .. }
         | ToolState::PrimitiveDrawing { .. }
-        | ToolState::Marquee { .. } => TouchGestureEffect::DiscardStroke,
+        | ToolState::Marquee { .. }
+        | ToolState::SubselectMarquee { .. } => TouchGestureEffect::DiscardStroke,
         _ => TouchGestureEffect::Blocked,
     }
 }
@@ -1383,6 +1426,7 @@ pub(crate) fn zoom_controls(app: &mut EditorApp, ui: &mut Ui) {
         app.state.project.meta.fps,
         app.session.current_frame + 1
     ));
+    crate::panels::toolbar::render_snap_button(app, ui);
 }
 
 fn q0rg_name(app: &EditorApp, id: u16, fallback: &str) -> String {

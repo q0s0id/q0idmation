@@ -8,6 +8,20 @@ use glow::HasContext as _;
 use q0s_format::v2::{BlendMode, GradientKind, GradientStop};
 
 mod lighting;
+#[cfg(not(target_arch = "wasm32"))]
+mod three;
+#[cfg(not(target_arch = "wasm32"))]
+pub use three::paint_frame3d;
+#[cfg(not(target_arch = "wasm32"))]
+mod stage3d;
+#[cfg(not(target_arch = "wasm32"))]
+pub use stage3d::{free_view, with_revision, FreeView, FreeViewGuard, Stage3d};
+#[cfg(target_arch = "wasm32")]
+mod web_mask;
+#[cfg(target_arch = "wasm32")]
+pub fn take_webgl_error() -> Option<String> {
+    web_mask::take_error()
+}
 pub use lighting::{paint_lighting, LightingPaint};
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -129,6 +143,7 @@ fn record_gpu_filter_sample_drop() {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(not(target_arch = "wasm32"))]
 fn record_gpu_filter_callback_cpu(
     ns: u64,
     region: CallbackRegion,
@@ -241,7 +256,6 @@ fn record_paint_callback(painter: &Painter, rect: Rect, fx: Option<VectorGroupFx
     });
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct CallbackRegion {
     left: i32,
@@ -252,7 +266,6 @@ pub(crate) struct CallbackRegion {
     source_uv_max: [f32; 2],
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn callback_region(
     viewport: Rect,
     clip_rect: Rect,
@@ -587,9 +600,19 @@ pub fn paint_solid_mesh_group_with_opacity_on_opaque_backdrop(
 
     #[cfg(target_arch = "wasm32")]
     {
-        for mesh in meshes {
-            painter.add(Shape::Mesh(mesh));
-        }
+        web_mask::paint(
+            painter,
+            rect,
+            Vec::new(),
+            vec![VectorMaskedPlacement {
+                primitives: meshes
+                    .into_iter()
+                    .map(VectorGroupPrimitive::Solid)
+                    .collect(),
+                blend_mode,
+                opacity,
+            }],
+        );
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1413,17 +1436,7 @@ pub fn paint_vector_masked_placements_on_opaque_backdrop(
 
     #[cfg(target_arch = "wasm32")]
     {
-        // The browser renderer has no glow callback backend yet. Keep the
-        // vector groups available there; native desktop uses the GPU mask pass.
-        let _ = masks;
-        for placement in placements {
-            paint_vector_group_on_opaque_backdrop(
-                painter,
-                placement.primitives,
-                placement.blend_mode,
-                placement.opacity,
-            );
-        }
+        web_mask::paint(painter, rect, masks, placements);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1514,51 +1527,17 @@ fn paint_vector_group_fx_impl(
 
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = fx;
-        let _ = cache_active;
-        for primitive in primitives {
-            match primitive {
-                VectorGroupPrimitive::Solid(mut mesh) => {
-                    for vertex in &mut mesh.vertices {
-                        let [r, g, b, a] = vertex.color.to_array();
-                        vertex.color = Color32::from_rgba_unmultiplied(
-                            r,
-                            g,
-                            b,
-                            ((f32::from(a) * opacity).round().clamp(0.0, 255.0)) as u8,
-                        );
-                    }
-                    painter.add(Shape::Mesh(mesh));
-                }
-                VectorGroupPrimitive::Textured {
-                    mesh,
-                    color_transform,
-                } => {
-                    let mut mesh = (*mesh).clone();
-                    for vertex in &mut mesh.vertices {
-                        let [r, g, b, a] = vertex.color.to_array();
-                        vertex.color = Color32::from_rgba_unmultiplied(
-                            r,
-                            g,
-                            b,
-                            ((f32::from(a) * opacity).round().clamp(0.0, 255.0)) as u8,
-                        );
-                    }
-                    painter.add(Shape::Mesh(mesh));
-                }
-                VectorGroupPrimitive::Gradient { mesh, mut paint } => {
-                    paint.tint = Color32::from_rgba_unmultiplied(
-                        paint.tint.r(),
-                        paint.tint.g(),
-                        paint.tint.b(),
-                        ((f32::from(paint.tint.a()) * opacity)
-                            .round()
-                            .clamp(0.0, 255.0)) as u8,
-                    );
-                    paint_gradient_mesh(painter, rect, mesh, paint);
-                }
-            }
-        }
+        let _ = (fx, cache_active);
+        web_mask::paint(
+            painter,
+            rect,
+            Vec::new(),
+            vec![VectorMaskedPlacement {
+                primitives,
+                blend_mode,
+                opacity,
+            }],
+        );
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1638,35 +1617,7 @@ pub fn paint_gradient_mesh(
 
     #[cfg(target_arch = "wasm32")]
     {
-        // Functional fallback for wasm: keep vector geometry, but interpolate at
-        // vertices because the native OpenGL analytic callback is unavailable.
-        let mut fallback = (*mesh).clone();
-        let inv = paint.gradient_inverse;
-        for vertex in &mut fallback.vertices {
-            let local = vertex.pos;
-            let gx = inv[0] * local.x + inv[1] * local.y + inv[4];
-            let gy = inv[2] * local.x + inv[3] * local.y + inv[5];
-            let position = match paint.kind {
-                GradientKind::Linear => ((gx + 1.0) * 0.5).clamp(0.0, 1.0),
-                GradientKind::Radial => (gx * gx + gy * gy).sqrt().clamp(0.0, 1.0),
-            };
-            let color = sample_stops(paint.stops.as_slice(), position);
-            vertex.color = Color32::from_rgba_unmultiplied(
-                ((u16::from(color[0]) * u16::from(paint.tint.r())) / 255) as u8,
-                ((u16::from(color[1]) * u16::from(paint.tint.g())) / 255) as u8,
-                ((u16::from(color[2]) * u16::from(paint.tint.b())) / 255) as u8,
-                ((u16::from(color[3]) * u16::from(paint.tint.a())) / 255) as u8,
-            );
-            vertex.color = paint.color_transform.apply(vertex.color);
-            vertex.pos = reproject_cached_mesh_point_affine(
-                vertex.pos,
-                egui::Vec2::ZERO,
-                paint.transform.source_origin,
-                paint.transform.target_origin,
-                paint.transform.linear,
-            );
-        }
-        painter.add(Shape::Mesh(fallback));
+        web_mask::gradient(painter, rect, mesh, paint);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1722,36 +1673,6 @@ pub fn paint_gradient_mesh(
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-fn sample_stops(stops: &[GradientStop], position: f32) -> [u8; 4] {
-    let Some(first) = stops.first() else {
-        return [0, 0, 0, 0];
-    };
-    if position <= first.position {
-        return [first.color.r, first.color.g, first.color.b, first.color.a];
-    }
-    for pair in stops.windows(2) {
-        if position <= pair[1].position {
-            let span = pair[1].position - pair[0].position;
-            let t = if span.abs() <= f32::EPSILON {
-                1.0
-            } else {
-                ((position - pair[0].position) / span).clamp(0.0, 1.0)
-            };
-            let mix =
-                |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
-            return [
-                mix(pair[0].color.r, pair[1].color.r),
-                mix(pair[0].color.g, pair[1].color.g),
-                mix(pair[0].color.b, pair[1].color.b),
-                mix(pair[0].color.a, pair[1].color.a),
-            ];
-        }
-    }
-    let last = stops.last().unwrap();
-    [last.color.r, last.color.g, last.color.b, last.color.a]
-}
-
 fn paint_texture_impl(
     painter: &Painter,
     rect: Rect,
@@ -1771,14 +1692,25 @@ fn paint_texture_impl(
 
     #[cfg(target_arch = "wasm32")]
     {
-        // q0idmation's current publication target is native. Keep wasm builds
-        // functional rather than silently dropping the placement.
         let _ = opaque_backdrop;
-        painter.image(
-            texture_id,
+        let mut mesh = Mesh::with_texture(texture_id);
+        mesh.add_rect_with_uv(
             rect,
-            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
             Color32::WHITE,
+        );
+        web_mask::paint(
+            painter,
+            rect,
+            Vec::new(),
+            vec![VectorMaskedPlacement {
+                primitives: vec![VectorGroupPrimitive::Textured {
+                    mesh: Arc::new(mesh),
+                    color_transform: ColorTransform::default(),
+                }],
+                blend_mode,
+                opacity: 1.0,
+            }],
         );
     }
 
@@ -4130,11 +4062,11 @@ fn native_framebuffer(raw: i32) -> Option<glow::Framebuffer> {
     NonZeroU32::new(raw as u32).map(glow::NativeFramebuffer)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 unsafe fn create_program(gl: &glow::Context) -> Result<glow::Program, String> {
     const VERTEX: &str = r#"#version 140
 uniform vec2 u_source_uv_min;
 uniform vec2 u_source_uv_max;
+uniform vec2 u_backdrop_uv_min;
 uniform vec2 u_backdrop_uv_max;
 out vec2 v_source_uv;
 out vec2 v_backdrop_uv;
@@ -4147,7 +4079,7 @@ void main() {
     gl_Position = vec4(p, 0.0, 1.0);
     vec2 source_t = vec2((p.x + 1.0) * 0.5, (1.0 - p.y) * 0.5);
     v_source_uv = mix(u_source_uv_min, u_source_uv_max, source_t);
-    v_backdrop_uv = vec2((p.x + 1.0) * 0.5, (p.y + 1.0) * 0.5) * u_backdrop_uv_max;
+    v_backdrop_uv = u_backdrop_uv_min + vec2((p.x + 1.0) * 0.5, (p.y + 1.0) * 0.5) * u_backdrop_uv_max;
 }
 "#;
     const FRAGMENT: &str = r#"#version 140
@@ -4262,7 +4194,6 @@ void main() {
 /// The shaders are written in desktop GLSL 1.40. OpenGL ES 3 runs the same
 /// code once the version line names its dialect and the default precisions
 /// that ES leaves unset are declared.
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn glsl_for(gl: &glow::Context, source: &str) -> String {
     if !gl.version().is_embedded {
         return source.to_owned();
@@ -4276,7 +4207,6 @@ precision highp sampler2D;{body}"
     )
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 unsafe fn create_group_program(gl: &glow::Context) -> Result<glow::Program, String> {
     const VERTEX: &str = r#"#version 140
 in vec2 a_pos;
@@ -4358,7 +4288,6 @@ void main() {
     Ok(program)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 unsafe fn create_group_textured_program(gl: &glow::Context) -> Result<glow::Program, String> {
     const VERTEX: &str = r#"#version 140
 in vec2 a_pos;
@@ -4462,7 +4391,6 @@ void main() {
     Ok(program)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 unsafe fn create_gradient_program(gl: &glow::Context) -> Result<glow::Program, String> {
     const VERTEX: &str = r#"#version 140
 in vec2 a_pos;
@@ -4638,7 +4566,6 @@ void main() {
     create_fullscreen_program(gl, VERTEX, FRAGMENT)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 unsafe fn create_mask_apply_program(gl: &glow::Context) -> Result<glow::Program, String> {
     const VERTEX: &str = r#"#version 140
 void main() {
@@ -4698,7 +4625,6 @@ void main() {
     create_fullscreen_program(gl, VERTEX, FRAGMENT)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 unsafe fn create_fullscreen_program(
     gl: &glow::Context,
     vertex_source: &str,

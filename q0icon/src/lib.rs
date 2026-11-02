@@ -174,8 +174,18 @@ mod tests {
         assert_eq!((player.width, player.height), (48, 48));
         assert_eq!(editor.rgba.len(), 48 * 48 * 4);
         assert_eq!(player.rgba.len(), 48 * 48 * 4);
-        assert!(editor.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0));
-        assert!(player.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0));
+        assert!(editor
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| pixel[3] != 0));
+        assert!(player
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| pixel[3] != 0));
         assert_ne!(editor.rgba, player.rgba);
     }
 

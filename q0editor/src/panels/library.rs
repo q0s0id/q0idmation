@@ -28,6 +28,7 @@ enum LibraryIcon {
     Bitmap,
     Video,
     Audio,
+    Model,
 }
 
 impl LibraryIcon {
@@ -51,6 +52,7 @@ impl LibraryIcon {
                 }
             }
             Asset::Rig(_) => Self::Symbol,
+            Asset::Model(_) => Self::Model,
         }
     }
 }
@@ -334,6 +336,10 @@ fn hash_library_project(project: &ProjectV2, hasher: &mut impl Hasher) {
                 3_u8.hash(hasher);
                 rig.nodes.len().hash(hasher);
                 rig.controls.len().hash(hasher);
+            }
+            Asset::Model(model) => {
+                4_u8.hash(hasher);
+                (std::sync::Arc::as_ptr(&model.data) as usize).hash(hasher);
             }
         }
     }
@@ -1046,8 +1052,12 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                                     ));
                                 }
                                 if response.double_clicked() {
-                                    if let LibraryKey::Q0rg(id) = row.key {
-                                        enter = Some((row.tab_id, id));
+                                    match row.key {
+                                        LibraryKey::Q0rg(id) => enter = Some((row.tab_id, id)),
+                                        LibraryKey::Asset(id) if row.icon == LibraryIcon::Model => {
+                                            app.queue(crate::app::Action::EditModel(id));
+                                        }
+                                        LibraryKey::Asset(_) => {}
                                     }
                                 }
                                 ui.label(row.kind);
@@ -1570,6 +1580,36 @@ fn draw_library_icon(
                 strong,
             );
         }
+        LibraryIcon::Model => {
+            // A cube seen from above a corner.
+            let c = rect.center();
+            let r = rect.width().min(rect.height()) * 0.42;
+            let top = pos2(c.x, c.y - r);
+            let left = pos2(c.x - r * 0.87, c.y - r * 0.5);
+            let right = pos2(c.x + r * 0.87, c.y - r * 0.5);
+            let middle = c;
+            let low_left = pos2(c.x - r * 0.87, c.y + r * 0.5);
+            let low_right = pos2(c.x + r * 0.87, c.y + r * 0.5);
+            let bottom = pos2(c.x, c.y + r);
+            painter.add(egui::Shape::convex_polygon(
+                vec![top, right, middle, left],
+                accent.gamma_multiply(0.55),
+                Stroke::NONE,
+            ));
+            for (a, b) in [
+                (top, right),
+                (right, low_right),
+                (low_right, bottom),
+                (bottom, low_left),
+                (low_left, left),
+                (left, top),
+                (left, middle),
+                (middle, right),
+                (middle, bottom),
+            ] {
+                painter.line_segment([a, b], strong);
+            }
+        }
         LibraryIcon::Bitmap => {
             painter.rect_stroke(rect, 1.5, quiet);
             painter.circle_filled(pos2(rect.right() - 3.0, rect.top() + 3.0), 1.4, accent);
@@ -1740,6 +1780,20 @@ fn collect_rows_for_project(
                     "{} bones / {} controls",
                     rig.nodes.len(),
                     rig.controls.len()
+                ),
+            ),
+            Asset::Model(model) => (
+                project
+                    .asset_names
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Model {id}")),
+                "model",
+                format!(
+                    "{} verts / {} tris / {} clips",
+                    model.data.vertex_count(),
+                    model.data.triangle_count(),
+                    model.data.clips.len()
                 ),
             ),
         };
@@ -2071,6 +2125,11 @@ fn preview_label_for_key(project: &ProjectV2, key: LibraryKey) -> String {
                     .cloned()
                     .unwrap_or_else(|| "Video asset".to_string()),
                 Asset::Rig(_) => "Rig metadata".to_string(),
+                Asset::Model(_) => project
+                    .asset_names
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| "3D model".to_string()),
             })
             .unwrap_or_else(|| "Missing asset".to_string()),
     }
@@ -2126,7 +2185,7 @@ fn collect_asset_color_stats(project: &ProjectV2, asset_id: u16, stats: &mut Pre
         Asset::Bitmap(bitmap) => {
             let pixel_count = bitmap.rgba.len() / 4;
             let stride = (pixel_count / 1024).max(1);
-            for pixel in bitmap.rgba.chunks_exact(4).step_by(stride) {
+            for pixel in bitmap.rgba.as_chunks::<4>().0.iter().step_by(stride) {
                 stats.add(
                     Rgba {
                         r: pixel[0],
@@ -2153,7 +2212,7 @@ fn collect_asset_color_stats(project: &ProjectV2, asset_id: u16, stats: &mut Pre
             };
             let pixel_count = rgba.len() / 4;
             let stride = (pixel_count / 1024).max(1);
-            for pixel in rgba.chunks_exact(4).step_by(stride) {
+            for pixel in rgba.as_chunks::<4>().0.iter().step_by(stride) {
                 stats.add(
                     Rgba {
                         r: pixel[0],
@@ -2163,6 +2222,11 @@ fn collect_asset_color_stats(project: &ProjectV2, asset_id: u16, stats: &mut Pre
                     },
                     1.0,
                 );
+            }
+        }
+        Asset::Model(model) => {
+            for material in &model.data.materials {
+                stats.add(material.color, 1.0);
             }
         }
         Asset::Rig(_) => {}
@@ -2463,7 +2527,7 @@ mod tests {
             asset_id: 2,
             width: 1,
             height: 1,
-            rgba: vec![0, 0, 0, 0],
+            rgba: vec![0, 0, 0, 0].into(),
         });
         assert_eq!(LibraryIcon::for_asset(&vector), LibraryIcon::Vector);
         assert_eq!(LibraryIcon::for_asset(&bitmap), LibraryIcon::Bitmap);
@@ -2488,7 +2552,7 @@ mod tests {
                 asset_id: 8,
                 width: 1,
                 height: 1,
-                rgba: vec![0, 0, 0, 0],
+                rgba: vec![0, 0, 0, 0].into(),
             }));
         app.state
             .project

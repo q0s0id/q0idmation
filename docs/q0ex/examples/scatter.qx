@@ -1,0 +1,64 @@
+# Scatter: shakes the selected objects up, with a window to play in.
+plugin "Scatter" {
+  id = "q0s.scatter"
+  version = "1.0.0"
+  author = "q0s"
+  summary = "Spread, spin and resize the selected objects at random."
+  color = "#facc15"
+}
+
+page ~~~
+# Scatter
+Select some objects, open **Plugins > Scatter > Scatter** and press
+**Shake**. Every object moves, turns and resizes by a random amount up to
+the limits you set.
+
+Each shake is one undo step. The window remembers how many times you shook
+things, even after the editor closes.
+~~~
+
+keep shakes = 0
+
+spread = 40
+spin = 20
+grow = 0.2
+
+fn shake() {
+  picked = project.selection()
+  if len(picked) == 0 {
+    say! "select something first"
+    return
+  }
+  for obj in picked {
+    obj.x += random(-spread, spread)
+    obj.y += random(-spread, spread)
+    obj.rotation += random(-spin, spin)
+    factor = 1 + random(-100, 100) / 100 * grow
+    obj.scale_x *= factor
+    obj.scale_y *= factor
+  }
+  shakes += 1
+}
+
+when window "Scatter" {
+  ui.heading! "Scatter"
+  spread = ui.slider("Spread", spread, 0, 200)
+  spin = ui.slider("Spin", spin, 0, 180)
+  grow = ui.slider("Resize", grow, 0, 1)
+  ui.sep!
+  ui.row! fn() {
+    if ui.button("Shake") {
+      shake()
+    }
+    if ui.button("Reset limits") {
+      spread = 40
+      spin = 20
+      grow = 0.2
+    }
+  }
+  ui.small! `{len(project.selection())} selected · shaken {shakes} times`
+}
+
+when menu "Shake the selection" {
+  shake()
+}

@@ -1,0 +1,12 @@
+[package]
+name = "q0online"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Shared authoritative collaboration protocol and project permissions for q0editor and q0id."
+
+[dependencies]
+q0s-format = { path = "../q0s-format", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"

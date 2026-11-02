@@ -22,7 +22,7 @@ fn range_has_an_ast_and_survives_bytecode_roundtrip() {
     assert!(!compiled.fatal);
     assert!(compiled.diagnostics.is_empty());
     let bytes = compiled.chunk.encode().unwrap();
-    assert_eq!(&bytes[4..6], &2_u16.to_le_bytes());
+    assert_eq!(&bytes[4..6], &q0vm::BYTECODE_VERSION.to_le_bytes());
     let decoded = Chunk::decode(&bytes).unwrap();
     assert_eq!(decoded, compiled.chunk);
     let mut vm = Vm::new();

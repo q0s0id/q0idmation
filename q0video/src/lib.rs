@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod import;
 pub mod q0v;
 

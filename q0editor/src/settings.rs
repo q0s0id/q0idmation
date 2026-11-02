@@ -805,6 +805,76 @@ impl From<CapShape> for BrushCap {
     }
 }
 
+/// How big a gap in its outline the paint bucket closes over.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum GapSize {
+    /// Only areas closed all the way round fill.
+    #[default]
+    None,
+    Small,
+    Medium,
+    Large,
+}
+
+impl GapSize {
+    pub const ALL: [Self; 4] = [Self::None, Self::Small, Self::Medium, Self::Large];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::None => "No gaps",
+            Self::Small => "Small gaps",
+            Self::Medium => "Medium gaps",
+            Self::Large => "Large gaps",
+        }
+    }
+
+    /// The widest gap closed, in stage pixels.
+    pub const fn pixels(self) -> f32 {
+        match self {
+            Self::None => 0.0,
+            Self::Small => 3.0,
+            Self::Medium => 8.0,
+            Self::Large => 18.0,
+        }
+    }
+}
+
+/// Snapping and the drawing tools' own switches.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DrawingAids {
+    /// Points snap to nearby anchors, line ends, crossings, object centres
+    /// and the stage.
+    pub snap: bool,
+    /// The Select tool shows its transform box; off, it only moves things.
+    pub transform_box: bool,
+    /// Rectangles, ovals and lines grow both ways from where the drag
+    /// starts. Alt does the same while held.
+    pub from_middle: bool,
+    pub bucket_gap: GapSize,
+    /// New lines are cut where they cross other lines, so each piece can be
+    /// picked on its own.
+    pub split_crossings: bool,
+    /// How wide a cut the knife leaves, in stage pixels.
+    pub knife_gap: u8,
+    /// The knife cuts along a jagged line instead of the one drawn.
+    pub knife_jagged: bool,
+}
+
+impl Default for DrawingAids {
+    fn default() -> Self {
+        Self {
+            snap: false,
+            transform_box: true,
+            from_middle: false,
+            bucket_gap: GapSize::None,
+            split_crossings: true,
+            knife_gap: 2,
+            knife_jagged: false,
+        }
+    }
+}
+
 /// Serde mirror of [`JoinShape`]: how new strokes turn their corners.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum BrushJoin {
@@ -1129,6 +1199,9 @@ pub struct Settings {
     pub brush: BrushPreferences,
     /// Freehand pencil smoothing, independent of brush settings.
     pub pencil_smoothing: u8,
+    /// Snapping and the drawing tools' own switches.
+    #[serde(default)]
+    pub aids: DrawingAids,
     #[serde(default)]
     pub brush_mode: PersistBrushMode,
     #[serde(default)]
@@ -1156,6 +1229,9 @@ pub struct Settings {
     pub q0lang_show_line_numbers: bool,
     #[serde(default = "default_q0lang_tab_width")]
     pub q0lang_tab_width: u8,
+    /// q0lang editors show the code as blocks (Simple) instead of text.
+    #[serde(default)]
+    pub q0lang_simple: bool,
     /// Most recently opened projects, newest first.
     #[serde(default)]
     pub recent_projects: Vec<PathBuf>,
@@ -1193,6 +1269,9 @@ pub struct Settings {
     pub light_enabled: bool,
     #[serde(default)]
     pub sweeper: crate::sweeper::SweeperSettings,
+    /// Installed plugins that are on, and their settings.
+    #[serde(default)]
+    pub plugins: crate::plugins::PluginPrefs,
 }
 
 fn default_q0lang_font_name() -> String {
@@ -1244,6 +1323,7 @@ impl Default for Settings {
             brush_join: BrushJoin::Round,
             brush: BrushPreferences::default(),
             pencil_smoothing: 50,
+            aids: DrawingAids::default(),
             brush_mode: PersistBrushMode::Classic,
             advanced_brush: AdvancedBrushPreferences::default(),
             advanced_brush_presets: Vec::new(),
@@ -1253,6 +1333,7 @@ impl Default for Settings {
             q0lang_font_name: default_q0lang_font_name(),
             q0lang_font_size: default_q0lang_font_size(),
             q0lang_show_line_numbers: default_q0lang_show_line_numbers(),
+            q0lang_simple: false,
             q0lang_tab_width: default_q0lang_tab_width(),
             recent_projects: Vec::new(),
             last_export_directory: None,
@@ -1267,6 +1348,7 @@ impl Default for Settings {
             particles_enabled: false,
             light_enabled: false,
             sweeper: Default::default(),
+            plugins: Default::default(),
         }
     }
 }

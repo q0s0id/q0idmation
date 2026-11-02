@@ -27,6 +27,7 @@ const LAYOUT_MARK: u16 = u16::MAX;
 const LAYOUT_VERSION: u8 = 3;
 
 #[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PhysicsData {
     /// One world per timeline that has physics.
     pub scenes: Vec<PhysicsScene>,
@@ -173,6 +174,7 @@ impl PhysicsData {
 
 /// How one timeline simulates.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PhysicsScene {
     pub q0rg_id: u16,
     /// Bodies start where the timeline has them on this frame...
@@ -231,6 +233,7 @@ impl PhysicsScene {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum BodyKind {
     /// Falls, bounces and gets pushed around.
     #[default]
@@ -263,6 +266,7 @@ impl BodyKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ColliderShape {
     /// The object's bounds, turning with it.
     #[default]
@@ -321,6 +325,7 @@ impl ColliderShape {
 
 /// How a body is moving on the start frame.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Momentum {
     /// Carry on the way the timeline moved it into the start frame.
     #[default]
@@ -330,6 +335,7 @@ pub enum Momentum {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PhysicsBody {
     pub q0rg_id: u16,
     /// The placed object, the same instance across its keyframes.
@@ -443,6 +449,7 @@ impl PhysicsBody {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum LiquidSource {
     /// The region is full of liquid on the start frame.
     #[default]
@@ -473,6 +480,7 @@ impl LiquidSource {
 /// A body of liquid: many small particles that push apart and cling
 /// together, baked into one filled drawing per frame.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PhysicsLiquid {
     pub q0rg_id: u16,
     pub liquid_id: u16,
@@ -562,6 +570,7 @@ impl PhysicsLiquid {
 
 /// How a link holds two objects together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum LinkKind {
     /// A rope or chain: never longer than its length, slack when shorter.
     /// It sags, swings and drags what hangs on it along.
@@ -605,6 +614,7 @@ impl LinkKind {
 
 /// How a link is drawn in the movie.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum LinkLook {
     /// Not drawn: the objects just behave as if tied.
     Hidden,
@@ -642,6 +652,7 @@ impl LinkLook {
 
 /// Ties object `to` to object `from`, or to a point on the stage.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PhysicsLink {
     pub q0rg_id: u16,
     pub link_id: u16,

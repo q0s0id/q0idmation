@@ -255,8 +255,10 @@ fn sample_to_rgba(
             let source_row = &source[y * source_stride..y * source_stride + row_bytes];
             let destination_row = &mut rgba[y * row_bytes..(y + 1) * row_bytes];
             for (source_pixel, destination_pixel) in source_row
-                .chunks_exact(4)
-                .zip(destination_row.chunks_exact_mut(4))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(destination_row.as_chunks_mut::<4>().0.iter_mut())
             {
                 destination_pixel[0] = source_pixel[2];
                 destination_pixel[1] = source_pixel[1];

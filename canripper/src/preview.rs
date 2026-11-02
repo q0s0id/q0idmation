@@ -8,6 +8,7 @@ use q0video::q0v::Q0vFile;
 use crate::{
     document::{Document, DocumentData, PreviewRef},
     swf::parse_swf,
+    swf_assets,
 };
 
 const MAX_PREVIEW_WIDTH: u32 = 720;
@@ -15,12 +16,21 @@ const MAX_PREVIEW_HEIGHT: u32 = 460;
 const MAX_TEXT_PREVIEW_BYTES: usize = 128 * 1024;
 const MAX_HEX_PREVIEW_BYTES: usize = 4096;
 
-#[derive(Debug, Clone)]
-pub struct VectorPreview {
+/// Paths drawn in one fill and one stroke.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorLayer {
     pub paths: Vec<v2::Path>,
     pub fill: Option<v2::Rgba>,
     pub stroke: Option<v2::Stroke>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VectorPreview {
+    /// Drawn in order, later layers over earlier ones.
+    pub layers: Vec<VectorLayer>,
     pub bounds: (f32, f32, f32, f32),
+    /// The stage colour behind a whole frame.
+    pub background: Option<v2::Rgba>,
     pub caption: String,
 }
 
@@ -75,8 +85,104 @@ pub fn preview_frame_count(document: &Document, reference: &PreviewRef) -> u32 {
         (PreviewRef::Q0vStandaloneVideo, DocumentData::Q0v(media)) => {
             u32::try_from(media.frames.len()).unwrap_or(u32::MAX).max(1)
         }
+        (PreviewRef::SwfTimeline, DocumentData::Swf(movie))
+        | (PreviewRef::SwfTimeline, DocumentData::Projector { movie, .. }) => {
+            u32::from(movie.frame_count).max(1)
+        }
+        (PreviewRef::SwfTag(index), DocumentData::Swf(movie))
+        | (PreviewRef::SwfTag(index), DocumentData::Projector { movie, .. }) => movie
+            .tags
+            .get(*index)
+            .filter(|tag| tag.code == 39)
+            .and_then(|tag| swf_assets::sprite_tags(tag).ok())
+            .map_or(1, |(frames, _)| u32::from(frames).max(1)),
         _ => 1,
     }
+}
+
+/// How fast `reference` plays, in frames a second.
+pub fn preview_fps(document: &Document, reference: &PreviewRef) -> f32 {
+    let fps = match (reference, &document.data) {
+        (
+            PreviewRef::QProjectQ0rg { path, .. } | PreviewRef::QProjectAsset { path, .. },
+            DocumentData::QProject(root),
+        ) => resolve_project(root, path)
+            .map(|resolved| f32::from(resolved.as_project().meta.fps))
+            .unwrap_or(24.0),
+        (PreviewRef::Q0vStandaloneVideo, DocumentData::Q0v(media)) => media.spec.fps as f32,
+        (_, DocumentData::Swf(movie)) | (_, DocumentData::Projector { movie, .. }) => {
+            movie.frame_rate
+        }
+        _ => 24.0,
+    };
+    if fps.is_finite() && fps >= 1.0 {
+        fps.min(120.0)
+    } else {
+        24.0
+    }
+}
+
+/// The bytes behind a node, for the hex view: a tag's payload, an asset's
+/// data, or else the whole file; with where they start and what they are.
+pub fn node_bytes<'a>(
+    document: &'a Document,
+    reference: Option<&PreviewRef>,
+) -> (std::borrow::Cow<'a, [u8]>, usize, String) {
+    use std::borrow::Cow;
+    match (reference, &document.data) {
+        (Some(PreviewRef::SwfTag(index)), DocumentData::Swf(movie))
+        | (Some(PreviewRef::SwfTag(index)), DocumentData::Projector { movie, .. }) => {
+            if let Some(tag) = movie.tags.get(*index) {
+                return (
+                    Cow::Borrowed(&tag.payload),
+                    tag.payload_offset,
+                    format!("{} payload • offsets in the uncompressed movie", tag.name),
+                );
+            }
+        }
+        (Some(PreviewRef::QProjectAsset { path, asset_id, .. }), DocumentData::QProject(root)) => {
+            if let Ok(resolved) = resolve_project(root, path) {
+                match resolved
+                    .as_project()
+                    .assets
+                    .iter()
+                    .find(|asset| asset.id() == *asset_id)
+                {
+                    Some(Asset::Bitmap(bitmap)) => {
+                        return (
+                            Cow::Owned(bitmap.rgba.to_vec()),
+                            0,
+                            format!("bitmap pixels • {}×{} RGBA", bitmap.width, bitmap.height),
+                        )
+                    }
+                    Some(Asset::Q0v(media)) => {
+                        return (Cow::Owned(media.bytes.to_vec()), 0, "q0v media".to_string())
+                    }
+                    _ => {}
+                }
+            }
+        }
+        (Some(PreviewRef::QProjectEmbedded { path, node_id }), DocumentData::QProject(root)) => {
+            if let Ok(resolved) = resolve_project(root, path) {
+                let embedded = resolved
+                    .as_project()
+                    .runtime
+                    .project_graph
+                    .nodes
+                    .iter()
+                    .find(|node| node.node_id == *node_id)
+                    .and_then(|node| match &node.source {
+                        ProjectDependencySource::Embedded(bytes) => Some(bytes.to_vec()),
+                        ProjectDependencySource::External(_) => None,
+                    });
+                if let Some(bytes) = embedded {
+                    return (Cow::Owned(bytes), 0, "embedded file".to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+    (Cow::Borrowed(&document.bytes), 0, "whole file".to_string())
 }
 
 pub fn build_preview(
@@ -145,11 +251,17 @@ pub fn build_preview(
         (PreviewRef::Q0vStandaloneAudio, DocumentData::Q0v(media)) => {
             preview_q0v_media(media, frame, true)
         }
-        (PreviewRef::SwfTag(index), DocumentData::Swf(movie)) => {
+        (PreviewRef::SwfTag(index), DocumentData::Swf(movie))
+        | (PreviewRef::SwfTag(index), DocumentData::Projector { movie, .. }) => {
             preview_swf_tag(movie, *index, frame)
         }
-        (PreviewRef::SwfTag(index), DocumentData::Projector { movie, .. }) => {
-            preview_swf_tag(movie, *index, frame)
+        (PreviewRef::SwfTimeline, DocumentData::Swf(movie))
+        | (PreviewRef::SwfTimeline, DocumentData::Projector { movie, .. }) => {
+            preview_swf_frame(movie, frame, true)
+        }
+        (PreviewRef::SwfFrame(at), DocumentData::Swf(movie))
+        | (PreviewRef::SwfFrame(at), DocumentData::Projector { movie, .. }) => {
+            preview_swf_frame(movie, *at, false)
         }
         _ => Err("selected tree node does not belong to this document".to_string()),
     }
@@ -227,7 +339,7 @@ fn preview_project_asset(
         Asset::Bitmap(bitmap) => Ok(PreviewContent::Image {
             width: usize::from(bitmap.width),
             height: usize::from(bitmap.height),
-            rgba: bitmap.rgba.clone(),
+            rgba: bitmap.rgba.to_vec(),
             caption: format!("bitmap #{asset_id} • {}×{}", bitmap.width, bitmap.height),
         }),
         Asset::Vector(_) => preview_vector_asset(project, asset_id),
@@ -236,6 +348,17 @@ fn preview_project_asset(
                 .map_err(|error| format!("parse embedded q0v: {error}"))?;
             preview_q0v_media(&media, frame, !media.spec.video)
         }
+        Asset::Model(model) => Ok(PreviewContent::Text {
+            text: format!(
+                "3D model #{asset_id}\nmeshes: {}\nvertices: {}\ntriangles: {}\nnodes: {}\nclips: {}",
+                model.data.meshes.len(),
+                model.data.vertex_count(),
+                model.data.triangle_count(),
+                model.data.nodes.len(),
+                model.data.clips.len()
+            ),
+            caption: "3D model".to_string(),
+        }),
         Asset::Rig(rig) => Ok(PreviewContent::Text {
             text: format!(
                 "rig asset #{asset_id}\nowner q0rg: {}\nnodes: {}\ncontrols: {}\nconstraints: {}\nchannels: {}\ndeformers: {}\nvariants: {}",
@@ -263,10 +386,13 @@ fn preview_vector_asset(project: &ProjectV2, asset_id: u16) -> Result<PreviewCon
     };
     let bounds = vector_source_bounds(vector).unwrap_or((0.0, 0.0, 1.0, 1.0));
     Ok(PreviewContent::Vector(VectorPreview {
-        paths: vector.paths.clone(),
-        fill: vector.fill,
-        stroke: vector.stroke,
+        layers: vec![VectorLayer {
+            paths: vector.paths.clone(),
+            fill: vector.fill,
+            stroke: vector.stroke,
+        }],
         bounds,
+        background: None,
         caption: format!("vector asset #{asset_id} • live vector geometry"),
     }))
 }
@@ -359,7 +485,7 @@ fn preview_q0v_media(
 ) -> Result<PreviewContent, String> {
     if media.spec.audio && (prefer_audio || !media.spec.video) {
         return Ok(waveform_preview(
-            media.audio_pcm_le_bytes(),
+            media.audio_pcm_le_bytes()?,
             media.spec.audio_channels,
             media.spec.audio_sample_rate,
         ));
@@ -477,28 +603,204 @@ fn preview_embedded_bytes(name: &str, bytes: &[u8], frame: u32) -> Result<Previe
     })
 }
 
+fn swf_movie_background(movie: &crate::swf::SwfMovie) -> Option<v2::Rgba> {
+    movie
+        .tags
+        .iter()
+        .find(|tag| tag.code == 9)
+        .and_then(|tag| swf_assets::Reader::new(&tag.payload).rgb().ok())
+}
+
+fn preview_swf_frame(
+    movie: &crate::swf::SwfMovie,
+    frame: u32,
+    timeline: bool,
+) -> Result<PreviewContent, String> {
+    let library = swf_assets::Library::new(movie);
+    let frames = u32::from(movie.frame_count).max(1);
+    let frame = frame.min(frames - 1);
+    let layers = library.draw_frame(frame)?;
+    let paths: usize = layers.iter().map(|layer| layer.paths.len()).sum();
+    Ok(PreviewContent::Vector(VectorPreview {
+        layers,
+        bounds: (0.0, 0.0, movie.width_px.max(1.0), movie.height_px.max(1.0)),
+        background: swf_movie_background(movie),
+        caption: format!(
+            "{} {} of {frames} • {paths} paths • bitmaps, text and filters are not drawn",
+            if timeline { "timeline frame" } else { "frame" },
+            frame + 1
+        ),
+    }))
+}
+
 fn preview_swf_tag(
     movie: &crate::swf::SwfMovie,
     index: usize,
     frame: u32,
 ) -> Result<PreviewContent, String> {
+    use swf_assets::Category;
     let tag = movie
         .tags
-        .iter()
-        .find(|tag| tag.index == index)
+        .get(index)
+        .filter(|tag| tag.index == index)
         .ok_or_else(|| format!("swf tag {index} is missing"))?;
-    match tag.code {
-        21 if tag.payload.len() > 2 => preview_embedded_bytes(tag.name, &tag.payload[2..], frame),
-        87 if tag.payload.len() > 6 => preview_embedded_bytes(tag.name, &tag.payload[6..], frame),
-        _ => Ok(PreviewContent::Text {
-            text: hex_preview(&tag.payload),
-            caption: format!(
-                "swf tag {} [{}] • {} bytes",
-                tag.name,
-                tag.code,
-                tag.payload.len()
-            ),
-        }),
+    let library = swf_assets::Library::new(movie);
+    let id = swf_assets::character_id(tag);
+    let named = id
+        .and_then(|id| library.name(id))
+        .map(|name| format!(" “{name}”"))
+        .unwrap_or_default();
+    match swf_assets::Category::of(tag.code) {
+        Category::Shape | Category::Sprite | Category::Button => {
+            let layers = library.draw(tag, frame)?;
+            let Some(bounds) = swf_assets::layer_bounds(&layers) else {
+                return Ok(PreviewContent::Text {
+                    text: "(nothing to draw)".to_string(),
+                    caption: format!("{}{named} draws nothing here", tag.name),
+                });
+            };
+            let what = match tag.code {
+                39 => format!("sprite frame {}", frame + 1),
+                7 | 34 => "button, up state".to_string(),
+                _ => "shape".to_string(),
+            };
+            Ok(PreviewContent::Vector(VectorPreview {
+                layers,
+                bounds: (bounds.x_min, bounds.y_min, bounds.x_max, bounds.y_max),
+                background: None,
+                caption: format!("{} ({}){named} • {what}", tag.name, id.unwrap_or(0)),
+            }))
+        }
+        Category::Image => {
+            let (width, height, rgba) = library.decode_image(tag)?;
+            Ok(PreviewContent::Image {
+                width: width as usize,
+                height: height as usize,
+                rgba,
+                caption: format!(
+                    "{} ({}){named} • {width}×{height}",
+                    tag.name,
+                    id.unwrap_or(0)
+                ),
+            })
+        }
+        Category::Sound => {
+            let sound = swf_assets::parse_sound(tag)?;
+            let data = tag.payload.get(sound.data_at..).unwrap_or(&[]);
+            if sound.format == 3 && sound.sixteen_bit {
+                return Ok(waveform_preview(
+                    data,
+                    if sound.stereo { 2 } else { 1 },
+                    sound.rate,
+                ));
+            }
+            Ok(PreviewContent::Text {
+                text: format!(
+                    "sound {}
+format: {}
+rate: {} Hz
+sample size: {} bit
+channels: {}
+samples: {}
+duration: {:.2} s
+
+export it to listen: {}",
+                    sound.id,
+                    sound.format_name(),
+                    sound.rate,
+                    if sound.sixteen_bit { 16 } else { 8 },
+                    if sound.stereo { 2 } else { 1 },
+                    sound.samples,
+                    f64::from(sound.samples) / f64::from(sound.rate.max(1)),
+                    sound.file(tag).0
+                ),
+                caption: format!("{} ({}){named}", tag.name, sound.id),
+            })
+        }
+        Category::Text if tag.code == 37 => {
+            let text = swf_assets::parse_edit_text(tag)?;
+            Ok(PreviewContent::Text {
+                text: format!(
+                    "variable: {}
+html: {}
+font size: {}
+colour: {}
+
+{}",
+                    if text.variable.is_empty() {
+                        "(none)"
+                    } else {
+                        &text.variable
+                    },
+                    text.html,
+                    text.font_height
+                        .map_or("-".to_string(), |h| format!("{h} px")),
+                    text.color.map_or("-".to_string(), |c| format!(
+                        "#{:02x}{:02x}{:02x}{:02x}",
+                        c.r, c.g, c.b, c.a
+                    )),
+                    text.text.unwrap_or_default()
+                ),
+                caption: format!("{} ({}){named} • edit text", tag.name, text.id),
+            })
+        }
+        Category::Script => {
+            if let Some(code) = swf_assets::action_code(tag) {
+                return Ok(PreviewContent::Text {
+                    text: swf_assets::disassemble(code),
+                    caption: format!("{} • AS1/2 P-code • {} bytes", tag.name, code.len()),
+                });
+            }
+            match swf_assets::abc_strings(tag) {
+                Ok((name, strings)) => Ok(PreviewContent::Text {
+                    text: format!(
+                        "AS3 bytecode block {}
+{} strings in its constant pool:
+
+{}",
+                        if name.is_empty() { "(unnamed)" } else { &name },
+                        strings.len(),
+                        strings.join("\n")
+                    ),
+                    caption: format!(
+                        "{} • ActionScript 3 • {} bytes",
+                        tag.name,
+                        tag.payload.len()
+                    ),
+                }),
+                Err(_) => Ok(hex_tag(tag)),
+            }
+        }
+        Category::BinaryData if tag.payload.len() > 6 => {
+            preview_embedded_bytes(tag.name, &tag.payload[6..], frame).or_else(|_| Ok(hex_tag(tag)))
+        }
+        _ => match tag.code {
+            77 => Ok(PreviewContent::Text {
+                text: text_preview(&tag.payload),
+                caption: "Metadata • XMP".to_string(),
+            }),
+            56 | 76 => Ok(PreviewContent::Text {
+                text: swf_assets::exported_names(tag)
+                    .into_iter()
+                    .map(|(id, name)| format!("{id}\t{name}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                caption: format!("{} • character names", tag.name),
+            }),
+            _ => Ok(hex_tag(tag)),
+        },
+    }
+}
+
+fn hex_tag(tag: &crate::swf::SwfTag) -> PreviewContent {
+    PreviewContent::Text {
+        text: hex_preview(&tag.payload),
+        caption: format!(
+            "swf tag {} [{}] • {} bytes",
+            tag.name,
+            tag.code,
+            tag.payload.len()
+        ),
     }
 }
 
@@ -506,7 +808,7 @@ fn waveform_preview(pcm: &[u8], channels: u16, sample_rate: u32) -> PreviewConte
     const WIDTH: usize = 720;
     const HEIGHT: usize = 180;
     let mut rgba = vec![0u8; WIDTH * HEIGHT * 4];
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0.iter_mut() {
         pixel.copy_from_slice(&[18, 18, 18, 255]);
     }
     let center = HEIGHT / 2;
@@ -815,7 +1117,9 @@ mod tests {
 
     fn image_has_visible_alpha(preview: PreviewContent) -> bool {
         match preview {
-            PreviewContent::Image { rgba, .. } => rgba.chunks_exact(4).any(|pixel| pixel[3] != 0),
+            PreviewContent::Image { rgba, .. } => {
+                rgba.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0)
+            }
             PreviewContent::Vector(_) | PreviewContent::Text { .. } => false,
         }
     }
@@ -828,14 +1132,14 @@ mod tests {
             panic!("vector preview became a bitmap/text preview");
         };
         assert_eq!(
-            vector.paths,
+            vector.layers[0].paths,
             match &project.assets[0] {
                 Asset::Vector(asset) => asset.paths.clone(),
                 _ => unreachable!(),
             }
         );
         assert_eq!(
-            vector.fill,
+            vector.layers[0].fill,
             Some(v2::Rgba {
                 r: 240,
                 g: 40,
@@ -843,7 +1147,7 @@ mod tests {
                 a: 255
             })
         );
-        assert!(vector.stroke.is_none());
+        assert!(vector.layers[0].stroke.is_none());
     }
 
     #[test]

@@ -23,8 +23,8 @@ pub struct Settings {
     pub viewport_h: u32,
     pub recent: Vec<PathBuf>,
     pub loop_playback: bool,
-    pub show_left_panel: bool,
-    pub show_right_panel: bool,
+    /// Keep the bottom playback bar visible for movies without q0lang.
+    pub pin_transport: bool,
     /// Global UI text size in points. egui's stock 14pt was too small
     /// for q0player's dense panels, so the player owns this as a first-class
     /// setting instead of relying on OS scaling alone.
@@ -68,8 +68,7 @@ impl Default for Settings {
             viewport_h: 360,
             recent: Vec::new(),
             loop_playback: true,
-            show_left_panel: !cfg!(target_os = "android"),
-            show_right_panel: !cfg!(target_os = "android"),
+            pin_transport: false,
             text_size_points: default_text_size_points(),
             auto_resolution: true,
             supersample: 2,

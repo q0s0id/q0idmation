@@ -168,7 +168,9 @@ fn read_utf16_ascii_runs(bytes: &[u8]) -> Vec<(usize, String)> {
             continue;
         };
         let units: Vec<u16> = raw
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect();
         let value = String::from_utf16_lossy(&units);

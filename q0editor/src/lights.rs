@@ -11,6 +11,7 @@
 use egui::{Color32, Context, Painter, RichText, Stroke, Ui};
 use q0s_format::lighting::{Light, LightKind, LightSetup};
 use q0s_format::runtime_scene::RuntimeSceneState;
+use q0s_format::transform::Follow;
 use q0s_format::v2::{ProjectV2, Rgba, Vec2};
 
 use crate::app::EditorApp;
@@ -44,8 +45,6 @@ struct LightDrag {
     light_id: u16,
     grip: Grip,
     press: Vec2,
-    /// Where the light was, as stored (offset for followers).
-    position: [f32; 2],
     /// Where the light's centre is on the stage.
     centre: [f32; 2],
 }
@@ -56,21 +55,29 @@ fn rgba(r: u8, g: u8, b: u8) -> Rgba {
     Rgba { r, g, b, a: 255 }
 }
 
-/// Where a followed object's middle is on `frame`.
-fn anchor(project: &ProjectV2, q0rg_id: u16, frame: u16, instance_id: u32) -> Option<[f32; 2]> {
-    q0s_format::raster::runtime_instance_metrics(
+/// Where a followed object's middle is on `frame`, and how it is turned.
+fn anchor(project: &ProjectV2, q0rg_id: u16, frame: u16, instance_id: u32) -> Option<Follow> {
+    q0s_format::raster::runtime_instance_follow(
         project,
         q0rg_id,
         frame,
         instance_id,
         &RuntimeSceneState::new(),
+        None,
     )
-    .map(|metrics| {
-        [
-            (metrics.left + metrics.right) * 0.5,
-            (metrics.top + metrics.bottom) * 0.5,
-        ]
-    })
+}
+
+/// What `light` follows on `frame`: `None` for a light that stays put,
+/// `Some(None)` when its object is not on the stage.
+fn light_anchor(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    light: &Light,
+    frame: u16,
+) -> Option<Option<Follow>> {
+    light
+        .follow
+        .map(|instance_id| anchor(project, q0rg_id, frame, instance_id))
 }
 
 /// `light` as it is on `frame`: its keys played into its plain values.
@@ -90,14 +97,20 @@ fn on_frame(light: &Light, frame: u16) -> Light {
 /// Where `light`'s centre is on the stage on `frame`.
 fn light_centre(project: &ProjectV2, q0rg_id: u16, light: &Light, frame: u16) -> Option<[f32; 2]> {
     let shown = on_frame(light, frame);
-    let [x, y] = shown.position;
-    match light.follow {
-        Some(instance_id) => {
-            let [ax, ay] = anchor(project, q0rg_id, frame, instance_id)?;
-            Some([ax + x, ay + y])
-        }
-        None => Some([x, y]),
+    match light_anchor(project, q0rg_id, light, frame) {
+        Some(anchor) => Some(anchor?.place(shown.position)),
+        None => Some(shown.position),
     }
+}
+
+/// `light` on `frame` as the stage shows it: a follower's aim turned with
+/// its object.
+fn on_stage(project: &ProjectV2, q0rg_id: u16, light: &Light, frame: u16) -> Light {
+    let mut shown = on_frame(light, frame);
+    if let Some(Some(anchor)) = light_anchor(project, q0rg_id, light, frame) {
+        shown.direction = anchor.turn_degrees(shown.direction);
+    }
+    shown
 }
 
 /// Stores `light` into `q0rg_id`'s setup. A light with keys keys the
@@ -438,14 +451,19 @@ fn render_contents(app: &mut EditorApp, ui: &mut Ui) {
             render_light(app, ui, &mut edit, &mut shown, mode, dim);
             if edit.follow_selection {
                 if let Some(instance_id) = follow_target(app, q0rg_id) {
-                    // The light keeps its place, now as an offset from the
-                    // object's middle.
-                    if let Some([ax, ay]) = anchor(&app.state.project, q0rg_id, frame, instance_id)
-                    {
-                        shown.position = [shown.position[0] - ax, shown.position[1] - ay];
-                        if shown.position[0].hypot(shown.position[1]) > 400.0 {
-                            shown.position = [0.0, 0.0];
-                        }
+                    // The light keeps its place and aim, now as an offset
+                    // and heading in the object's own space.
+                    if let Some(anchor) = anchor(&app.state.project, q0rg_id, frame, instance_id) {
+                        let away = [
+                            shown.position[0] - anchor.point[0],
+                            shown.position[1] - anchor.point[1],
+                        ];
+                        shown.position = if away[0].hypot(away[1]) > 400.0 {
+                            [0.0, 0.0]
+                        } else {
+                            anchor.offset_of(shown.position)
+                        };
+                        shown.direction = anchor.unturn_degrees(shown.direction);
                     }
                     shown.follow = Some(instance_id);
                     edit.snapshot = true;
@@ -800,6 +818,11 @@ fn render_light(
                         .unwrap_or_else(|| format!("object {instance_id}"));
                     ui.label(name);
                     if ui.small_button("Let go").clicked() {
+                        if let Some(Some(anchor)) =
+                            light_anchor(&app.state.project, q0rg_id, light, frame)
+                        {
+                            light.direction = anchor.turn_degrees(light.direction);
+                        }
                         if let Some(centre) =
                             light_centre(&app.state.project, q0rg_id, light, frame)
                         {
@@ -942,7 +965,7 @@ pub fn paint_stage_overlay(app: &EditorApp, painter: &Painter, view: &StageView)
         let Some(centre) = light_centre(&app.state.project, q0rg_id, light, frame) else {
             continue;
         };
-        let shown = on_frame(light, frame);
+        let shown = on_stage(&app.state.project, q0rg_id, light, frame);
         let selected = app.session.lights.selected == Some(light.light_id);
         let lamp = Color32::from_rgb(shown.color.r, shown.color.g, shown.color.b);
         let color = if selected {
@@ -1016,9 +1039,8 @@ pub fn paint_stage_overlay(app: &EditorApp, painter: &Painter, view: &StageView)
                     }
                 }
             }
-            if light.follow.is_some() {
-                let [x, y] = shown.position;
-                let object = view.stage_to_screen(Vec2::new(centre[0] - x, centre[1] - y));
+            if let Some(Some(anchor)) = light_anchor(&app.state.project, q0rg_id, light, frame) {
+                let object = view.stage_to_screen(Vec2::new(anchor.point[0], anchor.point[1]));
                 painter.line_segment(
                     [object, at],
                     Stroke::new(1.0_f32, color.gamma_multiply(0.6)),
@@ -1064,9 +1086,11 @@ pub fn handle_stage(
     let Some(centre) = light_centre(&app.state.project, q0rg_id, &light, frame) else {
         return false;
     };
+    let follow = light_anchor(&app.state.project, q0rg_id, &light, frame).flatten();
+    let staged = on_stage(&app.state.project, q0rg_id, &light, frame);
     let shown = on_frame(&light, frame);
     let near = |screen: egui::Pos2| {
-        grips(&shown, centre)
+        grips(&staged, centre)
             .into_iter()
             .map(|(grip, point)| (grip, view.stage_to_screen(point).distance(screen)))
             .filter(|(_, distance)| *distance <= 10.0)
@@ -1085,7 +1109,6 @@ pub fn handle_stage(
                 light_id: light.light_id,
                 grip,
                 press: view.screen_to_stage(press),
-                position: shown.position,
                 centre,
             });
             return true;
@@ -1113,10 +1136,16 @@ pub fn handle_stage(
     let mut changed = shown.clone();
     match drag.grip {
         Grip::Move => {
-            changed.position = [
-                drag.position[0] + cursor.x - drag.press.x,
-                drag.position[1] + cursor.y - drag.press.y,
+            let moved = [
+                drag.centre[0] + cursor.x - drag.press.x,
+                drag.centre[1] + cursor.y - drag.press.y,
             ];
+            // A follower stores where it sits on its object, in the
+            // object's own space.
+            changed.position = match follow {
+                Some(anchor) => anchor.offset_of(moved),
+                None => moved,
+            };
             if snap {
                 changed.position = changed.position.map(f32::round);
             }
@@ -1135,7 +1164,10 @@ pub fn handle_stage(
             if snap {
                 degrees = (degrees / 15.0).round() * 15.0;
             }
-            changed.direction = degrees;
+            changed.direction = match follow {
+                Some(anchor) => anchor.unturn_degrees(degrees),
+                None => degrees,
+            };
         }
     }
     if changed != shown {

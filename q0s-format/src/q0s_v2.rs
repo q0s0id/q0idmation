@@ -15,9 +15,12 @@
 //! Animate-style project scenes, v29 library folders, and v30 timeline masks.
 //! v33 adds instance tint color/amount, mirroring q1s v34.
 //! v34 adds non-destructive audio cuts, source offsets, balance and fades.
-//! Older revisions remain readable.
+//! v42 packs the file: after the header come the q1s body version and the
+//! body's length, then the body deflated, with vector paths packed. Older
+//! revisions remain readable.
 
 use crate::error::Error;
+use crate::io::Cursor;
 #[cfg(test)]
 use crate::v2::Q1S_V2_MAGIC;
 use crate::v2::{self, ProjectV2};
@@ -67,12 +70,39 @@ pub const Q0S_VERSION_PHYSICS: u16 = 39;
 /// Body of q1s v41: liquids, live physics and particle emitters.
 pub const Q0S_VERSION_PARTICLES: u16 = 40;
 pub const Q0S_VERSION_TRANSFORM_PIVOTS: u16 = 41;
-pub const Q0S_VERSION_CURRENT: u16 = Q0S_VERSION_TRANSFORM_PIVOTS;
+/// Deflated body with packed vector paths: a fraction of the size.
+pub const Q0S_VERSION_PACKED: u16 = 42;
+pub const Q0S_VERSION_CURRENT: u16 = Q0S_VERSION_PACKED;
 
-/// Serialise a `ProjectV2` as the current vector `.q0s` bytes. Internally we
-/// reuse the current `.q1s` writer and patch the magic+version header in-place
-/// so the player can tell `.q0s` apart from `.q1s`.
+/// The most a packed body may inflate to.
+const MAX_PACKED_BODY: usize = 1 << 30;
+
+/// Serialise a `ProjectV2` as the current vector `.q0s` bytes: the `.q1s`
+/// body with packed paths, deflated behind a q0s header.
 pub fn write_q0s_v2(project: &ProjectV2) -> Result<Vec<u8>, Error> {
+    let body = v2::write_with(project, true)?;
+    if body.len() < 6 {
+        return Err(Error::Validation("v2 writer returned a short buffer"));
+    }
+    let body_version = u16::from_le_bytes([body[4], body[5]]);
+    let raw = &body[6..];
+    if raw.len() > MAX_PACKED_BODY {
+        return Err(Error::Overflow("q0s body exceeds 1 GiB"));
+    }
+    let packed = miniz_oxide::deflate::compress_to_vec(raw, 8);
+    let mut out = Vec::with_capacity(12 + packed.len());
+    out.extend_from_slice(&Q0S_V2_MAGIC);
+    out.extend_from_slice(&Q0S_VERSION_PACKED.to_le_bytes());
+    out.extend_from_slice(&body_version.to_le_bytes());
+    out.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+    out.extend_from_slice(&packed);
+    Ok(out)
+}
+
+/// The unpacked `.q0s` layout before v42: the `.q1s` bytes with the magic
+/// and version swapped. Kept so tests can check older files still play.
+#[cfg(test)]
+fn write_unpacked_q0s(project: &ProjectV2) -> Result<Vec<u8>, Error> {
     let mut bytes = v2::write(project)?;
     if bytes.len() < 6 {
         return Err(Error::Validation("v2 writer returned a short buffer"));
@@ -120,6 +150,7 @@ pub fn parse_q0s_v2(bytes: &[u8]) -> Result<ProjectV2, Error> {
     }
     let version = u16::from_le_bytes([bytes[4], bytes[5]]);
     match version {
+        Q0S_VERSION_PACKED => parse_packed(bytes),
         Q0S_V2_VERSION => v2::parse_body_after_header(bytes, v2::Q1S_VERSION_SKEW),
         Q0S_VERSION_KEYFRAMES => v2::parse_body_after_header(bytes, v2::Q1S_VERSION_KEYFRAMES),
         Q0S_VERSION_ASSET_NAMES => v2::parse_body_after_header(bytes, v2::Q1S_VERSION_ASSET_NAMES),
@@ -216,6 +247,42 @@ pub fn parse_q0s_v2(bytes: &[u8]) -> Result<ProjectV2, Error> {
     }
 }
 
+fn parse_packed(bytes: &[u8]) -> Result<ProjectV2, Error> {
+    let mut c = Cursor::new(bytes);
+    c.read_exact(6)?;
+    let body_version = c.read_u16()?;
+    if !v2::is_known_version(body_version) {
+        return Err(Error::UnsupportedVersion(body_version));
+    }
+    let len = c.read_u32()? as usize;
+    let offset = bytes.len() - c.remaining();
+    let packed = c.read_exact(c.remaining())?;
+    // Deflate shrinks at most about a thousandfold, so a size past that is
+    // a lie, and is not allocated.
+    if len > MAX_PACKED_BODY || len > packed.len().saturating_mul(1032).saturating_add(64) {
+        return Err(Error::Validation("q0s body is too large"));
+    }
+    let mut body = vec![0; len];
+    let mut state =
+        miniz_oxide::inflate::stream::InflateState::new_boxed(miniz_oxide::DataFormat::Raw);
+    let result = miniz_oxide::inflate::stream::inflate(
+        &mut state,
+        packed,
+        &mut body,
+        miniz_oxide::MZFlush::Finish,
+    );
+    if result.status != Ok(miniz_oxide::MZStatus::StreamEnd) || result.bytes_written != len {
+        return Err(Error::Validation("q0s body is damaged"));
+    }
+    if result.bytes_consumed != packed.len() {
+        return Err(Error::TrailingBytes {
+            offset: offset + result.bytes_consumed,
+            remaining: packed.len() - result.bytes_consumed,
+        });
+    }
+    v2::parse_body_bytes(&body, body_version)
+}
+
 /// Quick-check: is this byte buffer a `.q0s` v2 file? Used by the player
 /// when it first opens a file to decide which loader to call.
 pub fn is_q0s_v2(bytes: &[u8]) -> bool {
@@ -267,6 +334,7 @@ pub fn is_q0s_v2(bytes: &[u8]) -> bool {
             | Q0S_VERSION_PHYSICS
             | Q0S_VERSION_PARTICLES
             | Q0S_VERSION_TRANSFORM_PIVOTS
+            | Q0S_VERSION_PACKED
     )
 }
 
@@ -399,6 +467,215 @@ mod tests {
         }
     }
 
+    /// A drawing on Flash's twentieth-of-a-pixel grid, as FLA imports are.
+    fn gridded_project(shapes: u16) -> ProjectV2 {
+        let mut project = small_project();
+        project.assets = (1..=shapes)
+            .map(|id| {
+                let at = |steps: i32| steps as f32 / 20.0;
+                let point =
+                    |i: i32| Vec2::new(at(i32::from(id) * 37 + i * 13), at((i * i) % 211 - 90));
+                let mut anchors: Vec<Anchor> = (0..60)
+                    .map(|i| Anchor {
+                        point: point(i),
+                        in_handle: None,
+                        out_handle: None,
+                    })
+                    .collect();
+                // Curves as the FLA importer makes them from quadratic
+                // segments, with now and then a handle right on the grid.
+                for i in 0..59 {
+                    let (start, end) = (point(i as i32), point(i as i32 + 1));
+                    match i % 4 {
+                        0 => {}
+                        3 => {
+                            anchors[i].out_handle = Some(Vec2::new(start.x + 0.25, start.y - 1.5));
+                            anchors[i + 1].in_handle = Some(Vec2::new(end.x - 0.35, end.y));
+                        }
+                        // Moved after import: a float step or two off the grid.
+                        2 if id % 2 == 0 => {
+                            let nudge = |value: f32, by: i32| {
+                                if value == 0.0 {
+                                    value
+                                } else {
+                                    f32::from_bits((value.to_bits() as i32 + by) as u32)
+                                }
+                            };
+                            anchors[i].point = Vec2::new(nudge(start.x, 1), nudge(start.y, -2));
+                            anchors[i].out_handle =
+                                Some(Vec2::new(nudge(start.x + 0.5, -1), nudge(start.y, 3)));
+                        }
+                        _ => {
+                            let control = Vec2::new(at(i as i32 * 29 - 300), at(i as i32 * 7 % 50));
+                            let third = |from: Vec2| {
+                                Vec2::new(
+                                    from.x + (control.x - from.x) * (2.0 / 3.0),
+                                    from.y + (control.y - from.y) * (2.0 / 3.0),
+                                )
+                            };
+                            anchors[i].out_handle = Some(third(start));
+                            anchors[i + 1].in_handle = Some(third(end));
+                        }
+                    }
+                }
+                Asset::Vector(VectorAsset {
+                    asset_id: id,
+                    paths: vec![VPath {
+                        anchors,
+                        closed: true,
+                    }],
+                    fill: Some(Rgba {
+                        r: 10,
+                        g: 20,
+                        b: 30,
+                        a: 255,
+                    }),
+                    stroke: None,
+                })
+            })
+            .collect();
+        project
+    }
+
+    #[test]
+    fn packed_paths_come_back_exactly_on_and_off_the_grid() {
+        let mut project = gridded_project(2);
+        let Asset::Vector(vector) = &mut project.assets[1] else {
+            unreachable!()
+        };
+        // Drawn by hand: off the grid, and odd values the grid must not touch.
+        vector.paths.push(VPath {
+            anchors: vec![
+                Anchor {
+                    point: Vec2::new(0.1234567, -98765.43),
+                    in_handle: Some(Vec2::new(-0.0, 1.0e-7)),
+                    out_handle: None,
+                },
+                Anchor {
+                    point: Vec2::new(-0.0, 0.05),
+                    in_handle: None,
+                    out_handle: Some(Vec2::new(3_400_000.0, -3.35)),
+                },
+                Anchor {
+                    point: Vec2::new(-3.35, 12.0),
+                    in_handle: Some(Vec2::new(0.1, 0.2)),
+                    out_handle: Some(Vec2::new(0.3, 0.7)),
+                },
+            ],
+            closed: false,
+        });
+        let bytes = write_q0s_v2(&project).unwrap();
+        let parsed = parse_q0s_v2(&bytes).unwrap();
+        let bits = |project: &ProjectV2| -> Vec<u32> {
+            project
+                .assets
+                .iter()
+                .flat_map(|asset| match asset {
+                    Asset::Vector(vector) => vector.paths.clone(),
+                    _ => Vec::new(),
+                })
+                .flat_map(|path| path.anchors)
+                .flat_map(|anchor| {
+                    [Some(anchor.point), anchor.in_handle, anchor.out_handle]
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|point| [point.x.to_bits(), point.y.to_bits()])
+                })
+                .collect()
+        };
+        assert_eq!(bits(&parsed), bits(&project), "not a bit moved");
+        assert_eq!(parsed, with_scene_table(&project));
+    }
+
+    #[test]
+    fn packed_q0s_is_a_fraction_of_the_unpacked_size() {
+        let project = gridded_project(200);
+        let packed = write_q0s_v2(&project).unwrap();
+        let unpacked = write_unpacked_q0s(&project).unwrap();
+        assert!(
+            packed.len() * 4 < unpacked.len(),
+            "{} packed vs {} unpacked",
+            packed.len(),
+            unpacked.len()
+        );
+        assert_eq!(
+            parse_q0s_v2(&packed).unwrap(),
+            parse_q0s_v2(&unpacked).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_drawing_repeated_as_another_asset_is_stored_once() {
+        let once = gridded_project(1);
+        let mut twice = gridded_project(1);
+        let Asset::Vector(first) = twice.assets[0].clone() else {
+            unreachable!()
+        };
+        // Same paths, another colour: only the paths are shared.
+        twice.assets.push(Asset::Vector(VectorAsset {
+            asset_id: 7,
+            fill: Some(Rgba {
+                r: 1,
+                g: 2,
+                b: 3,
+                a: 4,
+            }),
+            ..first
+        }));
+        let once_bytes = write_q0s_v2(&once).unwrap();
+        let twice_bytes = write_q0s_v2(&twice).unwrap();
+        assert!(
+            twice_bytes.len() < once_bytes.len() + 32,
+            "{} vs {}",
+            twice_bytes.len(),
+            once_bytes.len()
+        );
+        assert_eq!(
+            parse_q0s_v2(&twice_bytes).unwrap(),
+            with_scene_table(&twice)
+        );
+    }
+
+    #[test]
+    fn unpacked_q0s_files_still_play() {
+        let project = gridded_project(3);
+        let bytes = write_unpacked_q0s(&project).unwrap();
+        assert!(is_q0s_v2(&bytes));
+        assert_eq!(parse_q0s_v2(&bytes).unwrap(), with_scene_table(&project));
+    }
+
+    #[test]
+    fn a_damaged_packed_q0s_is_refused_not_misread() {
+        let bytes = write_q0s_v2(&gridded_project(3)).unwrap();
+        assert!(is_q0s_v2(&bytes));
+        for cut in [7, 11, 12, bytes.len() / 2, bytes.len() - 1] {
+            assert!(parse_q0s_v2(&bytes[..cut]).is_err(), "cut at {cut}");
+        }
+        let mut flipped = bytes.clone();
+        let middle = flipped.len() / 2;
+        flipped[middle] ^= 0x5a;
+        // A flipped bit either fails to inflate or fails to parse; it never
+        // panics.
+        let _ = parse_q0s_v2(&flipped);
+        let mut longer = bytes;
+        longer[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(parse_q0s_v2(&longer).is_err());
+    }
+
+    #[test]
+    fn a_packed_q0s_with_trailing_bytes_is_refused() {
+        let mut bytes = write_q0s_v2(&small_project()).unwrap();
+        let end = bytes.len();
+        bytes.extend_from_slice(b"junk");
+        assert_eq!(
+            parse_q0s_v2(&bytes).unwrap_err(),
+            Error::TrailingBytes {
+                offset: end,
+                remaining: 4,
+            }
+        );
+    }
+
     #[test]
     fn q0s_v2_round_trip() {
         let mut project = small_project();
@@ -407,10 +684,7 @@ mod tests {
             .insert(1, "player vector / РіРµСЂРѕР№".to_string());
         let bytes = write_q0s_v2(&project).expect("write");
         assert_eq!(&bytes[0..4], &Q0S_V2_MAGIC);
-        assert_eq!(
-            u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_LAYER_FRAME_COUNTS
-        );
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), Q0S_VERSION_PACKED);
         let parsed = parse_q0s_v2(&bytes).expect("parse");
         assert_eq!(parsed, with_scene_table(&project));
     }
@@ -460,10 +734,7 @@ mod tests {
             },
         );
         let bytes = write_q0s_v2(&project).expect("write gradient q0s");
-        assert_eq!(
-            u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_LAYER_FRAME_COUNTS
-        );
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), Q0S_VERSION_PACKED);
         assert_eq!(
             parse_q0s_v2(&bytes).expect("parse gradient q0s"),
             with_scene_table(&project)
@@ -495,6 +766,7 @@ mod tests {
                 quality: 3,
             }),
             shadow: Some(v2::DropShadowFx {
+                quality: 3,
                 color: v2::Rgba {
                     r: 0,
                     g: 0,
@@ -509,12 +781,10 @@ mod tests {
             audio_gain: 1.0,
             audio_muted: false,
             q0rg_playback: Default::default(),
+            three: None,
         };
         let bytes = write_q0s_v2(&project).expect("write placement fx q0s");
-        assert_eq!(
-            u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_LAYER_FRAME_COUNTS
-        );
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), Q0S_VERSION_PACKED);
         assert_eq!(
             parse_q0s_v2(&bytes).expect("parse placement fx q0s"),
             with_scene_table(&project)
@@ -527,10 +797,7 @@ mod tests {
         project.q0rgs[0].layers[0].placements[0].fx.audio_gain = 0.625;
         project.q0rgs[0].layers[0].placements[0].fx.audio_muted = true;
         let bytes = write_q0s_v2(&project).expect("write audio clip q0s");
-        assert_eq!(
-            u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_LAYER_FRAME_COUNTS
-        );
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), Q0S_VERSION_PACKED);
         assert_eq!(
             parse_q0s_v2(&bytes).expect("parse audio clip q0s"),
             with_scene_table(&project)
@@ -558,10 +825,7 @@ mod tests {
         });
 
         let bytes = write_q0s_v2(&project).expect("write timeline audio q0s");
-        assert_eq!(
-            u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_LAYER_FRAME_COUNTS
-        );
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), Q0S_VERSION_PACKED);
         let parsed = parse_q0s_v2(&bytes).expect("parse timeline audio q0s");
         assert_eq!(parsed, with_scene_table(&project));
         assert_eq!(parsed.audio_clips, project.audio_clips);
@@ -663,10 +927,7 @@ mod tests {
         project.q0rgs[0].layers[0].push_placement(target);
 
         let bytes = write_q0s_v2(&project).expect("write eased q0s");
-        assert_eq!(
-            u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_LAYER_FRAME_COUNTS
-        );
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), Q0S_VERSION_PACKED);
         assert_eq!(
             parse_q0s_v2(&bytes).expect("parse eased q0s"),
             with_scene_table(&project)
@@ -717,10 +978,7 @@ mod tests {
         );
 
         let bytes = write_q0s_v2(&project).expect("write appearance q0s");
-        assert_eq!(
-            u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_LAYER_FRAME_COUNTS
-        );
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), Q0S_VERSION_PACKED);
         assert_eq!(
             parse_q0s_v2(&bytes).expect("parse appearance q0s"),
             with_scene_table(&project)
@@ -777,10 +1035,7 @@ mod tests {
             },
         );
         let bytes = write_q0s_v2(&project).expect("write q0s fragments");
-        assert_eq!(
-            u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_LAYER_FRAME_COUNTS
-        );
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), Q0S_VERSION_PACKED);
         assert_eq!(
             parse_q0s_v2(&bytes).expect("parse q0s fragments"),
             with_scene_table(&project)
@@ -850,10 +1105,7 @@ mod tests {
             },
         );
         let bytes = write_q0s_v2(&project).expect("write affine q0s");
-        assert_eq!(
-            u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_LAYER_FRAME_COUNTS
-        );
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), Q0S_VERSION_PACKED);
         let parsed = parse_q0s_v2(&bytes).expect("parse affine q0s");
         assert_eq!(
             parsed.asset_appearances[&1].field_transform,
@@ -1004,10 +1256,7 @@ mod tests {
         v2::validate(&project).expect("nested q0s fixture");
 
         let bytes = write_q0s_v2(&project).expect("write nested q0s");
-        assert_eq!(
-            u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_LAYER_FRAME_COUNTS
-        );
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), Q0S_VERSION_PACKED);
         assert_eq!(
             parse_q0s_v2(&bytes).expect("parse nested q0s"),
             with_scene_table(&project)
@@ -1045,10 +1294,7 @@ mod tests {
         project.q0rgs[0].layers[0].placements[0].target = Target::Asset(7);
 
         let bytes = write_q0s_v2(&project).expect("write q0v q0s");
-        assert_eq!(
-            u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_LAYER_FRAME_COUNTS
-        );
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), Q0S_VERSION_PACKED);
         assert_eq!(
             parse_q0s_v2(&bytes).expect("parse q0v q0s"),
             with_scene_table(&project)
@@ -1068,7 +1314,7 @@ mod tests {
 
     #[test]
     fn q0s_v2_rejects_nonzero_reserved_flags() {
-        let mut bytes = write_q0s_v2(&small_project()).expect("write");
+        let mut bytes = write_unpacked_q0s(&small_project()).expect("write");
         bytes[6..8].copy_from_slice(&7_u16.to_le_bytes());
 
         assert_eq!(
@@ -1079,7 +1325,7 @@ mod tests {
 
     #[test]
     fn q0s_v2_rejects_trailing_bytes() {
-        let mut bytes = write_q0s_v2(&small_project()).expect("write");
+        let mut bytes = write_unpacked_q0s(&small_project()).expect("write");
         let expected_offset = bytes.len();
         bytes.extend_from_slice(b"junk");
 
@@ -1104,10 +1350,7 @@ mod tests {
         );
 
         let bytes = write_q0s_v2(&project).expect("write layer-state q0s");
-        assert_eq!(
-            u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_LAYER_FRAME_COUNTS
-        );
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), Q0S_VERSION_PACKED);
         let parsed = parse_q0s_v2(&bytes).expect("parse layer-state q0s");
         assert_eq!(parsed, with_scene_table(&project));
         assert!(!parsed.layer_is_visible(1, 1));
@@ -1211,10 +1454,7 @@ mod tests {
         let mut project = small_project();
         add_player_test_rig(&mut project);
         let bytes = write_q0s_v2(&project).expect("write rigged q0s");
-        assert_eq!(
-            u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_LAYER_FRAME_COUNTS
-        );
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), Q0S_VERSION_PACKED);
         assert_eq!(
             parse_q0s_v2(&bytes).expect("parse rigged q0s"),
             with_scene_table(&project)
@@ -1270,10 +1510,7 @@ mod tests {
             end_control: 5,
         });
         let bytes = write_q0s_v2(&project).expect("write deformer q0s");
-        assert_eq!(
-            u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_LAYER_FRAME_COUNTS
-        );
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), Q0S_VERSION_PACKED);
         assert_eq!(
             parse_q0s_v2(&bytes).expect("parse deformer q0s"),
             with_scene_table(&project)
@@ -1326,10 +1563,7 @@ mod tests {
             }],
         });
         let bytes = write_q0s_v2(&project).expect("write phase h q0s");
-        assert_eq!(
-            u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_LAYER_FRAME_COUNTS
-        );
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), Q0S_VERSION_PACKED);
         assert_eq!(
             parse_q0s_v2(&bytes).expect("parse phase h q0s"),
             with_scene_table(&project)
@@ -1363,10 +1597,7 @@ mod tests {
             .insert(v2::InstanceKey::new(1, 77), "actor".into());
 
         let bytes = write_q0s_v2(&project).expect("write project runtime q0s");
-        assert_eq!(
-            u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_LAYER_FRAME_COUNTS
-        );
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), Q0S_VERSION_PACKED);
         assert_eq!(
             parse_q0s_v2(&bytes).expect("parse project runtime q0s"),
             with_scene_table(&project)
@@ -1410,10 +1641,7 @@ mod tests {
             .insert(v2::FrameLabelKey::new(1, 1), "finish".into());
         let bytes = write_q0s_v2(&project).unwrap();
         assert!(is_q0s_v2(&bytes));
-        assert_eq!(
-            u16::from_le_bytes([bytes[4], bytes[5]]),
-            Q0S_VERSION_LAYER_FRAME_COUNTS
-        );
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), Q0S_VERSION_PACKED);
         assert_eq!(parse_q0s_v2(&bytes).unwrap(), with_scene_table(&project));
     }
 }

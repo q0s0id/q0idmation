@@ -114,7 +114,7 @@ pub fn bitmap_from_rgba(
         asset_id,
         width: width as u16,
         height: height as u16,
-        rgba,
+        rgba: rgba.into(),
     })
 }
 
@@ -135,7 +135,7 @@ mod tests {
         let bitmap = decode_bitmap_bytes(&png, 42).expect("decode png");
         assert_eq!(bitmap.asset_id, 42);
         assert_eq!((bitmap.width, bitmap.height), (2, 1));
-        assert_eq!(bitmap.rgba, source.into_raw());
+        assert_eq!(*bitmap.rgba, source.into_raw());
     }
 
     #[test]

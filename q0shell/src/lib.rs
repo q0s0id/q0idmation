@@ -75,6 +75,9 @@ impl ShellHost {
                         "physics, particles and lights run in q0player, not q0shell".to_string(),
                     );
                 }
+                RuntimeAction::Layer(_) | RuntimeAction::Window(_) => {
+                    log.push("layers and the window belong to q0player, not q0shell".to_string());
+                }
             }
         }
         Ok(log)

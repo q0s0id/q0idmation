@@ -1,0 +1,57 @@
+# Hello: the smallest plugin that does a bit of everything.
+plugin "Hello" {
+  id = "q0s.hello"
+  version = "1.0.0"
+  author = "q0s"
+  summary = "Says hello, counts frames and shows off the quirks."
+  color = "#9d4eff"
+}
+
+page ~~~
+# Hello!
+A tour of **q0ex** in one file. Read it in the Plugin Studio's Pro mode.
+
+1. `say!` talks, `print!` writes to the console
+2. `keep` remembers between runs
+3. `later!` and `every!` wait, with real units: `2s`, `250ms`
+4. `a <-> b` swaps, `|>` passes a value along
+~~~
+
+settings {
+  text name "Your name" = "animator"
+  toggle chatty "Say something every 10 seconds" = false
+}
+
+keep visits = 0
+
+when enabled {
+  visits += 1
+  say! `hello, {config.name}! visit number {visits}`
+  later! 2s {
+    print! "two seconds later..."
+  }
+  every! 10s {
+    if config.chatty {
+      say! pick(["keep animating", "nice frames!", "remember to save", "q0ex says hi"])
+    }
+  }
+}
+
+when frame n {
+  if n % 24 == 0 {
+    print! `frame {n}: one more second of animation`
+  }
+}
+
+when menu "Swap and pipe" {
+  a = "left"
+  b = "right"
+  a <-> b
+  numbers = 1..10
+  total = numbers |> filter(fn(x) { return x % 2 == 0 }) |> sum()
+  say! `a is {a}, b is {b}, the even numbers up to 10 add to {total}`
+}
+
+when setting "name" value {
+  say! `nice to meet you, {value}`
+}

@@ -13,8 +13,8 @@
 //! q0s currently targets Windows. The loader still fails gracefully so
 //! non-Windows builds continue to compile.
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use egui::{Context, FontData, FontDefinitions, FontFamily};
 
@@ -140,23 +140,82 @@ const SCRIPT_FALLBACKS: [(&str, u32); 7] = [
     ("/system/fonts/DroidSansFallback.ttf", 0),
 ];
 
+/// egui 0.27 clones owned font bytes both when it keeps the definitions and
+/// when it parses them. The large CJK collections must instead have one stable
+/// backing store. This bounded cache lives as long as egui's borrowed slices.
+static SCRIPT_FALLBACK_DATA: [OnceLock<Option<FallbackFontBytes>>; SCRIPT_FALLBACKS.len()] =
+    [const { OnceLock::new() }; SCRIPT_FALLBACKS.len()];
+
+enum FallbackFontBytes {
+    #[cfg(windows)]
+    Mapped {
+        bytes: memmap2::Mmap,
+        // Keep the share-mode guard alive as long as the borrowed mapping.
+        _file: std::fs::File,
+    },
+    Owned(Box<[u8]>),
+}
+
+impl FallbackFontBytes {
+    fn load(path: &Path) -> std::io::Result<Self> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+
+            // FILE_SHARE_READ permits other readers but prevents writes and
+            // deletion for the entire lifetime of the mapping and its handle.
+            if let Ok(file) = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .open(path)
+            {
+                // SAFETY: the retained file handle denies modification and
+                // truncation. The mapping is read-only and is never dropped
+                // while egui can borrow it from SCRIPT_FALLBACK_DATA.
+                if let Ok(bytes) = unsafe { memmap2::Mmap::map(&file) } {
+                    return Ok(Self::Mapped { bytes, _file: file });
+                }
+            }
+        }
+        // Platforms without mappings, or a file that cannot be mapped, still
+        // read once; cloning FontData never duplicates this shared backing.
+        std::fs::read(path).map(|bytes| Self::Owned(bytes.into_boxed_slice()))
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            #[cfg(windows)]
+            Self::Mapped { bytes, .. } => bytes,
+            Self::Owned(bytes) => bytes,
+        }
+    }
+}
+
+fn script_fallback_bytes(slot: usize) -> Option<&'static [u8]> {
+    SCRIPT_FALLBACK_DATA[slot]
+        .get_or_init(|| {
+            let path = Path::new(SCRIPT_FALLBACKS[slot].0);
+            if path.is_absolute() {
+                FallbackFontBytes::load(path).ok()
+            } else {
+                font_dirs()
+                    .iter()
+                    .find_map(|dir| FallbackFontBytes::load(&dir.join(path)).ok())
+            }
+        })
+        .as_ref()
+        .map(FallbackFontBytes::as_slice)
+}
+
 /// Puts the installed fonts of [`SCRIPT_FALLBACKS`] at the end of every
 /// family, so characters the UI fonts lack still show instead of boxes.
 pub fn add_script_fallbacks(defs: &mut FontDefinitions) {
-    let dirs = font_dirs();
-    for (file, index) in SCRIPT_FALLBACKS {
-        let path = std::path::Path::new(file);
-        let bytes = if path.is_absolute() {
-            std::fs::read(path).ok()
-        } else {
-            dirs.iter()
-                .find_map(|dir| std::fs::read(dir.join(file)).ok())
-        };
-        let Some(bytes) = bytes else {
+    for (slot, (file, index)) in SCRIPT_FALLBACKS.into_iter().enumerate() {
+        let Some(bytes) = script_fallback_bytes(slot) else {
             continue;
         };
         let key = format!("q0_fallback_{file}");
-        let mut data = FontData::from_owned(bytes);
+        let mut data = FontData::from_static(bytes);
         data.index = index;
         defs.font_data.insert(key.clone(), data);
         for family in [FontFamily::Proportional, FontFamily::Monospace] {
@@ -188,4 +247,55 @@ pub fn available_fonts(currently_selected: &str) -> Vec<String> {
     out.sort_by_key(|a| a.to_lowercase());
     out.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn script_fallbacks_share_bytes_across_contexts_and_definition_clones() {
+        let mut first = FontDefinitions::default();
+        add_script_fallbacks(&mut first);
+        let copy = first.clone();
+        let mut second = FontDefinitions::default();
+        add_script_fallbacks(&mut second);
+        for (key, data) in &first.font_data {
+            if !key.starts_with("q0_fallback_") {
+                continue;
+            }
+            assert!(matches!(data.font, std::borrow::Cow::Borrowed(_)));
+            assert!(std::ptr::eq(
+                data.font.as_ref(),
+                copy.font_data[key].font.as_ref()
+            ));
+            assert!(std::ptr::eq(
+                data.font.as_ref(),
+                second.font_data[key].font.as_ref()
+            ));
+        }
+    }
+
+    #[test]
+    fn shared_script_fallbacks_keep_their_glyph_coverage() {
+        let ctx = Context::default();
+        install(&ctx, "Consolas");
+        let _ = ctx.run(Default::default(), |ctx| {
+            ctx.fonts(|fonts| {
+                for (slot, (_, index)) in SCRIPT_FALLBACKS.into_iter().enumerate() {
+                    let Some(bytes) = script_fallback_bytes(slot) else {
+                        continue;
+                    };
+                    let face = ttf_parser::Face::parse(bytes, index).expect("system font");
+                    for ch in "Привет中文日本語한국어♠".chars() {
+                        if face.glyph_index(ch).is_some() {
+                            for family in [FontFamily::Proportional, FontFamily::Monospace] {
+                                assert!(fonts.has_glyph(&egui::FontId::new(13.0, family), ch));
+                            }
+                        }
+                    }
+                }
+            });
+        });
+    }
 }

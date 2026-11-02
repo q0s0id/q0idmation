@@ -1,4 +1,5 @@
 mod authoring;
+pub mod blocks;
 pub mod editor;
 pub mod fonts;
 pub mod frame_editor;

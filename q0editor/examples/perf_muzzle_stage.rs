@@ -155,6 +155,7 @@ fn q0rg_plain_support(
                         q0s_format::v2::Asset::Vector(v) => v.asset_id == id,
                         q0s_format::v2::Asset::Q0v(v) => v.asset_id == id,
                         q0s_format::v2::Asset::Rig(v) => v.asset_id == id,
+                        q0s_format::v2::Asset::Model(v) => v.asset_id == id,
                     }) else {
                         return false;
                     };
@@ -281,6 +282,7 @@ fn q0rg_complex_flags(
                         q0s_format::v2::Asset::Vector(v) => v.asset_id == id,
                         q0s_format::v2::Asset::Q0v(v) => v.asset_id == id,
                         q0s_format::v2::Asset::Rig(v) => v.asset_id == id,
+                        q0s_format::v2::Asset::Model(v) => v.asset_id == id,
                     }) {
                         match a {
                             q0s_format::v2::Asset::Vector(v) => {
@@ -419,7 +421,7 @@ fn main() {
                 let mut nonzero_alpha = 0usize;
                 let mut opaque = 0usize;
                 let mut alpha_max = 0u8;
-                for px in bitmap.rgba.chunks_exact(4) {
+                for px in bitmap.rgba.as_chunks::<4>().0.iter() {
                     alpha_max = alpha_max.max(px[3]);
                     nonzero_alpha += usize::from(px[3] != 0);
                     opaque += usize::from(px[3] == 255);

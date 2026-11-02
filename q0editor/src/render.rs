@@ -318,6 +318,7 @@ struct ClassicBrushPreviewTexture {
     view_transform: Affine,
 }
 
+#[cfg(test)]
 fn preview_polygon_contains(point: Pos2, polygon: &[Pos2]) -> bool {
     if polygon.len() < 3 {
         return false;
@@ -680,7 +681,11 @@ fn geo_segment_distance_sq(point: Point<f64>, start: Coord<f64>, end: Coord<f64>
 }
 
 #[cfg(feature = "appearance-mask-eraser")]
-fn polygon_boundary_near_point(polygon: &Polygon<f64>, point: Vec2, radius: f32) -> bool {
+pub(crate) fn polygon_boundary_near_point(
+    polygon: &Polygon<f64>,
+    point: Vec2,
+    radius: f32,
+) -> bool {
     let point = Point::new(f64::from(point.x), f64::from(point.y));
     let limit_sq = f64::from(radius.max(0.0)).powi(2);
     let ring_near = |ring: &LineString<f64>| {
@@ -901,7 +906,7 @@ struct FxPlacementKey {
 
 struct FxPlacementTexture {
     texture: TextureHandle,
-    crop: [u32; 4],
+    crop: [i32; 4],
     blend_mode: BlendMode,
     raster_translation: Vec2,
     raster_transform: Affine,
@@ -1658,7 +1663,7 @@ impl TextureCache {
                 .entry(asset_id)
                 .or_insert_with(|| vector_conservative_local_bounds(vector)),
             Asset::Vector(vector) => vector_conservative_local_bounds(vector),
-            Asset::Q0v(_) | Asset::Rig(_) => return true,
+            Asset::Q0v(_) | Asset::Rig(_) | Asset::Model(_) => return true,
         };
         let Some(bounds) = bounds else {
             return false;
@@ -1746,6 +1751,26 @@ impl TextureCache {
             .ceil()
             .max(1.0) as usize;
         let size = [width, height];
+        if let Some(preview) = self
+            .classic_brush_preview
+            .as_mut()
+            .filter(|preview| preview.size == size)
+        {
+            preview.pixels.fill(Color32::TRANSPARENT);
+            preview.texture.set(
+                ColorImage {
+                    size,
+                    pixels: preview.pixels.clone(),
+                },
+                TextureOptions::LINEAR,
+            );
+            preview.screen_rect = screen_rect;
+            preview.pixels_per_point = pixels_per_point;
+            preview.view_origin = view.origin;
+            preview.view_scale = view.effective_scale();
+            preview.view_transform = view.screen_transform();
+            return;
+        }
         let image = ColorImage::new(size, Color32::TRANSPARENT);
         let texture = ctx.load_texture("classic_brush_prerender", image, TextureOptions::LINEAR);
         self.classic_brush_preview = Some(ClassicBrushPreviewTexture {
@@ -1795,12 +1820,28 @@ impl TextureCache {
         let Some(preview) = self.classic_brush_preview.as_mut() else {
             return;
         };
-        let width = preview.size[0] as isize;
-        let height = preview.size[1] as isize;
+        let width = preview.size[0];
+        let height = preview.size[1];
         let ppp = preview.pixels_per_point;
         let mut dirty: Option<(usize, usize, usize, usize)> = None;
+        // Collect scanline intervals first. Zooming can put hundreds of
+        // overlapping dabs over the same screen pixels; testing every pixel
+        // against every polygon made this rebuild take seconds in debug.
+        // Merge each row's intervals before painting, preserving replacement
+        // alpha and keeping pixel work bounded by the visible canvas.
+        let mut crossings = vec![Vec::<f32>::new(); height];
+        let mut spans = vec![Vec::<(usize, usize)>::new(); height];
+        let pixel_start = |screen: f32, origin: f32, limit: usize| {
+            (((screen - origin) * ppp - 0.5).ceil() as isize).clamp(0, limit as isize) as usize
+        };
 
         for polygon in polygons.iter().filter(|polygon| polygon.len() >= 3) {
+            if polygon
+                .iter()
+                .any(|point| !point.x.is_finite() || !point.y.is_finite())
+            {
+                continue;
+            }
             let min_x_screen = polygon.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
             let min_y_screen = polygon.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
             let max_x_screen = polygon
@@ -1819,52 +1860,82 @@ impl TextureCache {
                 continue;
             }
 
-            let min_x = (((min_x_screen - preview.screen_rect.min.x) * ppp).floor() as isize - 1)
-                .clamp(0, width.saturating_sub(1));
-            let min_y = (((min_y_screen - preview.screen_rect.min.y) * ppp).floor() as isize - 1)
-                .clamp(0, height.saturating_sub(1));
-            let max_x = (((max_x_screen - preview.screen_rect.min.x) * ppp).ceil() as isize + 1)
-                .clamp(0, width.saturating_sub(1));
-            let max_y = (((max_y_screen - preview.screen_rect.min.y) * ppp).ceil() as isize + 1)
-                .clamp(0, height.saturating_sub(1));
-            if min_x > max_x || min_y > max_y {
+            if max_x_screen <= preview.screen_rect.left()
+                || min_x_screen >= preview.screen_rect.right()
+                || max_y_screen <= preview.screen_rect.top()
+                || min_y_screen >= preview.screen_rect.bottom()
+            {
                 continue;
             }
-
-            #[cfg(test)]
-            {
-                self.classic_preview_candidate_pixels +=
-                    (max_x - min_x + 1) as usize * (max_y - min_y + 1) as usize;
+            let first_y = pixel_start(min_y_screen, preview.screen_rect.top(), height);
+            let end_y = pixel_start(max_y_screen, preview.screen_rect.top(), height);
+            let mut previous = polygon[polygon.len() - 1];
+            for &current in polygon {
+                let dy = previous.y - current.y;
+                if dy.abs() > 1.0e-8 {
+                    let first =
+                        pixel_start(current.y.min(previous.y), preview.screen_rect.top(), height);
+                    let end =
+                        pixel_start(current.y.max(previous.y), preview.screen_rect.top(), height);
+                    for (y, row) in crossings.iter_mut().enumerate().take(end).skip(first) {
+                        let screen_y = preview.screen_rect.top() + (y as f32 + 0.5) / ppp;
+                        row.push(
+                            current.x + (screen_y - current.y) * (previous.x - current.x) / dy,
+                        );
+                    }
+                }
+                previous = current;
             }
-            for y in min_y..=max_y {
-                let screen_y = preview.screen_rect.min.y + (y as f32 + 0.5) / ppp;
-                let row = y as usize * preview.size[0];
-                for x in min_x..=max_x {
-                    let screen_x = preview.screen_rect.min.x + (x as f32 + 0.5) / ppp;
-                    if preview_polygon_contains(pos2(screen_x, screen_y), polygon) {
-                        let pixel = &mut preview.pixels[row + x as usize];
-                        if !transparent_only || *pixel == Color32::TRANSPARENT {
-                            *pixel = color;
+            for y in first_y..end_y {
+                crossings[y].sort_unstable_by(f32::total_cmp);
+                for pair in crossings[y].as_chunks::<2>().0.iter() {
+                    let first = pixel_start(pair[0], preview.screen_rect.left(), width);
+                    let end = pixel_start(pair[1], preview.screen_rect.left(), width);
+                    if first < end {
+                        // Keep the union as we go, rather than retaining an
+                        // interval per historical dab at every visible row.
+                        let row = &mut spans[y];
+                        let start = row.partition_point(|span| span.1 < first);
+                        let mut stop = start;
+                        let mut merged_first = first;
+                        let mut merged_end = end;
+                        while stop < row.len() && row[stop].0 <= merged_end {
+                            merged_first = merged_first.min(row[stop].0);
+                            merged_end = merged_end.max(row[stop].1);
+                            stop += 1;
+                        }
+                        if start == stop {
+                            row.insert(start, (first, end));
+                        } else {
+                            row[start] = (merged_first, merged_end);
+                            row.drain(start + 1..stop);
                         }
                     }
                 }
+                crossings[y].clear();
             }
-
-            let bounds = (
-                min_x as usize,
-                min_y as usize,
-                max_x as usize,
-                max_y as usize,
-            );
-            dirty = Some(match dirty {
-                None => bounds,
-                Some((x0, y0, x1, y1)) => (
-                    x0.min(bounds.0),
-                    y0.min(bounds.1),
-                    x1.max(bounds.2),
-                    y1.max(bounds.3),
-                ),
-            });
+        }
+        for (y, spans) in spans.iter().enumerate() {
+            for &(first, end) in spans {
+                let pixels = &mut preview.pixels[y * width + first..y * width + end];
+                if transparent_only {
+                    for pixel in pixels {
+                        if *pixel == Color32::TRANSPARENT {
+                            *pixel = color;
+                        }
+                    }
+                } else {
+                    pixels.fill(color);
+                }
+                #[cfg(test)]
+                {
+                    self.classic_preview_candidate_pixels += end - first;
+                }
+                dirty = Some(match dirty {
+                    None => (first, y, end - 1, y),
+                    Some((x0, y0, x1, y1)) => (x0.min(first), y0, x1.max(end - 1), y1.max(y)),
+                });
+            }
         }
 
         let Some((x0, y0, x1, y1)) = dirty else {
@@ -2005,6 +2076,126 @@ impl TextureCache {
         for asset_id in asset_ids {
             self.invalidate_asset(asset_id);
         }
+    }
+
+    /// A committed raw translation changes coordinates, not topology. Retain
+    /// the render/selection triangles instead of tessellating them again on
+    /// release and on the next wheel event.
+    pub(crate) fn translate_raw_asset_cache(
+        &mut self,
+        asset_id: u16,
+        delta: Vec2,
+        field_transform: Option<Affine>,
+    ) {
+        let mut render = self.vector_render_by_asset.remove(&asset_id);
+        #[cfg(feature = "appearance-mask-eraser")]
+        let mut stages = self
+            .selection_stage_mesh_by_key
+            .keys()
+            .filter(|key| key.asset_id == asset_id)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter_map(|key| {
+                self.selection_stage_mesh_by_key
+                    .remove(&key)
+                    .map(|value| (key, value))
+            })
+            .collect::<Vec<_>>();
+        #[cfg(feature = "appearance-mask-eraser")]
+        let mut paints = self
+            .selection_paint_by_key
+            .keys()
+            .filter(|key| key.asset_id == asset_id)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter_map(|key| {
+                self.selection_paint_by_key
+                    .remove(&key)
+                    .map(|value| (key, value))
+            })
+            .collect::<Vec<_>>();
+        self.invalidate_asset(asset_id);
+        let offset = egui::vec2(delta.x, delta.y);
+        if let Some(geometry) = render.as_mut() {
+            for point in geometry
+                .fill_vertices
+                .iter_mut()
+                .chain(&mut geometry.stroke_vertices)
+            {
+                point.x += delta.x;
+                point.y += delta.y;
+            }
+            for points in &mut geometry.fill_contours {
+                for point in points {
+                    *point += offset;
+                }
+            }
+            for (points, _) in &mut geometry.stroke_paths {
+                for point in points {
+                    point.x += delta.x;
+                    point.y += delta.y;
+                }
+            }
+            geometry.fill_bounds = geometry.fill_bounds.map(|bounds| bounds.translate(offset));
+        }
+        if let Some(geometry) = render {
+            self.vector_render_by_asset.insert(asset_id, geometry);
+        }
+        #[cfg(feature = "appearance-mask-eraser")]
+        {
+            let field_bits = field_transform.map(|field| {
+                [
+                    field.a11.to_bits(),
+                    field.a12.to_bits(),
+                    field.a21.to_bits(),
+                    field.a22.to_bits(),
+                    field.tx.to_bits(),
+                    field.ty.to_bits(),
+                ]
+            });
+            for (mut key, mut source) in stages.drain(..) {
+                if let Some(bits) = field_bits {
+                    key.field_transform_bits = bits;
+                }
+                for point in &mut source.fill_vertices {
+                    *point += offset;
+                }
+                for stroke in &mut source.strokes {
+                    for point in &mut stroke.contour_stage {
+                        *point += offset;
+                    }
+                    for range in &mut stroke.parametric {
+                        for point in &mut range.base_vertices {
+                            *point += offset;
+                        }
+                    }
+                }
+                self.selection_stage_mesh_by_key.insert(key, source);
+            }
+            for (mut key, mut paint) in paints.drain(..) {
+                if !paint.affine_reprojectable {
+                    continue;
+                }
+                if let Some(bits) = field_bits {
+                    key.field_transform_bits = bits;
+                }
+                let offset = offset * paint.view_scale;
+                for mesh in paint
+                    .meshes
+                    .iter_mut()
+                    .chain(paint.solid_overlay.iter_mut())
+                {
+                    for vertex in &mut Arc::make_mut(mesh).vertices {
+                        vertex.pos += offset;
+                    }
+                }
+                self.selection_paint_by_key.insert(key, paint);
+            }
+        }
+        #[cfg(not(feature = "appearance-mask-eraser"))]
+        let _ = field_transform;
     }
 
     pub(crate) fn audio_waveform(
@@ -2791,7 +2982,7 @@ fn split_cached_fill_remainder(
     let vertex_count = source.fill_vertices.len();
     let mut parent: Vec<usize> = (0..vertex_count).collect();
     let mut rank = vec![0_u8; vertex_count];
-    for triangle in source.fill_indices.chunks_exact(3) {
+    for triangle in source.fill_indices.as_chunks::<3>().0.iter() {
         let [a, b, c] = [
             triangle[0] as usize,
             triangle[1] as usize,
@@ -2805,7 +2996,7 @@ fn split_cached_fill_remainder(
     }
 
     let mut selected_root = vec![None; vertex_count];
-    for triangle in source.fill_indices.chunks_exact(3) {
+    for triangle in source.fill_indices.as_chunks::<3>().0.iter() {
         let a = triangle[0] as usize;
         let root = fill_mesh_find(&mut parent, a);
         if selected_root[root].is_some() {
@@ -2821,7 +3012,7 @@ fn split_cached_fill_remainder(
     let mut remap = vec![u32::MAX; vertex_count];
     let mut fill_vertices = Vec::new();
     let mut fill_indices = Vec::new();
-    for triangle in source.fill_indices.chunks_exact(3) {
+    for triangle in source.fill_indices.as_chunks::<3>().0.iter() {
         let root = fill_mesh_find(&mut parent, triangle[0] as usize);
         if selected_root[root].unwrap_or(false) {
             continue;
@@ -2960,7 +3151,7 @@ fn tessellate_cached_asset_strokes(
             .with_line_join(line_join)
             .with_miter_limit(q0s_format::geom::MITER_LIMIT)
             .with_line_cap(line_cap)
-            .with_tolerance(0.05);
+            .with_tolerance(0.002);
         let mut tessellator = StrokeTessellator::new();
         if tessellator
             .tessellate_path(
@@ -3800,7 +3991,7 @@ fn fx_crop_screen_rect(
     project: &ProjectV2,
     width: u32,
     height: u32,
-    crop: [u32; 4],
+    crop: [i32; 4],
     raster_translation: Vec2,
     current_translation: Vec2,
     view: &StageView,
@@ -3812,7 +4003,7 @@ fn fx_crop_screen_rect(
         current_translation.x - raster_translation.x,
         current_translation.y - raster_translation.y,
     );
-    let to_stage = |px: u32, py: u32| {
+    let to_stage = |px: i32, py: i32| {
         Vec2::new(
             px as f32 / width.max(1) as f32 * stage_width + delta.x,
             py as f32 / height.max(1) as f32 * stage_height + delta.y,
@@ -3963,7 +4154,7 @@ fn collect_vector_asset_group_primitives(
             }
             return true;
         }
-        Asset::Rig(_) => return false,
+        Asset::Rig(_) | Asset::Model(_) => return false,
     };
     let mut fill_transform = transform;
     match project.asset_appearances.get(&asset_id) {
@@ -4634,7 +4825,15 @@ fn render_fx_placement(
                         && tile.raster_transform.inverse().is_some()
                 })
             {
-                paint_transformed_fx_tile(painter, project, *old_key, cached, composed, view);
+                paint_transformed_fx_tile(
+                    painter,
+                    project,
+                    *old_key,
+                    cached,
+                    composed,
+                    view,
+                    inherited_color,
+                );
                 return;
             }
         }
@@ -4650,35 +4849,23 @@ fn render_fx_placement(
         if textures.fx_placement_textures.len() >= 512 {
             textures.fx_placement_textures.clear();
         }
-        let crop = if outer_only {
-            q0s_format::raster::rasterize_placement_outer_fx_scaled_cropped(
-                project,
-                host_q0rg_id,
-                placement,
-                local_frame,
-                composed,
-                fx,
-                width,
-                height,
-            )
-        } else {
-            q0s_format::raster::rasterize_placement_fx_scaled_cropped(
-                project,
-                host_q0rg_id,
-                placement,
-                local_frame,
-                composed,
-                fx,
-                width,
-                height,
-            )
-        };
+        let crop = q0s_format::raster::rasterize_placement_fx_tile(
+            project,
+            host_q0rg_id,
+            placement,
+            local_frame,
+            composed,
+            fx,
+            width,
+            height,
+            outer_only,
+        );
         let Some(mut crop) = crop else {
             return;
         };
         let tint_rgba = tint.to_array();
         if tint_rgba != [255, 255, 255, 255] {
-            for pixel in crop.rgba.chunks_exact_mut(4) {
+            for pixel in crop.rgba.as_chunks_mut::<4>().0.iter_mut() {
                 for channel in 0..3 {
                     pixel[channel] = ((u16::from(pixel[channel]) * u16::from(tint_rgba[channel])
                         + 127)
@@ -4701,7 +4888,7 @@ fn render_fx_placement(
             key,
             FxPlacementTexture {
                 texture,
-                crop: [crop.x, crop.y, crop.width, crop.height],
+                crop: [crop.x, crop.y, crop.width as i32, crop.height as i32],
                 blend_mode: if outer_only {
                     BlendMode::Normal
                 } else {
@@ -4715,38 +4902,14 @@ fn render_fx_placement(
     let Some(cached) = textures.fx_placement_textures.get(&key) else {
         return;
     };
-    let screen_rect = fx_crop_screen_rect(
-        project,
-        width,
-        height,
-        cached.crop,
-        cached.raster_translation,
-        Vec2::new(composed.tx, composed.ty),
-        view,
-    );
-    if !inherited_color.is_identity() {
-        let mut mesh = Mesh::with_texture(cached.texture.id());
-        mesh.add_rect_with_uv(
-            screen_rect,
-            Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
-            Color32::WHITE,
-        );
-        q0glblend::paint_vector_group_on_opaque_backdrop(
-            painter,
-            vec![q0glblend::VectorGroupPrimitive::Textured {
-                mesh: Arc::new(mesh),
-                color_transform: inherited_color,
-            }],
-            cached.blend_mode,
-            1.0,
-        );
-        return;
-    }
-    q0glblend::paint_texture_on_opaque_backdrop(
+    paint_transformed_fx_tile(
         painter,
-        screen_rect,
-        cached.texture.id(),
-        cached.blend_mode,
+        project,
+        key,
+        cached,
+        composed,
+        view,
+        inherited_color,
     );
 }
 
@@ -4757,6 +4920,7 @@ fn paint_transformed_fx_tile(
     cached: &FxPlacementTexture,
     current: Affine,
     view: &StageView,
+    inherited_color: q0glblend::ColorTransform,
 ) {
     let Some(inverse) = cached.raster_transform.inverse() else {
         return;
@@ -4790,7 +4954,19 @@ fn paint_transformed_fx_tile(
         });
     }
     mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
-    painter.add(Shape::Mesh(mesh));
+    if cached.blend_mode == BlendMode::Normal {
+        q0glblend::paint_mesh_color(painter, mesh, inherited_color);
+    } else {
+        q0glblend::paint_vector_group_on_opaque_backdrop(
+            painter,
+            vec![q0glblend::VectorGroupPrimitive::Textured {
+                mesh: Arc::new(mesh),
+                color_transform: inherited_color,
+            }],
+            cached.blend_mode,
+            1.0,
+        );
+    }
 }
 
 pub(crate) struct StageRenderPass<'a> {
@@ -4879,6 +5055,35 @@ impl<'a> StageRenderPass<'a> {
 
     #[allow(clippy::too_many_arguments)]
     fn render_tinted_filtered(
+        &self,
+        painter: &Painter,
+        q0rg_id: u16,
+        frame: u16,
+        view: &StageView,
+        textures: &mut TextureCache,
+        ctx: &Context,
+        tint: Color32,
+        excluded_layers: Option<&HashSet<u16>>,
+    ) {
+        let revision = self
+            .revision
+            .map(|(a, b)| a.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ b);
+        q0glblend::with_revision(revision, || {
+            self.render_tinted_filtered_now(
+                painter,
+                q0rg_id,
+                frame,
+                view,
+                textures,
+                ctx,
+                tint,
+                excluded_layers,
+            )
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_tinted_filtered_now(
         &self,
         painter: &Painter,
         q0rg_id: u16,
@@ -5345,7 +5550,7 @@ fn q0rg_contains_mask(
             continue;
         }
         let mask_sources = if layer_has_mask_assignment(project, q0rg_id, layer.layer_id) {
-            project.layer_mask_sources(q0rg_id, layer.layer_id)
+            project.layer_clipping_masks(q0rg_id, layer.layer_id)
         } else {
             Default::default()
         }
@@ -5451,7 +5656,7 @@ fn group_asset_supported(project: &ProjectV2, lookup: &RenderLookup<'_>, asset_i
                 matches!(appearance.material, q0s_format::v2::VectorMaterial::Solid)
             }
         },
-        Some(Asset::Rig(_)) | None => false,
+        Some(Asset::Rig(_) | Asset::Model(_)) | None => false,
     }
 }
 
@@ -5628,7 +5833,7 @@ fn q0rg_masks_supported_by_gpu(
             continue;
         }
         let mask_sources = if layer_has_mask_assignment(project, q0rg_id, layer.layer_id) {
-            project.layer_mask_sources(q0rg_id, layer.layer_id)
+            project.layer_clipping_masks(q0rg_id, layer.layer_id)
         } else {
             Default::default()
         }
@@ -5882,7 +6087,7 @@ fn collect_gpu_masked_layer(
     };
     let mut masks = Vec::new();
     for mask_id in project
-        .layer_mask_sources(q0rg.q0rg_id, layer.layer_id)
+        .layer_clipping_masks(q0rg.q0rg_id, layer.layer_id)
         .into_iter()
         .filter(|mask_id| {
             textures.mask_clips(q0rg.q0rg_id, *mask_id)
@@ -6143,7 +6348,7 @@ fn render_q0rg_outline(
                                 .collect();
                             painter.add(Shape::line(points, Stroke::new(1.15_f32, color)));
                         }
-                        Asset::Q0v(_) | Asset::Rig(_) => {}
+                        Asset::Q0v(_) | Asset::Rig(_) | Asset::Model(_) => {}
                     }
                 }
                 Target::Q0rg(child_id) if child_id != q0rg_id => {
@@ -6252,6 +6457,19 @@ fn render_q0rg(
     root_layer_filter: Option<RootLayerFilter<'_>>,
 ) {
     let mut vector_batch = VectorMeshBatch::default();
+    // Onion skins stay flat: their tint would not reach the 3D pass.
+    let mut three = if tint == Color32::WHITE {
+        q0glblend::Stage3d::new(
+            project,
+            q0rg_id,
+            frame,
+            Affine::IDENTITY,
+            view.screen_transform(),
+            &q0s_format::runtime_scene::RuntimeSceneState::new(),
+        )
+    } else {
+        q0glblend::Stage3d::OFF
+    };
     render_q0rg_with_vector_batch(
         painter,
         project,
@@ -6267,8 +6485,10 @@ fn render_q0rg(
         root_layer_filter,
         &mut vector_batch,
         q0glblend::ColorTransform::default(),
+        &mut three,
     );
     vector_batch.flush(painter);
+    three.flush(painter);
     textures.record_vector_mesh_batch(&vector_batch);
 }
 
@@ -6288,6 +6508,7 @@ fn render_q0rg_with_vector_batch(
     root_layer_filter: Option<RootLayerFilter<'_>>,
     vector_batch: &mut VectorMeshBatch,
     inherited_color: q0glblend::ColorTransform,
+    three: &mut q0glblend::Stage3d,
 ) {
     if depth > Q0RG_RECURSION_LIMIT {
         return;
@@ -6327,11 +6548,19 @@ fn render_q0rg_with_vector_batch(
         if let Some(paint) = lighting.as_ref().filter(|_| !lit) {
             if previous_layer.is_some() && previous_layer == paint.lighting.layer_id {
                 vector_batch.flush(painter);
+                three.flush(painter);
                 q0glblend::paint_lighting(painter, painter.clip_rect(), paint.clone());
                 lit = true;
             }
         }
         previous_layer = Some(layer.layer_id);
+        // Flat art the 3D lights reach, on this layer of the root or inside
+        // a symbol placed on such a layer.
+        let layer_lit_flat = if depth == 0 {
+            three.next_layer(layer.layer_id)
+        } else {
+            three.inside_lit
+        };
         if depth == 0 && root_layer_filter.is_some_and(|filter| !filter.includes(layer.layer_id)) {
             continue;
         }
@@ -6345,7 +6574,7 @@ fn render_q0rg_with_vector_batch(
         }
         // Blank mask frames disable that mask; populated masks keep clipping.
         let mask_sources = if layer_has_mask_assignment(project, q0rg_id, layer.layer_id) {
-            project.layer_mask_sources(q0rg_id, layer.layer_id)
+            project.layer_clipping_masks(q0rg_id, layer.layer_id)
         } else {
             Default::default()
         }
@@ -6364,6 +6593,7 @@ fn render_q0rg_with_vector_batch(
         }
         if !mask_sources.is_empty() {
             vector_batch.flush(painter);
+            three.flush(painter);
             if let Some((masks, placements)) = collect_gpu_masked_layer(
                 project,
                 lookup,
@@ -6426,6 +6656,37 @@ fn render_q0rg_with_vector_batch(
             // non-uniform scale through to children, which the old
             // `compose(Transform2D, Transform2D)` discarded.
             let composed = Affine::compose(parent, local_affine);
+            if three.active() {
+                let target_asset = match placement.target {
+                    Target::Asset(asset_id) => lookup.asset(asset_id),
+                    Target::Q0rg(_) => None,
+                };
+                if three.takes(target_asset, &resolved.fx, layer_lit_flat) {
+                    vector_batch.flush(painter);
+                    let opacity = resolved.fx.opacity.clamp(0.0, 1.0) * f32::from(tint.a()) / 255.0;
+                    three.push(
+                        project,
+                        q0rg_id,
+                        placement,
+                        target_asset,
+                        parent,
+                        local_affine,
+                        resolved.fx,
+                        local_frame,
+                        resolved.playback_start_frame,
+                        layer_lit_flat,
+                        opacity,
+                    );
+                    continue;
+                }
+                // A plain symbol is walked into; anything else flat is drawn
+                // now, over the 3D gathered so far.
+                let walks_into = matches!(placement.target, Target::Q0rg(_))
+                    && placement_fx_is_visual_identity(placement_fx_without_tint(resolved.fx));
+                if !walks_into {
+                    three.flush(painter);
+                }
+            }
             let color_only =
                 placement_fx_is_visual_identity(placement_fx_without_tint(resolved.fx));
             let color_transform = if color_only {
@@ -6648,6 +6909,7 @@ fn render_q0rg_with_vector_batch(
                             resolved.playback_start_frame,
                             resolved.fx.q0rg_playback,
                         );
+                        let was_lit = std::mem::replace(&mut three.inside_lit, layer_lit_flat);
                         render_q0rg_with_vector_batch(
                             painter,
                             project,
@@ -6663,7 +6925,9 @@ fn render_q0rg_with_vector_batch(
                             None,
                             vector_batch,
                             color_transform,
+                            three,
                         );
+                        three.inside_lit = was_lit;
                     }
                 }
             }
@@ -6671,6 +6935,7 @@ fn render_q0rg_with_vector_batch(
     }
     if let Some(paint) = lighting.filter(|_| !lit) {
         vector_batch.flush(painter);
+        three.flush(painter);
         q0glblend::paint_lighting(painter, painter.clip_rect(), paint);
     }
 }
@@ -6712,6 +6977,19 @@ pub fn active_transform_for_placement(
         .into_iter()
         .find(|resolved| resolved.index == placement_idx)
         .map(|resolved| resolved.interp)
+}
+
+/// The visual transform and effects of one placement when it is active at
+/// `frame`, eased through its tween like the stage draws it.
+pub fn active_state_for_placement(
+    layer: &q0s_format::v2::Layer,
+    placement_idx: usize,
+    frame: u16,
+) -> Option<(Transform2D, PlacementFx)> {
+    resolve_layer_at_frame(layer, frame)
+        .into_iter()
+        .find(|resolved| resolved.index == placement_idx)
+        .map(|resolved| (resolved.interp, resolved.fx))
 }
 
 pub fn placement_is_active_at(
@@ -7038,7 +7316,8 @@ fn render_asset_color(
                 );
             }
         }
-        Asset::Rig(_) => {}
+        // Models are drawn by the 3D pass.
+        Asset::Rig(_) | Asset::Model(_) => {}
         Asset::Vector(v) => {
             if let Some(appearance) = appearance {
                 if appearance.fill_gradient.is_some() {
@@ -7089,29 +7368,6 @@ fn render_asset_color(
                                 stroke_style.join,
                             ) {
                                 q0glblend::paint_mesh_color(painter, mesh, color_transform);
-                            }
-                            if !*closed
-                                && matches!(stroke_style.cap, q0s_format::geom::CapShape::Round)
-                            {
-                                let radius = stroke_style.width
-                                    * parent_scale
-                                    * view.effective_scale()
-                                    * 0.5;
-                                let color = modulate(rgba_to_color32(stroke_style.color), tint);
-                                if let Some(point) = polyline_screen.first() {
-                                    painter.circle_filled(
-                                        *point,
-                                        radius,
-                                        color_transform.apply(color),
-                                    );
-                                }
-                                if let Some(point) = polyline_screen.last() {
-                                    painter.circle_filled(
-                                        *point,
-                                        radius,
-                                        color_transform.apply(color),
-                                    );
-                                }
                             }
                         }
                     }
@@ -7165,18 +7421,6 @@ fn render_asset_color(
                             stroke_style.join,
                         ) {
                             q0glblend::paint_mesh_color(painter, mesh, color_transform);
-                        }
-                        if !*closed && matches!(stroke_style.cap, q0s_format::geom::CapShape::Round)
-                        {
-                            let radius =
-                                stroke_style.width * parent_scale * view.effective_scale() * 0.5;
-                            let color = modulate(rgba_to_color32(stroke_style.color), tint);
-                            if let Some(point) = polyline_screen.first() {
-                                painter.circle_filled(*point, radius, color_transform.apply(color));
-                            }
-                            if let Some(point) = polyline_screen.last() {
-                                painter.circle_filled(*point, radius, color_transform.apply(color));
-                            }
                         }
                     }
                 }
@@ -7314,24 +7558,32 @@ pub fn paint_complex_fill(painter: &Painter, contours: &[Vec<Pos2>], color: Colo
     paint_lyon_buffers(painter, buffers, color);
 }
 
-fn tessellate_bounded_stroke(
-    points: &[Pos2],
-    width: f32,
-    closed: bool,
-) -> Option<VertexBuffers<lyon_path::math::Point, u32>> {
-    if points.len() < 2 || !width.is_finite() || width <= 0.0 {
+fn bounded_stroke_path(points: &[Pos2], closed: bool) -> Option<lyon_path::Path> {
+    if points.len() < 2
+        || points
+            .iter()
+            .any(|point| !point.x.is_finite() || !point.y.is_finite())
+    {
         return None;
     }
     let mut path_builder = lyon_path::Path::builder();
     path_builder.begin(lyon_point(points[0].x, points[0].y));
     for point in &points[1..] {
-        if !point.x.is_finite() || !point.y.is_finite() {
-            return None;
-        }
         path_builder.line_to(lyon_point(point.x, point.y));
     }
     path_builder.end(closed);
-    let path = path_builder.build();
+    Some(path_builder.build())
+}
+
+fn tessellate_bounded_stroke(
+    points: &[Pos2],
+    width: f32,
+    closed: bool,
+) -> Option<VertexBuffers<lyon_path::math::Point, u32>> {
+    if !width.is_finite() || width <= 0.0 {
+        return None;
+    }
+    let path = bounded_stroke_path(points, closed)?;
     let mut buffers: VertexBuffers<lyon_path::math::Point, u32> = VertexBuffers::new();
     let mut tessellator = StrokeTessellator::new();
     let options = StrokeOptions::default()
@@ -7359,9 +7611,8 @@ fn tessellate_closed_bevel_stroke(
 }
 
 /// An artwork stroke: its corners as the stroke says, its ends flat or
-/// square. Round ends are painted as circles by the callers, the same in the
-/// editor and q0player.
-fn styled_stroke_mesh(
+/// square. Round caps are tessellated with the body, preserving alpha at the ends.
+pub(crate) fn styled_stroke_mesh(
     points: &[Pos2],
     width: f32,
     closed: bool,
@@ -7389,7 +7640,8 @@ fn styled_stroke_mesh(
     };
     let line_cap = match cap {
         q0s_format::geom::CapShape::Square => LineCap::Square,
-        _ => LineCap::Butt,
+        q0s_format::geom::CapShape::Round => LineCap::Round,
+        q0s_format::geom::CapShape::Butt => LineCap::Butt,
     };
     let options = StrokeOptions::default()
         .with_line_width(width)
@@ -7755,47 +8007,6 @@ fn direct_stroke_screen_mesh(
 }
 
 #[cfg(feature = "appearance-mask-eraser")]
-fn parametric_stroke_reference_mesh(
-    stroke: &mut CachedSelectionStroke,
-    width_points: f32,
-    color: Color32,
-    reference_scale: f32,
-) -> Option<Mesh> {
-    let scale = reference_scale.abs();
-    if !scale.is_finite() || scale <= 1.0e-6 || !width_points.is_finite() || width_points <= 0.0 {
-        return None;
-    }
-    let stage_width = width_points / scale;
-    if !stroke
-        .parametric
-        .iter()
-        .any(|range| stage_width >= range.min_width && stage_width <= range.max_width)
-        && !cache_parametric_range_for_width(stroke, stage_width)
-    {
-        return None;
-    }
-    let range = stroke
-        .parametric
-        .iter()
-        .find(|range| stage_width >= range.min_width && stage_width <= range.max_width)?;
-    let mut mesh = Mesh::default();
-    mesh.vertices.reserve(range.base_vertices.len());
-    for (base, width_vector) in range.base_vertices.iter().zip(&range.width_vectors) {
-        let center = pos2(base.x * reference_scale, base.y * reference_scale);
-        let offset = *width_vector * width_points;
-        mesh.vertices.push(Vertex {
-            pos: center + offset,
-            // Native cached selection rendering interprets this UV as the
-            // fixed-pixel extrusion from the zero-width centerline.
-            uv: pos2(offset.x, offset.y),
-            color,
-        });
-    }
-    mesh.indices = range.indices.clone();
-    Some(mesh)
-}
-
-#[cfg(feature = "appearance-mask-eraser")]
 fn fixed_screen_stroke_mesh(points: &[Pos2], width: f32, color: Color32) -> Option<Mesh> {
     fixed_screen_bounded_stroke_mesh(points, width, true, color)
 }
@@ -7807,46 +8018,46 @@ fn fixed_screen_bounded_stroke_mesh(
     closed: bool,
     color: Color32,
 ) -> Option<Mesh> {
-    let target = tessellate_bounded_stroke(points, width, closed)?;
-    let mut range = None;
-    for neighbor_width in [width * 2.0, width * 0.5, width * 1.125, width * 0.875] {
-        if neighbor_width <= 0.0 || !neighbor_width.is_finite() {
-            continue;
-        }
-        let Some(neighbor) = tessellate_bounded_stroke(points, neighbor_width, closed) else {
-            continue;
-        };
-        if let Some(candidate) = parametric_range_toward_bounded(
-            points,
-            closed,
-            width,
-            &target,
-            neighbor_width,
-            neighbor,
-        ) {
-            range = Some(candidate);
-            break;
-        }
-    }
-    let range = range?;
-    if range.base_vertices.len() != target.vertices.len() || range.indices != target.indices {
+    if !width.is_finite() || width <= 0.0 {
         return None;
     }
-    let mut mesh = Mesh::default();
-    mesh.vertices.reserve(target.vertices.len());
-    for (vertex, base) in target.vertices.iter().zip(&range.base_vertices) {
-        let pos = pos2(vertex.x, vertex.y);
-        let offset = pos - *base;
-        mesh.vertices.push(Vertex {
-            // Keep Lyon's exact target-width position byte-for-byte; the base
-            // is used only to recover the fixed-pixel extrusion in the shader.
-            pos,
-            uv: pos2(offset.x, offset.y),
-            color,
-        });
+    let path = bounded_stroke_path(points, closed)?;
+    let mut buffers: VertexBuffers<Vertex, u32> = VertexBuffers::new();
+    let options = StrokeOptions::default()
+        .with_line_width(width)
+        .with_line_join(LineJoin::Bevel)
+        .with_tolerance(0.05);
+    // Lyon already exposes the width-independent point on the path. Keep
+    // that exact centerline and its pixel extrusion in one tessellation,
+    // instead of inferring them by repeatedly tessellating nearby widths.
+    // The inference could fail after a move changed floating-point joins,
+    // forcing a fresh screen mesh at each subsequent zoom bucket.
+    if StrokeTessellator::new()
+        .tessellate_path(
+            &path,
+            &options,
+            &mut BuffersBuilder::new(
+                &mut buffers,
+                |vertex: lyon_tessellation::StrokeVertex<'_, '_>| {
+                    let position = vertex.position();
+                    let base = vertex.position_on_path();
+                    Vertex {
+                        pos: pos2(position.x, position.y),
+                        uv: pos2(position.x - base.x, position.y - base.y),
+                        color,
+                    }
+                },
+            ),
+        )
+        .is_err()
+    {
+        return None;
     }
-    mesh.indices = target.indices;
-    Some(mesh)
+    Some(Mesh {
+        vertices: buffers.vertices,
+        indices: buffers.indices,
+        ..Mesh::default()
+    })
 }
 
 #[cfg(feature = "appearance-mask-eraser")]
@@ -7886,31 +8097,14 @@ fn build_selection_reference_meshes(
     let mut black_outline = Mesh::default();
     let mut accent_outline = Mesh::default();
     for stroke in &mut source.strokes {
-        let black = parametric_stroke_reference_mesh(
-            stroke,
-            2.0,
-            Color32::from_black_alpha(180),
-            reference_scale,
-        )
-        .or_else(|| {
-            let screen = stroke
-                .contour_stage
-                .iter()
-                .copied()
-                .map(|point| stage_pos_to_screen(point, &reference_view))
-                .collect::<Vec<_>>();
-            fixed_screen_stroke_mesh(&screen, 2.0, Color32::from_black_alpha(180))
-        })?;
-        let accent_mesh = parametric_stroke_reference_mesh(stroke, 1.0, accent, reference_scale)
-            .or_else(|| {
-                let screen = stroke
-                    .contour_stage
-                    .iter()
-                    .copied()
-                    .map(|point| stage_pos_to_screen(point, &reference_view))
-                    .collect::<Vec<_>>();
-                fixed_screen_stroke_mesh(&screen, 1.0, accent)
-            })?;
+        let screen = stroke
+            .contour_stage
+            .iter()
+            .copied()
+            .map(|point| stage_pos_to_screen(point, &reference_view))
+            .collect::<Vec<_>>();
+        let black = fixed_screen_stroke_mesh(&screen, 2.0, Color32::from_black_alpha(180))?;
+        let accent_mesh = fixed_screen_stroke_mesh(&screen, 1.0, accent)?;
         black_outline.append(black);
         accent_outline.append(accent_mesh);
     }
@@ -8245,7 +8439,7 @@ fn paint_lyon_buffers(
     painter.add(Shape::Mesh(lyon_buffers_mesh(buffers, color)));
 }
 
-fn round_stroke_preview_contours(points: &[Pos2], width: f32) -> Option<Vec<Vec<Pos2>>> {
+pub(crate) fn round_stroke_preview_contours(points: &[Pos2], width: f32) -> Option<Vec<Vec<Pos2>>> {
     let radius = width.max(0.1) * 0.5;
     let unique = simplify_preview_polyline(&sanitize_preview_polyline(points, width), width);
     let first = *unique.first()?;
@@ -8655,7 +8849,10 @@ fn preview_bbox_with_placement_fx(
     }
     if let Some(shadow) = fx.shadow {
         if shadow.strength > 1.0e-6 && shadow.color.a > 0 {
-            let pad = shadow.blur_radius.max(0.0) * scale;
+            let pad = q0s_format::raster::placement_blur_support(
+                shadow.blur_radius.max(0.0) * scale,
+                shadow.quality,
+            );
             let dx = shadow.offset_x * scale;
             let dy = shadow.offset_y * scale;
             union(
@@ -8837,6 +9034,10 @@ pub(crate) fn render_asset_preview_with_revision(
     let Some(asset) = lookup.asset(asset_id) else {
         return;
     };
+    if let Asset::Model(model) = asset {
+        paint_model_preview(painter, project, model, view);
+        return;
+    }
     render_asset(
         painter,
         asset,
@@ -8850,6 +9051,46 @@ pub(crate) fn render_asset_preview_with_revision(
         0,
         project.meta.fps,
     );
+}
+
+/// A model in the library: its rest pose seen flat-on, as it sits in its
+/// own placement coordinates.
+fn paint_model_preview(
+    painter: &Painter,
+    project: &ProjectV2,
+    model: &q0s_format::three::ModelAsset,
+    view: &StageView,
+) {
+    use q0s_format::three::draw::{push_model, Frame3d, View3d};
+    use q0s_format::three::scene::{CameraPose, LightRig};
+    let camera = CameraPose::stage(project.meta.stage_width, project.meta.stage_height);
+    let view3d = View3d::new(
+        camera,
+        true,
+        [
+            f32::from(project.meta.stage_width),
+            f32::from(project.meta.stage_height),
+        ],
+        view.screen_transform(),
+        [1, 1],
+    );
+    let mut items = Vec::new();
+    push_model(
+        &mut items,
+        &model.data,
+        &q0s_format::three::Mat4::IDENTITY,
+        &model.data.rest_world(),
+        1.0,
+        true,
+    );
+    let frame = Frame3d {
+        rig: LightRig::default_for(&camera),
+        view: view3d,
+        items,
+        overlay: None,
+        clear: None,
+    };
+    q0glblend::paint_frame3d(painter, painter.clip_rect(), std::sync::Arc::new(frame));
 }
 
 /// World-space AABB of a placement, computed by sampling the placement's local
@@ -8928,7 +9169,7 @@ fn placement_bbox_at_depth(
 fn asset_stroke_padding(asset: &Asset) -> f32 {
     match asset {
         Asset::Vector(v) => v.stroke.map(|s| s.width * 0.5).unwrap_or(0.0),
-        Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => 0.0,
+        Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) | Asset::Model(_) => 0.0,
     }
 }
 
@@ -9290,6 +9531,10 @@ fn asset_local_outline(asset: &Asset) -> Vec<Vec2> {
                     Vec2::new(0.0, height),
                 ]
             })
+            .unwrap_or_default(),
+        Asset::Model(model) => model
+            .flat_bounds()
+            .map(|(min, max)| vec![min, Vec2::new(max.x, min.y), max, Vec2::new(min.x, max.y)])
             .unwrap_or_default(),
         Asset::Rig(_) => Vec::new(),
     }
@@ -9903,6 +10148,189 @@ mod tests {
     use q0s_format::v2::{Anchor, Layer, Path as VPath};
 
     #[test]
+    fn regression_shadow_survives_nested_editing_and_reuses_one_texture() {
+        let mut project = crate::state::default_project();
+        project.assets.push(Asset::Vector(VectorAsset {
+            asset_id: 60000,
+            paths: vec![VPath {
+                closed: true,
+                anchors: [(-20.0, -20.0), (20.0, -20.0), (20.0, 20.0), (-20.0, 20.0)]
+                    .into_iter()
+                    .map(|(x, y)| Anchor {
+                        point: Vec2::new(x, y),
+                        in_handle: None,
+                        out_handle: None,
+                    })
+                    .collect(),
+            }],
+            fill: Some(Rgba {
+                r: 240,
+                g: 60,
+                b: 20,
+                a: 255,
+            }),
+            stroke: None,
+        }));
+        let shadow = Placement {
+            instance_id: 1,
+            pivot: None,
+            frame: 0,
+            target: Target::Asset(60000),
+            transform: Transform2D::IDENTITY,
+            tween: Tween::None,
+            fx: PlacementFx {
+                shadow: Some(q0s_format::v2::DropShadowFx {
+                    color: Rgba {
+                        r: 0,
+                        g: 0,
+                        b: 0,
+                        a: 220,
+                    },
+                    blur_radius: 40.0,
+                    offset_x: -12.0,
+                    offset_y: 8.0,
+                    strength: 1.0,
+                    quality: 15,
+                }),
+                ..Default::default()
+            },
+        };
+        let mut child = project.q0rgs[0].clone();
+        child.q0rg_id = 2;
+        child.layers[0].placements = vec![shadow.clone()];
+        project.q0rgs.push(child);
+        let parent = Transform2D {
+            tx: 150.0,
+            ty: 100.0,
+            ..Transform2D::IDENTITY
+        };
+        project.q0rgs[0].layers[0].placements = vec![Placement {
+            target: Target::Q0rg(2),
+            transform: parent,
+            fx: PlacementFx::default(),
+            ..shadow
+        }];
+        let ctx = Context::default();
+        let mut cache = TextureCache::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(640.0, 480.0));
+        let root_view = StageView {
+            origin: Pos2::ZERO,
+            scale: 1.0,
+            stage_rect: rect,
+            edit_transform: Affine::IDENTITY,
+        };
+        let render = |cache: &mut TextureCache, q0rg, view: &StageView| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let painter = ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Middle,
+                        egui::Id::new("nested-shadow"),
+                    ));
+                    let pass = StageRenderPass::new_with_revision(&project, cache, Some((0, 1)));
+                    pass.render(&painter, q0rg, 0, view, cache, ctx);
+                },
+            )
+        };
+        let root = render(&mut cache, 1, &root_view);
+        assert_eq!(cache.fx_placement_textures.len(), 1);
+        let serial = cache.fx_serial;
+        let texture = cache
+            .fx_placement_textures
+            .values()
+            .next()
+            .unwrap()
+            .texture
+            .id();
+        let tile_positions = |output: &egui::FullOutput| {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    Shape::Mesh(mesh) if mesh.texture_id == texture => {
+                        Some(mesh.vertices.iter().map(|v| v.pos).collect::<Vec<_>>())
+                    }
+                    _ => None,
+                })
+                .expect("shadow mesh")
+        };
+        let inside = render(
+            &mut cache,
+            2,
+            &StageView {
+                edit_transform: Affine::from_transform(parent),
+                ..root_view
+            },
+        );
+        assert_eq!(
+            tile_positions(&root),
+            tile_positions(&inside),
+            "entering the symbol moved or cropped the shadow"
+        );
+        for scale in [0.5, 2.0, 8.0, 1.0] {
+            let _ = render(
+                &mut cache,
+                2,
+                &StageView {
+                    scale,
+                    edit_transform: Affine::from_transform(parent),
+                    ..root_view
+                },
+            );
+        }
+        assert_eq!(
+            cache.fx_serial, serial,
+            "idle paints or zoom rerasterized the shadow"
+        );
+    }
+
+    #[test]
+    fn regression_stroke_mesh_has_smooth_round_caps_and_exact_flat_caps() {
+        let points = vec![Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0)];
+        let mut vector = VectorAsset {
+            asset_id: 1,
+            paths: Vec::new(),
+            fill: None,
+            stroke: Some(q0s_format::v2::Stroke {
+                width: 2.0,
+                color: Rgba {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 255,
+                },
+                cap: q0s_format::geom::CapShape::Round,
+                join: q0s_format::geom::JoinShape::Round,
+            }),
+        };
+        let (vertices, _) = tessellate_cached_asset_strokes(&vector, &[(points.clone(), false)]);
+        assert!(
+            vertices.len() >= 32,
+            "round caps are too coarse for magnified artwork"
+        );
+        vector.stroke.as_mut().unwrap().cap = q0s_format::geom::CapShape::Butt;
+        let (vertices, _) = tessellate_cached_asset_strokes(&vector, &[(points, false)]);
+        assert!(
+            vertices.iter().all(|p| p.x >= -1.0e-4 && p.x <= 10.0001),
+            "flat caps protrude past their endpoint"
+        );
+        let mesh = styled_stroke_mesh(
+            &[pos2(0.0, 0.0), pos2(320.0, 0.0)],
+            64.0,
+            false,
+            Color32::BLACK,
+            q0s_format::geom::CapShape::Round,
+            q0s_format::geom::JoinShape::Round,
+        )
+        .unwrap();
+        assert!(mesh.vertices.len() > 32);
+        assert!(mesh.vertices.iter().any(|v| v.pos.x < -31.9));
+    }
+
+    #[test]
     fn radial_gradient_keeps_original_vector_mesh_for_analytic_gpu_sampling() {
         let vector = VectorAsset {
             asset_id: 4242,
@@ -10175,7 +10603,9 @@ mod tests {
         fn mesh_area(geometry: &CachedVectorRenderGeometry) -> f64 {
             geometry
                 .fill_indices
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .map(|triangle| {
                     let a = geometry.fill_vertices[triangle[0] as usize];
                     let b = geometry.fill_vertices[triangle[1] as usize];
@@ -10211,7 +10641,7 @@ mod tests {
             &remainder.fill_contours,
             pos2(50.0, 50.0)
         ));
-        for triangle in remainder.fill_indices.chunks_exact(3) {
+        for triangle in remainder.fill_indices.as_chunks::<3>().0.iter() {
             let a = remainder.fill_vertices[triangle[0] as usize];
             let b = remainder.fill_vertices[triangle[1] as usize];
             let c = remainder.fill_vertices[triangle[2] as usize];
@@ -10543,6 +10973,7 @@ mod tests {
         };
         let shadow = PlacementFx {
             shadow: Some(q0s_format::v2::DropShadowFx {
+                quality: 3,
                 color: Rgba {
                     r: 0,
                     g: 0,
@@ -11110,7 +11541,8 @@ mod tests {
                     height: 2,
                     rgba: vec![
                         255, 80, 20, 255, 255, 180, 40, 180, 100, 100, 100, 120, 0, 0, 0, 0,
-                    ],
+                    ]
+                    .into(),
                 }));
             project.q0rgs.push(Q0rg {
                 q0rg_id: 2,
@@ -11902,6 +12334,117 @@ mod tests {
             },
         );
     }
+    #[test]
+    fn brush_zoom_scanlines_keep_clipped_concave_and_translucent_preview_pixels() {
+        for pixels_per_point in [1.0, 1.5, 2.0] {
+            let ctx = Context::default();
+            ctx.set_pixels_per_point(pixels_per_point);
+            let rect = Rect::from_min_size(pos2(7.25, 9.5), egui::vec2(60.0, 48.0));
+            let mut cache = TextureCache::default();
+            let fill = Color32::from_rgba_unmultiplied(90, 30, 180, 100);
+            let outline = Color32::from_rgba_unmultiplied(180, 30, 90, 200);
+            let polygons = vec![
+                vec![
+                    pos2(-100.0, 14.0),
+                    pos2(40.5, 11.0),
+                    pos2(35.0, 32.0),
+                    pos2(22.0, 22.0),
+                    pos2(13.0, 43.0),
+                ],
+                vec![
+                    pos2(33.0, 17.0),
+                    pos2(80.0, 17.0),
+                    pos2(80.0, 60.0),
+                    pos2(33.0, 60.0),
+                ],
+                vec![
+                    pos2(-300.0, -300.0),
+                    pos2(-200.0, -300.0),
+                    pos2(-200.0, -200.0),
+                ],
+            ];
+            let border = vec![vec![
+                pos2(9.0, 11.0),
+                pos2(64.0, 11.0),
+                pos2(64.0, 55.0),
+                pos2(9.0, 55.0),
+            ]];
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                let view = StageView {
+                    origin: Pos2::ZERO,
+                    scale: 55.2,
+                    stage_rect: rect,
+                    edit_transform: Affine::IDENTITY,
+                };
+                cache.begin_classic_brush_preview(ctx, rect, &view);
+                cache.raster_classic_brush_preview(&polygons, fill);
+                cache.raster_classic_brush_preview_outline(&border, outline);
+                let preview = cache.classic_brush_preview.as_ref().unwrap();
+                for y in 0..preview.size[1] {
+                    for x in 0..preview.size[0] {
+                        let at = rect.min
+                            + egui::vec2(x as f32 + 0.5, y as f32 + 0.5) / preview.pixels_per_point;
+                        let expected = if polygons
+                            .iter()
+                            .any(|polygon| preview_polygon_contains(at, polygon))
+                        {
+                            fill
+                        } else if preview_polygon_contains(at, &border[0]) {
+                            outline
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+                        assert_eq!(
+                            preview.pixels[y * preview.size[0] + x],
+                            expected,
+                            "preview changed at {at:?}, scale={pixels_per_point}"
+                        );
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn brush_zoom_overlapping_preview_raster_work_is_bounded_by_the_canvas() {
+        let ctx = Context::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let mut cache = TextureCache::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let view = StageView {
+                origin: Pos2::ZERO,
+                scale: 55.2,
+                stage_rect: rect,
+                edit_transform: Affine::IDENTITY,
+            };
+            cache.begin_classic_brush_preview(ctx, rect, &view);
+            let polygons: Vec<_> = (0..64)
+                .map(|index| {
+                    let center = pos2(400.0 + index as f32 * 0.1, 300.0);
+                    (0..24)
+                        .map(|vertex| {
+                            let angle = std::f32::consts::TAU * vertex as f32 / 24.0;
+                            center
+                                + egui::vec2(angle.cos(), angle.sin()) * (10.0 * view.scale * 0.5)
+                        })
+                        .collect()
+                })
+                .collect();
+            let started = std::time::Instant::now();
+            cache.raster_classic_brush_preview(&polygons, Color32::BLACK);
+            eprintln!(
+                "brush zoom preview: {:?}, raster pixels={}",
+                started.elapsed(),
+                cache.classic_preview_candidate_pixels
+            );
+            assert!(
+                cache.classic_preview_candidate_pixels <= 800 * 600,
+                "overlapping dabs repeatedly rasterized the same pixels: {}",
+                cache.classic_preview_candidate_pixels
+            );
+        });
+    }
+
     #[test]
     fn classic_brush_texture_updates_only_new_dirty_tail() {
         let ctx = Context::default();
@@ -12880,6 +13423,36 @@ mod tests {
 
     #[cfg(feature = "appearance-mask-eraser")]
     #[test]
+    fn raw_move_zoom_fixed_outline_keeps_exact_vertices_at_tight_translated_turns() {
+        for translation in [0.0, 13.375, 991.125] {
+            for closed in [false, true] {
+                let points = vec![
+                    pos2(0.0, 0.0),
+                    pos2(100.0, 0.0),
+                    pos2(99.999, 0.001),
+                    pos2(50.0, 0.002),
+                    pos2(50.0, 40.0),
+                    pos2(49.999, 39.999),
+                    pos2(0.0, 4.0),
+                ]
+                .into_iter()
+                .map(|point| point + egui::vec2(translation, -translation))
+                .collect::<Vec<_>>();
+                let exact = tessellate_bounded_stroke(&points, 2.0, closed).unwrap();
+                let encoded =
+                    fixed_screen_bounded_stroke_mesh(&points, 2.0, closed, Color32::BLACK).unwrap();
+                assert_eq!(encoded.indices, exact.indices);
+                assert_eq!(encoded.vertices.len(), exact.vertices.len());
+                for (encoded, exact) in encoded.vertices.iter().zip(&exact.vertices) {
+                    assert_eq!(encoded.pos, pos2(exact.x, exact.y));
+                    assert!(encoded.uv.x.is_finite() && encoded.uv.y.is_finite());
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
     fn fixed_selection_outline_encoding_preserves_exact_lyon_vertices() {
         let points = vec![
             pos2(3.0, 5.0),
@@ -13433,7 +14006,9 @@ mod tests {
         assert_eq!(triangles.len(), (points.len() - 2) * 3);
 
         let triangle_area: f32 = triangles
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|triangle| {
                 cross_2d(
                     points[triangle[0] as usize],

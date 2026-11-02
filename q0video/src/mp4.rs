@@ -44,6 +44,35 @@ impl Mp4Spec {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mp4AudioSpec {
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub bitrate: u32,
+}
+
+impl Default for Mp4AudioSpec {
+    fn default() -> Self {
+        Self {
+            sample_rate: 48_000,
+            channels: 2,
+            bitrate: 160_000,
+        }
+    }
+}
+
+impl Mp4AudioSpec {
+    pub fn validate(self) -> Result<(), String> {
+        if !matches!(self.sample_rate, 44_100 | 48_000)
+            || !matches!(self.channels, 1 | 2)
+            || !matches!(self.bitrate, 96_000 | 128_000 | 160_000 | 192_000)
+        {
+            return Err("unsupported mp4 AAC audio format".into());
+        }
+        Ok(())
+    }
+}
+
 #[cfg(windows)]
 struct MediaFoundationSession {
     com_initialized: bool,
@@ -89,6 +118,8 @@ pub struct Mp4Encoder {
     stream_index: u32,
     spec: Mp4Spec,
     frame_index: u64,
+    audio: Option<(u32, Mp4AudioSpec)>,
+    audio_samples_written: u64,
     finalized: bool,
     _session: MediaFoundationSession,
 }
@@ -96,14 +127,30 @@ pub struct Mp4Encoder {
 #[cfg(windows)]
 impl Mp4Encoder {
     pub fn create(path: &Path, spec: Mp4Spec) -> Result<Self, String> {
-        spec.validate()?;
-        // Allow installed hardware MFTs, but retain software support for
-        // machines/drivers that cannot encode this particular output format.
-        Self::create_with_hardware(path, spec, true)
-            .or_else(|_| Self::create_with_hardware(path, spec, false))
+        Self::create_with_audio(path, spec, None)
     }
 
-    fn create_with_hardware(path: &Path, spec: Mp4Spec, hardware: bool) -> Result<Self, String> {
+    pub fn create_with_audio(
+        path: &Path,
+        spec: Mp4Spec,
+        audio: Option<Mp4AudioSpec>,
+    ) -> Result<Self, String> {
+        spec.validate()?;
+        if let Some(audio) = audio {
+            audio.validate()?;
+        }
+        // Allow installed hardware MFTs, but retain software support for
+        // machines/drivers that cannot encode this particular output format.
+        Self::create_with_hardware(path, spec, audio, true)
+            .or_else(|_| Self::create_with_hardware(path, spec, audio, false))
+    }
+
+    fn create_with_hardware(
+        path: &Path,
+        spec: Mp4Spec,
+        audio: Option<Mp4AudioSpec>,
+        hardware: bool,
+    ) -> Result<Self, String> {
         let session = MediaFoundationSession::start()?;
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         let mut attributes = None;
@@ -187,9 +234,29 @@ impl Mp4Encoder {
             input_type
                 .SetUINT32(&MF_MT_SAMPLE_SIZE, sample_size)
                 .map_err(|error| format!("set nv12 sample size: {error}"))?;
+            // Some hardware encoders default to B frames and shift video PTS
+            // by one frame while AAC starts at zero. Disable reordering for
+            // movies with audio so both presentation clocks really start at zero.
+            let video_parameters = if audio.is_some() {
+                let mut parameters = None;
+                MFCreateAttributes(&mut parameters, 1)
+                    .map_err(|error| format!("create video encoder parameters: {error}"))?;
+                let parameters = parameters.ok_or("missing video encoder parameters")?;
+                parameters
+                    .SetUINT32(&CODECAPI_AVEncMPVDefaultBPictureCount, 0)
+                    .map_err(|error| format!("disable video timestamp reordering: {error}"))?;
+                Some(parameters)
+            } else {
+                None
+            };
             writer
-                .SetInputMediaType(stream_index, &input_type, None::<&IMFAttributes>)
+                .SetInputMediaType(stream_index, &input_type, video_parameters.as_ref())
                 .map_err(|error| format!("connect nv12 to h.264 encoder: {error}"))?;
+        }
+        let audio = audio
+            .map(|spec| add_audio_stream(&writer, spec).map(|index| (index, spec)))
+            .transpose()?;
+        unsafe {
             writer
                 .BeginWriting()
                 .map_err(|error| format!("begin mp4 writing: {error}"))?;
@@ -200,6 +267,8 @@ impl Mp4Encoder {
             stream_index,
             spec,
             frame_index: 0,
+            audio,
+            audio_samples_written: 0,
             finalized: false,
             _session: session,
         })
@@ -267,6 +336,119 @@ impl Mp4Encoder {
         }
         self.finalized = true;
         Ok(())
+    }
+
+    /// Audio and video use integer sample clocks, with both streams starting at zero.
+    pub fn write_audio_pcm_i16(&mut self, interleaved: &[i16]) -> Result<(), String> {
+        let (stream, spec) = self.audio.ok_or("mp4 has no audio stream")?;
+        if !interleaved.len().is_multiple_of(usize::from(spec.channels)) {
+            return Err("mp4 audio is not aligned to whole channel frames".into());
+        }
+        if interleaved.is_empty() {
+            return Ok(());
+        }
+        let bytes: Vec<u8> = interleaved
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect();
+        let length = u32::try_from(bytes.len()).map_err(|_| "mp4 audio sample is too large")?;
+        let frames = interleaved.len() as u64 / u64::from(spec.channels);
+        let start =
+            self.audio_samples_written * MEDIA_TICKS_PER_SECOND / u64::from(spec.sample_rate);
+        let end = (self.audio_samples_written + frames) * MEDIA_TICKS_PER_SECOND
+            / u64::from(spec.sample_rate);
+        unsafe {
+            let buffer = MFCreateMemoryBuffer(length)
+                .map_err(|error| format!("allocate audio buffer: {error}"))?;
+            let mut destination = ptr::null_mut();
+            buffer
+                .Lock(&mut destination, None, None)
+                .map_err(|error| format!("lock audio buffer: {error}"))?;
+            ptr::copy_nonoverlapping(bytes.as_ptr(), destination, bytes.len());
+            buffer
+                .Unlock()
+                .map_err(|error| format!("unlock audio buffer: {error}"))?;
+            buffer
+                .SetCurrentLength(length)
+                .map_err(|error| format!("set audio buffer length: {error}"))?;
+            let sample =
+                MFCreateSample().map_err(|error| format!("create audio sample: {error}"))?;
+            sample
+                .AddBuffer(&buffer)
+                .map_err(|error| format!("attach audio buffer: {error}"))?;
+            sample
+                .SetSampleTime(start as i64)
+                .map_err(|error| format!("set audio time: {error}"))?;
+            sample
+                .SetSampleDuration((end - start) as i64)
+                .map_err(|error| format!("set audio duration: {error}"))?;
+            self.writer
+                .WriteSample(stream, &sample)
+                .map_err(|error| format!("write AAC sample: {error}"))?;
+        }
+        self.audio_samples_written += frames;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn add_audio_stream(writer: &IMFSinkWriter, spec: Mp4AudioSpec) -> Result<u32, String> {
+    unsafe {
+        let output = MFCreateMediaType().map_err(|error| format!("create AAC type: {error}"))?;
+        output
+            .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)
+            .map_err(|error| error.to_string())?;
+        output
+            .SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC)
+            .map_err(|error| error.to_string())?;
+        output
+            .SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, spec.sample_rate)
+            .map_err(|error| error.to_string())?;
+        output
+            .SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, u32::from(spec.channels))
+            .map_err(|error| error.to_string())?;
+        output
+            .SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)
+            .map_err(|error| error.to_string())?;
+        output
+            .SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, spec.bitrate / 8)
+            .map_err(|error| error.to_string())?;
+        output
+            .SetUINT32(&MF_MT_AAC_PAYLOAD_TYPE, 0)
+            .map_err(|error| error.to_string())?;
+        let index = writer
+            .AddStream(&output)
+            .map_err(|error| format!("add AAC stream: {error}"))?;
+        let input = MFCreateMediaType().map_err(|error| format!("create PCM type: {error}"))?;
+        input
+            .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)
+            .map_err(|error| error.to_string())?;
+        input
+            .SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)
+            .map_err(|error| error.to_string())?;
+        input
+            .SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, spec.sample_rate)
+            .map_err(|error| error.to_string())?;
+        input
+            .SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, u32::from(spec.channels))
+            .map_err(|error| error.to_string())?;
+        input
+            .SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)
+            .map_err(|error| error.to_string())?;
+        let alignment = u32::from(spec.channels) * 2;
+        input
+            .SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, alignment)
+            .map_err(|error| error.to_string())?;
+        input
+            .SetUINT32(
+                &MF_MT_AUDIO_AVG_BYTES_PER_SECOND,
+                spec.sample_rate * alignment,
+            )
+            .map_err(|error| error.to_string())?;
+        writer
+            .SetInputMediaType(index, &input, None::<&IMFAttributes>)
+            .map_err(|error| format!("connect PCM to AAC: {error}"))?;
+        Ok(index)
     }
 }
 
@@ -392,5 +574,138 @@ mod tests {
             .windows(4)
             .any(|window| window == b"ftyp"));
         std::fs::remove_file(path).expect("cleanup mp4");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn media_foundation_muxes_aac_alongside_video() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("q0video-aac-{}-{nonce}.mp4", std::process::id()));
+        let mut encoder = Mp4Encoder::create_with_audio(
+            &path,
+            Mp4Spec {
+                width: 64,
+                height: 64,
+                fps: 24,
+                bitrate: 500_000,
+            },
+            Some(Mp4AudioSpec::default()),
+        )
+        .unwrap();
+        for frame in 0..24 {
+            encoder
+                .write_rgba_frame(&[255, 0, 0, 255].repeat(64 * 64))
+                .unwrap();
+            let pcm: Vec<i16> = (frame * 2000..(frame + 1) * 2000)
+                .flat_map(|sample| {
+                    let value = ((sample as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin()
+                        * 12000.0) as i16;
+                    [value, -value]
+                })
+                .collect();
+            encoder.write_audio_pcm_i16(&pcm).unwrap();
+        }
+        encoder.finish().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.windows(4).any(|data| data == b"soun"));
+        assert!(bytes.windows(4).any(|data| data == b"mp4a"));
+        assert!(bytes.windows(4).any(|data| data == b"avc1"));
+        {
+            let _session = MediaFoundationSession::start().unwrap();
+            let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            unsafe {
+                let reader =
+                    MFCreateSourceReaderFromURL(PCWSTR(wide.as_ptr()), None::<&IMFAttributes>)
+                        .unwrap();
+                let mut timestamp = -1;
+                let mut sample = None;
+                let mut video_flags = 0;
+                reader
+                    .ReadSample(
+                        MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
+                        0,
+                        None,
+                        Some(&mut video_flags),
+                        Some(&mut timestamp),
+                        Some(&mut sample),
+                    )
+                    .unwrap();
+                assert!(sample.is_some());
+                assert_eq!(
+                    timestamp, 0,
+                    "video and audio must start on the same presentation clock"
+                );
+                let audio_stream = MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32;
+                let pcm_type = MFCreateMediaType().unwrap();
+                pcm_type
+                    .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)
+                    .unwrap();
+                pcm_type
+                    .SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)
+                    .unwrap();
+                pcm_type
+                    .SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)
+                    .unwrap();
+                reader
+                    .SetCurrentMediaType(audio_stream, None, &pcm_type)
+                    .unwrap();
+                let mut decoded = Vec::<i16>::new();
+                loop {
+                    let mut flags = 0;
+                    let mut sample = None;
+                    reader
+                        .ReadSample(
+                            audio_stream,
+                            0,
+                            None,
+                            Some(&mut flags),
+                            Some(&mut timestamp),
+                            Some(&mut sample),
+                        )
+                        .unwrap();
+                    if let Some(sample) = sample {
+                        if decoded.is_empty() {
+                            assert_eq!(timestamp, 0);
+                        }
+                        let buffer = sample.ConvertToContiguousBuffer().unwrap();
+                        let mut pointer = ptr::null_mut();
+                        let mut length = 0;
+                        buffer.Lock(&mut pointer, None, Some(&mut length)).unwrap();
+                        let data = std::slice::from_raw_parts(pointer, length as usize);
+                        decoded.extend(
+                            data.as_chunks::<2>()
+                                .0
+                                .iter()
+                                .map(|raw| i16::from_le_bytes([raw[0], raw[1]])),
+                        );
+                        buffer.Unlock().unwrap();
+                    }
+                    if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
+                        break;
+                    }
+                }
+                assert!(decoded.len() >= 48_000 * 2);
+                assert!(
+                    decoded.iter().any(|sample| sample.unsigned_abs() > 8_000),
+                    "AAC must decode to audible audio"
+                );
+                let error: f64 = decoded
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|pair| (f64::from(pair[0]) + f64::from(pair[1])).abs())
+                    .sum::<f64>()
+                    / decoded.len() as f64;
+                assert!(
+                    error < 100.0,
+                    "stereo polarity must survive encoding: {error}"
+                );
+            }
+        }
+        std::fs::remove_file(path).unwrap();
     }
 }

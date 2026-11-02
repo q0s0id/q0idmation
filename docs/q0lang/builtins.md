@@ -13,13 +13,15 @@
 | `q0.timeline` | `gorun!`, `gostop!`, `frame`, `label` |
 | `q0.object` | `self.x`, `self.y`, `self.frame`, `self.playing`, `self.name`, `self.id`, `self.width`, `self.height`, `self.left`, `self.right`, `self.top`, `self.bottom`, `self.hovered`, `self.mouse_x`, `self.mouse_y` |
 | `q0.mouse` | `mouse.down`, `mouse.up`, `mouse.move`, `mouse.click`, `mouse.double`, `mouse.wheel`, `mouse.over`, `mouse.out` |
-| `q0.input` | `input.left`, `input.right`, `input.jump`, `input.jump_pressed` |
+| `q0.input` | `input.left`, `input.right`, `input.jump`, `input.jump_pressed`, `input.up`, `input.down`, `input.action`, `input.action_pressed` |
 | `q0.scene` | `stage.width`, `stage.height`, `player.x`, `player.y`, `player.left`, `player.right`, `player.top`, `player.bottom`, `player.width`, `player.height`, `q0scene.switch!` |
-| `q0.time` | `time.dt` |
+| `q0.time` | `time.dt`, `time.tick` |
 | `q0.rig` | `q0rig.position!`, `q0rig.value!`, `q0rig.reset!`, `q0rig.pose!`, `q0rig.pose_reset!` |
 | `q0.physics` | `q0physics.start!`, `q0physics.pause!`, `q0physics.reset!`, `q0physics.push!`, `q0physics.velocity!`, `q0physics.spin!`, `q0physics.teleport!`, `q0physics.gravity!`, `q0physics.cut!` |
 | `q0.particles` | `q0particles.start!`, `q0particles.stop!`, `q0particles.burst!`, `q0particles.move!`, `q0particles.clear!` |
 | `q0.light` | `q0light.on!`, `q0light.off!`, `q0light.move!`, `q0light.color!`, `q0light.brightness!`, `q0light.size!`, `q0light.darkness!` |
+| `q0.layer` | `q0layer.hide!`, `q0layer.show!`, `q0layer.move!`, `q0layer.alpha!`, `q0layer.reset!`, `q0layer.solid!`, `q0layer.unsolid!`, `q0layer.touches`, `q0layer.which`, `q0layer.hit`, `q0layer.circle`, `q0layer.box`, `q0layer.visible`, `q0layer.count` |
+| `q0.window` | `q0window.fullscreen!`, `q0window.ui!`, `q0window.hotkeys!`, `q0window.move!`, `q0window.size!`, `q0window.center!`, `q0window.title!`, `q0window.top!`, `q0window.minimize!`, `q0window.perf!`, `q0window.quit!`, `window.x`, `window.y`, `window.width`, `window.height`, `window.fullscreen`, `window.ui`, `screen.width`, `screen.height` |
 | `q0shell` | `q0shell.print!`, `q0shell.read!`, `q0shell.write!`, `q0shell.append!`, `q0shell.mkdir!`, `q0shell.list!`, `q0shell.move!`, `q0shell.delete!` |
 
 This is the list of libraries the parser recognises, not a promise that every host implements every symbol. `frame` holds the current frame only inside object scripts; `label` has no value yet. `player` stands for an instance name you give in the project. The [availability table](hosts.md) explains which program supports what.
@@ -57,6 +59,22 @@ limited = clamp(position, 0, 20)
 
 `wave` is about `1`, `position` is `30` and `limited` is `20`. There is no random number generator, no `str()` / `number()` conversion and no string function yet. Strings join with `+`.
 
+## functions the player answers
+
+These look like math functions and go in expressions, with parentheses and commas, but q0player answers them while the script runs. Elsewhere they give a diagnostic and `null`. Each takes exactly the listed values.
+
+| written as | gives |
+| --- | --- |
+| `q0layer.touches(layer, thing)` | whether anything `thing` draws overlaps anything drawn on the layer |
+| `q0layer.which(layer, thing)` | the instance name of the first object on the layer that `thing` touches, `"drawing"` for unnamed artwork, `null` when nothing |
+| `q0layer.hit(layer, x, y)` | whether the stage point lies on something drawn on the layer |
+| `q0layer.circle(layer, x, y, radius)` | whether the circle overlaps the layer's drawing |
+| `q0layer.box(layer, left, top, width, height)` | whether the rectangle overlaps it |
+| `q0layer.visible(layer)` | whether the layer shows right now |
+| `q0layer.count(layer)` | how many objects the layer shows on this frame |
+
+What counts as drawn, and what `layer` and `thing` may be, is in the [host api](hosts.md#q0layer-whole-layers-and-everything-on-them).
+
 ## commands
 
 Commands are statements; they never return a value into an expression. Put a space after the name ending in `!` and separate arguments with commas. Do not write `q0rig.pose!(...)` and do not assign a command's result.
@@ -87,6 +105,17 @@ Commands are statements; they never return a value into an expression. Put a spa
 | `q0light.brightness! light, value` | light name, number; 1 shows colours as drawn | player |
 | `q0light.size! light, radius` | light name, pixels | player |
 | `q0light.darkness! value` | number, 0 (day) to 1 (pitch dark) | player |
+| `q0layer.hide! layer`, `q0layer.show! layer`, `q0layer.reset! layer` | a layer's name or row | player |
+| `q0layer.move! layer, x, y` | layer, two numbers in stage px | player |
+| `q0layer.alpha! layer, value` | layer, number 0…1 | player |
+| `q0layer.solid! layer, instance`, `q0layer.unsolid! layer, instance` | layer, instance name | player |
+| `q0window.fullscreen! on`, `q0window.ui! on`, `q0window.hotkeys! on`, `q0window.top! on` | `true`/`false`, `1`/`0` or `"on"`/`"off"` | player |
+| `q0window.move! x, y` | screen points | player |
+| `q0window.size! width, height` | screen points, at least 1 | player |
+| `q0window.title! text` | any value | player |
+| `q0window.decorations! on`, `q0window.titlebar! on` | boolean, system window frame | desktop player |
+| `q0window.icon! asset` | bundled bitmap name/id; null restores the default | desktop player |
+| `q0window.center!`, `q0window.minimize!`, `q0window.perf!`, `q0window.quit!` | none | player |
 | `q0shell.print! value, ...` | zero to 255 values | shell |
 | `q0shell.read! path` | path | shell |
 | `q0shell.write! path, text` | path, value to write | shell |

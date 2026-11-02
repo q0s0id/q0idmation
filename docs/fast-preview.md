@@ -11,9 +11,13 @@ Animation Preview panel remains available separately.
 
 q0player opens a separate resizable window containing only the stage. Camera,
 vector rendering, effects, animation and audio use the player's normal runtime.
-Space pauses/resumes, arrow keys step through frames, Home/End seek, F11 toggles
-fullscreen, and Escape closes the preview. Interactive projects keep their game
-input bindings. Playback loops the selected scene or the complete scene sequence.
+Space pauses/resumes, arrow keys step through frames, Home/End seek, F9 toggles
+fullscreen, F4 copies a performance log, and Escape closes the preview. Projects
+with q0lang play as games: they have no timeline keys and keep their game input
+bindings. A game's scripts may also hide the menu bar, keep F9 and F4 for
+themselves, go fullscreen, or move and size the window (q0lang's `q0.window`);
+reopening the movie puts the menu bar and keys back. Playback loops the
+selected scene or the complete scene sequence.
 
 Install an updated q0player, or put its executable next to q0editor.exe. The
 editor also checks the standard per-user installation and PATH. An older player

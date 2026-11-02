@@ -121,7 +121,12 @@ fn shape_tweens_round_trip_in_both_formats() {
     let q0s = write_q0s_v2(&project).expect("write q0s");
     assert_eq!(
         u16::from_le_bytes([q0s[4], q0s[5]]),
-        q0s_format::q0s_v2::Q0S_VERSION_SHAPE_TWEENS
+        q0s_format::q0s_v2::Q0S_VERSION_PACKED
+    );
+    // A packed q0s names the q1s body inside it.
+    assert_eq!(
+        u16::from_le_bytes([q0s[6], q0s[7]]),
+        Q1S_VERSION_SHAPE_TWEENS
     );
     assert_eq!(parse_q0s_v2(&q0s).expect("parse q0s"), expected);
 }

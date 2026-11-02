@@ -12,6 +12,7 @@ use q0s_format::particles::{
 };
 use q0s_format::raster::RuntimeBoundsCache;
 use q0s_format::runtime_scene::RuntimeSceneState;
+use q0s_format::transform::Follow;
 use q0s_format::v2::{ProjectV2, Rgba};
 
 use crate::rng::Rng;
@@ -82,7 +83,8 @@ pub struct ParticleDraw {
 }
 
 /// Where an emitter following object `instance_id` sits on `frame`: the
-/// middle of the object as drawn, or `None` while it is not on the stage.
+/// middle of the object as drawn and how it is turned, or `None` while it
+/// is not on the stage.
 pub fn follow_point(
     project: &ProjectV2,
     q0rg_id: u16,
@@ -90,28 +92,8 @@ pub fn follow_point(
     instance_id: u32,
     scene: &RuntimeSceneState,
     cache: Option<&RuntimeBoundsCache>,
-) -> Option<[f32; 2]> {
-    let metrics = match cache {
-        Some(cache) => q0s_format::raster::runtime_instance_metrics_with_cache(
-            project,
-            q0rg_id,
-            frame,
-            instance_id,
-            scene,
-            cache,
-        ),
-        None => q0s_format::raster::runtime_instance_metrics(
-            project,
-            q0rg_id,
-            frame,
-            instance_id,
-            scene,
-        ),
-    }?;
-    Some([
-        (metrics.left + metrics.right) * 0.5,
-        (metrics.top + metrics.bottom) * 0.5,
-    ])
+) -> Option<Follow> {
+    q0s_format::raster::runtime_instance_follow(project, q0rg_id, frame, instance_id, scene, cache)
 }
 
 pub struct ParticleSystem {
@@ -123,9 +105,9 @@ pub struct ParticleSystem {
     emitting: bool,
     /// Seconds since it started emitting.
     elapsed: f32,
-    /// Where the object it follows is; the emitter's position is an offset
-    /// from it.
-    anchor: Option<[f32; 2]>,
+    /// Where the object it follows is and how it is turned; the emitter's
+    /// position is an offset from it in the object's own space.
+    anchor: Option<Follow>,
 }
 
 impl ParticleSystem {
@@ -137,11 +119,7 @@ impl ParticleSystem {
 
     /// Like [`ParticleSystem::new`], following an object that starts at
     /// `anchor`.
-    pub fn new_at(
-        emitter: &ParticleEmitter,
-        stage_size: [f32; 2],
-        anchor: Option<[f32; 2]>,
-    ) -> Self {
+    pub fn new_at(emitter: &ParticleEmitter, stage_size: [f32; 2], anchor: Option<Follow>) -> Self {
         let mut system = Self {
             emitter: emitter.clone(),
             stage_size,
@@ -195,19 +173,23 @@ impl ParticleSystem {
         }
     }
 
-    /// Where the object the emitter follows is now.
-    pub fn set_anchor(&mut self, anchor: [f32; 2]) {
-        if self.emitter.follow.is_some() && anchor.iter().all(|value| value.is_finite()) {
+    /// Where the object the emitter follows is now, and how it is turned.
+    pub fn set_anchor(&mut self, anchor: Follow) {
+        let turn = anchor.turn;
+        let finite = anchor.point.iter().all(|value| value.is_finite())
+            && [turn.a11, turn.a12, turn.a21, turn.a22]
+                .iter()
+                .all(|value| value.is_finite());
+        if self.emitter.follow.is_some() && finite {
             self.anchor = Some(anchor);
         }
     }
 
     /// The emitter's centre on the stage.
     pub fn centre(&self) -> [f32; 2] {
-        let [x, y] = self.emitter.position;
         match self.anchor {
-            Some([ax, ay]) => [ax + x, ay + y],
-            None => [x, y],
+            Some(anchor) => anchor.place(self.emitter.position),
+            None => self.emitter.position,
         }
     }
 
@@ -225,13 +207,30 @@ impl ParticleSystem {
         }
     }
 
-    /// Where `particle` is on the stage.
+    /// Where `particle` is on the stage. Relative particles move in the
+    /// followed object's own space, so they turn with it.
     pub fn position_of(&self, particle: &Particle) -> [f32; 2] {
-        let [x, y] = match self.emitter.space {
-            ParticleSpace::Free => particle.origin,
-            ParticleSpace::Relative => self.centre(),
-        };
-        [x + particle.offset[0], y + particle.offset[1]]
+        match (self.emitter.space, self.anchor) {
+            (ParticleSpace::Relative, Some(anchor)) => {
+                let [x, y] = self.emitter.position;
+                anchor.place([x + particle.offset[0], y + particle.offset[1]])
+            }
+            (ParticleSpace::Relative, None) => {
+                let [x, y] = self.centre();
+                [x + particle.offset[0], y + particle.offset[1]]
+            }
+            (ParticleSpace::Free, _) => [
+                particle.origin[0] + particle.offset[0],
+                particle.origin[1] + particle.offset[1],
+            ],
+        }
+    }
+
+    /// The turn of the followed object that relative particles take on
+    /// as they go; free ones took theirs when they were born.
+    fn relative_turn(&self) -> Option<Follow> {
+        self.anchor
+            .filter(|_| self.emitter.space == ParticleSpace::Relative)
     }
 
     /// Advances `dt` seconds: ages and moves every particle, retires the
@@ -350,7 +349,25 @@ impl ParticleSystem {
             cos * local[0] - sin * local[1],
             sin * local[0] + cos * local[1],
         ];
-        let heading = emitter.direction.at(rng.signed()).to_radians();
+        // A followed object turns a free emitter's shape and aim with it;
+        // relative particles live in the object's own space and are turned
+        // as they are drawn.
+        let turn = self.anchor.filter(|_| emitter.space == ParticleSpace::Free);
+        let place = match turn {
+            Some(turn) => {
+                let turned = turn
+                    .turn
+                    .apply(q0s_format::v2::Vec2::new(place[0], place[1]));
+                [turned.x, turned.y]
+            }
+            None => place,
+        };
+        let heading = emitter.direction.at(rng.signed());
+        let heading = match turn {
+            Some(turn) => turn.turn_degrees(heading),
+            None => heading,
+        }
+        .to_radians();
         let speed = emitter.speed.at(rng.signed());
         let life = emitter.lifetime.at(rng.signed()).max(0.02);
         let size_start = emitter.size_start.at(rng.signed()).max(0.0);
@@ -459,6 +476,10 @@ impl ParticleSystem {
             particle.velocity[1].atan2(particle.velocity[0]) + spin
         } else {
             spin
+        };
+        let rotation = match self.relative_turn() {
+            Some(turn) => turn.turn_degrees(rotation.to_degrees()).to_radians(),
+            None => rotation,
         };
         ParticleStyle {
             size: size.max(0.0),
@@ -675,17 +696,65 @@ mod tests {
         settings.position = [0.0, -10.0];
         settings.speed = Varied::fixed(0.0);
         settings.space = ParticleSpace::Relative;
-        let mut system = ParticleSystem::new_at(&settings, [400.0, 300.0], Some([50.0, 50.0]));
+        let at = |point| Some(Follow::at(point));
+        let mut system = ParticleSystem::new_at(&settings, [400.0, 300.0], at([50.0, 50.0]));
         assert_eq!(system.position_of(&system.particles()[0]), [50.0, 40.0]);
-        system.set_anchor([200.0, 50.0]);
+        system.set_anchor(Follow::at([200.0, 50.0]));
         system.step(0.1);
         assert_eq!(system.position_of(&system.particles()[0]), [200.0, 40.0]);
 
         settings.space = ParticleSpace::Free;
-        let mut system = ParticleSystem::new_at(&settings, [400.0, 300.0], Some([50.0, 50.0]));
-        system.set_anchor([200.0, 50.0]);
+        let mut system = ParticleSystem::new_at(&settings, [400.0, 300.0], at([50.0, 50.0]));
+        system.set_anchor(Follow::at([200.0, 50.0]));
         system.step(0.1);
         assert_eq!(system.position_of(&system.particles()[0]), [50.0, 40.0]);
+    }
+
+    #[test]
+    fn a_turned_object_turns_its_emitter() {
+        use q0s_format::transform::Affine;
+        // A nozzle 20 px right of a ship's middle, firing right.
+        let mut settings = plain();
+        settings.follow = Some(5);
+        settings.position = [20.0, 0.0];
+        settings.direction = Varied::fixed(0.0);
+        settings.speed = Varied::fixed(100.0);
+        // The ship turned a quarter clockwise, at (100, 100).
+        let ship = Follow {
+            point: [100.0, 100.0],
+            turn: Affine {
+                a11: 0.0,
+                a12: -1.0,
+                a21: 1.0,
+                a22: 0.0,
+                tx: 0.0,
+                ty: 0.0,
+            },
+        };
+        let system = ParticleSystem::new_at(&settings, [400.0, 300.0], Some(ship));
+        let centre = system.centre();
+        assert!((centre[0] - 100.0).abs() < 1.0e-3 && (centre[1] - 120.0).abs() < 1.0e-3);
+        let particle = system.particles()[0];
+        assert!(
+            particle.velocity[0].abs() < 1.0e-3,
+            "{:?}",
+            particle.velocity
+        );
+        assert!(
+            (particle.velocity[1] - 100.0).abs() < 1.0e-3,
+            "fires down now"
+        );
+
+        // Relative particles swing round with the ship as it turns on.
+        settings.space = ParticleSpace::Relative;
+        settings.speed = Varied::fixed(0.0);
+        let mut system =
+            ParticleSystem::new_at(&settings, [400.0, 300.0], Some(Follow::at([100.0, 100.0])));
+        let before = system.position_of(&system.particles()[0]);
+        assert!((before[0] - 120.0).abs() < 1.0e-3 && (before[1] - 100.0).abs() < 1.0e-3);
+        system.set_anchor(ship);
+        let after = system.position_of(&system.particles()[0]);
+        assert!((after[0] - 100.0).abs() < 1.0e-3 && (after[1] - 120.0).abs() < 1.0e-3);
     }
 
     #[test]

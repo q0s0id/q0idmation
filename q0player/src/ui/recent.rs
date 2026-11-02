@@ -5,28 +5,28 @@ use std::path::{Path, PathBuf};
 
 use egui::{ScrollArea, Ui};
 
+use super::chrome;
+
 pub enum RecentAction {
     Open(PathBuf),
     Forget(PathBuf),
     ClearAll,
 }
 
-pub fn render(recent: &[PathBuf], ui: &mut Ui) -> Option<RecentAction> {
+/// The recent movies as cards, `current` marked as the one playing.
+pub fn render(recent: &[PathBuf], current: Option<&Path>, ui: &mut Ui) -> Option<RecentAction> {
     let mut action = None;
 
-    ui.horizontal(|ui| {
-        ui.heading("Recent");
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
+    chrome::panel_header(ui, "Recent", |ui| {
+        if !recent.is_empty()
+            && ui
                 .small_button("Clear")
                 .on_hover_text("Forget all recent files")
                 .clicked()
-            {
-                action = Some(RecentAction::ClearAll);
-            }
-        });
+        {
+            action = Some(RecentAction::ClearAll);
+        }
     });
-    ui.separator();
 
     if recent.is_empty() {
         ui.label(
@@ -42,29 +42,27 @@ pub fn render(recent: &[PathBuf], ui: &mut Ui) -> Option<RecentAction> {
     ScrollArea::vertical()
         .auto_shrink([false, true])
         .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
             for path in recent {
-                ui.horizontal(|ui| {
-                    let label = truncate_label(&display_label(path), 36);
-                    let resp = ui
-                        .add(
-                            egui::Label::new(egui::RichText::new(label).small())
-                                .sense(egui::Sense::click())
-                                .truncate(true),
-                        )
-                        .on_hover_text(path.display().to_string());
-                    if resp.clicked() {
-                        action = Some(RecentAction::Open(path.clone()));
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .small_button("x")
-                            .on_hover_text("Remove from recent")
-                            .clicked()
-                        {
-                            action = Some(RecentAction::Forget(path.clone()));
-                        }
-                    });
-                });
+                let kind = path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .unwrap_or("")
+                    .to_uppercase();
+                let (response, card) = chrome::recent_card(
+                    ui,
+                    &display_label(path),
+                    &folder_label(path),
+                    &kind,
+                    current == Some(path.as_path()),
+                    super::platform::TOUCH,
+                );
+                response.on_hover_text(path.display().to_string());
+                if card.forget {
+                    action = Some(RecentAction::Forget(path.clone()));
+                } else if card.open {
+                    action = Some(RecentAction::Open(path.clone()));
+                }
             }
         });
 
@@ -78,12 +76,23 @@ fn display_label(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-fn truncate_label(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
+/// The folder a movie is in, by name.
+fn folder_label(path: &Path) -> String {
+    path.parent()
+        .and_then(|parent| parent.file_name().or(Some(parent.as_os_str())))
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cards_name_the_movie_and_its_folder() {
+        let path = Path::new("movies").join("fight").join("scene 2.q0s");
+        assert_eq!(display_label(&path), "scene 2.q0s");
+        assert_eq!(folder_label(&path), "fight");
+        assert_eq!(folder_label(Path::new("alone.q0s")), "");
     }
-    let keep = max_chars.saturating_sub(3);
-    let mut shortened: String = text.chars().take(keep).collect();
-    shortened.push_str("...");
-    shortened
 }

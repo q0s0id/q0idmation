@@ -20,7 +20,7 @@ use q0s_format::particles::{
 };
 use q0s_format::raster::RuntimeBoundsCache;
 use q0s_format::runtime_scene::RuntimeSceneState;
-use q0s_format::transform::Affine;
+use q0s_format::transform::{Affine, Follow};
 use q0s_format::v2::{
     Anchor, BlendMode, GradientFill, GradientKind, GradientStop, LibraryItemReference, Path,
     Placement, PlacementFx, ProjectV2, Rgba, Target, TintFx, Transform2D, Tween, Vec2,
@@ -67,7 +67,8 @@ pub struct ParticleSession {
 struct EmitterDrag {
     emitter_id: u16,
     press: Vec2,
-    position: [f32; 2],
+    /// Where the emitter's centre was on the stage.
+    centre: [f32; 2],
 }
 
 impl ParticleSession {
@@ -524,9 +525,9 @@ fn render_contents(app: &mut EditorApp, ui: &mut Ui) {
             }
             if edit.follow_selection {
                 if let Some(instance_id) = follow_target(app, emitter.q0rg_id) {
-                    // The emitter keeps its place, now as an offset from the
-                    // object's middle.
-                    if let Some([ax, ay]) = follow_point(
+                    // The emitter keeps its place and aim, now as an offset
+                    // and heading in the object's own space.
+                    if let Some(anchor) = follow_point(
                         &app.state.project,
                         emitter.q0rg_id,
                         app.session.current_frame,
@@ -534,10 +535,16 @@ fn render_contents(app: &mut EditorApp, ui: &mut Ui) {
                         &RuntimeSceneState::new(),
                         None,
                     ) {
-                        emitter.position = [emitter.position[0] - ax, emitter.position[1] - ay];
-                        if emitter.position[0].hypot(emitter.position[1]) > 400.0 {
-                            emitter.position = [0.0, 0.0];
-                        }
+                        let away = [
+                            emitter.position[0] - anchor.point[0],
+                            emitter.position[1] - anchor.point[1],
+                        ];
+                        emitter.position = if away[0].hypot(away[1]) > 400.0 {
+                            [0.0, 0.0]
+                        } else {
+                            anchor.offset_of(emitter.position)
+                        };
+                        emitter.direction.value = anchor.unturn_degrees(emitter.direction.value);
                     }
                     emitter.follow = Some(instance_id);
                     mark(&mut edit);
@@ -1305,10 +1312,9 @@ fn followed_name(app: &EditorApp, q0rg_id: u16, instance_id: u32) -> String {
         .unwrap_or_else(|| format!("object {instance_id}"))
 }
 
-/// Where the emitter's centre is on the stage on `frame`.
-fn emitter_centre(app: &EditorApp, emitter: &ParticleEmitter, frame: u16) -> [f32; 2] {
-    let [x, y] = emitter.position;
-    let anchor = emitter.follow.and_then(|instance_id| {
+/// Where the object `emitter` follows is on `frame`, and how it is turned.
+fn emitter_anchor(app: &EditorApp, emitter: &ParticleEmitter, frame: u16) -> Option<Follow> {
+    emitter.follow.and_then(|instance_id| {
         follow_point(
             &app.state.project,
             emitter.q0rg_id,
@@ -1317,10 +1323,14 @@ fn emitter_centre(app: &EditorApp, emitter: &ParticleEmitter, frame: u16) -> [f3
             &RuntimeSceneState::new(),
             None,
         )
-    });
-    match anchor {
-        Some([ax, ay]) => [ax + x, ay + y],
-        None => [x, y],
+    })
+}
+
+/// Where the emitter's centre is on the stage on `frame`.
+fn emitter_centre(app: &EditorApp, emitter: &ParticleEmitter, frame: u16) -> [f32; 2] {
+    match emitter_anchor(app, emitter, frame) {
+        Some(anchor) => anchor.place(emitter.position),
+        None => emitter.position,
     }
 }
 
@@ -1393,7 +1403,11 @@ fn render_where(
                         .on_hover_text("Stay where it is now instead")
                         .clicked()
                     {
-                        emitter.position = emitter_centre(app, emitter, app.session.current_frame);
+                        let frame = app.session.current_frame;
+                        if let Some(anchor) = emitter_anchor(app, emitter, frame) {
+                            emitter.direction.value = anchor.turn_degrees(emitter.direction.value);
+                        }
+                        emitter.position = emitter_centre(app, emitter, frame);
                         emitter.follow = None;
                         mark(edit);
                     }
@@ -2044,7 +2058,7 @@ pub fn handle_stage(
             app.session.particles.drag = Some(EmitterDrag {
                 emitter_id: emitter.emitter_id,
                 press: view.screen_to_stage(press),
-                position: emitter.position,
+                centre: [cx, cy],
             });
             return true;
         }
@@ -2061,10 +2075,16 @@ pub fn handle_stage(
         return true;
     }
     if let Some(cursor) = cursor {
-        let mut position = [
-            drag.position[0] + cursor.x - drag.press.x,
-            drag.position[1] + cursor.y - drag.press.y,
+        let centre = [
+            drag.centre[0] + cursor.x - drag.press.x,
+            drag.centre[1] + cursor.y - drag.press.y,
         ];
+        // A follower stores where it sits on its object, in the object's
+        // own space.
+        let mut position = match emitter_anchor(app, &emitter, app.session.current_frame) {
+            Some(anchor) => anchor.offset_of(centre),
+            None => centre,
+        };
         if response.ctx.input(|input| input.modifiers.shift) {
             position = position.map(f32::round);
         }
@@ -2110,22 +2130,24 @@ pub fn paint_stage_overlay(app: &EditorApp, painter: &Painter, view: &StageView)
             accent.gamma_multiply(0.5)
         };
         let stroke = Stroke::new(if selected { 2.0_f32 } else { 1.0_f32 }, color);
+        let anchor = emitter_anchor(app, emitter, frame);
         let [cx, cy] = emitter_centre(app, emitter, frame);
+        // The shape and aim turn with a followed object.
+        let turn = anchor.map_or(Affine::IDENTITY, |anchor| anchor.turn);
         let to_screen = |x: f32, y: f32| {
             let (sin, cos) = emitter.angle.to_radians().sin_cos();
-            view.stage_to_screen(Vec2::new(cx + cos * x - sin * y, cy + sin * x + cos * y))
+            let turned = turn.apply(Vec2::new(cos * x - sin * y, sin * x + cos * y));
+            view.stage_to_screen(Vec2::new(cx + turned.x, cy + turned.y))
         };
+        let aim = |degrees: f32| anchor.map_or(degrees, |anchor| anchor.turn_degrees(degrees));
         let center = to_screen(0.0, 0.0);
-        if emitter.follow.is_some() {
-            let anchor = view.stage_to_screen(Vec2::new(
-                cx - emitter.position[0],
-                cy - emitter.position[1],
-            ));
+        if let Some(anchor) = anchor {
+            let object = view.stage_to_screen(Vec2::new(anchor.point[0], anchor.point[1]));
             painter.line_segment(
-                [anchor, center],
+                [object, center],
                 Stroke::new(1.0_f32, color.gamma_multiply(0.6)),
             );
-            painter.circle_filled(anchor, 3.0, color.gamma_multiply(0.6));
+            painter.circle_filled(object, 3.0, color.gamma_multiply(0.6));
         }
         match emitter.shape {
             EmitterShape::Point => {
@@ -2158,7 +2180,7 @@ pub fn paint_stage_overlay(app: &EditorApp, painter: &Painter, view: &StageView)
                 let length = 40.0;
                 let spread = emitter.direction.variance;
                 for (offset, width) in [(0.0, 2.0_f32), (-spread, 1.0), (spread, 1.0)] {
-                    let heading = (emitter.direction.value + offset).to_radians();
+                    let heading = aim(emitter.direction.value + offset).to_radians();
                     let tip = center + egui::vec2(heading.cos(), heading.sin()) * length;
                     if offset == 0.0 {
                         painter.arrow(center, tip - center, Stroke::new(width, color));

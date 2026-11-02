@@ -4,8 +4,11 @@
 pub mod analytics;
 pub mod app;
 mod atomic_file;
+mod chrome;
 pub mod credits;
+mod drawer;
 pub mod launch;
+mod perf;
 mod platform;
 pub mod recent;
 pub mod render;

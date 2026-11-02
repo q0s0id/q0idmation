@@ -15,6 +15,9 @@ A host is the program that runs q0lang and applies what it asks for. The runtime
 | object scripts (`self.*`) | analyses one text | no | yes | no |
 | rig commands | reported only | not applied | yes | reports it is unavailable |
 | live physics, particles and lights | reported only | not applied | yes | reports it is unavailable |
+| layer commands and solid layers | reported only | not applied | yes | reports it is unavailable |
+| layer questions (`q0layer.touches(...)`) | diagnostic, `null` | diagnostic, `null` | yes | diagnostic, `null` |
+| window commands and `window.*` | reported only | not applied | yes, desktop; phones keep their screen | reports it is unavailable |
 | switching bundled scenes | reported only | not applied | yes | reports it is unavailable |
 | file commands | reported only | not applied | ignored | yes |
 | mouse subscription table | yes | yes | yes | yes |
@@ -54,9 +57,13 @@ An unconditional jump from a frame to itself runs the same code again. The edito
 | `input.right` | bool | D or the right arrow is held |
 | `input.jump` | bool | W, the up arrow or Space is held |
 | `input.jump_pressed` | bool | jump went from released to pressed; cleared after the frame's scripts run |
+| `input.up` | bool | W or the up arrow is held |
+| `input.down` | bool | S or the down arrow is held |
+| `input.action` | bool | Z or Enter is held |
+| `input.action_pressed` | bool | action went from released to pressed; cleared like `input.jump_pressed` |
 | `time.dt` | number | the fixed step in seconds, 1 / fps |
 
-`import q0.input` switches on a game clock that runs independently of the animation's pause button. While a frame is held, its code keeps running at the movie's fps, even in a one-frame project, so controls and movement keep updating with the timeline stopped. Without the import, a paused animation runs no new ticks. On touch screens q0player shows on-screen left, right and jump buttons.
+`import q0.input` switches on a game clock that runs independently of the animation's pause button. While a frame is held, its code keeps running at the movie's fps, even in a one-frame project, so controls and movement keep updating with the timeline stopped. Without the import, a paused animation runs no new ticks. On touch screens q0player shows on-screen left, right and jump buttons; when a script reads `input.up` or `input.down`, the arrows become a cross with up and down too. The big button is jump and action at once. Up also counts as jump on a keyboard, so platformers and four-way games share the keys.
 
 The host refreshes these values before every script. Assigning `input.left` or `time.dt` changes neither the keyboard nor the clock, and the next refresh overwrites it. The api offers no other keys, no typed text, no timers and no system time.
 
@@ -218,4 +225,129 @@ pb func lights_out target {
 listen mouse.click lights_out
 ```
 
-Sources: [player](../../q0player/src/lib.rs), [object scripts](../../q0player/src/objects.rs), [live physics, particles and lights](../../q0player/src/live.rs), [lighting](../../q0s-format/src/lighting.rs), [player keys](../../q0player/src/ui/app.rs), [editor preview](../../q0editor/src/app.rs), [runtime commands](../../q0s-format/src/q0lang/runtime.rs), [simulation](../../q0physics/src/lib.rs).
+## q0.layer: whole layers and everything on them
+
+A layer of the main timeline is named by its name in the timeline, like `"bones"`, or by its row counted from the top of the timeline, like `1` for the top row. An exact name wins; otherwise case does not matter. A folder stands for everything inside it.
+
+| command | does |
+| --- | --- |
+| `q0layer.hide! layer` | hides the layer and everything on it |
+| `q0layer.show! layer` | shows it, even one hidden in the editor |
+| `q0layer.move! layer, x, y` | draws the whole layer `x`, `y` stage pixels away from where it is drawn; `0, 0` puts it back |
+| `q0layer.alpha! layer, value` | fades it: 1 as drawn, 0 invisible |
+| `q0layer.reset! layer` | the layer as authored again |
+| `q0layer.solid! layer, instance` | the instance can no longer move into anything drawn on the layer |
+| `q0layer.unsolid! layer, instance` | lets it through again |
+
+The questions are [functions](builtins.md#functions-the-player-answers): `q0layer.touches(layer, thing)`, `q0layer.which(layer, thing)`, `q0layer.hit(layer, x, y)`, `q0layer.circle(layer, x, y, radius)`, `q0layer.box(layer, left, top, width, height)`, `q0layer.visible(layer)` and `q0layer.count(layer)`. A `thing` is an instance name of the main timeline, or the name of another layer, which asks about everything on it.
+
+What counts as drawn:
+
+- fills where they are filled, and lines along their width; a box drawn as an outline is solid along its line and empty inside, a filled box is solid all over
+- brush strokes, and the artwork inside symbols placed on the layer, at the frame they show
+- shapes as a shape tween or a motion tween has them on this frame
+- bitmaps and videos as their rectangles
+
+Colour does not matter, so a fully transparent shape still counts: invisible walls are transparent shapes, or a layer faded to 0 with `q0layer.alpha!`. A hidden layer counts as nothing. Glow, shadow, blur and masks are left out; a moved layer counts where it is drawn.
+
+A question sees where the script has put things, although moves land after the script:
+
+```q0lang
+import q0.layer
+soul.x = soul.x + 4
+hit = q0layer.touches("bones", "soul")
+```
+
+`hit` is about the soul's new place. An instance that sits on the layer it asks about never touches itself.
+
+A solid layer stops an instance a script moves. After each script of the main timeline, an instance with a solid layer stops at the layer's edge and slides along it, and `name.x` / `name.y` say where it stopped. A fast move is walked in small steps, so it cannot jump over a thin line. Something already inside a solid layer, because the layer moved onto it, moves freely until it is out. Animation, `q0layer.move!` and live physics do not push anything.
+
+```q0lang
+import q0.input
+import q0.layer
+import q0.time
+
+if not ready {
+  q0layer.solid! "walls", "soul"
+  hp = 20
+  hurt = 0
+  ready = true
+}
+step = 160 * time.dt
+if input.left {
+  soul.x = soul.x - step
+}
+if input.right {
+  soul.x = soul.x + step
+}
+if input.up {
+  soul.y = soul.y - step
+}
+if input.down {
+  soul.y = soul.y + step
+}
+if hurt > 0 {
+  hurt = hurt - 1
+} else {
+  if q0layer.touches("bones", "soul") {
+    hp = hp - 1
+    hurt = 30
+  }
+}
+```
+
+This is the frame code of a held frame; draw the box's walls as lines on a layer called `walls`, the attacks on a layer called `bones`, and animate the bones with tweens on the main timeline. Commands from an object script act on the main timeline's layers; questions are answered for the main timeline's own scripts only.
+
+## q0.window
+
+The player's own window, on desktop systems. Sizes and places are in screen points; `window.*` and `screen.*` are refreshed before every script.
+
+| name | value |
+| --- | --- |
+| `window.x`, `window.y` | where the window's outer corner is on the desktop |
+| `window.width`, `window.height` | the size of the window's inside |
+| `window.fullscreen` | whether it is fullscreen |
+| `window.ui` | whether the menu bar and status show around the movie |
+| `screen.width`, `screen.height` | the size of the screen the window is on |
+
+Writing `window.x`, `window.y`, `window.width` or `window.height` moves or sizes the window, like the commands:
+
+| command | does |
+| --- | --- |
+| `q0window.fullscreen! on` | fullscreen with only the movie, as F9 does; `false` comes back |
+| `q0window.ui! on` | shows or hides the menu bar and status line |
+| `q0window.hotkeys! on` | whether F9 and F4 still work; Ctrl+O and Ctrl+R always do |
+| `q0window.move! x, y` | puts the window there |
+| `q0window.size! width, height` | sizes its inside |
+| `q0window.center!` | centres it on its screen |
+| `q0window.title! text` | the title in the title bar |
+| `q0window.decorations! on` (`q0window.titlebar! on`) | desktop system frame and title-bar buttons; false hides them, true restores them |
+| `q0window.icon! "app_icon"` | desktop window/taskbar icon from a library bitmap name or numeric asset id |
+| `q0window.icon! null` | restores q0player's own window icon |
+| `q0window.top! on` | keeps it above other windows |
+| `q0window.minimize!` | minimizes it |
+| `q0window.perf!` | copies the performance log, as F4 does |
+| `q0window.quit!` | closes the player |
+
+`on` takes `true` or `false`, `1` or `0`, or `"on"` or `"off"`. A fullscreen window neither moves nor sizes. Opening a movie again puts the menu bar and the keys back.
+
+```q0lang
+import q0.window
+import q0.math
+
+# shake the window when something hits
+pb func shake amount {
+  window.x = window.x + amount
+}
+q0window.title! "BONE ZONE"
+q0window.size! 640, 480
+q0window.center!
+```
+
+Sources: [player](../../q0player/src/lib.rs), [layers and window](../../q0player/src/layers.rs), [what layers draw](../../q0s-format/src/collide.rs), [object scripts](../../q0player/src/objects.rs), [live physics, particles and lights](../../q0player/src/live.rs), [lighting](../../q0s-format/src/lighting.rs), [player keys](../../q0player/src/ui/app.rs), [editor preview](../../q0editor/src/app.rs), [runtime commands](../../q0s-format/src/q0lang/runtime.rs), [simulation](../../q0physics/src/lib.rs).
+
+Window icons are bundled bitmap assets, not filesystem paths. Import a PNG into
+the movie library and pass its library name or asset id. Closing the movie or
+opening another one restores the normal player icon and system frame. These
+commands affect the desktop window; they do not change the executable's file
+icon, and have no effect in the browser or Android host.

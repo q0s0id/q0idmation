@@ -1,3 +1,4 @@
+pub mod collide;
 pub mod error;
 pub mod geom;
 mod io;
@@ -15,6 +16,7 @@ pub mod raster;
 pub mod rig;
 pub mod runtime_scene;
 pub mod shape_tween;
+pub mod three;
 pub mod transform;
 pub mod v2;
 
@@ -34,3 +36,5 @@ pub use v2::MAX_Q0RG_NESTING_DEPTH;
 
 /// Shared anchor-aware motion tween evaluation.
 pub mod motion_tween;
+#[cfg(feature = "serde")]
+pub mod serde_support;

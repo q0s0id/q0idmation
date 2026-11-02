@@ -633,7 +633,12 @@ fn convert_halo_only_raw_area_to_q0rg_preserves_visible_glow_without_loss() {
     let mut max_alpha_diff = 0u8;
     let mut sum_before = 0u64;
     let mut sum_after = 0u64;
-    for (before_px, after_px) in before.chunks_exact(4).zip(after.chunks_exact(4)) {
+    for (before_px, after_px) in before
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(after.as_chunks::<4>().0.iter())
+    {
         if before_px != after_px {
             differing += 1;
         }

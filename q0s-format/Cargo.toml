@@ -10,3 +10,10 @@ description = "Project and movie formats used by q0editor and q0player."
 [dependencies]
 q0vm = { path = "../q0vm" }
 q0video = { path = "../q0video" }
+miniz_oxide = "0.8"
+serde = { version = "1", features = ["derive", "rc"], optional = true }
+base64 = { version = "0.22", optional = true }
+
+[features]
+# Lets the editor hand any part of a project to plugins as plain data.
+serde = ["dep:serde", "dep:base64"]

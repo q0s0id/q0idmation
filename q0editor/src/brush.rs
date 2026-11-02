@@ -1,10 +1,10 @@
+use std::cell::{Cell, OnceCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use geo::algorithm::buffer::{BufferStyle, LineCap, LineJoin};
-use geo::sweep::Cross;
 use geo::{
-    Area, BooleanOps, BoundingRect, Buffer, Contains, ConvexHull, Coord, Intersections, Intersects,
-    Line, LineString, MultiPoint, MultiPolygon, Point, Polygon, SimplifyVwPreserve,
+    Area, BooleanOps, BoundingRect, Buffer, Contains, ConvexHull, Coord, Intersects, Line,
+    LineString, MultiPoint, MultiPolygon, Point, Polygon, SimplifyVw, SimplifyVwPreserve,
 };
 use q0s_format::v2::{
     Anchor, Asset, Path as VPath, Placement, ProjectV2, Rgba, Target, Transform2D, Tween, Vec2,
@@ -115,6 +115,13 @@ impl BrushSample {
 #[derive(Debug, Clone)]
 pub struct BrushStroke {
     pub samples: Vec<BrushSample>,
+    // Stage-space nib size when each input sample was recorded. In screen-size
+    // mode zoom changes future dabs, never the widths of earlier artwork.
+    nominal_sizes: Vec<f32>,
+    prerender_geometry: Vec<Vec<Vec2>>,
+    prerender_dirty_from: Option<usize>,
+    #[cfg(test)]
+    pub(crate) prerender_segment_builds: usize,
     pub coverage: MultiPolygon<f64>,
     preview_paths: Vec<VPath>,
     nib: BrushNib,
@@ -134,6 +141,11 @@ pub fn brush_begin(settings: BrushSettings, sample: BrushSample) -> BrushStroke 
     let preview_paths = coverage_to_linear_paths(&coverage);
     BrushStroke {
         samples: vec![sample],
+        nominal_sizes: vec![settings.size],
+        prerender_geometry: Vec::new(),
+        prerender_dirty_from: Some(0),
+        #[cfg(test)]
+        prerender_segment_builds: 0,
         coverage,
         preview_paths,
         nib: settings.nib,
@@ -153,6 +165,12 @@ pub fn brush_add_sample(
     settings: BrushSettings,
     mut sample: BrushSample,
 ) {
+    let mut changed_from = (stroke.nib != settings.nib
+        || stroke.pressure_size != settings.pressure_size
+        || stroke.velocity_size != settings.velocity_size
+        || stroke.dynamics_sensitivity != settings.dynamics_sensitivity.min(100)
+        || stroke.dynamics_min_size != sanitized_dynamic_min_size(settings.dynamics_min_size))
+    .then_some(0);
     // Windows pen input is not guaranteed to attach pressure to every motion
     // event. Once a gesture has produced real pen pressure, a pressureless
     // motion sample is missing data, not a mouse sample at 100% pressure.
@@ -161,6 +179,7 @@ pub fn brush_add_sample(
     // otherwise the committed vector gets a full-size circular start blob.
     if let Some(pressure) = sample.pressure {
         if stroke.last_pressure.is_none() {
+            changed_from = Some(0);
             for previous in &mut stroke.samples {
                 if previous.pressure.is_none() {
                     previous.pressure = Some(pressure);
@@ -178,12 +197,23 @@ pub fn brush_add_sample(
         .is_some_and(|last| vec2_distance(last.position, sample.position) <= 1.0e-5)
     {
         if let Some(last) = stroke.samples.last_mut() {
-            if sample.pressure.is_some() {
+            if sample.pressure.is_some() && sample.pressure != last.pressure {
                 last.pressure = sample.pressure;
+                changed_from = Some(
+                    changed_from
+                        .unwrap_or(usize::MAX)
+                        .min(stroke.samples.len().saturating_sub(2)),
+                );
             }
         }
     } else {
+        changed_from = Some(
+            changed_from
+                .unwrap_or(usize::MAX)
+                .min(stroke.samples.len().saturating_sub(1)),
+        );
         stroke.samples.push(sample);
+        stroke.nominal_sizes.push(settings.size);
     }
     stroke.nib = settings.nib;
     stroke.size = settings.size;
@@ -192,7 +222,74 @@ pub fn brush_add_sample(
     stroke.velocity_size = settings.velocity_size;
     stroke.dynamics_sensitivity = settings.dynamics_sensitivity.min(100);
     stroke.dynamics_min_size = sanitized_dynamic_min_size(settings.dynamics_min_size);
+    if let Some(first) = changed_from {
+        stroke.prerender_dirty_from = Some(stroke.prerender_dirty_from.unwrap_or(first).min(first));
+    }
     stroke.dirty_preview = true;
+}
+
+pub(crate) fn brush_prerender_dirty_from(stroke: &BrushStroke) -> Option<usize> {
+    stroke.prerender_dirty_from
+}
+
+fn prerender_nib(nib: BrushNib, center: Vec2, size: f32) -> Vec<Vec2> {
+    if nib != BrushNib::Circle {
+        return nib_outline(nib, size.max(0.1), center);
+    }
+    (0..24)
+        .map(|index| {
+            let angle = std::f32::consts::TAU * index as f32 / 24.0;
+            Vec2::new(
+                center.x + angle.cos() * size.max(0.1) * 0.5,
+                center.y + angle.sin() * size.max(0.1) * 0.5,
+            )
+        })
+        .collect()
+}
+
+/// Cache raw nib sweeps in document coordinates. Zoom only projects these
+/// vertices; it never repeats convex-hull construction for the stroke history.
+/// The cache includes all samples, including artwork outside the stage paper.
+pub(crate) fn brush_prerender_geometry(stroke: &mut BrushStroke) -> &[Vec<Vec2>] {
+    if let Some(first) = stroke.prerender_dirty_from.take() {
+        if stroke.samples.len() == 1 {
+            let (center, size) = brush_prerender_dab_at(stroke, 0).unwrap();
+            stroke.prerender_geometry = vec![prerender_nib(stroke.nib, center, size)];
+            #[cfg(test)]
+            {
+                stroke.prerender_segment_builds += 1;
+            }
+        } else {
+            stroke.prerender_geometry.truncate(first);
+            for index in stroke.prerender_geometry.len()..stroke.samples.len() - 1 {
+                let (start, start_size) = brush_prerender_dab_at(stroke, index).unwrap();
+                let (end, end_size) = brush_prerender_dab_at(stroke, index + 1).unwrap();
+                let hull = MultiPoint::new(
+                    prerender_nib(stroke.nib, start, start_size)
+                        .into_iter()
+                        .chain(prerender_nib(stroke.nib, end, end_size))
+                        .map(|point| Point::new(f64::from(point.x), f64::from(point.y)))
+                        .collect(),
+                )
+                .convex_hull();
+                let mut contour: Vec<_> = hull
+                    .exterior()
+                    .0
+                    .iter()
+                    .map(|point| Vec2::new(point.x as f32, point.y as f32))
+                    .collect();
+                if contour.first() == contour.last() {
+                    contour.pop();
+                }
+                stroke.prerender_geometry.push(contour);
+                #[cfg(test)]
+                {
+                    stroke.prerender_segment_builds += 1;
+                }
+            }
+        }
+    }
+    &stroke.prerender_geometry
 }
 
 /// Materialize the vector coverage from all raw samples in one operation.
@@ -205,10 +302,10 @@ pub fn brush_flush_pending(stroke: &mut BrushStroke) {
     }
     let trajectory = build_sweep_trajectory(&stroke.samples, stroke.smoothing, stroke.size);
     let sizes = stroke_sample_sizes(stroke);
-    stroke.coverage = if brush_size_dynamics_enabled(stroke) {
+    stroke.coverage = if stroke_has_variable_sizes(stroke) {
         sweep_variable_trajectory_nib(stroke.nib, &trajectory, &sizes)
     } else {
-        sweep_trajectory_nib(stroke.nib, stroke.size, &trajectory)
+        sweep_trajectory_nib(stroke.nib, stroke.nominal_sizes[0], &trajectory)
     };
     stroke.preview_paths = coverage_to_linear_paths(&stroke.coverage);
     stroke.dirty_preview = false;
@@ -228,6 +325,14 @@ pub fn brush_preview_nib(stroke: &BrushStroke) -> BrushNib {
 
 pub fn brush_size_dynamics_enabled(stroke: &BrushStroke) -> bool {
     stroke.pressure_size || stroke.velocity_size
+}
+
+fn stroke_has_variable_sizes(stroke: &BrushStroke) -> bool {
+    brush_size_dynamics_enabled(stroke)
+        || stroke
+            .nominal_sizes
+            .windows(2)
+            .any(|pair| pair[0] != pair[1])
 }
 
 pub fn brush_preview_dabs(stroke: &BrushStroke) -> Vec<(Vec2, f32)> {
@@ -255,7 +360,7 @@ pub fn brush_prerender_dabs(stroke: &BrushStroke) -> Vec<(Vec2, f32)> {
 pub fn brush_prerender_dab_at(stroke: &BrushStroke, index: usize) -> Option<(Vec2, f32)> {
     let sample = stroke.samples.get(index)?;
     let settings = BrushSettings {
-        size: stroke.size,
+        size: *stroke.nominal_sizes.get(index)?,
         pressure_size: stroke.pressure_size,
         velocity_size: stroke.velocity_size,
         dynamics_sensitivity: stroke.dynamics_sensitivity,
@@ -272,19 +377,12 @@ pub fn brush_prerender_dab_at(stroke: &BrushStroke, index: usize) -> Option<(Vec
 /// only the latest raw sample, so cursor feedback stays O(1) even on a very
 /// long gesture and cannot reintroduce progressive preview lag.
 pub fn brush_current_size(stroke: &BrushStroke) -> f32 {
-    let settings = BrushSettings {
-        size: stroke.size,
-        pressure_size: stroke.pressure_size,
-        velocity_size: stroke.velocity_size,
-        dynamics_sensitivity: stroke.dynamics_sensitivity,
-        dynamics_min_size: stroke.dynamics_min_size,
-        ..BrushSettings::default()
-    };
     stroke
         .samples
         .len()
         .checked_sub(1)
-        .map(|index| dynamic_sample_size(&stroke.samples, index, settings))
+        .and_then(|index| brush_prerender_dab_at(stroke, index))
+        .map(|(_, size)| size)
         .unwrap_or_else(|| stroke.size.max(0.1))
 }
 
@@ -296,11 +394,11 @@ pub fn brush_preview_paths_for_render(stroke: &BrushStroke) -> Vec<VPath> {
         return stroke.preview_paths.clone();
     }
     let trajectory = build_sweep_trajectory(&stroke.samples, stroke.smoothing, stroke.size);
-    let coverage = if brush_size_dynamics_enabled(stroke) {
+    let coverage = if stroke_has_variable_sizes(stroke) {
         let sizes = stroke_sample_sizes(stroke);
         sweep_variable_trajectory_nib(stroke.nib, &trajectory, &sizes)
     } else {
-        sweep_trajectory_nib(stroke.nib, stroke.size, &trajectory)
+        sweep_trajectory_nib(stroke.nib, stroke.nominal_sizes[0], &trajectory)
     };
     coverage_to_linear_paths(&coverage)
 }
@@ -316,7 +414,9 @@ pub fn brush_preview_trajectory(stroke: &BrushStroke) -> Vec<Vec2> {
 pub fn brush_finish(mut stroke: BrushStroke, settings: BrushSettings) -> MultiPolygon<f64> {
     let is_single_dab = stroke.samples.len() == 1;
     stroke.nib = settings.nib;
-    stroke.size = settings.size;
+    // Viewport changes on the release frame must not change either the
+    // authored widths or the gesture's smoothing scale.
+    stroke.size = stroke.nominal_sizes[0];
     stroke.smoothing = settings.smoothing;
     stroke.pressure_size = settings.pressure_size;
     stroke.velocity_size = settings.velocity_size;
@@ -329,7 +429,7 @@ pub fn brush_finish(mut stroke: BrushStroke, settings: BrushSettings) -> MultiPo
         // is already the exact static nib and must keep its literal footprint.
         stroke.coverage
     } else {
-        let mut finished = smooth_contours(&stroke.coverage, settings.smoothing, settings.size);
+        let mut finished = smooth_contours(&stroke.coverage, settings.smoothing, stroke.size);
         // A circular nib has no semantic corners, so restoring its two exact
         // endpoint discs protects the classic round cap from simplification.
         // Polygon nibs are different: unioning their literal endpoint imprint
@@ -496,17 +596,9 @@ fn brush_sample_speed(samples: &[BrushSample], index: usize) -> f32 {
 }
 
 fn stroke_sample_sizes(stroke: &BrushStroke) -> Vec<f32> {
-    dynamic_sample_sizes(
-        &stroke.samples,
-        BrushSettings {
-            size: stroke.size,
-            pressure_size: stroke.pressure_size,
-            velocity_size: stroke.velocity_size,
-            dynamics_sensitivity: stroke.dynamics_sensitivity,
-            dynamics_min_size: stroke.dynamics_min_size,
-            ..BrushSettings::default()
-        },
-    )
+    (0..stroke.samples.len())
+        .filter_map(|index| brush_prerender_dab_at(stroke, index).map(|(_, size)| size))
+        .collect()
 }
 
 fn sweep_variable_trajectory_nib(
@@ -766,6 +858,16 @@ pub fn smooth_contours(
             radius * (0.01 + effective_strength * 0.16),
         );
         let epsilon = (target_tolerance * backoff).powi(2).max(1.0e-8);
+        // The preserving simplifier checks intermediate edits one by one.
+        // Most brush rings simplify safely in one heap pass; validate that
+        // completed result, with the original preserving path as fallback.
+        let mut fast = softened.simplify_vw(epsilon);
+        restore_long_simplified_spans(coverage, &softened, &mut fast, radius);
+        if simplification_is_safe(coverage, &fast, strength, radius)
+            && simplified_ring_relationships_are_valid(&fast)
+        {
+            return fast;
+        }
         let candidate = softened.simplify_vw_preserve(epsilon);
         if simplification_is_safe(coverage, &candidate, strength, radius) {
             return candidate;
@@ -782,6 +884,127 @@ fn contour_smoothing_passes(smoothing: u8) -> usize {
         51..=75 => 2,
         76..=90 => 3,
         _ => 4,
+    }
+}
+
+fn simplified_ring_relationships_are_valid(candidate: &MultiPolygon<f64>) -> bool {
+    let ring_count: usize = candidate
+        .0
+        .iter()
+        .map(|polygon| 1 + polygon.interiors().len())
+        .sum();
+    if ring_count < 2 {
+        return true;
+    }
+    let mut segments = Vec::new();
+    let mut ring_index = 0;
+    for polygon in &candidate.0 {
+        for ring in std::iter::once(polygon.exterior()).chain(polygon.interiors()) {
+            let segment_count = ring.0.len().saturating_sub(1);
+            for (segment_index, pair) in ring.0.windows(2).enumerate() {
+                if pair[0] != pair[1] {
+                    segments.push(FillBoundarySegment {
+                        ring_index,
+                        segment_index,
+                        segment_count,
+                        line: Line::new(pair[0], pair[1]),
+                    });
+                }
+            }
+            ring_index += 1;
+        }
+    }
+    if fill_boundaries_intersect(segments, false) {
+        return false;
+    }
+    for (index, polygon) in candidate.0.iter().enumerate() {
+        let exterior = Polygon::new(polygon.exterior().clone(), Vec::new());
+        for (hole_index, hole) in polygon.interiors().iter().enumerate() {
+            let point = Point(hole.0[0]);
+            if !exterior.contains(&point) {
+                return false;
+            }
+            for other in &polygon.interiors()[..hole_index] {
+                if Polygon::new(other.clone(), Vec::new()).contains(&point)
+                    || Polygon::new(hole.clone(), Vec::new()).contains(&Point(other.0[0]))
+                {
+                    return false;
+                }
+            }
+        }
+        let point = Point(polygon.exterior().0[0]);
+        if candidate
+            .0
+            .iter()
+            .enumerate()
+            .any(|(other, polygon)| other != index && polygon.contains(&point))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Put source vertices back along overlong simplification chords. This keeps
+/// the existing bend guard without retrying expensive topology-preserving
+/// simplification four times only to discard each complete result.
+fn restore_long_simplified_spans(
+    original: &MultiPolygon<f64>,
+    softened: &MultiPolygon<f64>,
+    candidate: &mut MultiPolygon<f64>,
+    radius: f64,
+) {
+    let restore = |original: &LineString<f64>,
+                   source: &LineString<f64>,
+                   target: &mut LineString<f64>| {
+        let limit = ring_max_edge_length(original) * 2.5 + radius * 0.35;
+        if ring_max_edge_length(target) <= limit {
+            return;
+        }
+        let mut retained = Vec::with_capacity(target.0.len());
+        let mut search = 0;
+        for point in &target.0 {
+            let Some(offset) = source.0[search..].iter().position(|source| source == point) else {
+                return;
+            };
+            search += offset;
+            retained.push(search);
+            search += 1;
+        }
+        let mut restored = Vec::with_capacity(source.0.len());
+        restored.push(target.0[0]);
+        for pair in retained.windows(2) {
+            let mut start = pair[0];
+            if (source.0[start].x - source.0[pair[1]].x)
+                .hypot(source.0[start].y - source.0[pair[1]].y)
+                > limit
+            {
+                for index in pair[0] + 1..=pair[1] {
+                    if (source.0[start].x - source.0[index].x)
+                        .hypot(source.0[start].y - source.0[index].y)
+                        > limit
+                    {
+                        if index - 1 <= start {
+                            return;
+                        }
+                        restored.push(source.0[index - 1]);
+                        start = index - 1;
+                    }
+                }
+            }
+            restored.push(source.0[pair[1]]);
+        }
+        target.0 = restored;
+    };
+    for ((before, source), target) in original.0.iter().zip(&softened.0).zip(&mut candidate.0) {
+        target.exterior_mut(|ring| restore(before.exterior(), source.exterior(), ring));
+        target.interiors_mut(|rings| {
+            for ((before, source), target) in
+                before.interiors().iter().zip(source.interiors()).zip(rings)
+            {
+                restore(before, source, target);
+            }
+        });
     }
 }
 
@@ -975,11 +1198,10 @@ fn signed_ring_area(ring: &LineString<f64>) -> f64 {
         * 0.5
 }
 
-/// Fill rings smaller than this, in square stage pixels, are crumbs that
-/// boolean operations leave along nearly shared edges: a tenth of a pixel
-/// square or less, invisible at any zoom. Kept, each one costs a full union
-/// in every later selection, bucket fill and merge of its drawing.
-pub(crate) const SPECK_AREA: f64 = 0.01;
+/// Remove numerical crumbs, while retaining the smallest authored nibs.
+/// Stage area is not screen area: the former 0.01 threshold discarded real
+/// 0.1-unit brush marks that are several pixels wide when zoomed in.
+pub(crate) const SPECK_AREA: f64 = 0.0001;
 
 /// Whether `ring` encloses too little to be seen.
 pub(crate) fn is_speck(ring: &LineString<f64>) -> bool {
@@ -1003,6 +1225,38 @@ pub fn coverage_to_paths(coverage: &MultiPolygon<f64>) -> Vec<VPath> {
         }
     }
     paths
+}
+
+/// `coverage` as raw fill paths that keep its separate pieces apart.
+/// Smoothed curves can bulge across a hairline gap, such as a knife's cut or
+/// a thin eraser stroke, and fuse the pieces on either side back into one;
+/// then the exact straight edges are kept instead.
+pub(crate) fn coverage_to_separate_paths(coverage: &MultiPolygon<f64>) -> Vec<VPath> {
+    let paths = coverage_to_paths(coverage);
+    let pieces = coverage
+        .0
+        .iter()
+        .filter(|polygon| !is_speck(polygon.exterior()))
+        .count();
+    if pieces < 2 {
+        return paths;
+    }
+    let fitted = VectorAsset {
+        asset_id: 0,
+        paths,
+        fill: Some(Rgba {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        }),
+        stroke: None,
+    };
+    if vector_fill_topology(&fitted).surface.0.len() >= pieces {
+        fitted.paths
+    } else {
+        coverage_to_linear_paths(coverage)
+    }
 }
 
 pub(crate) fn coverage_to_linear_paths(coverage: &MultiPolygon<f64>) -> Vec<VPath> {
@@ -1054,7 +1308,11 @@ fn ring_to_path(ring: &LineString<f64>) -> Option<VPath> {
     }
     let hairpin_points = collapse_micro_hairpins(&baseline_points, fit_tolerance);
     let aggressive_points = collapse_micro_backsteps(&hairpin_points, fit_tolerance);
-    for fit_points in [&aggressive_points, &hairpin_points, &baseline_points] {
+    let variants = [&aggressive_points, &hairpin_points, &baseline_points];
+    for (index, fit_points) in variants.iter().copied().enumerate() {
+        if variants[..index].contains(&fit_points) {
+            continue;
+        }
         if fit_points.len() < 3 {
             continue;
         }
@@ -1914,33 +2172,19 @@ fn polyline_self_intersects(points: &[Vec2]) -> bool {
 }
 
 fn segments_intersect(a: Vec2, b: Vec2, c: Vec2, d: Vec2) -> bool {
-    const EPSILON: f32 = 1.0e-5;
-    let ab_c = cross(vec2_sub(b, a), vec2_sub(c, a));
-    let ab_d = cross(vec2_sub(b, a), vec2_sub(d, a));
-    let cd_a = cross(vec2_sub(d, c), vec2_sub(a, c));
-    let cd_b = cross(vec2_sub(d, c), vec2_sub(b, c));
-
-    if ((ab_c > EPSILON && ab_d < -EPSILON) || (ab_c < -EPSILON && ab_d > EPSILON))
-        && ((cd_a > EPSILON && cd_b < -EPSILON) || (cd_a < -EPSILON && cd_b > EPSILON))
-    {
-        return true;
-    }
-    (ab_c.abs() <= EPSILON && point_on_segment(c, a, b))
-        || (ab_d.abs() <= EPSILON && point_on_segment(d, a, b))
-        || (cd_a.abs() <= EPSILON && point_on_segment(a, c, d))
-        || (cd_b.abs() <= EPSILON && point_on_segment(b, c, d))
-}
-
-fn point_on_segment(point: Vec2, start: Vec2, end: Vec2) -> bool {
-    const EPSILON: f32 = 1.0e-5;
-    point.x >= start.x.min(end.x) - EPSILON
-        && point.x <= start.x.max(end.x) + EPSILON
-        && point.y >= start.y.min(end.y) - EPSILON
-        && point.y <= start.y.max(end.y) + EPSILON
-}
-
-fn cross(a: Vec2, b: Vec2) -> f32 {
-    a.x * b.y - a.y * b.x
+    // A fixed epsilon on a cross product has area units. On short fitted
+    // segments it could treat separated edges as collinear intersections and
+    // reject every fitting/backoff attempt. f64 robust orientation keeps
+    // actual crossings, touching endpoints and collinear overlaps exact.
+    let coord = |point: Vec2| Coord {
+        x: f64::from(point.x),
+        y: f64::from(point.y),
+    };
+    geo::line_intersection::line_intersection(
+        Line::new(coord(a), coord(b)),
+        Line::new(coord(c), coord(d)),
+    )
+    .is_some()
 }
 
 fn vec2_add(a: Vec2, b: Vec2) -> Vec2 {
@@ -2427,7 +2671,7 @@ fn merge_touching_raw_fills_after_edit_impl(
             }
             // Persist only the union boundary. Concatenating source paths left
             // interior edges selectable/stroked and could cancel opposite windings.
-            let paths = coverage_to_paths(&merged);
+            let paths = coverage_to_separate_paths(&merged);
             if !paths.is_empty() {
                 updates.push((style, asset_ids, paths));
             }
@@ -2592,7 +2836,7 @@ fn erase_brush_region_impl(
         let asset_id = *writable_assets
             .get(original_asset_id)
             .unwrap_or(original_asset_id);
-        let paths = coverage_to_paths(geometry);
+        let paths = coverage_to_separate_paths(geometry);
         if paths.is_empty() {
             remove_asset_ids.insert(asset_id);
         } else if let Some(Asset::Vector(vector)) = app
@@ -2673,7 +2917,6 @@ fn collect_raw_fill_candidates(
             {
                 return None;
             }
-            let geometry = vector_fill_geometry(vector);
             #[cfg(feature = "appearance-mask-eraser")]
             let geometry = if project
                 .asset_appearances
@@ -2685,8 +2928,10 @@ fn collect_raw_fill_candidates(
                     project.asset_appearances.get(&asset_id),
                 )
             } else {
-                geometry
+                vector_fill_geometry(vector)
             };
+            #[cfg(not(feature = "appearance-mask-eraser"))]
+            let geometry = vector_fill_geometry(vector);
             (!geometry.0.is_empty()).then_some(RawFillCandidate {
                 asset_id,
                 color,
@@ -2774,7 +3019,7 @@ fn asset_has_external_references(
     })
 }
 
-fn remove_current_layer_asset_placements(
+pub(crate) fn remove_current_layer_asset_placements(
     project: &mut ProjectV2,
     q0rg_id: u16,
     layer_id: u16,
@@ -2848,12 +3093,78 @@ struct FillBoundarySegment {
     line: Line<f64>,
 }
 
-impl Cross for FillBoundarySegment {
-    type Scalar = f64;
-
-    fn line(&self) -> Line<f64> {
-        self.line
+/// A bounding-box sweep avoids scheduling an intersection event for every
+/// adjacent endpoint in dense, already planar brush contours. Only the broad
+/// phase is approximate work reduction; the f64 intersection predicate is exact.
+fn fill_boundaries_intersect(segments: Vec<FillBoundarySegment>, check_self: bool) -> bool {
+    struct BoundedSegment {
+        source: FillBoundarySegment,
+        bounds: [f64; 4],
     }
+    let mut bounds = [
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    let mut lengths = [0.0; 2];
+    for segment in &segments {
+        let line = segment.line;
+        if ![line.start.x, line.start.y, line.end.x, line.end.y]
+            .into_iter()
+            .all(f64::is_finite)
+        {
+            return true;
+        }
+        bounds[0] = bounds[0].min(line.start.x.min(line.end.x));
+        bounds[1] = bounds[1].min(line.start.y.min(line.end.y));
+        bounds[2] = bounds[2].max(line.start.x.max(line.end.x));
+        bounds[3] = bounds[3].max(line.start.y.max(line.end.y));
+        lengths[0] += (line.end.x - line.start.x).abs();
+        lengths[1] += (line.end.y - line.start.y).abs();
+    }
+    // Choose the axis with fewer expected active intervals, including narrow
+    // comb-like drawings whose long edges all overlap along the other axis.
+    let sweep_x = lengths[0] / (bounds[2] - bounds[0]).max(1.0e-10)
+        <= lengths[1] / (bounds[3] - bounds[1]).max(1.0e-10);
+    let mut bounded: Vec<_> = segments
+        .into_iter()
+        .map(|source| {
+            let line = source.line;
+            let (a, b, c, d) = if sweep_x {
+                (line.start.x, line.end.x, line.start.y, line.end.y)
+            } else {
+                (line.start.y, line.end.y, line.start.x, line.end.x)
+            };
+            BoundedSegment {
+                source,
+                bounds: [a.min(b), a.max(b), c.min(d), c.max(d)],
+            }
+        })
+        .collect();
+    bounded.sort_unstable_by(|a, b| a.bounds[0].total_cmp(&b.bounds[0]));
+    let mut active: Vec<&BoundedSegment> = Vec::new();
+    for current in &bounded {
+        active.retain(|previous| previous.bounds[1] >= current.bounds[0]);
+        for previous in &active {
+            if previous.bounds[3] < current.bounds[2] || current.bounds[3] < previous.bounds[2] {
+                continue;
+            }
+            let left = &previous.source;
+            let right = &current.source;
+            if left.ring_index == right.ring_index {
+                let distance = left.segment_index.abs_diff(right.segment_index);
+                if !check_self || distance <= 1 || distance + 1 == left.segment_count {
+                    continue;
+                }
+            }
+            if geo::line_intersection::line_intersection(left.line, right.line).is_some() {
+                return true;
+            }
+        }
+        active.push(current);
+    }
+    false
 }
 
 #[derive(Debug, Clone)]
@@ -2872,6 +3183,8 @@ fn canonical_vector_fill_topology(vector: &VectorAsset) -> Option<VectorFillTopo
         polygon: Polygon<f64>,
         area: f64,
         bounds: (f64, f64, f64, f64),
+        containment_queries: Cell<usize>,
+        containment_index: OnceCell<geo::indexed::IntervalTreeMultiPolygon<f64>>,
     }
 
     let mut rings = Vec::new();
@@ -2912,6 +3225,8 @@ fn canonical_vector_fill_topology(vector: &VectorAsset) -> Option<VectorFillTopo
             path_index,
             polygon,
             area,
+            containment_queries: Cell::new(0),
+            containment_index: OnceCell::new(),
             bounds: (
                 bounds.min().x,
                 bounds.min().y,
@@ -2928,18 +3243,11 @@ fn canonical_vector_fill_topology(vector: &VectorAsset) -> Option<VectorFillTopo
     }
 
     // Canonical raw-fill assets have simple rings that may nest but never cross.
-    // Prove that cheaply with the sweep-line iterator. If an imported/legacy
+    // Prove that with a broad-phase bounds sweep. If an imported/legacy
     // vector really contains crossing or self-intersecting rings, keep the exact
     // old boolean path below instead of guessing topology.
-    for (left, right, _) in Intersections::from_iter(segments) {
-        if left.ring_index != right.ring_index {
-            return None;
-        }
-        let distance = left.segment_index.abs_diff(right.segment_index);
-        let adjacent = distance <= 1 || distance + 1 == left.segment_count;
-        if !adjacent {
-            return None;
-        }
+    if fill_boundaries_intersect(segments, true) {
+        return None;
     }
 
     rings.sort_by(|left, right| right.area.abs().total_cmp(&left.area.abs()));
@@ -2959,7 +3267,25 @@ fn canonical_vector_fill_topology(vector: &VectorAsset) -> Option<VectorFillTopo
                 && candidate.bounds.1 <= sample.y()
                 && candidate.bounds.2 >= sample.x()
                 && candidate.bounds.3 >= sample.y()
-                && candidate.polygon.contains(&sample)
+                && {
+                    let queries = candidate.containment_queries.get() + 1;
+                    candidate.containment_queries.set(queries);
+                    // Many holes used to rescan the complete dense exterior
+                    // once per ring. Build geo's interval index only when that
+                    // same boundary is actually queried repeatedly.
+                    if queries < 4 || candidate.polygon.exterior().0.len() < 128 {
+                        candidate.polygon.contains(&sample)
+                    } else {
+                        candidate
+                            .containment_index
+                            .get_or_init(|| {
+                                geo::indexed::IntervalTreeMultiPolygon::new(&MultiPolygon(vec![
+                                    candidate.polygon.clone(),
+                                ]))
+                            })
+                            .contains(&sample)
+                    }
+                }
         });
         let outside_winding = parent.map(|parent| inside_windings[parent]).unwrap_or(0);
         let inside_winding = outside_winding + if ring.area > 0.0 { 1 } else { -1 };
@@ -3088,7 +3414,7 @@ fn next_asset_id(project: &ProjectV2) -> u16 {
         .saturating_add(1)
 }
 
-fn remove_unreferenced_assets(project: &mut ProjectV2, candidates: &BTreeSet<u16>) {
+pub(crate) fn remove_unreferenced_assets(project: &mut ProjectV2, candidates: &BTreeSet<u16>) {
     if candidates.is_empty() {
         return;
     }
@@ -5126,9 +5452,11 @@ mod tests {
                 commit_brush_region(&mut app, brush_finish(gesture, paint), paint);
                 let after = render(&app.state.project);
                 let holes = before
-                    .chunks_exact(4)
-                    .zip(after.chunks_exact(4))
-                    .filter(|(a, b)| *a != [40, 40, 40, 255] && *b == [40, 40, 40, 255])
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(after.as_chunks::<4>().0.iter())
+                    .filter(|(a, b)| **a != [40, 40, 40, 255] && **b == [40, 40, 40, 255])
                     .count();
                 assert_eq!(
                     holes, 0,
@@ -5153,8 +5481,10 @@ mod tests {
                     .unwrap();
                 }
                 let changed = before
-                    .chunks_exact(4)
-                    .zip(after.chunks_exact(4))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(after.as_chunks::<4>().0.iter())
                     .enumerate()
                     .filter(|(index, (a, b))| {
                         let px = (index % 960) as f32 / 6.0;
@@ -5167,7 +5497,7 @@ mod tests {
                 assert_eq!(
                     changed, 0,
                     "a local stroke at ({x}, {y}) changed distant pixels, colour {color:?}; first differences: {:?}",
-                    before.chunks_exact(4).zip(after.chunks_exact(4)).enumerate()
+                    before.as_chunks::<4>().0.iter().zip(after.as_chunks::<4>().0.iter()).enumerate()
                         .filter(|(i, (a, b))| a != b && (((i / 960) as f32 / 6.0) < y - 7.0 || ((i / 960) as f32 / 6.0) > y + 17.0))
                         .map(|(i, (a, b))| ((i % 960, i / 960), a, b)).take(15).collect::<Vec<_>>()
                 );
@@ -5697,6 +6027,376 @@ mod tests {
     }
 
     #[test]
+    fn brush_release_short_disjoint_edges_are_not_false_intersections() {
+        assert!(!segments_intersect(
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.01, 0.005),
+            Vec2::new(0.005, 0.003),
+            Vec2::new(0.02, 0.01)
+        ));
+        assert!(segments_intersect(
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.01, 0.01),
+            Vec2::new(0.0, 0.01),
+            Vec2::new(0.01, 0.0)
+        ));
+        assert!(segments_intersect(
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.01, 0.0),
+            Vec2::new(0.005, 0.0),
+            Vec2::new(0.02, 0.0)
+        ));
+        assert!(segments_intersect(
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.01, 0.0),
+            Vec2::new(0.01, 0.0),
+            Vec2::new(0.02, 0.01)
+        ));
+    }
+
+    #[test]
+    fn brush_release_topology_guard_rejects_changed_hole_relationships() {
+        let ring = |x0, y0, x1, y1| {
+            path_to_polygon(&square_path(x0, y0, x1, y1))
+                .unwrap()
+                .exterior()
+                .clone()
+        };
+        assert!(simplified_ring_relationships_are_valid(&MultiPolygon(
+            vec![Polygon::new(
+                ring(0.0, 0.0, 20.0, 20.0),
+                vec![ring(3.0, 3.0, 7.0, 7.0)]
+            )]
+        )));
+        assert!(!simplified_ring_relationships_are_valid(&MultiPolygon(
+            vec![Polygon::new(
+                ring(0.0, 0.0, 20.0, 20.0),
+                vec![ring(30.0, 30.0, 32.0, 32.0)]
+            )]
+        )));
+        assert!(!simplified_ring_relationships_are_valid(&MultiPolygon(
+            vec![Polygon::new(
+                ring(0.0, 0.0, 20.0, 20.0),
+                vec![ring(18.0, 3.0, 22.0, 7.0)]
+            )]
+        )));
+        assert!(!simplified_ring_relationships_are_valid(&MultiPolygon(
+            vec![Polygon::new(
+                ring(0.0, 0.0, 20.0, 20.0),
+                vec![ring(2.0, 2.0, 12.0, 12.0), ring(4.0, 4.0, 6.0, 6.0)]
+            )]
+        )));
+        assert!(!simplified_ring_relationships_are_valid(&MultiPolygon(
+            vec![
+                Polygon::new(ring(0.0, 0.0, 20.0, 20.0), Vec::new()),
+                Polygon::new(ring(2.0, 2.0, 4.0, 4.0), Vec::new())
+            ]
+        )));
+        assert!(simplified_ring_relationships_are_valid(&MultiPolygon(
+            vec![
+                Polygon::new(ring(0.0, 0.0, 20.0, 20.0), vec![ring(2.0, 2.0, 12.0, 12.0)]),
+                Polygon::new(ring(4.0, 4.0, 6.0, 6.0), Vec::new())
+            ]
+        )));
+    }
+
+    #[test]
+    fn merge_drawing_dense_structure_phase_timings() {
+        for same_colour in [true, false] {
+            for dab in [true, false] {
+                let mut app = EditorApp::default();
+                let paint = settings(14.0, 50);
+                let mut paths = vec![VPath {
+                    anchors: (0..8192)
+                        .map(|index| {
+                            let angle = std::f32::consts::TAU * index as f32 / 8192.0;
+                            let radius = 260.0 + (angle * 37.0).sin() * 5.0;
+                            Anchor {
+                                point: Vec2::new(
+                                    300.0 + angle.cos() * radius,
+                                    300.0 + angle.sin() * radius,
+                                ),
+                                in_handle: None,
+                                out_handle: None,
+                            }
+                        })
+                        .collect(),
+                    closed: true,
+                }];
+                for row in -6..=6 {
+                    for column in -6..=6 {
+                        let dx = column as f32 * 30.0;
+                        let dy = row as f32 * 30.0;
+                        if dx.hypot(dy) > 205.0 {
+                            continue;
+                        }
+                        paths.push(VPath {
+                            anchors: (0..32)
+                                .map(|index| {
+                                    let angle = -std::f32::consts::TAU * index as f32 / 32.0;
+                                    Anchor {
+                                        point: Vec2::new(
+                                            300.0 + dx + angle.cos() * 6.0,
+                                            300.0 + dy + angle.sin() * 6.0,
+                                        ),
+                                        in_handle: None,
+                                        out_handle: None,
+                                    }
+                                })
+                                .collect(),
+                            closed: true,
+                        });
+                    }
+                }
+                let vector = VectorAsset {
+                    asset_id: 1,
+                    paths,
+                    fill: Some(if same_colour {
+                        paint.color
+                    } else {
+                        Rgba {
+                            r: 40,
+                            g: 80,
+                            b: 200,
+                            a: 255,
+                        }
+                    }),
+                    stroke: None,
+                };
+                let input_anchors = anchor_count(&vector.paths);
+                let hole_count = vector.paths.len() - 1;
+                app.state.project.assets = vec![Asset::Vector(vector)];
+                app.state.project.q0rgs[0].layers[0].placements = vec![Placement {
+                    pivot: None,
+                    instance_id: 0,
+                    frame: 0,
+                    target: Target::Asset(1),
+                    transform: Transform2D::IDENTITY,
+                    tween: Tween::None,
+                    fx: Default::default(),
+                }];
+                render_current_frame_once(&mut app);
+                let points = if dab {
+                    vec![Vec2::new(560.0, 300.0)]
+                } else {
+                    vec![Vec2::new(550.0, 300.0), Vec2::new(580.0, 306.0)]
+                };
+                let region = brush_finish(stroke(&points, paint), paint);
+                let start = std::time::Instant::now();
+                let candidates = collect_raw_fill_candidates(
+                    &app.state.project,
+                    app.session.current_q0rg_id,
+                    app.session.current_layer_id,
+                    0,
+                    false,
+                );
+                let collect = start.elapsed();
+                assert_eq!(candidates.len(), 1);
+                let fresh_paths = coverage_to_paths(&region);
+                let fresh_geometry = vector_fill_geometry(&VectorAsset {
+                    asset_id: 0,
+                    paths: fresh_paths.clone(),
+                    fill: Some(paint.color),
+                    stroke: None,
+                });
+                let start = std::time::Instant::now();
+                let edited = if same_colour {
+                    candidates[0].geometry.union(&fresh_geometry)
+                } else {
+                    candidates[0].geometry.difference(&fresh_geometry)
+                };
+                let boolean = start.elapsed();
+                let Asset::Vector(source) = &app.state.project.assets[0] else {
+                    unreachable!()
+                };
+                let start = std::time::Instant::now();
+                let sources = crate::brush_geometry::BoundarySources::new(
+                    source.paths.iter().chain(&fresh_paths),
+                );
+                let source_index = start.elapsed();
+                let start = std::time::Instant::now();
+                let _ = sources.paths(&edited);
+                let reconstruct = start.elapsed();
+                let start = std::time::Instant::now();
+                commit_brush_region(&mut app, region, paint);
+                let commit = start.elapsed();
+                let start = std::time::Instant::now();
+                render_current_frame_once(&mut app);
+                let render = start.elapsed();
+                eprintln!("dense merge same_colour={same_colour} dab={dab} anchors={input_anchors}: collect={collect:?} boolean={boolean:?} source_index={source_index:?} reconstruct={reconstruct:?} commit={commit:?} render={render:?}");
+                let expected = points.last().unwrap();
+                assert!(app.state.project.assets.iter().any(|asset| matches!(asset, Asset::Vector(vector) if vector.fill == Some(paint.color) && vector_fill_geometry(vector).contains(&Point::new(f64::from(expected.x), f64::from(expected.y))))));
+                let surfaces: Vec<_> = app
+                    .state
+                    .project
+                    .assets
+                    .iter()
+                    .filter_map(|asset| match asset {
+                        Asset::Vector(vector) => Some(vector_fill_geometry(vector)),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    surfaces
+                        .iter()
+                        .flat_map(|surface| &surface.0)
+                        .map(|polygon| polygon.interiors().len())
+                        .sum::<usize>(),
+                    hole_count
+                );
+                assert!(surfaces
+                    .iter()
+                    .all(|surface| !surface.contains(&Point::new(300.0, 300.0))));
+            }
+        }
+    }
+
+    #[test]
+    fn merge_drawing_boundary_sweep_matches_exact_reference() {
+        let mut seed = 17_u64;
+        for case in 0..64 {
+            let mut segments = Vec::new();
+            for ring_index in 0..3 {
+                let count = 3 + case % 9;
+                let points: Vec<_> = (0..count)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        let x = ((seed >> 32) % 21) as f64
+                            + ring_index as f64 * if case % 2 == 0 { 30.0 } else { 5.0 };
+                        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        Coord {
+                            x,
+                            y: ((seed >> 32) % 21) as f64,
+                        }
+                    })
+                    .collect();
+                for segment_index in 0..count {
+                    let line =
+                        Line::new(points[segment_index], points[(segment_index + 1) % count]);
+                    if line.start != line.end {
+                        segments.push(FillBoundarySegment {
+                            ring_index,
+                            segment_index,
+                            segment_count: count,
+                            line,
+                        });
+                    }
+                }
+            }
+            for check_self in [true, false] {
+                let expected = segments.iter().enumerate().any(|(index, left)| {
+                    segments[..index].iter().any(|right| {
+                        if left.ring_index == right.ring_index {
+                            let distance = left.segment_index.abs_diff(right.segment_index);
+                            if !check_self || distance <= 1 || distance + 1 == left.segment_count {
+                                return false;
+                            }
+                        }
+                        geo::line_intersection::line_intersection(left.line, right.line).is_some()
+                    })
+                });
+                assert_eq!(
+                    fill_boundaries_intersect(segments.clone(), check_self),
+                    expected,
+                    "case={case} check_self={check_self}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn brush_release_dense_scene_phase_timings() {
+        for dynamic in [false, true] {
+            let mut app = EditorApp::default();
+            app.state.project.assets.clear();
+            app.state.project.q0rgs[0].layers[0].placements.clear();
+            let mut paint = settings(14.0, 50);
+            paint.pressure_size = dynamic;
+            for index in 0..9 {
+                let cx = 100.0 + index as f32 * 140.0;
+                let cy = 150.0;
+                let path = VPath {
+                    anchors: (0..1024)
+                        .map(|vertex| {
+                            let angle = std::f32::consts::TAU * vertex as f32 / 1024.0;
+                            Anchor {
+                                point: Vec2::new(cx + angle.cos() * 60.0, cy + angle.sin() * 60.0),
+                                in_handle: None,
+                                out_handle: None,
+                            }
+                        })
+                        .collect(),
+                    closed: true,
+                };
+                let id = index + 1;
+                app.state.project.assets.push(raw_fill_asset(
+                    id,
+                    Rgba {
+                        r: 70,
+                        g: 90,
+                        b: 140,
+                        a: 255,
+                    },
+                    path,
+                ));
+                app.state.project.q0rgs[0].layers[0]
+                    .placements
+                    .push(Placement {
+                        pivot: None,
+                        instance_id: 0,
+                        frame: 0,
+                        target: Target::Asset(id),
+                        transform: Transform2D::IDENTITY,
+                        tween: Tween::None,
+                        fx: Default::default(),
+                    });
+            }
+            let mut gesture = brush_begin(
+                paint,
+                BrushSample::pointer(Vec2::new(70.0, 140.0), Some(0.6), 0.0),
+            );
+            for index in 1..=480 {
+                brush_add_sample(
+                    &mut gesture,
+                    paint,
+                    BrushSample::pointer(
+                        Vec2::new(
+                            70.0 + index as f32 * 0.5,
+                            140.0 + (index as f32 * 0.07).sin() * 30.0,
+                        ),
+                        Some(0.6 + (index as f32 * 0.03).sin() * 0.2),
+                        index as f64 / 240.0,
+                    ),
+                );
+            }
+            let started = std::time::Instant::now();
+            let trajectory = build_sweep_trajectory(&gesture.samples, paint.smoothing, paint.size);
+            let sizes = stroke_sample_sizes(&gesture);
+            let coverage = if dynamic {
+                sweep_variable_trajectory_nib(paint.nib, &trajectory, &sizes)
+            } else {
+                sweep_trajectory_nib(paint.nib, paint.size, &trajectory)
+            };
+            let sweep = started.elapsed();
+            let started = std::time::Instant::now();
+            let smoothed = smooth_contours(&coverage, paint.smoothing, paint.size);
+            let smooth = started.elapsed();
+            let started = std::time::Instant::now();
+            let paths = coverage_to_paths(&smoothed);
+            let fit = started.elapsed();
+            let started = std::time::Instant::now();
+            let finished = brush_finish(gesture, paint);
+            let finish = started.elapsed();
+            let started = std::time::Instant::now();
+            commit_brush_region(&mut app, finished, paint);
+            eprintln!("brush release pressure={dynamic}: sweep={sweep:?}, smooth={smooth:?}, fit={fit:?} ({} anchors), complete finish={finish:?}, commit={:?}", anchor_count(&paths), started.elapsed());
+            assert!(app.state.project.assets.iter().any(
+                |asset| matches!(asset, Asset::Vector(vector) if vector.fill == Some(paint.color))
+            ));
+        }
+    }
+
+    #[test]
     fn three_dense_strokes_commit_without_exponential_freeze() {
         use std::time::{Duration, Instant};
 
@@ -5776,6 +6476,94 @@ mod tests {
             .assets
             .iter()
             .any(|asset| asset.id() == original_asset_id));
+    }
+
+    #[test]
+    fn brush_zoom_screen_sized_samples_keep_their_individual_widths() {
+        for pressure_size in [false, true] {
+            let mut settings = BrushSettings {
+                size: 12.0,
+                smoothing: 0,
+                pressure_size,
+                scale_with_stage: false,
+                ..Default::default()
+            };
+            let mut stroke = brush_begin(
+                settings,
+                BrushSample::pointer(Vec2::new(50.0, 50.0), Some(1.0), 0.0),
+            );
+            settings.size /= 8.0;
+            brush_add_sample(
+                &mut stroke,
+                settings,
+                BrushSample::pointer(Vec2::new(100.0, 50.0), Some(1.0), 0.1),
+            );
+            assert_eq!(
+                brush_prerender_dabs(&stroke),
+                vec![(Vec2::new(50.0, 50.0), 12.0), (Vec2::new(100.0, 50.0), 1.5)]
+            );
+            assert_eq!(brush_current_size(&stroke), 1.5);
+            // Another zoom before pointer-up must not resize either sample.
+            settings.size /= 4.0;
+            let finished = brush_finish(stroke, settings);
+            assert!(
+                finished.contains(&Point::new(50.0, 54.0)),
+                "zoom shrank the earlier wide part"
+            );
+            assert!(
+                finished.contains(&Point::new(100.0, 50.5)),
+                "release shrank the later thin part"
+            );
+            assert!(
+                !finished.contains(&Point::new(100.0, 52.0)),
+                "new samples kept the old oversized nib"
+            );
+        }
+    }
+
+    #[test]
+    fn brush_zoom_small_authored_nibs_survive_commit_and_later_edits() {
+        for nib in BrushNib::ALL {
+            let mut app = EditorApp::default();
+            app.session.current_q0rg_id = app.state.project.meta.entry_q0rg_id;
+            app.session.current_layer_id = app.state.project.q0rgs[0].layers[0].layer_id;
+            let settings = BrushSettings {
+                nib,
+                size: 0.1,
+                smoothing: 0,
+                ..Default::default()
+            };
+            let at = Vec2::new(170.0, 318.0);
+            commit_brush_region(
+                &mut app,
+                brush_finish(brush_begin(settings, BrushSample::mouse(at)), settings),
+                settings,
+            );
+            let first = app
+                .state
+                .project
+                .assets
+                .iter()
+                .find_map(|asset| match asset {
+                    Asset::Vector(vector) => Some(vector.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| {
+                    panic!("visible zoomed {nib:?} dab was discarded on pointer-up")
+                });
+            assert!(
+                vector_fill_geometry(&first).contains(&Point::new(170.0, 318.0)),
+                "small {nib:?} fill disappeared from editable geometry"
+            );
+            let other = Vec2::new(180.0, 318.0);
+            commit_brush_region(
+                &mut app,
+                brush_finish(brush_begin(settings, BrushSample::mouse(other)), settings),
+                settings,
+            );
+            assert!(app.state.project.assets.iter().any(|asset| matches!(asset, Asset::Vector(vector) if vector.asset_id == first.asset_id && vector.paths == first.paths)),
+                "a subsequent stroke removed the original {nib:?} dab");
+        }
     }
 
     /// Crumbs like the ones bucket fills used to leave along nearly shared

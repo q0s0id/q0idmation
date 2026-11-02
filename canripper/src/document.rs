@@ -8,6 +8,7 @@ use q0s_format::{
 use q0video::q0v::Q0vFile;
 
 use crate::swf::{find_projector_swf, looks_like_swf, parse_swf, SwfMovie};
+use crate::swf_assets::{self, Category};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormatKind {
@@ -76,6 +77,10 @@ pub enum PreviewRef {
     Q0vStandaloneVideo,
     Q0vStandaloneAudio,
     SwfTag(usize),
+    /// The main timeline, playable frame by frame.
+    SwfTimeline,
+    /// One frame of the main timeline, from zero.
+    SwfFrame(u32),
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +111,8 @@ pub struct Document {
     pub summary: String,
     pub roots: Vec<TreeNode>,
     pub data: DocumentData,
+    /// Where each node sits in `roots`, by id; built when first asked.
+    lookup: std::sync::OnceLock<std::collections::HashMap<usize, Vec<usize>>>,
 }
 
 impl Document {
@@ -145,6 +152,30 @@ impl Document {
         self.node(id).and_then(|node| node.edit.as_ref())
     }
 
+    fn new(
+        path: PathBuf,
+        bytes: Vec<u8>,
+        format: FormatKind,
+        summary: String,
+        roots: Vec<TreeNode>,
+        data: DocumentData,
+    ) -> Self {
+        Self {
+            path,
+            bytes,
+            format,
+            summary,
+            roots,
+            data,
+            lookup: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Forgets where nodes were, after `roots` changed.
+    pub fn rebuild_lookup(&mut self) {
+        self.lookup = std::sync::OnceLock::new();
+    }
+
     pub fn rebuild_tree(&mut self) {
         let roots = match &self.data {
             DocumentData::Q1Legacy(project) => {
@@ -165,21 +196,34 @@ impl Document {
             }
         };
         self.roots = roots;
+        self.lookup = std::sync::OnceLock::new();
     }
 
-    fn node(&self, id: usize) -> Option<&TreeNode> {
-        fn find(nodes: &[TreeNode], id: usize) -> Option<&TreeNode> {
-            for node in nodes {
-                if node.id == id {
-                    return Some(node);
-                }
-                if let Some(found) = find(&node.children, id) {
-                    return Some(found);
+    pub fn node(&self, id: usize) -> Option<&TreeNode> {
+        let lookup = self.lookup.get_or_init(|| {
+            fn index(
+                nodes: &[TreeNode],
+                trail: &mut Vec<usize>,
+                out: &mut std::collections::HashMap<usize, Vec<usize>>,
+            ) {
+                for (position, node) in nodes.iter().enumerate() {
+                    trail.push(position);
+                    out.insert(node.id, trail.clone());
+                    index(&node.children, trail, out);
+                    trail.pop();
                 }
             }
-            None
+            let mut out = std::collections::HashMap::new();
+            index(&self.roots, &mut Vec::new(), &mut out);
+            out
+        });
+        let trail = lookup.get(&id)?;
+        let (first, rest) = trail.split_first()?;
+        let mut node = self.roots.get(*first)?;
+        for position in rest {
+            node = node.children.get(*position)?;
         }
-        find(&self.roots, id)
+        Some(node)
     }
 }
 
@@ -203,14 +247,14 @@ fn parse_q1_document(path: PathBuf, bytes: Vec<u8>) -> Result<Document, String> 
             project.scenes.len(),
             bytes.len()
         );
-        Ok(Document {
+        Ok(Document::new(
             path,
             bytes,
-            format: FormatKind::Q1s,
+            FormatKind::Q1s,
             summary,
             roots,
-            data: DocumentData::Q1Legacy(project),
-        })
+            DocumentData::Q1Legacy(project),
+        ))
     } else {
         let project =
             v2::parse(&bytes).map_err(|error| format!("parse q1s v{version}: {error}"))?;
@@ -242,14 +286,14 @@ fn parse_q0_document(path: PathBuf, bytes: Vec<u8>) -> Result<Document, String> 
             placement_count,
             bytes.len()
         );
-        Ok(Document {
+        Ok(Document::new(
             path,
             bytes,
-            format: FormatKind::Q0s,
+            FormatKind::Q0s,
             summary,
             roots,
-            data: DocumentData::Q0Legacy(movie),
-        })
+            DocumentData::Q0Legacy(movie),
+        ))
     }
 }
 
@@ -288,14 +332,14 @@ fn q_project_document(
         project.runtime.frame_scripts.len(),
         bytes.len()
     );
-    Ok(Document {
+    Ok(Document::new(
         path,
         bytes,
         format,
         summary,
         roots,
-        data: DocumentData::QProject(Box::new(project)),
-    })
+        DocumentData::QProject(Box::new(project)),
+    ))
 }
 
 fn parse_q0v_document(path: PathBuf, bytes: Vec<u8>) -> Result<Document, String> {
@@ -358,45 +402,45 @@ fn parse_q0v_document(path: PathBuf, bytes: Vec<u8>) -> Result<Document, String>
         },
         bytes.len()
     );
-    Ok(Document {
+    Ok(Document::new(
         path,
         bytes,
-        format: FormatKind::Q0v,
+        FormatKind::Q0v,
         summary,
         roots,
-        data: DocumentData::Q0v(media),
-    })
+        DocumentData::Q0v(media),
+    ))
 }
 
 fn parse_swf_document(path: PathBuf, bytes: Vec<u8>) -> Result<Document, String> {
     let movie = parse_swf(&bytes)?;
     let roots = swf_tree(&movie);
     let summary = swf_summary(&path, &movie, bytes.len(), None);
-    Ok(Document {
+    Ok(Document::new(
         path,
         bytes,
-        format: FormatKind::Swf,
+        FormatKind::Swf,
         summary,
         roots,
-        data: DocumentData::Swf(movie),
-    })
+        DocumentData::Swf(movie),
+    ))
 }
 
 fn parse_projector_document(path: PathBuf, bytes: Vec<u8>) -> Result<Document, String> {
     let embedded = find_projector_swf(&bytes)?;
     let roots = swf_tree(&embedded.movie);
     let summary = swf_summary(&path, &embedded.movie, bytes.len(), Some(embedded.offset));
-    Ok(Document {
+    Ok(Document::new(
         path,
         bytes,
-        format: FormatKind::FlashProjector,
+        FormatKind::FlashProjector,
         summary,
         roots,
-        data: DocumentData::Projector {
+        DocumentData::Projector {
             offset: embedded.offset,
             movie: embedded.movie,
         },
-    })
+    ))
 }
 
 fn swf_summary(path: &Path, movie: &SwfMovie, source_size: usize, offset: Option<usize>) -> String {
@@ -592,6 +636,18 @@ fn q_project_tree(
                         ),
                     )
                 }
+                Asset::Model(model) => (
+                    "model",
+                    AssetVisualKind::Rig,
+                    format!(
+                        "3D model {id}\nname: {name}\nmeshes: {}\nvertices: {}\ntriangles: {}\nnodes: {}\nclips: {}",
+                        model.data.meshes.len(),
+                        model.data.vertex_count(),
+                        model.data.triangle_count(),
+                        model.data.nodes.len(),
+                        model.data.clips.len()
+                    ),
+                ),
                 Asset::Rig(rig) => (
                     "rig",
                     AssetVisualKind::Rig,
@@ -912,34 +968,146 @@ fn parse_embedded_project(bytes: &[u8]) -> Result<(ProjectV2, &'static str), Str
     }
     Err("embedded movie is not a q0s/q1s container".to_string())
 }
+/// The tags of an SWF sorted the way JPEXS shows them: a folder for each kind
+/// of character, the frames of the main timeline, scripts, everything else,
+/// and the whole tag stream in order.
 fn swf_tree(movie: &SwfMovie) -> Vec<TreeNode> {
     let mut ids = Ids::default();
-    let mut tags = Vec::with_capacity(movie.tags.len());
+    let mut names = std::collections::HashMap::new();
+    for tag in movie.tags.iter().filter(|tag| matches!(tag.code, 56 | 76)) {
+        for (id, name) in swf_assets::exported_names(tag) {
+            names.insert(id, name);
+        }
+    }
+    let tag_detail = |tag: &crate::swf::SwfTag| {
+        let mut detail = format!(
+            "tag: {}\ncode: {}\nindex: {}\npayload offset: 0x{:x}\npayload length: {} bytes",
+            tag.name,
+            tag.code,
+            tag.index,
+            tag.payload_offset,
+            tag.payload.len()
+        );
+        if let Some(id) = swf_assets::character_id(tag) {
+            detail.push_str(&format!("\ncharacter id: {id}"));
+            if let Some(name) = names.get(&id) {
+                detail.push_str(&format!("\nexported as: {name}"));
+            }
+        }
+        if let Some(about) = swf_assets::describe(tag) {
+            detail.push_str(&format!("\nholds: {about}"));
+        }
+        detail
+    };
+    let tag_label = |tag: &crate::swf::SwfTag| {
+        let mut label = match swf_assets::character_id(tag) {
+            Some(id) => format!("{} ({id})", tag.name),
+            None => tag.name.to_string(),
+        };
+        if let Some(name) = swf_assets::character_id(tag).and_then(|id| names.get(&id)) {
+            label.push_str(&format!(" “{name}”"));
+        }
+        if let Some(about) = swf_assets::describe(tag) {
+            label.push_str(&format!(" • {about}"));
+        }
+        label
+    };
+
+    let mut folders: std::collections::BTreeMap<Category, Vec<TreeNode>> = Default::default();
     for tag in &movie.tags {
-        tags.push(TreeNode {
+        let category = Category::of(tag.code);
+        if category == Category::Control {
+            continue;
+        }
+        folders.entry(category).or_default().push(TreeNode {
             id: ids.next(),
-            label: format!("{:04} • {} [{}]", tag.index, tag.name, tag.code),
-            detail: format!(
-                "swf tag {}\ncode: {}\nindex: {}\npayload offset: 0x{:x}\npayload length: {} bytes",
-                tag.name,
-                tag.code,
-                tag.index,
-                tag.payload_offset,
-                tag.payload.len()
-            ),
+            label: tag_label(tag),
+            detail: tag_detail(tag),
             preview: Some(PreviewRef::SwfTag(tag.index)),
             edit: None,
             children: Vec::new(),
         });
     }
-    vec![TreeNode {
+
+    let frames = swf_assets::frames(&movie.tags)
+        .into_iter()
+        .enumerate()
+        .map(|(number, frame)| {
+            let listed = frame
+                .tags
+                .iter()
+                .filter_map(|index| movie.tags.get(*index))
+                .map(|tag| format!("  {:>6}  {}", tag.index, tag.name))
+                .collect::<Vec<_>>()
+                .join("\n");
+            TreeNode {
+                id: ids.next(),
+                label: match &frame.label {
+                    Some(label) => format!("frame {} “{label}”", number + 1),
+                    None => format!("frame {}", number + 1),
+                },
+                detail: format!(
+                    "frame {} of the main timeline\nlabel: {}\ntags: {}\n\n{listed}",
+                    number + 1,
+                    frame.label.as_deref().unwrap_or("-"),
+                    frame.tags.len()
+                ),
+                preview: Some(PreviewRef::SwfFrame(number as u32)),
+                edit: None,
+                children: Vec::new(),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let all = movie
+        .tags
+        .iter()
+        .map(|tag| TreeNode {
+            id: ids.next(),
+            label: format!("{:05} {}", tag.index, tag_label(tag)),
+            detail: tag_detail(tag),
+            preview: Some(PreviewRef::SwfTag(tag.index)),
+            edit: None,
+            children: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+
+    let folder = |ids: &mut Ids, label: &str, detail: &str, children: Vec<TreeNode>| TreeNode {
         id: ids.next(),
-        label: format!("tags ({})", tags.len()),
-        detail: "ordered swf tag stream".to_string(),
+        label: format!("{label} ({})", children.len()),
+        detail: detail.to_string(),
         preview: None,
         edit: None,
-        children: tags,
-    }]
+        children,
+    };
+    let mut roots = vec![TreeNode {
+        id: ids.next(),
+        label: format!("movie • {} frames", movie.frame_count),
+        detail: format!(
+            "main timeline\nstage: {} × {} px\nframe rate: {} fps\nframes: {}",
+            movie.width_px, movie.height_px, movie.frame_rate, movie.frame_count
+        ),
+        preview: Some(PreviewRef::SwfTimeline),
+        edit: None,
+        children: Vec::new(),
+    }];
+    for (category, children) in folders {
+        let detail = format!("{} tags of this kind", children.len());
+        roots.push(folder(&mut ids, category.folder(), &detail, children));
+    }
+    roots.push(folder(
+        &mut ids,
+        "frames",
+        "the frames of the main timeline and the tags each one runs",
+        frames,
+    ));
+    roots.push(folder(
+        &mut ids,
+        "all tags",
+        "the whole tag stream, in order",
+        all,
+    ));
+    roots
 }
 
 #[derive(Default)]

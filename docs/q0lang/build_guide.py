@@ -10,7 +10,7 @@ import re
 
 ROOT = Path(__file__).resolve().parent
 PAGES = ["README.md", "syntax.md", "builtins.md", "hosts.md", "events.md",
-         "q0shell.md", "runtime.md", "examples.md"]
+         "q0shell.md", "runtime.md", "examples.md", "simple.md"]
 
 
 def slug(text):

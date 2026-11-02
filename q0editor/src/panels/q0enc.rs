@@ -400,7 +400,7 @@ fn render_format_settings(
             if state.q0v_streams.audio {
                 ui.label(
                     RichText::new(
-                        "the container carries real pcm audio and seeks it with video. until audio clips land on the q0e timeline, this project exports duration-correct silence.",
+                        "includes timeline audio with clip volume, balance and fades. audio is compressed without losing quality.",
                     )
                     .small()
                     .color(dim),
@@ -434,7 +434,7 @@ fn render_format_settings(
             }
             ui.label(
                 RichText::new(
-                    "encoded natively through windows media foundation. the current q1s model has no audio clips yet, so this mp4 is video-only.",
+                    "exports the selected frame range. on windows, audible timeline clips are included automatically.",
                 )
                 .small()
                 .color(dim),

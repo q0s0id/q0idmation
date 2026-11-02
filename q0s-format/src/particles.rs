@@ -17,6 +17,7 @@ const LAYOUT_MARK: u16 = u16::MAX;
 const LAYOUT_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ParticleData {
     pub emitters: Vec<ParticleEmitter>,
 }
@@ -62,6 +63,7 @@ impl ParticleData {
 
 /// A value, and how far either side of it each particle may land.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Varied {
     pub value: f32,
     pub variance: f32,
@@ -88,6 +90,7 @@ impl Varied {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum EmitterShape {
     /// Everything leaves one point.
     #[default]
@@ -129,6 +132,7 @@ impl EmitterShape {
 
 /// What particles do once they are out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ParticleMotion {
     /// They fly off and gravity, pulls and drag steer them.
     #[default]
@@ -140,6 +144,7 @@ pub enum ParticleMotion {
 /// Whether particles stay where they were let go or travel with the
 /// emitter when it moves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ParticleSpace {
     /// Left behind where they were born, like smoke from a moving torch.
     #[default]
@@ -150,6 +155,7 @@ pub enum ParticleSpace {
 
 /// What one particle looks like.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ParticleLook {
     #[default]
     Circle,
@@ -211,6 +217,7 @@ impl ParticleLook {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ParticleEmitter {
     pub q0rg_id: u16,
     pub emitter_id: u16,

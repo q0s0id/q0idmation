@@ -11,6 +11,7 @@
 
 use crate::error::Error;
 use crate::io::{write_string_u16, Cursor};
+use crate::transform::Follow;
 use crate::v2::Rgba;
 
 /// The GPU lights at most this many lamps a timeline.
@@ -20,6 +21,7 @@ pub const MAX_GAIN: f32 = 2.0;
 const LAYOUT_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct LightingData {
     pub setups: Vec<LightSetup>,
 }
@@ -60,6 +62,7 @@ impl LightingData {
 
 /// How one timeline is lit.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct LightSetup {
     pub q0rg_id: u16,
     /// Off shows the timeline as drawn, lights and all kept.
@@ -109,12 +112,13 @@ impl LightSetup {
     }
 
     /// How the setup lights `frame` of a movie at `fps`. `anchor` says where
-    /// a followed object is; lights following one that is gone stay dark.
+    /// a followed object is and how it is turned; lights following one that
+    /// is gone stay dark.
     pub fn frame(
         &self,
         frame: u16,
         fps: u16,
-        mut anchor: impl FnMut(u32) -> Option<[f32; 2]>,
+        mut anchor: impl FnMut(u32) -> Option<Follow>,
     ) -> Option<FrameLighting> {
         if !self.enabled {
             return None;
@@ -129,7 +133,7 @@ impl LightSetup {
             .filter_map(|light| {
                 let origin = match light.follow {
                     Some(instance_id) => anchor(instance_id)?,
-                    None => [0.0, 0.0],
+                    None => Follow::at([0.0, 0.0]),
                 };
                 Some(light.lit(frame, time, origin))
             })
@@ -154,6 +158,7 @@ impl LightSetup {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum LightKind {
     /// Shines all around.
     #[default]
@@ -164,6 +169,7 @@ pub enum LightKind {
 
 /// A lamp.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Light {
     pub light_id: u16,
     /// How q0lang calls it.
@@ -201,6 +207,7 @@ pub struct Light {
 
 /// A light's animated values on one frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct LightKey {
     pub frame: u16,
     pub position: [f32; 2],
@@ -304,9 +311,10 @@ impl Light {
         }
     }
 
-    /// How it shines on `frame`, `time` seconds into the movie, around a
-    /// followed object at `origin`.
-    fn lit(&self, frame: u16, time: f32, origin: [f32; 2]) -> LitLight {
+    /// How it shines on `frame`, `time` seconds into the movie, riding
+    /// along with a followed object at `origin`: its offset and aim turn
+    /// with the object.
+    fn lit(&self, frame: u16, time: f32, origin: Follow) -> LitLight {
         let values = self.animated(frame);
         let waver = if self.flicker > 0.0 {
             1.0 - self.flicker * flicker_noise(self.light_id, time * self.flicker_speed)
@@ -316,15 +324,12 @@ impl Light {
         let strength = values.intensity * waver;
         let color = unit_rgb(values.color).map(|channel| channel * strength);
         LitLight {
-            position: [
-                origin[0] + values.position[0],
-                origin[1] + values.position[1],
-            ],
+            position: origin.place(values.position),
             color,
             radius: values.radius,
             softness: self.softness,
             spot: (self.kind == LightKind::Spot).then(|| Spot {
-                direction: values.direction.to_radians(),
+                direction: origin.turn_degrees(values.direction).to_radians(),
                 half_cone: (self.cone * 0.5).to_radians(),
                 softness: self.cone_softness,
             }),
@@ -381,6 +386,7 @@ fn flicker_noise(light_id: u16, t: f32) -> f32 {
 
 /// A spot light's cone.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Spot {
     /// Radians.
     pub direction: f32,
@@ -391,6 +397,7 @@ pub struct Spot {
 
 /// One light as it shines on one frame, in the timeline's own space.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct LitLight {
     pub position: [f32; 2],
     /// Colour times brightness, 0..=1 per unit of brightness.
@@ -441,6 +448,7 @@ impl LitLight {
 
 /// How one frame is lit.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FrameLighting {
     /// Layers up to and including this one are lit.
     pub layer_id: Option<u16>,
@@ -730,11 +738,56 @@ mod tests {
         follower.follow = Some(7);
         setup.lights.push(follower);
         let lighting = setup
-            .frame(0, 24, |id| (id == 7).then_some([30.0, 40.0]))
+            .frame(0, 24, |id| (id == 7).then_some(Follow::at([30.0, 40.0])))
             .unwrap();
         assert_eq!(lighting.lights[0].position, [30.0, 30.0]);
         let gone = setup.frame(0, 24, |_| None).unwrap();
         assert!(gone.lights.is_empty(), "no object, no light");
+    }
+
+    #[test]
+    fn followers_turn_with_their_object() {
+        let mut setup = LightSetup::new(1);
+        // A torch 50 px to the right of a hand, shining right.
+        let mut torch = lamp([50.0, 0.0]);
+        torch.kind = LightKind::Spot;
+        torch.direction = 0.0;
+        torch.follow = Some(7);
+        setup.lights.push(torch);
+        // The hand turned a quarter clockwise, at (100, 100).
+        let turned = crate::transform::Affine::from_transform(crate::v2::Transform2D {
+            rotation: std::f32::consts::FRAC_PI_2,
+            ..crate::v2::Transform2D::IDENTITY
+        });
+        let follow = Follow::from_placement(
+            crate::transform::Affine {
+                tx: 100.0,
+                ty: 100.0,
+                ..turned
+            },
+            crate::v2::Vec2::new(0.0, 0.0),
+        );
+        let lighting = setup.frame(0, 24, |_| Some(follow)).unwrap();
+        let light = lighting.lights[0];
+        assert!(
+            (light.position[0] - 100.0).abs() < 1.0e-3,
+            "{:?}",
+            light.position
+        );
+        assert!(
+            (light.position[1] - 150.0).abs() < 1.0e-3,
+            "{:?}",
+            light.position
+        );
+        let aim = light.spot.unwrap().direction.to_degrees();
+        assert!((aim - 90.0).abs() < 1.0e-3, "now shines down: {aim}");
+        // Back again: the offset and aim that land there.
+        let back = follow.offset_of(light.position);
+        assert!(
+            (back[0] - 50.0).abs() < 1.0e-3 && back[1].abs() < 1.0e-3,
+            "{back:?}"
+        );
+        assert!(follow.unturn_degrees(90.0).abs() < 1.0e-3);
     }
 
     #[test]

@@ -92,6 +92,11 @@ fn target_bounds(
                 include(Vec2::new(0.0, 0.0));
                 include(Vec2::new(h.spec.width as f32, h.spec.height as f32));
             }
+            Asset::Model(model) => {
+                let (min, max) = model.flat_bounds()?;
+                include(min);
+                include(max);
+            }
             Asset::Rig(_) => {}
         },
         Target::Q0rg(id) => {
@@ -142,7 +147,9 @@ pub fn default_pivot(project: &ProjectV2, target: Target) -> Option<Vec2> {
 /// Recover the legacy pure rotation case whose endpoints keep the artwork's
 /// default centre fixed. Old files did not store custom anchors, so do not
 /// guess a remote fixed point for an authored translation-and-rotation move.
-pub(crate) fn recover_legacy_pivots(project: &mut ProjectV2) {
+type PivotRepairs = HashMap<(usize, usize, usize), Vec2>;
+
+fn legacy_pivot_repairs(project: &ProjectV2) -> PivotRepairs {
     let mut cache = HashMap::new();
     let mut repairs = HashMap::new();
     for (qi, symbol) in project.q0rgs.iter().enumerate() {
@@ -206,7 +213,21 @@ pub(crate) fn recover_legacy_pivots(project: &mut ProjectV2) {
             }
         }
     }
-    for ((qi, li, pi), pivot) in repairs {
+    repairs
+}
+
+pub(crate) fn needs_pivot_wire_version(project: &ProjectV2) -> bool {
+    project
+        .q0rgs
+        .iter()
+        .flat_map(|q| &q.layers)
+        .flat_map(|l| &l.placements)
+        .any(|p| p.pivot.is_some())
+        || !legacy_pivot_repairs(project).is_empty()
+}
+
+pub(crate) fn recover_legacy_pivots(project: &mut ProjectV2) {
+    for ((qi, li, pi), pivot) in legacy_pivot_repairs(project) {
         project.q0rgs[qi].layers[li].placements[pi].pivot = Some(pivot);
     }
 }

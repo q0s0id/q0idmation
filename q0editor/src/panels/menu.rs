@@ -11,6 +11,12 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         ui.separator();
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             crate::workspace::render_menu(app, ui);
+            let online_resp = ui
+                .selectable_label(app.online.open, app.online.menu_label())
+                .on_hover_text("Rooms, friends and shared projects on q0id");
+            if online_resp.clicked() {
+                app.online.open = !app.online.open;
+            }
             let settings_resp = ui
                 .selectable_label(app.session.show_settings, "Settings")
                 .on_hover_text("Open or close settings");
@@ -69,6 +75,14 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     .on_hover_text("Open or close the particle system");
                 if particles_resp.clicked() {
                     app.queue(Action::ToggleParticles);
+                }
+            }
+            if app.has_active_project() && !app.home_visible() {
+                let scene_resp = ui
+                    .selectable_label(app.session.scene3d.open, "3D")
+                    .on_hover_text("Open or close the 3D window: models, camera and 3D lights");
+                if scene_resp.clicked() {
+                    app.queue(Action::ToggleScene3d);
                 }
             }
             if app.settings.light_enabled && app.has_active_project() && !app.home_visible() {
@@ -172,6 +186,27 @@ pub fn menus(app: &mut EditorApp, ui: &mut Ui) {
             app.queue(Action::ImportMedia);
             ui.close_menu();
         }
+        if ui
+            .add_enabled(
+                app.has_active_project() && !app.home_visible(),
+                egui::Button::new("Import 3D Model..."),
+            )
+            .on_hover_text("FBX, glTF, GLB or OBJ: added to the library and placed on the stage")
+            .clicked()
+        {
+            app.queue(Action::ImportModel);
+            ui.close_menu();
+        }
+        if ui
+            .add_enabled(
+                app.has_active_project() && !app.home_visible(),
+                egui::Button::new("New 3D Model"),
+            )
+            .clicked()
+        {
+            app.queue(Action::NewModel);
+            ui.close_menu();
+        }
         ui.separator();
         if ui
             .add_enabled(
@@ -222,8 +257,8 @@ pub fn menus(app: &mut EditorApp, ui: &mut Ui) {
 
     if !app.home_visible() && app.has_active_project() {
         ui.menu_button("Edit", |ui| {
-            let can_undo = app.history.can_undo();
-            let can_redo = app.history.can_redo();
+            let can_undo = app.online.connected() || app.history.can_undo();
+            let can_redo = app.online.connected() || app.history.can_redo();
             if ui
                 .add_enabled(
                     can_undo,
@@ -368,6 +403,14 @@ pub fn menus(app: &mut EditorApp, ui: &mut Ui) {
                 app.queue(Action::BreakApartSelection);
                 ui.close_menu();
             }
+            if ui
+                .button("Strokes to Own Layer")
+                .on_hover_text("Move this layer's outlines to a new layer above it; the fills stay")
+                .clicked()
+            {
+                app.queue(Action::StrokesToOwnLayer);
+                ui.close_menu();
+            }
             if app.settings.physics_enabled
                 || app.settings.particles_enabled
                 || app.settings.light_enabled
@@ -439,6 +482,22 @@ pub fn menus(app: &mut EditorApp, ui: &mut Ui) {
                 app.queue(Action::ToggleOutlineMode);
                 ui.close_menu();
             }
+            if ui
+                .add(egui::SelectableLabel::new(
+                    app.settings.aids.snap,
+                    format!(
+                        "Snapping    {}",
+                        app.settings.hotkeys.display(ShortcutCommand::ToggleSnap)
+                    ),
+                ))
+                .on_hover_text(
+                    "Drawn and dragged points land on anchors, line ends and lines nearby",
+                )
+                .clicked()
+            {
+                app.queue(Action::ToggleSnap);
+                ui.close_menu();
+            }
             for (label, shortcut, current_only) in [
                 (
                     "Fast Preview — All Scenes",
@@ -502,6 +561,10 @@ pub fn menus(app: &mut EditorApp, ui: &mut Ui) {
             );
         });
     }
+
+    ui.menu_button("Plugins", |ui| {
+        crate::plugins::menu(app, ui);
+    });
 
     ui.menu_button("Help", |ui| {
         if ui.button("Credits...").clicked() {
@@ -759,6 +822,7 @@ fn action_for_shortcut(command: ShortcutCommand) -> Option<Action> {
         C::ToolPencil => Action::SelectTool(crate::state::Tool::Pencil),
         C::ToolBrush => Action::SelectTool(crate::state::Tool::Brush),
         C::ToolEraser => Action::SelectTool(crate::state::Tool::Eraser),
+        C::ToolKnife => Action::SelectTool(crate::state::Tool::Knife),
         C::ToolLine => Action::SelectTool(crate::state::Tool::Line),
         C::ToolRectangle => Action::SelectTool(crate::state::Tool::Rectangle),
         C::ToolOval => Action::SelectTool(crate::state::Tool::Oval),
@@ -766,6 +830,7 @@ fn action_for_shortcut(command: ShortcutCommand) -> Option<Action> {
         C::ToolEyedropper => Action::SelectTool(crate::state::Tool::Eyedropper),
         C::ToolText => Action::SelectTool(crate::state::Tool::Text),
         C::ToolRig => Action::SelectTool(crate::state::Tool::Rig),
+        C::ToggleSnap => Action::ToggleSnap,
         C::PerformanceSnapshot | C::ClearSelection => return None,
     })
 }
@@ -924,6 +989,7 @@ pub fn handle_global_shortcuts(app: &mut EditorApp, ctx: &egui::Context) {
             test(ShortcutCommand::PreviousFrame);
             test(ShortcutCommand::NextFrame);
             test(ShortcutCommand::ClearSelection);
+            test(ShortcutCommand::ToggleSnap);
         }
         test(ShortcutCommand::InsertFrame);
         test(ShortcutCommand::RemoveFrame);
@@ -943,6 +1009,7 @@ pub fn handle_global_shortcuts(app: &mut EditorApp, ctx: &egui::Context) {
                 ShortcutCommand::ToolPencil,
                 ShortcutCommand::ToolBrush,
                 ShortcutCommand::ToolEraser,
+                ShortcutCommand::ToolKnife,
                 ShortcutCommand::ToolLine,
                 ShortcutCommand::ToolRectangle,
                 ShortcutCommand::ToolOval,

@@ -1,0 +1,68 @@
+# q0editor online
+
+open **Online** at the right of the editor menu. the label shows when you are live in a room, or how many invitations and friend requests are waiting.
+
+## signing in
+
+choose **sign in with q0id**. q0id.com opens in your browser; check that it shows the same ten-character code as the editor and choose **yes, connect q0editor**. merely opening the page never connects anything. the editor finishes signing in by itself a few seconds later.
+
+while it waits, the code is selectable (ctrl+c works), and **copy code**, **open browser again** and **copy sign-in link** reach the same request. a countdown shows how long the request stays valid. if the request is declined or expires, the panel says so and offers **try again**; **cancel sign-in** forgets the request so a late approval is never used.
+
+the sign-in lasts while q0editor stays open. sign out from the account menu (**⋯**) in the panel header. q0editor never sees your password.
+
+## rooms
+
+- **rooms** lists invitations first, then **start a room**, then your rooms with your rank, owner, member count and last activity.
+- **start room from this document** shares the open project. you become the owner. external project dependencies must be embedded first.
+- **join** opens the room in its own document tab once the canvas is idle. your other documents and unsaved work stay as they are.
+- **join with a room code** accepts the 32-character code that members can copy from the editor or the website.
+- closed rooms stay listed; their owner can reopen them.
+
+room tabs stay free to switch and close. while another document is active, the room keeps its connection and queues project events until you return; those events never replace the other document. **leave** ends live participation and keeps the document open as a local copy; your membership and assigned permissions remain available for a later session. leaving with an edit that hasn't synced yet asks for a second click. closing the editor also ends live participation.
+
+a room is shared, lasting work: nobody leaving, disconnecting or crashing ever closes it, and members can come back to it at any time. only its owner closes it, from **room settings**; a closed room keeps its project and history and can be reopened. **delete** removes a room permanently, including its saved project and history. it lives in room settings next to close, and on the card of an already-closed room; it needs a second click.
+
+## the room tab
+
+- the header shows the connection (**live**, **sending your edit…**, **reconnecting**), your rank, **undo mine**, **redo mine**, **copy code** and **leave**.
+- **your access** says what you can edit, whether the layer you are on is editable for you, and lists your rank defaults and personal assignments. **layers you can edit** expands to the full list.
+- **people** lists participants with avatars, ranks and where present members are (layer, frame and symbol). **go to** jumps to a participant's timeline and frame once.
+- **invite friends** sends invitations. the owner chooses what people join as (editor by default; viewer or admin); everyone else invites viewers. **waiting for an answer** lists pending invitations with **withdraw**.
+- the owner opens a participant to change their rank and assignments, and opens **room settings** to choose what each rank can edit (**everything** or **only what you assign**), inviting rules, the member limit, closing and deleting.
+- in an older room where editors or admins can't edit anything yet, the owner sees who is stuck and can let that rank edit everything in one click.
+
+## friends
+
+search by username (at least two characters, matched from the start). answer incoming requests, cancel outgoing ones, and invite friends to the room you are in. remove and block live in each friend's **⋯** menu and need a second click. blocked people are listed at the bottom with **unblock**.
+
+## room permissions
+
+- viewers follow the live project and cannot commit edits.
+- editors draw anywhere in a new room. the owner can switch editors to **only what you assign** and give each person layers, timeline folders or library folders.
+- admins edit like editors (configured separately) and can also ban lower-ranked participants. an admin who may edit nothing can still moderate.
+- the owner assigns ranks and grants, chooses what each rank edits, and closes, reopens or deletes the room.
+
+layers you can't edit show as locked in the timeline and on the stage while the room tab is active, and the stage says why when you try to draw on one. nothing is drawn and then taken back.
+
+the assignment tree shows your project's own names: each timeline (main timeline first, symbols with their library folder), its layers top-first with timeline folders indented, and library folders by path. ticking a folder covers everything inside it; rows already covered by a ticked folder or by a rank default say so. a library-folder grant gives authority over that folder's symbols and shared artwork, including their existing instances. the server checks every change; the panel only explains.
+
+## undo, conflicts and recovery
+
+undo and redo select only your own operations, and keep everybody else's later work, even strokes added to the same layer after yours. people drawing at the same time are merged: strokes on the same layer and frame, new artwork that happened to get the same id, and reordered layers all combine. only setting the same thing to two different values at once (two people renaming one layer, for example) is a conflict; then the room keeps the version it accepted first and yours is saved to recovery. the room does not open tabs automatically: use **open local copy** or **open unshared copy** when you want one. a change the room refuses (for example a layer you are not assigned) is kept the same way, with the reason named. recovery copies also survive closing the editor.
+
+disconnects retry uncertain edits with the same request id, and the panel shows **reconnecting** until the room answers again. server restarts preserve room checkpoints and the operation journal. if your access ends, the document stays open as a local copy.
+
+global runtime settings and the audio layout currently require a complete-project grant. network work, patch preparation and event reconciliation run outside the editor ui thread, and your edits are sent on their own connection so list refreshes and searches never delay them; stable idle frames do not copy the document. results prepared before a newer local edit are discarded rather than overwriting it. presence is sent when your timeline, layer or frame changes, plus a slow heartbeat.
+
+## website
+
+q0id.com/online shows the same account: invitations, rooms with participants and permissions, friends and requests. owners can change ranks, assignments and room settings there too.
+
+## implementation and ui handoff
+
+- `q0online/` contains the shared protocol, authoritative permission checks, personal history, and advisory access helpers (`layer_access`, `library_access`, `project_access`, `resource_label`) that interfaces use to explain access.
+- `q0online/` also contains the three-way merge (`merge_projects`) the server and editor share.
+- `q0editor/src/online/` contains the controller (`mod.rs`), background reconciliation (`sync.rs`), the panel (`ui.rs`) and the network workers (`transport.rs`).
+- `cargo test -p q0editor --lib online::` runs the online tests. `Q0EDITOR_ONLINE_SHOTS=<dir> cargo test -p q0editor --lib online::shots -- --ignored` renders review pictures of the panel without opening a window. an end-to-end test against a running server is described in `transport.rs`.
+- `Q0EDITOR_ONLINE_SERVER=http://127.0.0.1:8080` points a development editor at a local q0id server.
+- the q0id repository contains `ONLINE_HANDOFF.md` with the complete api, persistence and ui notes, and `tools/editor-online/` with a copy of these desktop sources.

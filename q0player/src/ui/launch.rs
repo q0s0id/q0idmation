@@ -9,6 +9,10 @@ use super::app::{PlayerApp, PreviewOptions};
 
 include!(concat!(env!("OUT_DIR"), "/window_icon.rs"));
 
+pub(crate) fn default_window_icon() -> egui::IconData {
+    q0_window_icon()
+}
+
 /// Framebuffer samples per pixel, matching q0editor: lyon emits one fill
 /// mesh and the framebuffer resolves triangle-edge coverage, which smooths
 /// vector edges without a second translucent outline or dark halos.

@@ -1,9 +1,6 @@
-mod app;
-mod icons;
-
 use std::path::PathBuf;
 
-use app::{apply_theme, CanRipperApp};
+use canripper::app::CanRipperApp;
 use canripper::{document::Document, extract::extract_document};
 
 fn main() -> eframe::Result<()> {
@@ -24,10 +21,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "CanRipper",
         options,
-        Box::new(move |cc| {
-            apply_theme(&cc.egui_ctx, CanRipperApp::default_theme());
-            Box::new(CanRipperApp::new(initial))
-        }),
+        Box::new(move |cc| Box::new(CanRipperApp::new(initial, &cc.egui_ctx))),
     )
 }
 

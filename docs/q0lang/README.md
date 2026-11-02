@@ -70,6 +70,7 @@ The player jumps to the frame with index `12` and stops; in a shorter animation 
 | [q0shell](q0shell.md) | running files, command-line options, file commands |
 | [runtime and qvm](runtime.md) | execution order, state, diagnostics, limits, bytecode |
 | [recipes](examples.md) | animation math, player movement, physics, particles and lights from code |
+| [Simple mode](simple.md) | the code as blocks in q0editor |
 
 Ready-made sources are in [examples](examples). `q0s-format/tests/q0lang_docs.rs` checks that every example in this reference compiles without a diagnostic and that the quick start prints what it shows above.
 
@@ -77,4 +78,8 @@ There are no arrays, objects, classes, closures, exceptions, async functions or 
 
 [qvm_plan.md](qvm_plan.md) and [q0lang_overhaul_plan.md](q0lang_overhaul_plan.md) keep the design history; their plans do not replace this reference.
 
-Sources: [parser](../../q0s-format/src/q0lang/parser.rs), [compiler](../../q0s-format/src/q0lang/compiler.rs), [runtime](../../q0s-format/src/q0lang/runtime.rs), [qvm](../../q0vm/src/lib.rs), [player](../../q0player/src/lib.rs), [object scripts](../../q0player/src/objects.rs), [editor](../../q0editor/src/app.rs), [shell](../../q0shell/src/lib.rs).
+## simple mode
+
+Every q0lang editor in q0editor has a SIMPLE / PRO switch. Simple shows the code as blocks you drag, Pro as text; both edit the same script. See [Simple mode](simple.md).
+
+Sources: [parser](../../q0s-format/src/q0lang/parser.rs), [printer](../../q0s-format/src/q0lang/printer.rs), [compiler](../../q0s-format/src/q0lang/compiler.rs), [runtime](../../q0s-format/src/q0lang/runtime.rs), [qvm](../../q0vm/src/lib.rs), [player](../../q0player/src/lib.rs), [object scripts](../../q0player/src/objects.rs), [editor](../../q0editor/src/app.rs), [shell](../../q0shell/src/lib.rs).

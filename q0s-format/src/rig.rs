@@ -13,6 +13,7 @@ use crate::v2::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RigControlValue {
     pub x: f32,
     pub y: f32,
@@ -20,6 +21,7 @@ pub struct RigControlValue {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum RigControlOverride {
     Position { control_id: u16, x: f32, y: f32 },
     Value { control_id: u16, value: f32 },
@@ -32,6 +34,7 @@ pub enum RigControlOverride {
 pub type RigRuntimeOverrides = HashMap<u16, Vec<RigControlOverride>>;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ResolvedRigBinding {
     pub node_id: u16,
     pub instance_id: u32,
@@ -39,6 +42,7 @@ pub struct ResolvedRigBinding {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RigPose {
     pub node_local: HashMap<u16, Transform2D>,
     pub node_world: HashMap<u16, Affine>,
@@ -935,6 +939,7 @@ pub fn resolved_variant_target(
 }
 
 #[derive(Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 struct TwoBoneIkParams {
     root_id: u16,
     mid_id: u16,

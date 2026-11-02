@@ -1,5 +1,7 @@
+mod audio;
 mod binary_fla;
 pub mod fonts;
+mod masks;
 mod text_outline;
 mod xfl_content;
 
@@ -348,7 +350,9 @@ pub fn import_fla(path: &Path) -> Result<ImportedProject, ImportError> {
     let mut signature = [0_u8; 8];
     let signature_len = file.read(&mut signature)?;
     if signature_len == signature.len() && signature == binary_fla::OLE2_MAGIC {
-        return binary_fla::import_legacy_fla(path);
+        let mut imported = binary_fla::import_legacy_fla(path)?;
+        masks::normalize(&mut imported)?;
+        return Ok(imported);
     }
 
     let file = File::open(path)?;
@@ -410,7 +414,9 @@ fn import_fla_archive<R: Read + Seek>(
             let lower = normalized.to_ascii_lowercase();
             if lower.starts_with("library/") && lower.ends_with(".xml") {
                 library_indices.push(index);
-            } else if lower.starts_with("bin/") && lower.ends_with(".dat") {
+            } else if (lower.starts_with("bin/") && lower.ends_with(".dat"))
+                || (lower.starts_with("library/") && audio::is_media_name(&lower))
+            {
                 binary_indices.push(index);
             }
         }
@@ -457,6 +463,7 @@ fn import_fla_archive<R: Read + Seek>(
 
     let mut imported = import_dom_document(path, &xml, source_kind)?;
     xfl_content::enrich_project(&mut imported, &xml, &library_docs, &binary_docs)?;
+    masks::normalize(&mut imported)?;
     Ok(imported)
 }
 
@@ -548,8 +555,10 @@ pub fn import_xfl(path: &Path) -> Result<ImportedProject, ImportError> {
     let mut binary_docs = Vec::new();
     if let Some(root) = dom_path.parent() {
         collect_binary_dat(&root.join("bin"), root, &mut binary_docs)?;
+        collect_audio_media(&root.join("LIBRARY"), root, &mut binary_docs)?;
     }
     xfl_content::enrich_project(&mut imported, &xml, &library_docs, &binary_docs)?;
+    masks::normalize(&mut imported)?;
     Ok(imported)
 }
 
@@ -614,6 +623,38 @@ fn collect_binary_dat(
     }
     Ok(())
 }
+
+fn collect_audio_media(
+    directory: &Path,
+    root: &Path,
+    output: &mut Vec<(String, Vec<u8>)>,
+) -> Result<(), ImportError> {
+    if !directory.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_audio_media(&path, root, output)?;
+        } else if audio::is_media_name(&path.to_string_lossy()) {
+            let size = entry.metadata()?.len();
+            if size > q0video::audio::MAX_DECODED_AUDIO_BYTES as u64 {
+                return Err(ImportError::Invalid(format!(
+                    "audio '{}' is too large ({size} bytes)",
+                    path.display()
+                )));
+            }
+            let relative = path.strip_prefix(root).unwrap_or(&path);
+            output.push((
+                relative.to_string_lossy().replace('\\', "/"),
+                std::fs::read(&path)?,
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn import_dom_document(
     source_path: &Path,
     xml: &[u8],
@@ -1355,7 +1396,7 @@ mod tests {
                 _ => None,
             })
             .expect("palette bitmap asset");
-        assert_eq!(bitmap.rgba, vec![240, 120, 30, 96]);
+        assert_eq!(*bitmap.rgba, vec![240, 120, 30, 96]);
         let leaf = imported
             .project
             .q0rgs
@@ -1875,6 +1916,199 @@ mod tests {
     }
 
     #[test]
+    fn fla_mask_fill_alpha_does_not_fade_the_masked_artwork() {
+        for alpha in ["0", "0.149019607843137", "0.5", "1"] {
+            let mask = square("#00FF00").replace(
+                "color=\"#00FF00\"",
+                &format!("color=\"#00FF00\" alpha=\"{alpha}\""),
+            );
+            let artwork = square("#EB374B").replace("200", "400");
+            let layers = format!(
+                r#"<DOMLayer name="mask" layerType="mask"><frames><DOMFrame index="0" duration="1"><elements>{mask}</elements></DOMFrame><DOMFrame index="1" duration="1"><elements/></DOMFrame></frames></DOMLayer><DOMLayer name="art" layerType="masked" parentLayerIndex="0"><frames><DOMFrame index="0" duration="2"><elements>{artwork}</elements></DOMFrame></frames></DOMLayer><DOMLayer name="ordinary artwork"><frames><DOMFrame index="0" duration="2"><elements>{mask}</elements></DOMFrame></frames></DOMLayer>"#
+            );
+            let imported = import_files(
+                &format!("mask-alpha-{alpha}"),
+                &[("DOMDocument.xml", stage_xml(&[], &layers).as_bytes())],
+            );
+            let mut project = imported.project;
+            let root = project
+                .q0rgs
+                .iter_mut()
+                .find(|q| q.q0rg_id == project.meta.entry_q0rg_id)
+                .unwrap();
+            let ordinary = root
+                .layers
+                .iter_mut()
+                .find(|layer| layer.name == "ordinary artwork")
+                .unwrap();
+            ordinary.placements[0].transform.tx = 30.0;
+            let image = q0s_format::raster::rasterize_q0rg_frame(
+                &project,
+                project.meta.entry_q0rg_id,
+                0,
+                320,
+                180,
+                1,
+                [255; 4],
+            );
+            let pixel = |x: usize, y: usize| &image[(y * 320 + x) * 4..(y * 320 + x) * 4 + 4];
+            assert_eq!(pixel(5, 5), [235, 55, 75, 255], "mask alpha={alpha}");
+            assert_eq!(pixel(15, 5), [255; 4], "outside the mask alpha={alpha}");
+            let ordinary_alpha = (alpha.parse::<f32>().unwrap() * 255.0).round() as u8;
+            assert_eq!(
+                pixel(35, 5)[0],
+                255 - ordinary_alpha,
+                "normal fill alpha must survive"
+            );
+            let blank = q0s_format::raster::rasterize_q0rg_frame(
+                &project,
+                project.meta.entry_q0rg_id,
+                1,
+                320,
+                180,
+                1,
+                [255; 4],
+            );
+            assert_eq!(
+                &blank[(5 * 320 + 15) * 4..(5 * 320 + 15) * 4 + 4],
+                [235, 55, 75, 255],
+                "blank mask frames still disable clipping"
+            );
+        }
+    }
+
+    #[test]
+    fn fla_mask_symbols_keep_private_opaque_geometry_and_original_playback() {
+        use q0s_format::v2::{Asset, Target};
+        let gradient = r##"<DOMShape><fills><FillStyle index="1"><LinearGradient><matrix><Matrix a="0.01" d="0.01" tx="5" ty="5"/></matrix><GradientEntry color="#00FF00" alpha="0.1" ratio="0"/><GradientEntry color="#0000FF" alpha="0" ratio="1"/></LinearGradient></FillStyle></fills><edges><Edge fillStyle1="1" edges="!0 0|200 0|200 200|0 200|0 0"/></edges></DOMShape>"##;
+        let source = symbol_xml("source", gradient);
+        let wrapper = symbol_xml(
+            "wrapper",
+            r#"<DOMSymbolInstance libraryItemName="source" symbolType="graphic" loop="single frame" firstFrame="0"><color><Color alphaMultiplier="0.25"/></color></DOMSymbolInstance>"#,
+        );
+        let layers = format!(
+            r#"<DOMLayer name="mask" layerType="mask"><frames><DOMFrame index="0"><elements><DOMSymbolInstance libraryItemName="wrapper" symbolType="graphic" loop="single frame" firstFrame="0"><color><Color alphaMultiplier="0.2"/></color></DOMSymbolInstance></elements></DOMFrame></frames></DOMLayer><DOMLayer name="art" layerType="masked" parentLayerIndex="0"><frames><DOMFrame index="0"><elements>{}</elements></DOMFrame></frames></DOMLayer><DOMLayer name="ordinary artwork"><frames><DOMFrame index="0"><elements><DOMSymbolInstance libraryItemName="wrapper"><matrix><Matrix tx="30"/></matrix></DOMSymbolInstance></elements></DOMFrame></frames></DOMLayer>"#,
+            square("#EB374B")
+        );
+        let imported = import_files(
+            "mask-symbol-alpha",
+            &[
+                (
+                    "DOMDocument.xml",
+                    stage_xml(&["source.xml", "wrapper.xml"], &layers).as_bytes(),
+                ),
+                ("LIBRARY/source.xml", source.as_bytes()),
+                ("LIBRARY/wrapper.xml", wrapper.as_bytes()),
+            ],
+        );
+        let project = &imported.project;
+        let root = project
+            .q0rgs
+            .iter()
+            .find(|q| q.q0rg_id == project.meta.entry_q0rg_id)
+            .unwrap();
+        let mask = &root
+            .layers
+            .iter()
+            .find(|l| l.name == "mask")
+            .unwrap()
+            .placements[0];
+        let ordinary = &root
+            .layers
+            .iter()
+            .find(|l| l.name == "ordinary artwork")
+            .unwrap()
+            .placements[0];
+        assert_ne!(
+            mask.target, ordinary.target,
+            "mask conversion must not change the shared artwork"
+        );
+        assert_eq!(mask.fx.opacity, 1.0);
+        assert_eq!(
+            mask.fx.q0rg_playback.mode,
+            q0s_format::v2::Q0rgPlaybackMode::SingleFrame
+        );
+        let Target::Q0rg(ordinary_id) = ordinary.target else {
+            panic!("ordinary symbol")
+        };
+        let ordinary_symbol = project
+            .q0rgs
+            .iter()
+            .find(|q| q.q0rg_id == ordinary_id)
+            .unwrap();
+        assert_eq!(ordinary_symbol.layers[0].placements[0].fx.opacity, 0.25);
+        assert!(
+            project
+                .asset_appearances
+                .values()
+                .any(|appearance| appearance.fill_gradient.is_some()),
+            "the original gradient must survive"
+        );
+        assert!(project.assets.iter().any(|asset| matches!(asset, Asset::Vector(vector) if vector.fill.is_some_and(|fill| fill.a < 255))), "the original fill alpha must survive");
+        let roundtrip = q0s_format::v2::parse(&q0s_format::v2::write(project).unwrap()).unwrap();
+        let image = q0s_format::raster::rasterize_q0rg_frame(
+            &roundtrip,
+            roundtrip.meta.entry_q0rg_id,
+            0,
+            320,
+            180,
+            1,
+            [255; 4],
+        );
+        assert_eq!(
+            &image[(5 * 320 + 5) * 4..(5 * 320 + 5) * 4 + 4],
+            [235, 55, 75, 255],
+            "nested gradient/instance alpha must not fade a mask"
+        );
+    }
+
+    #[test]
+    fn a_mask_symbol_can_contain_an_already_converted_mask() {
+        let mask =
+            square("#00FF00").replace("color=\"#00FF00\"", "color=\"#00FF00\" alpha=\"0.15\"");
+        let artwork = square("#EB374B");
+        let layers = |mask: &str| {
+            format!(
+                r#"<DOMLayer name="mask" layerType="mask"><frames><DOMFrame index="0"><elements>{mask}</elements></DOMFrame></frames></DOMLayer><DOMLayer name="art" layerType="masked" parentLayerIndex="0"><frames><DOMFrame index="0"><elements>{artwork}</elements></DOMFrame></frames></DOMLayer>"#
+            )
+        };
+        let inner = format!(
+            r#"<DOMSymbolItem xmlns="http://ns.adobe.com/xfl/2008/" name="inner"><timeline><DOMTimeline><layers>{}</layers></DOMTimeline></timeline></DOMSymbolItem>"#,
+            layers(&mask)
+        );
+        let outer = format!(
+            r#"<DOMSymbolItem xmlns="http://ns.adobe.com/xfl/2008/" name="outer"><timeline><DOMTimeline><layers>{}</layers></DOMTimeline></timeline></DOMSymbolItem>"#,
+            layers(r#"<DOMSymbolInstance libraryItemName="inner"/>"#)
+        );
+        let root = r#"<DOMLayer name="art"><frames><DOMFrame index="0"><elements><DOMSymbolInstance libraryItemName="outer"/></elements></DOMFrame></frames></DOMLayer>"#;
+        let imported = import_files(
+            "nested-mask-conversion",
+            &[
+                (
+                    "DOMDocument.xml",
+                    stage_xml(&["inner.xml", "outer.xml"], root).as_bytes(),
+                ),
+                ("LIBRARY/inner.xml", inner.as_bytes()),
+                ("LIBRARY/outer.xml", outer.as_bytes()),
+            ],
+        );
+        let project = &imported.project;
+        let image = q0s_format::raster::rasterize_q0rg_frame(
+            project,
+            project.meta.entry_q0rg_id,
+            0,
+            320,
+            180,
+            1,
+            [255; 4],
+        );
+        assert_eq!(
+            &image[(5 * 320 + 5) * 4..(5 * 320 + 5) * 4 + 4],
+            [235, 55, 75, 255]
+        );
+    }
+
+    #[test]
     fn a_bitmap_fill_masks_its_bitmap_with_the_fill_outline() {
         let mut encoder =
             flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
@@ -1954,6 +2188,250 @@ mod tests {
             "full width at the start"
         );
         assert!(reach_near(100.0) < 0.01, "tapered away at the end");
+    }
+
+    #[test]
+    fn embedded_sound_preserves_source_and_timeline_clips() {
+        let source = include_bytes!("../../q0video/tests/fixtures/tone.ogg");
+        let xml = stage_xml(&[], r#"<DOMLayer name="music"><frames><DOMFrame index="0" duration="2" soundName="music/tone.ogg" soundSync="stream"><SoundEnvelope><SoundEnvelopePoint mark44="0" level0="32768" level1="32768"/></SoundEnvelope></DOMFrame><DOMFrame index="2"/><DOMFrame index="3" duration="2" soundName="music/tone.ogg" soundSync="stream"/></frames></DOMLayer>"#)
+            .replacen("<symbols>", r#"<media><DOMSoundItem name="music/tone.ogg" href="music/tone.ogg" soundDataHRef="missing.dat"/></media><symbols>"#, 1);
+        let imported = import_files(
+            "embedded-sound",
+            &[
+                ("DOMDocument.xml", xml.as_bytes()),
+                ("LIBRARY/music/tone.ogg", source),
+                ("LIBRARY/stale.ogg", source),
+            ],
+        );
+        assert!(
+            imported.report.warnings.is_empty(),
+            "{:?}",
+            imported.report.warnings
+        );
+        let project = &imported.project;
+        assert_eq!(project.assets.len(), 1, "unlisted media is ignored");
+        let q0s_format::v2::Asset::Q0v(media) = &project.assets[0] else {
+            panic!("audio asset");
+        };
+        assert!(
+            media.bytes.ends_with(source),
+            "original Vorbis stream is retained byte for byte"
+        );
+        let original = q0video::audio::decode_source(source).unwrap();
+        let audio = q0video::q0v::audio_view(&media.bytes).unwrap();
+        assert_eq!(audio.pcm_le_bytes(), original.pcm_le_bytes);
+        assert_eq!(audio.spec.audio_sample_rate, 44_100);
+        assert_eq!(project.audio_clips.len(), 2);
+        assert_eq!(
+            project
+                .audio_clips
+                .iter()
+                .map(|clip| (clip.start_frame, clip.duration_frames, clip.gain))
+                .collect::<Vec<_>>(),
+            [(0, Some(2), 1.0), (3, Some(2), 1.0)]
+        );
+        assert_eq!(
+            project.runtime.library_item_folders
+                [&q0s_format::v2::LibraryItemReference::Asset(media.asset_id)],
+            "music"
+        );
+        let parsed = q0s_format::v2::parse(&q0s_format::v2::write(project).unwrap()).unwrap();
+        assert!(q0s_format::v2::wire_equivalent(project, &parsed));
+    }
+
+    #[test]
+    fn embedded_pcm_sound_fallback_keeps_samples_and_separates_visuals() {
+        let pcm: Vec<u8> = (0..4_410i16)
+            .flat_map(|sample| [sample, -sample])
+            .flat_map(i16::to_le_bytes)
+            .collect();
+        let layers = format!(
+            r#"<DOMLayer name="art and music"><frames><DOMFrame index="0" duration="4" soundName="tone.wav" soundSync="stream" inPoint44="441"><elements>{}</elements></DOMFrame></frames></DOMLayer>"#,
+            square("#ff0000")
+        );
+        let xml = stage_xml(&[], &layers).replacen("<symbols>", r#"<media><DOMSoundItem name="tone.wav" href="missing.wav" soundDataHRef="tone.dat" format="44kHz 16bit Stereo" sampleCount="4410"/></media><symbols>"#, 1);
+        let imported = import_files(
+            "pcm-sound",
+            &[("DOMDocument.xml", xml.as_bytes()), ("bin/tone.dat", &pcm)],
+        );
+        assert!(
+            imported.report.warnings.is_empty(),
+            "{:?}",
+            imported.report.warnings
+        );
+        let project = &imported.project;
+        let clip = &project.audio_clips[0];
+        assert_eq!(clip.source_offset_samples, 480);
+        assert_eq!(clip.duration_frames, Some(3));
+        let layer = project.q0rgs[0]
+            .layers
+            .iter()
+            .find(|layer| layer.layer_id == clip.layer_id)
+            .unwrap();
+        assert!(layer.placements.is_empty());
+        assert!(project.q0rgs[0]
+            .layers
+            .iter()
+            .any(|layer| !layer.placements.is_empty()));
+        let media = project
+            .assets
+            .iter()
+            .find_map(|asset| match asset {
+                q0s_format::v2::Asset::Q0v(media) => Some(media),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            q0video::q0v::audio_view(&media.bytes)
+                .unwrap()
+                .pcm_le_bytes(),
+            pcm
+        );
+    }
+
+    #[test]
+    fn missing_sound_is_reported_without_losing_the_document() {
+        let xml = stage_xml(&[], r#"<DOMLayer name="music"><frames><DOMFrame index="0" soundName="lost.ogg" soundSync="stream"/></frames></DOMLayer>"#).replacen("<symbols>", r#"<media><DOMSoundItem name="lost.ogg" href="lost.ogg"/></media><symbols>"#, 1);
+        let imported = import_files("missing-sound", &[("DOMDocument.xml", xml.as_bytes())]);
+        assert!(imported.project.audio_clips.is_empty());
+        assert!(imported.report.warnings.iter().any(
+            |warning| warning.contains("lost.ogg") && warning.contains("could not be imported")
+        ));
+    }
+
+    #[test]
+    fn uncompressed_xfl_reads_embedded_audio_from_library_folders() {
+        let root = std::env::temp_dir().join(format!(
+            "q0fla-xfl-audio-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let music = root.join("LIBRARY/music");
+        std::fs::create_dir_all(&music).unwrap();
+        let xml = stage_xml(&[], r#"<DOMLayer name="music"><frames><DOMFrame index="0" duration="4" soundName="music/tone.ogg" soundSync="stream"/></frames></DOMLayer>"#).replacen("<symbols>", r#"<media><DOMSoundItem name="music/tone.ogg" href="music/tone.ogg"/></media><symbols>"#, 1);
+        std::fs::write(root.join("project.xfl"), b"PROXY-CS5").unwrap();
+        std::fs::write(root.join("DOMDocument.xml"), xml).unwrap();
+        std::fs::write(
+            music.join("tone.ogg"),
+            include_bytes!("../../q0video/tests/fixtures/tone.ogg"),
+        )
+        .unwrap();
+        let imported = import_xfl(&root.join("project.xfl")).unwrap();
+        assert_eq!(imported.project.audio_clips.len(), 1);
+        assert!(
+            imported.report.warnings.is_empty(),
+            "{:?}",
+            imported.report.warnings
+        );
+        q0s_format::v2::validate(&imported.project).unwrap();
+        std::fs::remove_file(music.join("tone.ogg")).unwrap();
+        std::fs::remove_file(root.join("project.xfl")).unwrap();
+        std::fs::remove_file(root.join("DOMDocument.xml")).unwrap();
+        std::fs::remove_dir(music).unwrap();
+        std::fs::remove_dir(root.join("LIBRARY")).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn frame_color_tint_is_imported_and_tweened() {
+        let symbol = symbol_xml("flag", &square("#ffffff"));
+        let xml = stage_xml(
+            &["flag.xml"],
+            r##"<DOMLayer name="tint"><frames><DOMFrame index="0" duration="10" tweenType="motion"><elements><DOMSymbolInstance libraryItemName="flag"/></elements></DOMFrame><DOMFrame index="10"><elements><DOMSymbolInstance libraryItemName="flag"/></elements><frameColor><Color tintMultiplier="0.5" tintColor="#0000ff"></Color></frameColor></DOMFrame></frames></DOMLayer>"##,
+        );
+        let imported = import_files(
+            "frame-tint",
+            &[
+                ("DOMDocument.xml", xml.as_bytes()),
+                ("LIBRARY/flag.xml", symbol.as_bytes()),
+            ],
+        );
+        let project = &imported.project;
+        for (frame, red) in [(0, 255u8), (5, 191), (10, 128)] {
+            let image = q0s_format::raster::rasterize_q0rg_frame(
+                project,
+                project.meta.entry_q0rg_id,
+                frame,
+                320,
+                180,
+                1,
+                [0; 4],
+            );
+            let pixel = &image[(5 * 320 + 5) * 4..(5 * 320 + 5) * 4 + 4];
+            assert!(
+                pixel[0].abs_diff(red) <= 1 && pixel[1].abs_diff(red) <= 1,
+                "frame {frame}: {pixel:?}"
+            );
+            assert_eq!(&pixel[2..], [255, 255]);
+        }
+        let parsed = q0s_format::v2::parse(&q0s_format::v2::write(project).unwrap()).unwrap();
+        assert!(q0s_format::v2::wire_equivalent(project, &parsed));
+    }
+
+    #[test]
+    fn frame_color_and_instance_color_keep_their_separate_tween_tracks() {
+        let symbol = symbol_xml("flag", &square("#ffffff"));
+        let xml = stage_xml(
+            &["flag.xml"],
+            r##"<DOMLayer name="tint"><frames><DOMFrame index="0" duration="10" tweenType="motion"><elements><DOMSymbolInstance libraryItemName="flag"/></elements><frameColor><Color tintMultiplier="0.5" tintColor="#0000ff"/></frameColor></DOMFrame><DOMFrame index="10"><elements><DOMSymbolInstance libraryItemName="flag"><color><Color tintMultiplier="0.5" tintColor="#ff0000"/></color></DOMSymbolInstance></elements></DOMFrame></frames></DOMLayer>"##,
+        );
+        let imported = import_files(
+            "nested-frame-tint",
+            &[
+                ("DOMDocument.xml", xml.as_bytes()),
+                ("LIBRARY/flag.xml", symbol.as_bytes()),
+            ],
+        );
+        let project = &imported.project;
+        let image = q0s_format::raster::rasterize_q0rg_frame(
+            project,
+            project.meta.entry_q0rg_id,
+            5,
+            320,
+            180,
+            1,
+            [0; 4],
+        );
+        let pixel = &image[(5 * 320 + 5) * 4..(5 * 320 + 5) * 4 + 4];
+        for (value, expected) in pixel.iter().zip([191, 143, 207, 255]) {
+            assert!(
+                value.abs_diff(expected) <= 1,
+                "instance red tint followed by frame blue tint: {pixel:?}"
+            );
+        }
+        let parsed = q0s_format::v2::parse(&q0s_format::v2::write(project).unwrap()).unwrap();
+        assert!(q0s_format::v2::wire_equivalent(project, &parsed));
+    }
+
+    #[test]
+    fn frame_opacity_follows_compositing_of_overlapping_elements() {
+        let layers = format!(
+            r#"<DOMLayer name="art"><frames><DOMFrame index="0"><elements>{}{}</elements><frameColor><Color alphaMultiplier="0.5"/></frameColor></DOMFrame></frames></DOMLayer>"#,
+            square("#ffffff"),
+            square("#ffffff")
+        );
+        let imported = import_files(
+            "frame-opacity",
+            &[("DOMDocument.xml", stage_xml(&[], &layers).as_bytes())],
+        );
+        let project = &imported.project;
+        let image = q0s_format::raster::rasterize_q0rg_frame(
+            project,
+            project.meta.entry_q0rg_id,
+            0,
+            320,
+            180,
+            1,
+            [0; 4],
+        );
+        let alpha = image[(5 * 320 + 5) * 4 + 3];
+        assert!(
+            alpha.abs_diff(128) <= 1,
+            "frame opacity must be applied once: {alpha}"
+        );
     }
 
     #[test]

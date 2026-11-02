@@ -530,7 +530,9 @@ fn is_convex(points: &[[f32; 2]], loop_of: &[u32]) -> bool {
 /// Hertel and Mehlhorn), so a collider holds a few parts, not hundreds.
 fn merge_triangles(points: &[[f32; 2]], indices: &[u32]) -> Vec<Vec<[f32; 2]>> {
     let mut polygons: Vec<Option<Vec<u32>>> = indices
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .filter_map(|triangle| {
             let [a, b, c] = [triangle[0], triangle[1], triangle[2]];
             let area = cross(points[a as usize], points[b as usize], points[c as usize]);

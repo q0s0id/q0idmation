@@ -9,10 +9,20 @@ The Stage, Tools, Timeline, Library and Properties panels can be rearranged inde
 - Drop on a directional target to place the panel beside, above or below that panel.
 - Drop at the outer edge of the workspace to attach across that side of the workspace.
 - Drop away from dock targets to leave the panel floating inside the editor window.
+- Floating panels show only their tabs and contents, without an extra window header or frame padding.
 - Drag separators to resize attached panels. Drag floating-window borders or corners to resize both dimensions.
 - Right-click a panel tab for **Float panel**, **Hide panel** and **Dock to workspace edge**.
+- Close any panel, including Stage, with its tab's close button. Restore it through **Layout → Panels**.
 
 Floating panels stay inside q0editor. They are not separate operating-system windows.
+
+## multiple views
+
+- choose **Layout → new panel** to add another panel of any type, or right-click a panel tab and choose **duplicate panel**.
+- drag the new tab to a side dock target to show both views at once. each tab closes separately.
+- each stage keeps its own zoom, pan, symbol navigation, frame and selection. click or scroll over a stage to make it the editing view; the timeline and properties follow that view. the artwork and undo history belong to the shared document, so edits appear in every view.
+- library views keep separate search and sort controls; timeline views keep separate horizontal scroll positions.
+- saved layouts retain repeated panels. **Layout → Panels** hides or restores every tab of the selected type.
 
 ## Saving arrangements
 

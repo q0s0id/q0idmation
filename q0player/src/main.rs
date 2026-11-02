@@ -96,7 +96,12 @@ mod tests {
         let icon = options.viewport.icon.expect("q0player viewport icon");
         assert_eq!((icon.width, icon.height), (48, 48));
         assert_eq!(icon.rgba.len(), 48 * 48 * 4);
-        assert!(icon.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0));
+        assert!(icon
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| pixel[3] != 0));
     }
 
     #[test]

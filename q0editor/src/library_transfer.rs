@@ -254,6 +254,7 @@ pub fn import_library_item(
         match &mut asset {
             Asset::Bitmap(bitmap) => bitmap.asset_id = new_asset_id,
             Asset::Vector(vector) => vector.asset_id = new_asset_id,
+            Asset::Model(model) => model.asset_id = new_asset_id,
             Asset::Q0v(video) => {
                 video.asset_id = new_asset_id;
                 // Keep item IDs independent, but reuse immutable media bytes.

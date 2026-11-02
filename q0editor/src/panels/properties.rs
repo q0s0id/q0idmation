@@ -114,7 +114,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                             .color(app.settings.theme.text_dim.to_color32())
                             .small(),
                     );
-                    if !strokes.is_empty() || !stroke_segments.is_empty() {
+                    if !fills.is_empty() || !strokes.is_empty() || !stroke_segments.is_empty() {
                         selected_stroke_properties(app, ui);
                     }
                 }
@@ -132,12 +132,24 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                             .small(),
                     );
                 }
-                Selection::SubselectPoints { anchor_indices, .. } => {
+                Selection::SubselectPoints { path, anchor_indices, .. } => {
+                    let more: Vec<usize> = app
+                        .session
+                        .subselect_more
+                        .iter()
+                        .filter(|(other, _)| *other != path)
+                        .map(|(_, indices)| indices.len())
+                        .collect();
+                    let points = anchor_indices.len() + more.iter().sum::<usize>();
                     ui.label(
-                        egui::RichText::new(format!(
-                            "Subselect: {} vector point(s)",
-                            anchor_indices.len()
-                        ))
+                        egui::RichText::new(if more.is_empty() {
+                            format!("Subselect: {points} vector point(s)")
+                        } else {
+                            format!(
+                                "Subselect: {points} vector point(s) on {} paths",
+                                more.len() + 1
+                            )
+                        })
                         .strong(),
                     );
                     ui.label(
@@ -544,39 +556,173 @@ fn render_audio_clip_properties(app: &mut EditorApp, ui: &mut Ui) -> bool {
     true
 }
 
+/// A change to the selected outlines.
+type Restyle = Box<dyn Fn(&mut VStroke)>;
+
+/// Stroke and fill of the selected raw parts, editable in place.
 fn selected_stroke_properties(app: &mut EditorApp, ui: &mut Ui) {
-    let Some((mut width, mixed)) =
-        crate::tools::selected_stroke_width(&app.state.project, &app.session.selection)
-    else {
-        return;
-    };
-    ui.add_space(8.0);
-    ui.label(egui::RichText::new("Stroke").strong());
-    if mixed {
-        ui.label(
-            egui::RichText::new("Mixed widths - editing makes them equal")
-                .color(app.settings.theme.text_dim.to_color32())
-                .small(),
-        );
-    }
-    egui::Grid::new("selected_stroke_style")
-        .num_columns(2)
-        .show(ui, |ui| {
-            ui.label("Width");
-            let response = ui.add(
-                egui::DragValue::new(&mut width)
-                    .speed(0.1)
-                    .clamp_range(0.1..=64.0),
+    use q0s_format::geom::{CapShape, JoinShape};
+    let crate::tools::SelectedPaint { stroke, fill } =
+        crate::tools::selected_paint(&app.state.project, &app.session.selection);
+    let dim = app.settings.theme.text_dim.to_color32();
+    if let Some((stroke, mixed)) = stroke {
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("Stroke").strong());
+        if mixed {
+            ui.label(
+                egui::RichText::new("Mixed styles - what you change is made the same")
+                    .color(dim)
+                    .small(),
             );
-            if response.drag_started() || response.gained_focus() {
-                app.history
-                    .snapshot_with_session(&app.state.project, &app.session);
+        }
+        let mut snapshot = false;
+        let mut restyle: Option<Restyle> = None;
+        egui::Grid::new("selected_stroke_style")
+            .num_columns(2)
+            .show(ui, |ui| {
+                ui.label("Color");
+                let mut color = rgba_to_color32(stroke.color);
+                let response = crate::color_picker::color_edit_button_srgba(ui, &mut color);
+                if response.gained_focus() || response.clicked() {
+                    snapshot = true;
+                }
+                if response.changed() {
+                    let picked = color32_to_rgba(color);
+                    restyle = Some(Box::new(move |stroke| stroke.color = picked));
+                }
+                ui.end_row();
+
+                ui.label("Opacity");
+                let mut opacity = f32::from(stroke.color.a) / 2.55;
+                let response = ui.add(
+                    egui::Slider::new(&mut opacity, 0.0..=100.0)
+                        .suffix("%")
+                        .fixed_decimals(0),
+                );
+                if response.drag_started() || response.gained_focus() {
+                    snapshot = true;
+                }
+                if response.changed() {
+                    let alpha = (opacity * 2.55).round().clamp(0.0, 255.0) as u8;
+                    restyle = Some(Box::new(move |stroke| stroke.color.a = alpha));
+                }
+                ui.end_row();
+
+                ui.label("Width");
+                let mut width = stroke.width;
+                let response = ui.add(
+                    egui::DragValue::new(&mut width)
+                        .speed(0.1)
+                        .clamp_range(0.1..=64.0),
+                );
+                if response.drag_started() || response.gained_focus() {
+                    snapshot = true;
+                }
+                if response.changed() {
+                    restyle = Some(Box::new(move |stroke| stroke.width = width));
+                }
+                ui.end_row();
+
+                ui.label("Ends");
+                ui.horizontal(|ui| {
+                    for (cap, label) in [
+                        (CapShape::Round, "Round"),
+                        (CapShape::Butt, "Flat"),
+                        (CapShape::Square, "Square"),
+                    ] {
+                        if ui.selectable_label(stroke.cap == cap, label).clicked()
+                            && stroke.cap != cap
+                        {
+                            snapshot = true;
+                            restyle = Some(Box::new(move |stroke| stroke.cap = cap));
+                        }
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Corners");
+                ui.horizontal(|ui| {
+                    for (join, label) in [
+                        (JoinShape::Round, "Round"),
+                        (JoinShape::Miter, "Sharp"),
+                        (JoinShape::Bevel, "Bevel"),
+                    ] {
+                        if ui.selectable_label(stroke.join == join, label).clicked()
+                            && stroke.join != join
+                        {
+                            snapshot = true;
+                            restyle = Some(Box::new(move |stroke| stroke.join = join));
+                        }
+                    }
+                });
+                ui.end_row();
+            });
+        if snapshot {
+            app.history
+                .snapshot_with_session(&app.state.project, &app.session);
+        }
+        if let Some(restyle) = restyle {
+            if crate::tools::restyle_selected_strokes(app, restyle) {
+                if let Some((stroke, _)) =
+                    crate::tools::selected_paint(&app.state.project, &app.session.selection).stroke
+                {
+                    app.session.stroke_width = stroke.width;
+                }
             }
-            if response.changed() {
-                crate::tools::set_selected_stroke_width(app, width);
-            }
-            ui.end_row();
-        });
+        }
+    }
+    if let Some((color, mixed)) = fill {
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("Fill").strong());
+        if mixed {
+            ui.label(
+                egui::RichText::new("Mixed colours - what you pick paints them all")
+                    .color(dim)
+                    .small(),
+            );
+        }
+        let mut snapshot = false;
+        let mut picked = None;
+        egui::Grid::new("selected_fill_style")
+            .num_columns(2)
+            .show(ui, |ui| {
+                ui.label("Color");
+                let mut shown = rgba_to_color32(color);
+                let response = crate::color_picker::color_edit_button_srgba(ui, &mut shown);
+                if response.gained_focus() || response.clicked() {
+                    snapshot = true;
+                }
+                if response.changed() {
+                    picked = Some(color32_to_rgba(shown));
+                }
+                ui.end_row();
+
+                ui.label("Opacity");
+                let mut opacity = f32::from(color.a) / 2.55;
+                let response = ui.add(
+                    egui::Slider::new(&mut opacity, 0.0..=100.0)
+                        .suffix("%")
+                        .fixed_decimals(0),
+                );
+                if response.drag_started() || response.gained_focus() {
+                    snapshot = true;
+                }
+                if response.changed() {
+                    picked = Some(Rgba {
+                        a: (opacity * 2.55).round().clamp(0.0, 255.0) as u8,
+                        ..color
+                    });
+                }
+                ui.end_row();
+            });
+        if snapshot {
+            app.history
+                .snapshot_with_session(&app.state.project, &app.session);
+        }
+        if let Some(picked) = picked {
+            crate::tools::set_selected_fill(app, picked);
+        }
+    }
 }
 
 fn raw_path_properties(
@@ -606,7 +752,7 @@ fn raw_path_properties(
         })
         .and_then(|asset| match asset {
             Asset::Vector(vector) => vector.paths.get(path_idx),
-            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => None,
+            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) | Asset::Model(_) => None,
         });
     let Some(path) = path else {
         ui.label("Selection is no longer available");
@@ -817,6 +963,7 @@ enum ToolPropertyKind {
     Pencil,
     Brush,
     Eraser,
+    Knife,
     Line,
     ClosedShape,
     Fill,
@@ -835,6 +982,7 @@ fn tool_property_kind(tool: Tool) -> ToolPropertyKind {
         Tool::Pencil => ToolPropertyKind::Pencil,
         Tool::Brush => ToolPropertyKind::Brush,
         Tool::Eraser => ToolPropertyKind::Eraser,
+        Tool::Knife => ToolPropertyKind::Knife,
         Tool::Line => ToolPropertyKind::Line,
         Tool::Rectangle | Tool::Oval => ToolPropertyKind::ClosedShape,
         Tool::Bucket => ToolPropertyKind::Fill,
@@ -854,11 +1002,20 @@ fn render_tool_properties(app: &mut EditorApp, ui: &mut Ui) {
     );
 
     match tool_property_kind(app.session.current_tool) {
-        ToolPropertyKind::Select => tool_hint(
-            app,
-            ui,
-            "Drag artwork to move it; Alt-drag artwork to duplicate. Alt-drag the anchor cross to reposition it.",
-        ),
+        ToolPropertyKind::Select => {
+            tool_hint(
+                app,
+                ui,
+                "Drag artwork to move it; Alt-drag artwork to duplicate. Alt-drag the anchor cross to reposition it. Double-click a line to pick every line joined to it.",
+            );
+            aid_checkbox(
+                app,
+                ui,
+                |aids| &mut aids.transform_box,
+                "Transform box",
+                "Off: the Select tool only moves things, with no handles to catch by mistake",
+            );
+        }
         ToolPropertyKind::Lasso => tool_hint(
             app,
             ui,
@@ -877,9 +1034,12 @@ fn render_tool_properties(app: &mut EditorApp, ui: &mut Ui) {
         ToolPropertyKind::Subselect => tool_hint(
             app,
             ui,
-            "Edit individual vector anchors and handles. This tool has no drawing style.",
+            "Edit individual vector anchors and handles. Drag over empty stage to pick many points, on several lines at once, then drag one of them to move them all. Drag a line's middle to bend it.",
         ),
-        ToolPropertyKind::Pen => stroke_tool_properties(app, ui, "Pen path", true, true),
+        ToolPropertyKind::Pen => {
+            stroke_tool_properties(app, ui, "Pen path", true, true);
+            crossing_option(app, ui);
+        }
         ToolPropertyKind::Pencil => {
             stroke_tool_properties(app, ui, "Freehand line", false, true);
             if ui.add(egui::Slider::new(&mut app.settings.pencil_smoothing, 0..=100).text("Smoothing")).changed() {
@@ -888,9 +1048,15 @@ fn render_tool_properties(app: &mut EditorApp, ui: &mut Ui) {
         }
         ToolPropertyKind::Brush => brush_properties(app, ui),
         ToolPropertyKind::Eraser => eraser_properties(app, ui),
-        ToolPropertyKind::Line => stroke_tool_properties(app, ui, "Straight line", false, true),
+        ToolPropertyKind::Knife => knife_properties(app, ui),
+        ToolPropertyKind::Line => {
+            stroke_tool_properties(app, ui, "Straight line", false, true);
+            middle_option(app, ui);
+            crossing_option(app, ui);
+        }
         ToolPropertyKind::ClosedShape => {
-            stroke_tool_properties(app, ui, "Closed shape", true, false)
+            stroke_tool_properties(app, ui, "Closed shape", true, false);
+            middle_option(app, ui);
         }
         ToolPropertyKind::Fill => fill_tool_properties(app, ui),
         ToolPropertyKind::Eyedropper => tool_hint(
@@ -900,6 +1066,54 @@ fn render_tool_properties(app: &mut EditorApp, ui: &mut Ui) {
         ),
         ToolPropertyKind::Rig => crate::rigging::render_properties(app, ui),
     }
+}
+
+fn knife_properties(app: &mut EditorApp, ui: &mut Ui) {
+    tool_hint(
+        app,
+        ui,
+        "Drag across shapes on this layer to cut them apart; Shift cuts straight. Fills fall into pieces you can move or delete, outlines open along the cut.",
+    );
+    let mut gap = app.settings.aids.knife_gap;
+    if ui
+        .add(
+            egui::Slider::new(&mut gap, 0..=24)
+                .text("Gap")
+                .suffix(" px"),
+        )
+        .on_hover_text("How wide a crack the cut leaves; 0 only parts the pieces")
+        .changed()
+    {
+        app.settings.aids.knife_gap = gap;
+        app.settings.save();
+    }
+    aid_checkbox(
+        app,
+        ui,
+        |aids| &mut aids.knife_jagged,
+        "Jagged crack",
+        "Cut along a zigzag following the line drawn, for broken and cracked looks",
+    );
+}
+
+fn middle_option(app: &mut EditorApp, ui: &mut Ui) {
+    aid_checkbox(
+        app,
+        ui,
+        |aids| &mut aids.from_middle,
+        "Draw from the middle",
+        "The drag starts in the middle and grows both ways. Hold Alt for the same; Shift keeps it square or at 45 degrees",
+    );
+}
+
+fn crossing_option(app: &mut EditorApp, ui: &mut Ui) {
+    aid_checkbox(
+        app,
+        ui,
+        |aids| &mut aids.split_crossings,
+        "Cut lines where they cross",
+        "New lines and the lines they cross are cut where they meet, so each piece can be picked on its own",
+    );
 }
 
 fn tool_hint(app: &EditorApp, ui: &mut Ui, text: &str) {
@@ -1656,8 +1870,39 @@ fn fill_tool_properties(app: &mut EditorApp, ui: &mut Ui) {
             ui.label("Opacity");
             opacity_control(ui, &mut fill.a);
             ui.end_row();
+
+            ui.label("Close gaps");
+            let before = app.settings.aids.bucket_gap;
+            egui::ComboBox::from_id_source("bucket_gap")
+                .selected_text(before.label())
+                .show_ui(ui, |ui| {
+                    for gap in crate::settings::GapSize::ALL {
+                        ui.selectable_value(&mut app.settings.aids.bucket_gap, gap, gap.label());
+                    }
+                })
+                .response
+                .on_hover_text("Fill outlines that are not quite closed");
+            if app.settings.aids.bucket_gap != before {
+                app.settings.save();
+            }
+            ui.end_row();
         });
     app.session.fill_color = Some(fill);
+}
+
+/// A switch kept in the settings, saved as soon as it is flipped.
+fn aid_checkbox(
+    app: &mut EditorApp,
+    ui: &mut Ui,
+    value: fn(&mut crate::settings::DrawingAids) -> &mut bool,
+    label: &str,
+    hint: &str,
+) {
+    let mut on = *value(&mut app.settings.aids);
+    if ui.checkbox(&mut on, label).on_hover_text(hint).changed() {
+        *value(&mut app.settings.aids) = on;
+        app.settings.save();
+    }
 }
 
 fn opacity_control(ui: &mut Ui, alpha: &mut u8) {
@@ -1922,6 +2167,17 @@ fn asset_properties(app: &mut EditorApp, ui: &mut Ui, id: u16) {
                 ui.label(format!("invalid q0v: {error}"));
             }
         },
+        Asset::Model(model) => {
+            let data = &model.data;
+            ui.label(format!("3D model: {} mesh(es)", data.meshes.len()));
+            ui.label(format!(
+                "{} vertices / {} triangles",
+                data.vertex_count(),
+                data.triangle_count()
+            ));
+            let bones = data.nodes.iter().filter(|node| node.bone).count();
+            ui.label(format!("{bones} bone(s) / {} clip(s)", data.clips.len()));
+        }
         Asset::Rig(rig) => {
             ui.label(format!("Rig for q0rg {}", rig.owner_q0rg_id));
             ui.label(format!(
@@ -2398,11 +2654,53 @@ fn placement_properties(
                 app.open_replace_q0rg_dialog(q0rg_id, layer_id, placement_idx);
             }
         });
-        if ui.add_enabled(
-            !app.state.project.layer_is_locked(q0rg_id, layer_id),
-            egui::Button::new("Duplicate Symbol"),
-        ).on_hover_text("Create an independent copy, including nested symbols, without changing the original").clicked() {
-            app.queue(crate::app::Action::DuplicateSymbol(q0rg_id, layer_id, placement_idx));
+        let unlocked = !app.state.project.layer_is_locked(q0rg_id, layer_id);
+        ui.horizontal_wrapped(|ui| {
+            if ui.add_enabled(
+                unlocked,
+                egui::Button::new("Duplicate Symbol"),
+            ).on_hover_text("Create an independent copy, including nested symbols, without changing the original").clicked() {
+                app.queue(crate::app::Action::DuplicateSymbol(q0rg_id, layer_id, placement_idx));
+            }
+            if ui
+                .add_enabled(unlocked, egui::Button::new("Make Variant"))
+                .on_hover_text("Copy this symbol as a variant of it (a broken, dented or wounded version), show the copy here and start drawing on it")
+                .clicked()
+            {
+                app.queue(crate::app::Action::MakeVariant(q0rg_id, layer_id, placement_idx));
+            }
+        });
+        let family = crate::variants::family(&app.state.project, child_id);
+        if family.len() > 1 {
+            let index = family.iter().position(|id| *id == child_id).unwrap_or(0);
+            ui.horizontal(|ui| {
+                ui.label("Variant");
+                if ui
+                    .add_enabled(unlocked, egui::Button::new("<").small())
+                    .on_hover_text("Show the previous variant here")
+                    .clicked()
+                {
+                    app.queue(crate::app::Action::SwapVariant(
+                        q0rg_id,
+                        layer_id,
+                        placement_idx,
+                        -1,
+                    ));
+                }
+                ui.label(format!("{} / {}", index + 1, family.len()));
+                if ui
+                    .add_enabled(unlocked, egui::Button::new(">").small())
+                    .on_hover_text("Show the next variant here")
+                    .clicked()
+                {
+                    app.queue(crate::app::Action::SwapVariant(
+                        q0rg_id,
+                        layer_id,
+                        placement_idx,
+                        1,
+                    ));
+                }
+            });
         }
         ui.separator();
         ui.label(egui::RichText::new("Playback").strong());
@@ -2631,6 +2929,18 @@ fn placement_properties(
         }
     }
 
+    crate::scene3d::placement_3d_properties(
+        app,
+        ui,
+        reference,
+        target,
+        &mut fx,
+        current_frame,
+        playback_start_frame,
+        &mut fx_dirty,
+        &mut wants_snapshot,
+    );
+
     let fx_values = [fx];
     render_fx_controls(ui, &mut fx, &fx_values);
     if fx != fx_values[0] {
@@ -2769,6 +3079,7 @@ enum FxField {
     ShadowOffsetX,
     ShadowOffsetY,
     ShadowStrength,
+    ShadowQuality,
     Reset,
 }
 
@@ -2806,6 +3117,9 @@ impl FxField {
             }
             Self::ShadowStrength => {
                 value.shadow.map(|v| v.strength) != first.shadow.map(|v| v.strength)
+            }
+            Self::ShadowQuality => {
+                value.shadow.map(|v| v.quality) != first.shadow.map(|v| v.quality)
             }
             Self::Reset => false,
         })
@@ -2864,7 +3178,8 @@ impl FxEdits {
             GlowRadiusY => radius_y, GlowStrength => strength, GlowQuality => quality);
         optional!(blur, BlurEnabled, BlurRadiusX => radius_x, BlurRadiusY => radius_y, BlurQuality => quality);
         optional!(shadow, ShadowEnabled, ShadowColor => color, ShadowBlur => blur_radius,
-            ShadowOffsetX => offset_x, ShadowOffsetY => offset_y, ShadowStrength => strength);
+            ShadowOffsetX => offset_x, ShadowOffsetY => offset_y, ShadowStrength => strength,
+            ShadowQuality => quality);
     }
 }
 
@@ -3255,6 +3570,7 @@ fn render_fx_controls(ui: &mut Ui, fx: &mut PlacementFx, values: &[PlacementFx])
     );
     if shadow_toggle.changed() {
         fx.shadow = shadow_enabled.then_some(DropShadowFx {
+            quality: 3,
             color: Rgba {
                 r: 0,
                 g: 0,
@@ -3309,6 +3625,12 @@ fn render_fx_controls(ui: &mut Ui, fx: &mut PlacementFx, values: &[PlacementFx])
                             .show_value(true),
                     );
                     edits.response(FxField::ShadowStrength, &response);
+                    ui.end_row();
+
+                    fx_label(ui, "quality", FxField::ShadowQuality, values);
+                    let response =
+                        ui.add(egui::DragValue::new(&mut shadow.quality).clamp_range(1..=15));
+                    edits.response(FxField::ShadowQuality, &response);
                     ui.end_row();
                 });
         });

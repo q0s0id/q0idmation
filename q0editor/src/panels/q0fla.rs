@@ -36,7 +36,7 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
             ui.add_space(6.0);
             ui.label(
                 RichText::new(
-                    "Current importer: document size, fps, timeline length, layers/folders, hidden/locked state and keyframes. Artwork/symbol/media import comes next.",
+                    "imports document settings, timelines, layers and folders, vector artwork, symbols, bitmaps, audio clips, and supported color effects.",
                 )
                 .small()
                 .color(app.settings.theme.text_dim.to_color32()),

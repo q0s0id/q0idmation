@@ -7,18 +7,141 @@ use q0s_format::q0lang::runtime::{
     ExecutionReport, Runtime, RuntimeAction, RuntimeDiagnostic, RuntimeValue, TimelineTarget,
 };
 use q0s_format::raster::{
-    active_placement_states_at, runtime_instance_metrics_with_cache, RuntimeBoundsCache,
+    active_placement_states_at, active_placement_states_with, runtime_instance_metrics_with_cache,
+    LayerTimeline, RuntimeBoundsCache,
 };
 use q0s_format::rig::RigControlOverride;
 use q0s_format::runtime_scene::{PlaybackRequest, RuntimeSceneState};
 use q0s_format::transform::Affine;
-use q0s_format::v2::{InstanceKey, ProjectV2, Target, Vec2, MAX_Q0RG_NESTING_DEPTH};
+use q0s_format::v2::{
+    Asset, InstanceKey, ProjectV2, Q0rg, RigAsset, Target, Vec2, MAX_Q0RG_NESTING_DEPTH,
+};
 
 use crate::{Inner, Player, MAX_FRAME_SCRIPT_TRANSITIONS};
 
 const MAX_ACTIVE_OBJECTS: usize = 4096;
 pub(crate) const OBJECT_INSTRUCTION_BUDGET: usize = 100_000;
 pub(crate) const MAX_RUNTIME_DIAGNOSTICS: usize = 256;
+
+/// What the object pass needs to know about a project, worked out once: the
+/// player never edits a project, and a scene switch brings a new one.
+pub(crate) struct ObjectIndex {
+    q0rgs: HashMap<u16, usize>,
+    rigs: HashMap<u16, usize>,
+    scripted: HashSet<u16>,
+    /// Symbols with a script in them or anywhere below them. Only these get
+    /// objects: an unscripted symbol plays by its placement, which the
+    /// renderer works out by itself, so tracking it every frame was wasted.
+    live: HashSet<u16>,
+    timelines: HashMap<(u16, u16), LayerTimeline>,
+}
+
+impl ObjectIndex {
+    pub(crate) fn new(project: &ProjectV2) -> Self {
+        let q0rgs: HashMap<u16, usize> = project
+            .q0rgs
+            .iter()
+            .enumerate()
+            .map(|(i, q0rg)| (q0rg.q0rg_id, i))
+            .rev()
+            .collect();
+        let mut rigs = HashMap::new();
+        for (i, asset) in project.assets.iter().enumerate() {
+            if let Asset::Rig(rig) = asset {
+                rigs.entry(rig.owner_q0rg_id).or_insert(i);
+            }
+        }
+        let mut scripted: HashSet<u16> = project
+            .q0rgs
+            .iter()
+            .filter(|q0rg| !q0rg.script.trim().is_empty())
+            .map(|q0rg| q0rg.q0rg_id)
+            .collect();
+        scripted.extend(
+            project
+                .runtime
+                .frame_scripts
+                .iter()
+                .filter(|script| !script.source.trim().is_empty())
+                .map(|script| script.q0rg_id),
+        );
+        // What each symbol can show, rig variants included.
+        let children: HashMap<u16, Vec<u16>> = project
+            .q0rgs
+            .iter()
+            .map(|q0rg| {
+                let placed = q0rg
+                    .layers
+                    .iter()
+                    .flat_map(|layer| &layer.placements)
+                    .map(|placement| placement.target);
+                let variants = rigs
+                    .get(&q0rg.q0rg_id)
+                    .and_then(|&i| match &project.assets[i] {
+                        Asset::Rig(rig) => Some(rig),
+                        _ => None,
+                    })
+                    .into_iter()
+                    .flat_map(|rig| &rig.variants)
+                    .flat_map(|variant| &variant.choices)
+                    .map(|choice| choice.target);
+                let mut ids: Vec<u16> = placed
+                    .chain(variants)
+                    .filter_map(|target| match target {
+                        Target::Q0rg(id) => Some(id),
+                        Target::Asset(_) => None,
+                    })
+                    .collect();
+                ids.sort_unstable();
+                ids.dedup();
+                (q0rg.q0rg_id, ids)
+            })
+            .collect();
+        let mut live = scripted.clone();
+        loop {
+            let before = live.len();
+            for (id, ids) in &children {
+                if !live.contains(id) && ids.iter().any(|child| live.contains(child)) {
+                    live.insert(*id);
+                }
+            }
+            if live.len() == before {
+                break;
+            }
+        }
+        let timelines = project
+            .q0rgs
+            .iter()
+            .filter(|q0rg| live.contains(&q0rg.q0rg_id))
+            .flat_map(|q0rg| {
+                q0rg.layers
+                    .iter()
+                    .map(|layer| ((q0rg.q0rg_id, layer.layer_id), LayerTimeline::new(layer)))
+            })
+            .collect();
+        Self {
+            q0rgs,
+            rigs,
+            scripted,
+            live,
+            timelines,
+        }
+    }
+
+    fn q0rg<'p>(&self, project: &'p ProjectV2, id: u16) -> Option<&'p Q0rg> {
+        project
+            .q0rgs
+            .get(*self.q0rgs.get(&id)?)
+            .filter(|q0rg| q0rg.q0rg_id == id)
+    }
+
+    fn rig<'p>(&self, project: &'p ProjectV2, owner: u16) -> Option<&'p RigAsset> {
+        match project.assets.get(*self.rigs.get(&owner)?) {
+            Some(Asset::Rig(rig)) if rig.owner_q0rg_id == owner => Some(rig),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct ObjectWorld {
@@ -115,6 +238,7 @@ impl ObjectWorld {
 
 struct ObjectPass<'a> {
     project: &'a ProjectV2,
+    index: &'a ObjectIndex,
     bounds: &'a RuntimeBoundsCache,
     globals: &'a BTreeMap<String, RuntimeValue>,
     instructions: usize,
@@ -148,10 +272,12 @@ impl ObjectPass<'_> {
         if depth >= MAX_Q0RG_NESTING_DEPTH {
             return;
         }
-        let Some(q0rg) = self.project.q0rgs.iter().find(|q| q.q0rg_id == owner) else {
-            return;
-        };
-        let rig_pose = q0s_format::rig::rig_for_q0rg(self.project, owner).map(|rig| {
+        let index = self.index;
+        let q0rg = index
+            .q0rg(self.project, owner)
+            .filter(|_| index.live.contains(&owner));
+        let rig = index.rig(self.project, owner);
+        let rig_pose = rig.map(|rig| {
             q0s_format::rig::evaluate_rig(
                 rig,
                 f32::from(frame),
@@ -163,16 +289,17 @@ impl ObjectPass<'_> {
             )
         });
         let mut active = Vec::new();
-        for layer in &q0rg.layers {
+        for layer in q0rg.iter().flat_map(|q0rg| &q0rg.layers) {
             if !self.project.layer_is_visible(owner, layer.layer_id) {
                 continue;
             }
-            for state in active_placement_states_at(layer, frame) {
+            let states = match index.timelines.get(&(owner, layer.layer_id)) {
+                Some(timeline) => active_placement_states_with(layer, frame, timeline),
+                None => active_placement_states_at(layer, frame),
+            };
+            for state in states {
                 let placement = &layer.placements[state.index];
-                let target = match (
-                    q0s_format::rig::rig_for_q0rg(self.project, owner),
-                    rig_pose.as_ref(),
-                ) {
+                let target = match (rig, rig_pose.as_ref()) {
                     (Some(rig), Some(pose)) => q0s_format::rig::resolved_variant_target(
                         rig,
                         pose,
@@ -182,6 +309,9 @@ impl ObjectPass<'_> {
                     _ => placement.target,
                 };
                 if let Target::Q0rg(symbol) = target {
+                    if !index.live.contains(&symbol) {
+                        continue;
+                    }
                     let authored = rig_pose
                         .as_ref()
                         .and_then(|pose| pose.binding_transform(placement.instance_id))
@@ -190,11 +320,12 @@ impl ObjectPass<'_> {
                         InstanceKey::new(owner, placement.instance_id),
                         symbol,
                         authored,
+                        (state.playback_start_frame, state.fx.q0rg_playback),
                     ));
                 }
             }
         }
-        let active_keys: HashSet<_> = active.iter().map(|(key, _, _)| *key).collect();
+        let active_keys: HashSet<_> = active.iter().map(|(key, _, _, _)| *key).collect();
         world.instances.retain(|key, _| {
             if active_keys.contains(key) {
                 true
@@ -203,22 +334,16 @@ impl ObjectPass<'_> {
                 false
             }
         });
-        for (key, symbol, authored) in active {
+        for (key, symbol, authored, (placed_at, playback)) in active {
             if self.remaining_objects == 0 {
                 self.diagnostic("scene", "active q0rg limit exceeded (4096)");
                 break;
             }
             self.remaining_objects -= 1;
-            let Some(definition) = self.project.q0rgs.iter().find(|q| q.q0rg_id == symbol) else {
+            let Some(definition) = index.q0rg(self.project, symbol) else {
                 continue;
             };
-            let scripted = !definition.script.trim().is_empty()
-                || self
-                    .project
-                    .runtime
-                    .frame_scripts
-                    .iter()
-                    .any(|script| script.q0rg_id == symbol && !script.source.trim().is_empty());
+            let scripted = index.scripted.contains(&symbol);
             let fresh = !world
                 .instances
                 .get(&key)
@@ -262,20 +387,31 @@ impl ObjectPass<'_> {
                 object.frame = frame.min(definition.frame_count.saturating_sub(1));
             }
             if !scripted {
-                object.frame = frame % definition.frame_count.max(1);
+                // Unscripted symbols play as the editor shows them: by their
+                // placement's playback mode, from where they were placed.
+                object.frame = q0s_format::v2::resolve_q0rg_playback_frame(
+                    self.project,
+                    symbol,
+                    frame,
+                    placed_at,
+                    playback,
+                );
             } else if self.advance && !fresh && object.playing && request.frame.is_none() {
                 object.frame = (object.frame + 1) % definition.frame_count.max(1);
             }
             let mut local = scene.effective_affine(key, authored);
             let world_transform = Affine::compose(parent, local);
-            let metrics = runtime_instance_metrics_with_cache(
-                self.project,
-                owner,
-                frame,
-                key.instance_id,
-                scene,
-                self.bounds,
-            );
+            // Only a script reads its bounds or hears the pointer.
+            let metrics = object.runtime.as_ref().and_then(|_| {
+                runtime_instance_metrics_with_cache(
+                    self.project,
+                    owner,
+                    frame,
+                    key.instance_id,
+                    scene,
+                    self.bounds,
+                )
+            });
             let pointer = match (self.globals.get("mouse.x"), self.globals.get("mouse.y")) {
                 (Some(RuntimeValue::Number(x)), Some(RuntimeValue::Number(y))) => {
                     Some(Vec2::new(*x as f32, *y as f32))
@@ -490,10 +626,8 @@ impl ObjectPass<'_> {
                         self.transitions -= 1;
                         object.playing = playing;
                         let count = self
-                            .project
-                            .q0rgs
-                            .iter()
-                            .find(|q| q.q0rg_id == object.symbol)
+                            .index
+                            .q0rg(self.project, object.symbol)
                             .map_or(1, |q| q.frame_count.max(1));
                         jump = Some(frame.min(count - 1));
                     } else {
@@ -503,7 +637,9 @@ impl ObjectPass<'_> {
                 RuntimeAction::SceneSwitch { .. }
                 | RuntimeAction::Physics(_)
                 | RuntimeAction::Particles(_)
-                | RuntimeAction::Light(_) => self.scene_actions.push(action),
+                | RuntimeAction::Light(_)
+                | RuntimeAction::Layer(_)
+                | RuntimeAction::Window(_) => self.scene_actions.push(action),
                 RuntimeAction::ShellCommand { .. } => {}
                 action => {
                     if let Err(message) =
@@ -743,6 +879,13 @@ impl Player {
             _ => return,
         };
         self.sync_q0lang_host_globals();
+        if self
+            .object_index
+            .as_ref()
+            .is_none_or(|(source, _)| !Arc::ptr_eq(source, &project))
+        {
+            self.object_index = Some((Arc::clone(&project), ObjectIndex::new(&project)));
+        }
         let globals = self
             .q0lang
             .as_ref()
@@ -762,6 +905,11 @@ impl Player {
             .unwrap_or_default();
         let mut pass = ObjectPass {
             project: &project,
+            index: &self
+                .object_index
+                .as_ref()
+                .expect("object index just built")
+                .1,
             bounds: &self
                 .runtime_bounds_cache
                 .as_ref()

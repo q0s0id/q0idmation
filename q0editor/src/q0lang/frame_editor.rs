@@ -62,6 +62,8 @@ pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
                 && script.frame == draft.frame
         });
 
+    let mut simple = app.settings.q0lang_simple;
+    let names = super::blocks::Names::of_project(&app.state.project, draft.q0rg_id);
     let mut open = true;
     let mut save = false;
     let mut remove = false;
@@ -80,6 +82,8 @@ pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
     .fit_to_screen(ctx)
     .show(ctx, |ui| {
         ui.horizontal(|ui| {
+            super::blocks::mode_switch(ui, &mut simple);
+            ui.separator();
             ui.label(RichText::new("q0lang frame code").strong());
             ui.separator();
             ui.label(
@@ -110,34 +114,52 @@ pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
         });
         ui.separator();
 
-        super::authoring::tools_ui(ui, text_edit_id, &mut draft.source);
-        ui.separator();
-
-        let theme_for_layouter = theme.clone();
-        let font_for_layouter = font_id.clone();
-        let mut layouter = move |ui: &egui::Ui, text: &str, _wrap_width: f32| {
-            let job = super::syntax::layout_line(
-                text,
-                &theme_for_layouter,
-                font_for_layouter.clone(),
-                f32::INFINITY,
-            );
-            ui.fonts(|fonts| fonts.layout_job(job))
-        };
-        egui::ScrollArea::both()
-            .id_source(text_edit_id.with("scroll"))
-            .auto_shrink([false, false])
-            .max_height((ui.available_height() - 115.0).max(180.0))
-            .show(ui, |ui| {
-                let output = TextEdit::multiline(&mut draft.source)
-                    .id(text_edit_id)
-                    .desired_width(ui.available_width().max(240.0))
-                    .desired_rows(18)
-                    .font(font_id.clone())
-                    .layouter(&mut layouter)
-                    .show(ui);
-                super::authoring::scroll_to_selection(ui, &output);
+        if simple {
+            let issues = diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.line)
+                .collect::<Vec<_>>();
+            let height = (ui.available_height() - 115.0).max(220.0);
+            ui.allocate_ui(egui::vec2(ui.available_width(), height), |ui| {
+                ui.set_min_height(height);
+                super::blocks::show(
+                    ui,
+                    text_edit_id.with("blocks"),
+                    &mut draft.source,
+                    &names,
+                    &issues,
+                );
             });
+        } else {
+            super::authoring::tools_ui(ui, text_edit_id, &mut draft.source);
+            ui.separator();
+
+            let theme_for_layouter = theme.clone();
+            let font_for_layouter = font_id.clone();
+            let mut layouter = move |ui: &egui::Ui, text: &str, _wrap_width: f32| {
+                let job = super::syntax::layout_line(
+                    text,
+                    &theme_for_layouter,
+                    font_for_layouter.clone(),
+                    f32::INFINITY,
+                );
+                ui.fonts(|fonts| fonts.layout_job(job))
+            };
+            egui::ScrollArea::both()
+                .id_source(text_edit_id.with("scroll"))
+                .auto_shrink([false, false])
+                .max_height((ui.available_height() - 115.0).max(180.0))
+                .show(ui, |ui| {
+                    let output = TextEdit::multiline(&mut draft.source)
+                        .id(text_edit_id)
+                        .desired_width(ui.available_width().max(240.0))
+                        .desired_rows(18)
+                        .font(font_id.clone())
+                        .layouter(&mut layouter)
+                        .show(ui);
+                    super::authoring::scroll_to_selection(ui, &output);
+                });
+        }
         let analysis = super::authoring::analyze(ctx, &draft.source);
         let diagnostics = &analysis.diagnostics;
 
@@ -243,6 +265,10 @@ pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
         close = true;
     }
 
+    if simple != app.settings.q0lang_simple {
+        app.settings.q0lang_simple = simple;
+        app.settings.save();
+    }
     if close || !open {
         app.session.frame_script_editor = None;
     } else {

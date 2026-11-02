@@ -30,6 +30,26 @@ pub struct SwfTag {
     pub payload: Vec<u8>,
 }
 
+/// What is worked out about a movie once and kept while it is open: its
+/// character index, the shapes decoded so far, and where the main timeline
+/// was last laid out. Clones of a movie share it.
+#[derive(Clone, Default)]
+pub struct SwfCache {
+    pub(crate) index: std::sync::Arc<std::sync::OnceLock<crate::swf_assets::Index>>,
+    pub(crate) shapes: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<u16, std::sync::Arc<Vec<crate::preview::VectorLayer>>>,
+        >,
+    >,
+    pub(crate) timeline: std::sync::Arc<std::sync::Mutex<Option<crate::swf_assets::Timeline>>>,
+}
+
+impl std::fmt::Debug for SwfCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SwfCache")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SwfMovie {
     pub compression: SwfCompression,
@@ -42,6 +62,7 @@ pub struct SwfMovie {
     pub frame_count: u16,
     pub tags: Vec<SwfTag>,
     pub normalized_fws: Vec<u8>,
+    pub cache: SwfCache,
 }
 
 #[derive(Debug, Clone)]
@@ -223,6 +244,7 @@ fn parse_swf_inner(bytes: &[u8], allow_trailing: bool) -> Result<SwfMovie, Strin
         frame_count,
         tags,
         normalized_fws,
+        cache: SwfCache::default(),
     })
 }
 

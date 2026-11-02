@@ -9,6 +9,8 @@ homepage.workspace = true
 description = "q0v container and MP4 import/export support for q0idmation."
 [dependencies]
 image = { version = "0.24.9", default-features = false, features = ["png"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+symphonia = { version = "0.5.5", default-features = false, features = ["mp3", "flac", "ogg", "vorbis", "wav", "pcm"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

@@ -1,6 +1,10 @@
+pub mod app;
 pub mod document;
 pub mod edit;
 pub mod extract;
+pub mod icons;
 pub mod preview;
 pub mod save;
+pub mod skin;
 pub mod swf;
+pub mod swf_assets;

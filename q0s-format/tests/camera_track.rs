@@ -24,7 +24,7 @@ fn project_with_pixel() -> ProjectV2 {
             asset_id: 1,
             width: 1,
             height: 1,
-            rgba: vec![255, 0, 0, 255],
+            rgba: vec![255, 0, 0, 255].into(),
         })],
         asset_names: HashMap::new(),
         asset_appearances: HashMap::new(),
@@ -254,7 +254,9 @@ fn raster_camera_moves_view_without_touching_object_transform() {
 
     let red_positions = |pixels: &[u8]| {
         pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .enumerate()
             .filter_map(|(i, px)| (px[0] > 200 && px[3] > 200).then_some((i % 8, i / 8)))
             .collect::<Vec<_>>()

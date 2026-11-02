@@ -26,8 +26,8 @@ use lyon_tessellation::{
     FillOptions, FillRule as LyonFillRule, FillTessellator, LineCap, LineJoin, StrokeOptions,
     StrokeTessellator,
 };
-use q0s_format::geom::flatten_path;
-use q0s_format::raster::active_placement_states_at;
+use q0s_format::geom::{flatten_path, flatten_path_within};
+use q0s_format::raster::{active_placement_states_with, ActivePlacementState, LayerTimeline};
 use q0s_format::runtime_scene::RuntimeSceneState;
 use q0s_format::transform::Affine;
 use q0s_format::v2::{
@@ -37,11 +37,15 @@ use q0s_format::v2::{
 
 const Q0RG_RECURSION_LIMIT: u8 = 8;
 const BEZIER_SAMPLES: usize = 16;
+/// How far, in the artwork's own units, a cached curve may stray from the
+/// true one. Cached meshes are drawn at any size, so it is kept fine.
+const CURVE_TOLERANCE: f32 = 0.025;
 
 /// Bitmap texture cache keyed by `asset_id`. Lives on `PlayerApp` so we
 /// only upload each bitmap to the GPU once per session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct FxPlacementKey {
+    masked: bool,
     host_q0rg_id: u16,
     layer_id: u16,
     placement_idx: usize,
@@ -66,15 +70,172 @@ struct VideoTexture {
 #[derive(Default)]
 pub struct TextureCache {
     by_asset_id: HashMap<u16, TextureHandle>,
-    solid_vectors: HashMap<u16, Vec<std::sync::Arc<Mesh>>>,
+    /// Each vector's meshes in its own space, and whether a mesh is one
+    /// colour all over (gradient fills are not).
+    solid_vectors: HashMap<u16, Vec<(std::sync::Arc<Mesh>, bool)>>,
     by_q0v_frame: HashMap<(usize, u32), VideoTexture>,
     masked_q0rg_frames: HashMap<(u16, u16, u32, u32), TextureHandle>,
     q0v_media: HashMap<usize, q0video::q0v::Q0vFile>,
     fx_placement_textures: HashMap<FxPlacementKey, FxPlacementTexture>,
     fx_serial: u64,
+    index: Option<ProjectIndex>,
+}
+
+/// Where each asset, symbol and rig sits in the project, so drawing a frame
+/// does not search them over and over. The player never edits a project,
+/// and opening a file or scene clears this with the rest of the cache.
+struct ProjectIndex {
+    /// The project this was built for, by address and size.
+    source: (usize, usize, usize),
+    assets: HashMap<u16, usize>,
+    q0rgs: HashMap<u16, usize>,
+    rigs: HashMap<u16, usize>,
+    contains_mask: HashMap<u16, bool>,
+    timelines: HashMap<(u16, u16), LayerTimeline>,
+    /// Asset sizes for placing lights on instances, measured when first lit.
+    bounds: Option<q0s_format::raster::RuntimeBoundsCache>,
+}
+
+impl ProjectIndex {
+    fn source(project: &ProjectV2) -> (usize, usize, usize) {
+        (
+            project.assets.as_ptr() as usize,
+            project.assets.len(),
+            project.q0rgs.len(),
+        )
+    }
+
+    fn build(project: &ProjectV2) -> Self {
+        let mut rigs = HashMap::new();
+        for (i, asset) in project.assets.iter().enumerate() {
+            if let Asset::Rig(rig) = asset {
+                rigs.entry(rig.owner_q0rg_id).or_insert(i);
+            }
+        }
+        Self {
+            source: Self::source(project),
+            assets: project
+                .assets
+                .iter()
+                .enumerate()
+                .map(|(i, asset)| (asset.id(), i))
+                .rev()
+                .collect(),
+            q0rgs: project
+                .q0rgs
+                .iter()
+                .enumerate()
+                .map(|(i, q0rg)| (q0rg.q0rg_id, i))
+                .rev()
+                .collect(),
+            rigs,
+            contains_mask: HashMap::new(),
+            timelines: HashMap::new(),
+            bounds: None,
+        }
+    }
 }
 
 impl TextureCache {
+    fn index(&mut self, project: &ProjectV2) -> &mut ProjectIndex {
+        let source = ProjectIndex::source(project);
+        if self
+            .index
+            .as_ref()
+            .is_none_or(|index| index.source != source)
+        {
+            self.index = Some(ProjectIndex::build(project));
+        }
+        self.index.as_mut().expect("index was just built")
+    }
+}
+
+fn find_asset<'p>(project: &'p ProjectV2, cache: &mut TextureCache, id: u16) -> Option<&'p Asset> {
+    let i = *cache.index(project).assets.get(&id)?;
+    project.assets.get(i).filter(|asset| asset.id() == id)
+}
+
+fn find_q0rg<'p>(
+    project: &'p ProjectV2,
+    cache: &mut TextureCache,
+    id: u16,
+) -> Option<&'p q0s_format::v2::Q0rg> {
+    let i = *cache.index(project).q0rgs.get(&id)?;
+    project.q0rgs.get(i).filter(|q0rg| q0rg.q0rg_id == id)
+}
+
+/// What `layer` of `q0rg_id` shows at `frame`.
+fn active_states(
+    project: &ProjectV2,
+    cache: &mut TextureCache,
+    q0rg_id: u16,
+    layer: &q0s_format::v2::Layer,
+    frame: u16,
+) -> Vec<ActivePlacementState> {
+    let timeline = cache
+        .index(project)
+        .timelines
+        .entry((q0rg_id, layer.layer_id))
+        .or_insert_with(|| LayerTimeline::new(layer));
+    active_placement_states_with(layer, frame, timeline)
+}
+
+fn frame_lighting(
+    project: &ProjectV2,
+    cache: &mut TextureCache,
+    q0rg_id: u16,
+    frame: u16,
+    scene_state: &RuntimeSceneState,
+) -> Option<q0s_format::lighting::FrameLighting> {
+    scene_state
+        .lighting
+        .as_ref()
+        .unwrap_or(&project.runtime.lighting)
+        .setup(q0rg_id)?;
+    let bounds = cache
+        .index(project)
+        .bounds
+        .get_or_insert_with(|| q0s_format::raster::RuntimeBoundsCache::new(project));
+    q0s_format::raster::frame_lighting_with(project, q0rg_id, frame, scene_state, Some(bounds))
+}
+
+fn find_rig<'p>(
+    project: &'p ProjectV2,
+    cache: &mut TextureCache,
+    q0rg_id: u16,
+) -> Option<&'p q0s_format::v2::RigAsset> {
+    let i = *cache.index(project).rigs.get(&q0rg_id)?;
+    match project.assets.get(i) {
+        Some(Asset::Rig(rig)) if rig.owner_q0rg_id == q0rg_id => Some(rig),
+        _ => None,
+    }
+}
+
+impl TextureCache {
+    /// What the cache holds, for the performance log.
+    pub fn summary(&self) -> String {
+        let meshes: usize = self.solid_vectors.values().map(Vec::len).sum();
+        let vertices: usize = self
+            .solid_vectors
+            .values()
+            .flatten()
+            .map(|(mesh, _)| mesh.vertices.len())
+            .sum();
+        let video_bytes: usize = self.by_q0v_frame.values().map(|frame| frame.bytes).sum();
+        format!(
+            "bitmaps={} vectors={} vector_meshes={} vector_vertices={} video_frames={} video_mb={:.1} cpu_masked_frames={} fx_textures={} indexed={}",
+            self.by_asset_id.len(),
+            self.solid_vectors.len(),
+            meshes,
+            vertices,
+            self.by_q0v_frame.len(),
+            video_bytes as f64 / (1024.0 * 1024.0),
+            self.masked_q0rg_frames.len(),
+            self.fx_placement_textures.len(),
+            self.index.is_some(),
+        )
+    }
+
     pub fn invalidate(&mut self) {
         self.by_asset_id.clear();
         self.solid_vectors.clear();
@@ -82,6 +243,7 @@ impl TextureCache {
         self.masked_q0rg_frames.clear();
         self.q0v_media.clear();
         self.fx_placement_textures.clear();
+        self.index = None;
     }
 }
 
@@ -193,13 +355,12 @@ pub fn paint_v2_frame_with_runtime_overrides(
     // Masks are cut on the GPU like the editor does. Rasterizing the whole
     // frame on the CPU is the fallback for what that cannot draw: it costs
     // tens of milliseconds a frame and has no anti-aliasing.
-    let cpu_masks = q0rg_contains_mask(project, q0rg_id, &mut std::collections::HashSet::new(), 0)
+    let cpu_masks = q0rg_contains_mask(project, q0rg_id, cache)
         && !gpu_masks_supported(
             project,
             q0rg_id,
             frame,
             authored_root_affine(project, q0rg_id, frame),
-            &view,
             0,
             cache,
             scene_state,
@@ -251,33 +412,67 @@ pub fn paint_v2_frame_with_runtime_overrides(
             );
         }
     } else {
+        let root = authored_root_affine(project, q0rg_id, frame);
+        let mut three = q0glblend::Stage3d::new(
+            project,
+            q0rg_id,
+            frame,
+            root,
+            Affine {
+                a11: view.scale,
+                a12: 0.0,
+                a21: 0.0,
+                a22: view.scale,
+                tx: view.origin.x,
+                ty: view.origin.y,
+            },
+            scene_state,
+        );
         paint_q0rg(
             painter,
             ctx,
             project,
             q0rg_id,
             frame,
-            authored_root_affine(project, q0rg_id, frame),
+            root,
             &view,
             0,
             cache,
             rig_overrides,
             scene_state,
             q0glblend::ColorTransform::default(),
+            &mut three,
         );
+        three.flush(painter);
     }
 }
 
-fn q0rg_contains_mask(
+fn q0rg_contains_mask(project: &ProjectV2, q0rg_id: u16, cache: &mut TextureCache) -> bool {
+    if let Some(known) = cache.index(project).contains_mask.get(&q0rg_id) {
+        return *known;
+    }
+    let found = q0rg_contains_mask_inner(
+        project,
+        q0rg_id,
+        &mut std::collections::HashSet::new(),
+        0,
+        cache,
+    );
+    cache.index(project).contains_mask.insert(q0rg_id, found);
+    found
+}
+
+fn q0rg_contains_mask_inner(
     project: &ProjectV2,
     q0rg_id: u16,
     visited: &mut std::collections::HashSet<u16>,
     depth: u8,
+    cache: &mut TextureCache,
 ) -> bool {
     if depth > Q0RG_RECURSION_LIMIT || !visited.insert(q0rg_id) {
         return false;
     }
-    let Some(q0rg) = project.q0rgs.iter().find(|q0rg| q0rg.q0rg_id == q0rg_id) else {
+    let Some(q0rg) = find_q0rg(project, cache, q0rg_id) else {
         return false;
     };
     q0rg.layers.iter().any(|layer| {
@@ -287,7 +482,7 @@ fn q0rg_contains_mask(
                 .iter()
                 .any(|placement| match placement.target {
                     Target::Q0rg(child_id) => {
-                        q0rg_contains_mask(project, child_id, visited, depth + 1)
+                        q0rg_contains_mask_inner(project, child_id, visited, depth + 1, cache)
                     }
                     Target::Asset(_) => false,
                 })
@@ -332,10 +527,11 @@ fn affine_bits(affine: Affine) -> [u32; 6] {
     ]
 }
 
+/// Whether a vector can be drawn from its cached meshes: plain colour or
+/// gradient fills, without materials or erasing.
 fn solid_appearance(appearance: Option<&VectorAppearance>) -> bool {
     appearance.is_none_or(|appearance| {
         matches!(appearance.material, q0s_format::v2::VectorMaterial::Solid)
-            && appearance.fill_gradient.is_none()
             && appearance.erase_mask.is_empty()
             && appearance.clip_mask.is_empty()
             && appearance.material_source.is_empty()
@@ -350,12 +546,15 @@ fn similarity(affine: Affine) -> bool {
     (x - y).abs() <= tolerance && dot.abs() <= tolerance
 }
 
-fn local_solid_meshes(vector: &q0s_format::v2::VectorAsset) -> Vec<std::sync::Arc<Mesh>> {
+fn local_solid_meshes(
+    vector: &q0s_format::v2::VectorAsset,
+    appearance: Option<&VectorAppearance>,
+) -> Vec<std::sync::Arc<Mesh>> {
     let paths: Vec<_> = vector
         .paths
         .iter()
         .map(|path| {
-            let mut points: Vec<_> = flatten_path(path, BEZIER_SAMPLES)
+            let mut points: Vec<_> = flatten_path_within(path, CURVE_TOLERANCE, BEZIER_SAMPLES)
                 .into_iter()
                 .map(|point| pos2(point.x, point.y))
                 .collect();
@@ -366,7 +565,46 @@ fn local_solid_meshes(vector: &q0s_format::v2::VectorAsset) -> Vec<std::sync::Ar
         })
         .collect();
     let mut meshes = Vec::new();
-    if let Some(color) = vector.fill {
+    if let Some((gradient, field_transform)) = appearance.and_then(|appearance| {
+        appearance
+            .fill_gradient
+            .as_ref()
+            .map(|gradient| (gradient, appearance.field_transform))
+    }) {
+        let mut gradient = gradient.clone();
+        gradient.transform = Affine::compose(field_transform, gradient.transform);
+        let contours = paths
+            .iter()
+            .filter(|(_, closed)| *closed)
+            .map(|(points, _)| points.clone())
+            .collect::<Vec<_>>();
+        if let Some(buffers) = tessellate_complex_fill(&contours) {
+            // Coloured once, in the vector's own space: placing it only
+            // moves the vertices.
+            let local = StageView {
+                origin: Pos2::ZERO,
+                scale: 1.0,
+            };
+            let mut mesh = Mesh::default();
+            for triangle in buffers.indices.as_chunks::<3>().0.iter() {
+                let corner = |i: usize| {
+                    let point = buffers.vertices[triangle[i] as usize];
+                    Vec2::new(point.x, point.y)
+                };
+                emit_gradient_triangle(
+                    &mut mesh,
+                    [corner(0), corner(1), corner(2)],
+                    &gradient,
+                    Affine::IDENTITY,
+                    &local,
+                    0,
+                );
+            }
+            if !mesh.indices.is_empty() {
+                meshes.push(std::sync::Arc::new(mesh));
+            }
+        }
+    } else if let Some(color) = vector.fill {
         let contours = paths
             .iter()
             .filter(|(_, closed)| *closed)
@@ -440,6 +678,7 @@ fn local_solid_meshes(vector: &q0s_format::v2::VectorAsset) -> Vec<std::sync::Ar
 
 fn solid_meshes(
     vector: &q0s_format::v2::VectorAsset,
+    appearance: Option<&VectorAppearance>,
     transform: Affine,
     view: &StageView,
     cache: &mut TextureCache,
@@ -450,12 +689,23 @@ fn solid_meshes(
     cache
         .solid_vectors
         .entry(vector.asset_id)
-        .or_insert_with(|| local_solid_meshes(vector))
+        .or_insert_with(|| {
+            local_solid_meshes(vector, appearance)
+                .into_iter()
+                .map(|mesh| {
+                    let one_color = mesh
+                        .vertices
+                        .windows(2)
+                        .all(|pair| pair[0].color == pair[1].color);
+                    (mesh, one_color)
+                })
+                .collect()
+        })
         .iter()
-        .map(|source| {
+        .map(|(source, one_color)| {
             let mut mesh = source.as_ref().clone();
-            // These solid fill/stroke meshes have one authored color. Apply
-            // tint once, rather than converting RGB for every glyph vertex.
+            // Most meshes have one authored color: tint it once rather than
+            // converting RGB for every vertex.
             let paint = source
                 .vertices
                 .first()
@@ -464,7 +714,11 @@ fn solid_meshes(
             for vertex in &mut mesh.vertices {
                 vertex.pos =
                     stage_to_screen(transform.apply(Vec2::new(vertex.pos.x, vertex.pos.y)), view);
-                vertex.color = paint;
+                vertex.color = if *one_color {
+                    paint
+                } else {
+                    color.apply(vertex.color)
+                };
             }
             mesh
         })
@@ -482,7 +736,7 @@ fn morphed_meshes(
 ) -> Vec<Mesh> {
     shapes
         .iter()
-        .flat_map(local_solid_meshes)
+        .flat_map(|shape| local_solid_meshes(shape, None))
         .map(|source| {
             let mut mesh = source.as_ref().clone();
             for vertex in &mut mesh.vertices {
@@ -511,19 +765,24 @@ fn collect_solid_q0rg(
     if depth > Q0RG_RECURSION_LIMIT {
         return false;
     }
-    let Some(q) = project.q0rgs.iter().find(|q| q.q0rg_id == owner) else {
+    let Some(q) = find_q0rg(project, cache, owner) else {
         return false;
     };
     // Nested masks, rig deformation and nested group effects keep their
     // existing renderer; this collector accepts only plain vector artwork.
-    if q0s_format::rig::rig_for_q0rg(project, owner).is_some() {
+    if find_rig(project, cache, owner).is_some() {
         return false;
     }
     let frame = frame % q.frame_count.max(1);
     for layer in &q.layers {
-        if !project.layer_is_visible(owner, layer.layer_id) {
+        let look = scene.layer_look(project, owner, layer.layer_id);
+        if !look.visible || look.alpha <= 0.0 {
             continue;
         }
+        if look.alpha < 1.0 {
+            return false;
+        }
+        let parent = look.shift(parent);
         if project
             .layer_metadata
             .get(&q0s_format::v2::LayerKey {
@@ -535,7 +794,7 @@ fn collect_solid_q0rg(
             return false;
         }
         let shape_morph = q0s_format::shape_tween::project_layer_morph(project, layer, frame);
-        for active in active_placement_states_at(layer, frame) {
+        for active in active_states(project, cache, owner, layer, frame) {
             let placement = &layer.placements[active.index];
             let mut visual = active.fx;
             visual.tint = None;
@@ -562,17 +821,18 @@ fn collect_solid_q0rg(
             }
             match placement.target {
                 Target::Asset(id) => {
-                    let Some(Asset::Vector(vector)) =
-                        project.assets.iter().find(|asset| asset.id() == id)
-                    else {
+                    let Some(Asset::Vector(vector)) = find_asset(project, cache, id) else {
                         return false;
                     };
-                    if !solid_appearance(project.asset_appearances.get(&id))
+                    let appearance = project.asset_appearances.get(&id);
+                    if !solid_appearance(appearance)
                         || (vector.stroke.is_some() && !similarity(transform))
                     {
                         return false;
                     }
-                    meshes.extend(solid_meshes(vector, transform, view, cache, color));
+                    meshes.extend(solid_meshes(
+                        vector, appearance, transform, view, cache, color,
+                    ));
                 }
                 Target::Q0rg(id) => {
                     let fallback = q0s_format::v2::resolve_q0rg_playback_frame(
@@ -628,6 +888,7 @@ fn paint_fx_placement(
     );
     let (width, height) = fx_raster_size(stage_rect, ctx);
     let key = FxPlacementKey {
+        masked: false,
         host_q0rg_id,
         layer_id,
         placement_idx,
@@ -719,11 +980,12 @@ fn paint_q0rg(
     rig_overrides: &q0s_format::rig::RigRuntimeOverrides,
     scene_state: &RuntimeSceneState,
     inherited_color: q0glblend::ColorTransform,
+    three: &mut q0glblend::Stage3d,
 ) {
     if depth > Q0RG_RECURSION_LIMIT {
         return;
     }
-    let Some(q) = project.q0rgs.iter().find(|q| q.q0rg_id == q0rg_id) else {
+    let Some(q) = find_q0rg(project, cache, q0rg_id) else {
         return;
     };
     let local_frame = if q.frame_count > 0 {
@@ -731,7 +993,7 @@ fn paint_q0rg(
     } else {
         0
     };
-    let rig_pose = q0s_format::rig::rig_for_q0rg(project, q0rg_id).map(|rig| {
+    let rig_pose = find_rig(project, cache, q0rg_id).map(|rig| {
         let overrides = rig_overrides
             .get(&q0rg_id)
             .map(Vec::as_slice)
@@ -747,7 +1009,7 @@ fn paint_q0rg(
         ),
     );
     let lighting = (depth == 0)
-        .then(|| q0s_format::raster::frame_lighting(project, q0rg_id, local_frame, scene_state))
+        .then(|| frame_lighting(project, cache, q0rg_id, local_frame, scene_state))
         .flatten()
         .and_then(|lighting| {
             let to_screen = Affine::compose(
@@ -772,23 +1034,33 @@ fn paint_q0rg(
     for layer in &q.layers {
         if let Some(paint) = lighting.as_ref().filter(|_| !lit) {
             if previous_layer.is_some() && previous_layer == paint.lighting.layer_id {
+                three.flush(painter);
                 q0glblend::paint_lighting(painter, stage_rect, paint.clone());
                 lit = true;
             }
         }
         previous_layer = Some(layer.layer_id);
-        if !project.layer_is_visible(q0rg_id, layer.layer_id) {
+        // Flat art the 3D lights reach.
+        let layer_lit_flat = if depth == 0 {
+            three.next_layer(layer.layer_id)
+        } else {
+            three.inside_lit
+        };
+        let look = scene_state.layer_look(project, q0rg_id, layer.layer_id);
+        if !look.visible || look.alpha <= 0.0 {
             continue;
         }
         // A mask draws nothing itself; it cuts the layers it masks.
         if is_mask_layer(project, q0rg_id, layer.layer_id) {
             continue;
         }
+        // Scripts move and fade whole layers (q0.layer).
+        let parent = look.shift(parent);
+        let fade_from = (look.alpha < 1.0).then(|| painter.add(Shape::Noop));
         if rig_pose.is_none()
-            && !project
-                .layer_mask_sources(q0rg_id, layer.layer_id)
-                .is_empty()
+            && !active_clipping_masks(project, q, layer.layer_id, local_frame, cache).is_empty()
         {
+            three.flush(painter);
             if let Some((masks, placements)) = collect_masked_layer(
                 project,
                 Some(ctx),
@@ -800,16 +1072,20 @@ fn paint_q0rg(
                 depth,
                 cache,
                 scene_state,
+                rig_overrides,
                 inherited_color,
             ) {
                 q0glblend::paint_vector_masked_placements_on_opaque_backdrop(
                     painter, masks, placements,
                 );
             }
+            if let Some(from) = fade_from {
+                fade_shapes_since(painter, from, look.alpha);
+            }
             continue;
         }
         let shape_morph = q0s_format::shape_tween::project_layer_morph(project, layer, local_frame);
-        for active in active_placement_states_at(layer, local_frame) {
+        for active in active_states(project, cache, q0rg_id, layer, local_frame) {
             let Some(placement) = layer.placements.get(active.index) else {
                 continue;
             };
@@ -823,6 +1099,34 @@ fn paint_q0rg(
             // as authored/rig transforms, so the crisp GUI renderer and the
             // shared raster renderer cannot disagree about where an instance is.
             let composed = Affine::compose(parent, local_affine);
+            if three.active() {
+                let target_asset = match placement.target {
+                    Target::Asset(id) => find_asset(project, cache, id),
+                    Target::Q0rg(_) => None,
+                };
+                if three.takes(target_asset, &active.fx, layer_lit_flat) {
+                    three.push(
+                        project,
+                        q0rg_id,
+                        placement,
+                        target_asset,
+                        parent,
+                        local_affine,
+                        active.fx,
+                        local_frame,
+                        active.playback_start_frame,
+                        layer_lit_flat,
+                        active.fx.opacity.clamp(0.0, 1.0),
+                    );
+                    continue;
+                }
+                let mut plain = active.fx;
+                plain.tint = None;
+                let walks_into = matches!(placement.target, Target::Q0rg(_)) && plain.is_identity();
+                if !walks_into {
+                    three.flush(painter);
+                }
+            }
             let mut visual_fx = active.fx;
             visual_fx.tint = None;
             let color_transform = active
@@ -875,14 +1179,14 @@ fn paint_q0rg(
                             )
                         }
                         Target::Asset(id) => {
-                            if let Some(Asset::Vector(vector)) =
-                                project.assets.iter().find(|asset| asset.id() == id)
-                            {
-                                if solid_appearance(project.asset_appearances.get(&id))
+                            if let Some(Asset::Vector(vector)) = find_asset(project, cache, id) {
+                                let appearance = project.asset_appearances.get(&id);
+                                if solid_appearance(appearance)
                                     && (vector.stroke.is_none() || similarity(composed))
                                 {
                                     meshes = solid_meshes(
                                         vector,
+                                        appearance,
                                         composed,
                                         view,
                                         cache,
@@ -930,7 +1234,7 @@ fn paint_q0rg(
             }
             match placement.target {
                 Target::Asset(asset_id) => {
-                    if let Some(asset) = project.assets.iter().find(|a| a.id() == asset_id) {
+                    if let Some(asset) = find_asset(project, cache, asset_id) {
                         paint_asset(
                             painter,
                             ctx,
@@ -959,6 +1263,7 @@ fn paint_q0rg(
                     } else {
                         &child_scene.rig_overrides
                     };
+                    let was_lit = std::mem::replace(&mut three.inside_lit, layer_lit_flat);
                     paint_q0rg(
                         painter,
                         ctx,
@@ -972,14 +1277,40 @@ fn paint_q0rg(
                         child_rig,
                         child_scene,
                         color_transform,
+                        three,
                     );
+                    three.inside_lit = was_lit;
                 }
                 _ => {}
             }
         }
+        if let Some(from) = fade_from {
+            fade_shapes_since(painter, from, look.alpha);
+        }
     }
     if let Some(paint) = lighting.filter(|_| !lit) {
+        three.flush(painter);
         q0glblend::paint_lighting(painter, stage_rect, paint);
+    }
+}
+
+/// Fades everything painted after `from` to `alpha`, the way a faded layer
+/// looks. Shapes drawn by the GPU's own callbacks keep their colours.
+fn fade_shapes_since(painter: &Painter, from: egui::layers::ShapeIdx, alpha: f32) {
+    let mut painted = Vec::new();
+    let mut index = 0;
+    painter.for_each_shape(|clipped| {
+        if index > from.0 {
+            painted.push((index, clipped.clip_rect, clipped.shape.clone()));
+        }
+        index += 1;
+    });
+    for (index, clip, mut shape) in painted {
+        egui::epaint::shape_transform::adjust_colors(&mut shape, &|color| {
+            *color = color.gamma_multiply(alpha);
+        });
+        Painter::new(painter.ctx().clone(), painter.layer_id(), clip)
+            .set(egui::layers::ShapeIdx(index), shape);
     }
 }
 
@@ -1093,6 +1424,30 @@ fn is_mask_layer(project: &ProjectV2, q0rg_id: u16, layer_id: u16) -> bool {
     project.layer_metadata(q0rg_id, layer_id).kind == q0s_format::v2::LayerKind::Mask
 }
 
+/// A blank mask keyframe disables clipping, including its held cells and
+/// frames beyond the mask's duration. An active but transparent mask still
+/// clips everything, matching the shared raster renderer.
+fn active_clipping_masks(
+    project: &ProjectV2,
+    q: &q0s_format::v2::Q0rg,
+    layer_id: u16,
+    frame: u16,
+    cache: &mut TextureCache,
+) -> Vec<u16> {
+    project
+        .layer_clipping_masks(q.q0rg_id, layer_id)
+        .into_iter()
+        .filter(|mask_id| {
+            q.layers
+                .iter()
+                .find(|layer| layer.layer_id == *mask_id)
+                .is_some_and(|layer| {
+                    !active_states(project, cache, q.q0rg_id, layer, frame).is_empty()
+                })
+        })
+        .collect()
+}
+
 /// Solid meshes of one placement: plain vector artwork, a shape tween's
 /// in-between, or a symbol holding only those. False when it holds anything
 /// else.
@@ -1101,7 +1456,7 @@ fn collect_solid_placement(
     project: &ProjectV2,
     q0rg_id: u16,
     placement: &Placement,
-    active: &q0s_format::raster::ActivePlacementState,
+    active: &ActivePlacementState,
     morph: Option<&q0s_format::shape_tween::LayerMorph>,
     local_frame: u16,
     transform: Affine,
@@ -1118,16 +1473,17 @@ fn collect_solid_placement(
     }
     match placement.target {
         Target::Asset(id) => {
-            let Some(Asset::Vector(vector)) = project.assets.iter().find(|asset| asset.id() == id)
-            else {
+            let Some(Asset::Vector(vector)) = find_asset(project, cache, id) else {
                 return false;
             };
-            if !solid_appearance(project.asset_appearances.get(&id))
-                || (vector.stroke.is_some() && !similarity(transform))
+            let appearance = project.asset_appearances.get(&id);
+            if !solid_appearance(appearance) || (vector.stroke.is_some() && !similarity(transform))
             {
                 return false;
             }
-            meshes.extend(solid_meshes(vector, transform, view, cache, color));
+            meshes.extend(solid_meshes(
+                vector, appearance, transform, view, cache, color,
+            ));
             true
         }
         Target::Q0rg(id) => {
@@ -1161,6 +1517,98 @@ type MaskedLayer = (
     Vec<q0glblend::VectorMaskedPlacement>,
 );
 
+/// Keep a complex symbol local: flattening it must not flatten the whole scene.
+#[allow(clippy::too_many_arguments)]
+fn raster_mask_placement(
+    project: &ProjectV2,
+    ctx: Option<&Context>,
+    owner: u16,
+    layer: u16,
+    index: usize,
+    placement: &Placement,
+    frame: u16,
+    transform: Affine,
+    fx: PlacementFx,
+    view: &StageView,
+    cache: &mut TextureCache,
+    scene: &RuntimeSceneState,
+    rigs: &q0s_format::rig::RigRuntimeOverrides,
+    color: q0glblend::ColorTransform,
+) -> Option<q0glblend::VectorGroupPrimitive> {
+    let ctx = ctx?;
+    let stage = Rect::from_min_size(
+        view.origin,
+        egui::vec2(
+            f32::from(project.meta.stage_width.max(1)) * view.scale,
+            f32::from(project.meta.stage_height.max(1)) * view.scale,
+        ),
+    );
+    let (width, height) = fx_raster_size(stage, ctx);
+    let key = FxPlacementKey {
+        masked: true,
+        host_q0rg_id: owner,
+        layer_id: layer,
+        placement_idx: index,
+        local_frame: frame,
+        width,
+        height,
+        affine_bits: affine_bits(transform),
+    };
+    if !scene.is_empty() || !rigs.is_empty() {
+        cache.fx_placement_textures.remove(&key);
+    }
+    if !cache.fx_placement_textures.contains_key(&key) {
+        if cache.fx_placement_textures.len() >= 64 {
+            cache.fx_placement_textures.clear();
+        }
+        let crop = q0s_format::raster::rasterize_placement_fx_scaled_cropped_with_runtime_state(
+            project, owner, placement, frame, transform, fx, width, height, rigs, scene,
+        )?;
+        let image = ColorImage::from_rgba_unmultiplied(
+            [crop.width as usize, crop.height as usize],
+            &crop.rgba,
+        );
+        cache.fx_serial = cache.fx_serial.wrapping_add(1);
+        let texture = ctx.load_texture(
+            format!("masked-placement-{}", cache.fx_serial),
+            image,
+            TextureOptions::LINEAR,
+        );
+        cache.fx_placement_textures.insert(
+            key,
+            FxPlacementTexture {
+                texture,
+                crop: [crop.x, crop.y, crop.width, crop.height],
+                blend_mode: BlendMode::Normal,
+            },
+        );
+    }
+    let cached = cache.fx_placement_textures.get(&key)?;
+    let [x, y, w, h] = cached.crop;
+    let rect = Rect::from_min_max(
+        stage.min
+            + egui::vec2(
+                x as f32 / width as f32 * stage.width(),
+                y as f32 / height as f32 * stage.height(),
+            ),
+        stage.min
+            + egui::vec2(
+                (x + w) as f32 / width as f32 * stage.width(),
+                (y + h) as f32 / height as f32 * stage.height(),
+            ),
+    );
+    let mut mesh = Mesh::with_texture(cached.texture.id());
+    mesh.add_rect_with_uv(
+        rect,
+        Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
+        Color32::WHITE,
+    );
+    Some(q0glblend::VectorGroupPrimitive::Textured {
+        mesh: std::sync::Arc::new(mesh),
+        color_transform: color,
+    })
+}
+
 /// `layer` and the masks over it, ready for the GPU to cut, or `None` when
 /// something in them needs the CPU renderer. Without a `ctx` nothing is
 /// decoded or uploaded: the call only checks that the layer can be drawn so.
@@ -1176,6 +1624,7 @@ fn collect_masked_layer(
     depth: u8,
     cache: &mut TextureCache,
     scene_state: &RuntimeSceneState,
+    rig_overrides: &q0s_format::rig::RigRuntimeOverrides,
     inherited_color: q0glblend::ColorTransform,
 ) -> Option<MaskedLayer> {
     let q0rg_id = q.q0rg_id;
@@ -1188,15 +1637,16 @@ fn collect_masked_layer(
     };
 
     let mut masks = Vec::new();
-    for mask_id in project.layer_mask_sources(q0rg_id, layer.layer_id) {
+    for mask_id in active_clipping_masks(project, q, layer.layer_id, local_frame, cache) {
         let mask_layer = q.layers.iter().find(|layer| layer.layer_id == mask_id)?;
         if !project.layer_is_visible(q0rg_id, mask_id) || !is_mask_layer(project, q0rg_id, mask_id)
         {
             return None;
         }
         let morph = q0s_format::shape_tween::project_layer_morph(project, mask_layer, local_frame);
-        let mut meshes = Vec::new();
-        for active in active_placement_states_at(mask_layer, local_frame) {
+        let mut primitives = Vec::new();
+        for active in active_states(project, cache, q0rg_id, mask_layer, local_frame) {
+            let mut meshes = Vec::new();
             let placement = mask_layer.placements.get(active.index)?;
             let mut visual = active.fx;
             visual.tint = None;
@@ -1217,30 +1667,45 @@ fn collect_masked_layer(
                     &mut meshes,
                 )
             {
-                return None;
+                if let Some(primitive) = raster_mask_placement(
+                    project,
+                    ctx,
+                    q0rg_id,
+                    mask_id,
+                    active.index,
+                    placement,
+                    local_frame,
+                    placed(placement, &active),
+                    active.fx,
+                    view,
+                    cache,
+                    scene_state,
+                    rig_overrides,
+                    q0glblend::ColorTransform::default(),
+                ) {
+                    primitives.push(primitive);
+                }
+            } else {
+                primitives.extend(
+                    meshes
+                        .into_iter()
+                        .map(q0glblend::VectorGroupPrimitive::Solid),
+                );
             }
         }
-        masks.push(
-            meshes
-                .into_iter()
-                .map(q0glblend::VectorGroupPrimitive::Solid)
-                .collect(),
-        );
+        masks.push(primitives);
     }
 
     let morph = q0s_format::shape_tween::project_layer_morph(project, layer, local_frame);
     let mut placements = Vec::new();
-    for active in active_placement_states_at(layer, local_frame) {
+    for active in active_states(project, cache, q0rg_id, layer, local_frame) {
         let placement = layer.placements.get(active.index)?;
-        // Opacity and blending travel with the masked placement; filters
-        // and the like need the CPU renderer.
+        // Opacity/blending stay on the GPU; only unsupported symbol contents
+        // are rasterized, in their own bounded tile.
         let mut plain = active.fx;
         plain.tint = None;
         plain.opacity = 1.0;
         plain.blend_mode = BlendMode::Normal;
-        if !plain.is_identity() {
-            return None;
-        }
         let transform = placed(placement, &active);
         let color = active
             .fx
@@ -1250,7 +1715,8 @@ fn collect_masked_layer(
             .then(inherited_color);
         let mut primitives = Vec::new();
         let image = match placement.target {
-            Target::Asset(id) => match project.assets.iter().find(|asset| asset.id() == id) {
+            _ if !plain.is_identity() => None,
+            Target::Asset(id) => match find_asset(project, cache, id) {
                 Some(Asset::Bitmap(b)) => Some(ctx.map(|ctx| {
                     let texture = bitmap_texture(cache, ctx, b);
                     Some((texture, f32::from(b.width), f32::from(b.height)))
@@ -1279,28 +1745,50 @@ fn collect_masked_layer(
             }
             None => {
                 let mut meshes = Vec::new();
-                if !collect_solid_placement(
+                if plain.is_identity()
+                    && collect_solid_placement(
+                        project,
+                        q0rg_id,
+                        placement,
+                        &active,
+                        morph.as_ref(),
+                        local_frame,
+                        transform,
+                        view,
+                        depth,
+                        cache,
+                        scene_state,
+                        color,
+                        &mut meshes,
+                    )
+                {
+                    primitives.extend(
+                        meshes
+                            .into_iter()
+                            .map(q0glblend::VectorGroupPrimitive::Solid),
+                    );
+                } else if let Some(primitive) = raster_mask_placement(
                     project,
+                    ctx,
                     q0rg_id,
+                    layer.layer_id,
+                    active.index,
                     placement,
-                    &active,
-                    morph.as_ref(),
                     local_frame,
                     transform,
+                    PlacementFx {
+                        opacity: 1.0,
+                        blend_mode: BlendMode::Normal,
+                        ..active.fx
+                    },
                     view,
-                    depth,
                     cache,
                     scene_state,
-                    color,
-                    &mut meshes,
+                    rig_overrides,
+                    inherited_color,
                 ) {
-                    return None;
+                    primitives.push(primitive);
                 }
-                primitives.extend(
-                    meshes
-                        .into_iter()
-                        .map(q0glblend::VectorGroupPrimitive::Solid),
-                );
             }
         }
         placements.push(q0glblend::VectorMaskedPlacement {
@@ -1313,13 +1801,11 @@ fn collect_masked_layer(
 }
 
 /// Whether every masked layer this frame shows can be cut on the GPU.
-#[allow(clippy::too_many_arguments)]
 fn gpu_masks_supported(
     project: &ProjectV2,
     q0rg_id: u16,
     frame: u16,
     parent: Affine,
-    view: &StageView,
     depth: u8,
     cache: &mut TextureCache,
     scene_state: &RuntimeSceneState,
@@ -1327,7 +1813,7 @@ fn gpu_masks_supported(
     if depth > Q0RG_RECURSION_LIMIT {
         return true;
     }
-    let Some(q) = project.q0rgs.iter().find(|q| q.q0rg_id == q0rg_id) else {
+    let Some(q) = find_q0rg(project, cache, q0rg_id) else {
         return true;
     };
     let local_frame = if q.frame_count > 0 {
@@ -1335,38 +1821,22 @@ fn gpu_masks_supported(
     } else {
         0
     };
-    let rigged = q0s_format::rig::rig_for_q0rg(project, q0rg_id).is_some();
+    let rigged = find_rig(project, cache, q0rg_id).is_some();
     for layer in &q.layers {
         if !project.layer_is_visible(q0rg_id, layer.layer_id)
             || is_mask_layer(project, q0rg_id, layer.layer_id)
         {
             continue;
         }
-        if !project
-            .layer_mask_sources(q0rg_id, layer.layer_id)
-            .is_empty()
-        {
-            if rigged
-                || collect_masked_layer(
-                    project,
-                    None,
-                    q,
-                    layer,
-                    local_frame,
-                    parent,
-                    view,
-                    depth,
-                    cache,
-                    scene_state,
-                    q0glblend::ColorTransform::default(),
-                )
-                .is_none()
-            {
+        if !active_clipping_masks(project, q, layer.layer_id, local_frame, cache).is_empty() {
+            // Complex contents have their own cropped fallback now. Do not
+            // build every mask/placement mesh once here and again when drawing.
+            if rigged {
                 return false;
             }
             continue;
         }
-        for active in active_placement_states_at(layer, local_frame) {
+        for active in active_states(project, cache, q0rg_id, layer, local_frame) {
             let Some(placement) = layer.placements.get(active.index) else {
                 continue;
             };
@@ -1397,7 +1867,6 @@ fn gpu_masks_supported(
                 child_id,
                 child_frame,
                 transform,
-                view,
                 depth + 1,
                 cache,
                 child_scene,
@@ -1438,10 +1907,11 @@ fn paint_asset(
             let mesh = image_quad(texture.id(), w, h, transform, view);
             q0glblend::paint_mesh_color(painter, mesh, color_transform);
         }
-        Asset::Rig(_) => {}
+        // Models are drawn by the 3D pass.
+        Asset::Rig(_) | Asset::Model(_) => {}
         Asset::Vector(v) => {
             if solid_appearance(appearance) && (v.stroke.is_none() || similarity(transform)) {
-                for mesh in solid_meshes(v, transform, view, cache, color_transform) {
+                for mesh in solid_meshes(v, appearance, transform, view, cache, color_transform) {
                     painter.add(Shape::Mesh(mesh));
                 }
                 return;
@@ -1563,24 +2033,6 @@ fn paint_asset(
                         q0glblend::paint_mesh_color(painter, mesh, color_transform);
                     }
                 }
-                // Round caps via end-circles — egui's stroke is butt by
-                // default. Mirrors the editor render so editor and
-                // playback are pixel-identical.
-                if let Some(s) = &v.stroke {
-                    if !path.closed
-                        && polyline_screen.len() >= 2
-                        && matches!(s.cap, q0s_format::geom::CapShape::Round)
-                    {
-                        let r = s.width * parent_scale * view.scale * 0.5;
-                        let col = color_transform.apply(rgba_to_color32(s.color));
-                        if let Some(p) = polyline_screen.first() {
-                            painter.circle_filled(*p, r, col);
-                        }
-                        if let Some(p) = polyline_screen.last() {
-                            painter.circle_filled(*p, r, col);
-                        }
-                    }
-                }
             }
         }
     }
@@ -1602,7 +2054,7 @@ fn paint_complex_gradient_color(
         return;
     };
     let mut mesh = Mesh::default();
-    for triangle in buffers.indices.chunks_exact(3) {
+    for triangle in buffers.indices.as_chunks::<3>().0.iter() {
         let local = [
             Vec2::new(
                 buffers.vertices[triangle[0] as usize].x,
@@ -1812,7 +2264,7 @@ pub fn paint_live_draws(
                 });
                 match target {
                     Target::Asset(id) => {
-                        if let Some(asset) = project.assets.iter().find(|asset| asset.id() == id) {
+                        if let Some(asset) = find_asset(project, cache, id) {
                             paint_asset(
                                 painter,
                                 ctx,
@@ -1840,6 +2292,7 @@ pub fn paint_live_draws(
                         rig_overrides,
                         scene_state,
                         q0glblend::ColorTransform::default(),
+                        &mut q0glblend::Stage3d::off(),
                     ),
                 }
             }
@@ -2012,8 +2465,7 @@ fn paint_complex_fill(painter: &Painter, contours: &[Vec<Pos2>], color: Color32)
 }
 
 /// An artwork stroke: its corners as the stroke says, its ends flat or
-/// square. Round ends are painted as circles by the callers, the same in the
-/// editor and q0player.
+/// square. Round caps share the body mesh and its alpha coverage.
 fn styled_stroke_mesh(
     points: &[Pos2],
     width: f32,
@@ -2042,7 +2494,8 @@ fn styled_stroke_mesh(
     };
     let line_cap = match cap {
         q0s_format::geom::CapShape::Square => LineCap::Square,
-        _ => LineCap::Butt,
+        q0s_format::geom::CapShape::Round => LineCap::Round,
+        q0s_format::geom::CapShape::Butt => LineCap::Butt,
     };
     let options = StrokeOptions::default()
         .with_line_width(width)
@@ -2146,7 +2599,7 @@ mod tests {
         buffers: &VertexBuffers<lyon_path::math::Point, u32>,
         point: Pos2,
     ) -> bool {
-        buffers.indices.chunks_exact(3).any(|triangle| {
+        buffers.indices.as_chunks::<3>().0.iter().any(|triangle| {
             let a = buffers.vertices[triangle[0] as usize];
             let b = buffers.vertices[triangle[1] as usize];
             let c = buffers.vertices[triangle[2] as usize];
@@ -2165,6 +2618,36 @@ mod tests {
         let has_negative = ab < -EPSILON || bc < -EPSILON || ca < -EPSILON;
         let has_positive = ab > EPSILON || bc > EPSILON || ca > EPSILON;
         !(has_negative && has_positive)
+    }
+
+    #[test]
+    fn regression_player_stroke_caps_match_the_editor() {
+        use q0s_format::geom::{CapShape, JoinShape};
+        let points = [pos2(0.0, 0.0), pos2(320.0, 0.0)];
+        let round = styled_stroke_mesh(
+            &points,
+            64.0,
+            false,
+            Color32::BLACK,
+            CapShape::Round,
+            JoinShape::Round,
+        )
+        .unwrap();
+        assert!(round.vertices.len() > 32);
+        assert!(round.vertices.iter().any(|v| v.pos.x < -31.9));
+        let flat = styled_stroke_mesh(
+            &points,
+            64.0,
+            false,
+            Color32::BLACK,
+            CapShape::Butt,
+            JoinShape::Round,
+        )
+        .unwrap();
+        assert!(flat
+            .vertices
+            .iter()
+            .all(|v| v.pos.x >= -0.001 && v.pos.x <= 320.001));
     }
 
     #[test]
@@ -2336,7 +2819,7 @@ mod tests {
                 asset_id: 1,
                 width: 2,
                 height: 2,
-                rgba: [255, 0, 0, 255].repeat(4),
+                rgba: [255, 0, 0, 255].repeat(4).into(),
             })],
             asset_names: Default::default(),
             asset_appearances: Default::default(),
@@ -2472,7 +2955,7 @@ mod tests {
                 asset_id: 1,
                 width: 2,
                 height: 2,
-                rgba: [255, 0, 0, 255].repeat(4),
+                rgba: [255, 0, 0, 255].repeat(4).into(),
             })],
             asset_names: std::collections::HashMap::new(),
             asset_appearances: std::collections::HashMap::new(),
@@ -2538,6 +3021,139 @@ mod tests {
             0,
             "hidden layer must emit no interactive player shapes"
         );
+    }
+
+    #[test]
+    fn blank_mask_frames_keep_the_artwork_visible() {
+        use q0s_format::v2::{
+            BitmapAsset, Layer, LayerKey, LayerKind, LayerMetadata, Placement, ProjectMeta, Q0rg,
+            Transform2D, Tween,
+        };
+
+        let mut project = ProjectV2 {
+            meta: ProjectMeta {
+                name: "blank-mask-player".into(),
+                fps: 24,
+                stage_width: 16,
+                stage_height: 16,
+                background_color: q0s_format::v2::Rgba {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                },
+                entry_q0rg_id: 1,
+            },
+            assets: vec![Asset::Bitmap(BitmapAsset {
+                asset_id: 1,
+                width: 2,
+                height: 2,
+                rgba: [255, 0, 0, 255].repeat(4).into(),
+            })],
+            asset_names: std::collections::HashMap::new(),
+            asset_appearances: std::collections::HashMap::new(),
+            layer_metadata: std::collections::HashMap::new(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
+            q0rgs: vec![Q0rg {
+                q0rg_id: 1,
+                name: "Stage".into(),
+                frame_count: 8,
+                script: String::new(),
+                layers: vec![Layer {
+                    layer_id: 1,
+                    timeline_frame_count: None,
+                    name: "art".into(),
+                    explicit_keyframes: Vec::new(),
+                    placements: vec![Placement {
+                        pivot: None,
+                        instance_id: 0,
+                        frame: 0,
+                        target: Target::Asset(1),
+                        transform: Transform2D::IDENTITY,
+                        tween: Tween::None,
+                        fx: Default::default(),
+                    }],
+                }],
+            }],
+        };
+        let mut mask = project.q0rgs[0].layers[0].clone();
+        mask.layer_id = 2;
+        mask.name = "mask".into();
+        mask.explicit_keyframes = vec![0, 1, 3];
+        mask.timeline_frame_count = Some(5);
+        let mut transparent = mask.placements[0].clone();
+        transparent.frame = 3;
+        transparent.target = Target::Asset(2);
+        mask.placements.push(transparent);
+        project.assets.push(Asset::Bitmap(BitmapAsset {
+            asset_id: 2,
+            width: 2,
+            height: 2,
+            rgba: vec![0; 16].into(),
+        }));
+        project.q0rgs[0].layers.push(mask);
+        project.layer_metadata.insert(
+            LayerKey::new(1, 1),
+            LayerMetadata {
+                mask_layer_id: Some(2),
+                ..Default::default()
+            },
+        );
+        project.layer_metadata.insert(
+            LayerKey::new(1, 2),
+            LayerMetadata {
+                kind: LayerKind::Mask,
+                ..Default::default()
+            },
+        );
+        let context = Context::default();
+        let target = Rect::from_min_size(Pos2::ZERO, egui::vec2(16.0, 16.0));
+        let mut cache = TextureCache::default();
+        // Exercise the blank keyframe, its hold, a transparent active mask,
+        // the end of its duration, and seeking back with a warm cache.
+        for (frame, visible, clipped) in [
+            (0, true, true),
+            (1, true, false),
+            (2, true, false),
+            (3, false, true),
+            (4, false, true),
+            (5, true, false),
+            (7, true, false),
+            (0, true, true),
+            (2, true, false),
+        ] {
+            let output = context.run(
+                egui::RawInput {
+                    screen_rect: Some(target),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let painter = ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Middle,
+                        egui::Id::new("blank-mask-test"),
+                    ));
+                    paint_v2_frame(&painter, ctx, &project, 1, frame, target, &mut cache, false);
+                },
+            );
+            let painted = output
+                .shapes
+                .iter()
+                .any(|shape| matches!(shape.shape, Shape::Mesh(_) | Shape::Callback(_)));
+            assert_eq!(painted, visible, "frame {frame}: GPU artwork visibility");
+            let callback = output
+                .shapes
+                .iter()
+                .any(|shape| matches!(shape.shape, Shape::Callback(_)));
+            assert_eq!(callback, visible && clipped, "frame {frame}: GPU clipping");
+            let reference =
+                q0s_format::raster::rasterize_q0rg_frame(&project, 1, frame, 16, 16, 1, [0; 4]);
+            assert_eq!(
+                reference.as_chunks::<4>().0.iter().any(|p| p[3] > 0),
+                visible,
+                "frame {frame}: reference visibility"
+            );
+        }
     }
 
     #[test]

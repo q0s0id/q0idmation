@@ -162,9 +162,16 @@ pub(crate) fn render_project_dialog(app: &mut EditorApp, ctx: &egui::Context) {
     {
         return;
     }
-    if crate::text_fonts::installed().is_none() {
-        ctx.request_repaint_after(std::time::Duration::from_millis(100));
-        return;
+    if app.session.font_audit.revision != Some(app.state.revision()) {
+        if !crate::text_tool::has_editable_text(&app.state.project) {
+            app.session.font_audit.revision = Some(app.state.revision());
+            app.session.font_audit.dialog = None;
+            return;
+        }
+        if crate::text_fonts::installed().is_none() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
     }
     let mut audit = std::mem::take(&mut app.session.font_audit);
     if audit.revision != Some(app.state.revision()) {

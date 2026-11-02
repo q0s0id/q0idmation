@@ -96,6 +96,11 @@ pub fn handle(
         if response.clicked() || response.drag_started() {
             app.session.status = if !current_layer_is_visible {
                 "layer is hidden"
+            } else if q0s_format::v2::layer_is_read_only(
+                app.session.current_q0rg_id,
+                app.session.current_layer_id,
+            ) {
+                "you can't edit this layer in the room. pick a layer you were given, or ask the owner"
             } else {
                 "layer is locked"
             }
@@ -129,6 +134,7 @@ pub fn handle(
     if crate::physics::handle_stage(app, response, cursor_stage, view)
         || crate::particles::handle_stage(app, response, cursor_stage, view)
         || crate::lights::handle_stage(app, response, cursor_stage, view)
+        || crate::scene3d_stage::handle_stage(app, response, view)
     {
         ctx.request_repaint();
         return;
@@ -142,6 +148,7 @@ pub fn handle(
         Tool::Pencil => pencil_freehand(app, response, cursor_stage, view, ctx),
         Tool::Brush => brush_tool(app, response, view, ctx),
         Tool::Eraser => eraser(app, response, view, ctx),
+        Tool::Knife => crate::knife::handle(app, response, cursor_stage, view, ctx),
         Tool::Select => select(app, response, cursor_stage, view),
         Tool::Lasso => lasso(app, response, cursor_stage, view, ctx),
         Tool::Subselect => subselect(app, response, cursor_stage, view),
@@ -298,9 +305,11 @@ pub fn draw_overlay(app: &mut EditorApp, response: &Response, painter: &Painter,
     crate::physics::paint_stage_overlay(app, painter, view);
     crate::particles::paint_stage_overlay(app, painter, view);
     crate::lights::paint_stage_overlay(app, painter, view);
+    crate::scene3d_stage::paint_stage_overlay(app, painter, view);
     if app.session.viewport.hand_active || app.session.viewport.panning {
         return;
     }
+    crate::snap::paint_hint(app, painter, view, response.ctx.frame_nr());
     draw_brush_cursor(app, painter, view);
     draw_eraser_cursor(app, painter, view);
     draw_transform_cursor(app, response, painter, view);
@@ -486,14 +495,10 @@ fn subselect_contour_hit(
             }
         }
     }
-    best.map(|(path, _)| path).or_else(|| {
-        hit_test_raw_path(project, q0rg_id, frame, cursor).map(|hit| PathRef {
-            q0rg_id,
-            layer_id: hit.layer_id,
-            placement_idx: hit.placement_idx,
-            path_idx: hit.path_idx,
-        })
-    })
+    // Subselect activates the contour under the pointer. A fill-body fallback
+    // used to pick an arbitrarily distant edge of a large filled shape, and its
+    // fixed stage-space tolerance also grew with zoom.
+    best.map(|(path, _)| path)
 }
 
 fn replace_raw_path_handle(
@@ -644,6 +649,93 @@ fn curve_point(path: &VPath, segment: usize, t: f32) -> Vec2 {
     )
 }
 
+/// `path` with segment `segment_idx` bent so the point at `t` on it moves
+/// by as much as the cursor has from `start_cursor`; the anchors stay put.
+///
+/// A straight or evenly bowed segment bends into one smooth arc, the way a
+/// line is bent in Animate: both ends lean towards the bend, so it has no
+/// steep shoulders. Other curves keep their shape and are pulled along.
+fn bend_segment(
+    path: &VPath,
+    segment_idx: usize,
+    t: f32,
+    start_cursor: Vec2,
+    cursor: Vec2,
+) -> VPath {
+    let mut bent = path.clone();
+    let next = (segment_idx + 1) % bent.anchors.len();
+    let start = path.anchors[segment_idx].point;
+    let end = path.anchors[next].point;
+    let out = path.anchors[segment_idx].out_handle.unwrap_or(start);
+    let into = path.anchors[next].in_handle.unwrap_or(end);
+    let dx = cursor.x - start_cursor.x;
+    let dy = cursor.y - start_cursor.y;
+    let span = (end.x - start.x).hypot(end.y - start.y);
+    let lift = |point: Vec2| {
+        if span <= 1.0e-6 {
+            return 0.0;
+        }
+        ((point.x - start.x) * (end.y - start.y) - (point.y - start.y) * (end.x - start.x)).abs()
+            / span
+    };
+    let tolerance = (span * 0.01).max(0.05);
+    let straight = lift(out) <= tolerance && lift(into) <= tolerance;
+    // A cubic made from a quadratic has both handles two thirds of the way
+    // to the same control point.
+    let control_from_out = Vec2::new(
+        start.x + (out.x - start.x) * 1.5,
+        start.y + (out.y - start.y) * 1.5,
+    );
+    let control_from_into = Vec2::new(
+        end.x + (into.x - end.x) * 1.5,
+        end.y + (into.y - end.y) * 1.5,
+    );
+    let bowed = (control_from_out.x - control_from_into.x)
+        .hypot(control_from_out.y - control_from_into.y)
+        <= (span * 0.02).max(0.5);
+    if span > 1.0e-3 && (straight || bowed) {
+        let held = curve_point(path, segment_idx, t);
+        let target = Vec2::new(held.x + dx, held.y + dy);
+        // Where along the arc it is held: a straight line's cubic does not
+        // run evenly, so measure it along the line instead.
+        let s = if straight {
+            (((held.x - start.x) * (end.x - start.x) + (held.y - start.y) * (end.y - start.y))
+                / (span * span))
+                .clamp(0.1, 0.9)
+        } else {
+            t.clamp(0.1, 0.9)
+        };
+        let u = 1.0 - s;
+        let weight = 2.0 * s * u;
+        let control = Vec2::new(
+            (target.x - u * u * start.x - s * s * end.x) / weight,
+            (target.y - u * u * start.y - s * s * end.y) / weight,
+        );
+        bent.anchors[segment_idx].out_handle = Some(Vec2::new(
+            start.x + (control.x - start.x) * (2.0 / 3.0),
+            start.y + (control.y - start.y) * (2.0 / 3.0),
+        ));
+        bent.anchors[next].in_handle = Some(Vec2::new(
+            end.x + (control.x - end.x) * (2.0 / 3.0),
+            end.y + (control.y - end.y) * (2.0 / 3.0),
+        ));
+        return bent;
+    }
+    let u = 1.0 - t;
+    let w1 = 3.0 * u * u * t;
+    let w2 = 3.0 * u * t * t;
+    let denominator = (w1 * w1 + w2 * w2).max(0.0001);
+    bent.anchors[segment_idx].out_handle = Some(Vec2::new(
+        out.x + dx * w1 / denominator,
+        out.y + dy * w1 / denominator,
+    ));
+    bent.anchors[next].in_handle = Some(Vec2::new(
+        into.x + dx * w2 / denominator,
+        into.y + dy * w2 / denominator,
+    ));
+    bent
+}
+
 fn begin_curve_drag(app: &mut EditorApp, path: PathRef, press: Vec2, only_open: bool) -> bool {
     let Some(source) = raw_path_clone(
         &app.state.project,
@@ -716,28 +808,8 @@ fn handle_curve_drag(app: &mut EditorApp, response: &Response, cursor: Option<Ve
     };
     if response.dragged_by(PointerButton::Primary) {
         if let Some(cursor) = cursor {
-            let mut bent = start_path.clone();
-            let next = (segment_idx + 1) % bent.anchors.len();
-            let u = 1.0 - t;
-            let w1 = 3.0 * u * u * t;
-            let w2 = 3.0 * u * t * t;
-            let denominator = (w1 * w1 + w2 * w2).max(0.0001);
-            let a = start_path.anchors[segment_idx]
-                .out_handle
-                .unwrap_or(start_path.anchors[segment_idx].point);
-            let b = start_path.anchors[next]
-                .in_handle
-                .unwrap_or(start_path.anchors[next].point);
-            let dx = cursor.x - start_cursor.x;
-            let dy = cursor.y - start_cursor.y;
-            bent.anchors[segment_idx].out_handle = Some(Vec2::new(
-                a.x + dx * w1 / denominator,
-                a.y + dy * w1 / denominator,
-            ));
-            bent.anchors[next].in_handle = Some(Vec2::new(
-                b.x + dx * w2 / denominator,
-                b.y + dy * w2 / denominator,
-            ));
+            let next = (segment_idx + 1) % start_path.anchors.len();
+            let bent = bend_segment(&start_path, segment_idx, t, start_cursor, cursor);
             let asset_id = raw_placement_asset_id(
                 &app.state.project,
                 path.q0rg_id,
@@ -851,6 +923,12 @@ fn subselect(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, vie
             anchor_radius,
         );
         if let Some((path, anchor_idx)) = hit {
+            if begin_dragging_many_points(app, path, anchor_idx, press) {
+                return;
+            }
+            if !shift_down {
+                app.session.subselect_more.clear();
+            }
             let mut selected = match &app.session.selection {
                 Selection::SubselectPoints {
                     path: current,
@@ -911,10 +989,45 @@ fn subselect(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, vie
                 return;
             }
         }
+        // Empty stage: a rubber band picks every point inside it.
+        if !shift_down {
+            app.session.selection = Selection::None;
+            app.session.subselect_more.clear();
+        }
+        app.session.tool_state = ToolState::SubselectMarquee { start: press };
+        app.session.status = "Drag over the points to pick".to_string();
+        return;
     }
 
     if response.dragged_by(PointerButton::Primary) {
         match app.session.tool_state.clone() {
+            ToolState::DraggingManyPoints {
+                parts,
+                start_cursor,
+            } => {
+                if let Some(point) = cursor {
+                    let delta = constrain_move_delta(
+                        Vec2::new(point.x - start_cursor.x, point.y - start_cursor.y),
+                        shift_down,
+                    );
+                    let mut moved = false;
+                    for (path, indices, start_path) in &parts {
+                        if replace_raw_path_points_translated(
+                            &mut app.state.project,
+                            *path,
+                            indices,
+                            start_path,
+                            delta,
+                        ) {
+                            invalidate_path_asset(app, *path);
+                            moved = true;
+                        }
+                    }
+                    if moved {
+                        app.state.mark_artwork_dirty();
+                    }
+                }
+            }
             ToolState::DraggingPathPoints {
                 path,
                 anchor_indices,
@@ -924,6 +1037,17 @@ fn subselect(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, vie
                 start_bounds_max,
             } => {
                 if let Some(point) = cursor {
+                    let point = if shift_down {
+                        point
+                    } else {
+                        crate::snap::move_cursor(
+                            app,
+                            start_cursor,
+                            point,
+                            view,
+                            response.ctx.frame_nr(),
+                        )
+                    };
                     let delta = constrain_move_delta(
                         Vec2::new(point.x - start_cursor.x, point.y - start_cursor.y),
                         shift_down,
@@ -977,7 +1101,27 @@ fn subselect(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, vie
     }
 
     if response.drag_stopped_by(PointerButton::Primary) {
+        crate::snap::end_move();
         match app.session.tool_state.clone() {
+            ToolState::SubselectMarquee { start } => {
+                app.session.tool_state = ToolState::Idle;
+                if let Some(end) = cursor {
+                    pick_points_in_rect(app, start, end, shift_down);
+                }
+                return;
+            }
+            ToolState::DraggingManyPoints { parts, .. } => {
+                app.session.tool_state = ToolState::Idle;
+                app.session.status = format!(
+                    "Moved {} point(s) on {} path(s)",
+                    parts
+                        .iter()
+                        .map(|(_, indices, _)| indices.len())
+                        .sum::<usize>(),
+                    parts.len()
+                );
+                return;
+            }
             ToolState::DraggingPathPoints {
                 path,
                 anchor_indices,
@@ -1043,6 +1187,9 @@ fn subselect(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, vie
         return;
     };
 
+    if !shift_down {
+        app.session.subselect_more.clear();
+    }
     if let Some((path_ref, anchor_idx)) = subselect_scene_anchor_hit(
         &app.state.project,
         app.session.current_q0rg_id,
@@ -1113,6 +1260,179 @@ fn subselect(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, vie
     } else if !shift_down {
         app.session.selection = Selection::None;
     }
+}
+
+/// Every picked point Subselect holds: the selection's own and those on
+/// further paths.
+fn subselect_picked(app: &EditorApp) -> Vec<(PathRef, Vec<usize>)> {
+    let Selection::SubselectPoints {
+        path,
+        anchor_indices,
+        ..
+    } = &app.session.selection
+    else {
+        return Vec::new();
+    };
+    let mut picked = vec![(*path, anchor_indices.clone())];
+    picked.extend(
+        app.session
+            .subselect_more
+            .iter()
+            .filter(|(more, indices)| more != path && !indices.is_empty())
+            .cloned(),
+    );
+    picked
+}
+
+/// Starts moving every picked point when the press lands on one of them
+/// and points on more than one path are picked.
+fn begin_dragging_many_points(
+    app: &mut EditorApp,
+    path: PathRef,
+    anchor_idx: usize,
+    press: Vec2,
+) -> bool {
+    let picked = subselect_picked(app);
+    if picked.len() < 2
+        || !picked
+            .iter()
+            .any(|(picked_path, indices)| *picked_path == path && indices.contains(&anchor_idx))
+    {
+        return false;
+    }
+    app.history
+        .snapshot_with_session(&app.state.project, &app.session);
+    let refs: Vec<PathRef> = picked.iter().map(|(path, _)| *path).collect();
+    let Some(mapped) =
+        prepare_raw_path_refs_for_edit(&mut app.state.project, &refs, app.session.current_frame)
+    else {
+        return false;
+    };
+    let mut parts = Vec::new();
+    for ((_, indices), path) in picked.into_iter().zip(mapped) {
+        let Some(start_path) = raw_path_clone(
+            &app.state.project,
+            path.q0rg_id,
+            path.layer_id,
+            path.placement_idx,
+            path.path_idx,
+        ) else {
+            return false;
+        };
+        parts.push((path, indices, start_path));
+    }
+    let (first, first_indices, first_path) = parts[0].clone();
+    app.session.selection = subselect_points_selection(first, &first_path, first_indices);
+    app.session.subselect_more = parts[1..]
+        .iter()
+        .map(|(path, indices, _)| (*path, indices.clone()))
+        .collect();
+    app.session.tool_state = ToolState::DraggingManyPoints {
+        parts,
+        start_cursor: press,
+    };
+    app.session.status = "Moving the picked points".to_string();
+    true
+}
+
+/// Picks the points of raw paths inside the rectangle from `start` to
+/// `end`, adding to what is picked when `add` is set.
+fn pick_points_in_rect(app: &mut EditorApp, start: Vec2, end: Vec2, add: bool) {
+    let min = Vec2::new(start.x.min(end.x), start.y.min(end.y));
+    let max = Vec2::new(start.x.max(end.x), start.y.max(end.y));
+    let q0rg_id = app.session.current_q0rg_id;
+    let frame = app.session.current_frame;
+    let mut picked: Vec<(PathRef, Vec<usize>)> = if add {
+        subselect_picked(app)
+    } else {
+        Vec::new()
+    };
+    if let Some(q0rg) = app
+        .state
+        .project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+    {
+        for layer in &q0rg.layers {
+            if !app.state.project.layer_is_visible(q0rg_id, layer.layer_id)
+                || app.state.project.layer_is_locked(q0rg_id, layer.layer_id)
+            {
+                continue;
+            }
+            for (placement_idx, transform) in crate::render::active_placements_at(layer, frame) {
+                let Some(Target::Asset(asset_id)) = layer
+                    .placements
+                    .get(placement_idx)
+                    .map(|placement| placement.target)
+                else {
+                    continue;
+                };
+                let Some(Asset::Vector(vector)) = app
+                    .state
+                    .project
+                    .assets
+                    .iter()
+                    .find(|asset| asset.id() == asset_id)
+                else {
+                    continue;
+                };
+                let affine = Affine::from_transform(transform);
+                for (path_idx, path) in vector.paths.iter().enumerate() {
+                    let inside: Vec<usize> = path
+                        .anchors
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, anchor)| {
+                            point_in_bounds(
+                                affine.apply(anchor.point),
+                                (min.x, min.y, max.x, max.y),
+                            )
+                        })
+                        .map(|(index, _)| index)
+                        .collect();
+                    if inside.is_empty() {
+                        continue;
+                    }
+                    let reference = PathRef {
+                        q0rg_id,
+                        layer_id: layer.layer_id,
+                        placement_idx,
+                        path_idx,
+                    };
+                    match picked.iter_mut().find(|(path, _)| *path == reference) {
+                        Some((_, indices)) => {
+                            for index in inside {
+                                if !indices.contains(&index) {
+                                    indices.push(index);
+                                }
+                            }
+                        }
+                        None => picked.push((reference, inside)),
+                    }
+                }
+            }
+        }
+    }
+    let Some((first, first_indices)) = picked.first().cloned() else {
+        app.session.selection = Selection::None;
+        app.session.subselect_more.clear();
+        app.session.status = "No points there".to_string();
+        return;
+    };
+    let Some(first_path) = raw_path_clone(
+        &app.state.project,
+        first.q0rg_id,
+        first.layer_id,
+        first.placement_idx,
+        first.path_idx,
+    ) else {
+        return;
+    };
+    let count: usize = picked.iter().map(|(_, indices)| indices.len()).sum();
+    app.session.status = format!("Picked {count} point(s) on {} path(s)", picked.len());
+    app.session.selection = subselect_points_selection(first, &first_path, first_indices);
+    app.session.subselect_more = picked.split_off(1);
 }
 
 /// Decide what cursor the OS should show for the current tool + cursor
@@ -1193,7 +1513,7 @@ fn pick_cursor(
         // We draw our own ring overlay for the eraser; the OS pointer
         // would just clutter the area, so hide it.
         Tool::Eraser => CursorIcon::None,
-        Tool::Bucket | Tool::Eyedropper => CursorIcon::Crosshair,
+        Tool::Bucket | Tool::Eyedropper | Tool::Knife => CursorIcon::Crosshair,
         Tool::Rig => CursorIcon::Default,
         Tool::Subselect => CursorIcon::Default,
         Tool::Select => select_cursor(app, response, view).unwrap_or(CursorIcon::Default),
@@ -1210,11 +1530,19 @@ fn resize_cursor_for_handle(handle: Handle) -> egui::CursorIcon {
     }
 }
 
+/// Whether the Select tool shows its transform box. Off, it only moves.
+fn transform_box_shown(app: &EditorApp) -> bool {
+    app.settings.aids.transform_box || app.session.current_tool != Tool::Select
+}
+
 fn selected_transform_hit(
     app: &mut EditorApp,
     view: &StageView,
     cursor_screen: Pos2,
 ) -> Option<TransformHit> {
+    if !transform_box_shown(app) {
+        return None;
+    }
     if matches!(
         app.session.selection,
         Selection::RawArea { .. }
@@ -1800,6 +2128,9 @@ fn set_selection_transform_pivot(app: &mut EditorApp, point: Vec2) {
     let anchors =
         crate::selection_edit::selected_object_refs(&app.state.project, &app.session.selection)
             .into_iter()
+            // A group pivot belongs to this selection, never to every member.
+            // Persist a local pivot only when editing one display object.
+            .filter(|_| matches!(app.session.selection, Selection::Placement { .. }))
             .filter_map(|reference| {
                 let layer = app
                     .state
@@ -1861,6 +2192,9 @@ fn set_selection_transform_pivot(app: &mut EditorApp, point: Vec2) {
 }
 
 fn selected_pivot_hit(app: &mut EditorApp, view: &StageView, cursor_screen: Pos2) -> bool {
+    if !transform_box_shown(app) {
+        return false;
+    }
     let explicit_pivot = selection_transform_pivot(app);
     let pivot = explicit_pivot.or_else(|| {
         if matches!(app.session.selection, Selection::Multi(_)) {
@@ -1883,9 +2217,18 @@ fn pen(
     response: &Response,
     cursor: Option<Vec2>,
     _painter: &Painter,
-    _view: &StageView,
+    view: &StageView,
     ctx: &Context,
 ) {
+    let cursor = cursor.map(|point| {
+        crate::snap::point(
+            app,
+            point,
+            view,
+            &crate::snap::Leave::default(),
+            ctx.frame_nr(),
+        )
+    });
     let in_progress = matches!(app.session.tool_state, ToolState::PenDrawing { .. });
     if !in_progress && !matches!(app.session.tool_state, ToolState::Idle) {
         // Other tool was active; reset.
@@ -2337,26 +2680,26 @@ fn sync_classic_brush_preview_for_view(
         return;
     }
 
-    // The cache itself is screen-space for fast incremental drawing. Rebuild
-    // only when the camera changes, always from the gesture's stage-space
-    // samples and nib so zoom/pan can never distort or pin an in-flight stroke.
-    let (dabs, nib, fill, outline) = match &app.session.tool_state {
+    let brush_color = Color32::from_rgba_unmultiplied(
+        app.session.brush.color.r,
+        app.session.brush.color.g,
+        app.session.brush.color.b,
+        app.session.brush.color.a,
+    );
+    let (body, expanded, fill, outline) = match &mut app.session.tool_state {
         ToolState::BrushDrawing { stroke } => (
-            crate::brush::brush_prerender_dabs(stroke),
-            crate::brush::brush_preview_nib(stroke),
-            Color32::from_rgba_unmultiplied(
-                app.session.brush.color.r,
-                app.session.brush.color.g,
-                app.session.brush.color.b,
-                app.session.brush.color.a,
-            ),
+            classic_cached_prerender_in_view(crate::brush::brush_prerender_geometry(stroke), view),
+            None,
+            brush_color,
             None,
         ),
         ToolState::EraserDrawing { stroke } => {
             let (fill, outline) = eraser_preview_colors();
+            let dabs = crate::brush::brush_prerender_dabs(stroke);
+            let nib = crate::brush::brush_preview_nib(stroke);
             (
-                crate::brush::brush_prerender_dabs(stroke),
-                crate::brush::brush_preview_nib(stroke),
+                classic_prerender_contours(&dabs, nib, view, 0.0),
+                Some(classic_prerender_contours(&dabs, nib, view, 1.0)),
                 fill,
                 Some(outline),
             )
@@ -2365,9 +2708,19 @@ fn sync_classic_brush_preview_for_view(
     };
     app.textures
         .begin_classic_brush_preview(ctx, response.rect, view);
-    let body = classic_prerender_contours(&dabs, nib, view, 0.0);
-    let expanded = outline.map(|_| classic_prerender_contours(&dabs, nib, view, 1.0));
     raster_classic_preview_contours(app, &body, fill, expanded.as_deref(), outline);
+}
+
+fn classic_cached_prerender_in_view(contours: &[Vec<Vec2>], view: &StageView) -> Vec<Vec<Pos2>> {
+    contours
+        .iter()
+        .map(|contour| {
+            contour
+                .iter()
+                .map(|point| stage_to_screen(*point, view))
+                .collect()
+        })
+        .collect()
 }
 
 fn classic_brush(app: &mut EditorApp, response: &Response, view: &StageView, ctx: &Context) {
@@ -2410,61 +2763,52 @@ fn classic_brush(app: &mut EditorApp, response: &Response, view: &StageView, ctx
     let dragged = response.dragged_by(PointerButton::Primary);
     let drag_stopped = response.drag_stopped_by(PointerButton::Primary);
 
-    sync_classic_brush_preview_for_view(app, response, view, ctx);
-
-    if classic_drag_frame_accepts_samples(drag_started, dragged, drag_stopped) {
-        let samples = classic_input_samples(ctx, response, view);
-        let mut new_contours = Vec::new();
-        if let ToolState::BrushDrawing { stroke } = &mut app.session.tool_state {
-            let old_len = stroke.samples.len();
-            for sample in samples {
-                crate::brush::brush_add_sample(stroke, settings, sample);
-            }
-            let new_len = stroke.samples.len();
-            if new_len > old_len {
-                for index in old_len.max(1)..new_len {
-                    let Some((start_position, start_size)) =
-                        crate::brush::brush_prerender_dab_at(stroke, index - 1)
-                    else {
-                        continue;
-                    };
-                    let Some((end_position, end_size)) =
-                        crate::brush::brush_prerender_dab_at(stroke, index)
-                    else {
-                        continue;
-                    };
-                    new_contours.push(classic_prerender_segment_contour(
-                        settings.nib,
-                        (
-                            stage_to_screen(start_position, view),
-                            start_size * view.effective_scale(),
-                        ),
-                        (
-                            stage_to_screen(end_position, view),
-                            end_size * view.effective_scale(),
-                        ),
-                    ));
-                }
-            }
-        }
-        if !new_contours.is_empty() {
-            app.textures
-                .raster_classic_brush_preview(&new_contours, preview_color);
-        }
-    }
-
-    if response.drag_stopped_by(PointerButton::Primary) {
+    if drag_stopped {
         if let ToolState::BrushDrawing { stroke } =
             std::mem::replace(&mut app.session.tool_state, ToolState::Idle)
         {
             let region = crate::brush::brush_finish(stroke, settings);
             crate::brush::commit_brush_region(app, region, settings);
-            app.textures.clear_classic_brush_preview();
             ctx.request_repaint();
-        } else {
-            app.textures.clear_classic_brush_preview();
         }
+        app.textures.clear_classic_brush_preview();
         return;
+    }
+
+    sync_classic_brush_preview_for_view(app, response, view, ctx);
+
+    if classic_drag_frame_accepts_samples(drag_started, dragged, drag_stopped) {
+        let samples = classic_input_samples(ctx, response, view);
+        let mut new_contours = Vec::new();
+        let mut rebuild = false;
+        if let ToolState::BrushDrawing { stroke } = &mut app.session.tool_state {
+            let old_len = stroke.samples.len();
+            let old_first = crate::brush::brush_prerender_dab_at(stroke, 0);
+            let old_nib = crate::brush::brush_preview_nib(stroke);
+            for sample in samples {
+                crate::brush::brush_add_sample(stroke, settings, sample);
+            }
+            if let Some(first) = crate::brush::brush_prerender_dirty_from(stroke) {
+                rebuild = first < old_len.saturating_sub(1)
+                    || old_first != crate::brush::brush_prerender_dab_at(stroke, 0)
+                    || old_nib != crate::brush::brush_preview_nib(stroke);
+                let from = if rebuild {
+                    0
+                } else {
+                    old_len.saturating_sub(1)
+                };
+                let geometry = crate::brush::brush_prerender_geometry(stroke);
+                new_contours = classic_cached_prerender_in_view(&geometry[from..], view);
+            }
+        }
+        if rebuild {
+            app.textures
+                .begin_classic_brush_preview(ctx, response.rect, view);
+        }
+        if !new_contours.is_empty() {
+            app.textures
+                .raster_classic_brush_preview(&new_contours, preview_color);
+        }
     }
 
     // A click without a drag is still a real brush gesture: one nib imprint.
@@ -2488,6 +2832,7 @@ fn classic_brush(app: &mut EditorApp, response: &Response, view: &StageView, ctx
         }
     }
 }
+
 pub(crate) fn rect_polygon(rect: (f32, f32, f32, f32)) -> Polygon<f64> {
     Polygon::new(
         LineString::new(vec![
@@ -2516,6 +2861,7 @@ pub(crate) fn rect_polygon(rect: (f32, f32, f32, f32)) -> Polygon<f64> {
     )
 }
 
+#[cfg(test)]
 fn signed_path_area(path: &VPath) -> f64 {
     let points = flatten_path(path);
     if points.len() < 3 {
@@ -4796,6 +5142,22 @@ fn begin_group_transform_inner(
     true
 }
 
+/// Where a drag that moves the selection began, for snapping it.
+fn move_start_cursor(state: &ToolState) -> Option<Vec2> {
+    match state {
+        ToolState::DraggingPlacement { start_cursor, .. }
+        | ToolState::DraggingPath { start_cursor, .. }
+        | ToolState::DraggingPaths { start_cursor, .. }
+        | ToolState::DraggingPathPoints { start_cursor, .. }
+        | ToolState::DraggingLineEnd { start_cursor, .. } => Some(*start_cursor),
+        ToolState::DraggingGroup {
+            operation: GroupTransformOperation::Move { start_cursor },
+            ..
+        } => Some(*start_cursor),
+        _ => None,
+    }
+}
+
 fn constrain_move_delta(delta: Vec2, shift: bool) -> Vec2 {
     if !shift {
         return delta;
@@ -6305,6 +6667,42 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                         return;
                     }
                 }
+                if hit.is_none() {
+                    // A second click on a line picks every line joined to it.
+                    let joined = match selection_at_point_pub(
+                        &app.state.project,
+                        q0rg_id,
+                        app.session.current_frame,
+                        p,
+                    ) {
+                        Some(Selection::Path {
+                            q0rg_id,
+                            layer_id,
+                            placement_idx,
+                            path_idx,
+                        }) => Some(PathRef {
+                            q0rg_id,
+                            layer_id,
+                            placement_idx,
+                            path_idx,
+                        }),
+                        Some(Selection::StrokeSegment(segment)) => Some(segment.path),
+                        _ => None,
+                    }
+                    .filter(|path| stroke_for_path_ref(&app.state.project, *path).is_some())
+                    .and_then(|path| {
+                        crate::crossings::connected_selection(
+                            &app.state.project,
+                            app.session.current_frame,
+                            path,
+                        )
+                    });
+                    if let Some(joined) = joined {
+                        app.session.selection = joined;
+                        app.session.status = "Selected every line joined to it".to_string();
+                        return;
+                    }
+                }
                 if !app.session.edit_in_place.is_empty() {
                     let outside = crate::render::q0rg_frame_bbox(
                         &app.state.project,
@@ -6427,18 +6825,27 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
     // handles around its bbox. If a supported handle is hit, start axis scaling.
     // Otherwise hit-test the placement body for move, or clear the selection.
     if response.drag_started_by(PointerButton::Primary) {
-        if let Some(current_cursor) = cursor {
-            // egui reports drag_started after crossing its drag threshold. Use
-            // the reconstructed press origin so tiny handles remain grabbable.
+        'drag_start: {
+            let Some(current_cursor) = cursor else {
+                break 'drag_start;
+            };
+            // Hit-test the original press, then apply the current pointer in
+            // this same frame. Returning after gesture setup used to discard
+            // short drags whose only move event crossed egui's drag threshold.
             let cursor_screen = response
-                .interact_pointer_pos()
-                .map(|screen| screen - response.drag_delta());
+                .ctx
+                .input(|input| input.pointer.press_origin())
+                .or_else(|| {
+                    response
+                        .interact_pointer_pos()
+                        .map(|screen| screen - response.drag_delta())
+                });
             let p = cursor_screen
                 .map(|screen| screen_to_stage(screen, view))
                 .unwrap_or(current_cursor);
             if let Some(screen_pos) = cursor_screen {
                 if !alt_down && begin_dragging_line_end(app, view, screen_pos, p) {
-                    return;
+                    break 'drag_start;
                 }
                 // A normal drag through the centre moves the selected artwork.
                 // Moving the transform anchor is an explicit Alt gesture.
@@ -6449,7 +6856,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                     set_selection_transform_pivot(app, p);
                     app.session.tool_state = ToolState::DraggingTransformPivot { selection };
                     app.session.status = "Moving transform anchor".to_string();
-                    return;
+                    break 'drag_start;
                 }
             }
             if alt_down {
@@ -6516,7 +6923,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 {
                     app.session.marquee_base_selection = Some(app.session.selection.clone());
                     app.session.tool_state = ToolState::Marquee { start: p };
-                    return;
+                    break 'drag_start;
                 }
             }
             if !alt_down
@@ -6553,7 +6960,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                             p,
                             "Moving object",
                         );
-                        return;
+                        break 'drag_start;
                     }
                 }
             }
@@ -6572,7 +6979,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                     if let Some(hit) = hit_test_raw_transform(bounds, view, screen_pos) {
                         if begin_group_transform(app, selection, GroupTransformIntent::Hit(hit), p)
                         {
-                            return;
+                            break 'drag_start;
                         }
                     }
                 }
@@ -6601,7 +7008,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                             }
                         };
                         if started {
-                            return;
+                            break 'drag_start;
                         }
                     }
                 }
@@ -6632,7 +7039,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                             hit,
                             p,
                         ) {
-                            return;
+                            break 'drag_start;
                         }
                     }
                 }
@@ -6654,7 +7061,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                         && p.y <= bounds.3
                         && begin_group_transform(app, selection, GroupTransformIntent::Move, p)
                     {
-                        return;
+                        break 'drag_start;
                     }
                 }
             }
@@ -6716,7 +7123,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                             start_pivot,
                         };
                         app.session.status = "Moving selected fill".to_string();
-                        return;
+                        break 'drag_start;
                     }
                 }
             }
@@ -6724,7 +7131,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 if point_hits_stroke_segment_with_slop(&app.state.project, segment, p, hit_slop)
                     && begin_dragging_raw_stroke_segment(app, segment, p, "Moving stroke segment")
                 {
-                    return;
+                    break 'drag_start;
                 }
             }
             if let Selection::RawParts {
@@ -6752,14 +7159,19 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                         "Moving selected raw parts",
                     )
                 {
-                    return;
+                    break 'drag_start;
                 }
             }
             if let Some(refs) = selection_raw_path_refs(&app.session.selection) {
-                if point_hits_selected_raw_paths_with_slop(&app.state.project, &refs, p, hit_slop)
-                    && begin_dragging_raw_paths(app, refs, p, "Moving selected raw graphics")
+                if point_hits_selected_raw_paths_cached_with_slop(
+                    &app.state.project,
+                    &mut app.textures,
+                    &refs,
+                    p,
+                    hit_slop,
+                ) && begin_dragging_raw_paths(app, refs, p, "Moving selected raw graphics")
                 {
-                    return;
+                    break 'drag_start;
                 }
             }
             // Existing V-area selection: dragging inside its marquee moves
@@ -6783,7 +7195,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                         &[path],
                         app.session.current_frame,
                     ) else {
-                        return;
+                        break 'drag_start;
                     };
                     let mapped_path = mapped.remove(0);
                     if let Some(start_path) = raw_path_clone(
@@ -6808,7 +7220,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                             start_bounds_max: bounds_max,
                         };
                         app.session.status = "Reshaping fill selection".to_string();
-                        return;
+                        break 'drag_start;
                     }
                 }
             }
@@ -6854,7 +7266,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                                 placement_idx,
                                 app.session.current_frame,
                             ) else {
-                                return;
+                                break 'drag_start;
                             };
                             placement_idx
                         };
@@ -6906,7 +7318,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                             TransformHit::Skew(edge) => {
                                 let Some(inverse) = Affine::from_transform(start_t).inverse()
                                 else {
-                                    return;
+                                    break 'drag_start;
                                 };
                                 app.session.tool_state = ToolState::DraggingPlacementSkew {
                                     q0rg_id,
@@ -6921,7 +7333,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                                 app.session.status = "Skewing selection".to_string();
                             }
                         }
-                        return;
+                        break 'drag_start;
                     }
                 }
             }
@@ -6943,7 +7355,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                             "Moving selection",
                         )
                     {
-                        return;
+                        break 'drag_start;
                     }
                 }
                 if let Some(refs) = selection_raw_path_refs(&app.session.selection) {
@@ -6951,7 +7363,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                         .is_some_and(|bounds| point_in_bounds(p, bounds))
                         && begin_dragging_raw_paths(app, refs, p, "Moving selected raw graphics")
                     {
-                        return;
+                        break 'drag_start;
                     }
                 }
             }
@@ -6969,7 +7381,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 match hit {
                     RawSelectionHit::Fill(refs) => {
                         if begin_dragging_raw_paths(app, refs, p, "Moving fill region") {
-                            return;
+                            break 'drag_start;
                         }
                     }
                     RawSelectionHit::FillPart(refs) => {
@@ -6981,7 +7393,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                             p,
                             "Moving fill",
                         ) {
-                            return;
+                            break 'drag_start;
                         }
                     }
                     RawSelectionHit::StrokePart(segment) => {
@@ -6991,12 +7403,12 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                             p,
                             "Moving stroke segment",
                         ) {
-                            return;
+                            break 'drag_start;
                         }
                     }
                     RawSelectionHit::Path(path) => {
                         if begin_dragging_raw_paths(app, vec![path], p, "Moving contour") {
-                            return;
+                            break 'drag_start;
                         }
                     }
                 }
@@ -7031,7 +7443,22 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
         }
     }
 
-    if response.dragged_by(PointerButton::Primary) {
+    if response.drag_started_by(PointerButton::Primary)
+        || response.dragged_by(PointerButton::Primary)
+        || response.drag_stopped_by(PointerButton::Primary)
+    {
+        // With the magnet on, the dragged selection's nearest point lands on
+        // whatever is within reach.
+        let cursor = match (cursor, move_start_cursor(&app.session.tool_state)) {
+            (Some(point), Some(start)) if !shift_down => Some(crate::snap::move_cursor(
+                app,
+                start,
+                point,
+                view,
+                response.ctx.frame_nr(),
+            )),
+            _ => cursor,
+        };
         match app.session.tool_state.clone() {
             ToolState::DraggingPlacement {
                 q0rg_id,
@@ -7505,6 +7932,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
     }
 
     if response.drag_stopped_by(PointerButton::Primary) {
+        crate::snap::end_move();
         // Marquee finalisation: collect every placement on the current q0rg
         // whose bbox intersects the rubber-band rect.
         if let ToolState::Marquee { start } = app.session.tool_state.clone() {
@@ -7639,6 +8067,10 @@ struct MergeObjectSelectionIdentity {
 struct MergeSelectionSnapshot {
     raw: Vec<MergeRawSelectionIdentity>,
     objects: Vec<MergeObjectSelectionIdentity>,
+    /// The fill the selection covered. A merged drawing can hold pieces
+    /// cut apart earlier (by the knife or the eraser); only the pieces
+    /// meeting this are selected again.
+    surface: Option<MultiPolygon<f64>>,
 }
 
 fn capture_merge_selection_snapshot(
@@ -7702,6 +8134,7 @@ fn capture_merge_selection_snapshot(
         Selection::None | Selection::Asset(_) | Selection::Q0rg(_) => {}
     }
 
+    let surface = selected_fill_surface(project, &raw_paths, &raw_placements);
     raw_placements.extend(raw_paths.iter().map(|path| PlacementRef {
         q0rg_id: path.q0rg_id,
         layer_id: path.layer_id,
@@ -7773,7 +8206,100 @@ fn capture_merge_selection_snapshot(
     MergeSelectionSnapshot {
         raw: raw.into_iter().collect(),
         objects,
+        surface: (!surface.0.is_empty()).then_some(surface),
     }
+}
+
+/// The fill covered by the selected raw paths, and by whole drawings.
+fn selected_fill_surface(
+    project: &ProjectV2,
+    paths: &[PathRef],
+    placements: &[PlacementRef],
+) -> MultiPolygon<f64> {
+    let vector_at = |q0rg_id: u16, layer_id: u16, placement_idx: usize| {
+        let asset_id = raw_placement_asset_id(project, q0rg_id, layer_id, placement_idx)?;
+        match project.assets.iter().find(|asset| asset.id() == asset_id)? {
+            Asset::Vector(vector) if vector.fill.is_some() => Some(vector),
+            _ => None,
+        }
+    };
+    let mut picked: std::collections::BTreeMap<(u16, u16, usize), Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for path in paths {
+        picked
+            .entry((path.q0rg_id, path.layer_id, path.placement_idx))
+            .or_default()
+            .push(path.path_idx);
+    }
+    let mut pieces = Vec::new();
+    for ((q0rg_id, layer_id, placement_idx), indices) in picked {
+        let Some(vector) = vector_at(q0rg_id, layer_id, placement_idx) else {
+            continue;
+        };
+        let subset = VectorAsset {
+            paths: indices
+                .iter()
+                .filter_map(|index| vector.paths.get(*index))
+                .filter(|path| path.closed)
+                .cloned()
+                .collect(),
+            ..vector.clone()
+        };
+        if !subset.paths.is_empty() {
+            pieces.push(crate::brush::vector_fill_geometry(&subset));
+        }
+    }
+    for placement in placements {
+        if let Some(vector) = vector_at(
+            placement.q0rg_id,
+            placement.layer_id,
+            placement.placement_idx,
+        ) {
+            pieces.push(crate::brush::vector_fill_geometry(vector));
+        }
+    }
+    geo::unary_union(pieces.iter())
+}
+
+/// The paths of the separate fill pieces of `vector` that meet `surface`,
+/// or `None` when that cannot be told apart.
+fn fill_paths_meeting(vector: &VectorAsset, surface: &MultiPolygon<f64>) -> Option<Vec<usize>> {
+    if surface.0.is_empty() || vector.fill.is_none() {
+        return None;
+    }
+    let topology = crate::brush::vector_fill_topology(vector);
+    let pieces = topology.surface.0.iter().enumerate();
+    let mut meeting: Vec<usize> = match topology.component_path_indices {
+        Some(components) => pieces
+            .filter(|(_, piece)| piece.intersects(surface))
+            .flat_map(|(index, _)| components.get(index).cloned().unwrap_or_default())
+            .collect(),
+        // Curved or crossing outlines: a path belongs to the pieces its
+        // anchors lie on, as when picking them with a click.
+        None => {
+            let meeting_pieces: Vec<_> = pieces
+                .filter(|(_, piece)| piece.intersects(surface))
+                .map(|(_, piece)| piece)
+                .collect();
+            vector
+                .paths
+                .iter()
+                .enumerate()
+                .filter(|(_, path)| path.closed)
+                .filter(|(_, path)| {
+                    meeting_pieces.iter().any(|piece| {
+                        path.anchors.iter().any(|anchor| {
+                            crate::render::polygon_boundary_near_point(piece, anchor.point, 0.5)
+                        })
+                    })
+                })
+                .map(|(index, _)| index)
+                .collect()
+        }
+    };
+    meeting.sort_unstable();
+    meeting.dedup();
+    (!meeting.is_empty()).then_some(meeting)
 }
 
 fn restore_merge_selection(
@@ -7823,12 +8349,12 @@ fn restore_merge_selection(
             }
         }
     }
-    let path_counts: std::collections::BTreeMap<u16, usize> = project
+    let vectors: std::collections::BTreeMap<u16, &VectorAsset> = project
         .assets
         .iter()
         .filter_map(|asset| match asset {
-            Asset::Vector(vector) => Some((vector.asset_id, vector.paths.len())),
-            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => None,
+            Asset::Vector(vector) => Some((vector.asset_id, vector)),
+            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) | Asset::Model(_) => None,
         })
         .collect();
 
@@ -7837,10 +8363,17 @@ fn restore_merge_selection(
         let Some(&placement_idx) = active_raw_placements.get(&(q0rg_id, layer_id, asset_id)) else {
             continue;
         };
-        let Some(&path_count) = path_counts.get(&asset_id) else {
+        let Some(vector) = vectors.get(&asset_id) else {
             continue;
         };
-        paths.extend((0..path_count).map(|path_idx| PathRef {
+        // Pieces the selection never touched stay unselected, even when the
+        // merge put them in the same drawing.
+        let picked = snapshot
+            .surface
+            .as_ref()
+            .and_then(|surface| fill_paths_meeting(vector, surface))
+            .unwrap_or_else(|| (0..vector.paths.len()).collect());
+        paths.extend(picked.into_iter().map(|path_idx| PathRef {
             q0rg_id,
             layer_id,
             placement_idx,
@@ -8608,6 +9141,7 @@ fn polygon_boundary_near_cursor(polygon: &Polygon<f64>, cursor: Vec2, radius: f3
     ring_near(polygon.exterior()) || polygon.interiors().iter().any(ring_near)
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RawPathHit {
     layer_id: u16,
@@ -8619,6 +9153,7 @@ struct RawPathHit {
 /// Only identity, non-tweened placements are raw-edit surfaces; transformed
 /// placements are display objects and intentionally fall back to object
 /// selection.
+#[cfg(test)]
 fn hit_test_raw_path(
     project: &ProjectV2,
     q0rg_id: u16,
@@ -9843,7 +10378,26 @@ fn bake_raw_refs_live_transform(app: &mut EditorApp, refs: &[PathRef]) -> bool {
         {
             placement.transform = Transform2D::IDENTITY;
         }
-        app.textures.invalidate_asset(asset_id);
+        let translation_only =
+            affine.a11 == 1.0 && affine.a22 == 1.0 && affine.a12 == 0.0 && affine.a21 == 0.0;
+        if translation_only {
+            #[cfg(feature = "appearance-mask-eraser")]
+            let field = app
+                .state
+                .project
+                .asset_appearances
+                .get(&asset_id)
+                .map(|appearance| appearance.field_transform);
+            #[cfg(not(feature = "appearance-mask-eraser"))]
+            let field = None;
+            app.textures.translate_raw_asset_cache(
+                asset_id,
+                Vec2::new(affine.tx, affine.ty),
+                field,
+            );
+        } else {
+            app.textures.invalidate_asset(asset_id);
+        }
     }
     changed
 }
@@ -10033,6 +10587,87 @@ fn raw_selection_supports_axis_resize(bounds: (f32, f32, f32, f32)) -> bool {
 #[cfg(test)]
 fn point_hits_selected_raw_paths(project: &ProjectV2, refs: &[PathRef], point: Vec2) -> bool {
     point_hits_selected_raw_paths_with_slop(project, refs, point, HitSlop::ONE_X)
+}
+
+fn point_hits_selected_raw_paths_cached_with_slop(
+    project: &ProjectV2,
+    textures: &mut TextureCache,
+    refs: &[PathRef],
+    point: Vec2,
+    slop: HitSlop,
+) -> bool {
+    #[cfg(not(feature = "appearance-mask-eraser"))]
+    {
+        let _ = textures;
+        return point_hits_selected_raw_paths_with_slop(project, refs, point, slop);
+    }
+    #[cfg(feature = "appearance-mask-eraser")]
+    {
+        let mut grouped = std::collections::BTreeMap::<_, Vec<PathRef>>::new();
+        for &reference in refs {
+            grouped
+                .entry((
+                    reference.q0rg_id,
+                    reference.layer_id,
+                    reference.placement_idx,
+                ))
+                .or_default()
+                .push(reference);
+        }
+        for ((q0rg_id, layer_id, placement_idx), group) in grouped {
+            let Some(vector) = raw_placement_asset_id(project, q0rg_id, layer_id, placement_idx)
+                .and_then(|id| {
+                    project.assets.iter().find_map(|asset| match asset {
+                        Asset::Vector(vector) if vector.asset_id == id => Some(vector),
+                        _ => None,
+                    })
+                })
+            else {
+                continue;
+            };
+            let mut indices: Vec<_> = group.iter().map(|reference| reference.path_idx).collect();
+            indices.sort_unstable();
+            indices.dedup();
+            if indices.len() != vector.paths.len()
+                || indices
+                    .iter()
+                    .enumerate()
+                    .any(|(index, actual)| index != *actual)
+            {
+                // Partial path selections retain their exact subset semantics.
+                if point_hits_selected_raw_paths_with_slop(project, &group, point, slop) {
+                    return true;
+                }
+                continue;
+            }
+            // A move isolates the selected raw component into its own asset.
+            // Reuse that immutable asset's flattened hit geometry on hover and
+            // wheel frames, rather than cloning and flattening every Bezier.
+            if vector.fill.is_some()
+                && interactive_visible_fill_hit_cached(
+                    vector,
+                    project.asset_appearances.get(&vector.asset_id),
+                    point,
+                    slop.edge,
+                    textures,
+                )
+            {
+                return true;
+            }
+            let radius = vector.stroke.as_ref().map_or(slop.stroke, |stroke| {
+                stroke.width.max(1.0) * 0.5 + slop.stroke
+            });
+            if textures
+                .appearance_hit_geometry(vector, project.asset_appearances.get(&vector.asset_id))
+                .strokes
+                .iter()
+                .any(|path| nearest_segment_distance(&path.points, point) <= radius)
+            {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 fn point_hits_selected_raw_paths_with_slop(
@@ -10419,8 +11054,9 @@ fn selected_raw_body_contains_point_with_slop(
             layer_id,
             placement_idx,
             path_idx,
-        } => point_hits_selected_raw_paths_with_slop(
+        } => point_hits_selected_raw_paths_cached_with_slop(
             &app.state.project,
+            &mut app.textures,
             &[PathRef {
                 q0rg_id,
                 layer_id,
@@ -10430,9 +11066,13 @@ fn selected_raw_body_contains_point_with_slop(
             point,
             slop,
         ),
-        Selection::Paths(refs) => {
-            point_hits_selected_raw_paths_with_slop(&app.state.project, &refs, point, slop)
-        }
+        Selection::Paths(refs) => point_hits_selected_raw_paths_cached_with_slop(
+            &app.state.project,
+            &mut app.textures,
+            &refs,
+            point,
+            slop,
+        ),
         Selection::StrokeSegment(segment) => {
             point_hits_stroke_segment_with_slop(&app.state.project, segment, point, slop)
         }
@@ -10451,9 +11091,13 @@ fn selected_raw_body_contains_point_with_slop(
             point,
             slop,
         ),
-        Selection::Mixed { paths, .. } => {
-            point_hits_selected_raw_paths_with_slop(&app.state.project, &paths, point, slop)
-        }
+        Selection::Mixed { paths, .. } => point_hits_selected_raw_paths_cached_with_slop(
+            &app.state.project,
+            &mut app.textures,
+            &paths,
+            point,
+            slop,
+        ),
         _ => false,
     };
     app.perf
@@ -10572,7 +11216,7 @@ fn isolate_partial_appearance_raw_refs(app: &mut EditorApp, refs: Vec<PathRef>) 
             .find(|asset| asset.id() == asset_id)
             .and_then(|asset| match asset {
                 Asset::Vector(vector) => Some(vector),
-                Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => None,
+                Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) | Asset::Model(_) => None,
             })
         else {
             return refs;
@@ -10796,9 +11440,15 @@ fn capture_whole_asset_appearances_for_raw_refs(
             // geometry starts moving. If an older buggy edit left a non-identity
             // field, freeze_material_source_from_current_body maps it back through
             // the inverse field first.
-            if crate::appearance::freeze_material_source_from_current_body(&vector, appearance) {
+            let field_changed = appearance.field_transform != Affine::IDENTITY;
+            if crate::appearance::freeze_material_source_from_current_body(&vector, appearance)
+                && field_changed
+            {
                 frozen_assets.push(asset_id);
             }
+            // At an identity field this only copies the same source paths into
+            // persistent metadata. Its visible geometry and warm render meshes
+            // are unchanged; invalidating them made the first drag hitch too.
             captured.push(AppearanceTransformSnapshot {
                 asset_id,
                 field_transform: appearance.field_transform,
@@ -11407,18 +12057,6 @@ fn selection_stroke_refs(selection: &Selection) -> Vec<PathRef> {
     }
 }
 
-pub(crate) fn selected_stroke_width(
-    project: &ProjectV2,
-    selection: &Selection,
-) -> Option<(f32, bool)> {
-    let mut widths = selection_stroke_refs(selection)
-        .into_iter()
-        .filter_map(|reference| stroke_for_path_ref(project, reference).map(|stroke| stroke.width));
-    let first = widths.next()?;
-    let mixed = widths.any(|width| (width - first).abs() > 1.0e-4);
-    Some((first, mixed))
-}
-
 fn raw_stroke_refs_need_isolation(project: &ProjectV2, refs: &[PathRef]) -> bool {
     let mut grouped: std::collections::BTreeMap<
         (u16, u16, usize),
@@ -11451,8 +12089,167 @@ fn raw_stroke_refs_need_isolation(project: &ProjectV2, refs: &[PathRef]) -> bool
         })
 }
 
+/// The selected raw parts, sorted into fills, whole lines and sides of
+/// filled shapes' outlines.
+fn selection_paint_parts(
+    project: &ProjectV2,
+    selection: &Selection,
+) -> (Vec<PathRef>, Vec<PathRef>, Vec<StrokeSegmentRef>) {
+    let (parts, strokes, segments, _) = raw_style_selection_parts(selection).unwrap_or_default();
+    if matches!(selection, Selection::RawParts { .. }) {
+        return (parts, strokes, segments);
+    }
+    // A whole path is both its fill and its outline.
+    let mut fills = Vec::new();
+    let mut lines = strokes;
+    for reference in parts {
+        let Some(asset_id) = raw_placement_asset_id(
+            project,
+            reference.q0rg_id,
+            reference.layer_id,
+            reference.placement_idx,
+        ) else {
+            continue;
+        };
+        let Some(Asset::Vector(vector)) =
+            project.assets.iter().find(|asset| asset.id() == asset_id)
+        else {
+            continue;
+        };
+        let Some(path) = vector.paths.get(reference.path_idx) else {
+            continue;
+        };
+        if vector.fill.is_some() && path.closed {
+            fills.push(reference);
+        }
+        if vector.stroke.is_some() {
+            lines.push(reference);
+        }
+    }
+    (fills, lines, segments)
+}
+
+fn fill_for_path_ref(project: &ProjectV2, reference: PathRef) -> Option<Rgba> {
+    let asset_id = raw_placement_asset_id(
+        project,
+        reference.q0rg_id,
+        reference.layer_id,
+        reference.placement_idx,
+    )?;
+    let Asset::Vector(vector) = project.assets.iter().find(|asset| asset.id() == asset_id)? else {
+        return None;
+    };
+    vector.paths.get(reference.path_idx)?;
+    vector.fill
+}
+
+/// How the selected raw parts are painted: the first stroke and fill
+/// found, each with whether the others differ from it.
+pub(crate) struct SelectedPaint {
+    pub stroke: Option<(VStroke, bool)>,
+    pub fill: Option<(Rgba, bool)>,
+}
+
+pub(crate) fn selected_paint(project: &ProjectV2, selection: &Selection) -> SelectedPaint {
+    let (fills, strokes, segments) = selection_paint_parts(project, selection);
+    let mut stroke_styles = strokes
+        .iter()
+        .copied()
+        .chain(segments.iter().map(|segment| segment.path))
+        .filter_map(|reference| stroke_for_path_ref(project, reference));
+    let stroke = stroke_styles
+        .next()
+        .map(|first| (first, stroke_styles.any(|other| other != first)));
+    let mut fill_colors = fills
+        .iter()
+        .filter_map(|reference| fill_for_path_ref(project, *reference));
+    let fill = fill_colors
+        .next()
+        .map(|first| (first, fill_colors.any(|other| other != first)));
+    SelectedPaint { stroke, fill }
+}
+
+/// Changes the fill of the selected raw parts. Parts sharing a drawing
+/// with others, or with an outline that is not selected, are lifted into
+/// their own first, so only what is selected changes.
+pub(crate) fn set_selected_fill(app: &mut EditorApp, color: Rgba) -> bool {
+    let selection = app.session.selection.clone();
+    let (fills, strokes, segments) = selection_paint_parts(&app.state.project, &selection);
+    if fills.is_empty() {
+        return false;
+    }
+    let Some(mut refs) =
+        prepare_raw_path_refs_for_edit(&mut app.state.project, &fills, app.session.current_frame)
+    else {
+        return false;
+    };
+    let outline_unselected = refs.iter().zip(&fills).any(|(mapped, source)| {
+        stroke_for_path_ref(&app.state.project, *mapped).is_some()
+            && (!strokes.contains(source) || segments.iter().any(|segment| segment.path == *source))
+    });
+    let isolated =
+        if outline_unselected || raw_stroke_refs_need_isolation(&app.state.project, &refs) {
+            let Some(isolated) = materialize_raw_style_parts(app, &refs, &[]) else {
+                return false;
+            };
+            refs = isolated;
+            true
+        } else {
+            false
+        };
+    let asset_ids: std::collections::BTreeSet<u16> = refs
+        .iter()
+        .filter_map(|reference| {
+            raw_placement_asset_id(
+                &app.state.project,
+                reference.q0rg_id,
+                reference.layer_id,
+                reference.placement_idx,
+            )
+        })
+        .collect();
+    let mut changed = false;
+    for asset_id in &asset_ids {
+        if let Some(Asset::Vector(vector)) = app
+            .state
+            .project
+            .assets
+            .iter_mut()
+            .find(|asset| asset.id() == *asset_id)
+        {
+            if vector.fill.is_some_and(|fill| fill != color) {
+                vector.fill = Some(color);
+                changed = true;
+            }
+        }
+    }
+    if changed || isolated {
+        app.textures.invalidate_assets(asset_ids);
+        if isolated {
+            app.session.selection = selection_from_group_parts(refs, Vec::new());
+        }
+        app.state.mark_dirty();
+    }
+    changed
+}
+
+#[cfg(test)]
 pub(crate) fn set_selected_stroke_width(app: &mut EditorApp, width: f32) -> bool {
     let width = width.clamp(0.1, 64.0);
+    let changed = restyle_selected_strokes(app, |stroke| stroke.width = width);
+    if changed {
+        app.session.stroke_width = width;
+    }
+    changed
+}
+
+/// Changes the outline of the selected raw parts with `restyle`: colour,
+/// width, ends or corners. Lines sharing a drawing with others are lifted
+/// into their own first, so only what is selected changes.
+pub(crate) fn restyle_selected_strokes(
+    app: &mut EditorApp,
+    restyle: impl Fn(&mut VStroke),
+) -> bool {
     let selection = app.session.selection.clone();
     let mut refs = if let Selection::StrokeSegment(segment) = &selection {
         let Some(reference) = materialize_raw_stroke_segment(app, *segment) else {
@@ -11530,15 +12327,16 @@ pub(crate) fn set_selected_stroke_width(app: &mut EditorApp, width: f32) -> bool
         let Some(stroke) = vector.stroke.as_mut() else {
             continue;
         };
-        if (stroke.width - width).abs() > 1.0e-4 {
-            stroke.width = width;
+        let before = *stroke;
+        restyle(stroke);
+        stroke.width = stroke.width.clamp(0.1, 64.0);
+        if *stroke != before {
             changed = true;
         }
     }
     if changed {
         app.textures.invalidate_assets(asset_ids);
         app.session.selection = selection_from_group_parts(refs, Vec::new());
-        app.session.stroke_width = width;
         app.state.mark_dirty();
     }
     changed
@@ -12759,7 +13557,20 @@ fn primitive_drag(
     kind: PrimitiveKind,
 ) {
     let pointer = primitive_pointer(response, cursor, view);
-    let shift = response.ctx.input(|input| input.modifiers.shift);
+    let (shift, alt) = response
+        .ctx
+        .input(|input| (input.modifiers.shift, input.modifiers.alt));
+    let from_middle = alt || app.settings.aids.from_middle;
+    let frame_nr = response.ctx.frame_nr();
+    let leave = crate::snap::Leave::default();
+    let snapped =
+        |app: &EditorApp, point: Vec2| crate::snap::point(app, point, view, &leave, frame_nr);
+    if !matches!(app.session.tool_state, ToolState::PrimitiveDrawing { .. }) {
+        // Show where a press would land.
+        if let Some(hover) = response.hover_pos() {
+            snapped(app, screen_to_stage(hover, view));
+        }
+    }
 
     if response.drag_started_by(PointerButton::Primary) {
         // egui starts a drag only once the pointer has travelled past its
@@ -12768,7 +13579,8 @@ fn primitive_drag(
             .ctx
             .input(|input| input.pointer.press_origin())
             .map(|screen| screen_to_stage(screen, view))
-            .or(pointer);
+            .or(pointer)
+            .map(|point| snapped(app, point));
         if let Some(point) = pressed.filter(|point| drawing_point_is_finite(*point)) {
             app.session.tool_state = ToolState::PrimitiveDrawing {
                 start: point,
@@ -12786,8 +13598,11 @@ fn primitive_drag(
     if response.dragged_by(PointerButton::Primary)
         || response.drag_stopped_by(PointerButton::Primary)
     {
+        let pointer = pointer
+            .filter(|point| drawing_point_is_finite(*point))
+            .map(|point| if shift { point } else { snapped(app, point) });
         if let ToolState::PrimitiveDrawing { start, end } = &mut app.session.tool_state {
-            if let Some(point) = pointer.filter(|point| drawing_point_is_finite(*point)) {
+            if let Some(point) = pointer {
                 *end = constrain_primitive_end(kind, *start, point, shift);
             }
         }
@@ -12797,6 +13612,11 @@ fn primitive_drag(
         if let ToolState::PrimitiveDrawing { start, end } =
             std::mem::replace(&mut app.session.tool_state, ToolState::Idle)
         {
+            let (start, end) = if from_middle {
+                primitive_from_middle(start, end)
+            } else {
+                (start, end)
+            };
             if let Some(path) = primitive_path(kind, start, end) {
                 commit_vector_path(app, path, DrawingMode::Merge);
             } else {
@@ -12804,6 +13624,12 @@ fn primitive_drag(
             }
         }
     }
+}
+
+/// A shape drawn from its middle: the drag's start is the middle and its
+/// end one corner, so the shape reaches as far the other way.
+fn primitive_from_middle(start: Vec2, end: Vec2) -> (Vec2, Vec2) {
+    (Vec2::new(2.0 * start.x - end.x, 2.0 * start.y - end.y), end)
 }
 
 fn anchor(p: Vec2) -> Anchor {
@@ -12913,6 +13739,7 @@ fn commit_vector_path(app: &mut EditorApp, new_path: VPath, mode: DrawingMode) {
                 DrawingMode::Merge => format!("Shape updated ({} paths)", path_count),
                 DrawingMode::Object => unreachable!(),
             };
+            cut_new_line_at_crossings(app, q0rg_id, layer_id, frame, asset_id, path_count - 1);
             return;
         }
     }
@@ -12951,6 +13778,7 @@ fn commit_vector_path(app: &mut EditorApp, new_path: VPath, mode: DrawingMode) {
         }
     }
     app.textures.invalidate_asset(asset_id);
+    cut_new_line_at_crossings(app, q0rg_id, layer_id, frame, asset_id, 0);
     if merge_closed_fill
         && crate::brush::merge_touching_raw_fills_after_edit_focused(
             &mut app.state.project,
@@ -12962,6 +13790,32 @@ fn commit_vector_path(app: &mut EditorApp, new_path: VPath, mode: DrawingMode) {
     {
         app.textures.invalidate();
         app.session.selection = Selection::None;
+    }
+}
+
+/// Cuts a freshly drawn line and the lines it crosses where they meet,
+/// while that is switched on.
+fn cut_new_line_at_crossings(
+    app: &mut EditorApp,
+    q0rg_id: u16,
+    layer_id: u16,
+    frame: u16,
+    asset_id: u16,
+    path_idx: usize,
+) {
+    if !app.settings.aids.split_crossings {
+        return;
+    }
+    if crate::crossings::cut_at_crossings(
+        &mut app.state.project,
+        q0rg_id,
+        layer_id,
+        frame,
+        asset_id,
+        path_idx,
+    ) {
+        app.textures.invalidate();
+        app.state.mark_dirty();
     }
 }
 
@@ -13674,6 +14528,9 @@ fn asset_visible_body_contains_point(
                     && local.x <= media.spec.width as f32
                     && local.y <= media.spec.height as f32
             }),
+        Asset::Model(model) => model.flat_bounds().is_some_and(|(min, max)| {
+            local.x >= min.x && local.y >= min.y && local.x <= max.x && local.y <= max.y
+        }),
         Asset::Rig(_) => false,
     }
 }
@@ -14333,15 +15190,16 @@ fn draw_in_progress_overlay(app: &EditorApp, painter: &Painter, view: &StageView
                     app.session.stroke_color.a,
                 );
                 let points: Vec<Pos2> = points.iter().map(|p| stage_to_screen(*p, view)).collect();
-                painter.add(Shape::Path(PathShape {
-                    points,
-                    closed: false,
-                    fill: Color32::TRANSPARENT,
-                    stroke: Stroke::new(
-                        app.session.stroke_width.max(0.5) * view.effective_scale(),
-                        stroke_color,
-                    ),
-                }));
+                if let Some(mesh) = crate::render::styled_stroke_mesh(
+                    &points,
+                    app.session.stroke_width.max(0.5) * view.effective_scale(),
+                    false,
+                    stroke_color,
+                    app.session.brush_cap,
+                    app.session.brush_join,
+                ) {
+                    painter.add(Shape::Mesh(mesh));
+                }
             }
         }
         ToolState::BrushDrawing { .. } => {
@@ -14355,7 +15213,14 @@ fn draw_in_progress_overlay(app: &EditorApp, painter: &Painter, view: &StageView
         }
         ToolState::PrimitiveDrawing { start, end } => {
             if let Some(kind) = primitive_kind_for_tool(app.session.current_tool) {
-                if let Some(path) = primitive_path(kind, *start, *end) {
+                let from_middle = app.settings.aids.from_middle
+                    || painter.ctx().input(|input| input.modifiers.alt);
+                let (start, end) = if from_middle {
+                    primitive_from_middle(*start, *end)
+                } else {
+                    (*start, *end)
+                };
+                if let Some(path) = primitive_path(kind, start, end) {
                     let points: Vec<Pos2> = flatten_path_for_stroke(&path)
                         .into_iter()
                         .map(|point| stage_to_screen(point, view))
@@ -14374,24 +15239,33 @@ fn draw_in_progress_overlay(app: &EditorApp, painter: &Painter, view: &StageView
                     } else {
                         Color32::TRANSPARENT
                     };
-                    painter.add(Shape::Path(PathShape {
-                        points,
-                        closed: path.closed,
-                        fill,
-                        stroke: Stroke::new(
-                            app.session.stroke_width.max(0.5) * view.effective_scale(),
-                            Color32::from_rgba_unmultiplied(
-                                app.session.stroke_color.r,
-                                app.session.stroke_color.g,
-                                app.session.stroke_color.b,
-                                app.session.stroke_color.a,
-                            ),
+                    if fill != Color32::TRANSPARENT {
+                        painter.add(Shape::Path(PathShape {
+                            points: points.clone(),
+                            closed: path.closed,
+                            fill,
+                            stroke: Stroke::NONE,
+                        }));
+                    }
+                    if let Some(mesh) = crate::render::styled_stroke_mesh(
+                        &points,
+                        app.session.stroke_width.max(0.5) * view.effective_scale(),
+                        path.closed,
+                        Color32::from_rgba_unmultiplied(
+                            app.session.stroke_color.r,
+                            app.session.stroke_color.g,
+                            app.session.stroke_color.b,
+                            app.session.stroke_color.a,
                         ),
-                    }));
+                        app.session.brush_cap,
+                        app.session.brush_join,
+                    ) {
+                        painter.add(Shape::Mesh(mesh));
+                    }
                 }
             }
         }
-        ToolState::Marquee { start } => {
+        ToolState::Marquee { start } | ToolState::SubselectMarquee { start } => {
             if let Some(c) = cursor {
                 let a = stage_to_screen(*start, view);
                 let b = c;
@@ -14417,8 +15291,213 @@ fn draw_in_progress_overlay(app: &EditorApp, painter: &Painter, view: &StageView
         | ToolState::DraggingPlacementSkew { .. }
         | ToolState::DraggingGroup { .. }
         | ToolState::DraggingTransformPivot { .. }
+        | ToolState::DraggingManyPoints { .. }
         | ToolState::Idle => {}
+        ToolState::KnifeDrawing { .. } => crate::knife::paint_preview(app, painter, view),
     }
+}
+
+/// The painted bodies of the selected line channels, unioned before stippling.
+/// Store stage-space geometry so pan and zoom only reproject the cached union.
+#[derive(Clone)]
+struct SelectedStrokeSurface {
+    revision: (u64, u64),
+    frame: u16,
+    selection: Selection,
+    surface: std::sync::Arc<MultiPolygon<f64>>,
+}
+
+fn selected_stroke_surface(app: &EditorApp, ctx: &Context) -> std::sync::Arc<MultiPolygon<f64>> {
+    let revision = (
+        app.active_project_tab_id().unwrap_or(0),
+        app.state.revision(),
+    );
+    let key = egui::Id::new("selected_stroke_surface");
+    if let Some(cached) = ctx.data(|data| data.get_temp::<SelectedStrokeSurface>(key)) {
+        if cached.revision == revision
+            && cached.frame == app.session.current_frame
+            && cached.selection == app.session.selection
+        {
+            return cached.surface;
+        }
+    }
+    let surface = build_selected_stroke_surface(app);
+    ctx.data_mut(|data| {
+        data.insert_temp(
+            key,
+            SelectedStrokeSurface {
+                revision,
+                frame: app.session.current_frame,
+                selection: app.session.selection.clone(),
+                surface: surface.clone(),
+            },
+        )
+    });
+    surface
+}
+
+fn build_selected_stroke_surface(app: &EditorApp) -> std::sync::Arc<MultiPolygon<f64>> {
+    let project = &app.state.project;
+    let mut whole: Vec<PathRef> = Vec::new();
+    let mut segments = Vec::new();
+    let mut clip = None;
+    let mut add_paths = |refs: &[PathRef]| {
+        for reference in refs {
+            let Some(asset_id) = raw_placement_asset_id(
+                project,
+                reference.q0rg_id,
+                reference.layer_id,
+                reference.placement_idx,
+            ) else {
+                continue;
+            };
+            let Some(Asset::Vector(vector)) = project.assets.iter().find(|a| a.id() == asset_id)
+            else {
+                continue;
+            };
+            if vector
+                .paths
+                .get(reference.path_idx)
+                .is_some_and(|path| !path.closed || vector.fill.is_none())
+            {
+                whole.push(*reference);
+            }
+        }
+    };
+    match &app.session.selection {
+        Selection::Path {
+            q0rg_id,
+            layer_id,
+            placement_idx,
+            path_idx,
+        } => add_paths(&[PathRef {
+            q0rg_id: *q0rg_id,
+            layer_id: *layer_id,
+            placement_idx: *placement_idx,
+            path_idx: *path_idx,
+        }]),
+        Selection::Paths(refs) | Selection::Mixed { paths: refs, .. } => add_paths(refs),
+        Selection::RawParts {
+            strokes,
+            stroke_segments,
+            ..
+        } => {
+            whole.extend(strokes);
+            segments.extend(stroke_segments);
+        }
+        Selection::StrokeSegment(segment) => segments.push(*segment),
+        Selection::RawArea {
+            placements,
+            bounds_min,
+            bounds_max,
+            clip_region,
+            ..
+        } => {
+            clip = Some(selection_clip_region(
+                (bounds_min.x, bounds_min.y, bounds_max.x, bounds_max.y),
+                clip_region.as_ref(),
+            ));
+            for reference in placements {
+                let Some(asset_id) = raw_placement_asset_id(
+                    project,
+                    reference.q0rg_id,
+                    reference.layer_id,
+                    reference.placement_idx,
+                ) else {
+                    continue;
+                };
+                let Some(Asset::Vector(vector)) =
+                    project.assets.iter().find(|a| a.id() == asset_id)
+                else {
+                    continue;
+                };
+                whole.extend((0..vector.paths.len()).map(|path_idx| PathRef {
+                    q0rg_id: reference.q0rg_id,
+                    layer_id: reference.layer_id,
+                    placement_idx: reference.placement_idx,
+                    path_idx,
+                }));
+            }
+        }
+        _ => {}
+    }
+    whole.sort_by_key(|r| (r.q0rg_id, r.layer_id, r.placement_idx, r.path_idx));
+    whole.dedup();
+    let mut polygons = Vec::new();
+    let mut append = |reference: PathRef, segment: Option<usize>| {
+        let Some(placement) = project
+            .q0rgs
+            .iter()
+            .find(|q| q.q0rg_id == reference.q0rg_id)
+            .and_then(|q| q.layers.iter().find(|l| l.layer_id == reference.layer_id))
+            .and_then(|l| l.placements.get(reference.placement_idx))
+        else {
+            return;
+        };
+        let Target::Asset(asset_id) = placement.target else {
+            return;
+        };
+        let Some(Asset::Vector(vector)) = project.assets.iter().find(|a| a.id() == asset_id) else {
+            return;
+        };
+        let Some(stroke) = vector.stroke else {
+            return;
+        };
+        let Some(path) = vector.paths.get(reference.path_idx) else {
+            return;
+        };
+        let part = segment.and_then(|index| authored_stroke_segment(path, index));
+        if segment.is_some() && part.is_none() {
+            return;
+        }
+        let path = part.as_ref().unwrap_or(path);
+        let transform = placement_transform_for_edit(
+            project,
+            reference.q0rg_id,
+            reference.layer_id,
+            reference.placement_idx,
+            app.session.current_frame,
+        )
+        .map(|(transform, _)| transform)
+        .unwrap_or(placement.transform);
+        let affine = Affine::from_transform(transform);
+        for contour in q0s_format::geom::stroke_polygons(
+            &flatten_path_for_stroke(path),
+            path.closed,
+            stroke.width * 0.5,
+            stroke.cap,
+            stroke.join,
+        ) {
+            if contour.len() < 3 {
+                continue;
+            }
+            let mut ring: Vec<Coord<f64>> = contour
+                .into_iter()
+                .map(|p| {
+                    let p = affine.apply(p);
+                    Coord {
+                        x: f64::from(p.x),
+                        y: f64::from(p.y),
+                    }
+                })
+                .collect();
+            ring.push(ring[0]);
+            polygons.push(Polygon::new(LineString(ring), Vec::new()));
+        }
+    };
+    for reference in &whole {
+        append(*reference, None);
+    }
+    for segment in segments {
+        if !whole.contains(&segment.path) {
+            append(segment.path, Some(segment.segment_idx));
+        }
+    }
+    let surface = geo::unary_union(polygons.iter());
+    std::sync::Arc::new(match clip {
+        Some(clip) => surface.intersection(&clip),
+        None => surface,
+    })
 }
 
 /// Draw selection bounds using the current theme accent.
@@ -14470,6 +15549,18 @@ pub fn draw_selection_overlay(app: &mut EditorApp, painter: &Painter, view: &Sta
     };
     let bounds_elapsed = transform_started.elapsed();
     let mut placement_pivot = None;
+    let boxed = transform_box_shown(app);
+    if app.session.current_tool != Tool::Subselect {
+        let surface = selected_stroke_surface(app, painter.ctx());
+        paint_selection_surface(
+            painter,
+            &surface_to_screen_contours(&surface, view),
+            selection_color(app),
+        );
+    }
+    painter
+        .ctx()
+        .data_mut(|data| data.insert_temp(egui::Id::new(FREE_MOVE_ID), !boxed));
     draw_selection_content_overlay(
         app,
         painter,
@@ -14479,8 +15570,10 @@ pub fn draw_selection_overlay(app: &mut EditorApp, painter: &Painter, view: &Sta
         &mut placement_pivot,
     );
     let transform_started = std::time::Instant::now();
-    draw_group_transform_frame(app, painter, view, selection_bounds);
-    draw_transform_pivot_overlay(app, painter, view, selection_bounds, placement_pivot);
+    if boxed {
+        draw_group_transform_frame(app, painter, view, selection_bounds);
+        draw_transform_pivot_overlay(app, painter, view, selection_bounds, placement_pivot);
+    }
     if let Some(geometry) = geometry {
         app.textures
             .store_placement_bounds_cache(geometry.bounds, revision);
@@ -14586,6 +15679,11 @@ fn draw_selection_content_overlay(
     } = app.session.selection
     {
         draw_subselect_path_overlay(app, painter, view, path, anchor_indices);
+        for (more, indices) in &app.session.subselect_more {
+            if *more != path {
+                draw_subselect_path_overlay(app, painter, view, *more, indices);
+            }
+        }
         return;
     }
     if let Selection::PathPoints {
@@ -14717,7 +15815,7 @@ fn draw_selection_content_overlay(
             stroke: Stroke::new(1.5_f32, accent),
         }));
 
-        if rig_bound || supports_axis_resize(active_transform) {
+        if (rig_bound || supports_axis_resize(active_transform)) && transform_box_shown(app) {
             for (_, world) in frame_handle_positions(frame) {
                 let point = stage_to_screen(world, view);
                 let handle = egui::Rect::from_center_size(point, egui::vec2(9.0, 9.0));
@@ -15458,7 +16556,7 @@ fn draw_clipped_raw_area_selection(
     if app.textures.raw_area_selection(&key).is_none() {
         let region = clip_region.clone();
         let mut surfaces = Vec::new();
-        let mut strokes = Vec::new();
+        let strokes = Vec::new();
         for (asset_id, _) in &key.assets {
             let Some(Asset::Vector(vector)) = app
                 .state
@@ -15473,18 +16571,6 @@ fn draw_clipped_raw_area_selection(
                 crate::perf::PerfCounter::SelectionPathCount,
                 vector.paths.len() as u64,
             );
-            if vector.stroke.is_some() {
-                let (paths, _) = clip_stroked_paths_in_region(vector, &region);
-                for path in paths {
-                    let points: Vec<_> = flatten_path(&path)
-                        .into_iter()
-                        .map(|point| pos2(point.x, point.y))
-                        .collect();
-                    if points.len() >= 2 {
-                        strokes.push(points);
-                    }
-                }
-            }
             if vector.fill.is_some() {
                 surfaces.push(
                     raw_selectable_fill_surface(&app.state.project, *asset_id, vector)
@@ -15861,6 +16947,9 @@ fn draw_stroke_segment_overlay(
     view: &StageView,
     segment: StrokeSegmentRef,
 ) {
+    if app.session.current_tool != Tool::Subselect {
+        return;
+    }
     let Some(vector) = stroke_segment_snapshot(&app.state.project, segment) else {
         return;
     };
@@ -15888,14 +16977,40 @@ fn draw_stroke_segment_overlay(
     if points.len() < 2 {
         return;
     }
-    painter.add(Shape::line(
-        points.clone(),
-        Stroke::new(3.0_f32, Color32::from_black_alpha(210)),
-    ));
-    painter.add(Shape::line(
+    let width = vector.stroke.map_or(1.0, |stroke| stroke.width)
+        * affine.uniform_scale()
+        * view.effective_scale().abs();
+    draw_selected_line(app, painter, points, false, width);
+}
+
+/// A selected line as the Select tool shows it: its whole painted body
+/// dotted like a selected fill. Subselect shows the line it runs along,
+/// where its points are.
+fn draw_selected_line(
+    app: &EditorApp,
+    painter: &Painter,
+    points: Vec<Pos2>,
+    closed: bool,
+    _width_px: f32,
+) {
+    // Select paints all selected strokes together, once, above. Drawing them
+    // separately doubles the stipple/alpha wherever two line bodies overlap.
+    if app.session.current_tool != Tool::Subselect {
+        return;
+    }
+    let accent = selection_color(app);
+    painter.add(Shape::Path(PathShape {
+        points: points.clone(),
+        closed,
+        fill: Color32::TRANSPARENT,
+        stroke: Stroke::new(3.0_f32, Color32::from_black_alpha(210)),
+    }));
+    painter.add(Shape::Path(PathShape {
         points,
-        Stroke::new(1.5_f32, selection_color(app)),
-    ));
+        closed,
+        fill: Color32::TRANSPARENT,
+        stroke: Stroke::new(1.5_f32, accent),
+    }));
 }
 
 fn draw_raw_stroke_parts_overlay(
@@ -15904,7 +17019,9 @@ fn draw_raw_stroke_parts_overlay(
     view: &StageView,
     refs: &[PathRef],
 ) {
-    let accent = selection_color(app);
+    if app.session.current_tool != Tool::Subselect {
+        return;
+    }
     for reference in refs {
         let Some(placement) = app
             .state
@@ -15945,18 +17062,10 @@ fn draw_raw_stroke_parts_overlay(
         if points.len() < 2 {
             continue;
         }
-        painter.add(Shape::Path(PathShape {
-            points: points.clone(),
-            closed: path.closed,
-            fill: Color32::TRANSPARENT,
-            stroke: Stroke::new(3.0_f32, Color32::from_black_alpha(210)),
-        }));
-        painter.add(Shape::Path(PathShape {
-            points,
-            closed: path.closed,
-            fill: Color32::TRANSPARENT,
-            stroke: Stroke::new(1.5_f32, accent),
-        }));
+        let width = vector.stroke.map_or(1.0, |stroke| stroke.width)
+            * affine.uniform_scale()
+            * view.effective_scale().abs();
+        draw_selected_line(app, painter, points, path.closed, width);
     }
 }
 
@@ -16018,32 +17127,27 @@ fn draw_raw_paths_overlay(
         // Open paths remain ordinary path overlays. Closed fill refs use the
         // resolved visual material surface, so erased mask regions disappear
         // from the stipple/outline while soft halo becomes selectable artwork.
-        for path_idx in &path_indices {
-            let Some(path) = vector.paths.get(*path_idx) else {
-                continue;
-            };
-            if path.closed && vector.fill.is_some() {
-                continue;
-            }
-            let placement_transform = Affine::from_transform(placement.transform);
-            let raw_points: Vec<Pos2> = flatten_path(path)
-                .into_iter()
-                .map(|point| stage_to_screen(placement_transform.apply(point), view))
-                .collect();
-            let points = crate::render::sanitize_display_polyline(&raw_points, 2.0, path.closed);
-            if points.len() >= 2 {
-                painter.add(Shape::Path(PathShape {
-                    points: points.clone(),
-                    closed: path.closed,
-                    fill: Color32::TRANSPARENT,
-                    stroke: Stroke::new(3.0_f32, Color32::from_black_alpha(210)),
-                }));
-                painter.add(Shape::Path(PathShape {
-                    points,
-                    closed: path.closed,
-                    fill: Color32::TRANSPARENT,
-                    stroke: Stroke::new(1.5_f32, selection_color(app)),
-                }));
+        if app.session.current_tool == Tool::Subselect {
+            for path_idx in &path_indices {
+                let Some(path) = vector.paths.get(*path_idx) else {
+                    continue;
+                };
+                if path.closed && vector.fill.is_some() {
+                    continue;
+                }
+                let placement_transform = Affine::from_transform(placement.transform);
+                let raw_points: Vec<Pos2> = flatten_path(path)
+                    .into_iter()
+                    .map(|point| stage_to_screen(placement_transform.apply(point), view))
+                    .collect();
+                let points =
+                    crate::render::sanitize_display_polyline(&raw_points, 2.0, path.closed);
+                if points.len() >= 2 {
+                    let width = vector.stroke.map_or(1.0, |stroke| stroke.width)
+                        * placement_transform.uniform_scale()
+                        * view.effective_scale().abs();
+                    draw_selected_line(app, painter, points, path.closed, width);
+                }
             }
         }
 
@@ -16332,7 +17436,17 @@ fn draw_partial_raw_selection(
     draw_flash_selection_box(painter, selection_rect, selection_color(app));
 }
 
+/// Set while the Select tool only moves: selection boxes lose their handles.
+const FREE_MOVE_ID: &str = "q0editor.free-move";
+
 fn draw_flash_selection_box(painter: &Painter, rect: egui::Rect, accent: Color32) {
+    if painter
+        .ctx()
+        .data(|data| data.get_temp::<bool>(egui::Id::new(FREE_MOVE_ID)))
+        .unwrap_or(false)
+    {
+        return;
+    }
     painter.rect_stroke(rect, 0.0, Stroke::new(1.0_f32, accent));
     for point in [
         rect.left_top(),
@@ -16640,7 +17754,22 @@ fn bucket_fill_at(app: &mut EditorApp, point: Vec2) -> bool {
     // Stroke intersections partition existing paint as well as empty space.
     // Resolve the planar face before choosing the fill underneath the cursor;
     // otherwise a background fill steals the click and is recoloured whole.
-    let region = find_bucket_face(&app.state.project, q0rg_id, layer_id, frame, point);
+    let mut region = find_bucket_face(&app.state.project, q0rg_id, layer_id, frame, point);
+    let gap = app.settings.aids.bucket_gap.pixels();
+    if gap > 0.0 {
+        // An outline with gaps in it still holds paint: the smaller of the
+        // closed face and the face with its gaps bridged wins.
+        if let Some(bridged) =
+            find_gap_closed_face(&app.state.project, q0rg_id, layer_id, frame, point, gap)
+        {
+            if region
+                .as_ref()
+                .is_none_or(|exact| bridged.unsigned_area() < exact.unsigned_area())
+            {
+                region = Some(bridged);
+            }
+        }
+    }
     if let Some(target) = find_bucket_target(&app.state.project, q0rg_id, layer_id, frame, point) {
         return recolour_bucket_target(app, target, color, region.as_ref());
     }
@@ -16712,7 +17841,7 @@ fn recolour_bucket_target(
         .find(|asset| asset.id() == asset_id)
         .and_then(|asset| match asset {
             Asset::Vector(vector) => Some(vector.clone()),
-            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => None,
+            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) | Asset::Model(_) => None,
         })
     else {
         return false;
@@ -17121,6 +18250,97 @@ fn find_bucket_face(
         let holes = geo::unary_union(inner_faces.iter());
         region = region.difference(&holes);
     }
+    (region.unsigned_area() > 0.05).then_some(region)
+}
+
+/// The empty area around `cursor` on `layer_id`, enclosed by what is drawn
+/// there once gaps up to `gap` stage pixels wide are bridged: everything
+/// drawn is thickened until such gaps shut, the enclosed hole is found and
+/// grown back by as much. `None` when the hole still runs off into the open.
+fn find_gap_closed_face(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    frame: u16,
+    cursor: Vec2,
+    gap: f32,
+) -> Option<MultiPolygon<f64>> {
+    use geo::Buffer;
+    if !project.layer_is_visible(q0rg_id, layer_id) || project.layer_is_locked(q0rg_id, layer_id) {
+        return None;
+    }
+    let layer = project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)?
+        .layers
+        .iter()
+        .find(|layer| layer.layer_id == layer_id)?;
+    let mut ink = vec![raw_fill_surface_on_layer(project, q0rg_id, layer_id, frame)];
+    for placement_idx in active_raw_placement_indices(project, layer, frame) {
+        let Target::Asset(asset_id) = layer.placements[placement_idx].target else {
+            continue;
+        };
+        let Some(Asset::Vector(vector)) =
+            project.assets.iter().find(|asset| asset.id() == asset_id)
+        else {
+            continue;
+        };
+        let Some(stroke) = vector.stroke else {
+            continue;
+        };
+        for path in &vector.paths {
+            let mut points = flatten_path(path);
+            if path.closed {
+                points.extend(points.first().copied());
+            }
+            if points.len() < 2 {
+                continue;
+            }
+            let line = LineString::new(
+                points
+                    .iter()
+                    .map(|point| Coord {
+                        x: f64::from(point.x),
+                        y: f64::from(point.y),
+                    })
+                    .collect(),
+            );
+            ink.push(line.buffer(f64::from(stroke.width.max(0.5)) * 0.5));
+        }
+    }
+    let ink = geo::unary_union(ink.iter());
+    let frame_box = ink.bounding_rect()?;
+    let half = f64::from(gap) * 0.5;
+    let shut = ink.buffer(half);
+    let margin = f64::from(gap) * 2.0 + 16.0;
+    let outer = geo::Rect::new(
+        Coord {
+            x: frame_box.min().x - margin,
+            y: frame_box.min().y - margin,
+        },
+        Coord {
+            x: frame_box.max().x + margin,
+            y: frame_box.max().y + margin,
+        },
+    );
+    let open = MultiPolygon(vec![outer.to_polygon()]).difference(&shut);
+    let point = Point::new(f64::from(cursor.x), f64::from(cursor.y));
+    let hole = open
+        .0
+        .into_iter()
+        .find(|polygon| polygon.contains(&point))?;
+    // The hole around everything is the outside, not an enclosed area.
+    let hole_box = hole.bounding_rect()?;
+    let edge = margin * 0.5;
+    if hole_box.min().x <= outer.min().x + edge
+        || hole_box.min().y <= outer.min().y + edge
+        || hole_box.max().x >= outer.max().x - edge
+        || hole_box.max().y >= outer.max().y - edge
+    {
+        return None;
+    }
+    let region = MultiPolygon(vec![hole]).buffer(half);
     (region.unsigned_area() > 0.05).then_some(region)
 }
 
@@ -18334,6 +19554,9 @@ mod tests {
     #[test]
     fn clicking_then_dragging_a_stroked_fill_detaches_fill_from_outline() {
         let mut app = EditorApp::default();
+        // This checks a precise drag delta, independently of the user's saved
+        // magnet preference. Snapping has its own on/off interaction coverage.
+        app.settings.aids.snap = false;
         let color = Rgba {
             r: 60,
             g: 100,
@@ -18505,7 +19728,7 @@ mod tests {
                 asset_id: 1,
                 width: 10,
                 height: 10,
-                rgba: vec![255; 400],
+                rgba: vec![255; 400].into(),
             }));
         for (x, y) in [(10.0, 10.0), (100.0, 100.0)] {
             project.q0rgs[0].layers[0].push_placement(Placement {
@@ -18556,7 +19779,7 @@ mod tests {
                 asset_id: 1,
                 width: 10,
                 height: 10,
-                rgba: vec![255; 400],
+                rgba: vec![255; 400].into(),
             }));
         project.q0rgs.push(Q0rg {
             q0rg_id: 2,
@@ -21075,7 +22298,7 @@ mod tests {
             .find(|asset| asset.id() == original_asset)
             .and_then(|asset| match asset {
                 Asset::Vector(vector) => vector.paths.first(),
-                Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => None,
+                Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) | Asset::Model(_) => None,
             })
             .expect("original path");
         let current = project
@@ -21084,7 +22307,7 @@ mod tests {
             .find(|asset| asset.id() == current_asset)
             .and_then(|asset| match asset {
                 Asset::Vector(vector) => vector.paths.first(),
-                Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => None,
+                Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) | Asset::Model(_) => None,
             })
             .expect("current path");
         assert_eq!(original.anchors[0].point.x, 0.0);
@@ -21430,7 +22653,7 @@ mod tests {
         let mesh = advanced_preview_mesh(&dabs, &view, settings);
         for dab in &dabs {
             let point = stage_to_screen(dab.center, &view);
-            let covered = mesh.indices.chunks_exact(3).any(|triangle| {
+            let covered = mesh.indices.as_chunks::<3>().0.iter().any(|triangle| {
                 triangle_contains(
                     point,
                     mesh.vertices[triangle[0] as usize].pos,
@@ -22136,7 +23359,7 @@ mod tests {
 
         let vector = match &project.assets[0] {
             Asset::Vector(vector) => vector,
-            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => unreachable!(),
+            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) | Asset::Model(_) => unreachable!(),
         };
         let surface = vector_fill_geometry(vector);
         assert!(surface.contains(&Point::new(100.0, 100.0)));
@@ -22181,7 +23404,7 @@ mod tests {
         }
         let vector = match &project.assets[0] {
             Asset::Vector(vector) => vector,
-            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => unreachable!(),
+            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) | Asset::Model(_) => unreachable!(),
         };
         let moved = vector_fill_geometry(vector);
         assert!(
@@ -22447,7 +23670,7 @@ mod tests {
         let project = appearance_selection_project(true);
         let vector = match &project.assets[0] {
             Asset::Vector(vector) => vector,
-            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => unreachable!(),
+            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) | Asset::Model(_) => unreachable!(),
         };
         let appearance = project.asset_appearances.get(&1).expect("appearance");
         let mut cache = TextureCache::default();
@@ -22644,7 +23867,7 @@ mod tests {
         app.state.project = appearance_selection_project(false);
         let before_vector = match &app.state.project.assets[0] {
             Asset::Vector(vector) => vector.clone(),
-            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => unreachable!(),
+            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) | Asset::Model(_) => unreachable!(),
         };
         let before_appearance = app.state.project.asset_appearances[&1].clone();
         let before_visible = crate::appearance::visible_material_surface_for_vector(
@@ -22702,7 +23925,7 @@ mod tests {
         ));
         let moved_vector = match &app.state.project.assets[0] {
             Asset::Vector(vector) => vector,
-            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => unreachable!(),
+            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) | Asset::Model(_) => unreachable!(),
         };
         let moved_appearance = app
             .state
@@ -22796,7 +24019,7 @@ mod tests {
         assert_eq!(repaired.field_transform, old_field);
         let current_vector = match &app.state.project.assets[0] {
             Asset::Vector(vector) => vector,
-            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => unreachable!(),
+            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) | Asset::Model(_) => unreachable!(),
         };
         let expected = crate::appearance::material_support(
             &vector_fill_geometry(current_vector),
@@ -22880,7 +24103,7 @@ mod tests {
                 vector,
                 app.state.project.asset_appearances.get(&selected_asset_id),
             ),
-            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => unreachable!(),
+            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) | Asset::Model(_) => unreachable!(),
         };
         let neighbor_before = match app
             .state
@@ -22894,7 +24117,7 @@ mod tests {
                 vector,
                 app.state.project.asset_appearances.get(&neighbor_asset_id),
             ),
-            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => unreachable!(),
+            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) | Asset::Model(_) => unreachable!(),
         };
         let neighbor_vector_before = app
             .state
@@ -22930,7 +24153,7 @@ mod tests {
                 vector,
                 app.state.project.asset_appearances.get(&selected_asset_id),
             ),
-            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => unreachable!(),
+            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) | Asset::Model(_) => unreachable!(),
         };
         let neighbor_after = match app
             .state
@@ -22944,7 +24167,7 @@ mod tests {
                 vector,
                 app.state.project.asset_appearances.get(&neighbor_asset_id),
             ),
-            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => unreachable!(),
+            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) | Asset::Model(_) => unreachable!(),
         };
         let expected_selected = crate::appearance::transform_surface(&selected_before, transform);
         assert!(surface_mismatch_area(&selected_after, &expected_selected) < 0.05);
@@ -22967,7 +24190,7 @@ mod tests {
         let project = appearance_selection_project(false);
         let vector = match &project.assets[0] {
             Asset::Vector(vector) => vector,
-            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => unreachable!(),
+            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) | Asset::Model(_) => unreachable!(),
         };
         let paths = std::sync::Arc::new(vector.paths.clone());
         let appearance = project.asset_appearances.get(&1).expect("appearance");
@@ -24950,7 +26173,7 @@ mod tests {
             .find(|asset| asset.id() == source_asset)
             .and_then(|asset| match asset {
                 Asset::Vector(vector) => vector.fill,
-                Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => None,
+                Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) | Asset::Model(_) => None,
             });
         let current_fill = app
             .state
@@ -24960,7 +26183,7 @@ mod tests {
             .find(|asset| asset.id() == current_asset)
             .and_then(|asset| match asset {
                 Asset::Vector(vector) => vector.fill,
-                Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => None,
+                Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) | Asset::Model(_) => None,
             });
         assert_eq!(source_fill, Some(old));
         assert_eq!(current_fill, Some(new));
@@ -25016,7 +26239,7 @@ mod tests {
             .iter()
             .filter_map(|asset| match asset {
                 Asset::Vector(vector) => vector.fill,
-                Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) => None,
+                Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) | Asset::Model(_) => None,
             })
             .collect();
         assert!(fills.contains(&old));
@@ -27486,6 +28709,577 @@ mod tests {
         app
     }
 
+    fn raw_move_zoom_app() -> EditorApp {
+        let mut project = project_with_line();
+        project.meta.stage_width = 640;
+        project.meta.stage_height = 480;
+        project.assets = vec![Asset::Vector(VectorAsset {
+            asset_id: 1,
+            paths: vec![VPath {
+                anchors: (0..512)
+                    .map(|index| {
+                        let angle = std::f32::consts::TAU * index as f32 / 512.0;
+                        let radius = 70.0 + (angle * 11.0).sin() * 0.4;
+                        anchor(Vec2::new(
+                            160.0 + radius * angle.cos(),
+                            140.0 + radius * angle.sin(),
+                        ))
+                    })
+                    .collect(),
+                closed: true,
+            }],
+            fill: Some(Rgba {
+                r: 30,
+                g: 90,
+                b: 170,
+                a: 255,
+            }),
+            stroke: None,
+        })];
+        project.asset_appearances.clear();
+        project.q0rgs[0].layers[0].placements[0].transform = Transform2D::IDENTITY;
+        project.q0rgs[0].layers[0].placements[0].target = Target::Asset(1);
+        let mut app = select_tool_app(project);
+        app.settings.aids.snap = false;
+        app
+    }
+
+    #[test]
+    fn raw_move_zoom_short_repeated_drags_apply_every_time() {
+        let mut app = raw_move_zoom_app();
+        let mut stage = StageHarness::new(&mut app);
+        for index in 0..6 {
+            let x = 160.0 + index as f32 * 24.0;
+            let y = 140.0 + index as f32 * 8.0;
+            let before = app.state.project.assets[0].clone();
+            stage.press(&mut app, x, y);
+            stage.drag_to(&mut app, x + 24.0, y + 8.0);
+            stage.release(&mut app, x + 24.0, y + 8.0);
+            assert!(matches!(app.session.tool_state, ToolState::Idle));
+            assert!(
+                app.state.project.assets[0] != before,
+                "raw graphics ignored drag {}",
+                index + 1
+            );
+            let Asset::Vector(vector) = &app.state.project.assets[0] else {
+                unreachable!()
+            };
+            assert!(
+                (vector.paths[0].anchors[0].point.x - (230.0 + (index + 1) as f32 * 24.0)).abs()
+                    < 0.01,
+                "drag {} did not apply its complete displacement",
+                index + 1
+            );
+        }
+    }
+
+    #[test]
+    fn raw_move_zoom_release_applies_the_last_pointer_position() {
+        let mut app = raw_move_zoom_app();
+        let mut stage = StageHarness::new(&mut app);
+        stage.press(&mut app, 160.0, 140.0);
+        stage.drag_to(&mut app, 184.0, 148.0);
+        stage.drag_to(&mut app, 200.0, 150.0);
+        stage.release(&mut app, 220.0, 150.0);
+        let Asset::Vector(vector) = &app.state.project.assets[0] else {
+            unreachable!()
+        };
+        assert!(
+            (vector.paths[0].anchors[0].point.x - 290.0).abs() < 0.01,
+            "release lost the last part of the movement: {:?}",
+            vector.paths[0].anchors[0].point
+        );
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn raw_move_zoom_released_geometry_keeps_camera_independent_selection_cache() {
+        let mut app = raw_move_zoom_app();
+        let reference = PathRef {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: 0,
+            path_idx: 0,
+        };
+        app.session.selection = Selection::Paths(vec![reference]);
+        let ctx = Context::default();
+        let rect = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        for step in 0..3 {
+            assert!(begin_dragging_raw_paths(
+                &mut app,
+                vec![reference],
+                Vec2::new(160.0, 140.0),
+                "test move"
+            ));
+            let transform = Affine {
+                tx: 13.375,
+                ty: -4.625,
+                ..Affine::IDENTITY
+            };
+            assert!(set_raw_refs_live_transform(
+                &mut app.state.project,
+                &[reference],
+                transform
+            ));
+            assert!(bake_raw_refs_live_transform(&mut app, &[reference]));
+            app.session.tool_state = ToolState::Idle;
+            app.state.mark_dirty();
+            let builds = app.textures.selection_paint_build_count();
+            let started = std::time::Instant::now();
+            for scale in [0.75, 1.0, 1.4, 2.1, 3.7, 6.0, 12.3, 32.0] {
+                let view = StageView {
+                    origin: pos2(
+                        400.0 - (160.0 + (step + 1) as f32 * 13.375) * scale,
+                        300.0 - (140.0 - (step + 1) as f32 * 4.625) * scale,
+                    ),
+                    scale,
+                    stage_rect: rect,
+                    edit_transform: Affine::IDENTITY,
+                };
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(rect),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        let painter = ctx.layer_painter(egui::LayerId::new(
+                            egui::Order::Middle,
+                            egui::Id::new("raw-move-zoom"),
+                        ));
+                        draw_selection_overlay(&mut app, &painter, &view);
+                    },
+                );
+            }
+            eprintln!(
+                "raw move {} then zoom: {:?}, paint rebuilds={}",
+                step + 1,
+                started.elapsed(),
+                app.textures.selection_paint_build_count() - builds
+            );
+            assert_eq!(
+                app.textures.selection_paint_build_count() - builds,
+                usize::from(step == 0),
+                "moving the raw fill forced selection tessellation on every zoom step"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_move_zoom_warm_sixteen_contours_keep_scene_and_selection_triangles() {
+        for with_field in [false, true] {
+            let mut app = raw_move_zoom_app();
+            let Asset::Vector(vector) = &mut app.state.project.assets[0] else {
+                unreachable!()
+            };
+            let original = vector.paths[0].clone();
+            vector.paths = (0..16)
+                .map(|index| {
+                    let mut path = original.clone();
+                    for anchor in &mut path.anchors {
+                        anchor.point = Vec2::new(
+                            (anchor.point.x - 160.0) * 0.3 + 60.0 + (index % 4) as f32 * 120.0,
+                            (anchor.point.y - 140.0) * 0.3 + 60.0 + (index / 4) as f32 * 100.0,
+                        );
+                    }
+                    path
+                })
+                .collect();
+            if with_field {
+                app.state.project.asset_appearances.insert(
+                    1,
+                    q0s_format::v2::VectorAppearance {
+                        material: q0s_format::v2::VectorMaterial::Solid,
+                        material_source: Vec::new(),
+                        erase_mask: Vec::new(),
+                        clip_mask: Vec::new(),
+                        field_transform: Affine::IDENTITY,
+                        fill_gradient: None,
+                    },
+                );
+            }
+            let refs: Vec<_> = (0..16)
+                .map(|path_idx| PathRef {
+                    q0rg_id: 1,
+                    layer_id: 1,
+                    placement_idx: 0,
+                    path_idx,
+                })
+                .collect();
+            app.session.selection = Selection::Paths(refs.clone());
+            let ctx = Context::default();
+            let rect = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+            let paint = |app: &mut EditorApp, scale: f32| {
+                let view = StageView {
+                    origin: pos2(10.0, 10.0),
+                    scale,
+                    stage_rect: rect,
+                    edit_transform: Affine::IDENTITY,
+                };
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(rect),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        let painter = ctx.layer_painter(egui::LayerId::new(
+                            egui::Order::Middle,
+                            egui::Id::new("sixteen-contour-move-zoom"),
+                        ));
+                        crate::render::render_stage(
+                            &painter,
+                            &app.state.project,
+                            1,
+                            0,
+                            &view,
+                            &mut app.textures,
+                            ctx,
+                        );
+                        draw_selection_overlay(app, &painter, &view);
+                    },
+                );
+            };
+            paint(&mut app, 1.0);
+            let paints = app.textures.selection_paint_build_count();
+            let stages = app.textures.selection_stage_mesh_build_count();
+            let renders = app.textures.vector_render_geometry_build_count();
+            let started = std::time::Instant::now();
+            for _ in 0..3 {
+                assert!(begin_dragging_raw_paths(
+                    &mut app,
+                    refs.clone(),
+                    Vec2::new(60.0, 60.0),
+                    "test move"
+                ));
+                assert!(set_raw_refs_live_transform(
+                    &mut app.state.project,
+                    &refs,
+                    Affine {
+                        tx: 13.375,
+                        ty: -4.625,
+                        ..Affine::IDENTITY
+                    }
+                ));
+                assert!(bake_raw_refs_live_transform(&mut app, &refs));
+                app.session.tool_state = ToolState::Idle;
+                app.state.mark_dirty();
+                for scale in [1.0, 1.5, 2.1, 12.3] {
+                    paint(&mut app, scale);
+                }
+            }
+            eprintln!("16 contours, three releases and 12 zoom frames, field={with_field}: {:?}, selection rebuilds={}", started.elapsed(), app.textures.selection_paint_build_count() - paints);
+            assert_eq!(
+                app.textures.selection_paint_build_count(),
+                paints,
+                "release discarded warm selection paint"
+            );
+            assert_eq!(
+                app.textures.selection_stage_mesh_build_count(),
+                stages,
+                "release discarded warm stage topology"
+            );
+            assert_eq!(
+                app.textures.vector_render_geometry_build_count(),
+                renders,
+                "release discarded warm scene triangles"
+            );
+        }
+    }
+
+    #[test]
+    fn brush_zoom_cached_sweeps_keep_all_nibs_and_negative_coordinates() {
+        for nib in crate::brush::BrushNib::ALL {
+            let settings = crate::brush::BrushSettings {
+                nib,
+                size: 10.0,
+                pressure_size: true,
+                ..Default::default()
+            };
+            let mut stroke = crate::brush::brush_begin(
+                settings,
+                crate::brush::BrushSample::pointer(Vec2::new(-500.0, -400.0), Some(0.5), 0.0),
+            );
+            for index in 1..96 {
+                crate::brush::brush_add_sample(
+                    &mut stroke,
+                    settings,
+                    crate::brush::BrushSample::pointer(
+                        Vec2::new(
+                            -500.0 + index as f32 * 2.0,
+                            -400.0 + (index as f32 * 0.2).sin() * 12.0,
+                        ),
+                        Some(0.5 + (index as f32 * 0.1).sin() * 0.4),
+                        index as f64 / 120.0,
+                    ),
+                );
+            }
+            let dabs = crate::brush::brush_prerender_dabs(&stroke);
+            let samples = stroke.samples.clone();
+            let _ = crate::brush::brush_prerender_geometry(&mut stroke);
+            let builds = stroke.prerender_segment_builds;
+            for scale in [0.75, 2.0, 12.3] {
+                let view = StageView {
+                    origin: pos2(700.0, 600.0),
+                    scale,
+                    stage_rect: egui::Rect::from_min_max(Pos2::ZERO, pos2(800.0, 600.0)),
+                    edit_transform: Affine::IDENTITY,
+                };
+                let expected = classic_prerender_contours(&dabs, nib, &view, 0.0);
+                let actual = classic_cached_prerender_in_view(
+                    crate::brush::brush_prerender_geometry(&mut stroke),
+                    &view,
+                );
+                assert_eq!(actual.len(), expected.len());
+                for (actual, expected) in actual.iter().zip(&expected) {
+                    let close = |points: &[Pos2]| {
+                        points
+                            .iter()
+                            .chain(points.first())
+                            .map(|p| Vec2::new(p.x, p.y))
+                            .collect::<Vec<_>>()
+                    };
+                    let a = close(actual);
+                    let b = close(expected);
+                    assert!(
+                        a.iter()
+                            .all(|point| nearest_segment_distance(&b, *point) < 0.01)
+                            && b.iter()
+                                .all(|point| nearest_segment_distance(&a, *point) < 0.01),
+                        "cached {nib:?} silhouette changed at zoom {scale}"
+                    );
+                }
+                assert_eq!(
+                    stroke.prerender_segment_builds, builds,
+                    "zoom rebuilt recorded nib geometry"
+                );
+                assert_eq!(stroke.samples, samples, "preview changed authored samples");
+            }
+        }
+    }
+
+    #[test]
+    fn brush_zoom_long_stroke_reprojects_cached_geometry_without_hull_rebuilds() {
+        let settings = crate::brush::BrushSettings::default();
+        let mut stroke = crate::brush::brush_begin(
+            settings,
+            crate::brush::BrushSample::mouse(Vec2::new(-300.0, -200.0)),
+        );
+        for index in 1..1000 {
+            crate::brush::brush_add_sample(
+                &mut stroke,
+                settings,
+                crate::brush::BrushSample::mouse(Vec2::new(
+                    -300.0 + index as f32 * 0.2,
+                    -200.0 + (index as f32 * 0.02).sin() * 20.0,
+                )),
+            );
+            let _ = crate::brush::brush_prerender_geometry(&mut stroke);
+        }
+        let dabs = crate::brush::brush_prerender_dabs(&stroke);
+        let builds = stroke.prerender_segment_builds;
+        let views = [1.2, 1.5, 1.8, 2.1].map(|scale| StageView {
+            origin: pos2(500.0, 400.0),
+            scale,
+            stage_rect: egui::Rect::from_min_max(Pos2::ZERO, pos2(800.0, 600.0)),
+            edit_transform: Affine::IDENTITY,
+        });
+        let started = std::time::Instant::now();
+        for view in &views {
+            std::hint::black_box(classic_prerender_contours(&dabs, settings.nib, view, 0.0));
+        }
+        let old = started.elapsed();
+        let started = std::time::Instant::now();
+        for view in &views {
+            std::hint::black_box(classic_cached_prerender_in_view(
+                crate::brush::brush_prerender_geometry(&mut stroke),
+                view,
+            ));
+        }
+        eprintln!(
+            "brush zoom 1000 samples, four views: repeated hulls={old:?}, cached projection={:?}",
+            started.elapsed()
+        );
+        assert_eq!(stroke.prerender_segment_builds, builds);
+    }
+
+    #[test]
+    fn brush_zoom_drawing_outside_paper_survives_zoom_and_release() {
+        let mut app = select_tool_app(project_with_line());
+        app.state.project.assets.clear();
+        app.state.project.q0rgs[0].layers[0].placements.clear();
+        app.session.current_tool = Tool::Brush;
+        app.session.brush_mode = crate::advanced_brush::BrushMode::Classic;
+        app.session.brush.size = 12.0;
+        app.session.brush.smoothing = 0;
+        let mut stage = StageHarness::new(&mut app);
+        app.session.viewport.pan.x += 1200.0;
+        app.session.viewport.pan.y += 800.0;
+        stage.frame(
+            &mut app,
+            vec![egui::Event::PointerMoved(pos2(180.0, 180.0))],
+        );
+        stage.frame(&mut app, press(180.0, 180.0, true));
+        stage.frame(
+            &mut app,
+            vec![egui::Event::PointerMoved(pos2(220.0, 180.0))],
+        );
+        stage.frame(
+            &mut app,
+            vec![egui::Event::PointerMoved(pos2(250.0, 200.0))],
+        );
+        stage.frame(&mut app, vec![egui::Event::Scroll(egui::vec2(0.0, 1200.0))]);
+        for _ in 0..4 {
+            stage.frame(&mut app, vec![]);
+        }
+        stage.frame(
+            &mut app,
+            vec![egui::Event::PointerMoved(pos2(270.0, 210.0))],
+        );
+        let ToolState::BrushDrawing { stroke } = &app.session.tool_state else {
+            panic!("outside-paper drawing stopped");
+        };
+        assert!(stroke
+            .samples
+            .iter()
+            .all(|sample| sample.position.x < 0.0 && sample.position.y < 0.0));
+        stage.frame(&mut app, press(270.0, 210.0, false));
+        let Asset::Vector(vector) = app
+            .state
+            .project
+            .assets
+            .first()
+            .expect("outside-paper stroke was lost")
+        else {
+            unreachable!()
+        };
+        assert!(vector
+            .paths
+            .iter()
+            .flat_map(|path| &path.anchors)
+            .all(|anchor| anchor.point.x < 0.0 && anchor.point.y < 0.0));
+        assert!(!app.state.project.q0rgs[0].layers[0].placements.is_empty());
+    }
+
+    #[cfg(feature = "appearance-mask-eraser")]
+    #[test]
+    fn raw_move_zoom_selected_body_reuses_flattened_asset_after_move() {
+        let mut app = raw_move_zoom_app();
+        let reference = PathRef {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: 0,
+            path_idx: 0,
+        };
+        app.session.selection = Selection::Paths(vec![reference]);
+        assert!(begin_dragging_raw_paths(
+            &mut app,
+            vec![reference],
+            Vec2::new(160.0, 140.0),
+            "test move"
+        ));
+        assert!(set_raw_refs_live_transform(
+            &mut app.state.project,
+            &[reference],
+            Affine {
+                tx: 13.375,
+                ty: -4.625,
+                ..Affine::IDENTITY
+            }
+        ));
+        assert!(bake_raw_refs_live_transform(&mut app, &[reference]));
+        app.session.tool_state = ToolState::Idle;
+        let builds = app.textures.appearance_hit_build_count();
+        for _ in 0..120 {
+            assert!(selected_raw_body_contains_point(
+                &mut app,
+                Vec2::new(173.375, 135.375)
+            ));
+        }
+        assert_eq!(
+            app.textures.appearance_hit_build_count() - builds,
+            1,
+            "selected hover did not retain its flattened geometry after a move"
+        );
+    }
+
+    #[test]
+    fn brush_zoom_release_preserves_drawn_width_and_committed_artwork() {
+        for scale_with_stage in [true, false] {
+            let mut app = select_tool_app(project_with_line());
+            app.state.project.assets.clear();
+            app.state.project.q0rgs[0].layers[0].placements.clear();
+            app.session.current_tool = Tool::Brush;
+            app.session.brush_mode = crate::advanced_brush::BrushMode::Classic;
+            app.session.brush = crate::brush::BrushSettings {
+                size: 20.0,
+                smoothing: 0,
+                scale_with_stage,
+                ..Default::default()
+            };
+            let mut stage = StageHarness::new(&mut app);
+            stage.frame(&mut app, press(180.0, 180.0, true));
+            stage.frame(
+                &mut app,
+                vec![egui::Event::PointerMoved(pos2(210.0, 180.0))],
+            );
+            stage.frame(
+                &mut app,
+                vec![egui::Event::PointerMoved(pos2(240.0, 180.0))],
+            );
+            let ToolState::BrushDrawing { stroke } = &app.session.tool_state else {
+                panic!("brush gesture did not start");
+            };
+            let initial_size = crate::brush::brush_preview_size(stroke);
+            let mut settings = app.session.brush;
+            settings.size = initial_size;
+            let expected = crate::brush::brush_finish(stroke.clone(), settings);
+            stage.frame(&mut app, vec![egui::Event::Scroll(egui::vec2(0.0, 2000.0))]);
+            for _ in 0..4 {
+                stage.frame(&mut app, vec![]);
+            }
+            assert!(
+                app.session.viewport.zoom > 2.0,
+                "wheel zoom did not run: {}",
+                app.session.viewport.zoom
+            );
+            let ToolState::BrushDrawing { stroke } = &app.session.tool_state else {
+                panic!("zoom abandoned the gesture");
+            };
+            assert_eq!(
+                crate::brush::brush_prerender_dab_at(stroke, 0).unwrap().1,
+                initial_size,
+                "zoom retroactively changed the stroke width"
+            );
+            stage.frame(&mut app, press(240.0, 180.0, false));
+            assert!(matches!(app.session.tool_state, ToolState::Idle));
+            let Asset::Vector(vector) = app
+                .state
+                .project
+                .assets
+                .first()
+                .expect("pointer-up discarded the stroke")
+            else {
+                panic!("expected a vector stroke");
+            };
+            let actual = crate::brush::vector_fill_geometry(vector);
+            assert!(
+                (actual.unsigned_area() / expected.unsigned_area() - 1.0).abs() < 0.05,
+                "committed width differs from the drawn stroke: expected={}, actual={}",
+                expected.unsigned_area(),
+                actual.unsigned_area()
+            );
+            let committed = app.state.project.clone();
+            for _ in 0..20 {
+                stage.frame(&mut app, vec![]);
+            }
+            app.textures.invalidate();
+            stage.frame(&mut app, vec![]);
+            assert_eq!(
+                app.state.project, committed,
+                "later frames or cache invalidation lost the committed stroke"
+            );
+        }
+    }
+
     /// F6 mid-drag on a symbol, through the whole stage as the editor runs it.
     #[test]
     fn f6_mid_drag_on_the_stage_keeps_the_object_following_the_pointer() {
@@ -27585,5 +29379,790 @@ mod tests {
             (second - 40.0).abs() < 1.0,
             "frame 1 followed the drag: {second}"
         );
+    }
+}
+
+#[cfg(test)]
+mod sprite_tests {
+    use super::*;
+    use crate::app::Action;
+
+    fn ink() -> VStroke {
+        VStroke {
+            color: Rgba {
+                r: 20,
+                g: 20,
+                b: 20,
+                a: 255,
+            },
+            width: 2.0,
+            cap: q0s_format::geom::CapShape::Round,
+            join: q0s_format::geom::JoinShape::Round,
+        }
+    }
+
+    fn blank_app() -> EditorApp {
+        let mut app = EditorApp::default();
+        app.state.project.assets.clear();
+        app.state.project.q0rgs[0].layers[0].placements.clear();
+        app.session.current_q0rg_id = app.state.project.q0rgs[0].q0rg_id;
+        app.session.current_layer_id = app.state.project.q0rgs[0].layers[0].layer_id;
+        app.session.current_frame = 0;
+        app.session.stroke_color = ink().color;
+        app.session.stroke_width = ink().width;
+        app
+    }
+
+    fn straight(points: &[(f32, f32)], closed: bool) -> VPath {
+        VPath {
+            anchors: points
+                .iter()
+                .map(|&(x, y)| anchor(Vec2::new(x, y)))
+                .collect(),
+            closed,
+        }
+    }
+
+    fn place(app: &mut EditorApp, vector: VectorAsset) {
+        let asset_id = vector.asset_id;
+        app.state.project.assets.push(Asset::Vector(vector));
+        app.state.project.q0rgs[0].layers[0]
+            .placements
+            .push(Placement {
+                pivot: None,
+                instance_id: 0,
+                frame: 0,
+                target: Target::Asset(asset_id),
+                transform: Transform2D::IDENTITY,
+                tween: Tween::None,
+                fx: Default::default(),
+            });
+    }
+
+    fn filled_square(app: &mut EditorApp) {
+        place(
+            app,
+            VectorAsset {
+                asset_id: 1,
+                paths: vec![straight(
+                    &[(20.0, 20.0), (80.0, 20.0), (80.0, 80.0), (20.0, 80.0)],
+                    true,
+                )],
+                fill: Some(Rgba {
+                    r: 200,
+                    g: 200,
+                    b: 200,
+                    a: 255,
+                }),
+                stroke: Some(ink()),
+            },
+        );
+    }
+
+    /// Every drawing on the first layer.
+    fn drawings(app: &EditorApp) -> Vec<VectorAsset> {
+        app.state.project.q0rgs[0].layers[0]
+            .placements
+            .iter()
+            .filter_map(|placement| match placement.target {
+                Target::Asset(asset_id) => {
+                    app.state
+                        .project
+                        .assets
+                        .iter()
+                        .find_map(|asset| match asset {
+                            Asset::Vector(vector) if vector.asset_id == asset_id => {
+                                Some(vector.clone())
+                            }
+                            _ => None,
+                        })
+                }
+                Target::Q0rg(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn regression_group_pivot_does_not_replace_individual_pasted_object_anchors() {
+        let mut app = blank_app();
+        filled_square(&mut app);
+        let original = app.state.project.q0rgs[0].layers[0].placements[0].clone();
+        let mut left = original.clone();
+        left.transform.tx = 100.0;
+        left.pivot = Some(Vec2::new(35.0, 45.0));
+        let mut right = original;
+        right.transform.tx = 250.0;
+        app.state.project.q0rgs[0].layers[0].placements = vec![left, right];
+        let refs: Vec<_> = (0..2)
+            .map(|placement_idx| PlacementRef {
+                q0rg_id: 1,
+                layer_id: 1,
+                placement_idx,
+            })
+            .collect();
+        app.session.selection = Selection::Multi(refs.clone());
+        set_selection_transform_pivot(&mut app, Vec2::new(225.0, 50.0));
+        let payload =
+            crate::selection_edit::capture_clipboard(&app.state.project, &app.session.selection);
+        let result = crate::selection_edit::paste_payload(
+            &mut app.state.project,
+            1,
+            1,
+            0,
+            &payload,
+            Vec2::new(30.0, 20.0),
+        );
+        assert_eq!(result.objects.len(), 2);
+        let layer = &app.state.project.q0rgs[0].layers[0];
+        assert_eq!(
+            layer.placements[result.objects[0].placement_idx].pivot,
+            Some(Vec2::new(35.0, 45.0))
+        );
+        assert_eq!(
+            layer.placements[result.objects[1].placement_idx].pivot,
+            None
+        );
+        app.session.selection = Selection::Placement {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: result.objects[1].placement_idx,
+        };
+        assert_eq!(
+            selection_transform_pivot(&app),
+            Some(Vec2::new(330.0, 70.0))
+        );
+    }
+
+    #[test]
+    fn regression_subselect_does_not_activate_a_far_contour_through_its_fill() {
+        let mut app = blank_app();
+        filled_square(&mut app);
+        assert!(
+            subselect_contour_hit(&app.state.project, 1, 0, Vec2::new(50.0, 50.0), 7.0).is_none()
+        );
+        assert!(
+            subselect_contour_hit(&app.state.project, 1, 0, Vec2::new(21.0, 50.0), 7.0).is_some()
+        );
+        assert!(
+            subselect_scene_anchor_hit(&app.state.project, 1, 0, Vec2::new(50.0, 50.0), 7.0)
+                .is_none()
+        );
+    }
+
+    fn thick_crossing_lines() -> EditorApp {
+        let mut app = blank_app();
+        let mut stroke = ink();
+        stroke.width = 20.0;
+        stroke.cap = q0s_format::geom::CapShape::Butt;
+        place(
+            &mut app,
+            VectorAsset {
+                asset_id: 1,
+                paths: vec![
+                    straight(&[(0.0, 50.0), (100.0, 50.0)], false),
+                    straight(&[(50.0, 0.0), (50.0, 100.0)], false),
+                ],
+                fill: None,
+                stroke: Some(stroke),
+            },
+        );
+        app.session.selection = Selection::Paths(
+            (0..2)
+                .map(|path_idx| PathRef {
+                    q0rg_id: 1,
+                    layer_id: 1,
+                    placement_idx: 0,
+                    path_idx,
+                })
+                .collect(),
+        );
+        app
+    }
+
+    #[test]
+    fn regression_selected_lines_union_overlaps_and_keep_flat_caps() {
+        let mut app = thick_crossing_lines();
+        let surface = build_selected_stroke_surface(&app);
+        assert!(
+            (surface.unsigned_area() - 3600.0).abs() < 0.01,
+            "two strokes must have one 3600-unit surface, including their intersection only once"
+        );
+        assert!(
+            !surface.contains(&Point::new(-2.0, 50.0)),
+            "flat cap grew a round end"
+        );
+        assert!(surface.contains(&Point::new(2.0, 50.0)));
+        app.session.selection =
+            marquee_selection(&app.state.project, 1, 0, (-20.0, -20.0, 120.0, 120.0));
+        let marquee = build_selected_stroke_surface(&app);
+        assert!(
+            (marquee.unsigned_area() - surface.unsigned_area()).abs() < 0.01,
+            "marquee must select the same painted line body as clicking"
+        );
+        app.session.selection =
+            marquee_selection(&app.state.project, 1, 0, (40.0, -20.0, 60.0, 120.0));
+        let partial = build_selected_stroke_surface(&app);
+        assert!(
+            (partial.unsigned_area() - 2000.0).abs() < 0.01,
+            "partial line selection escaped the marquee"
+        );
+    }
+
+    #[test]
+    fn regression_marquee_lines_emit_stipple_and_reuse_the_stage_union() {
+        let mut app = thick_crossing_lines();
+        app.session.selection =
+            marquee_selection(&app.state.project, 1, 0, (-20.0, -20.0, 120.0, 120.0));
+        let ctx = Context::default();
+        let before = selected_stroke_surface(&app, &ctx);
+        let after = selected_stroke_surface(&app, &ctx);
+        assert!(
+            std::sync::Arc::ptr_eq(&before, &after),
+            "idle paints rebuilt the union"
+        );
+        let rect = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(250.0, 250.0));
+        let view = StageView {
+            origin: pos2(50.0, 50.0),
+            scale: 1.0,
+            stage_rect: rect,
+            edit_transform: Affine::IDENTITY,
+        };
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Middle,
+                    egui::Id::new("marquee-line-body"),
+                ));
+                draw_selection_overlay(&mut app, &painter, &view);
+            },
+        );
+        assert!(
+            output.shapes.iter().any(|shape| match &shape.shape {
+                Shape::Mesh(mesh) =>
+                    mesh.texture_id != egui::TextureId::default() && !mesh.indices.is_empty(),
+                _ => false,
+            }),
+            "marquee lines produced only the old centerline outline"
+        );
+    }
+
+    #[test]
+    fn crossing_lines_are_cut_and_a_double_click_picks_every_joined_piece() {
+        let mut app = blank_app();
+        for line in [
+            [(0.0, 50.0), (100.0, 50.0)],
+            [(50.0, 0.0), (50.0, 100.0)],
+            [(300.0, 0.0), (300.0, 100.0)],
+        ] {
+            commit_vector_path(&mut app, straight(&line, false), DrawingMode::Merge);
+        }
+        let lines: usize = drawings(&app).iter().map(|vector| vector.paths.len()).sum();
+        assert_eq!(
+            lines, 5,
+            "the cross became four pieces, the far line stayed whole"
+        );
+
+        let Some(Selection::Path {
+            q0rg_id,
+            layer_id,
+            placement_idx,
+            path_idx,
+        }) = selection_at_point_pub(&app.state.project, 1, 0, Vec2::new(25.0, 50.0))
+        else {
+            panic!("a click picks one piece");
+        };
+        let piece = raw_path_clone(
+            &app.state.project,
+            q0rg_id,
+            layer_id,
+            placement_idx,
+            path_idx,
+        )
+        .unwrap();
+        let ends = (piece.anchors[0].point, piece.anchors.last().unwrap().point);
+        assert!(
+            ends.0.x.abs() < 0.01 && (ends.1.x - 50.0).abs() < 0.01,
+            "only up to the crossing: {ends:?}"
+        );
+        let joined = crate::crossings::connected_selection(
+            &app.state.project,
+            0,
+            PathRef {
+                q0rg_id,
+                layer_id,
+                placement_idx,
+                path_idx,
+            },
+        );
+        let Some(Selection::Paths(refs)) = joined else {
+            panic!("a double click picks the joined lines: {joined:?}");
+        };
+        assert_eq!(refs.len(), 4, "every arm of the cross, not the far line");
+    }
+
+    #[test]
+    fn a_bent_line_becomes_an_even_arc_leaning_into_the_bend() {
+        let line = straight(&[(0.0, 0.0), (100.0, 0.0)], false);
+        let held = curve_point(&line, 0, 0.5);
+        let bent = bend_segment(&line, 0, 0.5, held, Vec2::new(held.x, held.y + 20.0));
+        let middle = curve_point(&bent, 0, 0.5);
+        assert!(
+            (middle.x - 50.0).abs() < 0.01 && (middle.y - 20.0).abs() < 0.01,
+            "{middle:?}"
+        );
+        let out = bent.anchors[0].out_handle.unwrap();
+        let into = bent.anchors[1].in_handle.unwrap();
+        // Both ends aim at the same point, the arc's control point.
+        let aim = |from: Vec2, handle: Vec2| (handle.y - from.y).atan2(handle.x - from.x);
+        assert!((aim(Vec2::new(0.0, 0.0), out) - 40.0_f32.atan2(50.0)).abs() < 1.0e-3);
+        assert!((aim(Vec2::new(100.0, 0.0), into) - 40.0_f32.atan2(-50.0)).abs() < 1.0e-3);
+        assert!(
+            out.x > 20.0 && into.x < 80.0,
+            "no steep shoulders: {out:?} {into:?}"
+        );
+    }
+
+    #[test]
+    fn selected_outlines_and_fills_are_restyled_in_place() {
+        let mut app = blank_app();
+        filled_square(&mut app);
+        app.session.selection = Selection::Path {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: 0,
+            path_idx: 0,
+        };
+        assert!(restyle_selected_strokes(&mut app, |stroke| {
+            stroke.cap = q0s_format::geom::CapShape::Butt;
+            stroke.join = q0s_format::geom::JoinShape::Miter;
+            stroke.color.a = 128;
+        }));
+        let red = Rgba {
+            r: 220,
+            g: 0,
+            b: 0,
+            a: 200,
+        };
+        assert!(set_selected_fill(&mut app, red));
+        let all = drawings(&app);
+        assert_eq!(
+            all.len(),
+            1,
+            "a whole shape is restyled without being split"
+        );
+        let stroke = all[0].stroke.unwrap();
+        assert_eq!(stroke.cap, q0s_format::geom::CapShape::Butt);
+        assert_eq!(stroke.join, q0s_format::geom::JoinShape::Miter);
+        assert_eq!(stroke.color.a, 128);
+        assert_eq!(all[0].fill, Some(red));
+        assert_eq!(
+            selected_paint(&app.state.project, &app.session.selection).fill,
+            Some((red, false))
+        );
+
+        // Only the fill picked: it is lifted off its outline first.
+        app.session.selection =
+            selection_at_point_pub(&app.state.project, 1, 0, Vec2::new(50.0, 50.0)).unwrap();
+        let green = Rgba {
+            r: 0,
+            g: 180,
+            b: 0,
+            a: 255,
+        };
+        assert!(set_selected_fill(&mut app, green));
+        let all = drawings(&app);
+        assert!(all
+            .iter()
+            .any(|vector| vector.fill == Some(green) && vector.stroke.is_none()));
+        assert!(all
+            .iter()
+            .any(|vector| vector.stroke.is_some() && vector.fill != Some(green)));
+    }
+
+    #[test]
+    fn the_knife_breaks_a_filled_shape_and_its_outline_in_two() {
+        let mut app = blank_app();
+        filled_square(&mut app);
+        app.settings.aids.knife_gap = 4;
+        assert!(crate::knife::cut(
+            &mut app,
+            &[Vec2::new(50.0, 0.0), Vec2::new(50.0, 100.0)]
+        ));
+        let all = drawings(&app);
+        let fill = all
+            .iter()
+            .find(|vector| vector.fill.is_some())
+            .expect("the fill stays");
+        assert!(fill.stroke.is_none(), "fill and outline parted");
+        let pieces = crate::brush::vector_fill_geometry(fill);
+        assert_eq!(pieces.0.len(), 2, "two halves");
+        let outline = all
+            .iter()
+            .find(|vector| vector.stroke.is_some())
+            .expect("the outline stays");
+        assert_eq!(
+            outline.paths.len(),
+            2,
+            "the outline ring opens on both sides"
+        );
+        assert!(outline.paths.iter().all(|path| !path.closed));
+        assert!(app.history.can_undo(), "one undo step");
+        assert!(
+            !crate::knife::cut(&mut app, &[Vec2::new(200.0, 0.0), Vec2::new(200.0, 100.0)]),
+            "nothing there"
+        );
+    }
+
+    #[test]
+    fn the_bucket_bridges_a_gap_only_when_asked() {
+        let mut app = blank_app();
+        app.session.fill_color = Some(Rgba {
+            r: 250,
+            g: 200,
+            b: 0,
+            a: 255,
+        });
+        // A square outline left open by 5 px at its last corner.
+        place(
+            &mut app,
+            VectorAsset {
+                asset_id: 1,
+                paths: vec![straight(
+                    &[
+                        (20.0, 20.0),
+                        (80.0, 20.0),
+                        (80.0, 80.0),
+                        (20.0, 80.0),
+                        (20.0, 25.0),
+                    ],
+                    false,
+                )],
+                fill: None,
+                stroke: Some(ink()),
+            },
+        );
+        assert!(!bucket_fill_at(&mut app, Vec2::new(50.0, 50.0)), "it leaks");
+        app.settings.aids.bucket_gap = crate::settings::GapSize::Medium;
+        assert!(bucket_fill_at(&mut app, Vec2::new(50.0, 50.0)));
+        let filled = drawings(&app)
+            .into_iter()
+            .find(|vector| vector.fill.is_some())
+            .expect("a fill");
+        let area = crate::brush::vector_fill_geometry(&filled).unsigned_area();
+        assert!(
+            (3000.0..4000.0).contains(&area),
+            "the square's inside: {area}"
+        );
+    }
+
+    #[test]
+    fn subselect_rubber_band_moves_points_on_several_lines() {
+        let mut app = blank_app();
+        app.session.current_tool = Tool::Subselect;
+        place(
+            &mut app,
+            VectorAsset {
+                asset_id: 1,
+                paths: vec![
+                    straight(&[(0.0, 0.0), (100.0, 0.0)], false),
+                    straight(&[(0.0, 50.0), (100.0, 50.0)], false),
+                ],
+                fill: None,
+                stroke: Some(ink()),
+            },
+        );
+        pick_points_in_rect(
+            &mut app,
+            Vec2::new(90.0, -10.0),
+            Vec2::new(110.0, 60.0),
+            false,
+        );
+        assert_eq!(subselect_picked(&app).len(), 2, "an end on each line");
+        assert!(begin_dragging_many_points(
+            &mut app,
+            PathRef {
+                q0rg_id: 1,
+                layer_id: 1,
+                placement_idx: 0,
+                path_idx: 0,
+            },
+            1,
+            Vec2::new(100.0, 0.0),
+        ));
+        let ToolState::DraggingManyPoints { parts, .. } = app.session.tool_state.clone() else {
+            panic!("dragging them together");
+        };
+        for (path, indices, start) in &parts {
+            assert!(replace_raw_path_points_translated(
+                &mut app.state.project,
+                *path,
+                indices,
+                start,
+                Vec2::new(10.0, 5.0),
+            ));
+        }
+        let paths = &drawings(&app)[0].paths;
+        assert_eq!(paths[0].anchors[1].point, Vec2::new(110.0, 5.0));
+        assert_eq!(paths[1].anchors[1].point, Vec2::new(110.0, 55.0));
+        assert_eq!(
+            paths[0].anchors[0].point,
+            Vec2::new(0.0, 0.0),
+            "the other ends stay"
+        );
+    }
+
+    #[test]
+    fn snapping_lands_on_line_ends_before_lines() {
+        let mut app = blank_app();
+        place(
+            &mut app,
+            VectorAsset {
+                asset_id: 1,
+                paths: vec![straight(&[(0.0, 0.0), (100.0, 0.0)], false)],
+                fill: None,
+                stroke: Some(ink()),
+            },
+        );
+        let scene = crate::snap::SnapScene::build(
+            &app.state.project,
+            1,
+            0,
+            &crate::snap::Leave::default(),
+            None,
+        );
+        let end = scene.nearest(Vec2::new(97.0, 4.0), 8.0).unwrap();
+        assert_eq!(end.point, Vec2::new(100.0, 0.0));
+        let along = scene.nearest(Vec2::new(40.0, 5.0), 8.0).unwrap();
+        assert!((along.point.x - 40.0).abs() < 0.01 && along.point.y.abs() < 0.01);
+        let moving = crate::snap::Leave::selection(&Selection::Path {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: 0,
+            path_idx: 0,
+        });
+        let without = crate::snap::SnapScene::build(&app.state.project, 1, 0, &moving, None);
+        assert!(
+            without.nearest(Vec2::new(97.0, 4.0), 8.0).is_none(),
+            "a dragged line does not snap to itself"
+        );
+    }
+
+    #[test]
+    fn a_jagged_crack_keeps_the_halves_apart_through_a_merge() {
+        let mut app = blank_app();
+        let gray = Rgba {
+            r: 52,
+            g: 52,
+            b: 58,
+            a: 255,
+        };
+        place(
+            &mut app,
+            VectorAsset {
+                asset_id: 91,
+                paths: vec![primitive_path(
+                    PrimitiveKind::Oval,
+                    Vec2::new(270.0, 200.0),
+                    Vec2::new(570.0, 440.0),
+                )
+                .unwrap()],
+                fill: Some(gray),
+                stroke: None,
+            },
+        );
+        let crack = [
+            (505.0, 175.0),
+            (480.0, 240.0),
+            (500.0, 300.0),
+            (462.0, 355.0),
+            (484.0, 410.0),
+            (455.0, 470.0),
+        ]
+        .map(|(x, y)| Vec2::new(x, y));
+        assert!(crate::knife::cut(&mut app, &crack));
+        let pieces = |app: &EditorApp| {
+            drawings(app)
+                .iter()
+                .map(|vector| crate::brush::vector_fill_topology(vector).surface.0.len())
+                .sum::<usize>()
+        };
+        assert_eq!(pieces(&app), 2, "the crack parts the halves for good");
+        let left = selection_at_point_pub(&app.state.project, 1, 0, Vec2::new(350.0, 320.0))
+            .and_then(|selection| selection_raw_path_refs(&selection))
+            .expect("the left half");
+        let right = selection_at_point_pub(&app.state.project, 1, 0, Vec2::new(540.0, 320.0))
+            .and_then(|selection| selection_raw_path_refs(&selection))
+            .expect("the right half");
+        assert!(
+            left.iter().all(|path| !right.contains(path)),
+            "picked one at a time"
+        );
+
+        // A shape dropped onto the left half merges with it, not the right.
+        place(
+            &mut app,
+            VectorAsset {
+                asset_id: 120,
+                paths: vec![straight(
+                    &[
+                        (250.0, 300.0),
+                        (300.0, 300.0),
+                        (300.0, 340.0),
+                        (250.0, 340.0),
+                    ],
+                    true,
+                )],
+                fill: Some(gray),
+                stroke: None,
+            },
+        );
+        let dropped = Selection::Path {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: 1,
+            path_idx: 0,
+        };
+        let snapshot = capture_merge_selection_snapshot(&app.state.project, &dropped, 0);
+        let reports = crate::brush::merge_touching_raw_fills_after_edit_focused_with_remap(
+            &mut app.state.project,
+            1,
+            1,
+            0,
+            &std::collections::BTreeSet::from([120]),
+        );
+        assert_eq!(reports.len(), 1);
+        assert_eq!(pieces(&app), 2, "still two halves after the merge");
+        let restored = restore_merge_selection(&app.state.project, &snapshot, &reports, 0)
+            .and_then(|selection| selection_raw_path_refs(&selection))
+            .expect("a selection");
+        let right_now = selection_at_point_pub(&app.state.project, 1, 0, Vec2::new(540.0, 320.0))
+            .and_then(|selection| selection_raw_path_refs(&selection))
+            .expect("the right half");
+        assert!(
+            restored.iter().all(|path| !right_now.contains(path)),
+            "the far half is not selected: {restored:?} {right_now:?}"
+        );
+    }
+
+    #[test]
+    fn a_merge_keeps_knife_cut_pieces_out_of_the_selection() {
+        let mut app = blank_app();
+        let gray = Rgba {
+            r: 120,
+            g: 120,
+            b: 120,
+            a: 255,
+        };
+        // Two pieces of one drawing, cut apart earlier.
+        place(
+            &mut app,
+            VectorAsset {
+                asset_id: 1,
+                paths: vec![
+                    straight(&[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)], true),
+                    straight(
+                        &[(50.0, 0.0), (60.0, 0.0), (60.0, 10.0), (50.0, 10.0)],
+                        true,
+                    ),
+                ],
+                fill: Some(gray),
+                stroke: None,
+            },
+        );
+        // A shape dropped onto the first piece.
+        place(
+            &mut app,
+            VectorAsset {
+                asset_id: 2,
+                paths: vec![straight(
+                    &[(8.0, 2.0), (20.0, 2.0), (20.0, 8.0), (8.0, 8.0)],
+                    true,
+                )],
+                fill: Some(gray),
+                stroke: None,
+            },
+        );
+        let moved = Selection::Path {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: 1,
+            path_idx: 0,
+        };
+        let snapshot = capture_merge_selection_snapshot(&app.state.project, &moved, 0);
+        let reports = crate::brush::merge_touching_raw_fills_after_edit_focused_with_remap(
+            &mut app.state.project,
+            1,
+            1,
+            0,
+            &std::collections::BTreeSet::from([2]),
+        );
+        assert_eq!(reports.len(), 1, "the drop merged the drawings");
+        let restored = restore_merge_selection(&app.state.project, &snapshot, &reports, 0)
+            .expect("a selection");
+        let refs = selection_raw_path_refs(&restored).expect("raw paths");
+        let merged = drawings(&app)
+            .into_iter()
+            .find(|vector| vector.asset_id == reports[0].new_asset_id)
+            .unwrap();
+        assert_eq!(
+            merged.paths.len(),
+            2,
+            "the far piece is still its own piece"
+        );
+        assert_eq!(refs.len(), 1, "only the merged piece is selected: {refs:?}");
+        let selected = &merged.paths[refs[0].path_idx];
+        assert!(selected.anchors.iter().all(|anchor| anchor.point.x <= 20.0));
+    }
+
+    #[test]
+    fn a_variant_takes_the_instance_and_swaps_back() {
+        let mut app = EditorApp::default();
+        let ctx = egui::Context::default();
+        app.handle(&ctx, Action::CreateProject(Default::default()));
+        app.state.project.q0rgs[0].layers[0].placements.clear();
+        app.handle(&ctx, Action::AddQ0rg);
+        let symbol = app.state.project.q0rgs.last().unwrap().q0rg_id;
+        let name = app.state.project.q0rgs.last().unwrap().name.clone();
+        app.state.project.q0rgs[0].layers[0]
+            .placements
+            .push(Placement {
+                pivot: None,
+                instance_id: 0,
+                frame: 0,
+                target: Target::Q0rg(symbol),
+                transform: Transform2D::IDENTITY,
+                tween: Tween::None,
+                fx: Default::default(),
+            });
+        let (root, layer) = (
+            app.state.project.q0rgs[0].q0rg_id,
+            app.state.project.q0rgs[0].layers[0].layer_id,
+        );
+        app.session.current_q0rg_id = root;
+        app.session.current_frame = 0;
+        app.handle(&ctx, Action::MakeVariant(root, layer, 0));
+        let shown =
+            |app: &EditorApp| match app.state.project.q0rgs[0].layers[0].placements[0].target {
+                Target::Q0rg(id) => id,
+                Target::Asset(_) => 0,
+            };
+        let variant = shown(&app);
+        assert_ne!(variant, symbol);
+        let variant_name = app
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == variant)
+            .unwrap()
+            .name
+            .clone();
+        assert_eq!(variant_name, format!("{name} ~2"));
+        app.handle(&ctx, Action::SwapVariant(root, layer, 0, 1));
+        assert_eq!(shown(&app), symbol, "round the family and back");
     }
 }

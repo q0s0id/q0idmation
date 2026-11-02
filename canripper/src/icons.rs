@@ -1,21 +1,41 @@
-use egui::{pos2, vec2, Color32, Painter, Pos2, Rect, Response, Sense, Shape, Stroke, Ui};
+//! Small colour icons in the manner of 2000s desktop software: a yellow
+//! folder, a picture frame, a floppy disk, a speaker. They are painted from
+//! shapes on a 16-unit grid, so they stay sharp at any size and need no
+//! image files.
 
-use canripper::document::{AssetVisualKind, EditRef, PreviewRef, TreeNode};
+use egui::{pos2, vec2, Align2, Color32, FontId, Painter, Pos2, Rect, Shape, Stroke};
 
-const TOOL_BUTTON: f32 = 30.0;
-const TOOL_ICON: f32 = 17.0;
-const TREE_ICON: f32 = 14.0;
+use crate::document::{AssetVisualKind, Document, DocumentData, EditRef, PreviewRef, TreeNode};
+use crate::swf_assets::Category;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiIcon {
+    // Toolbar.
     Open,
     Save,
     SaveAs,
     Export,
+    ToQ1s,
     ReplaceImage,
     Extract,
     Theme,
+    About,
+    // Transport and view.
+    Play,
+    Pause,
+    First,
+    Previous,
+    Next,
+    Last,
+    ZoomIn,
+    ZoomOut,
+    ZoomFit,
+    ZoomActual,
+    Search,
+    Clear,
+    // Tree.
     Folder,
+    FolderOpen,
     Vector,
     Bitmap,
     Media,
@@ -26,127 +46,31 @@ pub enum UiIcon {
     Audio,
     Binary,
     Document,
+    Shape,
+    MorphShape,
+    Sprite,
+    Button,
+    Text,
+    Font,
+    Frame,
+    Movie,
+    Other,
 }
 
-pub fn toolbar_button(
-    ui: &mut Ui,
-    icon: UiIcon,
-    enabled: bool,
-    tooltip: &str,
-    accent: Color32,
-) -> Response {
-    let sense = if enabled {
-        Sense::click()
-    } else {
-        Sense::hover()
-    };
-    let (rect, response) = ui.allocate_exact_size(vec2(TOOL_BUTTON, TOOL_BUTTON), sense);
-    let response = response.on_hover_text(tooltip);
-    if ui.is_rect_visible(rect) {
-        let visuals = ui.style().interact(&response);
-        if response.hovered() && enabled {
-            ui.painter().rect(
-                rect.shrink(1.0),
-                4.0,
-                visuals.weak_bg_fill,
-                Stroke::new(1.0_f32, accent.gamma_multiply(0.75)),
-            );
-        }
-        let foreground = if enabled {
-            visuals.text_color()
-        } else {
-            visuals.text_color().gamma_multiply(0.35)
-        };
-        let secondary = if enabled {
-            accent
-        } else {
-            accent.gamma_multiply(0.25)
-        };
-        draw_icon(
-            ui.painter(),
-            Rect::from_center_size(rect.center(), vec2(TOOL_ICON, TOOL_ICON)),
-            icon,
-            foreground,
-            secondary,
-        );
-    }
-    response
-}
+const FOLDER: Color32 = Color32::from_rgb(0xF2, 0xC9, 0x4C);
+const FOLDER_DARK: Color32 = Color32::from_rgb(0xA8, 0x80, 0x1E);
+const PAPER: Color32 = Color32::from_rgb(0xFC, 0xFC, 0xF8);
+const INK: Color32 = Color32::from_rgb(0x2B, 0x2B, 0x2B);
+const BLUE: Color32 = Color32::from_rgb(0x2F, 0x6F, 0xD1);
+const SKY: Color32 = Color32::from_rgb(0x8C, 0xC4, 0xF2);
+const GREEN: Color32 = Color32::from_rgb(0x3B, 0xA5, 0x3A);
+const RED: Color32 = Color32::from_rgb(0xD1, 0x3B, 0x33);
+const ORANGE: Color32 = Color32::from_rgb(0xF0, 0x8A, 0x24);
+const PURPLE: Color32 = Color32::from_rgb(0x7D, 0x55, 0xC7);
+const GREY: Color32 = Color32::from_rgb(0x8A, 0x8F, 0x96);
 
-pub fn tree_row(ui: &mut Ui, node: &TreeNode, selected: bool, accent: Color32) -> Response {
-    let galley = egui::WidgetText::from(node.label.clone()).into_galley(
-        ui,
-        None,
-        f32::INFINITY,
-        egui::TextStyle::Button,
-    );
-    let padding = ui.spacing().button_padding;
-    let content_height = TREE_ICON.max(galley.size().y);
-    let desired = vec2(
-        ui.available_width().max(40.0),
-        (content_height + padding.y * 2.0).max(ui.spacing().interact_size.y),
-    );
-    let (rect, response) = ui.allocate_exact_size(desired, Sense::click());
-    if ui.is_rect_visible(rect) {
-        let visuals = ui.style().interact_selectable(&response, selected);
-        if selected || response.hovered() || response.has_focus() {
-            ui.painter().rect(
-                rect,
-                3.0,
-                visuals.weak_bg_fill,
-                if selected {
-                    Stroke::new(1.0_f32, accent.gamma_multiply(0.72))
-                } else {
-                    Stroke::NONE
-                },
-            );
-        }
-        if selected {
-            ui.painter().rect_filled(
-                Rect::from_min_max(
-                    pos2(rect.left(), rect.top() + 4.0),
-                    pos2(rect.left() + 2.0, rect.bottom() - 4.0),
-                ),
-                1.0,
-                accent,
-            );
-        }
-        let content = rect.shrink2(padding);
-        let icon_rect = Rect::from_center_size(
-            pos2(content.left() + TREE_ICON * 0.5, content.center().y),
-            vec2(TREE_ICON, TREE_ICON),
-        );
-        draw_icon(
-            ui.painter(),
-            icon_rect,
-            icon_for_tree_node(node),
-            visuals.text_color(),
-            accent,
-        );
-        ui.painter().galley(
-            pos2(
-                icon_rect.right() + 6.0,
-                content.center().y - galley.size().y * 0.5,
-            ),
-            galley,
-            visuals.text_color(),
-        );
-    }
-    response
-}
-
-pub fn tiny_icon(ui: &mut Ui, icon: UiIcon, accent: Color32) {
-    let (rect, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-    draw_icon(
-        ui.painter(),
-        Rect::from_center_size(rect.center(), vec2(14.0, 14.0)),
-        icon,
-        ui.visuals().text_color(),
-        accent,
-    );
-}
-
-pub fn icon_for_tree_node(node: &TreeNode) -> UiIcon {
+/// Which icon a tree node shows. SWF tags show what kind of tag they are.
+pub fn icon_for_tree_node(node: &TreeNode, document: Option<&Document>, open: bool) -> UiIcon {
     if let Some(edit) = &node.edit {
         return match edit {
             EditRef::QProjectQ0rgScript { .. } => UiIcon::Symbol,
@@ -165,22 +89,48 @@ pub fn icon_for_tree_node(node: &TreeNode) -> UiIcon {
         Some(PreviewRef::Q1LegacyBitmap(_) | PreviewRef::Q0LegacyBitmap(_)) => UiIcon::Bitmap,
         Some(PreviewRef::Q0vStandaloneVideo) => UiIcon::Video,
         Some(PreviewRef::Q0vStandaloneAudio) => UiIcon::Audio,
-        Some(PreviewRef::SwfTag(_)) => UiIcon::Binary,
+        Some(PreviewRef::SwfTimeline) => UiIcon::Movie,
+        Some(PreviewRef::SwfFrame(_)) => UiIcon::Frame,
+        Some(PreviewRef::SwfTag(index)) => {
+            let code = document.and_then(|document| match &document.data {
+                DocumentData::Swf(movie) | DocumentData::Projector { movie, .. } => {
+                    movie.tags.get(*index).map(|tag| tag.code)
+                }
+                _ => None,
+            });
+            match code.map(Category::of) {
+                Some(Category::Shape) => UiIcon::Shape,
+                Some(Category::MorphShape) => UiIcon::MorphShape,
+                Some(Category::Sprite) => UiIcon::Sprite,
+                Some(Category::Button) => UiIcon::Button,
+                Some(Category::Image) => UiIcon::Bitmap,
+                Some(Category::Text) => UiIcon::Text,
+                Some(Category::Font) => UiIcon::Font,
+                Some(Category::Sound) => UiIcon::Audio,
+                Some(Category::Video) => UiIcon::Video,
+                Some(Category::BinaryData) => UiIcon::Binary,
+                Some(Category::Script) => UiIcon::Code,
+                Some(Category::Control) if code == Some(1) => UiIcon::Frame,
+                _ => UiIcon::Other,
+            }
+        }
+        None if !node.children.is_empty() && open => UiIcon::FolderOpen,
         None if !node.children.is_empty() => UiIcon::Folder,
         None => UiIcon::Document,
     }
 }
 
+/// Points on the icon's 16-unit grid.
 #[derive(Clone, Copy)]
-struct Canvas {
+struct Grid {
     rect: Rect,
 }
 
-impl Canvas {
+impl Grid {
     fn p(self, x: f32, y: f32) -> Pos2 {
         pos2(
-            self.rect.left() + self.rect.width() * x,
-            self.rect.top() + self.rect.height() * y,
+            self.rect.left() + self.rect.width() * x / 16.0,
+            self.rect.top() + self.rect.height() * y / 16.0,
         )
     }
 
@@ -188,228 +138,533 @@ impl Canvas {
         Rect::from_min_max(self.p(x0, y0), self.p(x1, y1))
     }
 
-    fn line(self, painter: &Painter, points: &[(f32, f32)], stroke: Stroke) {
-        painter.add(Shape::line(
-            points.iter().map(|&(x, y)| self.p(x, y)).collect(),
-            stroke,
-        ));
+    fn unit(self) -> f32 {
+        self.rect.width() / 16.0
     }
 
-    fn polygon(self, painter: &Painter, points: &[(f32, f32)], fill: Color32, stroke: Stroke) {
+    fn poly(self, painter: &Painter, points: &[(f32, f32)], fill: Color32, outline: Color32) {
         painter.add(Shape::convex_polygon(
             points.iter().map(|&(x, y)| self.p(x, y)).collect(),
             fill,
-            stroke,
+            Stroke::new(self.unit().max(0.8), outline),
         ));
+    }
+
+    fn line(self, painter: &Painter, points: &[(f32, f32)], width: f32, color: Color32) {
+        painter.add(Shape::line(
+            points.iter().map(|&(x, y)| self.p(x, y)).collect(),
+            Stroke::new(width * self.unit(), color),
+        ));
+    }
+
+    fn boxed(self, painter: &Painter, rect: Rect, fill: Color32, outline: Color32, round: f32) {
+        painter.rect(
+            rect,
+            round * self.unit(),
+            fill,
+            Stroke::new(self.unit().max(0.8), outline),
+        );
+    }
+
+    fn text(self, painter: &Painter, x: f32, y: f32, text: &str, size: f32, color: Color32) {
+        painter.text(
+            self.p(x, y),
+            Align2::CENTER_CENTER,
+            text,
+            FontId::proportional(size * self.unit()),
+            color,
+        );
     }
 }
 
-pub fn draw_icon(
-    painter: &Painter,
-    rect: Rect,
-    icon: UiIcon,
-    foreground: Color32,
-    accent: Color32,
-) {
-    let c = Canvas {
-        rect: rect.shrink(0.75),
-    };
-    let fg = Stroke::new(1.35_f32, foreground);
-    let ac = Stroke::new(1.45_f32, accent);
+fn darker(color: Color32) -> Color32 {
+    Color32::from_rgb(
+        (u16::from(color.r()) * 3 / 5) as u8,
+        (u16::from(color.g()) * 3 / 5) as u8,
+        (u16::from(color.b()) * 3 / 5) as u8,
+    )
+}
+
+fn page(painter: &Painter, g: Grid, fill: Color32) {
+    g.poly(
+        painter,
+        &[
+            (3.0, 1.0),
+            (10.0, 1.0),
+            (13.5, 4.5),
+            (13.5, 15.0),
+            (3.0, 15.0),
+        ],
+        fill,
+        GREY,
+    );
+    g.poly(
+        painter,
+        &[(10.0, 1.0), (13.5, 4.5), (10.0, 4.5)],
+        Color32::from_gray(220),
+        GREY,
+    );
+}
+
+fn picture(painter: &Painter, g: Grid) {
+    g.boxed(
+        painter,
+        g.r(1.0, 2.5, 15.0, 13.5),
+        SKY,
+        Color32::from_gray(90),
+        0.5,
+    );
+    g.poly(
+        painter,
+        &[(2.0, 12.5), (6.5, 7.0), (10.0, 12.5)],
+        GREEN,
+        darker(GREEN),
+    );
+    g.poly(
+        painter,
+        &[(7.0, 12.5), (10.5, 8.5), (14.0, 12.5)],
+        darker(GREEN),
+        darker(GREEN),
+    );
+    painter.circle_filled(
+        g.p(11.5, 5.5),
+        1.3 * g.unit(),
+        Color32::from_rgb(0xFF, 0xD3, 0x3A),
+    );
+}
+
+fn floppy(painter: &Painter, g: Grid) {
+    g.poly(
+        painter,
+        &[
+            (1.5, 1.5),
+            (13.0, 1.5),
+            (14.5, 3.0),
+            (14.5, 14.5),
+            (1.5, 14.5),
+        ],
+        BLUE,
+        darker(BLUE),
+    );
+    g.boxed(
+        painter,
+        g.r(4.0, 1.5, 11.5, 6.0),
+        Color32::from_gray(225),
+        Color32::from_gray(120),
+        0.0,
+    );
+    painter.rect_filled(g.r(8.8, 2.3, 10.4, 5.2), 0.0, BLUE);
+    g.boxed(
+        painter,
+        g.r(3.5, 8.5, 12.5, 14.5),
+        PAPER,
+        Color32::from_gray(140),
+        0.0,
+    );
+}
+
+fn arrow(painter: &Painter, g: Grid, from: (f32, f32), to: (f32, f32), color: Color32) {
+    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+    let length = (dx * dx + dy * dy).sqrt().max(0.001);
+    let (ux, uy) = (dx / length, dy / length);
+    let back = (to.0 - ux * 3.5, to.1 - uy * 3.5);
+    g.line(painter, &[from, back], 2.0, color);
+    g.poly(
+        painter,
+        &[
+            to,
+            (back.0 - uy * 2.6, back.1 + ux * 2.6),
+            (back.0 + uy * 2.6, back.1 - ux * 2.6),
+        ],
+        color,
+        darker(color),
+    );
+}
+
+fn magnifier(painter: &Painter, g: Grid) {
+    g.line(
+        painter,
+        &[(9.5, 9.5), (14.5, 14.5)],
+        2.6,
+        Color32::from_rgb(0x6B, 0x4B, 0x2A),
+    );
+    painter.circle(
+        g.p(6.5, 6.5),
+        5.0 * g.unit(),
+        Color32::from_rgba_unmultiplied(0xCF, 0xE8, 0xFF, 200),
+        Stroke::new(1.4 * g.unit(), Color32::from_gray(80)),
+    );
+}
+
+/// Paints `icon` in `rect`. Disabled icons are washed out with the panel
+/// colour, as greyed toolbar icons were.
+pub fn draw_icon(painter: &Painter, rect: Rect, icon: UiIcon, enabled: bool) {
+    paint_icon(painter, rect, icon);
+    if !enabled {
+        let face = painter.ctx().style().visuals.panel_fill;
+        painter.rect_filled(rect.expand(1.0), 0.0, face.gamma_multiply(0.62));
+    }
+}
+
+fn paint_icon(painter: &Painter, rect: Rect, icon: UiIcon) {
+    let g = Grid { rect };
+    let u = g.unit();
     match icon {
-        UiIcon::Open | UiIcon::Folder => {
-            c.line(painter, &[(0.08, 0.30), (0.08, 0.82), (0.92, 0.82)], fg);
-            c.line(
+        UiIcon::Folder | UiIcon::Open => {
+            g.poly(
                 painter,
                 &[
-                    (0.08, 0.30),
-                    (0.34, 0.30),
-                    (0.43, 0.18),
-                    (0.68, 0.18),
-                    (0.75, 0.30),
+                    (1.0, 3.0),
+                    (6.0, 3.0),
+                    (7.5, 4.5),
+                    (15.0, 4.5),
+                    (15.0, 13.5),
+                    (1.0, 13.5),
                 ],
-                fg,
+                FOLDER,
+                FOLDER_DARK,
             );
-            c.polygon(
+            painter.line_segment(
+                [g.p(1.5, 6.0), g.p(14.5, 6.0)],
+                Stroke::new(u, Color32::from_rgb(0xFF, 0xE6, 0x96)),
+            );
+            if icon == UiIcon::Open {
+                arrow(painter, g, (8.0, 12.0), (8.0, 1.0), GREEN);
+            }
+        }
+        UiIcon::FolderOpen => {
+            g.poly(
                 painter,
-                &[(0.10, 0.39), (0.94, 0.39), (0.80, 0.82), (0.08, 0.82)],
-                accent.gamma_multiply(0.16),
-                ac,
+                &[
+                    (1.0, 3.0),
+                    (6.0, 3.0),
+                    (7.5, 4.5),
+                    (13.0, 4.5),
+                    (13.0, 13.5),
+                    (1.0, 13.5),
+                ],
+                FOLDER_DARK,
+                darker(FOLDER_DARK),
+            );
+            g.poly(
+                painter,
+                &[(3.5, 7.0), (15.5, 7.0), (13.0, 13.5), (1.0, 13.5)],
+                FOLDER,
+                FOLDER_DARK,
             );
         }
-        UiIcon::Save | UiIcon::SaveAs => {
-            painter.rect_stroke(c.r(0.13, 0.08, 0.87, 0.92), 1.5, fg);
-            painter.rect_stroke(c.r(0.29, 0.08, 0.70, 0.35), 0.75, ac);
-            painter.rect_stroke(c.r(0.28, 0.60, 0.72, 0.92), 1.0, fg);
-            if icon == UiIcon::SaveAs {
-                c.line(
-                    painter,
-                    &[(0.58, 0.71), (0.91, 0.38)],
-                    Stroke::new(2.0_f32, accent),
-                );
-                c.polygon(
-                    painter,
-                    &[(0.88, 0.35), (0.95, 0.42), (0.91, 0.46), (0.84, 0.39)],
-                    accent,
-                    Stroke::NONE,
-                );
-            }
+        UiIcon::Save => floppy(painter, g),
+        UiIcon::SaveAs => {
+            floppy(painter, g);
+            g.line(painter, &[(7.5, 15.0), (15.0, 7.5)], 2.6, ORANGE);
+            g.line(
+                painter,
+                &[(14.0, 8.5), (15.5, 7.0)],
+                2.6,
+                Color32::from_rgb(0xF6, 0xA0, 0xA0),
+            );
         }
         UiIcon::Export => {
-            painter.rect_stroke(c.r(0.10, 0.12, 0.62, 0.88), 1.0, fg);
-            c.line(painter, &[(0.50, 0.50), (0.90, 0.50)], ac);
-            c.line(painter, &[(0.72, 0.31), (0.91, 0.50), (0.72, 0.69)], ac);
+            page(painter, g, PAPER);
+            arrow(painter, g, (5.0, 10.5), (15.5, 10.5), GREEN);
         }
-        UiIcon::ReplaceImage | UiIcon::Bitmap => {
-            painter.rect_stroke(c.r(0.08, 0.14, 0.92, 0.86), 1.5, fg);
-            painter.circle_filled(c.p(0.73, 0.34), rect.width() * 0.075, accent);
-            c.line(
-                painter,
-                &[
-                    (0.13, 0.76),
-                    (0.36, 0.49),
-                    (0.51, 0.66),
-                    (0.64, 0.55),
-                    (0.87, 0.77),
-                ],
-                ac,
-            );
-            if icon == UiIcon::ReplaceImage {
-                c.line(painter, &[(0.54, 0.93), (0.80, 0.93), (0.91, 0.80)], fg);
-                c.line(painter, &[(0.91, 0.80), (0.91, 0.94)], fg);
-            }
+        UiIcon::ToQ1s => {
+            page(painter, g, PAPER);
+            g.text(painter, 8.0, 8.5, "q1", 6.0, RED);
         }
         UiIcon::Extract => {
-            painter.rect_stroke(c.r(0.13, 0.50, 0.87, 0.91), 1.2, fg);
-            c.line(painter, &[(0.50, 0.08), (0.50, 0.66)], ac);
-            c.line(painter, &[(0.29, 0.45), (0.50, 0.67), (0.71, 0.45)], ac);
+            g.poly(
+                painter,
+                &[(1.5, 8.0), (14.5, 8.0), (14.5, 15.0), (1.5, 15.0)],
+                Color32::from_rgb(0xC8, 0x9B, 0x5E),
+                Color32::from_rgb(0x7A, 0x55, 0x26),
+            );
+            painter.line_segment(
+                [g.p(1.5, 10.5), g.p(14.5, 10.5)],
+                Stroke::new(u, Color32::from_rgb(0x7A, 0x55, 0x26)),
+            );
+            arrow(painter, g, (8.0, 0.5), (8.0, 9.5), GREEN);
+        }
+        UiIcon::ReplaceImage => {
+            picture(painter, g);
+            arrow(painter, g, (4.0, 15.0), (12.0, 15.0), ORANGE);
         }
         UiIcon::Theme => {
-            painter.circle_stroke(c.p(0.48, 0.51), rect.width() * 0.37, ac);
-            painter.circle_filled(c.p(0.35, 0.31), rect.width() * 0.055, foreground);
-            painter.circle_filled(c.p(0.57, 0.27), rect.width() * 0.055, accent);
-            painter.circle_filled(c.p(0.70, 0.46), rect.width() * 0.055, foreground);
-            painter.circle_filled(c.p(0.28, 0.58), rect.width() * 0.055, accent);
+            painter.circle(
+                g.p(8.0, 8.0),
+                7.0 * u,
+                Color32::from_rgb(0xE8, 0xD2, 0xA8),
+                Stroke::new(u, Color32::from_rgb(0x8A, 0x6A, 0x3A)),
+            );
+            for (x, y, color) in [
+                (5.0, 5.0, RED),
+                (9.0, 4.0, BLUE),
+                (12.0, 7.0, GREEN),
+                (4.5, 9.5, ORANGE),
+            ] {
+                painter.circle_filled(g.p(x, y), 1.4 * u, color);
+            }
             painter.circle_filled(
-                c.p(0.56, 0.74),
-                rect.width() * 0.13,
+                g.p(9.5, 11.0),
+                1.8 * u,
                 painter.ctx().style().visuals.panel_fill,
             );
         }
+        UiIcon::About => {
+            painter.circle(g.p(8.0, 8.0), 7.0 * u, BLUE, Stroke::new(u, darker(BLUE)));
+            g.text(painter, 8.0, 8.3, "i", 11.0, Color32::WHITE);
+        }
+        UiIcon::Play => g.poly(
+            painter,
+            &[(4.0, 2.0), (14.0, 8.0), (4.0, 14.0)],
+            GREEN,
+            darker(GREEN),
+        ),
+        UiIcon::Pause => {
+            g.boxed(painter, g.r(3.5, 2.5, 7.0, 13.5), BLUE, darker(BLUE), 0.5);
+            g.boxed(painter, g.r(9.0, 2.5, 12.5, 13.5), BLUE, darker(BLUE), 0.5);
+        }
+        UiIcon::First | UiIcon::Last | UiIcon::Previous | UiIcon::Next => {
+            let left = matches!(icon, UiIcon::First | UiIcon::Previous);
+            let tri: [(f32, f32); 3] = if left {
+                [(13.0, 3.0), (13.0, 13.0), (5.0, 8.0)]
+            } else {
+                [(3.0, 3.0), (3.0, 13.0), (11.0, 8.0)]
+            };
+            g.poly(painter, &tri, INK, INK);
+            if matches!(icon, UiIcon::First | UiIcon::Last) {
+                let x = if left { 2.5 } else { 11.5 };
+                painter.rect_filled(g.r(x, 3.0, x + 2.0, 13.0), 0.0, INK);
+            }
+        }
+        UiIcon::ZoomIn | UiIcon::ZoomOut => {
+            magnifier(painter, g);
+            g.line(painter, &[(4.0, 6.5), (9.0, 6.5)], 1.6, INK);
+            if icon == UiIcon::ZoomIn {
+                g.line(painter, &[(6.5, 4.0), (6.5, 9.0)], 1.6, INK);
+            }
+        }
+        UiIcon::Search => magnifier(painter, g),
+        UiIcon::ZoomFit => {
+            for (cx, cy, sx, sy) in [
+                (1.5, 1.5, 1.0, 1.0),
+                (14.5, 1.5, -1.0, 1.0),
+                (1.5, 14.5, 1.0, -1.0),
+                (14.5, 14.5, -1.0, -1.0),
+            ] {
+                g.line(
+                    painter,
+                    &[(cx + sx * 4.5, cy), (cx, cy), (cx, cy + sy * 4.5)],
+                    1.8,
+                    INK,
+                );
+            }
+            g.boxed(painter, g.r(5.0, 5.0, 11.0, 11.0), SKY, BLUE, 0.5);
+        }
+        UiIcon::ZoomActual => {
+            g.boxed(painter, g.r(1.0, 2.0, 15.0, 14.0), PAPER, GREY, 1.0);
+            g.text(painter, 8.0, 8.2, "1:1", 7.0, INK);
+        }
+        UiIcon::Clear => {
+            painter.circle_filled(g.p(8.0, 8.0), 6.5 * u, Color32::from_gray(150));
+            g.line(painter, &[(5.0, 5.0), (11.0, 11.0)], 1.8, Color32::WHITE);
+            g.line(painter, &[(11.0, 5.0), (5.0, 11.0)], 1.8, Color32::WHITE);
+        }
         UiIcon::Vector => {
-            let a = c.p(0.12, 0.76);
-            let b = c.p(0.49, 0.20);
-            let d = c.p(0.88, 0.70);
-            let h1 = c.p(0.27, 0.33);
-            let h2 = c.p(0.72, 0.31);
-            painter.line_segment(
-                [a, h1],
-                Stroke::new(0.8_f32, foreground.gamma_multiply(0.55)),
-            );
-            painter.line_segment(
-                [b, h2],
-                Stroke::new(0.8_f32, foreground.gamma_multiply(0.55)),
-            );
             painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
-                [a, h1, h2, d],
+                [
+                    g.p(2.0, 13.0),
+                    g.p(3.0, 2.0),
+                    g.p(13.0, 14.0),
+                    g.p(14.0, 3.0),
+                ],
                 false,
                 Color32::TRANSPARENT,
-                ac,
+                Stroke::new(1.6 * u, PURPLE),
             ));
-            for p in [a, b, d] {
-                painter.circle_filled(p, rect.width() * 0.075, foreground);
-                painter.circle_stroke(p, rect.width() * 0.075, Stroke::new(0.7_f32, accent));
-            }
-        }
-        UiIcon::Media | UiIcon::Video => {
-            painter.rect_stroke(c.r(0.08, 0.16, 0.92, 0.84), 1.5, fg);
-            c.polygon(
-                painter,
-                &[(0.42, 0.34), (0.42, 0.68), (0.70, 0.51)],
-                accent,
-                Stroke::NONE,
-            );
-            if icon == UiIcon::Media {
-                for x in [0.16, 0.84] {
-                    painter
-                        .line_segment([c.p(x, 0.18), c.p(x, 0.82)], Stroke::new(1.0_f32, accent));
-                }
-            }
-        }
-        UiIcon::Rig => {
-            let a = c.p(0.20, 0.75);
-            let b = c.p(0.48, 0.50);
-            let d = c.p(0.78, 0.23);
-            painter.line_segment([a, b], Stroke::new(2.2_f32, foreground));
-            painter.line_segment([b, d], Stroke::new(2.2_f32, accent));
-            for p in [a, b, d] {
-                painter.circle_filled(
-                    p,
-                    rect.width() * 0.09,
-                    painter.ctx().style().visuals.panel_fill,
+            for (x, y) in [(2.0, 13.0), (14.0, 3.0)] {
+                g.boxed(
+                    painter,
+                    Rect::from_center_size(g.p(x, y), vec2(3.0 * u, 3.0 * u)),
+                    PAPER,
+                    INK,
+                    0.0,
                 );
-                painter.circle_stroke(p, rect.width() * 0.09, ac);
             }
         }
-        UiIcon::Symbol => {
-            painter.rect_stroke(c.r(0.28, 0.12, 0.88, 0.72), 1.5, fg);
-            painter.rect_stroke(c.r(0.10, 0.30, 0.70, 0.90), 1.5, ac);
+        UiIcon::Shape => {
+            painter.circle(
+                g.p(6.0, 7.0),
+                5.0 * u,
+                Color32::from_rgb(0x55, 0x9C, 0xE8),
+                Stroke::new(u, darker(BLUE)),
+            );
+            g.poly(
+                painter,
+                &[(8.0, 6.0), (15.0, 14.5), (5.0, 14.5)],
+                PURPLE,
+                darker(PURPLE),
+            );
         }
-        UiIcon::Code => {
-            c.line(painter, &[(0.36, 0.24), (0.13, 0.50), (0.36, 0.76)], ac);
-            c.line(painter, &[(0.64, 0.24), (0.87, 0.50), (0.64, 0.76)], ac);
-            painter.line_segment([c.p(0.57, 0.16), c.p(0.43, 0.84)], fg);
+        UiIcon::MorphShape => {
+            painter.circle(
+                g.p(5.0, 6.0),
+                4.0 * u,
+                Color32::from_rgb(0x55, 0x9C, 0xE8),
+                Stroke::new(u, darker(BLUE)),
+            );
+            g.boxed(
+                painter,
+                g.r(9.0, 8.5, 15.0, 14.5),
+                PURPLE,
+                darker(PURPLE),
+                0.0,
+            );
+            g.line(painter, &[(7.0, 10.0), (9.0, 12.0)], 1.2, INK);
+        }
+        UiIcon::Sprite | UiIcon::Symbol => {
+            g.boxed(painter, g.r(1.5, 1.5, 14.5, 14.5), BLUE, darker(BLUE), 2.0);
+            g.boxed(
+                painter,
+                g.r(4.0, 4.0, 12.0, 12.0),
+                Color32::from_rgb(0x7F, 0xB2, 0xF0),
+                Color32::WHITE,
+                1.0,
+            );
+            if icon == UiIcon::Sprite {
+                g.poly(
+                    painter,
+                    &[(6.5, 5.5), (10.5, 8.0), (6.5, 10.5)],
+                    Color32::WHITE,
+                    Color32::WHITE,
+                );
+            }
+        }
+        UiIcon::Button => {
+            g.boxed(
+                painter,
+                g.r(1.0, 4.0, 15.0, 12.0),
+                Color32::from_rgb(0xD8, 0xE6, 0xF5),
+                Color32::from_gray(90),
+                3.0,
+            );
+            painter.line_segment(
+                [g.p(3.0, 5.5), g.p(13.0, 5.5)],
+                Stroke::new(u, Color32::WHITE),
+            );
+            g.text(painter, 8.0, 8.2, "OK", 6.0, INK);
+        }
+        UiIcon::Bitmap => picture(painter, g),
+        UiIcon::Text => g.text(
+            painter,
+            8.0,
+            8.5,
+            "A",
+            15.0,
+            Color32::from_rgb(0x1E, 0x3F, 0x8C),
+        ),
+        UiIcon::Font => {
+            g.text(painter, 6.0, 8.5, "A", 13.0, RED);
+            g.text(painter, 12.0, 10.5, "a", 9.0, darker(RED));
         }
         UiIcon::Audio => {
-            let bars = [
-                (0.16, 0.36),
-                (0.30, 0.62),
-                (0.44, 0.82),
-                (0.58, 0.54),
-                (0.72, 0.72),
-                (0.86, 0.30),
-            ];
-            for (index, (x, height)) in bars.into_iter().enumerate() {
-                let color = if index % 2 == 0 { fg } else { ac };
-                painter.line_segment(
-                    [c.p(x, 0.5 - height * 0.35), c.p(x, 0.5 + height * 0.35)],
-                    color,
-                );
+            g.poly(
+                painter,
+                &[
+                    (1.5, 6.0),
+                    (4.5, 6.0),
+                    (8.5, 2.5),
+                    (8.5, 13.5),
+                    (4.5, 10.0),
+                    (1.5, 10.0),
+                ],
+                Color32::from_gray(110),
+                INK,
+            );
+            for (r, w) in [(3.0, 1.3), (5.5, 1.3)] {
+                let points: Vec<Pos2> = (-4..=4)
+                    .map(|i| {
+                        let a = i as f32 * 0.17;
+                        pos2(
+                            g.p(8.5, 8.0).x + a.cos() * r * u,
+                            g.p(8.5, 8.0).y + a.sin() * r * u,
+                        )
+                    })
+                    .collect();
+                painter.add(Shape::line(points, Stroke::new(w * u, ORANGE)));
             }
         }
+        UiIcon::Video | UiIcon::Media | UiIcon::Movie => {
+            g.boxed(
+                painter,
+                g.r(1.0, 3.0, 15.0, 13.0),
+                Color32::from_gray(50),
+                INK,
+                0.5,
+            );
+            for x in [2.0, 5.0, 8.0, 11.0, 13.5] {
+                painter.rect_filled(g.r(x, 3.8, x + 1.4, 5.0), 0.0, PAPER);
+                painter.rect_filled(g.r(x, 11.0, x + 1.4, 12.2), 0.0, PAPER);
+            }
+            if icon == UiIcon::Movie {
+                g.poly(
+                    painter,
+                    &[(6.0, 6.0), (11.0, 8.0), (6.0, 10.0)],
+                    ORANGE,
+                    ORANGE,
+                );
+            } else {
+                painter.rect_filled(g.r(3.0, 6.0, 13.0, 10.0), 0.0, SKY);
+            }
+        }
+        UiIcon::Frame => {
+            g.boxed(painter, g.r(2.0, 2.0, 14.0, 14.0), PAPER, GREY, 0.0);
+            painter.circle_filled(g.p(8.0, 8.0), 2.2 * u, INK);
+        }
         UiIcon::Binary => {
-            for y in 0..3 {
-                for x in 0..3 {
-                    let center = c.p(0.25 + x as f32 * 0.25, 0.25 + y as f32 * 0.25);
-                    let on = (x + y) % 2 == 0;
-                    if on {
-                        painter.rect_filled(
-                            Rect::from_center_size(center, vec2(3.0, 3.0)),
-                            0.5,
-                            accent,
-                        );
-                    } else {
-                        painter.circle_stroke(center, 1.6, fg);
-                    }
-                }
+            page(painter, g, Color32::from_rgb(0xE6, 0xF2, 0xE6));
+            g.text(painter, 8.0, 7.0, "01", 5.0, darker(GREEN));
+            g.text(painter, 8.0, 11.5, "10", 5.0, darker(GREEN));
+        }
+        UiIcon::Code => {
+            page(painter, g, PAPER);
+            g.line(painter, &[(7.0, 6.0), (5.0, 9.0), (7.0, 12.0)], 1.3, BLUE);
+            g.line(painter, &[(9.5, 6.0), (11.5, 9.0), (9.5, 12.0)], 1.3, BLUE);
+        }
+        UiIcon::Rig => {
+            g.line(
+                painter,
+                &[(3.0, 13.0), (8.0, 8.0), (13.0, 3.0)],
+                2.2,
+                ORANGE,
+            );
+            for (x, y) in [(3.0, 13.0), (8.0, 8.0), (13.0, 3.0)] {
+                painter.circle(g.p(x, y), 1.8 * u, PAPER, Stroke::new(u, darker(ORANGE)));
             }
         }
         UiIcon::Document => {
-            c.polygon(
-                painter,
-                &[
-                    (0.18, 0.08),
-                    (0.65, 0.08),
-                    (0.85, 0.28),
-                    (0.85, 0.92),
-                    (0.18, 0.92),
-                ],
-                Color32::TRANSPARENT,
-                fg,
+            page(painter, g, PAPER);
+            for y in [7.0, 9.5, 12.0] {
+                g.line(painter, &[(5.0, y), (11.5, y)], 1.0, GREY);
+            }
+        }
+        UiIcon::Other => {
+            painter.circle(
+                g.p(8.0, 8.0),
+                5.5 * u,
+                Color32::from_gray(170),
+                Stroke::new(u, Color32::from_gray(90)),
             );
-            c.line(painter, &[(0.65, 0.08), (0.65, 0.29), (0.85, 0.29)], ac);
-            c.line(painter, &[(0.31, 0.50), (0.72, 0.50)], fg);
-            c.line(painter, &[(0.31, 0.66), (0.66, 0.66)], fg);
+            for i in 0..8 {
+                let a = i as f32 * std::f32::consts::FRAC_PI_4;
+                let c = g.p(8.0, 8.0);
+                painter.circle_filled(
+                    pos2(c.x + a.cos() * 6.2 * u, c.y + a.sin() * 6.2 * u),
+                    1.3 * u,
+                    Color32::from_gray(140),
+                );
+            }
+            painter.circle_filled(g.p(8.0, 8.0), 2.0 * u, Color32::from_gray(235));
         }
     }
 }
@@ -417,10 +672,9 @@ pub fn draw_icon(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use canripper::document::TreeNode;
 
     #[test]
-    fn resource_kinds_map_to_typed_vector_icons() {
+    fn resource_kinds_map_to_their_icons() {
         let make = |preview| TreeNode {
             id: 0,
             label: String::new(),
@@ -429,25 +683,25 @@ mod tests {
             edit: None,
             children: Vec::new(),
         };
+        let vector = make(PreviewRef::QProjectAsset {
+            path: Vec::new(),
+            asset_id: 1,
+            kind: AssetVisualKind::Vector,
+        });
+        assert_eq!(icon_for_tree_node(&vector, None, false), UiIcon::Vector);
         assert_eq!(
-            icon_for_tree_node(&make(PreviewRef::QProjectAsset {
-                path: Vec::new(),
-                asset_id: 1,
-                kind: AssetVisualKind::Vector,
-            })),
-            UiIcon::Vector
-        );
-        assert_eq!(
-            icon_for_tree_node(&make(PreviewRef::QProjectAsset {
-                path: Vec::new(),
-                asset_id: 2,
-                kind: AssetVisualKind::Bitmap,
-            })),
-            UiIcon::Bitmap
-        );
-        assert_eq!(
-            icon_for_tree_node(&make(PreviewRef::Q0vStandaloneAudio)),
+            icon_for_tree_node(&make(PreviewRef::Q0vStandaloneAudio), None, false),
             UiIcon::Audio
         );
+        assert_eq!(
+            icon_for_tree_node(&make(PreviewRef::SwfFrame(3)), None, false),
+            UiIcon::Frame
+        );
+        let folder = TreeNode {
+            preview: None,
+            children: vec![vector.clone()],
+            ..vector
+        };
+        assert_eq!(icon_for_tree_node(&folder, None, true), UiIcon::FolderOpen);
     }
 }

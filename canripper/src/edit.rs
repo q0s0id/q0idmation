@@ -215,7 +215,7 @@ fn replace_with_rgba(
                     asset_id: *asset_id,
                     width,
                     height,
-                    rgba: rgba.clone(),
+                    rgba: rgba.clone().into(),
                 });
                 project.asset_appearances.remove(asset_id);
                 if let Err(error) = q0s_format::v2::validate(project) {

@@ -145,6 +145,8 @@ pub enum Tool {
     Pencil,
     Brush,
     Eraser,
+    /// Cuts drawn shapes apart along a dragged line.
+    Knife,
     Line,
     Rectangle,
     Oval,
@@ -155,7 +157,7 @@ pub enum Tool {
 }
 
 impl Tool {
-    pub const ALL: [Tool; 15] = [
+    pub const ALL: [Tool; 16] = [
         Tool::Select,
         Tool::Lasso,
         Tool::Hand,
@@ -164,6 +166,7 @@ impl Tool {
         Tool::Pencil,
         Tool::Brush,
         Tool::Eraser,
+        Tool::Knife,
         Tool::Line,
         Tool::Rectangle,
         Tool::Oval,
@@ -183,6 +186,7 @@ impl Tool {
             Tool::Pencil => "Pencil",
             Tool::Brush => "Brush",
             Tool::Eraser => "Eraser",
+            Tool::Knife => "Knife",
             Tool::Line => "Line",
             Tool::Rectangle => "Rectangle",
             Tool::Oval => "Oval",
@@ -203,6 +207,7 @@ impl Tool {
             Tool::Pencil => "Y",
             Tool::Brush => "B",
             Tool::Eraser => "E",
+            Tool::Knife => "C",
             Tool::Line => "N",
             Tool::Rectangle => "R",
             Tool::Oval => "O",
@@ -806,6 +811,20 @@ pub enum ToolState {
     Marquee {
         start: Vec2,
     },
+    /// Subselect's rubber band: the points inside it are picked, on as
+    /// many lines and shapes as it covers.
+    SubselectMarquee {
+        start: Vec2,
+    },
+    /// The knife's cut being dragged.
+    KnifeDrawing {
+        points: Vec<Vec2>,
+    },
+    /// Subselect moving the picked points of several paths together.
+    DraggingManyPoints {
+        parts: Vec<(PathRef, Vec<usize>, VPath)>,
+        start_cursor: Vec2,
+    },
 }
 
 impl ToolState {
@@ -1001,6 +1020,9 @@ pub struct Session {
     pub selection: Selection,
     pub transform_pivot: Option<TransformPivot>,
     pub marquee_base_selection: Option<Selection>,
+    /// Points picked on further paths alongside a `SubselectPoints`
+    /// selection, by Subselect's rubber band.
+    pub subselect_more: Vec<(PathRef, Vec<usize>)>,
     /// One history step for a completed selection gesture, never per pointer move.
     pub selection_history_gesture: Option<(HistoryPivotState, bool)>,
     pub(crate) frame_edit_gesture: Option<crate::frame_edit::Gesture>,
@@ -1084,6 +1106,9 @@ pub struct Session {
     pub particles: crate::particles::ParticleSession,
     /// Light editor window; hidden unless enabled in Settings.
     pub lights: crate::lights::LightSession,
+    pub scene3d: crate::scene3d::Scene3dSession,
+    /// The 3D tools on the stage and the free 3D view.
+    pub tools3d: crate::tools3d::Tools3dSession,
     /// The background preview both windows share.
     pub sim_preview: crate::sim_preview::SimPreview,
     pub rig_auto_key: bool,
@@ -1260,6 +1285,7 @@ impl Session {
             selection: Selection::None,
             transform_pivot: None,
             marquee_base_selection: None,
+            subselect_more: Vec::new(),
             selection_history_gesture: None,
             frame_edit_gesture: None,
             frame_edit_selection: Vec::new(),
@@ -1323,6 +1349,8 @@ impl Session {
             physics: Default::default(),
             particles: Default::default(),
             lights: Default::default(),
+            scene3d: Default::default(),
+            tools3d: Default::default(),
             sim_preview: Default::default(),
             rig_auto_key: true,
             rig_selected_node: None,
@@ -1578,7 +1606,8 @@ impl Session {
                         q0s_format::v2::Asset::Vector(vector) => vector.paths.get(path_idx),
                         q0s_format::v2::Asset::Bitmap(_)
                         | q0s_format::v2::Asset::Q0v(_)
-                        | q0s_format::v2::Asset::Rig(_) => None,
+                        | q0s_format::v2::Asset::Rig(_)
+                        | q0s_format::v2::Asset::Model(_) => None,
                     })
                     .is_some();
                 if !exists {
@@ -2260,7 +2289,8 @@ fn path_ref_exists(project: &ProjectV2, r: PathRef) -> bool {
             q0s_format::v2::Asset::Vector(vector) => vector.paths.get(r.path_idx),
             q0s_format::v2::Asset::Bitmap(_)
             | q0s_format::v2::Asset::Q0v(_)
-            | q0s_format::v2::Asset::Rig(_) => None,
+            | q0s_format::v2::Asset::Rig(_)
+            | q0s_format::v2::Asset::Model(_) => None,
         })
         .is_some()
 }
@@ -2282,7 +2312,8 @@ fn path_anchor_count(project: &ProjectV2, r: PathRef) -> Option<usize> {
             q0s_format::v2::Asset::Vector(vector) => vector.paths.get(r.path_idx),
             q0s_format::v2::Asset::Bitmap(_)
             | q0s_format::v2::Asset::Q0v(_)
-            | q0s_format::v2::Asset::Rig(_) => None,
+            | q0s_format::v2::Asset::Rig(_)
+            | q0s_format::v2::Asset::Model(_) => None,
         })
         .map(|path| path.anchors.len())
 }
@@ -2304,7 +2335,8 @@ fn path_segment_count(project: &ProjectV2, r: PathRef) -> Option<usize> {
             q0s_format::v2::Asset::Vector(vector) => vector.paths.get(r.path_idx),
             q0s_format::v2::Asset::Bitmap(_)
             | q0s_format::v2::Asset::Q0v(_)
-            | q0s_format::v2::Asset::Rig(_) => None,
+            | q0s_format::v2::Asset::Rig(_)
+            | q0s_format::v2::Asset::Model(_) => None,
         })
         .map(|path| {
             if path.anchors.len() < 2 {
@@ -2362,10 +2394,65 @@ fn collapse_mixed_selection(paths: Vec<PathRef>, objects: Vec<PlacementRef>) -> 
     }
 }
 
-/// Snapshot-based undo/redo stack. Each snapshot is a deep clone of the project,
-/// which is acceptable for the current scale (vector shapes are tiny). Capped to
-/// avoid unbounded memory growth on long sessions.
+/// Snapshot-based undo/redo stack. Each snapshot is a clone of the project.
+/// Pixel and video buffers are shared between clones, but drawings are not,
+/// so a big project keeps fewer steps: the steps are capped by count and by
+/// the memory they hold, whichever comes first.
 const HISTORY_CAP: usize = 64;
+/// Memory undo may hold. Phones end an app that grows past a few hundred MB.
+const HISTORY_BUDGET: usize = if cfg!(target_os = "android") {
+    160 << 20
+} else {
+    1536 << 20
+};
+
+/// Roughly how much memory a copy of `project` holds of its own. Shared
+/// pixel and video buffers count their share.
+pub(crate) fn project_copy_bytes(project: &ProjectV2) -> usize {
+    use std::mem::size_of;
+    let paths = |paths: &[q0s_format::v2::Path]| -> usize {
+        paths
+            .iter()
+            .map(|path| 32 + path.anchors.len() * size_of::<q0s_format::v2::Anchor>())
+            .sum()
+    };
+    let mut bytes = size_of::<ProjectV2>();
+    for asset in &project.assets {
+        bytes += size_of::<q0s_format::v2::Asset>()
+            + match asset {
+                q0s_format::v2::Asset::Vector(vector) => paths(&vector.paths),
+                q0s_format::v2::Asset::Bitmap(bitmap) => {
+                    bitmap.rgba.len() / std::sync::Arc::strong_count(&bitmap.rgba).max(1)
+                }
+                q0s_format::v2::Asset::Q0v(video) => {
+                    video.bytes.len() / std::sync::Arc::strong_count(&video.bytes).max(1)
+                }
+                q0s_format::v2::Asset::Rig(_) => 4096,
+                q0s_format::v2::Asset::Model(model) => {
+                    let data = &model.data;
+                    (data.vertex_count() * 48
+                        + data.triangle_count() * 24
+                        + data.textures.iter().map(|t| t.rgba.len()).sum::<usize>())
+                        / std::sync::Arc::strong_count(&model.data).max(1)
+                }
+            };
+    }
+    for appearance in project.asset_appearances.values() {
+        bytes += 256
+            + paths(&appearance.erase_mask)
+            + paths(&appearance.material_source)
+            + paths(&appearance.clip_mask);
+    }
+    for q0rg in &project.q0rgs {
+        bytes += 64 + q0rg.name.len() + q0rg.script.len();
+        for layer in &q0rg.layers {
+            bytes += 64
+                + layer.name.len()
+                + layer.placements.len() * size_of::<q0s_format::v2::Placement>();
+        }
+    }
+    bytes
+}
 
 #[derive(Clone, Copy)]
 pub struct TimelineHistoryPosition {
@@ -2404,6 +2491,8 @@ impl HistoryPivotState {
 struct HistoryEntry {
     // Selection-only entries do not copy or modify project artwork.
     project: Option<ProjectV2>,
+    /// What `project` holds in memory, from `project_copy_bytes`.
+    bytes: usize,
     timeline_position: Option<TimelineHistoryPosition>,
     pivot_state: Option<HistoryPivotState>,
 }
@@ -2425,6 +2514,25 @@ impl History {
 
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty()
+    }
+
+    /// Memory the stored steps hold, roughly.
+    pub fn held_bytes(&self) -> usize {
+        self.undo
+            .iter()
+            .chain(&self.redo)
+            .map(|entry| entry.bytes)
+            .sum()
+    }
+
+    /// Forgets the oldest steps past the count cap or the memory budget. The
+    /// newest step always stays, so one undo is always there.
+    fn trim(&mut self) {
+        let mut held = self.held_bytes();
+        while self.undo.len() > 1 && (self.undo.len() > HISTORY_CAP || held > HISTORY_BUDGET) {
+            let dropped = self.undo.remove(0);
+            held = held.saturating_sub(dropped.bytes);
+        }
     }
 
     pub fn can_redo(&self) -> bool {
@@ -2490,6 +2598,7 @@ impl History {
     pub fn snapshot_selection(&mut self, state: HistoryPivotState) {
         self.undo.push(HistoryEntry {
             project: None,
+            bytes: 0,
             timeline_position: None,
             pivot_state: Some(state),
         });
@@ -2519,16 +2628,17 @@ impl History {
         }) {
             return;
         }
+        let project = current.clone();
+        let bytes = project_copy_bytes(&project);
         self.undo.push(HistoryEntry {
-            project: Some(current.clone()),
+            project: Some(project),
+            bytes,
             timeline_position: None,
             pivot_state,
         });
         self.snapshot_revision = self.snapshot_revision.wrapping_add(1);
-        if self.undo.len() > HISTORY_CAP {
-            self.undo.remove(0);
-        }
         self.redo.clear();
+        self.trim();
     }
 
     /// Pop the latest "before"; move `current` onto the redo stack.
@@ -2549,8 +2659,10 @@ impl History {
             reconcile(&current, &current);
             (current, None)
         };
+        let bytes = redo_project.as_ref().map_or(0, project_copy_bytes);
         self.redo.push(HistoryEntry {
             project: redo_project,
+            bytes,
             timeline_position: None,
             pivot_state: None,
         });
@@ -2575,8 +2687,10 @@ impl History {
             reconcile(&current, &current);
             (current, None)
         };
+        let bytes = undo_project.as_ref().map_or(0, project_copy_bytes);
         self.undo.push(HistoryEntry {
             project: undo_project,
+            bytes,
             timeline_position: None,
             pivot_state: None,
         });
@@ -2742,5 +2856,47 @@ mod default_project_tests {
             rig.nodes[0].binding.expect("binding").instance_id,
             stable_id
         );
+    }
+
+    #[test]
+    fn undo_steps_share_pixels_and_forget_old_steps_past_the_budget() {
+        use super::{HistoryEntry, HISTORY_BUDGET};
+        use q0s_format::v2::{BitmapAsset, ProjectV2};
+        let mut project = default_project();
+        project.assets.push(Asset::Bitmap(BitmapAsset {
+            asset_id: 900,
+            width: 1024,
+            height: 1024,
+            rgba: vec![7; 1024 * 1024 * 4].into(),
+        }));
+        let mut history = History::new();
+        for step in 0..10 {
+            project.meta.name = format!("step {step}");
+            history.snapshot(&project);
+        }
+        let pixels = |project: &ProjectV2| match project.assets.last() {
+            Some(Asset::Bitmap(bitmap)) => bitmap.rgba.clone(),
+            _ => panic!("the bitmap"),
+        };
+        let stored = history.undo[0].project.as_ref().expect("a snapshot");
+        assert!(
+            std::sync::Arc::ptr_eq(&pixels(stored), &pixels(&project)),
+            "an undo step shares the pixels instead of copying 4 MB"
+        );
+        // Ten full copies would hold 40 MB of pixels.
+        assert!(history.held_bytes() < 16 << 20, "{}", history.held_bytes());
+
+        // Steps that each hold more than the budget leave only the newest.
+        let mut history = History::new();
+        for _ in 0..3 {
+            history.undo.push(HistoryEntry {
+                project: Some(default_project()),
+                bytes: HISTORY_BUDGET,
+                timeline_position: None,
+                pivot_state: None,
+            });
+            history.trim();
+        }
+        assert_eq!(history.undo.len(), 1);
     }
 }

@@ -7,8 +7,10 @@
 pub mod contour;
 pub mod links;
 pub mod liquid;
+pub mod liquid3d;
 pub mod particles;
 pub mod rigid;
+pub mod rigid3d;
 mod rng;
 
 pub use rigid::{

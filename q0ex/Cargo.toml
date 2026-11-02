@@ -1,0 +1,13 @@
+[package]
+name = "q0ex"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "q0ex, the plugin language of q0editor: parser, interpreter and the .qx plugin file."
+
+[dependencies]
+base64 = "0.22"
+serde_json = "1"

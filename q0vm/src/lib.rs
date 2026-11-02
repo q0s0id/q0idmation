@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 pub const BYTECODE_MAGIC: [u8; 4] = *b"QVM\0";
-// Version 2 adds range iteration. Version 1 chunks remain readable; older
-// players reject new chunks at the header instead of misreading instructions.
-pub const BYTECODE_VERSION: u16 = 2;
+// Version 2 adds range iteration, version 3 host queries and the layer and
+// window channels. Older chunks remain readable; older players reject new
+// chunks at the header instead of misreading instructions.
+pub const BYTECODE_VERSION: u16 = 3;
 pub const DEFAULT_INSTRUCTION_BUDGET: usize = 100_000;
 pub const DEFAULT_STACK_LIMIT: usize = 4_096;
 pub const DEFAULT_CALL_DEPTH_LIMIT: usize = 128;
@@ -85,6 +86,37 @@ pub enum HostAction {
     PhysicsCommand { command: String, args: Vec<Value> },
     ParticlesCommand { command: String, args: Vec<Value> },
     LightCommand { command: String, args: Vec<Value> },
+    LayerCommand { command: String, args: Vec<Value> },
+    WindowCommand { command: String, args: Vec<Value> },
+}
+
+/// Answers calls the host owns, such as `q0layer.touches(...)`, while a
+/// script runs. `vars` are the shared variables as they stand right then, so
+/// an answer can see where the script has just moved something.
+pub trait HostQuery {
+    fn query(
+        &mut self,
+        name: &str,
+        args: &[Value],
+        vars: &BTreeMap<String, Value>,
+    ) -> Result<Value, String>;
+}
+
+/// The host of a program that answers nothing, such as the editor's
+/// analysis or q0shell.
+pub struct NoHost;
+
+impl HostQuery for NoHost {
+    fn query(
+        &mut self,
+        name: &str,
+        _args: &[Value],
+        _vars: &BTreeMap<String, Value>,
+    ) -> Result<Value, String> {
+        Err(format!(
+            "`{name}` is answered by q0player while the movie plays"
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +198,9 @@ pub enum Opcode {
     Physics = 41,
     Particles = 42,
     Light = 43,
+    CallHost = 44,
+    Layer = 45,
+    Window = 46,
 }
 
 impl TryFrom<u8> for Opcode {
@@ -214,6 +249,9 @@ impl TryFrom<u8> for Opcode {
             41 => Self::Physics,
             42 => Self::Particles,
             43 => Self::Light,
+            44 => Self::CallHost,
+            45 => Self::Layer,
+            46 => Self::Window,
             38 => Self::RangeStart,
             39 => Self::RangeNext,
             40 => Self::RangeEnd,
@@ -351,7 +389,7 @@ impl Chunk {
             return Err(BytecodeError::Malformed("bad qvm bytecode magic"));
         }
         let version = cursor.read_u16()?;
-        if version != 1 && version != BYTECODE_VERSION {
+        if !(1..=BYTECODE_VERSION).contains(&version) {
             return Err(BytecodeError::UnsupportedVersion(version));
         }
         let constant_count = cursor.read_u32()? as usize;
@@ -491,13 +529,22 @@ impl Vm {
     }
 
     pub fn execute(&mut self, chunk: &Chunk, instruction_budget: usize) -> ExecutionReport {
+        self.execute_with_host(chunk, instruction_budget, &mut NoHost)
+    }
+
+    pub fn execute_with_host(
+        &mut self,
+        chunk: &Chunk,
+        instruction_budget: usize,
+        host: &mut dyn HostQuery,
+    ) -> ExecutionReport {
         let mut report = ExecutionReport::default();
         self.stack.clear();
         self.locals.clear();
         self.ranges.clear();
         self.ip = 0;
         let budget = instruction_budget.max(1);
-        let result = self.run_range(chunk, chunk.code.len(), budget, &mut report);
+        let result = self.run_range(chunk, chunk.code.len(), budget, &mut report, host);
         if let Err((line, message)) = result {
             report.diagnostics.push(Diagnostic::new(line, message));
         }
@@ -512,6 +559,16 @@ impl Vm {
         args: &[Value],
         instruction_budget: usize,
     ) -> ExecutionReport {
+        self.dispatch_event_with_host(event, args, instruction_budget, &mut NoHost)
+    }
+
+    pub fn dispatch_event_with_host(
+        &mut self,
+        event: &str,
+        args: &[Value],
+        instruction_budget: usize,
+        host: &mut dyn HostQuery,
+    ) -> ExecutionReport {
         let mut report = ExecutionReport::default();
         let handlers = self.state.listeners.get(event).cloned().unwrap_or_default();
         let budget = instruction_budget.max(1);
@@ -523,7 +580,8 @@ impl Vm {
                 ));
                 break;
             }
-            if let Err((line, message)) = self.invoke_function(&handler, args, budget, &mut report)
+            if let Err((line, message)) =
+                self.invoke_function(&handler, args, budget, &mut report, host)
             {
                 report.diagnostics.push(Diagnostic::new(line, message));
             }
@@ -537,6 +595,7 @@ impl Vm {
         args: &[Value],
         budget: usize,
         report: &mut ExecutionReport,
+        host: &mut dyn HostQuery,
     ) -> Result<(), (usize, String)> {
         let function = self
             .state
@@ -573,7 +632,7 @@ impl Vm {
             .collect::<BTreeMap<_, _>>();
         self.locals.push(locals);
         self.ip = function.entry;
-        let result = self.run_range(&function.chunk, function.end, budget, report);
+        let result = self.run_range(&function.chunk, function.end, budget, report, host);
         self.locals.clear();
         self.stack.clear();
         self.ranges.clear();
@@ -590,6 +649,7 @@ impl Vm {
         end: usize,
         budget: usize,
         report: &mut ExecutionReport,
+        host: &mut dyn HostQuery,
     ) -> Result<RunSignal, (usize, String)> {
         while self.ip < end {
             if report.instructions_executed >= budget {
@@ -642,7 +702,8 @@ impl Vm {
                     self.op_ordered_compare(CompareKind::GreaterEqual, report, line)
                 }
                 Opcode::CallMath => self.op_call_math(chunk, report, line),
-                Opcode::CallUser => self.op_call_user(chunk, budget, report, line),
+                Opcode::CallUser => self.op_call_user(chunk, budget, report, line, host),
+                Opcode::CallHost => self.op_call_host(chunk, report, line, host),
                 Opcode::GoRun => self.op_timeline(true, report),
                 Opcode::GoStop => self.op_timeline(false, report),
                 Opcode::Shell => self.op_host_call(chunk, HostChannel::Shell, report),
@@ -651,6 +712,8 @@ impl Vm {
                 Opcode::Physics => self.op_host_call(chunk, HostChannel::Physics, report),
                 Opcode::Particles => self.op_host_call(chunk, HostChannel::Particles, report),
                 Opcode::Light => self.op_host_call(chunk, HostChannel::Light, report),
+                Opcode::Layer => self.op_host_call(chunk, HostChannel::Layer, report),
+                Opcode::Window => self.op_host_call(chunk, HostChannel::Window, report),
                 Opcode::Listen => self.op_listener(chunk, false),
                 Opcode::Unlisten => self.op_listener(chunk, true),
                 Opcode::Import => self.op_import(chunk),
@@ -967,12 +1030,32 @@ impl Vm {
         }
     }
 
+    fn op_call_host(
+        &mut self,
+        chunk: &Chunk,
+        report: &mut ExecutionReport,
+        line: usize,
+        host: &mut dyn HostQuery,
+    ) -> Result<(), String> {
+        let name = self.read_named_constant(chunk)?;
+        let argc = self.read_u8(chunk)? as usize;
+        let args = self.pop_args(argc)?;
+        match host.query(&name, &args, &self.state.vars) {
+            Ok(value) => self.push(value),
+            Err(message) => {
+                report.diagnostics.push(Diagnostic::new(line, message));
+                self.push(Value::Null)
+            }
+        }
+    }
+
     fn op_call_user(
         &mut self,
         chunk: &Chunk,
         budget: usize,
         report: &mut ExecutionReport,
         line: usize,
+        host: &mut dyn HostQuery,
     ) -> Result<(), String> {
         let name = self.read_named_constant(chunk)?;
         let argc = self.read_u8(chunk)? as usize;
@@ -1013,7 +1096,7 @@ impl Vm {
         let range_base = self.ranges.len();
         self.locals.push(locals);
         self.ip = function.entry;
-        let nested = self.run_range(&function.chunk, function.end, budget, report);
+        let nested = self.run_range(&function.chunk, function.end, budget, report, host);
         self.locals.pop();
         self.ip = return_ip;
         self.stack.truncate(stack_base);
@@ -1057,6 +1140,8 @@ impl Vm {
             HostChannel::Physics => HostAction::PhysicsCommand { command, args },
             HostChannel::Particles => HostAction::ParticlesCommand { command, args },
             HostChannel::Light => HostAction::LightCommand { command, args },
+            HostChannel::Layer => HostAction::LayerCommand { command, args },
+            HostChannel::Window => HostAction::WindowCommand { command, args },
         });
         Ok(())
     }
@@ -1217,6 +1302,8 @@ enum HostChannel {
     Physics,
     Particles,
     Light,
+    Layer,
+    Window,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1397,11 +1484,68 @@ mod tests {
         let mut bytes = chunk.encode().unwrap();
         bytes[4..6].copy_from_slice(&1_u16.to_le_bytes());
         assert_eq!(Chunk::decode(&bytes).unwrap(), chunk);
-        bytes[4..6].copy_from_slice(&3_u16.to_le_bytes());
+        bytes[4..6].copy_from_slice(&4_u16.to_le_bytes());
         assert_eq!(
             Chunk::decode(&bytes),
-            Err(BytecodeError::UnsupportedVersion(3))
+            Err(BytecodeError::UnsupportedVersion(4))
         );
+    }
+
+    struct Touching;
+
+    impl HostQuery for Touching {
+        fn query(
+            &mut self,
+            name: &str,
+            args: &[Value],
+            vars: &BTreeMap<String, Value>,
+        ) -> Result<Value, String> {
+            match name {
+                "q0layer.touches" => Ok(Value::Bool(
+                    args.len() == 2 && vars.get("soul.x") == Some(&Value::Number(5.0)),
+                )),
+                _ => Err(format!("unknown `{name}`")),
+            }
+        }
+    }
+
+    #[test]
+    fn host_queries_answer_with_the_variables_as_they_stand() {
+        let mut chunk = Chunk::new();
+        let five = chunk.add_constant(Value::Number(5.0)).unwrap();
+        let soul_x = string_constant(&mut chunk, "soul.x");
+        let layer = chunk.add_constant(Value::String("bones".into())).unwrap();
+        let thing = chunk.add_constant(Value::String("soul".into())).unwrap();
+        let touches = string_constant(&mut chunk, "q0layer.touches");
+        let hit = string_constant(&mut chunk, "hit");
+        let missing = string_constant(&mut chunk, "q0layer.nope");
+        chunk.emit_op(Opcode::Constant, 1);
+        chunk.emit_u32(five);
+        chunk.emit_op(Opcode::StoreGlobal, 1);
+        chunk.emit_u32(soul_x);
+        chunk.emit_op(Opcode::Constant, 2);
+        chunk.emit_u32(layer);
+        chunk.emit_op(Opcode::Constant, 2);
+        chunk.emit_u32(thing);
+        chunk.emit_op(Opcode::CallHost, 2);
+        chunk.emit_u32(touches);
+        chunk.emit_u8(2);
+        chunk.emit_op(Opcode::StoreGlobal, 2);
+        chunk.emit_u32(hit);
+        chunk.emit_op(Opcode::CallHost, 3);
+        chunk.emit_u32(missing);
+        chunk.emit_u8(0);
+        chunk.emit_op(Opcode::Pop, 3);
+        chunk.emit_op(Opcode::Halt, 3);
+        let mut vm = Vm::new();
+        let report = vm.execute_with_host(&chunk, 100, &mut Touching);
+        assert_eq!(vm.state.vars.get("hit"), Some(&Value::Bool(true)));
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].line, 3);
+        let report = Vm::new().execute(&chunk, 100);
+        assert!(report.diagnostics[0]
+            .message
+            .contains("answered by q0player"));
     }
 
     #[test]

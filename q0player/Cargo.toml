@@ -7,28 +7,44 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "Playback runtime for q0s and q0v media."
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = ["native-ui"]
+native-ui = ["dep:q0credits", "dep:q0glblend", "dep:q0theme", "dep:eframe", "dep:egui", "dep:dirs", "dep:rodio", "dep:rfd"]
+browser-gpu = ["dep:q0glblend", "dep:q0theme", "dep:egui", "dep:egui_glow", "dep:glow", "dep:web-sys", "dep:js-sys"]
+
 [[bin]]
 name = "q0player"
 path = "src/main.rs"
+required-features = ["native-ui"]
 
 [dependencies]
-q0credits = { path = "../q0credits" }
-q0glblend = { path = "../q0glblend" }
+q0credits = { path = "../q0credits", optional = true }
+q0glblend = { path = "../q0glblend", optional = true }
 q0s-format = { path = "../q0s-format" }
 q0physics = { path = "../q0physics" }
 q0video = { path = "../q0video" }
-q0theme = { path = "../q0theme" }
-eframe = "0.27"
-egui = "0.27"
+q0theme = { path = "../q0theme", optional = true }
+eframe = { version = "0.27", optional = true }
+egui = { version = "0.27", optional = true }
 lyon_path = "1"
 lyon_tessellation = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-dirs = "5"
-rodio = { version = "0.20", default-features = false }
+dirs = { version = "5", optional = true }
+rodio = { version = "0.20", default-features = false, optional = true }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
-rfd = "0.14"
+rfd = { version = "0.14", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "=0.2.118"
+egui_glow = { version = "0.27", optional = true }
+glow = { version = "0.13", optional = true }
+web-sys = { version = "0.3", optional = true, features = ["HtmlCanvasElement", "WebGl2RenderingContext", "WebGlRenderingContext"] }
+js-sys = { version = "0.3", optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 q0android = { path = "../q0android" }
@@ -36,6 +52,7 @@ log = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
 
 [dev-dependencies]
 image = { version = "0.24.9", default-features = false, features = ["png"] }

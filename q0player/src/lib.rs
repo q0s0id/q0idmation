@@ -1,7 +1,19 @@
+mod layers;
 mod live;
 mod objects;
+#[cfg(any(feature = "native-ui", feature = "browser-gpu"))]
+mod transport;
+#[cfg(feature = "native-ui")]
 pub mod ui;
 
+#[cfg(target_arch = "wasm32")]
+pub mod web;
+
+#[cfg(all(target_arch = "wasm32", feature = "browser-gpu"))]
+#[path = "ui/render.rs"]
+mod browser_render;
+
+pub use layers::WindowInfo;
 pub use live::{LiveDraws, ParticleDraw};
 
 use std::collections::HashMap;
@@ -11,7 +23,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use q0s_format::q0lang::runtime::{
-    Runtime, RuntimeAction, RuntimeDiagnostic, RuntimeValue, TimelineTarget,
+    LayerRef, Runtime, RuntimeAction, RuntimeDiagnostic, RuntimeValue, TimelineTarget,
+    WindowCommand,
 };
 use q0s_format::rig::{RigControlOverride, RigRuntimeOverrides};
 use q0s_format::runtime_scene::RuntimeSceneState;
@@ -87,6 +100,10 @@ struct PlayerInputState {
     right: bool,
     jump: bool,
     jump_pressed: bool,
+    up: bool,
+    down: bool,
+    action: bool,
+    action_pressed: bool,
 }
 
 #[derive(Clone)]
@@ -117,6 +134,17 @@ pub struct Player {
     /// Physics and particles q0lang runs while the movie plays.
     live: live::Live,
     runtime_bounds_cache: Option<(Arc<ProjectV2>, q0s_format::raster::RuntimeBoundsCache)>,
+    object_index: Option<(Arc<ProjectV2>, objects::ObjectIndex)>,
+    /// Outlines of the movie's artwork, for q0.layer's questions.
+    collision: Option<(Arc<ProjectV2>, q0s_format::collide::CollisionCache)>,
+    /// Layers that stop an instance: `q0layer.solid! layer, instance`.
+    solids: Vec<(LayerRef, String)>,
+    /// What scripts asked of the window, for the app to pick up.
+    window_requests: Vec<WindowCommand>,
+    window: WindowInfo,
+    /// The movie's scripts read `input.up` or `input.down`: touch screens
+    /// show a four-way pad.
+    four_way: bool,
     objects: objects::ObjectWorld,
     scene_library: HashMap<String, Arc<ProjectV2>>,
     active_scene_alias: Option<String>,
@@ -160,6 +188,7 @@ fn build_q0v_audio_timeline(media: Arc<Q0vFile>) -> Option<PlayerAudioTimeline> 
     if !media.spec.audio || media.spec.audio_channels == 0 || media.spec.audio_sample_rate == 0 {
         return None;
     }
+    media.audio_pcm_le_bytes().ok()?;
     let total_sample_frames = u64::from(media.spec.timeline_frames.max(1))
         .saturating_mul(u64::from(PLAYER_AUDIO_SAMPLE_RATE))
         .div_ceil(u64::from(media.spec.fps.max(1)))
@@ -207,7 +236,8 @@ fn build_project_audio_timeline(project: &ProjectV2) -> Option<PlayerAudioTimeli
             let Asset::Q0v(asset) = asset else {
                 continue;
             };
-            let parsed = Arc::new(Q0vFile::parse(asset.bytes.as_ref().clone()).ok()?);
+            let parsed = Arc::new(Q0vFile::parse_shared(Arc::clone(&asset.bytes)).ok()?);
+            parsed.audio_pcm_le_bytes().ok()?;
             parsed_by_asset.insert(clip.asset_id, Arc::clone(&parsed));
             parsed
         };
@@ -264,7 +294,9 @@ pub(crate) fn sample_audio_timeline(
         if channels == 0 {
             continue;
         }
-        let pcm = media.audio_pcm_le_bytes();
+        let Ok(pcm) = media.audio_pcm_le_bytes() else {
+            continue;
+        };
         let source_frames = pcm.len() / 2 / channels;
         if source_frames == 0 {
             continue;
@@ -307,6 +339,22 @@ pub(crate) fn sample_audio_timeline(
     mixed.clamp(-1.0, 1.0)
 }
 
+/// Whether any script of `project` reads `input.up` or `input.down`.
+fn reads_four_way(project: &ProjectV2) -> bool {
+    let reads = |source: &str| source.contains("input.up") || source.contains("input.down");
+    project.q0rgs.iter().any(|q0rg| reads(&q0rg.script))
+        || project
+            .runtime
+            .frame_scripts
+            .iter()
+            .any(|script| reads(&script.source))
+        || project.runtime.project_graph.nodes.iter().any(|node| {
+            node.kind == ProjectDependencyKind::Q0lang
+                && matches!(&node.source, ProjectDependencySource::Embedded(bytes)
+                    if reads(&String::from_utf8_lossy(bytes)))
+        })
+}
+
 fn build_bundled_scene_library(
     project: &ProjectV2,
     diagnostics: &mut Vec<RuntimeDiagnostic>,
@@ -318,7 +366,11 @@ fn build_bundled_scene_library(
         })
     {
         match &node.source {
-            ProjectDependencySource::Embedded(bytes) => match parse_q0s_v2(bytes) {
+            ProjectDependencySource::Embedded(bytes) => match parse_q0s_v2(bytes)
+                .and_then(|mut scene| {
+                    q0s_format::v2::assign_missing_instance_ids(&mut scene)?;
+                    Ok(scene)
+                }) {
                 Ok(scene) => {
                     scenes.insert(node.alias.clone(), Arc::new(scene));
                 }
@@ -384,6 +436,12 @@ impl Player {
             scene_runtime: RuntimeSceneState::new(),
             live: Default::default(),
             runtime_bounds_cache: None,
+            object_index: None,
+            collision: None,
+            solids: Vec::new(),
+            window_requests: Vec::new(),
+            window: WindowInfo::default(),
+            four_way: false,
             objects: objects::ObjectWorld::default(),
             scene_library: HashMap::new(),
             active_scene_alias: None,
@@ -403,7 +461,11 @@ impl Player {
     /// we fall through to the legacy bitmap loader.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
         if is_q0s_v2(bytes) {
-            let project = parse_q0s_v2(bytes)?;
+            let mut project = parse_q0s_v2(bytes)?;
+            // Placements without an identity would all share one runtime
+            // state per timeline, and every nested q0rg would then show the
+            // frame of whichever was updated last.
+            q0s_format::v2::assign_missing_instance_ids(&mut project)?;
             let entry_q0rg_id = project.meta.entry_q0rg_id;
             let q = project
                 .q0rgs
@@ -442,6 +504,12 @@ impl Player {
                 scene_runtime: RuntimeSceneState::new(),
                 live: Default::default(),
                 runtime_bounds_cache: None,
+                object_index: None,
+                collision: None,
+                solids: Vec::new(),
+                window_requests: Vec::new(),
+                window: WindowInfo::default(),
+                four_way: false,
                 objects: objects::ObjectWorld::default(),
                 scene_library,
                 active_scene_alias: None,
@@ -454,6 +522,11 @@ impl Player {
                 accumulator_sec: 0.0,
                 frame_script_entries: 0,
             };
+            player.four_way = player.project_v2().is_some_and(reads_four_way)
+                || player
+                    .scene_library
+                    .values()
+                    .any(|scene| reads_four_way(scene));
             let mut transition_budget = MAX_FRAME_SCRIPT_TRANSITIONS;
             player.sync_q0lang_host_globals();
             let mut startup_q0lang = startup_q0lang;
@@ -501,6 +574,12 @@ impl Player {
                 scene_runtime: RuntimeSceneState::new(),
                 live: Default::default(),
                 runtime_bounds_cache: None,
+                object_index: None,
+                collision: None,
+                solids: Vec::new(),
+                window_requests: Vec::new(),
+                window: WindowInfo::default(),
+                four_way: false,
                 objects: objects::ObjectWorld::default(),
                 scene_library: HashMap::new(),
                 active_scene_alias: None,
@@ -631,10 +710,50 @@ impl Player {
         self.input.jump = jump;
     }
 
+    /// Up, down and the action key (`input.up`, `input.down`,
+    /// `input.action`), beside what `set_input_state` sets.
+    pub fn set_more_input(&mut self, up: bool, down: bool, action: bool) {
+        if action && !self.input.action {
+            self.input.action_pressed = true;
+        }
+        self.input.up = up;
+        self.input.down = down;
+        self.input.action = action;
+    }
+
+    /// Whether the scripts steer in four directions, so a touch screen
+    /// needs up and down buttons too.
+    pub fn uses_four_way_input(&self) -> bool {
+        self.four_way
+    }
+
     pub fn uses_game_input(&self) -> bool {
         self.q0lang
             .as_ref()
             .is_some_and(|runtime| runtime.imported_libraries.contains("q0.input"))
+    }
+
+    /// Whether the movie runs q0lang. Like a Flash game, it then decides
+    /// where it goes itself, and the player shows no timeline to seek.
+    pub fn is_game(&self) -> bool {
+        let Some(project) = self.project_v2() else {
+            return false;
+        };
+        project
+            .q0rgs
+            .iter()
+            .any(|q0rg| !q0rg.script.trim().is_empty())
+            || project
+                .runtime
+                .frame_scripts
+                .iter()
+                .any(|script| !script.source.trim().is_empty())
+            || project
+                .runtime
+                .project_graph
+                .nodes
+                .iter()
+                .any(|node| node.kind == ProjectDependencyKind::Q0lang)
     }
 
     pub fn uses_mouse_events(&self) -> bool {
@@ -662,7 +781,7 @@ impl Player {
         }
         self.sync_q0lang_host_globals();
         let stage_args = [RuntimeValue::String("stage".into())];
-        let report = if let Some(runtime) = self.q0lang.as_mut() {
+        if let Some(runtime) = self.q0lang.as_mut() {
             runtime
                 .vars
                 .insert("mouse.x".into(), RuntimeValue::Number(f64::from(x)));
@@ -680,10 +799,15 @@ impl Player {
                 "mouse.wheel_y".into(),
                 RuntimeValue::Number(f64::from(wheel_y)),
             );
-            Some(runtime.dispatch_event(event, &stage_args, objects::OBJECT_INSTRUCTION_BUDGET))
-        } else {
-            None
-        };
+        }
+        let report = self.script_parts().map(|(runtime, mut host)| {
+            runtime.dispatch_event_with_host(
+                event,
+                &stage_args,
+                objects::OBJECT_INSTRUCTION_BUDGET,
+                &mut host,
+            )
+        });
         if let Some(report) = report {
             let available = objects::MAX_RUNTIME_DIAGNOSTICS
                 .saturating_sub(self.initial_script_diagnostics.len());
@@ -694,6 +818,43 @@ impl Player {
             self.apply_q0lang_actions_with_budget(&report.actions, &mut transition_budget);
         }
         self.dispatch_object_pointer(event, &stage_args);
+    }
+
+    /// `listen time.tick handler`: the movie's own handlers, once a tick,
+    /// whatever frame the timeline shows.
+    /// Key presses (`input.jump_pressed`) last until the tick's scripts and
+    /// handlers have all run.
+    fn dispatch_tick(&mut self, transition_budget: &mut usize) {
+        if !self
+            .q0lang
+            .as_ref()
+            .is_some_and(|runtime| runtime.listeners.contains_key("time.tick"))
+        {
+            self.input.jump_pressed = false;
+            self.input.action_pressed = false;
+            return;
+        }
+        self.sync_q0lang_host_globals();
+        let args = [RuntimeValue::String("stage".into())];
+        let report = self.script_parts().map(|(runtime, mut host)| {
+            runtime.dispatch_event_with_host(
+                "time.tick",
+                &args,
+                q0s_format::q0lang::runtime::DEFAULT_INSTRUCTION_BUDGET,
+                &mut host,
+            )
+        });
+        if let Some(report) = report {
+            let available = objects::MAX_RUNTIME_DIAGNOSTICS
+                .saturating_sub(self.initial_script_diagnostics.len());
+            self.initial_script_diagnostics
+                .extend(report.diagnostics.into_iter().take(available));
+            self.apply_q0lang_scene_writes();
+            self.sync_q0lang_host_globals();
+            self.apply_q0lang_actions_with_budget(&report.actions, transition_budget);
+        }
+        self.input.jump_pressed = false;
+        self.input.action_pressed = false;
     }
 
     pub fn runtime_instance_metrics(
@@ -787,15 +948,16 @@ impl Player {
         }
         let channels = media.spec.audio_channels;
         let sample_rate = media.spec.audio_sample_rate;
+        let pcm = media.audio_pcm_le_bytes().ok()?;
         let start_per_channel = u64::from(*frame_index).saturating_mul(u64::from(sample_rate))
             / u64::from(media.spec.fps.max(1));
         let start_interleaved = start_per_channel
             .saturating_mul(u64::from(channels))
-            .min(media.audio_pcm_le_bytes().len() as u64 / 2)
-            as usize;
-        let samples = media
-            .audio_pcm_le_bytes()
-            .chunks_exact(2)
+            .min(pcm.len() as u64 / 2) as usize;
+        let samples = pcm
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|raw| i16::from_le_bytes([raw[0], raw[1]]) as f32 / 32768.0)
             .collect();
         Some(Q0vAudioData {
@@ -941,19 +1103,21 @@ impl Player {
         }
     }
 
-    pub fn tick(&mut self, delta_sec: f32) {
+    /// Runs the movie on by `delta_sec`, and says how many of its frames
+    /// that took.
+    pub fn tick(&mut self, delta_sec: f32) -> usize {
         let interactive_runtime = self.uses_game_input();
         if !self.playing
             && !interactive_runtime
             && !self.objects.has_active_scripts()
             && !self.live.is_active()
         {
-            return;
+            return 0;
         }
         // A suspended window must not replay minutes of scripts in one UI
         // update. NaN/inf deltas are also rejected before the fixed-step loop.
         if !delta_sec.is_finite() {
-            return;
+            return 0;
         }
         let frame_time = 1.0_f32 / self.fps() as f32;
         self.accumulator_sec += delta_sec.clamp(0.0, frame_time * 16.0);
@@ -973,6 +1137,7 @@ impl Player {
                     self.advance_timeline_one_frame();
                 }
                 self.run_current_frame_scripts(&mut transition_budget);
+                self.dispatch_tick(&mut transition_budget);
                 self.update_objects(true);
                 continue;
             }
@@ -984,6 +1149,7 @@ impl Player {
 
             if self.advance_timeline_one_frame() {
                 self.run_current_frame_scripts(&mut transition_budget);
+                self.dispatch_tick(&mut transition_budget);
                 self.update_objects(true);
                 if !self.playing {
                     self.accumulator_sec = 0.0;
@@ -998,6 +1164,7 @@ impl Player {
         if steps == 16 {
             self.accumulator_sec = self.accumulator_sec.min(frame_time);
         }
+        steps
     }
 
     /// Advance authored timeline transport by one fixed frame. Returns true
@@ -1075,9 +1242,16 @@ impl Player {
 
     fn run_q0lang_source_with_budget(&mut self, source: &str, transition_budget: &mut usize) {
         self.sync_q0lang_host_globals();
-        let report = match self.q0lang.as_mut() {
-            Some(runtime) => runtime.execute_source(source),
-            None => return,
+        let report = match self.script_parts() {
+            Some((runtime, mut host)) => runtime.execute_source_with_host(
+                source,
+                q0s_format::q0lang::runtime::DEFAULT_INSTRUCTION_BUDGET,
+                &mut host,
+            ),
+            None => match self.q0lang.as_mut() {
+                Some(runtime) => runtime.execute_source(source),
+                None => return,
+            },
         };
         self.initial_script_diagnostics.extend(report.diagnostics);
         self.apply_q0lang_scene_writes();
@@ -1108,7 +1282,6 @@ impl Player {
         for (_, _, source) in scripts {
             self.run_q0lang_source_with_budget(&source, transition_budget);
         }
-        self.input.jump_pressed = false;
     }
 
     fn ensure_runtime_bounds_cache(&mut self) {
@@ -1167,9 +1340,13 @@ impl Player {
             })
             .collect::<Vec<_>>();
         let fixed_dt = 1.0 / f64::from(self.fps().max(1));
+        let window = self.window_globals();
         let Some(runtime) = self.q0lang.as_mut() else {
             return;
         };
+        for (name, value) in window {
+            runtime.vars.insert(name.into(), value);
+        }
         runtime
             .vars
             .insert("stage.width".into(), RuntimeValue::Number(stage_width));
@@ -1192,6 +1369,14 @@ impl Player {
             "input.jump_pressed".into(),
             RuntimeValue::Bool(self.input.jump_pressed),
         );
+        for (name, value) in [
+            ("input.up", self.input.up),
+            ("input.down", self.input.down),
+            ("input.action", self.input.action),
+            ("input.action_pressed", self.input.action_pressed),
+        ] {
+            runtime.vars.insert(name.into(), RuntimeValue::Bool(value));
+        }
         for (name, metrics) in metrics {
             for (suffix, value) in [
                 ("x", metrics.x),
@@ -1227,6 +1412,7 @@ impl Player {
                 .collect::<Vec<_>>(),
             _ => return,
         };
+        self.apply_window_writes();
         let Some(runtime) = self.q0lang.as_ref() else {
             return;
         };
@@ -1241,10 +1427,15 @@ impl Player {
                     Some(RuntimeValue::Number(value)) if value.is_finite() => *value as f32,
                     _ => return None,
                 };
-                Some((key, x, y))
+                Some((key, name, x, y))
             })
             .collect::<Vec<_>>();
-        for (key, x, y) in writes {
+        for (key, name, x, y) in writes {
+            let (x, y) = if self.solids.iter().any(|(_, thing)| *thing == name) {
+                self.stop_at_solids(key, &name, x, y)
+            } else {
+                (x, y)
+            };
             self.scene_runtime.set_position(key, x, y);
         }
         self.apply_object_playback_writes();
@@ -1324,6 +1515,8 @@ impl Player {
                 | RuntimeAction::Light(_) => {
                     self.apply_live_action(action);
                 }
+                RuntimeAction::Layer(command) => self.apply_layer_command(command),
+                RuntimeAction::Window(command) => self.request_window(command.clone()),
             }
         }
     }
@@ -1382,6 +1575,7 @@ impl Player {
             frame_index: 0,
         };
         self.scene_runtime = RuntimeSceneState::new();
+        self.solids.clear();
         self.live.clear();
         self.objects = objects::ObjectWorld::default();
         self.rig_runtime_overrides.clear();
@@ -1614,7 +1808,7 @@ fn render_q0v(
     viewport_width: u32,
     viewport_height: u32,
 ) {
-    for pixel in frame.chunks_exact_mut(4) {
+    for pixel in frame.as_chunks_mut::<4>().0.iter_mut() {
         pixel.copy_from_slice(&[255, 255, 255, 255]);
     }
     if !media.spec.video || viewport_width == 0 || viewport_height == 0 {
@@ -1649,7 +1843,7 @@ fn render_v1(
     viewport_height: u32,
 ) {
     let color = &movie.background;
-    for px in frame.chunks_exact_mut(4) {
+    for px in frame.as_chunks_mut::<4>().0.iter_mut() {
         px[0] = color.r;
         px[1] = color.g;
         px[2] = color.b;
@@ -1727,11 +1921,11 @@ fn blit_bitmap(
 #[cfg(test)]
 mod tests {
     use super::{
-        sample_audio_timeline, Player, PlayerFormat, PlayerLoadError, MAX_Q0S_FILE_BYTES,
-        PLAYER_AUDIO_SAMPLE_RATE,
+        sample_audio_timeline, Player, PlayerFormat, PlayerLoadError, WindowInfo,
+        MAX_Q0S_FILE_BYTES, PLAYER_AUDIO_SAMPLE_RATE,
     };
     use image::ImageEncoder;
-    use q0s_format::q0lang::runtime::RuntimeValue;
+    use q0s_format::q0lang::runtime::{RuntimeValue, WindowCommand};
     use q0video::q0v::{Q0vSpec, Q0vWriter, MEDIA_TICKS_PER_SECOND};
     use std::io::Cursor;
 
@@ -1811,6 +2005,109 @@ mod tests {
             }],
         };
         q0s_format::write_q0s_v2(&project).expect("write q0s v2")
+    }
+
+    #[test]
+    fn nested_q0rgs_play_by_their_own_playback_even_without_instance_ids() {
+        use q0s_format::v2::{
+            InstanceKey, Layer, Placement, Q0rg, Q0rgPlayback, Q0rgPlaybackMode, Target,
+            Transform2D, Tween,
+        };
+
+        // Symbols placed with no instance id, as some files have them: a
+        // five-frame one that plays once, a three-frame loop, and two loops
+        // with scripts, which run as objects of their own.
+        let bytes = q0s_v2_with_entry_script("", 10);
+        let mut project = q0s_format::parse_q0s_v2(&bytes).expect("fixture");
+        for (id, frames, script) in [
+            (2_u16, 5_u16, ""),
+            (3, 3, ""),
+            (
+                4,
+                3,
+                "count = 1
+",
+            ),
+            (
+                5,
+                4,
+                "count = 1
+",
+            ),
+        ] {
+            project.q0rgs.push(Q0rg {
+                q0rg_id: id,
+                name: format!("symbol {id}"),
+                frame_count: frames,
+                script: script.to_string(),
+                layers: vec![Layer {
+                    layer_id: 1,
+                    timeline_frame_count: None,
+                    name: "art".to_string(),
+                    explicit_keyframes: Vec::new(),
+                    placements: Vec::new(),
+                }],
+            });
+        }
+        let placed = |id: u16, mode: Q0rgPlaybackMode| Placement {
+            pivot: None,
+            instance_id: 0,
+            frame: 0,
+            target: Target::Q0rg(id),
+            transform: Transform2D::IDENTITY,
+            tween: Tween::None,
+            fx: q0s_format::v2::PlacementFx {
+                q0rg_playback: Q0rgPlayback {
+                    mode,
+                    placement_relative: true,
+                    ..Q0rgPlayback::default()
+                },
+                ..Default::default()
+            },
+        };
+        let stage = &mut project.q0rgs[0].layers[0];
+        stage.explicit_keyframes = vec![0];
+        stage.placements.push(placed(2, Q0rgPlaybackMode::PlayOnce));
+        stage.placements.push(placed(3, Q0rgPlaybackMode::Loop));
+        stage.placements.push(placed(4, Q0rgPlaybackMode::Loop));
+        stage.placements.push(placed(5, Q0rgPlaybackMode::Loop));
+        let bytes = q0s_format::write_q0s_v2(&project).expect("write");
+
+        let mut player = Player::from_bytes(&bytes).expect("load");
+        if !player.is_playing() {
+            player.toggle_play_pause();
+        }
+        for _ in 0..7 {
+            player.tick(1.0 / f32::from(player.fps()) + 0.0001);
+        }
+        assert_eq!(player.current_frame(), 7);
+        let project = player.project_v2().expect("v2");
+        let stage = &project.q0rgs[0].layers[0];
+        // The frame the renderer draws: runtime state where an object has
+        // some, the placement's playback otherwise.
+        let shown = |index: usize| {
+            let placement = &stage.placements[index];
+            let Target::Q0rg(symbol) = placement.target else {
+                unreachable!("symbols only")
+            };
+            let authored = q0s_format::v2::resolve_q0rg_playback_frame(
+                project,
+                symbol,
+                7,
+                placement.frame,
+                placement.fx.q0rg_playback,
+            );
+            let key = InstanceKey::new(1, placement.instance_id);
+            player.scene_runtime().child_context(key, authored).0
+        };
+        let mut ids: Vec<u32> = stage.placements.iter().map(|p| p.instance_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 4, "every placement has its own identity");
+        assert_eq!(shown(0), 4, "played once and held its last frame");
+        assert_eq!(shown(1), 1, "looped: 7 frames into a 3-frame loop");
+        assert_eq!(shown(2), 1, "a scripted 3-frame loop runs on its own");
+        assert_eq!(shown(3), 3, "and a scripted 4-frame one beside it");
     }
 
     #[test]
@@ -2278,6 +2575,44 @@ pb func update current_vy {
     }
 
     #[test]
+    fn compressed_q0v_and_embedded_audio_play_and_seek() {
+        let source = include_bytes!("../../q0video/tests/fixtures/tone.mp3");
+        let decoded = q0video::audio::decode_source(source).unwrap();
+        let samples = decoded.samples_per_channel();
+        let spec = Q0vSpec {
+            width: 0,
+            height: 0,
+            fps: decoded.sample_rate,
+            timeline_frames: samples as u32,
+            video: false,
+            audio: true,
+            audio_sample_rate: decoded.sample_rate,
+            audio_channels: decoded.channels,
+        };
+        let mut writer = Q0vWriter::new(Cursor::new(Vec::new()), spec).unwrap();
+        writer.write_audio_encoded(source, samples).unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let mut player = Player::from_q0v_bytes(bytes.clone()).unwrap();
+        let audio = player.q0v_audio_data().unwrap();
+        assert_eq!(audio.samples.len(), samples as usize);
+        assert!(audio.samples.iter().any(|sample| sample.abs() > 0.05));
+        player.seek_to_frame(4410);
+        let audio = player.q0v_audio_data().unwrap();
+        assert_eq!(audio.start_interleaved, 4410);
+
+        let mut project = q0s_format::parse_q0s_v2(&q0s_v2_with_timeline_audio(false)).unwrap();
+        let q0s_format::v2::Asset::Q0v(media) = &mut project.assets[0] else {
+            panic!("audio fixture")
+        };
+        media.bytes = bytes.into();
+        let project_bytes = q0s_format::write_q0s_v2(&project).unwrap();
+        let player = Player::from_bytes(&project_bytes).unwrap();
+        let timeline = player.audio_timeline().unwrap();
+        assert_eq!(sample_audio_timeline(&timeline, 1999, 0), 0.0);
+        assert!((2000..14000).any(|frame| sample_audio_timeline(&timeline, frame, 0).abs() > 0.02));
+    }
+
+    #[test]
     fn q0v_file_magic_is_auto_detected_by_from_file() {
         let directory = std::env::temp_dir().join(format!(
             "q0player-q0v-{}-{}",
@@ -2430,7 +2765,7 @@ pb func update current_vy {
         let mut min_x = usize::MAX;
         let mut max_x = 0usize;
         let mut found = false;
-        for (index, pixel) in rgba.chunks_exact(4).enumerate() {
+        for (index, pixel) in rgba.as_chunks::<4>().0.iter().enumerate() {
             if pixel[0..3] != [255, 255, 255] {
                 let x = index % width;
                 min_x = min_x.min(x);
@@ -3308,13 +3643,17 @@ pb func update current_vy {
             "runtime bend control did not deform player pixels"
         );
         let scripted_dark_y = scripted_pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .enumerate()
             .filter_map(|(index, pixel)| (pixel[0..3] != [255, 255, 255]).then_some(index / 32))
             .min()
             .expect("scripted bend painted pixels");
         let baseline_dark_y = baseline_pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .enumerate()
             .filter_map(|(index, pixel)| (pixel[0..3] != [255, 255, 255]).then_some(index / 32))
             .min()
@@ -3494,7 +3833,9 @@ pb func update current_vy {
         assert_ne!(baseline_pixels, posed_pixels);
         assert_eq!(baseline_pixels, reset_pixels);
         assert!(posed_pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|pixel| pixel[0..3] == [255, 0, 0]));
     }
 
@@ -3514,10 +3855,349 @@ pb func update current_vy {
             "variant control did not switch rendered target"
         );
         assert!(baseline_pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|pixel| pixel[0..3] == [0, 0, 0]));
         assert!(scripted_pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|pixel| pixel[0..3] == [255, 0, 0]));
+    }
+
+    /// A box drawn as a line, a bone, and a soul symbol inside the box:
+    /// layers "walls", "bones" and "soul", bottom to top.
+    fn q0s_v2_bullet_box_fixture(setup: &str, tick: &str) -> Vec<u8> {
+        use q0s_format::geom::{CapShape, JoinShape};
+        use q0s_format::v2::{
+            Anchor, Asset, FrameScript, InstanceKey, Layer, Path, Placement, ProjectDependencyKind,
+            ProjectDependencyNode, ProjectDependencySource, ProjectMeta, ProjectV2, Q0rg, Rgba,
+            Stroke, Target, Transform2D, Tween, Vec2, VectorAsset,
+        };
+        let rect = |width: f32, height: f32| Path {
+            closed: true,
+            anchors: [(0.0, 0.0), (width, 0.0), (width, height), (0.0, height)]
+                .into_iter()
+                .map(|(x, y)| Anchor {
+                    point: Vec2::new(x, y),
+                    in_handle: None,
+                    out_handle: None,
+                })
+                .collect(),
+        };
+        let ink = Rgba {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        let vector = |asset_id, path, fill, stroke| {
+            Asset::Vector(VectorAsset {
+                asset_id,
+                paths: vec![path],
+                fill,
+                stroke,
+            })
+        };
+        let place = |instance_id, target, tx, ty| Placement {
+            pivot: None,
+            instance_id,
+            frame: 0,
+            target,
+            transform: Transform2D {
+                tx,
+                ty,
+                ..Transform2D::IDENTITY
+            },
+            tween: Tween::None,
+            fx: Default::default(),
+        };
+        let layer = |layer_id, name: &str, placement| Layer {
+            layer_id,
+            timeline_frame_count: None,
+            name: name.into(),
+            explicit_keyframes: vec![0],
+            placements: vec![placement],
+        };
+        let mut project = ProjectV2 {
+            meta: ProjectMeta {
+                name: "bullet-box".into(),
+                fps: 30,
+                stage_width: 200,
+                stage_height: 200,
+                background_color: Rgba {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 255,
+                },
+                entry_q0rg_id: 1,
+            },
+            assets: vec![
+                vector(1, rect(10.0, 10.0), Some(ink), None),
+                vector(
+                    2,
+                    rect(100.0, 100.0),
+                    None,
+                    Some(Stroke {
+                        color: ink,
+                        width: 4.0,
+                        cap: CapShape::Round,
+                        join: JoinShape::Miter,
+                    }),
+                ),
+                vector(3, rect(10.0, 40.0), Some(ink), None),
+            ],
+            asset_names: Default::default(),
+            asset_appearances: Default::default(),
+            layer_metadata: Default::default(),
+            audio_clips: Vec::new(),
+            runtime: Default::default(),
+            q0rgs: vec![
+                Q0rg {
+                    q0rg_id: 1,
+                    name: "Stage".into(),
+                    frame_count: 1,
+                    script: String::new(),
+                    layers: vec![
+                        layer(1, "walls", place(1, Target::Asset(2), 50.0, 50.0)),
+                        layer(2, "bones", place(2, Target::Asset(3), 120.0, 60.0)),
+                        layer(3, "soul", place(11, Target::Q0rg(2), 95.0, 95.0)),
+                    ],
+                },
+                Q0rg {
+                    q0rg_id: 2,
+                    name: "Soul".into(),
+                    frame_count: 1,
+                    script: String::new(),
+                    layers: vec![layer(4, "heart", place(22, Target::Asset(1), 0.0, 0.0))],
+                },
+            ],
+        };
+        project
+            .runtime
+            .instance_names
+            .insert(InstanceKey::new(1, 11), "soul".to_string());
+        project
+            .runtime
+            .project_graph
+            .nodes
+            .push(ProjectDependencyNode {
+                node_id: 1,
+                parent_node_id: None,
+                alias: "fight".into(),
+                kind: ProjectDependencyKind::Q0lang,
+                source: ProjectDependencySource::Embedded(setup.as_bytes().to_vec()),
+            });
+        project.runtime.frame_scripts.push(FrameScript {
+            q0rg_id: 1,
+            layer_id: 3,
+            frame: 0,
+            source: tick.into(),
+        });
+        q0s_format::write_q0s_v2(&project).expect("write bullet box fixture")
+    }
+
+    #[test]
+    fn layer_questions_see_drawn_shapes_and_where_the_script_moved_things() {
+        let setup = r#"import q0.layer
+start_bones = q0layer.touches("bones", "soul")
+on_line = q0layer.hit("walls", 51, 100)
+in_box = q0layer.hit("walls", 100, 100)
+on_bone = q0layer.hit("bones", 125, 70)
+near_bone = q0layer.circle("bones", 108, 70, 3)
+box_bone = q0layer.box("bones", 0, 65, 121, 2)
+what = q0layer.which("bones", "soul")
+soul.x = 118
+moved_bones = q0layer.touches("bones", "soul")
+moved_what = q0layer.which("bones", "soul")
+top_row = q0layer.count(1)
+walls_row = q0layer.hit(3, 51, 100)
+"#;
+        let bytes = q0s_v2_bullet_box_fixture(setup, "");
+        let player = Player::from_bytes(&bytes).expect("load bullet box");
+        assert!(
+            player.initial_script_diagnostics().is_empty(),
+            "{:?}",
+            player.initial_script_diagnostics()
+        );
+        for (name, expected) in [
+            ("start_bones", "false"),
+            ("on_line", "true"),
+            ("in_box", "false"),
+            ("on_bone", "true"),
+            ("near_bone", "false"),
+            ("box_bone", "true"),
+            ("what", "null"),
+            ("moved_bones", "true"),
+            ("moved_what", "drawing"),
+            ("top_row", "1"),
+            ("walls_row", "true"),
+        ] {
+            assert_eq!(
+                runtime_var(&player, name).as_deref(),
+                Some(expected),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_solid_layer_stops_an_instance_at_its_line() {
+        let setup = "import q0.input\nimport q0.layer\nq0layer.solid! \"walls\", \"soul\"\n";
+        let tick = "soul.x = soul.x + 100\n";
+        let bytes = q0s_v2_bullet_box_fixture(setup, tick);
+        let mut player = Player::from_bytes(&bytes).expect("load bullet box");
+        player.set_playing(false);
+        player.tick(1.0 / 30.0);
+        let soul = player.runtime_instance_metrics("soul").expect("soul");
+        // The box's line is 4 wide around x = 150: the soul stops at 148.
+        assert!(
+            soul.right <= 148.5 && soul.right > 146.0,
+            "soul went to {soul:?}"
+        );
+        // Without the wall it would have gone through.
+        let free = q0s_v2_bullet_box_fixture("import q0.input\n", tick);
+        let mut free = Player::from_bytes(&free).expect("load free box");
+        free.tick(1.0 / 30.0);
+        assert!(free.runtime_instance_metrics("soul").expect("soul").left > 150.0);
+    }
+
+    #[test]
+    fn scripts_hide_move_and_fade_whole_layers() {
+        let setup = r#"import q0.layer
+q0layer.hide! "bones"
+hidden_seen = q0layer.visible("bones")
+soul.x = 118
+hidden_hit = q0layer.touches("bones", "soul")
+"#;
+        let bytes = q0s_v2_bullet_box_fixture(setup, "");
+        let player = Player::from_bytes(&bytes).expect("load bullet box");
+        // Commands land after the script that gave them.
+        assert_eq!(runtime_var(&player, "hidden_seen").as_deref(), Some("true"));
+        assert_eq!(runtime_var(&player, "hidden_hit").as_deref(), Some("true"));
+        let layers = player.scene_runtime();
+        let look = layers.layer_look(player.project_v2().unwrap(), 1, 2);
+        assert!(!look.visible);
+
+        let tick = r#"if not moved {
+  q0layer.move! "bones", -100, 0
+  q0layer.alpha! "walls", 0.5
+  moved = true
+} else {
+  bone_hit = q0layer.hit("bones", 25, 70)
+  old_hit = q0layer.hit("bones", 125, 70)
+}
+"#;
+        let bytes = q0s_v2_bullet_box_fixture("import q0.input\nmoved = false\n", tick);
+        let mut player = Player::from_bytes(&bytes).expect("load bullet box");
+        player.tick(1.0 / 30.0);
+        assert_eq!(runtime_var(&player, "bone_hit").as_deref(), Some("true"));
+        assert_eq!(runtime_var(&player, "old_hit").as_deref(), Some("false"));
+        let project = player.project_v2().unwrap();
+        let walls = player.scene_runtime().layer_look(project, 1, 1);
+        assert_eq!(walls.alpha, 0.5);
+        let mut pixels = vec![0_u8; 200 * 200 * 4];
+        player.render_with_quality(&mut pixels, 200, 200, 1);
+        // Red ink on white: the green channel says how much ink is there.
+        let at = |x: usize, y: usize| pixels[(y * 200 + x) * 4 + 1];
+        assert!(at(25, 80) < 50, "the bone moved left");
+        assert!(at(125, 80) > 200, "nothing stays where it was");
+        let line = at(50, 120);
+        assert!(
+            (90..170).contains(&line),
+            "the walls are half see-through: {line}"
+        );
+    }
+
+    #[test]
+    fn scripts_change_window_icon_and_system_frame() {
+        let bytes = q0s_v2_with_entry_script(
+            r#"import q0.window
+q0window.icon! "app_icon"
+q0window.decorations! false
+q0window.titlebar! true
+q0window.icon! null
+"#,
+            1,
+        );
+        let mut player = Player::from_bytes(&bytes).expect("window script");
+        assert_eq!(
+            player.take_window_requests(),
+            vec![
+                WindowCommand::Icon(Some("app_icon".into())),
+                WindowCommand::Decorations(false),
+                WindowCommand::Decorations(true),
+                WindowCommand::Icon(None),
+            ]
+        );
+    }
+
+    #[test]
+    fn scripts_ask_the_window_to_move_size_and_hide_the_player() {
+        let setup = r#"import q0.window
+q0window.ui! false
+q0window.hotkeys! "off"
+q0window.size! 640, 480
+seen_width = window.width
+window.x = window.x + 30
+"#;
+        let bytes = q0s_v2_bullet_box_fixture(setup, "");
+        let mut player = Player::from_bytes(&bytes).expect("load bullet box");
+        let requests = player.take_window_requests();
+        assert_eq!(
+            requests,
+            vec![
+                WindowCommand::Move { x: 30.0, y: 0.0 },
+                WindowCommand::Ui(false),
+                WindowCommand::Hotkeys(false),
+                WindowCommand::Size {
+                    width: 640.0,
+                    height: 480.0
+                },
+            ]
+        );
+        assert_eq!(runtime_var(&player, "seen_width").as_deref(), Some("0"));
+        assert!(player.take_window_requests().is_empty());
+        player.set_window_info(WindowInfo {
+            x: 100.0,
+            y: 50.0,
+            width: 640.0,
+            height: 480.0,
+            screen_width: 1920.0,
+            screen_height: 1080.0,
+            fullscreen: false,
+            ui: false,
+        });
+        player.dispatch_pointer_event("mouse.move", 0.0, 0.0, true, 0.0, 0.0);
+        assert_eq!(
+            runtime_var(&player, "screen.width").as_deref(),
+            Some("1920")
+        );
+        assert!(player.take_window_requests().is_empty());
+    }
+
+    #[test]
+    fn tick_handlers_run_every_frame_while_the_timeline_plays() {
+        // Dotted names are shared, so a function can count with them.
+        let setup = "import q0.time\ng.ticks = 0\npb func count target {\n  g.ticks = g.ticks + 1\n}\nlisten time.tick count\n";
+        let bytes =
+            q0s_v2_with_entry_and_frame_scripts(setup, 10, &[(3, 1, "at_three = g.ticks\n")]);
+        let mut player = Player::from_bytes(&bytes).expect("load");
+        assert_eq!(runtime_var(&player, "g.ticks").as_deref(), Some("0"));
+        for _ in 0..5 {
+            player.tick(1.0 / 24.0);
+        }
+        assert_eq!(runtime_var(&player, "g.ticks").as_deref(), Some("5"));
+        // Frame code of a frame runs before that frame's tick.
+        assert_eq!(runtime_var(&player, "at_three").as_deref(), Some("2"));
+        player.set_playing(false);
+        player.tick(1.0 / 24.0);
+        assert_eq!(
+            runtime_var(&player, "g.ticks").as_deref(),
+            Some("5"),
+            "a paused movie rests"
+        );
     }
 }

@@ -5,7 +5,7 @@
 //!   Header:
 //!     [4]   magic "Q1S\0"
 //!     [2]   version = 2 (legacy) | 3 (skew) | 4 (blank keyframes) | 5 (asset names) | 6 (layer folders) | 7 (q0v assets) | 8 (easing) | 9 (vector appearance masks) | 10 (post-material appearance fragments) | 11 (appearance field affine) | 12 (layer visibility/locks) | 13 (nested layer folders) | 14 (placement FX)
-//!     [2]   flags (reserved = 0)
+//!     [2]   flags: bit 0 = packed paths (written in .q0s only), others reserved = 0
 //!     [2]   asset_count
 //!     [2]   q0rg_count
 //!   Meta: (same in v2 and v3)
@@ -61,7 +61,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::error::Error;
-use crate::io::{write_string_u16, Cursor};
+use crate::io::{write_string_u16, write_zigzag, Cursor};
 
 pub const Q1S_V2_MAGIC: [u8; 4] = *b"Q1S\0";
 pub const Q1S_VERSION_LEGACY: u16 = 2;
@@ -134,7 +134,11 @@ pub const Q1S_VERSION_PHYSICS: u16 = 40;
 pub const Q1S_VERSION_PARTICLES: u16 = 41;
 /// v42: per-placement local transform anchors, used by motion interpolation.
 pub const Q1S_VERSION_TRANSFORM_PIVOTS: u16 = 42;
-pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_TRANSFORM_PIVOTS;
+pub const Q1S_VERSION_SHADOW_QUALITY: u16 = 43;
+/// v44: 3D models, placements in 3D and timeline 3D setups (camera, 3D
+/// lights, bone poses), appended after the lighting block.
+pub const Q1S_VERSION_THREE_D: u16 = 44;
+pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_THREE_D;
 /// Kept as an alias so external code that imported the v2-era constant keeps
 /// compiling. It now means "the current write-out version".
 pub const Q1S_V2_VERSION: u16 = Q1S_VERSION_CURRENT;
@@ -152,6 +156,7 @@ const ASSET_KIND_BITMAP: u8 = 1;
 const ASSET_KIND_VECTOR: u8 = 2;
 const ASSET_KIND_Q0V: u8 = 3;
 const ASSET_KIND_RIG: u8 = 4;
+const ASSET_KIND_MODEL: u8 = 6;
 const ASSET_KIND_Q0V_REFERENCE: u8 = 5;
 const TARGET_KIND_ASSET: u8 = 1;
 const TARGET_KIND_Q0RG: u8 = 2;
@@ -189,6 +194,7 @@ const Q0RG_PLAYBACK_SINGLE_FRAME: u8 = 4;
 const Q0RG_PLAYBACK_MANUAL: u8 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Vec2 {
     pub x: f32,
     pub y: f32,
@@ -205,6 +211,7 @@ impl Vec2 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Rgba {
     pub r: u8,
     pub g: u8,
@@ -213,6 +220,7 @@ pub struct Rgba {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Stroke {
     pub color: Rgba,
     pub width: f32,
@@ -234,6 +242,7 @@ impl Stroke {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProjectMeta {
     pub name: String,
     pub fps: u16,
@@ -244,14 +253,19 @@ pub struct ProjectMeta {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct BitmapAsset {
     pub asset_id: u16,
     pub width: u16,
     pub height: u16,
-    pub rgba: Vec<u8>,
+    /// Shared between copies of the project (undo steps, previews) until
+    /// one of them changes the pixels; see `Arc::make_mut`.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_support::b64_arc"))]
+    pub rgba: Arc<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Anchor {
     pub point: Vec2,
     pub in_handle: Option<Vec2>,
@@ -259,12 +273,14 @@ pub struct Anchor {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Path {
     pub anchors: Vec<Anchor>,
     pub closed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorAsset {
     pub asset_id: u16,
     pub paths: Vec<Path>,
@@ -276,6 +292,7 @@ pub struct VectorAsset {
 /// material rendering and destructive-looking edits such as the mask eraser
 /// live on top of it instead of rewriting the source paths.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum VectorMaterial {
     Solid,
     SoftHalo { radius: f32, opacity: f32 },
@@ -290,18 +307,21 @@ pub enum VectorMaterial {
 /// Empty source/clip vectors preserve the legacy behaviour: current vector geometry
 /// is the material source and the whole finite material support is visible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum GradientKind {
     Linear,
     Radial,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct GradientStop {
     pub position: f32,
     pub color: Rgba,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct GradientFill {
     pub kind: GradientKind,
     /// Sorted stops in the inclusive 0..=1 range. Stop alpha is part of RGBA.
@@ -384,6 +404,7 @@ impl GradientFill {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorAppearance {
     pub material: VectorMaterial,
     pub erase_mask: Vec<Path>,
@@ -396,14 +417,17 @@ pub struct VectorAppearance {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Q0vAsset {
     pub asset_id: u16,
     /// Complete embedded `.q0v` bytes. Projects stay portable and never rely
     /// on an external absolute media path.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_support::b64_arc"))]
     pub bytes: std::sync::Arc<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum RigControlKind {
     Position2D,
     Rotation,
@@ -412,6 +436,7 @@ pub enum RigControlKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RigBinding {
     /// Persistent identity of the logical display object track. Unlike a
     /// placement vector index or target occurrence this survives reordering,
@@ -422,6 +447,7 @@ pub struct RigBinding {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RigNode {
     pub node_id: u16,
     pub name: String,
@@ -432,6 +458,7 @@ pub struct RigNode {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RigControl {
     pub control_id: u16,
     pub name: String,
@@ -446,6 +473,7 @@ pub struct RigControl {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum RigConstraint {
     RotationLimit {
         constraint_id: u16,
@@ -510,6 +538,7 @@ impl RigConstraint {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum RigPropertyRef {
     NodeTx(u16),
     NodeTy(u16),
@@ -547,6 +576,7 @@ impl RigPropertyRef {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RigKey {
     pub frame: u16,
     pub value: f32,
@@ -554,12 +584,14 @@ pub struct RigKey {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RigChannel {
     pub property: RigPropertyRef,
     pub keys: Vec<RigKey>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RigDriver {
     pub driver_id: u16,
     pub source_control: u16,
@@ -571,12 +603,14 @@ pub struct RigDriver {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RigPoseValue {
     pub property: RigPropertyRef,
     pub value: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RigPosePreset {
     pub pose_id: u16,
     pub name: String,
@@ -584,12 +618,14 @@ pub struct RigPosePreset {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum RigPoseBlendMode {
     Override,
     Additive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RigPoseDriver {
     pub driver_id: u16,
     pub source_control: u16,
@@ -604,6 +640,7 @@ pub struct RigPoseDriver {
 /// Explicit mirror relation between exact rig properties. Forward mapping is
 /// `right = left * multiplier + offset`; reverse uses the algebraic inverse.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RigMirrorPair {
     pub left: RigPropertyRef,
     pub right: RigPropertyRef,
@@ -612,12 +649,14 @@ pub struct RigMirrorPair {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RigVariantChoice {
     pub name: String,
     pub target: Target,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RigVariantSet {
     pub variant_id: u16,
     pub name: String,
@@ -627,18 +666,21 @@ pub struct RigVariantSet {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RigSkinBoneBind {
     pub node_id: u16,
     pub inverse_rest_world: Affine,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RigSkinWeight {
     pub node_id: u16,
     pub weight: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RigSkinAnchorWeights {
     pub path_index: u16,
     pub anchor_index: u16,
@@ -646,6 +688,7 @@ pub struct RigSkinAnchorWeights {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum RigDeformer {
     Skin {
         deformer_id: u16,
@@ -704,6 +747,7 @@ impl RigDeformer {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RigAsset {
     pub asset_id: u16,
     pub owner_q0rg_id: u16,
@@ -720,11 +764,14 @@ pub struct RigAsset {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Asset {
     Bitmap(BitmapAsset),
     Vector(VectorAsset),
     Q0v(Q0vAsset),
     Rig(RigAsset),
+    /// A 3D model.
+    Model(crate::three::ModelAsset),
 }
 
 impl Asset {
@@ -734,11 +781,13 @@ impl Asset {
             Asset::Vector(v) => v.asset_id,
             Asset::Q0v(v) => v.asset_id,
             Asset::Rig(v) => v.asset_id,
+            Asset::Model(m) => m.asset_id,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Transform2D {
     pub tx: f32,
     pub ty: f32,
@@ -772,12 +821,14 @@ impl Default for Transform2D {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Target {
     Asset(u16),
     Q0rg(u16),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum EasingFamily {
     Quad = 0,
@@ -827,6 +878,7 @@ impl EasingFamily {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum EasingMode {
     In = 0,
@@ -851,6 +903,7 @@ impl EasingMode {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Easing {
     #[default]
     Linear,
@@ -981,6 +1034,7 @@ fn sample_cubic_bezier(x1: f32, y1: f32, x2: f32, y2: f32, x: f32) -> f32 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Tween {
     None,
     Linear {
@@ -1051,6 +1105,7 @@ impl Tween {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum BlendMode {
     #[default]
     Normal,
@@ -1061,6 +1116,7 @@ pub enum BlendMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct BlurFx {
     pub radius_x: f32,
     pub radius_y: f32,
@@ -1068,6 +1124,7 @@ pub struct BlurFx {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct GlowFx {
     pub color: Rgba,
     pub radius_x: f32,
@@ -1077,15 +1134,24 @@ pub struct GlowFx {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DropShadowFx {
     pub color: Rgba,
     pub blur_radius: f32,
     pub offset_x: f32,
     pub offset_y: f32,
     pub strength: f32,
+    #[cfg_attr(feature = "serde", serde(default = "default_shadow_quality"))]
+    pub quality: u8,
+}
+
+#[cfg(feature = "serde")]
+fn default_shadow_quality() -> u8 {
+    3
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Q0rgPlaybackMode {
     #[default]
     Loop,
@@ -1097,6 +1163,7 @@ pub enum Q0rgPlaybackMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Q0rgPlayback {
     pub mode: Q0rgPlaybackMode,
     /// Playback rate, where 100 is 1x. Valid authored rates are 1..=10_000.
@@ -1289,12 +1356,14 @@ pub fn resolve_q0rg_playback_frame(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TintFx {
     pub color: Rgba,
     pub amount: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PlacementFx {
     pub opacity: f32,
     pub tint: Option<TintFx>,
@@ -1305,6 +1374,9 @@ pub struct PlacementFx {
     pub audio_gain: f32,
     pub audio_muted: bool,
     pub q0rg_playback: Q0rgPlayback,
+    /// Its place in 3D. `None` keeps a drawing flat; a model without one
+    /// sits at depth 0, unturned, in its rest pose.
+    pub three: Option<crate::three::Space3d>,
 }
 
 impl Default for PlacementFx {
@@ -1319,6 +1391,7 @@ impl Default for PlacementFx {
             audio_gain: 1.0,
             audio_muted: false,
             q0rg_playback: Q0rgPlayback::default(),
+            three: None,
         }
     }
 }
@@ -1386,6 +1459,29 @@ impl PlacementFx {
                 target.q0rg_playback
             } else {
                 self.q0rg_playback
+            },
+            three: match (self.three, target.three) {
+                (None, None) => None,
+                (Some(a), Some(b)) => Some(a.lerp_to(b, t)),
+                (None, Some(b)) => Some(
+                    crate::three::Space3d {
+                        clip: b.clip,
+                        clip_time: b.clip_time,
+                        clip_speed: b.clip_speed,
+                        ..crate::three::Space3d::default()
+                    }
+                    .lerp_to(b, t),
+                ),
+                (Some(_), None) if t >= 1.0 => None,
+                (Some(a), None) => Some(a.lerp_to(
+                    crate::three::Space3d {
+                        clip: a.clip,
+                        clip_time: a.clip_time,
+                        clip_speed: a.clip_speed,
+                        ..crate::three::Space3d::default()
+                    },
+                    t,
+                )),
             },
         }
     }
@@ -1464,6 +1560,7 @@ fn lerp_shadow(a: Option<DropShadowFx>, b: Option<DropShadowFx>, t: f32) -> Opti
             offset_x: lerp_f32(a.offset_x, b.offset_x, t),
             offset_y: lerp_f32(a.offset_y, b.offset_y, t),
             strength: lerp_f32(a.strength, b.strength, t),
+            quality: if t < 0.5 { a.quality } else { b.quality },
         }),
         (None, Some(b)) => Some(DropShadowFx {
             strength: lerp_f32(0.0, b.strength, t),
@@ -1477,6 +1574,7 @@ fn lerp_shadow(a: Option<DropShadowFx>, b: Option<DropShadowFx>, t: f32) -> Opti
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Placement {
     /// Persistent logical display-object identity. Zero means "not assigned"
     /// and is valid for ordinary unrigged content; rig bindings always require
@@ -1493,6 +1591,7 @@ pub struct Placement {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Layer {
     pub layer_id: u16,
     /// `None` inherits the owning q0rg's shared duration. `Some(n)` stores a
@@ -1565,6 +1664,7 @@ impl Layer {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct LayerKey {
     pub q0rg_id: u16,
     pub layer_id: u16,
@@ -1577,6 +1677,7 @@ impl LayerKey {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum LayerKind {
     #[default]
     Normal,
@@ -1585,6 +1686,7 @@ pub enum LayerKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct LayerMetadata {
     pub kind: LayerKind,
     pub parent_folder_id: Option<u16>,
@@ -1602,6 +1704,7 @@ pub struct LayerMetadata {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AudioClip {
     pub q0rg_id: u16,
     pub layer_id: u16,
@@ -1618,18 +1721,21 @@ pub struct AudioClip {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ProjectDependencyKind {
     Movie,
     Q0lang,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ProjectDependencySource {
     External(String),
     Embedded(Vec<u8>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProjectDependencyNode {
     pub node_id: u16,
     pub parent_node_id: Option<u16>,
@@ -1639,11 +1745,13 @@ pub struct ProjectDependencyNode {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProjectGraph {
     pub nodes: Vec<ProjectDependencyNode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FrameScript {
     pub q0rg_id: u16,
     pub layer_id: u16,
@@ -1652,6 +1760,7 @@ pub struct FrameScript {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct InstanceKey {
     pub q0rg_id: u16,
     pub instance_id: u32,
@@ -1667,6 +1776,7 @@ impl InstanceKey {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CameraState {
     /// Camera centre in project stage/world coordinates.
     pub center_x: f32,
@@ -1709,6 +1819,7 @@ impl CameraState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CameraKey {
     pub frame: u16,
     pub state: CameraState,
@@ -1716,6 +1827,7 @@ pub struct CameraKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CameraTrack {
     pub enabled: bool,
     pub keys: Vec<CameraKey>,
@@ -1724,6 +1836,7 @@ pub struct CameraTrack {
 /// A top-level Animate-style scene. Each scene owns one root q0rg timeline;
 /// nested q0rgs remain reusable symbols and are not listed here.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProjectScene {
     pub scene_id: u16,
     pub q0rg_id: u16,
@@ -1737,11 +1850,14 @@ impl CameraTrack {
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProjectRuntimeData {
     pub project_graph: ProjectGraph,
     pub frame_scripts: Vec<FrameScript>,
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_support::pairs"))]
     pub instance_names: HashMap<InstanceKey, String>,
     /// One label per frame; names are unique within their owning q0rg.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_support::pairs"))]
     pub frame_labels: HashMap<FrameLabelKey, String>,
     /// Authored project camera. Kept outside q0rg layer/display-object data so
     /// camera animation can never mutate object coordinates or become selectable
@@ -1753,6 +1869,7 @@ pub struct ProjectRuntimeData {
     /// Nested library folder paths, stored as slash-separated paths.
     pub library_folders: Vec<String>,
     /// Library item placement within a folder. Missing entries belong to root.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_support::pairs"))]
     pub library_item_folders: HashMap<LibraryItemReference, String>,
     /// Physics setups. Simulations are baked into keyframes; players only
     /// need the worlds marked live, which q0lang drives.
@@ -1761,9 +1878,12 @@ pub struct ProjectRuntimeData {
     pub particles: crate::particles::ParticleData,
     /// Lights. Never baked: every renderer lights the frame itself.
     pub lighting: crate::lighting::LightingData,
+    /// 3D cameras, 3D lights and bone poses per timeline.
+    pub scene3d: crate::three::Scene3dData,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum LibraryItemReference {
     Q0rg(u16),
     Asset(u16),
@@ -1782,6 +1902,7 @@ fn valid_library_folder_path(path: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FrameLabelKey {
     pub q0rg_id: u16,
     pub frame: u16,
@@ -1821,6 +1942,7 @@ pub fn validate_frame_label_name(name: &str) -> Result<(), Error> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Q0rg {
     pub q0rg_id: u16,
     pub name: String,
@@ -1830,6 +1952,7 @@ pub struct Q0rg {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProjectV2 {
     pub meta: ProjectMeta,
     pub assets: Vec<Asset>,
@@ -1841,6 +1964,7 @@ pub struct ProjectV2 {
     pub asset_appearances: HashMap<u16, VectorAppearance>,
     /// Sparse structural metadata for timeline layers. Missing entries are
     /// ordinary top-level layers, preserving legacy project behaviour.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_support::pairs"))]
     pub layer_metadata: HashMap<LayerKey, LayerMetadata>,
     /// Audio clips live beside the visual timeline rather than inside display
     /// placements, so they can never become stage objects or visual keyframes.
@@ -2298,6 +2422,19 @@ impl ProjectV2 {
         sources
     }
 
+    /// The masks that cut `layer` when drawn: its mask sources that are
+    /// mask layers and visible. A hidden mask stops masking, as a hidden
+    /// layer stops existing in an export; it never hides what it masks.
+    pub fn layer_clipping_masks(&self, q0rg_id: u16, layer_id: u16) -> Vec<u16> {
+        self.layer_mask_sources(q0rg_id, layer_id)
+            .into_iter()
+            .filter(|mask_id| {
+                self.layer_metadata(q0rg_id, *mask_id).kind == LayerKind::Mask
+                    && self.layer_is_visible(q0rg_id, *mask_id)
+            })
+            .collect()
+    }
+
     pub fn layer_parent_folder(&self, q0rg_id: u16, layer_id: u16) -> Option<u16> {
         self.layer_metadata(q0rg_id, layer_id).parent_folder_id
     }
@@ -2352,15 +2489,20 @@ impl ProjectV2 {
             if metadata.hidden {
                 return false;
             }
+            // Folders hide what is in them. A mask does not hide what it
+            // masks: a hidden mask just stops masking.
             pending.extend(metadata.parent_folder_id);
-            pending.extend(metadata.mask_layer_id);
         }
         true
     }
 
     /// Whether artwork on this layer is protected from editing. Lock state
     /// inherits through containing folders while preserving local flags.
+    /// An embedding editor's read-only overlay also counts as locked.
     pub fn layer_is_locked(&self, q0rg_id: u16, layer_id: u16) -> bool {
+        if layer_is_read_only(q0rg_id, layer_id) {
+            return true;
+        }
         let mut pending = vec![layer_id];
         let mut visited = HashSet::new();
         while let Some(id) = pending.pop() {
@@ -2375,6 +2517,32 @@ impl ProjectV2 {
         }
         false
     }
+}
+
+/// Layers by (q0rg_id, layer_id), shared without copying between frames.
+pub type LayerSet = Arc<HashSet<(u16, u16)>>;
+
+std::thread_local! {
+    /// Layers the embedding editor treats as read-only on this thread, on top
+    /// of their own lock flags: in a shared q0editor room, the layers this
+    /// participant may not edit. Keyed by (q0rg_id, layer_id).
+    static READ_ONLY_LAYERS: std::cell::RefCell<Option<LayerSet>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Replace this thread's read-only overlay; `None` clears it.
+pub fn set_read_only_layers(layers: Option<LayerSet>) {
+    READ_ONLY_LAYERS.with(|overlay| *overlay.borrow_mut() = layers);
+}
+
+/// Whether the overlay, not the layer's own lock flag, protects this layer.
+pub fn layer_is_read_only(q0rg_id: u16, layer_id: u16) -> bool {
+    READ_ONLY_LAYERS.with(|overlay| {
+        overlay
+            .borrow()
+            .as_ref()
+            .is_some_and(|layers| layers.contains(&(q0rg_id, layer_id)))
+    })
 }
 
 fn rig_uses_pro_extensions(rig: &RigAsset) -> bool {
@@ -3569,6 +3737,7 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
                 }
             }
             Asset::Rig(rig) => validate_rig_asset(rig)?,
+            Asset::Model(_) => {}
         }
     }
 
@@ -3921,9 +4090,10 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
                 if let Some(shadow) = p.fx.shadow {
                     if !shadow.blur_radius.is_finite()
                         || !(0.0..=512.0).contains(&shadow.blur_radius)
+                        || !(1..=15).contains(&shadow.quality)
                     {
                         return Err(Error::Validation(
-                            "placement shadow blur must be finite and between 0 and 512",
+                            "placement shadow blur must be finite and between 0 and 512 with quality 1..=15",
                         ));
                     }
                     if !shadow.offset_x.is_finite() || !shadow.offset_y.is_finite() {
@@ -4510,6 +4680,7 @@ fn shared_media_references(project: &ProjectV2) -> HashMap<u16, u16> {
 }
 
 #[derive(Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 struct MediaPayloads {
     contents: HashMap<u64, Vec<Arc<Vec<u8>>>>,
     by_id: HashMap<u16, Arc<Vec<u8>>>,
@@ -4538,13 +4709,32 @@ impl MediaPayloads {
 }
 
 pub fn write(project: &ProjectV2) -> Result<Vec<u8>, Error> {
-    let version = if project
+    write_with(project, false)
+}
+
+/// Body flag: vector paths are packed (see `write_packed_paths`).
+pub(crate) const BODY_FLAG_PACKED_PATHS: u16 = 1;
+
+/// `write`, optionally packing vector paths. Packed bodies are for .q0s.
+pub(crate) fn write_with(project: &ProjectV2, packed: bool) -> Result<Vec<u8>, Error> {
+    let version = if uses_three_d(project) {
+        Q1S_VERSION_THREE_D
+    } else if project
         .q0rgs
         .iter()
         .flat_map(|q| &q.layers)
         .flat_map(|layer| &layer.placements)
-        .any(|placement| placement.pivot.is_some())
+        .any(|placement| {
+            placement
+                .fx
+                .shadow
+                .is_some_and(|shadow| shadow.quality != 3)
+        })
     {
+        Q1S_VERSION_SHADOW_QUALITY
+    } else if crate::motion_tween::needs_pivot_wire_version(project) {
+        // An authored absent anchor must stay absent. Emitting a legacy body
+        // would run pivot recovery on parse-back and change the modern project.
         Q1S_VERSION_TRANSFORM_PIVOTS
     } else if project.runtime.physics.uses_v41()
         || !project.runtime.particles.is_empty()
@@ -4580,7 +4770,21 @@ pub fn write(project: &ProjectV2) -> Result<Vec<u8>, Error> {
     } else {
         Q1S_VERSION_LAYER_FRAME_COUNTS
     };
-    write_version(project, version)
+    write_version_with(project, version, packed)
+}
+
+fn uses_three_d(project: &ProjectV2) -> bool {
+    !project.runtime.scene3d.is_empty()
+        || project
+            .assets
+            .iter()
+            .any(|asset| matches!(asset, Asset::Model(_)))
+        || project
+            .q0rgs
+            .iter()
+            .flat_map(|q| &q.layers)
+            .flat_map(|layer| &layer.placements)
+            .any(|placement| placement.fx.three.is_some())
 }
 
 fn uses_shape_tweens(project: &ProjectV2) -> bool {
@@ -4639,8 +4843,28 @@ fn uses_rig_pose_keys(project: &ProjectV2) -> bool {
             .any(|key| key.tween.easing() == Easing::Hold)
 }
 
+#[cfg(test)]
 pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>, Error> {
+    write_version_with(project, version, false)
+}
+
+fn write_version_with(project: &ProjectV2, version: u16, packed: bool) -> Result<Vec<u8>, Error> {
     validate(project)?;
+    if version < Q1S_VERSION_THREE_D && uses_three_d(project) {
+        return Err(Error::Validation("legacy q1s versions cannot store 3D"));
+    }
+    if version < Q1S_VERSION_SHADOW_QUALITY
+        && project
+            .q0rgs
+            .iter()
+            .flat_map(|q| &q.layers)
+            .flat_map(|layer| &layer.placements)
+            .any(|p| p.fx.shadow.is_some_and(|shadow| shadow.quality != 3))
+    {
+        return Err(Error::Validation(
+            "legacy q1s version cannot store shadow quality",
+        ));
+    }
     if version < Q1S_VERSION_TRANSFORM_PIVOTS
         && project
             .q0rgs
@@ -4731,6 +4955,8 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
         && version != Q1S_VERSION_PHYSICS
         && version != Q1S_VERSION_PARTICLES
         && version != Q1S_VERSION_TRANSFORM_PIVOTS
+        && version != Q1S_VERSION_SHADOW_QUALITY
+        && version != Q1S_VERSION_THREE_D
     {
         return Err(Error::UnsupportedVersion(version));
     }
@@ -5064,7 +5290,8 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
     let mut out = Vec::new();
     out.extend_from_slice(&Q1S_V2_MAGIC);
     out.extend_from_slice(&version.to_le_bytes());
-    out.extend_from_slice(&0_u16.to_le_bytes()); // flags
+    let flags = if packed { BODY_FLAG_PACKED_PATHS } else { 0 };
+    out.extend_from_slice(&flags.to_le_bytes());
     out.extend_from_slice(&asset_count.to_le_bytes());
     out.extend_from_slice(&q0rg_count.to_le_bytes());
 
@@ -5089,6 +5316,7 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
     } else {
         HashMap::new()
     };
+    let mut path_memory = packed.then(PathMemory::default);
     for asset in assets {
         if let Some(original) = media_references.get(&asset.id()) {
             out.extend_from_slice(&asset.id().to_le_bytes());
@@ -5109,6 +5337,7 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
             asset,
             project.asset_names.get(&asset.id()).map(String::as_str),
             version,
+            path_memory.as_mut(),
         )?;
     }
 
@@ -5422,14 +5651,18 @@ pub(crate) fn write_version(project: &ProjectV2, version: u16) -> Result<Vec<u8>
         crate::particles::write(&mut out, &project.runtime.particles)?;
         crate::lighting::write(&mut out, &project.runtime.lighting)?;
     }
+    if version >= Q1S_VERSION_THREE_D {
+        crate::three::wire::write_scene(&mut out, &project.runtime.scene3d)?;
+    }
     Ok(out)
 }
 
-fn write_asset(
+fn write_asset<'a>(
     out: &mut Vec<u8>,
-    asset: &Asset,
+    asset: &'a Asset,
     asset_name: Option<&str>,
     version: u16,
+    packed: Option<&mut PathMemory<'a>>,
 ) -> Result<(), Error> {
     match asset {
         Asset::Bitmap(b) => {
@@ -5489,17 +5722,31 @@ fn write_asset(
 
             let path_count = u16::try_from(v.paths.len())
                 .map_err(|_| Error::Overflow("path count exceeds u16"))?;
-            out.extend_from_slice(&path_count.to_le_bytes());
-            for path in &v.paths {
-                out.push(if path.closed { 1 } else { 0 });
-                let anchor_count = u16::try_from(path.anchors.len())
-                    .map_err(|_| Error::Overflow("anchor count exceeds u16"))?;
-                out.extend_from_slice(&anchor_count.to_le_bytes());
-                for anchor in &path.anchors {
-                    out.extend_from_slice(&anchor.point.x.to_le_bytes());
-                    out.extend_from_slice(&anchor.point.y.to_le_bytes());
-                    write_optional_vec2(out, anchor.in_handle);
-                    write_optional_vec2(out, anchor.out_handle);
+            if let Some(memory) = packed {
+                match memory.earlier(v.asset_id, &v.paths) {
+                    Some(earlier) => {
+                        out.push(PACKED_PATHS_REPEATED);
+                        out.extend_from_slice(&earlier.to_le_bytes());
+                    }
+                    None => {
+                        out.push(PACKED_PATHS_HERE);
+                        out.extend_from_slice(&path_count.to_le_bytes());
+                        write_packed_paths(out, &v.paths)?;
+                    }
+                }
+            } else {
+                out.extend_from_slice(&path_count.to_le_bytes());
+                for path in &v.paths {
+                    out.push(if path.closed { 1 } else { 0 });
+                    let anchor_count = u16::try_from(path.anchors.len())
+                        .map_err(|_| Error::Overflow("anchor count exceeds u16"))?;
+                    out.extend_from_slice(&anchor_count.to_le_bytes());
+                    for anchor in &path.anchors {
+                        out.extend_from_slice(&anchor.point.x.to_le_bytes());
+                        out.extend_from_slice(&anchor.point.y.to_le_bytes());
+                        write_optional_vec2(out, anchor.in_handle);
+                        write_optional_vec2(out, anchor.out_handle);
+                    }
                 }
             }
         }
@@ -5522,8 +5769,398 @@ fn write_asset(
             }
             write_rig_asset(out, rig, asset_name, version)?;
         }
+        Asset::Model(model) => {
+            if version < Q1S_VERSION_THREE_D {
+                return Err(Error::Validation("legacy q1s versions cannot store 3D"));
+            }
+            out.extend_from_slice(&model.asset_id.to_le_bytes());
+            out.push(ASSET_KIND_MODEL);
+            write_string_u16(out, asset_name.unwrap_or(""))?;
+            crate::three::wire::write_model(out, &model.data)?;
+        }
     }
     Ok(())
+}
+
+// Packed paths. Flash, SWF and imported FLA artwork sit on a grid of
+// twentieths of a pixel, and points split from their curves on fortieths. A
+// point on that grid is stored as whole steps from the point before, a byte
+// or two each instead of four. A handle is stored as steps from its point,
+// or, when it came from one of Flash's quadratic curves, as that curve's
+// control point: the handle is worked out from it exactly as the importer
+// did, and the next point's handle reuses it. Artwork moved after import
+// sits a hair off the grid; it is stored as grid steps plus how many float
+// steps it is off. Anything else stays a plain float, so packing never moves
+// a point.
+/// A packed drawing's paths follow.
+const PACKED_PATHS_HERE: u8 = 0;
+/// A packed drawing has the same paths as an earlier one, by asset id.
+const PACKED_PATHS_REPEATED: u8 = 1;
+
+/// The paths a packed file has written so far, so a drawing that is repeated
+/// as another asset, as frame-by-frame imports often do, is stored once.
+#[derive(Default)]
+struct PathMemory<'a> {
+    written: HashMap<u64, Vec<(u16, &'a [Path])>>,
+}
+
+impl<'a> PathMemory<'a> {
+    /// The asset that already wrote these exact paths, or `None` after
+    /// remembering them as `asset_id`'s.
+    fn earlier(&mut self, asset_id: u16, paths: &'a [Path]) -> Option<u16> {
+        use std::hash::{Hash, Hasher};
+        let bits = |paths: &[Path]| {
+            paths
+                .iter()
+                .flat_map(|path| {
+                    std::iter::once(u32::from(path.closed))
+                        .chain(std::iter::once(path.anchors.len() as u32))
+                        .chain(path.anchors.iter().flat_map(|anchor| {
+                            [Some(anchor.point), anchor.in_handle, anchor.out_handle]
+                                .into_iter()
+                                .flat_map(|point| match point {
+                                    Some(point) => [1, point.x.to_bits(), point.y.to_bits()],
+                                    None => [0, 0, 0],
+                                })
+                        }))
+                })
+                .collect::<Vec<u32>>()
+        };
+        let mine = bits(paths);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        mine.hash(&mut hasher);
+        let same = self.written.entry(hasher.finish()).or_default();
+        if let Some((earlier, _)) = same.iter().find(|(_, other)| bits(other) == mine) {
+            return Some(*earlier);
+        }
+        same.push((asset_id, paths));
+        None
+    }
+}
+
+const PACKED_HAS_IN: u8 = 1;
+const PACKED_HAS_OUT: u8 = 2;
+const PACKED_POINT_ON_GRID: u8 = 4;
+const PACKED_IN_SHIFT: u8 = 3;
+const PACKED_OUT_SHIFT: u8 = 5;
+/// Grid values in this anchor carry their float-step corrections.
+const PACKED_NUDGED: u8 = 0x80;
+const PACKED_GRID: f32 = 40.0;
+/// The most float steps a value may be off the grid and still count as on it.
+const PACKED_MAX_NUDGE: i32 = 1 << 10;
+
+/// How a handle is stored.
+const HANDLE_RAW: u8 = 0;
+/// Steps from its point.
+const HANDLE_ON_GRID: u8 = 1;
+/// A quadratic control point, in steps from the point.
+const HANDLE_QUADRATIC: u8 = 2;
+/// The control point the previous point's out handle came from.
+const HANDLE_SHARED: u8 = 3;
+
+fn packed_value(steps: i32) -> f32 {
+    steps as f32 / PACKED_GRID
+}
+
+/// `value` as grid steps and how many float steps it is off them, when it
+/// is on or near the grid.
+fn packed_steps(value: f32) -> Option<(i32, i32)> {
+    let steps = (value * PACKED_GRID).round();
+    // Kept small enough that a step between two points fits an i32.
+    if !steps.is_finite() || steps.abs() > (1 << 26) as f32 {
+        return None;
+    }
+    let steps = steps as i32;
+    let base = packed_value(steps);
+    if base.to_bits() == value.to_bits() {
+        return Some((steps, 0));
+    }
+    // Float steps only count between values of one sign.
+    if base == 0.0 || base.is_sign_negative() != value.is_sign_negative() {
+        return None;
+    }
+    let nudge = i64::from(value.to_bits()) - i64::from(base.to_bits());
+    (nudge.abs() <= i64::from(PACKED_MAX_NUDGE)).then_some((steps, nudge as i32))
+}
+
+fn nudged(steps: i32, nudge: i32) -> Result<f32, Error> {
+    let base = packed_value(steps);
+    if nudge == 0 {
+        return Ok(base);
+    }
+    if base == 0.0 || nudge.abs() > PACKED_MAX_NUDGE {
+        return Err(Error::Validation("invalid packed nudge"));
+    }
+    let bits = i64::from(base.to_bits()) + i64::from(nudge);
+    let value = f32::from_bits(bits as u32);
+    if value.is_finite() && value.is_sign_negative() == base.is_sign_negative() {
+        Ok(value)
+    } else {
+        Err(Error::Validation("invalid packed nudge"))
+    }
+}
+
+/// The handle a quadratic curve from `point` through `control` gives it,
+/// worked out as the importers do.
+fn quadratic_handle(point: f32, control: f32) -> f32 {
+    point + (control - point) * (2.0 / 3.0)
+}
+
+/// The control point, in steps, that gives `handle` from `point`.
+fn quadratic_control(point: f32, handle: f32) -> Option<i32> {
+    let guess = ((point + (handle - point) * 1.5) * PACKED_GRID).round();
+    if !guess.is_finite() || guess.abs() > (1 << 26) as f32 {
+        return None;
+    }
+    let guess = guess as i32;
+    [guess, guess - 1, guess + 1]
+        .into_iter()
+        .find(|steps| quadratic_handle(point, packed_value(*steps)).to_bits() == handle.to_bits())
+}
+
+/// How one handle of a packed anchor is stored.
+enum PackedHandle {
+    Raw(Vec2),
+    OnGrid((i32, i32), (i32, i32)),
+    Quadratic((i32, i32)),
+    Shared,
+}
+
+fn pack_handle(
+    point: Vec2,
+    handle: Vec2,
+    shared: Option<(i32, i32)>,
+    may_share: bool,
+) -> PackedHandle {
+    let from_control = |(x, y): (i32, i32)| {
+        quadratic_handle(point.x, packed_value(x)).to_bits() == handle.x.to_bits()
+            && quadratic_handle(point.y, packed_value(y)).to_bits() == handle.y.to_bits()
+    };
+    let grid = packed_steps(handle.x).zip(packed_steps(handle.y));
+    if may_share && shared.is_some_and(from_control) {
+        return PackedHandle::Shared;
+    }
+    if let Some(((x, 0), (y, 0))) = grid {
+        return PackedHandle::OnGrid((x, y), (0, 0));
+    }
+    if let Some(control) =
+        quadratic_control(point.x, handle.x).zip(quadratic_control(point.y, handle.y))
+    {
+        return PackedHandle::Quadratic(control);
+    }
+    match grid {
+        Some(((x, nudge_x), (y, nudge_y))) => PackedHandle::OnGrid((x, y), (nudge_x, nudge_y)),
+        None => PackedHandle::Raw(handle),
+    }
+}
+
+fn write_packed_paths(out: &mut Vec<u8>, paths: &[Path]) -> Result<(), Error> {
+    let mut previous = (0, 0);
+    let mut control: Option<(i32, i32)> = None;
+    for path in paths {
+        out.push(u8::from(path.closed));
+        let anchor_count = u16::try_from(path.anchors.len())
+            .map_err(|_| Error::Overflow("anchor count exceeds u16"))?;
+        out.extend_from_slice(&anchor_count.to_le_bytes());
+        for anchor in &path.anchors {
+            let mut header = 0;
+            if anchor.in_handle.is_some() {
+                header |= PACKED_HAS_IN;
+            }
+            if anchor.out_handle.is_some() {
+                header |= PACKED_HAS_OUT;
+            }
+            let point = packed_steps(anchor.point.x).zip(packed_steps(anchor.point.y));
+            let Some(((x, nudge_x), (y, nudge_y))) = point else {
+                // Off the grid: everything plain.
+                out.push(header);
+                for value in [Some(anchor.point), anchor.in_handle, anchor.out_handle]
+                    .into_iter()
+                    .flatten()
+                {
+                    out.extend_from_slice(&value.x.to_le_bytes());
+                    out.extend_from_slice(&value.y.to_le_bytes());
+                }
+                control = None;
+                continue;
+            };
+            header |= PACKED_POINT_ON_GRID;
+            let shared = control.take();
+            let handles = [
+                anchor
+                    .in_handle
+                    .map(|handle| pack_handle(anchor.point, handle, shared, true)),
+                anchor
+                    .out_handle
+                    .map(|handle| pack_handle(anchor.point, handle, None, false)),
+            ];
+            let mut nudges = vec![nudge_x, nudge_y];
+            for (side, handle) in handles.iter().enumerate() {
+                let Some(handle) = handle else {
+                    continue;
+                };
+                let mode = match handle {
+                    PackedHandle::Raw(_) => HANDLE_RAW,
+                    PackedHandle::OnGrid(_, (nudge_x, nudge_y)) => {
+                        nudges.extend([*nudge_x, *nudge_y]);
+                        HANDLE_ON_GRID
+                    }
+                    PackedHandle::Quadratic(steps) => {
+                        if side == 1 {
+                            control = Some(*steps);
+                        }
+                        HANDLE_QUADRATIC
+                    }
+                    PackedHandle::Shared => HANDLE_SHARED,
+                };
+                header |= mode
+                    << if side == 0 {
+                        PACKED_IN_SHIFT
+                    } else {
+                        PACKED_OUT_SHIFT
+                    };
+            }
+            let nudge = nudges.iter().any(|nudge| *nudge != 0);
+            if nudge {
+                header |= PACKED_NUDGED;
+            }
+            out.push(header);
+            write_zigzag(out, x - previous.0);
+            write_zigzag(out, y - previous.1);
+            if nudge {
+                write_zigzag(out, nudge_x);
+                write_zigzag(out, nudge_y);
+            }
+            previous = (x, y);
+            for handle in handles.into_iter().flatten() {
+                match handle {
+                    PackedHandle::Raw(value) => {
+                        out.extend_from_slice(&value.x.to_le_bytes());
+                        out.extend_from_slice(&value.y.to_le_bytes());
+                    }
+                    PackedHandle::OnGrid(steps, nudges) => {
+                        write_zigzag(out, steps.0 - x);
+                        write_zigzag(out, steps.1 - y);
+                        if nudge {
+                            write_zigzag(out, nudges.0);
+                            write_zigzag(out, nudges.1);
+                        }
+                    }
+                    PackedHandle::Quadratic(steps) => {
+                        write_zigzag(out, steps.0 - x);
+                        write_zigzag(out, steps.1 - y);
+                    }
+                    PackedHandle::Shared => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_packed_path(
+    c: &mut Cursor,
+    previous: &mut (i32, i32),
+    control: &mut Option<(i32, i32)>,
+) -> Result<Path, Error> {
+    let closed = match c.read_u8()? {
+        0 => false,
+        1 => true,
+        _ => return Err(Error::Validation("invalid path closed flag")),
+    };
+    let anchor_count = c.read_u16()?;
+    let mut anchors = Vec::with_capacity(usize::from(anchor_count));
+    let step = |from: i32, by: i32| {
+        from.checked_add(by)
+            .ok_or(Error::Validation("packed path step overflows"))
+    };
+    for _ in 0..anchor_count {
+        let header = c.read_u8()?;
+        let has = [header & PACKED_HAS_IN != 0, header & PACKED_HAS_OUT != 0];
+        let modes = [
+            (header >> PACKED_IN_SHIFT) & 3,
+            (header >> PACKED_OUT_SHIFT) & 3,
+        ];
+        for side in 0..2 {
+            if !has[side] && modes[side] != HANDLE_RAW {
+                return Err(Error::Validation("invalid packed anchor flags"));
+            }
+        }
+        if header & PACKED_POINT_ON_GRID == 0 {
+            if modes != [HANDLE_RAW; 2] || header & PACKED_NUDGED != 0 {
+                return Err(Error::Validation("invalid packed anchor flags"));
+            }
+            let point = Vec2::new(c.read_f32()?, c.read_f32()?);
+            let mut handles = [None, None];
+            for (handle, present) in handles.iter_mut().zip(has) {
+                if present {
+                    *handle = Some(Vec2::new(c.read_f32()?, c.read_f32()?));
+                }
+            }
+            *control = None;
+            anchors.push(Anchor {
+                point,
+                in_handle: handles[0],
+                out_handle: handles[1],
+            });
+            continue;
+        }
+        let nudge = header & PACKED_NUDGED != 0;
+        let read_nudge = |c: &mut Cursor| -> Result<i32, Error> {
+            if nudge {
+                c.read_zigzag()
+            } else {
+                Ok(0)
+            }
+        };
+        let (x, y) = (
+            step(previous.0, c.read_zigzag()?)?,
+            step(previous.1, c.read_zigzag()?)?,
+        );
+        *previous = (x, y);
+        let at = Vec2::new(nudged(x, read_nudge(c)?)?, nudged(y, read_nudge(c)?)?);
+        let shared = control.take();
+        let mut handles = [None, None];
+        for (side, handle) in handles.iter_mut().enumerate() {
+            if !has[side] {
+                continue;
+            }
+            let from_control = |(cx, cy): (i32, i32)| {
+                Vec2::new(
+                    quadratic_handle(at.x, packed_value(cx)),
+                    quadratic_handle(at.y, packed_value(cy)),
+                )
+            };
+            *handle = Some(match modes[side] {
+                HANDLE_RAW => Vec2::new(c.read_f32()?, c.read_f32()?),
+                HANDLE_ON_GRID => {
+                    let steps = (step(x, c.read_zigzag()?)?, step(y, c.read_zigzag()?)?);
+                    Vec2::new(
+                        nudged(steps.0, read_nudge(c)?)?,
+                        nudged(steps.1, read_nudge(c)?)?,
+                    )
+                }
+                HANDLE_QUADRATIC => {
+                    let steps = (step(x, c.read_zigzag()?)?, step(y, c.read_zigzag()?)?);
+                    if side == 1 {
+                        *control = Some(steps);
+                    }
+                    from_control(steps)
+                }
+                _ => from_control(
+                    shared
+                        .filter(|_| side == 0)
+                        .ok_or(Error::Validation("packed handle has no curve to share"))?,
+                ),
+            });
+        }
+        anchors.push(Anchor {
+            point: at,
+            in_handle: handles[0],
+            out_handle: handles[1],
+        });
+    }
+    Ok(Path { anchors, closed })
 }
 
 fn write_rig_asset(
@@ -6041,6 +6678,9 @@ fn write_placement_fx(out: &mut Vec<u8>, fx: PlacementFx, version: u16) {
         out.extend_from_slice(&shadow.offset_x.to_le_bytes());
         out.extend_from_slice(&shadow.offset_y.to_le_bytes());
         out.extend_from_slice(&shadow.strength.to_le_bytes());
+        if version >= Q1S_VERSION_SHADOW_QUALITY {
+            out.push(shadow.quality);
+        }
     }
     if flags & PLACEMENT_FX_Q0RG_PLAYBACK != 0 {
         out.push(match fx.q0rg_playback.mode {
@@ -6076,6 +6716,9 @@ fn write_placement_fx(out: &mut Vec<u8>, fx: PlacementFx, version: u16) {
                 out.extend_from_slice(&tint.amount.to_le_bytes());
             }
         }
+    }
+    if version >= Q1S_VERSION_THREE_D {
+        crate::three::wire::write_space(out, fx.three);
     }
 }
 
@@ -6174,6 +6817,11 @@ fn read_placement_fx(c: &mut Cursor<'_>, version: u16) -> Result<PlacementFx, Er
             offset_x: c.read_f32()?,
             offset_y: c.read_f32()?,
             strength: c.read_f32()?,
+            quality: if version >= Q1S_VERSION_SHADOW_QUALITY {
+                c.read_u8()?
+            } else {
+                3
+            },
         })
     } else {
         None
@@ -6243,6 +6891,11 @@ fn read_placement_fx(c: &mut Cursor<'_>, version: u16) -> Result<PlacementFx, Er
     } else {
         None
     };
+    let three = if version >= Q1S_VERSION_THREE_D {
+        crate::three::wire::read_space(c)?
+    } else {
+        None
+    };
     Ok(PlacementFx {
         opacity,
         tint,
@@ -6253,6 +6906,7 @@ fn read_placement_fx(c: &mut Cursor<'_>, version: u16) -> Result<PlacementFx, Er
         audio_gain,
         audio_muted,
         q0rg_playback,
+        three,
     })
 }
 
@@ -6366,7 +7020,15 @@ pub fn parse(bytes: &[u8]) -> Result<ProjectV2, Error> {
     }
 
     let version = c.read_u16()?;
-    if version != Q1S_VERSION_LEGACY
+    if !is_known_version(version) {
+        return Err(Error::UnsupportedVersion(version));
+    }
+    parse_body(c, version)
+}
+
+/// Whether this reader understands q1s body `version`.
+pub(crate) fn is_known_version(version: u16) -> bool {
+    !(version != Q1S_VERSION_LEGACY
         && version != Q1S_VERSION_SKEW
         && version != Q1S_VERSION_KEYFRAMES
         && version != Q1S_VERSION_ASSET_NAMES
@@ -6407,10 +7069,8 @@ pub fn parse(bytes: &[u8]) -> Result<ProjectV2, Error> {
         && version != Q1S_VERSION_PHYSICS
         && version != Q1S_VERSION_PARTICLES
         && version != Q1S_VERSION_TRANSFORM_PIVOTS
-    {
-        return Err(Error::UnsupportedVersion(version));
-    }
-    parse_body(c, version)
+        && version != Q1S_VERSION_SHADOW_QUALITY
+        && version != Q1S_VERSION_THREE_D)
 }
 
 /// Parse a project body after a six-byte wrapper header without copying the
@@ -6422,11 +7082,18 @@ pub(crate) fn parse_body_after_header(bytes: &[u8], body_version: u16) -> Result
     parse_body(c, body_version)
 }
 
+/// Parse a project body that starts at its flags, as a packed .q0s holds it
+/// once inflated.
+pub(crate) fn parse_body_bytes(body: &[u8], version: u16) -> Result<ProjectV2, Error> {
+    parse_body(Cursor::new(body), version)
+}
+
 fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
     let flags = c.read_u16()?;
-    if flags != 0 {
+    if flags & !BODY_FLAG_PACKED_PATHS != 0 {
         return Err(Error::UnsupportedFlags(flags));
     }
+    let packed = flags & BODY_FLAG_PACKED_PATHS != 0;
     let asset_count = c.read_u16()?;
     let q0rg_count = c.read_u16()?;
 
@@ -6455,7 +7122,8 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
     let mut asset_names = HashMap::new();
     let mut media_payloads = MediaPayloads::default();
     for _ in 0..asset_count {
-        let (asset, asset_name) = parse_asset(&mut c, version, &mut media_payloads)?;
+        let (asset, asset_name) =
+            parse_asset(&mut c, version, packed, &assets, &mut media_payloads)?;
         if let Some(name) = asset_name {
             asset_names.insert(asset.id(), name);
         }
@@ -6843,6 +7511,9 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
             runtime.lighting = crate::lighting::read(&mut c)?;
         }
     }
+    if version >= Q1S_VERSION_THREE_D {
+        runtime.scene3d = crate::three::wire::read_scene(&mut c)?;
+    }
     c.finish()?;
 
     let mut project = ProjectV2 {
@@ -6915,6 +7586,8 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
 fn parse_asset(
     c: &mut Cursor,
     version: u16,
+    packed: bool,
+    earlier: &[Asset],
     media: &mut MediaPayloads,
 ) -> Result<(Asset, Option<String>), Error> {
     let asset_id = c.read_u16()?;
@@ -6936,7 +7609,7 @@ fn parse_asset(
                 asset_id,
                 width,
                 height,
-                rgba,
+                rgba: rgba.into(),
             })
         }
         ASSET_KIND_VECTOR => {
@@ -7009,9 +7682,33 @@ fn parse_asset(
                 _ => return Err(Error::Validation("invalid has_stroke flag")),
             };
 
-            let path_count = c.read_u16()?;
+            let repeated = packed && {
+                match c.read_u8()? {
+                    PACKED_PATHS_HERE => false,
+                    PACKED_PATHS_REPEATED => true,
+                    _ => return Err(Error::Validation("invalid packed paths kind")),
+                }
+            };
+            let path_count = if repeated { 0 } else { c.read_u16()? };
             let mut paths = Vec::with_capacity(usize::from(path_count));
+            if repeated {
+                let id = c.read_u16()?;
+                paths = earlier
+                    .iter()
+                    .find_map(|asset| match asset {
+                        Asset::Vector(vector) if vector.asset_id == id => {
+                            Some(vector.paths.clone())
+                        }
+                        _ => None,
+                    })
+                    .ok_or(Error::Validation("packed paths repeat a missing drawing"))?;
+            }
+            let (mut previous, mut control) = ((0, 0), None);
             for _ in 0..path_count {
+                if packed {
+                    paths.push(read_packed_path(c, &mut previous, &mut control)?);
+                    continue;
+                }
                 let closed = match c.read_u8()? {
                     0 => false,
                     1 => true,
@@ -7059,6 +7756,12 @@ fn parse_asset(
         }
         ASSET_KIND_RIG if version >= Q1S_VERSION_RIGGING => {
             Asset::Rig(read_rig_asset(c, asset_id, version)?)
+        }
+        ASSET_KIND_MODEL if version >= Q1S_VERSION_THREE_D => {
+            Asset::Model(crate::three::ModelAsset {
+                asset_id,
+                data: Arc::new(crate::three::wire::read_model(c)?),
+            })
         }
         other => return Err(Error::InvalidAssetKind(other)),
     };
@@ -7635,6 +8338,70 @@ mod compatibility_tests {
         expected
     }
 
+    #[test]
+    fn modern_unset_pivots_survive_save_while_old_rotation_files_are_recovered() {
+        let mut project = legacy_project();
+        let Asset::Vector(vector) = &mut project.assets[0] else {
+            unreachable!()
+        };
+        vector.paths.push(Path {
+            closed: true,
+            anchors: [(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)]
+                .into_iter()
+                .map(|(x, y)| Anchor {
+                    point: Vec2::new(x, y),
+                    in_handle: None,
+                    out_handle: None,
+                })
+                .collect(),
+        });
+        vector.fill = Some(Rgba {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 255,
+        });
+        let source = Placement {
+            pivot: None,
+            instance_id: 0,
+            frame: 0,
+            target: Target::Asset(1),
+            transform: Transform2D::IDENTITY,
+            tween: Tween::Linear { to_frame: 1 },
+            fx: PlacementFx::default(),
+        };
+        let destination = Placement {
+            frame: 1,
+            transform: Transform2D {
+                tx: 20.0,
+                rotation: std::f32::consts::FRAC_PI_2,
+                ..Transform2D::IDENTITY
+            },
+            tween: Tween::None,
+            ..source
+        };
+        project.q0rgs[0].layers[0].placements = vec![source, destination];
+        let bytes = write(&project).unwrap();
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            Q1S_VERSION_TRANSFORM_PIVOTS
+        );
+        let parsed = parse(&bytes).unwrap();
+        assert!(wire_equivalent(&project, &parsed));
+        assert!(parsed.q0rgs[0].layers[0]
+            .placements
+            .iter()
+            .all(|placement| placement.pivot.is_none()));
+        let old = parse(&write_version(&project, Q1S_VERSION_PARTICLES).unwrap()).unwrap();
+        for placement in &old.q0rgs[0].layers[0].placements {
+            let pivot = placement.pivot.expect("old files retain anchor migration");
+            assert!((pivot.x - 10.0).abs() < 0.001 && (pivot.y - 10.0).abs() < 0.001);
+        }
+        let packed =
+            crate::q0s_v2::parse_q0s_v2(&crate::q0s_v2::write_q0s_v2(&project).unwrap()).unwrap();
+        assert!(wire_equivalent(&project, &packed));
+    }
+
     fn test_q0v_bytes() -> Vec<u8> {
         let spec = q0video::q0v::Q0vSpec {
             width: 2,
@@ -7688,7 +8455,11 @@ mod compatibility_tests {
         let bytes = crate::q0s_v2::write_q0s_v2(&project).unwrap();
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            crate::q0s_v2::Q0S_VERSION_PHYSICS
+            crate::q0s_v2::Q0S_VERSION_PACKED
+        );
+        assert_eq!(
+            u16::from_le_bytes([bytes[6], bytes[7]]),
+            Q1S_VERSION_PHYSICS
         );
         let parsed = crate::q0s_v2::parse_q0s_v2(&bytes).unwrap();
         assert_eq!(parsed.runtime.physics, project.runtime.physics);
@@ -7716,7 +8487,11 @@ mod compatibility_tests {
         let bytes = crate::q0s_v2::write_q0s_v2(&project).unwrap();
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            crate::q0s_v2::Q0S_VERSION_PARTICLES
+            crate::q0s_v2::Q0S_VERSION_PACKED
+        );
+        assert_eq!(
+            u16::from_le_bytes([bytes[6], bytes[7]]),
+            Q1S_VERSION_PARTICLES
         );
         let parsed = crate::q0s_v2::parse_q0s_v2(&bytes).unwrap();
         assert_eq!(parsed.runtime.physics, project.runtime.physics);

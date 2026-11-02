@@ -19,6 +19,7 @@
 use crate::v2::{Transform2D, Vec2};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Affine {
     pub a11: f32,
     pub a12: f32,
@@ -120,4 +121,81 @@ impl Affine {
     pub fn uniform_scale(&self) -> f32 {
         (self.a11 * self.a22 - self.a12 * self.a21).abs().sqrt()
     }
+}
+
+/// Where a followed object is and how it is turned. Lights and particle
+/// emitters riding along with an object keep their offset in the object's
+/// own space, so they swing round, stretch and flip with it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Follow {
+    /// The object's middle on its timeline.
+    pub point: [f32; 2],
+    /// The object's turn, stretch and flip; its move is in `point`.
+    pub turn: Affine,
+}
+
+impl Follow {
+    /// An object at `point` that is not turned.
+    pub fn at(point: [f32; 2]) -> Self {
+        Self {
+            point,
+            turn: Affine::IDENTITY,
+        }
+    }
+
+    /// An object placed by `affine` whose own bounds have their middle at
+    /// `local_middle`.
+    pub fn from_placement(affine: Affine, local_middle: Vec2) -> Self {
+        let middle = affine.apply(local_middle);
+        Self {
+            point: [middle.x, middle.y],
+            turn: Affine {
+                tx: 0.0,
+                ty: 0.0,
+                ..affine
+            },
+        }
+    }
+
+    /// Where `offset`, taken from the object's middle in its own space,
+    /// is on the timeline.
+    pub fn place(&self, offset: [f32; 2]) -> [f32; 2] {
+        let turned = self.turn.apply(Vec2::new(offset[0], offset[1]));
+        [self.point[0] + turned.x, self.point[1] + turned.y]
+    }
+
+    /// The offset in the object's own space that lands on `point`.
+    pub fn offset_of(&self, point: [f32; 2]) -> [f32; 2] {
+        let away = Vec2::new(point[0] - self.point[0], point[1] - self.point[1]);
+        let local = self.turn.inverse().map_or(away, |back| back.apply(away));
+        [local.x, local.y]
+    }
+
+    /// A heading in degrees (0 to the right, 90 down) turned with the
+    /// object.
+    pub fn turn_degrees(&self, degrees: f32) -> f32 {
+        turned_degrees(self.turn, degrees)
+    }
+
+    /// The heading in the object's own space that turns into `degrees`.
+    pub fn unturn_degrees(&self, degrees: f32) -> f32 {
+        match self.turn.inverse() {
+            Some(back) => turned_degrees(back, degrees),
+            None => degrees,
+        }
+    }
+}
+
+fn turned_degrees(turn: Affine, degrees: f32) -> f32 {
+    if turn == Affine::IDENTITY {
+        return degrees;
+    }
+    let (sin, cos) = degrees.to_radians().sin_cos();
+    let heading = turn.apply(Vec2::new(cos, sin));
+    if heading.x.hypot(heading.y) < 1.0e-6 {
+        return degrees;
+    }
+    let turned = heading.y.atan2(heading.x).to_degrees();
+    // Stay on the same lap as `degrees`, so animated headings keep winding.
+    turned + ((degrees - turned) / 360.0).round() * 360.0
 }

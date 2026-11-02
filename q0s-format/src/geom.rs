@@ -10,6 +10,7 @@ use crate::v2::Vec2;
 /// Cap shape applied to both ends of a stroked polyline when wrapping
 /// it into a closed `brush_outline` polygon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum CapShape {
     /// Half-circle smooth caps. Looks like a felt-tip pen.
     Round,
@@ -24,6 +25,7 @@ pub enum CapShape {
 
 /// How a stroke turns its corners.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum JoinShape {
     /// Sharp points; very sharp corners are cut off like a bevel.
     Miter,
@@ -73,7 +75,14 @@ pub fn stroke_polygons(
             pts.pop();
         }
     }
-    let round_steps = |radius: f32| ((radius * 1.2) as usize).clamp(8, 48);
+    // Keep small authored caps smooth when magnified, too. Eight sides at
+    // stage resolution turned a normal pencil nib into an octagon at zoom.
+    let round_steps = |radius: f32| {
+        let angle = (1.0 - 0.002 / radius.max(0.002)).clamp(-1.0, 1.0).acos();
+        (std::f32::consts::PI / angle.max(0.001))
+            .ceil()
+            .clamp(32.0, 512.0) as usize
+    };
     let mut polygons = Vec::new();
     if pts.len() == 1 {
         // A dot: only a round or square nib shows anything.
@@ -332,6 +341,52 @@ pub fn flatten_path(path: &crate::v2::Path, samples_per_segment: usize) -> Vec<V
         sample_segment(a, b, samples_per_segment, &mut out);
     }
     out
+}
+
+/// Like `flatten_path`, but each curve gets only as many steps as keep the
+/// polyline within `tolerance` of it, up to `max_samples`. Small curves,
+/// which imported artwork is full of, become a few steps instead of many.
+pub fn flatten_path_within(
+    path: &crate::v2::Path,
+    tolerance: f32,
+    max_samples: usize,
+) -> Vec<Vec2> {
+    if path.anchors.len() < 2 {
+        return path.anchors.iter().map(|anchor| anchor.point).collect();
+    }
+    let mut out: Vec<Vec2> = vec![path.anchors[0].point];
+    let segment_count = if path.closed {
+        path.anchors.len()
+    } else {
+        path.anchors.len() - 1
+    };
+    for i in 0..segment_count {
+        let a = &path.anchors[i];
+        let b = &path.anchors[(i + 1) % path.anchors.len()];
+        let samples = curve_steps(a, b, tolerance).min(max_samples.max(1));
+        sample_segment(a, b, samples, &mut out);
+    }
+    out
+}
+
+/// Steps that keep a cubic within `tolerance` of its chords (Wang's formula).
+fn curve_steps(a: &crate::v2::Anchor, b: &crate::v2::Anchor, tolerance: f32) -> usize {
+    let p0 = a.point;
+    let p1 = a.out_handle.unwrap_or(a.point);
+    let p2 = b.in_handle.unwrap_or(b.point);
+    let p3 = b.point;
+    let bend = |a: Vec2, b: Vec2, c: Vec2| {
+        let x = a.x - 2.0 * b.x + c.x;
+        let y = a.y - 2.0 * b.y + c.y;
+        (x * x + y * y).sqrt()
+    };
+    let most = bend(p0, p1, p2).max(bend(p1, p2, p3));
+    let steps = (0.75 * most / tolerance.max(1.0e-6)).sqrt().ceil();
+    if steps.is_finite() {
+        (steps as usize).max(1)
+    } else {
+        1
+    }
 }
 
 fn sample_segment(

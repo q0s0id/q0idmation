@@ -177,7 +177,7 @@ impl FileStats {
                 Asset::Q0v(video) => {
                     total_bitmap_bytes += video.bytes.len() as u64;
                 }
-                Asset::Rig(_) => {}
+                Asset::Rig(_) | Asset::Model(_) => {}
             }
         }
 
@@ -226,13 +226,9 @@ impl FileStats {
 
 fn render_q0v(s: &Q0vStats, ui: &mut Ui) {
     let accent = ui.visuals().hyperlink_color;
-    ui.horizontal(|ui| {
-        ui.heading("File info");
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new("q0v media").color(accent).small());
-        });
+    super::chrome::panel_header(ui, "File info", |ui| {
+        ui.label(RichText::new("q0v media").color(accent).small());
     });
-    ui.separator();
     ScrollArea::vertical()
         .auto_shrink([false, true])
         .show(ui, |ui| {
@@ -275,13 +271,9 @@ fn render_q0v(s: &Q0vStats, ui: &mut Ui) {
 }
 
 fn render_v1(s: &V1Stats, ui: &mut Ui) {
-    ui.horizontal(|ui| {
-        ui.heading("File info");
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new("Bitmap v1").weak().small());
-        });
+    super::chrome::panel_header(ui, "File info", |ui| {
+        ui.label(RichText::new("Bitmap v1").weak().small());
     });
-    ui.separator();
     ScrollArea::vertical()
         .auto_shrink([false, true])
         .show(ui, |ui| {
@@ -344,13 +336,9 @@ fn render_v1(s: &V1Stats, ui: &mut Ui) {
 
 fn render_v2(s: &V2Stats, ui: &mut Ui) {
     let accent = ui.visuals().hyperlink_color;
-    ui.horizontal(|ui| {
-        ui.heading("File info");
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new("Vector v2").color(accent).small());
-        });
+    super::chrome::panel_header(ui, "File info", |ui| {
+        ui.label(RichText::new("Vector v2").color(accent).small());
     });
-    ui.separator();
     ScrollArea::vertical()
         .auto_shrink([false, true])
         .show(ui, |ui| {
@@ -395,7 +383,12 @@ fn row(ui: &mut Ui, label: &str, value: &str) {
 }
 
 fn section(ui: &mut Ui, title: &str) {
-    ui.label(RichText::new(title).strong().small().underline());
+    ui.label(
+        RichText::new(title.to_uppercase())
+            .size(10.5)
+            .strong()
+            .color(ui.visuals().weak_text_color()),
+    );
     ui.label("");
     ui.end_row();
 }

@@ -14,7 +14,7 @@ pub fn migrate_v1_to_v2(v1: Q1Project) -> Result<ProjectV2, Error> {
                 asset_id: a.asset_id,
                 width: a.width,
                 height: a.height,
-                rgba: a.rgba,
+                rgba: a.rgba.into(),
             })
         })
         .collect();

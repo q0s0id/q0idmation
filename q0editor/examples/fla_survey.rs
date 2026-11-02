@@ -57,7 +57,7 @@ fn main() {
                 Asset::Vector(_) => 0,
                 Asset::Bitmap(_) => 1,
                 Asset::Q0v(_) => 2,
-                Asset::Rig(_) => 3,
+                Asset::Rig(_) | Asset::Model(_) => 3,
             }] += 1;
         }
         let placements = project

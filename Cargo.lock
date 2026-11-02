@@ -769,8 +769,9 @@ dependencies = [
 
 [[package]]
 name = "canripper"
-version = "0.1.0-beta.5.1"
+version = "0.1.0-beta.6"
 dependencies = [
+ "dirs",
  "eframe",
  "egui",
  "flate2",
@@ -782,6 +783,8 @@ dependencies = [
  "q0theme",
  "q0video",
  "rfd",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1542,6 +1545,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "extended"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af9673d8203fcb076b19dfd17e38b3d4ae9f44959416ea532ce72415a6020365"
+
+[[package]]
 name = "fastrand"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1755,7 +1764,7 @@ dependencies = [
  "rand 0.10.1",
  "rand_pcg",
  "robust",
- "rstar",
+ "rstar 0.12.2",
  "sif-itree",
  "spade",
 ]
@@ -1769,7 +1778,7 @@ dependencies = [
  "approx",
  "num-traits",
  "rayon",
- "rstar",
+ "rstar 0.12.2",
  "serde",
  "spade",
 ]
@@ -3185,6 +3194,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "parry3d"
+version = "0.31.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b626edc0b497dba4bdf6e1e0797895294ed9f61dac2bd28cb5d34d37ad2ca7e"
+dependencies = [
+ "approx",
+ "arrayvec",
+ "bitflags 2.11.1",
+ "downcast-rs 2.0.2",
+ "either",
+ "ena",
+ "foldhash",
+ "glamx",
+ "hashbrown 0.17.0",
+ "log",
+ "num-derive 0.5.1",
+ "num-traits",
+ "ordered-float",
+ "rstar 0.13.1",
+ "simba",
+ "slab",
+ "smallvec",
+ "spade",
+ "static_assertions",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3371,7 +3408,7 @@ dependencies = [
 
 [[package]]
 name = "q0android"
-version = "0.1.0-beta.5.1"
+version = "0.1.0-beta.6"
 dependencies = [
  "egui",
  "glutin",
@@ -3383,14 +3420,14 @@ dependencies = [
 
 [[package]]
 name = "q0credits"
-version = "0.1.0-beta.5.1"
+version = "0.1.0-beta.6"
 dependencies = [
  "egui",
 ]
 
 [[package]]
 name = "q0editor"
-version = "0.1.0-beta.5.1"
+version = "0.1.0-beta.6"
 dependencies = [
  "base64",
  "clipboard-win",
@@ -3407,9 +3444,12 @@ dependencies = [
  "memmap2",
  "q0android",
  "q0credits",
+ "q0ex",
  "q0fla",
  "q0glblend",
  "q0icon",
+ "q0model",
+ "q0online",
  "q0physics",
  "q0s-format",
  "q0theme",
@@ -3428,7 +3468,7 @@ dependencies = [
 
 [[package]]
 name = "q0editor-android"
-version = "0.1.0-beta.5.1"
+version = "0.1.0-beta.6"
 dependencies = [
  "android_logger",
  "egui",
@@ -3440,13 +3480,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "q0ex"
+version = "0.1.0-beta.6"
+dependencies = [
+ "base64",
+ "serde_json",
+]
+
+[[package]]
 name = "q0fla"
-version = "0.1.0-beta.5.1"
+version = "0.1.0-beta.6"
 dependencies = [
  "cfb",
  "flate2",
  "jpeg-decoder",
  "q0s-format",
+ "q0video",
  "quick-xml",
  "ttf-parser",
  "winreg",
@@ -3455,7 +3504,7 @@ dependencies = [
 
 [[package]]
 name = "q0glblend"
-version = "0.1.0-beta.5.1"
+version = "0.1.0-beta.6"
 dependencies = [
  "egui",
  "egui_glow",
@@ -3465,24 +3514,48 @@ dependencies = [
 
 [[package]]
 name = "q0icon"
-version = "0.1.0-beta.5.1"
+version = "0.1.0-beta.6"
+
+[[package]]
+name = "q0model"
+version = "0.1.0-beta.6"
+dependencies = [
+ "image",
+ "miniz_oxide",
+ "q0s-format",
+ "serde_json",
+]
+
+[[package]]
+name = "q0online"
+version = "0.1.0"
+dependencies = [
+ "q0s-format",
+ "serde",
+ "serde_json",
+ "sha2",
+]
 
 [[package]]
 name = "q0physics"
-version = "0.1.0-beta.5.1"
+version = "0.1.0-beta.6"
 dependencies = [
  "q0s-format",
  "rapier2d",
+ "rapier3d",
 ]
 
 [[package]]
 name = "q0player"
-version = "0.1.0-beta.5.1"
+version = "0.1.0-beta.6"
 dependencies = [
  "dirs",
  "eframe",
  "egui",
+ "egui_glow",
+ "glow",
  "image",
+ "js-sys",
  "log",
  "lyon_path",
  "lyon_tessellation",
@@ -3498,13 +3571,16 @@ dependencies = [
  "rodio",
  "serde",
  "serde_json",
+ "wasm-bindgen",
+ "web-sys",
+ "windows-sys 0.59.0",
  "winreg",
  "winres",
 ]
 
 [[package]]
 name = "q0player-android"
-version = "0.1.0-beta.5.1"
+version = "0.1.0-beta.6"
 dependencies = [
  "android_logger",
  "log",
@@ -3515,22 +3591,25 @@ dependencies = [
 
 [[package]]
 name = "q0s-format"
-version = "0.1.0-beta.5.1"
+version = "0.1.0-beta.6"
 dependencies = [
+ "base64",
+ "miniz_oxide",
  "q0video",
  "q0vm",
+ "serde",
 ]
 
 [[package]]
 name = "q0shell"
-version = "0.1.0-beta.5.1"
+version = "0.1.0-beta.6"
 dependencies = [
  "q0s-format",
 ]
 
 [[package]]
 name = "q0term"
-version = "0.1.0-beta.5.1"
+version = "0.1.0-beta.6"
 dependencies = [
  "eframe",
  "egui",
@@ -3539,19 +3618,21 @@ dependencies = [
 
 [[package]]
 name = "q0theme"
-version = "0.1.0-beta.5.1"
+version = "0.1.0-beta.6"
 
 [[package]]
 name = "q0video"
-version = "0.1.0-beta.5.1"
+version = "0.1.0-beta.6"
 dependencies = [
+ "flate2",
  "image",
+ "symphonia",
  "windows 0.58.0",
 ]
 
 [[package]]
 name = "q0vm"
-version = "0.1.0-beta.5.1"
+version = "0.1.0-beta.6"
 
 [[package]]
 name = "quick-xml"
@@ -3645,6 +3726,28 @@ dependencies = [
  "nalgebra",
  "num-traits",
  "parry2d",
+ "profiling",
+ "serde",
+ "simba",
+ "static_assertions",
+ "thiserror 2.0.18",
+ "wide",
+]
+
+[[package]]
+name = "rapier3d"
+version = "0.36.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "033e2edc815d61ab97bd74ed5d1cbea5ebe575218774a7cfedbd3551f0033317"
+dependencies = [
+ "approx",
+ "arrayvec",
+ "bitflags 2.11.1",
+ "glamx",
+ "log",
+ "nalgebra",
+ "num-traits",
+ "parry3d",
  "profiling",
  "serde",
  "simba",
@@ -3825,6 +3928,17 @@ name = "rstar"
 version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "421400d13ccfd26dfa5858199c30a5d76f9c54e0dba7575273025b43c5175dbb"
+dependencies = [
+ "heapless",
+ "num-traits",
+ "smallvec",
+]
+
+[[package]]
+name = "rstar"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90e7279515baf3838062fa9c495a408bc2f3abbf9cd2ac8c2d4108b90fa29b89"
 dependencies = [
  "heapless",
  "num-traits",
@@ -4033,6 +4147,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
 name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4227,9 +4352,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5773a4c030a19d9bfaa090f49746ff35c75dfddfa700df7a5939d5e076a57039"
 dependencies = [
  "lazy_static",
+ "symphonia-bundle-flac",
  "symphonia-bundle-mp3",
+ "symphonia-codec-pcm",
+ "symphonia-codec-vorbis",
+ "symphonia-core",
+ "symphonia-format-ogg",
+ "symphonia-format-riff",
+ "symphonia-metadata",
+]
+
+[[package]]
+name = "symphonia-bundle-flac"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c91565e180aea25d9b80a910c546802526ffd0072d0b8974e3ebe59b686c9976"
+dependencies = [
+ "log",
  "symphonia-core",
  "symphonia-metadata",
+ "symphonia-utils-xiph",
 ]
 
 [[package]]
@@ -4242,6 +4384,27 @@ dependencies = [
  "log",
  "symphonia-core",
  "symphonia-metadata",
+]
+
+[[package]]
+name = "symphonia-codec-pcm"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e89d716c01541ad3ebe7c91ce4c8d38a7cf266a3f7b2f090b108fb0cb031d95"
+dependencies = [
+ "log",
+ "symphonia-core",
+]
+
+[[package]]
+name = "symphonia-codec-vorbis"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f025837c309cd69ffef572750b4a2257b59552c5399a5e49707cc5b1b85d1c73"
+dependencies = [
+ "log",
+ "symphonia-core",
+ "symphonia-utils-xiph",
 ]
 
 [[package]]
@@ -4258,6 +4421,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "symphonia-format-ogg"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b4955c67c1ed3aa8ae8428d04ca8397fbef6a19b2b051e73b5da8b1435639cb"
+dependencies = [
+ "log",
+ "symphonia-core",
+ "symphonia-metadata",
+ "symphonia-utils-xiph",
+]
+
+[[package]]
+name = "symphonia-format-riff"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2d7c3df0e7d94efb68401d81906eae73c02b40d5ec1a141962c592d0f11a96f"
+dependencies = [
+ "extended",
+ "log",
+ "symphonia-core",
+ "symphonia-metadata",
+]
+
+[[package]]
 name = "symphonia-metadata"
 version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4267,6 +4454,16 @@ dependencies = [
  "lazy_static",
  "log",
  "symphonia-core",
+]
+
+[[package]]
+name = "symphonia-utils-xiph"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee27c85ab799a338446b68eec77abf42e1a6f1bb490656e121c6e27bfbab9f16"
+dependencies = [
+ "symphonia-core",
+ "symphonia-metadata",
 ]
 
 [[package]]

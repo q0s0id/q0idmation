@@ -178,6 +178,22 @@ impl Compiler {
                     self.chunk.emit_u8(argc);
                 }
             }
+            Statement::LayerCommand { command, args } => {
+                if let Some(argc) = self.compile_args(args, line, "q0.layer command", context) {
+                    let command = self.name_constant(command, line);
+                    self.chunk.emit_op(Opcode::Layer, line);
+                    self.chunk.emit_u32(command);
+                    self.chunk.emit_u8(argc);
+                }
+            }
+            Statement::WindowCommand { command, args } => {
+                if let Some(argc) = self.compile_args(args, line, "q0.window command", context) {
+                    let command = self.name_constant(command, line);
+                    self.chunk.emit_op(Opcode::Window, line);
+                    self.chunk.emit_u32(command);
+                    self.chunk.emit_u8(argc);
+                }
+            }
             Statement::Listen { event, handler } | Statement::Unlisten { event, handler } => {
                 let event = self.name_constant(event, line);
                 let handler = self.name_constant(handler, line);
@@ -496,9 +512,34 @@ impl Compiler {
                 let Some(argc) = self.compile_args(args, line, "q0lang call", context) else {
                     return;
                 };
+                let host = parser::is_host_function_name(name);
+                if host {
+                    match parser::HOST_FUNCTIONS
+                        .iter()
+                        .find(|(known, _)| known == name)
+                    {
+                        Some((_, wanted)) if *wanted != args.len() => {
+                            self.diagnostics.push(Diagnostic {
+                                line,
+                                message: format!(
+                                    "`{name}` takes {wanted} value{}, got {}",
+                                    if *wanted == 1 { "" } else { "s" },
+                                    args.len()
+                                ),
+                            })
+                        }
+                        Some(_) => {}
+                        None => self.diagnostics.push(Diagnostic {
+                            line,
+                            message: format!("unknown q0.layer function `{name}`"),
+                        }),
+                    }
+                }
                 let name_constant = self.name_constant(name, line);
                 self.chunk.emit_op(
-                    if is_math_call(name) {
+                    if host {
+                        Opcode::CallHost
+                    } else if is_math_call(name) {
                         Opcode::CallMath
                     } else {
                         Opcode::CallUser

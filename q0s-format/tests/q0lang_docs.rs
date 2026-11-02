@@ -119,3 +119,46 @@ fn the_quick_start_prints_what_the_readme_says() {
         ]
     );
 }
+
+/// Simple mode writes code back out with the printer: every example has to
+/// come back out the way the printer first wrote it, and still compile.
+#[test]
+fn every_reference_example_reads_back_from_the_printer() {
+    use q0s_format::q0lang::{compiler, parser, printer};
+    let mut sources = Vec::new();
+    for entry in std::fs::read_dir(docs_dir())
+        .expect("docs/q0lang exists")
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        let plan = path
+            .file_stem()
+            .is_some_and(|stem| stem.to_string_lossy().ends_with("_plan"));
+        if path.extension().is_some_and(|extension| extension == "md") && !plan {
+            let markdown = std::fs::read_to_string(&path).expect("readable page");
+            sources.extend(
+                q0lang_blocks(&markdown)
+                    .into_iter()
+                    .map(|(_, source)| source),
+            );
+        }
+    }
+    for entry in std::fs::read_dir(docs_dir().join("examples"))
+        .expect("examples exist")
+        .filter_map(Result::ok)
+    {
+        sources.push(std::fs::read_to_string(entry.path()).expect("readable example"));
+    }
+    assert!(sources.len() > 20);
+    for source in sources {
+        let (printed, _) = printer::print_program(&parser::parse(&source).statements);
+        let (again, _) = printer::print_program(&parser::parse(&printed).statements);
+        assert_eq!(printed, again, "from:\n{source}");
+        let compiled = compiler::compile_source(&printed);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{printed}\n{:?}",
+            compiled.diagnostics
+        );
+    }
+}

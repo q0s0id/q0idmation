@@ -198,6 +198,7 @@ pub(crate) struct Autosave {
     tracked: HashMap<u64, Tracked>,
     queue: VecDeque<u64>,
     pending: Option<Pending>,
+    online_writes: Vec<mpsc::Receiver<Result<(), String>>>,
     next_due: Option<Instant>,
     pass_cost: Duration,
     last_error: Option<String>,
@@ -237,6 +238,7 @@ impl Autosave {
             tracked: HashMap::new(),
             queue: VecDeque::new(),
             pending: None,
+            online_writes: Vec::new(),
             next_due: None,
             pass_cost: Duration::ZERO,
             last_error: None,
@@ -250,6 +252,39 @@ impl Autosave {
 
     pub(crate) fn recovered(&self) -> &[RecoveryEntry] {
         &self.recovered
+    }
+
+    /// Rejected room edits belong to recovery, not automatically opened tabs.
+    pub(crate) fn preserve_online_change(&mut self, project: ProjectV2) {
+        if self.root.is_none() {
+            return;
+        }
+        let dir = match self.ensure_session() {
+            Ok(dir) => dir,
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                return;
+            }
+        };
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let stem = format!("online-{}-{id}", unix_now());
+        let manifest = Manifest {
+            version: 1,
+            kind: SnapshotKind::Project,
+            origin: SnapshotOrigin::Autosave,
+            title: format!("{} (unshared online change)", project.meta.name),
+            original_path: None,
+            saved_unix_secs: unix_now(),
+            data_file: format!("{stem}.q1s"),
+        };
+        let (tx, rx) = mpsc::channel();
+        self.online_writes.push(rx);
+        std::thread::spawn(move || {
+            let result =
+                write_snapshot(&dir, &stem, &manifest, &Payload::Project(Box::new(project)));
+            let _ = tx.send(result);
+        });
     }
 
     pub(crate) fn last_snapshot_age(&self) -> Option<Duration> {
@@ -630,6 +665,17 @@ fn start_snapshot(app: &mut EditorApp, tab_id: u64) -> Result<(), String> {
 
 /// Called once per frame. Everything here is cheap unless a snapshot is due.
 pub(crate) fn tick(app: &mut EditorApp, ctx: &egui::Context) {
+    app.autosave
+        .online_writes
+        .retain(|receiver| match receiver.try_recv() {
+            Ok(Ok(())) => false,
+            Ok(Err(error)) => {
+                eprintln!("online recovery write failed: {error}");
+                false
+            }
+            Err(mpsc::TryRecvError::Empty) => true,
+            Err(mpsc::TryRecvError::Disconnected) => false,
+        });
     if app.autosave.root.is_none() {
         return;
     }
@@ -777,6 +823,11 @@ pub(crate) fn emergency_flush(app: &mut EditorApp) {
 /// Clean exit: every document was saved or discarded, so nothing of this
 /// session needs to survive. Snapshots of still-dirty documents are kept.
 pub(crate) fn shutdown(app: &mut EditorApp) {
+    for receiver in app.autosave.online_writes.drain(..) {
+        if let Ok(Err(error)) = receiver.recv_timeout(EXIT_WAIT) {
+            eprintln!("online recovery write failed: {error}");
+        }
+    }
     if let Some(pending) = app.autosave.pending.take() {
         let result = pending
             .receiver
@@ -1047,5 +1098,22 @@ mod tests {
         assert_eq!(age_label(240), "4 min ago");
         assert_eq!(age_label(7200), "2 h ago");
         assert_eq!(age_label(86_400 * 3), "3 days ago");
+    }
+
+    #[test]
+    fn regression_unshared_online_copy_survives_without_an_open_tab() {
+        let root = TestDir::new("unshared-online");
+        let mut autosave = Autosave::with_root(Some(root.0.clone()));
+        let mut project = crate::state::default_project();
+        project.meta.name = "my unshared drawing".into();
+        autosave.preserve_online_change(project);
+        for receiver in autosave.online_writes.drain(..) {
+            receiver.recv_timeout(EXIT_WAIT).unwrap().unwrap();
+        }
+        drop(autosave);
+        let (entries, _adopted) = scan(&root.0, None);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].title().contains("my unshared drawing"));
+        assert!(entries[0].data_path().is_file());
     }
 }

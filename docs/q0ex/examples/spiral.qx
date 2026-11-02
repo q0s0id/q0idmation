@@ -1,0 +1,54 @@
+# Spiral: draws a spiral on the current layer.
+plugin "Spiral" {
+  id = "q0s.spiral"
+  version = "1.0.0"
+  author = "q0s"
+  summary = "Draws a spiral where you want it."
+  color = "#ff6b9d"
+}
+
+page ~~~
+# Spiral
+->{big}{#ff6b9d}round and round{/}{/}<-
+
+Picks the middle of the stage, or the pointer when it is over the stage,
+and draws a **spiral** on the current layer as one drawing.
+
+- set the turns, the size and the colour under **Settings**
+- *Plugins > Spiral > Draw a spiral* draws it
+- **ctrl+shift+s** draws it too
+
+> It is one undo step, so ctrl+z takes it back.
+~~~
+
+settings {
+  heading "Shape" ? "How the spiral turns"
+  slider turns "Turns" = 4 from 1 to 12 step 0.5
+  slider size "Size" = 160 from 20 to 600 ? "Distance from the middle to the end"
+  slider detail "Points a turn" = 48 from 8 to 120 step 1
+  heading "Look"
+  color tint "Colour" = "#ff6b9d"
+  slider width "Line width" = 3 from 0.5 to 20 step 0.5
+}
+
+fn draw_spiral() {
+  middle = editor.mouse() or {x: project.width() / 2, y: project.height() / 2}
+  points = []
+  count = round(config.turns * config.detail)
+  for i in 0..count {
+    t = i / count
+    angle = t * config.turns * 360
+    radius = t * config.size
+    push! points, [middle.x + cos(angle) * radius, middle.y + sin(angle) * radius]
+  }
+  project.path! points, false, null, config.tint, config.width
+  say! `a spiral of {count + 1} points`
+}
+
+when menu "Draw a spiral" {
+  draw_spiral()
+}
+
+when key "ctrl+shift+s" {
+  draw_spiral()
+}

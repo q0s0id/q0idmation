@@ -59,6 +59,29 @@ impl<'a> Cursor<'a> {
         self.data.len().saturating_sub(self.offset)
     }
 
+    /// A LEB128 unsigned number of up to 32 bits.
+    pub(crate) fn read_varint(&mut self) -> Result<u32, Error> {
+        let mut value = 0_u32;
+        for shift in (0..35).step_by(7) {
+            let byte = self.read_u8()?;
+            let bits = u32::from(byte & 0x7f);
+            if shift == 28 && bits > 0x0f {
+                return Err(Error::Validation("varint exceeds 32 bits"));
+            }
+            value |= bits << shift;
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+        }
+        Err(Error::Validation("varint exceeds 32 bits"))
+    }
+
+    /// A zigzag-coded signed number, small either side of zero.
+    pub(crate) fn read_zigzag(&mut self) -> Result<i32, Error> {
+        let value = self.read_varint()?;
+        Ok((value >> 1) as i32 ^ -((value & 1) as i32))
+    }
+
     pub(crate) fn finish(self) -> Result<(), Error> {
         let remaining = self.remaining();
         if remaining == 0 {
@@ -70,6 +93,18 @@ impl<'a> Cursor<'a> {
             })
         }
     }
+}
+
+pub(crate) fn write_varint(out: &mut Vec<u8>, mut value: u32) {
+    while value >= 0x80 {
+        out.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+pub(crate) fn write_zigzag(out: &mut Vec<u8>, value: i32) {
+    write_varint(out, ((value << 1) ^ (value >> 31)) as u32);
 }
 
 pub(crate) fn write_string_u16(out: &mut Vec<u8>, text: &str) -> Result<(), Error> {

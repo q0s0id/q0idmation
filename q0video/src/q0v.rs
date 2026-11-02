@@ -1,15 +1,35 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::io::{Seek, SeekFrom, Write};
-use std::sync::Arc;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::{Arc, OnceLock};
+
+use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 
 pub const MAGIC: [u8; 4] = *b"Q0V\0";
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 pub const MEDIA_TICKS_PER_SECOND: u64 = 10_000_000;
 const HEADER_SIZE: u64 = 80;
 const INDEX_ENTRY_SIZE: u64 = 24;
 const FLAG_VIDEO: u16 = 1;
 const FLAG_AUDIO: u16 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioCodec {
+    Pcm16 = 0,
+    DeflatePcm16 = 1,
+    Source = 2,
+}
+
+fn audio_codec(bytes: &[u8]) -> Result<AudioCodec, String> {
+    let version = read_u16(bytes, 4)?;
+    let codec = read_u32(bytes, 36)?;
+    match (version, codec) {
+        (1 | 2, 0) => Ok(AudioCodec::Pcm16),
+        (2, 1) => Ok(AudioCodec::DeflatePcm16),
+        (2, 2) => Ok(AudioCodec::Source),
+        _ => Err("unsupported q0v audio codec".into()),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Q0vSpec {
@@ -86,7 +106,7 @@ pub fn probe_header(bytes: &[u8]) -> Result<Q0vHeader, String> {
         return Err("q0v magic is invalid".to_string());
     }
     let version = read_u16(bytes, 4)?;
-    if version != VERSION {
+    if !(1..=VERSION).contains(&version) {
         return Err(format!("unsupported q0v version {version}"));
     }
     let flags = read_u16(bytes, 6)?;
@@ -106,6 +126,10 @@ pub fn probe_header(bytes: &[u8]) -> Result<Q0vHeader, String> {
         audio_channels: read_u16(bytes, 32)?,
     };
     spec.validate()?;
+    let codec = audio_codec(bytes)?;
+    if !audio && codec != AudioCodec::Pcm16 {
+        return Err("q0v has an audio codec without audio".into());
+    }
     let audio_bits = read_u16(bytes, 34)?;
     if audio && audio_bits != 16 {
         return Err("q0v audio must be signed 16-bit PCM".to_string());
@@ -146,9 +170,16 @@ pub fn encode_frame_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>,
     let mut png = Vec::new();
     let encoder =
         PngEncoder::new_with_quality(&mut png, CompressionType::Best, FilterType::Adaptive);
-    let written = if rgba.chunks_exact(4).all(|pixel| pixel[3] == u8::MAX) {
+    let written = if rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .all(|pixel| pixel[3] == u8::MAX)
+    {
         let rgb: Vec<u8> = rgba
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
             .collect();
         encoder.write_image(&rgb, width, height, image::ColorType::Rgb8)
@@ -194,6 +225,7 @@ pub struct Q0vWriter<W: Write + Seek> {
     stored: HashMap<PayloadKey, (u64, u32)>,
     audio_offset: Option<u64>,
     audio_samples_per_channel: u64,
+    audio_codec: AudioCodec,
     finished: bool,
 }
 
@@ -214,8 +246,44 @@ impl<W: Write + Seek> Q0vWriter<W> {
             stored: HashMap::new(),
             audio_offset: None,
             audio_samples_per_channel: 0,
+            audio_codec: AudioCodec::Pcm16,
             finished: false,
         })
+    }
+
+    /// Lossless, independently compressed PCM blocks. Legacy `new` still writes v1.
+    pub fn new_compressed(writer: W, spec: Q0vSpec) -> Result<Self, String> {
+        let mut writer = Self::new(writer, spec)?;
+        if spec.audio {
+            writer.audio_codec = AudioCodec::DeflatePcm16;
+        }
+        Ok(writer)
+    }
+
+    /// Store the original MP3, Ogg/Vorbis or FLAC bitstream without transcoding.
+    pub fn write_audio_encoded(
+        &mut self,
+        encoded: &[u8],
+        samples_per_channel: u64,
+    ) -> Result<(), String> {
+        if !self.spec.audio
+            || self.audio_offset.is_some()
+            || encoded.is_empty()
+            || samples_per_channel == 0
+        {
+            return Err("q0v encoded audio must be the only audio payload".into());
+        }
+        self.audio_offset = Some(
+            self.writer
+                .stream_position()
+                .map_err(|error| error.to_string())?,
+        );
+        self.audio_codec = AudioCodec::Source;
+        self.writer
+            .write_all(encoded)
+            .map_err(|error| format!("write q0v encoded audio: {error}"))?;
+        self.audio_samples_per_channel = samples_per_channel;
+        Ok(())
     }
 
     fn check_video_frame(&self) -> Result<(), String> {
@@ -281,6 +349,9 @@ impl<W: Write + Seek> Q0vWriter<W> {
         if !self.spec.audio {
             return Err("q0v has no audio stream".to_string());
         }
+        if self.audio_codec == AudioCodec::Source {
+            return Err("cannot append PCM to encoded q0v audio".into());
+        }
         let channels = usize::from(self.spec.audio_channels);
         if !interleaved.len().is_multiple_of(channels) {
             return Err("q0v audio buffer is not aligned to whole channel frames".to_string());
@@ -292,13 +363,30 @@ impl<W: Write + Seek> Q0vWriter<W> {
                     .map_err(|error| format!("query q0v audio offset: {error}"))?,
             );
         }
-        let mut bytes = Vec::with_capacity(interleaved.len() * 2);
-        for sample in interleaved {
-            bytes.extend_from_slice(&sample.to_le_bytes());
+        for chunk in interleaved.chunks(4096 * channels) {
+            let bytes: Vec<u8> = chunk
+                .iter()
+                .flat_map(|sample| sample.to_le_bytes())
+                .collect();
+            if self.audio_codec == AudioCodec::DeflatePcm16 {
+                let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+                encoder
+                    .write_all(&bytes)
+                    .map_err(|error| format!("compress q0v audio: {error}"))?;
+                let compressed = encoder
+                    .finish()
+                    .map_err(|error| format!("finish q0v audio block: {error}"))?;
+                write_u32(&mut self.writer, bytes.len() as u32)?;
+                write_u32(&mut self.writer, compressed.len() as u32)?;
+                self.writer
+                    .write_all(&compressed)
+                    .map_err(|error| format!("write q0v audio block: {error}"))?;
+            } else {
+                self.writer
+                    .write_all(&bytes)
+                    .map_err(|error| format!("write q0v audio: {error}"))?;
+            }
         }
-        self.writer
-            .write_all(&bytes)
-            .map_err(|error| format!("write q0v audio: {error}"))?;
         self.audio_samples_per_channel = self
             .audio_samples_per_channel
             .saturating_add((interleaved.len() / channels) as u64);
@@ -362,7 +450,14 @@ impl<W: Write + Seek> Q0vWriter<W> {
         self.writer
             .write_all(&MAGIC)
             .map_err(|error| format!("write q0v magic: {error}"))?;
-        write_u16(&mut self.writer, VERSION)?;
+        write_u16(
+            &mut self.writer,
+            if self.audio_codec == AudioCodec::Pcm16 {
+                1
+            } else {
+                VERSION
+            },
+        )?;
         let flags = if self.spec.video { FLAG_VIDEO } else { 0 }
             | if self.spec.audio { FLAG_AUDIO } else { 0 };
         write_u16(&mut self.writer, flags)?;
@@ -388,7 +483,7 @@ impl<W: Write + Seek> Q0vWriter<W> {
             },
         )?;
         write_u16(&mut self.writer, if self.spec.audio { 16 } else { 0 })?;
-        write_u32(&mut self.writer, 0)?;
+        write_u32(&mut self.writer, self.audio_codec as u32)?;
         write_u64(&mut self.writer, self.audio_samples_per_channel)?;
         write_u64(&mut self.writer, self.audio_offset.unwrap_or(0))?;
         write_u64(&mut self.writer, index_offset)?;
@@ -413,6 +508,7 @@ struct ParsedQ0vLayout {
     audio_samples_per_channel: u64,
     audio_offset: usize,
     audio_length: usize,
+    audio_codec: AudioCodec,
 }
 
 fn parse_layout(bytes: &[u8]) -> Result<ParsedQ0vLayout, String> {
@@ -423,7 +519,7 @@ fn parse_layout(bytes: &[u8]) -> Result<ParsedQ0vLayout, String> {
         return Err("q0v magic is invalid".to_string());
     }
     let version = read_u16(bytes, 4)?;
-    if version != VERSION {
+    if !(1..=VERSION).contains(&version) {
         return Err(format!("unsupported q0v version {version}"));
     }
     let flags = read_u16(bytes, 6)?;
@@ -443,12 +539,18 @@ fn parse_layout(bytes: &[u8]) -> Result<ParsedQ0vLayout, String> {
         audio_channels: read_u16(bytes, 32)?,
     };
     spec.validate()?;
+    let codec = audio_codec(bytes)?;
     let video_frames = read_u32(bytes, 24)?;
     let audio_bits = read_u16(bytes, 34)?;
     if audio && audio_bits != 16 {
         return Err("q0v audio must be signed 16-bit pcm".to_string());
     }
-    if !audio && (spec.audio_sample_rate != 0 || spec.audio_channels != 0 || audio_bits != 0) {
+    if !audio
+        && (spec.audio_sample_rate != 0
+            || spec.audio_channels != 0
+            || audio_bits != 0
+            || codec != AudioCodec::Pcm16)
+    {
         return Err("q0v has audio metadata without an audio stream".to_string());
     }
     let audio_samples_per_channel = read_u64(bytes, 40)?;
@@ -475,12 +577,28 @@ fn parse_layout(bytes: &[u8]) -> Result<ParsedQ0vLayout, String> {
         return Err("q0v index bounds or trailing bytes are invalid".to_string());
     }
     let audio_length = if audio {
-        let length = audio_samples_per_channel
+        let pcm_length = audio_samples_per_channel
             .checked_mul(u64::from(spec.audio_channels))
             .and_then(|samples| samples.checked_mul(2))
             .ok_or_else(|| "q0v audio length overflows".to_string())?;
-        if audio_offset < HEADER_SIZE || audio_offset.saturating_add(length) != index_offset {
+        if audio_offset < HEADER_SIZE || audio_offset > index_offset {
             return Err("q0v audio payload bounds are invalid".to_string());
+        }
+        let length = index_offset - audio_offset;
+        if codec == AudioCodec::Pcm16 && length != pcm_length {
+            return Err("q0v PCM payload length is invalid".into());
+        }
+        if codec != AudioCodec::Pcm16 && pcm_length > crate::audio::MAX_DECODED_AUDIO_BYTES as u64 {
+            return Err("decoded q0v audio exceeds the 240 MiB media limit".into());
+        }
+        if codec == AudioCodec::DeflatePcm16 {
+            validate_audio_blocks(
+                &bytes[audio_offset as usize..index_offset as usize],
+                pcm_length,
+                spec.audio_channels,
+            )?;
+        } else if codec == AudioCodec::Source && length == 0 {
+            return Err("q0v encoded audio is empty".into());
         }
         length
     } else {
@@ -519,6 +637,7 @@ fn parse_layout(bytes: &[u8]) -> Result<ParsedQ0vLayout, String> {
         audio_samples_per_channel,
         audio_offset: audio_offset as usize,
         audio_length: audio_length as usize,
+        audio_codec: codec,
     })
 }
 
@@ -528,16 +647,32 @@ pub fn validate_bytes(bytes: &[u8]) -> Result<(), String> {
     parse_layout(bytes).map(|_| ())
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
+enum PcmBytes<'a> {
+    Borrowed(&'a [u8]),
+    Decoded(Arc<Vec<u8>>),
+}
+
+#[derive(Debug, Clone)]
 pub struct Q0vAudioView<'a> {
     pub spec: Q0vSpec,
     pub samples_per_channel: u64,
-    pcm_le_bytes: &'a [u8],
+    pcm_le_bytes: PcmBytes<'a>,
 }
 
 impl<'a> Q0vAudioView<'a> {
-    pub fn pcm_le_bytes(self) -> &'a [u8] {
-        self.pcm_le_bytes
+    pub fn pcm_le_bytes(&self) -> &[u8] {
+        match &self.pcm_le_bytes {
+            PcmBytes::Borrowed(bytes) => bytes,
+            PcmBytes::Decoded(bytes) => bytes,
+        }
+    }
+
+    pub fn decoded_pcm(&self) -> Option<Arc<Vec<u8>>> {
+        match &self.pcm_le_bytes {
+            PcmBytes::Borrowed(_) => None,
+            PcmBytes::Decoded(bytes) => Some(Arc::clone(bytes)),
+        }
     }
 }
 
@@ -555,8 +690,113 @@ pub fn audio_view(bytes: &[u8]) -> Result<Q0vAudioView<'_>, String> {
     Ok(Q0vAudioView {
         spec: layout.spec,
         samples_per_channel: layout.audio_samples_per_channel,
-        pcm_le_bytes: &bytes[layout.audio_offset..end],
+        pcm_le_bytes: if layout.audio_codec == AudioCodec::Pcm16 {
+            PcmBytes::Borrowed(&bytes[layout.audio_offset..end])
+        } else {
+            PcmBytes::Decoded(Arc::new(decode_audio_payload(bytes, &layout)?))
+        },
     })
+}
+
+type AudioCache = HashMap<usize, (std::sync::Weak<Vec<u8>>, Arc<Vec<u8>>)>;
+thread_local! {
+    static AUDIO_CACHE: std::cell::RefCell<AudioCache> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// Decode an immutable asset once on the calling worker; discard it when the
+/// source is no longer owned by a project. Repeated mixer chunks share the PCM.
+pub fn audio_view_shared(bytes: &Arc<Vec<u8>>) -> Result<Q0vAudioView<'_>, String> {
+    let layout = parse_layout(bytes)?;
+    if !layout.spec.audio {
+        return Err("q0v has no audio stream".into());
+    }
+    if layout.audio_codec == AudioCodec::Pcm16 {
+        return audio_view(bytes);
+    }
+    let key = Arc::as_ptr(bytes) as usize;
+    let cached = AUDIO_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.retain(|_, (source, _)| source.strong_count() > 0);
+        cache.get(&key).map(|(_, pcm)| Arc::clone(pcm))
+    });
+    let pcm = match cached {
+        Some(pcm) => pcm,
+        None => {
+            let pcm = Arc::new(decode_audio_payload(bytes, &layout)?);
+            AUDIO_CACHE.with(|cache| {
+                cache
+                    .borrow_mut()
+                    .insert(key, (Arc::downgrade(bytes), Arc::clone(&pcm)));
+            });
+            pcm
+        }
+    };
+    Ok(Q0vAudioView {
+        spec: layout.spec,
+        samples_per_channel: layout.audio_samples_per_channel,
+        pcm_le_bytes: PcmBytes::Decoded(pcm),
+    })
+}
+
+fn validate_audio_blocks(mut payload: &[u8], expected: u64, channels: u16) -> Result<(), String> {
+    let mut total = 0_u64;
+    while !payload.is_empty() {
+        let decoded = read_u32(payload, 0)? as usize;
+        let compressed = read_u32(payload, 4)? as usize;
+        if decoded == 0
+            || decoded > 4096 * usize::from(channels) * 2
+            || !decoded.is_multiple_of(usize::from(channels) * 2)
+            || compressed == 0
+        {
+            return Err("invalid q0v compressed audio block".into());
+        }
+        payload = payload
+            .get(8..)
+            .and_then(|data| data.get(compressed..))
+            .ok_or("truncated q0v audio block")?;
+        total = total
+            .checked_add(decoded as u64)
+            .ok_or("q0v audio size overflows")?;
+        if total > expected {
+            return Err("q0v audio blocks exceed the declared duration".into());
+        }
+    }
+    if total != expected {
+        return Err("q0v audio blocks do not cover the declared duration".into());
+    }
+    Ok(())
+}
+
+fn decode_audio_payload(bytes: &[u8], layout: &ParsedQ0vLayout) -> Result<Vec<u8>, String> {
+    let mut payload = &bytes[layout.audio_offset..layout.audio_offset + layout.audio_length];
+    let expected =
+        layout.audio_samples_per_channel as usize * usize::from(layout.spec.audio_channels) * 2;
+    if layout.audio_codec == AudioCodec::Source {
+        let decoded = crate::audio::decode_source(payload)?;
+        if decoded.sample_rate != layout.spec.audio_sample_rate
+            || decoded.channels != layout.spec.audio_channels
+            || decoded.pcm_le_bytes.len() != expected
+        {
+            return Err("embedded audio format or duration disagrees with q0v header".into());
+        }
+        return Ok(decoded.pcm_le_bytes);
+    }
+    let mut pcm = Vec::with_capacity(expected);
+    while !payload.is_empty() {
+        let decoded = read_u32(payload, 0)? as usize;
+        let compressed = read_u32(payload, 4)? as usize;
+        let block = &payload[8..8 + compressed];
+        let before = pcm.len();
+        let mut decoder = ZlibDecoder::new(block).take(decoded as u64 + 1);
+        decoder
+            .read_to_end(&mut pcm)
+            .map_err(|error| format!("decompress q0v audio: {error}"))?;
+        if pcm.len() - before != decoded {
+            return Err("q0v audio block decoded to the wrong size".into());
+        }
+        payload = &payload[8 + compressed..];
+    }
+    Ok(pcm)
 }
 
 #[derive(Debug, Clone)]
@@ -567,6 +807,8 @@ pub struct Q0vFile {
     pub audio_samples_per_channel: u64,
     audio_offset: usize,
     audio_length: usize,
+    audio_codec: AudioCodec,
+    decoded_audio: Arc<OnceLock<Result<Vec<u8>, String>>>,
 }
 
 impl Q0vFile {
@@ -584,6 +826,8 @@ impl Q0vFile {
             audio_samples_per_channel: layout.audio_samples_per_channel,
             audio_offset: layout.audio_offset,
             audio_length: layout.audio_length,
+            audio_codec: layout.audio_codec,
+            decoded_audio: Arc::new(OnceLock::new()),
         })
     }
 
@@ -607,11 +851,25 @@ impl Q0vFile {
         Ok(decoded.into_raw())
     }
 
-    pub fn audio_pcm_le_bytes(&self) -> &[u8] {
+    pub fn audio_pcm_le_bytes(&self) -> Result<&[u8], String> {
         if !self.spec.audio {
-            return &[];
+            return Ok(&[]);
         }
-        &self.bytes[self.audio_offset..self.audio_offset + self.audio_length]
+        if self.audio_codec == AudioCodec::Pcm16 {
+            return Ok(&self.bytes[self.audio_offset..self.audio_offset + self.audio_length]);
+        }
+        self.decoded_audio
+            .get_or_init(|| {
+                let layout = parse_layout(&self.bytes)?;
+                decode_audio_payload(&self.bytes, &layout)
+            })
+            .as_ref()
+            .map(Vec::as_slice)
+            .map_err(Clone::clone)
+    }
+
+    pub fn audio_codec(&self) -> AudioCodec {
+        self.audio_codec
     }
 }
 
@@ -654,6 +912,85 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lossless_audio_blocks_shrink_and_restore_exactly_and_reject_corruption() {
+        let samples: Vec<i16> = (0..48_000)
+            .flat_map(|index| {
+                let value = ((index % 73) as i16 - 36) * 300;
+                [value, -value]
+            })
+            .collect();
+        let spec = Q0vSpec {
+            width: 0,
+            height: 0,
+            fps: 24,
+            timeline_frames: 24,
+            video: false,
+            audio: true,
+            audio_sample_rate: 48_000,
+            audio_channels: 2,
+        };
+        let mut writer = Q0vWriter::new_compressed(std::io::Cursor::new(Vec::new()), spec).unwrap();
+        for chunk in samples.chunks(12_000 * 2) {
+            writer.write_audio_pcm_i16(chunk).unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner();
+        assert!(bytes.len() < samples.len() / 4);
+        let parsed = Q0vFile::parse(bytes.clone()).unwrap();
+        assert_eq!(parsed.audio_codec(), AudioCodec::DeflatePcm16);
+        let restored: Vec<i16> = parsed
+            .audio_pcm_le_bytes()
+            .unwrap()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|raw| i16::from_le_bytes([raw[0], raw[1]]))
+            .collect();
+        assert_eq!(restored, samples);
+        let mut truncated = bytes.clone();
+        truncated[84..88].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(validate_bytes(&truncated).is_err());
+        let mut corrupt = bytes;
+        corrupt[88] ^= 0xff;
+        let parsed = Q0vFile::parse(corrupt).unwrap();
+        assert!(parsed.audio_pcm_le_bytes().is_err());
+    }
+
+    #[test]
+    fn encoded_audio_restores_original_samples_and_rejects_wrong_duration() {
+        for source in [
+            include_bytes!("../tests/fixtures/tone.mp3").as_slice(),
+            include_bytes!("../tests/fixtures/tone.ogg").as_slice(),
+            include_bytes!("../tests/fixtures/tone.flac").as_slice(),
+        ] {
+            let decoded = crate::audio::decode_source(source).unwrap();
+            let samples = decoded.samples_per_channel();
+            let spec = Q0vSpec {
+                width: 0,
+                height: 0,
+                fps: decoded.sample_rate,
+                timeline_frames: samples as u32,
+                video: false,
+                audio: true,
+                audio_sample_rate: decoded.sample_rate,
+                audio_channels: decoded.channels,
+            };
+            let mut writer = Q0vWriter::new(std::io::Cursor::new(Vec::new()), spec).unwrap();
+            writer.write_audio_encoded(source, samples).unwrap();
+            assert!(writer.write_audio_pcm_i16(&[0]).is_err());
+            let bytes = writer.finish().unwrap().into_inner();
+            assert_eq!(bytes.len(), source.len() + HEADER_SIZE as usize);
+            let view = audio_view(&bytes).unwrap();
+            assert_eq!(view.pcm_le_bytes(), decoded.pcm_le_bytes);
+            let parsed = Q0vFile::parse(bytes.clone()).unwrap();
+            assert_eq!(parsed.audio_pcm_le_bytes().unwrap(), decoded.pcm_le_bytes);
+            let mut wrong = bytes;
+            wrong[40..48].copy_from_slice(&(samples + 1).to_le_bytes());
+            let parsed = Q0vFile::parse(wrong).unwrap();
+            assert!(parsed.audio_pcm_le_bytes().is_err());
+        }
+    }
     use image::ImageEncoder;
     use std::io::Cursor;
 
@@ -695,7 +1032,7 @@ mod tests {
         assert_eq!(parsed.frames.len(), 2);
         assert_eq!(parsed.decode_frame_rgba(1).unwrap(), vec![0, 255, 0, 255]);
         assert_eq!(
-            parsed.audio_pcm_le_bytes(),
+            parsed.audio_pcm_le_bytes().unwrap(),
             &[1, 0, 255, 255, 2, 0, 254, 255]
         );
     }

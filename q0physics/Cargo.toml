@@ -11,3 +11,4 @@ description = "Rigid bodies, liquids and particles for q0idmation, shared by q0e
 [dependencies]
 q0s-format = { path = "../q0s-format" }
 rapier2d = "0.36"
+rapier3d = "0.36"

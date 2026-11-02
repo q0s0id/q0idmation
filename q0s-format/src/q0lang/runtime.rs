@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use q0vm::{FunctionBytecode, HostAction, Vm, VmState};
 
+pub use q0vm::{HostQuery, NoHost, DEFAULT_INSTRUCTION_BUDGET};
+
 use super::compiler;
 use super::parser::{Diagnostic, Program};
 
@@ -50,6 +52,17 @@ impl Runtime {
         source: &str,
         instruction_budget: usize,
     ) -> ExecutionReport {
+        self.execute_source_with_host(source, instruction_budget, &mut NoHost)
+    }
+
+    /// Runs `source`, with `host` answering calls such as
+    /// `q0layer.touches(...)` as they come.
+    pub fn execute_source_with_host(
+        &mut self,
+        source: &str,
+        instruction_budget: usize,
+        host: &mut dyn HostQuery,
+    ) -> ExecutionReport {
         let compiled = if let Some(compiled) = self.compiled_source_cache.get(source) {
             Arc::clone(compiled)
         } else {
@@ -62,7 +75,7 @@ impl Runtime {
             }
             compiled
         };
-        self.execute_compiled(&compiled, instruction_budget)
+        self.execute_compiled(&compiled, instruction_budget, host)
     }
 
     pub fn execute_program(&mut self, program: &Program) -> ExecutionReport {
@@ -75,7 +88,7 @@ impl Runtime {
         instruction_budget: usize,
     ) -> ExecutionReport {
         let compiled = compiler::compile(program);
-        self.execute_compiled(&compiled, instruction_budget)
+        self.execute_compiled(&compiled, instruction_budget, &mut NoHost)
     }
 
     pub fn dispatch_event(
@@ -83,6 +96,16 @@ impl Runtime {
         event: &str,
         args: &[RuntimeValue],
         instruction_budget: usize,
+    ) -> ExecutionReport {
+        self.dispatch_event_with_host(event, args, instruction_budget, &mut NoHost)
+    }
+
+    pub fn dispatch_event_with_host(
+        &mut self,
+        event: &str,
+        args: &[RuntimeValue],
+        instruction_budget: usize,
+        host: &mut dyn HostQuery,
     ) -> ExecutionReport {
         let state = VmState {
             vars: std::mem::take(&mut self.vars),
@@ -93,7 +116,7 @@ impl Runtime {
             functions: std::mem::take(&mut self.compiled_functions),
         };
         let mut vm = Vm::with_state(state);
-        let vm_report = vm.dispatch_event(event, args, instruction_budget);
+        let vm_report = vm.dispatch_event_with_host(event, args, instruction_budget, host);
         self.install_vm_state(vm.state);
         self.translate_vm_report(vm_report, Vec::new())
     }
@@ -102,6 +125,7 @@ impl Runtime {
         &mut self,
         compiled: &compiler::CompiledProgram,
         instruction_budget: usize,
+        host: &mut dyn HostQuery,
     ) -> ExecutionReport {
         let report = ExecutionReport {
             actions: Vec::new(),
@@ -121,7 +145,7 @@ impl Runtime {
             functions: std::mem::take(&mut self.compiled_functions),
         };
         let mut vm = Vm::with_state(state);
-        let vm_report = vm.execute(&compiled.chunk, instruction_budget);
+        let vm_report = vm.execute_with_host(&compiled.chunk, instruction_budget, host);
         self.install_vm_state(vm.state);
         self.translate_vm_report(vm_report, report.diagnostics)
     }
@@ -170,6 +194,12 @@ impl Runtime {
                 }
                 HostAction::LightCommand { command, args } => {
                     emit_light_command(&command, &args, &mut report);
+                }
+                HostAction::LayerCommand { command, args } => {
+                    emit_layer_command(&command, &args, &mut report);
+                }
+                HostAction::WindowCommand { command, args } => {
+                    emit_window_command(&command, &args, &mut report);
                 }
             }
         }
@@ -355,6 +385,149 @@ fn emit_light_command(command: &str, args: &[RuntimeValue], report: &mut Executi
     }
 }
 
+/// A layer named in a script: a name, or a row of the editor's timeline
+/// counted from the top.
+pub fn layer_ref(value: &RuntimeValue) -> Option<LayerRef> {
+    match value {
+        RuntimeValue::Number(row) if row.is_finite() && *row >= 1.0 => {
+            Some(LayerRef::Row(row.min(f64::from(u16::MAX)) as u16))
+        }
+        RuntimeValue::String(name) | RuntimeValue::Ident(name) | RuntimeValue::Raw(name)
+            if !name.is_empty() =>
+        {
+            Some(LayerRef::Name(name.clone()))
+        }
+        _ => None,
+    }
+}
+
+fn emit_layer_command(command: &str, args: &[RuntimeValue], report: &mut ExecutionReport) {
+    let action = match (command, args) {
+        ("hide", [layer]) => layer_ref(layer).map(|layer| LayerCommand::Hide { layer }),
+        ("show", [layer]) => layer_ref(layer).map(|layer| LayerCommand::Show { layer }),
+        ("reset", [layer]) => layer_ref(layer).map(|layer| LayerCommand::Reset { layer }),
+        ("move", [layer, x, y]) => match (layer_ref(layer), finite_number(x), finite_number(y)) {
+            (Some(layer), Some(x), Some(y)) => Some(LayerCommand::Move { layer, x, y }),
+            _ => None,
+        },
+        ("alpha", [layer, value]) => {
+            layer_ref(layer)
+                .zip(finite_number(value))
+                .map(|(layer, value)| LayerCommand::Alpha {
+                    layer,
+                    value: value.clamp(0.0, 1.0),
+                })
+        }
+        ("solid", [layer, thing]) => layer_ref(layer)
+            .zip(runtime_name(thing))
+            .map(|(layer, thing)| LayerCommand::Solid { layer, thing }),
+        ("unsolid", [layer, thing]) => layer_ref(layer)
+            .zip(runtime_name(thing))
+            .map(|(layer, thing)| LayerCommand::Unsolid { layer, thing }),
+        ("hide" | "show" | "reset" | "move" | "alpha" | "solid" | "unsolid", _) => None,
+        _ => {
+            report.diagnostics.push(RuntimeDiagnostic::at_line(
+                0,
+                format!("unknown q0.layer command `q0layer.{command}!`"),
+            ));
+            return;
+        }
+    };
+    match action {
+        Some(action) => report.actions.push(RuntimeAction::Layer(action)),
+        None => {
+            let usage = match command {
+                "move" => "q0layer.move! expects: q0layer.move! layer, x, y",
+                "alpha" => "q0layer.alpha! expects: q0layer.alpha! layer, value (0 to 1)",
+                "solid" => "q0layer.solid! expects: q0layer.solid! layer, instance",
+                "unsolid" => "q0layer.unsolid! expects: q0layer.unsolid! layer, instance",
+                _ => "expects the layer's name, or its row in the timeline counted from the top",
+            };
+            report
+                .diagnostics
+                .push(RuntimeDiagnostic::at_line(0, usage.to_string()));
+        }
+    }
+}
+
+fn switch(value: &RuntimeValue) -> Option<bool> {
+    match value {
+        RuntimeValue::Bool(on) => Some(*on),
+        RuntimeValue::Number(number) if number.is_finite() => Some(*number != 0.0),
+        RuntimeValue::String(word) | RuntimeValue::Ident(word) => {
+            match word.to_ascii_lowercase().as_str() {
+                "on" | "yes" | "true" => Some(true),
+                "off" | "no" | "false" => Some(false),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn emit_window_command(command: &str, args: &[RuntimeValue], report: &mut ExecutionReport) {
+    let action = match (command, args) {
+        ("fullscreen", [on]) => switch(on).map(WindowCommand::Fullscreen),
+        ("fullscreen", []) => Some(WindowCommand::Fullscreen(true)),
+        ("ui", [on]) => switch(on).map(WindowCommand::Ui),
+        ("hotkeys", [on]) => switch(on).map(WindowCommand::Hotkeys),
+        ("top", [on]) => switch(on).map(WindowCommand::OnTop),
+        ("move", [x, y]) => finite_number(x)
+            .zip(finite_number(y))
+            .map(|(x, y)| WindowCommand::Move { x, y }),
+        ("size", [width, height]) => finite_number(width)
+            .zip(finite_number(height))
+            .filter(|(width, height)| *width >= 1.0 && *height >= 1.0)
+            .map(|(width, height)| WindowCommand::Size { width, height }),
+        ("center", []) => Some(WindowCommand::Center),
+        ("title", [text]) => Some(WindowCommand::Title(text.display_lossy())),
+        ("decorations" | "titlebar", [on]) => switch(on).map(WindowCommand::Decorations),
+        ("icon", []) | ("icon", [RuntimeValue::Null]) => Some(WindowCommand::Icon(None)),
+        ("icon", [asset]) if matches!(asset, RuntimeValue::String(_) | RuntimeValue::Ident(_)) => {
+            Some(WindowCommand::Icon(Some(asset.display_lossy())))
+        }
+        ("icon", [RuntimeValue::Number(id)])
+            if id.is_finite() && *id >= 1.0 && *id <= 65535.0 && id.fract() == 0.0 =>
+        {
+            Some(WindowCommand::Icon(Some(format!("{id:.0}"))))
+        }
+        ("minimize", []) => Some(WindowCommand::Minimize),
+        ("perf", []) => Some(WindowCommand::PerformanceLog),
+        ("quit", []) => Some(WindowCommand::Quit),
+        (
+            "fullscreen" | "ui" | "hotkeys" | "top" | "move" | "size" | "center" | "title"
+            | "minimize" | "perf" | "quit" | "icon" | "decorations" | "titlebar",
+            _,
+        ) => None,
+        _ => {
+            report.diagnostics.push(RuntimeDiagnostic::at_line(
+                0,
+                format!("unknown q0.window command `q0window.{command}!`"),
+            ));
+            return;
+        }
+    };
+    match action {
+        Some(action) => report.actions.push(RuntimeAction::Window(action)),
+        None => {
+            let usage = match command {
+                "move" => "q0window.move! expects: q0window.move! x, y",
+                "size" => "q0window.size! expects: q0window.size! width, height",
+                "title" => "q0window.title! expects: q0window.title! text",
+                "icon" => "expects a library bitmap name/id, or null to restore the player icon",
+                "fullscreen" | "ui" | "hotkeys" | "top" | "decorations" | "titlebar" => {
+                    "expects on or off: true, false, \"on\" or \"off\""
+                }
+                _ => "takes no values",
+            };
+            report.diagnostics.push(RuntimeDiagnostic::at_line(
+                0,
+                format!("q0window.{command}! {usage}"),
+            ));
+        }
+    }
+}
+
 fn emit_particles_command(command: &str, args: &[RuntimeValue], report: &mut ExecutionReport) {
     let action = match (command, args) {
         ("start", [name]) => runtime_name(name).map(|emitter| ParticlesCommand::Start { emitter }),
@@ -526,6 +699,92 @@ pub enum RuntimeAction {
     Particles(ParticlesCommand),
     /// Changes the lights while the movie plays (q0.light).
     Light(LightCommand),
+    /// Hides, moves or fades a whole layer, or makes it solid (q0.layer).
+    Layer(LayerCommand),
+    /// Asks q0player's window to change (q0.window).
+    Window(WindowCommand),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum LayerRef {
+    Name(String),
+    /// A row of the editor's timeline, counted from the top, starting at 1.
+    Row(u16),
+}
+
+impl std::fmt::Display for LayerRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Name(name) => write!(f, "{name:?}"),
+            Self::Row(row) => write!(f, "{row}"),
+        }
+    }
+}
+
+/// What a script does to a layer: everything on it, drawn shapes and placed
+/// symbols alike.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LayerCommand {
+    Hide {
+        layer: LayerRef,
+    },
+    Show {
+        layer: LayerRef,
+    },
+    /// Shifts the whole layer this far from where it is drawn, in stage px.
+    Move {
+        layer: LayerRef,
+        x: f64,
+        y: f64,
+    },
+    Alpha {
+        layer: LayerRef,
+        value: f64,
+    },
+    /// Back to the layer as authored.
+    Reset {
+        layer: LayerRef,
+    },
+    /// The named instance cannot move into anything drawn on the layer.
+    Solid {
+        layer: LayerRef,
+        thing: String,
+    },
+    Unsolid {
+        layer: LayerRef,
+        thing: String,
+    },
+}
+
+/// What a script asks of the player's window. Sizes and places are in
+/// screen points.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WindowCommand {
+    /// Fullscreen with only the movie, as F9 does.
+    Fullscreen(bool),
+    /// The menu bar and status line around the movie.
+    Ui(bool),
+    /// Whether F9 and F4 still work.
+    Hotkeys(bool),
+    OnTop(bool),
+    Move {
+        x: f64,
+        y: f64,
+    },
+    Size {
+        width: f64,
+        height: f64,
+    },
+    Center,
+    Title(String),
+    /// Desktop system frame, including the title bar and window buttons.
+    Decorations(bool),
+    /// Library bitmap name/id; None restores the player's own icon.
+    Icon(Option<String>),
+    Minimize,
+    /// Copies the performance log, as F4 does.
+    PerformanceLog,
+    Quit,
 }
 
 /// Lights are named by the name given in the light editor; colours run 0

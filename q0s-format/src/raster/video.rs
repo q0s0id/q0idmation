@@ -96,7 +96,7 @@ impl VideoCache {
                     asset_id: video.asset_id,
                     width,
                     height,
-                    rgba,
+                    rgba: rgba.into(),
                 }),
                 last_used: self.serial,
             });

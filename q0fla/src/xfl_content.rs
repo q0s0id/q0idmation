@@ -52,6 +52,8 @@ struct RawFrame {
     ease_method: Option<String>,
     ease_intensity: f32,
     custom_ease_points: Vec<[f32; 2]>,
+    sound: Option<crate::audio::RawSound>,
+    color_fx: PlacementFx,
     elements: Vec<RawElement>,
 }
 
@@ -480,6 +482,7 @@ pub(crate) fn enrich_project(
     }
 
     imported.project.assets.clear();
+    imported.project.audio_clips.clear();
     imported.project.asset_names.clear();
     imported.project.asset_appearances.clear();
     imported.project.q0rgs.clear();
@@ -561,7 +564,7 @@ pub(crate) fn enrich_project(
                     asset_id,
                     width,
                     height,
-                    rgba,
+                    rgba: rgba.into(),
                 }));
                 let normalized_name = media.name.replace('\\', "/");
                 imported.project.asset_names.insert(
@@ -593,6 +596,13 @@ pub(crate) fn enrich_project(
             )),
         }
     }
+    let sound_assets = crate::audio::import_media(
+        dom_xml,
+        &binary_by_name,
+        &mut imported.project,
+        &mut next_asset_id,
+        &mut imported.report.warnings,
+    )?;
     for (index, scene) in document_scenes.into_iter().enumerate() {
         let scene_id = u16::try_from(index + 1)
             .map_err(|_| ImportError::Invalid("too many fla scenes".to_string()))?;
@@ -607,6 +617,7 @@ pub(crate) fn enrich_project(
             &scene_name,
             &symbol_index,
             &bitmap_asset_ids,
+            &sound_assets,
             &mut imported.project,
             &mut next_asset_id,
             &mut next_q0rg_id,
@@ -636,6 +647,7 @@ pub(crate) fn enrich_project(
             &symbol_name,
             &symbol_index,
             &bitmap_asset_ids,
+            &sound_assets,
             &mut imported.project,
             &mut next_asset_id,
             &mut next_q0rg_id,
@@ -1033,6 +1045,7 @@ fn build_q0rg(
     q0rg_name: &str,
     symbols: &SymbolIndex,
     bitmap_asset_ids: &HashMap<String, u16>,
+    sound_assets: &crate::audio::SoundMap,
     project: &mut ProjectV2,
     next_asset_id: &mut u16,
     next_q0rg_id: &mut u16,
@@ -1238,6 +1251,15 @@ fn build_q0rg(
                 explicit_keyframes.push(0);
             }
         }
+        apply_frame_colors(
+            raw_layer,
+            timeline.frame_count,
+            &mut placements,
+            &explicit_keyframes,
+            project,
+            next_q0rg_id,
+            &mut warnings,
+        )?;
         layers.push(Layer {
             layer_id,
             timeline_frame_count: Some(if raw_layer.kind == LayerKind::Folder {
@@ -1255,6 +1277,57 @@ fn build_q0rg(
             explicit_keyframes,
             placements,
         });
+
+        if raw_layer.kind != LayerKind::Folder
+            && raw_layer.frames.iter().any(|frame| frame.sound.is_some())
+        {
+            // Native sound clips occupy their own layer when Animate mixes
+            // sound and visual elements on the same layer.
+            let audio_layer = if layers
+                .last()
+                .is_some_and(|layer| !layer.placements.is_empty())
+            {
+                let audio_id = u16::try_from(
+                    timeline.layers.len()
+                        + layers
+                            .iter()
+                            .filter(|layer| usize::from(layer.layer_id) > timeline.layers.len())
+                            .count()
+                        + 1,
+                )
+                .map_err(|_| ImportError::Invalid("too many audio layers in fla".into()))?;
+                layers.push(Layer {
+                    layer_id: audio_id,
+                    timeline_frame_count: Some(timeline.frame_count),
+                    name: format!("{} audio", raw_layer.name),
+                    explicit_keyframes: raw_layer
+                        .frames
+                        .iter()
+                        .filter(|frame| frame.sound.is_some())
+                        .map(|frame| frame.index)
+                        .collect(),
+                    placements: Vec::new(),
+                });
+                audio_id
+            } else {
+                layer_id
+            };
+            for frame in &raw_layer.frames {
+                if let Some(sound) = &frame.sound {
+                    crate::audio::append_clip(
+                        sound,
+                        sound_assets,
+                        project,
+                        q0rg_id,
+                        audio_layer,
+                        frame.index,
+                        frame.duration,
+                        timeline.frame_count,
+                        &mut warnings,
+                    );
+                }
+            }
+        }
 
         // A masked layer points at its mask; it sits in the folder its mask
         // sits in.
@@ -1320,6 +1393,89 @@ fn build_q0rg(
         warnings,
         pending_text,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_frame_colors(
+    layer: &RawLayer,
+    frame_count: u16,
+    placements: &mut Vec<Placement>,
+    keyframes: &[u16],
+    project: &mut ProjectV2,
+    next_q0rg_id: &mut u16,
+    warnings: &mut Vec<String>,
+) -> Result<(), ImportError> {
+    let neutral = PlacementFx::default();
+    if layer.frames.iter().all(|frame| frame.color_fx == neutral) {
+        return Ok(());
+    }
+    let direct = layer.frames.iter().all(|frame| {
+        let elements: Vec<_> = placements
+            .iter()
+            .filter(|placement| placement.frame == frame.index)
+            .collect();
+        (elements.len() <= 1 || frame.color_fx.opacity == 1.0)
+            && elements.iter().all(|placement| {
+                PlacementFx {
+                    q0rg_playback: neutral.q0rg_playback,
+                    ..placement.fx
+                } == neutral
+                    && (frame.tween_type == RawTweenType::None || placement.tween.is_motion())
+            })
+    });
+    if direct {
+        for placement in placements {
+            if let Some(frame) = layer
+                .frames
+                .iter()
+                .find(|frame| frame.index == placement.frame)
+            {
+                if frame.color_fx != neutral {
+                    placement.fx.opacity = frame.color_fx.opacity;
+                    placement.fx.tint = frame.color_fx.tint;
+                }
+            }
+        }
+    } else {
+        // A frame effect follows compositing of all its elements. Keep that
+        // order, including their existing tints/filters and tween clocks.
+        let group_id = *next_q0rg_id;
+        *next_q0rg_id = next_q0rg_id
+            .checked_add(1)
+            .ok_or_else(|| ImportError::Invalid("too many frame effect groups in fla".into()))?;
+        project.q0rgs.push(Q0rg {
+            q0rg_id: group_id,
+            name: format!("{} frame color", layer.name),
+            frame_count,
+            script: String::new(),
+            layers: vec![Layer {
+                layer_id: 1,
+                name: layer.name.clone(),
+                timeline_frame_count: None,
+                explicit_keyframes: keyframes.to_vec(),
+                placements: std::mem::take(placements),
+            }],
+        });
+        for (index, frame) in layer.frames.iter().enumerate() {
+            let tween = import_frame_tween(
+                frame,
+                layer.frames.get(index + 1).map(|next| next.index),
+                &layer.name,
+                &layer.name,
+                warnings,
+            );
+            placements.push(Placement {
+                pivot: None,
+                instance_id: 0,
+                frame: frame.index,
+                target: Target::Q0rg(group_id),
+                transform: Transform2D::IDENTITY,
+                tween,
+                fx: frame.color_fx,
+            });
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn shape_assets(
@@ -2108,6 +2264,7 @@ fn parse_timeline_index(
     let mut current_layer: Option<(usize, RawLayer)> = None;
     let mut current_frame: Option<(usize, RawFrame)> = None;
     let mut custom_ease_depth: Option<usize> = None;
+    let mut frame_color_depth: Option<usize> = None;
     let mut instance: Option<InstanceState> = None;
     let mut bitmap: Option<BitmapState> = None;
     let mut shape: Option<ShapeState> = None;
@@ -2151,6 +2308,8 @@ fn parse_timeline_index(
                             max_frame_end.max(u32::from(frame.index) + u32::from(frame.duration));
                     }
                     current_frame = Some((depth, frame));
+                } else if current_frame.is_some() && name == b"frameColor" {
+                    frame_color_depth = Some(depth);
                 } else if current_frame.is_some() && name == b"CustomEase" {
                     custom_ease_depth = Some(depth);
                 } else if current_frame.is_some() && name == b"Ease" {
@@ -2234,6 +2393,14 @@ fn parse_timeline_index(
                 if let Some(state) = instance.as_mut() {
                     apply_instance_filter(&reader, &element, name, state, &mut unsupported)?;
                 }
+                read_frame_color_or_sound(
+                    &reader,
+                    &element,
+                    name,
+                    frame_color_depth.is_some(),
+                    &mut current_frame,
+                    &mut instance,
+                )?;
                 handle_shape_start(&reader, &element, depth, &mut shape, &mut unsupported)?;
             }
             Event::Empty(element) => {
@@ -2243,6 +2410,14 @@ fn parse_timeline_index(
                 if let Some(state) = instance.as_mut() {
                     apply_instance_filter(&reader, &element, name, state, &mut unsupported)?;
                 }
+                read_frame_color_or_sound(
+                    &reader,
+                    &element,
+                    name,
+                    frame_color_depth.is_some(),
+                    &mut current_frame,
+                    &mut instance,
+                )?;
                 if current_layer.is_some() && name == b"DOMFrame" && current_frame.is_none() {
                     let frame = raw_frame(&reader, &element)?;
                     if current_layer
@@ -2281,57 +2456,6 @@ fn parse_timeline_index(
                             parse_f32_attr(&reader, &element, b"x", 0.0)?,
                             parse_f32_attr(&reader, &element, b"y", 0.0)?,
                         ]);
-                    }
-                } else if name == b"Color" && instance.is_some() {
-                    if let Some(state) = instance.as_mut() {
-                        if let Some(alpha) = attr(&reader, &element, b"alphaMultiplier")? {
-                            let alpha = alpha.parse::<f32>().map_err(|_| {
-                                ImportError::Invalid(format!("invalid alphaMultiplier '{alpha}'"))
-                            })?;
-                            state.instance.opacity = alpha.clamp(0.0, 1.0);
-                        }
-                        if let Some(amount) = attr(&reader, &element, b"tintMultiplier")? {
-                            let amount = amount.parse::<f32>().map_err(|_| {
-                                ImportError::Invalid(format!("invalid tintMultiplier '{amount}'"))
-                            })?;
-                            if !amount.is_finite() {
-                                return Err(ImportError::Invalid(
-                                    "non-finite tintMultiplier".to_string(),
-                                ));
-                            }
-                            let color = attr(&reader, &element, b"tintColor")?
-                                .map(|value| parse_hex_color(&value))
-                                .transpose()?
-                                .unwrap_or(Rgba {
-                                    r: 0,
-                                    g: 0,
-                                    b: 0,
-                                    a: 255,
-                                });
-                            state.instance.tint = Some(q0s_format::v2::TintFx {
-                                color,
-                                amount: amount.clamp(0.0, 1.0),
-                            });
-                        }
-                        if let Some(brightness) = attr(&reader, &element, b"brightness")? {
-                            let brightness = brightness.parse::<f32>().map_err(|_| {
-                                ImportError::Invalid(format!("invalid brightness '{brightness}'"))
-                            })?;
-                            // Brightness blends toward white when above zero
-                            // and toward black below it, exactly like a tint.
-                            if brightness.is_finite() && brightness != 0.0 {
-                                let level = if brightness > 0.0 { 255 } else { 0 };
-                                state.instance.tint = Some(q0s_format::v2::TintFx {
-                                    color: Rgba {
-                                        r: level,
-                                        g: level,
-                                        b: level,
-                                        a: 255,
-                                    },
-                                    amount: brightness.abs().clamp(0.0, 1.0),
-                                });
-                            }
-                        }
                     }
                 } else if name == b"DOMTextAttrs" {
                     if let Some(state) = text.as_mut() {
@@ -2412,7 +2536,9 @@ fn parse_timeline_index(
             Event::End(element) => {
                 let name_buf = element.name();
                 let name = name_buf.as_ref();
-                if name == b"CustomEase" && custom_ease_depth == Some(depth) {
+                if name == b"frameColor" && frame_color_depth == Some(depth) {
+                    frame_color_depth = None;
+                } else if name == b"CustomEase" && custom_ease_depth == Some(depth) {
                     custom_ease_depth = None;
                 } else if name == b"characters"
                     && text
@@ -2571,6 +2697,79 @@ fn parse_timeline_index(
     }))
 }
 
+fn read_frame_color_or_sound(
+    reader: &Reader<&[u8]>,
+    element: &BytesStart<'_>,
+    name: &[u8],
+    frame_color: bool,
+    frame: &mut Option<(usize, RawFrame)>,
+    instance: &mut Option<InstanceState>,
+) -> Result<(), ImportError> {
+    if name == b"SoundEnvelopePoint" {
+        if let Some(sound) = frame.as_mut().and_then(|(_, frame)| frame.sound.as_mut()) {
+            sound.envelope_point(reader, element)?;
+        }
+    } else if name == b"Color" {
+        if frame_color {
+            if let Some((_, frame)) = frame.as_mut() {
+                read_color_effect(reader, element, &mut frame.color_fx)?;
+            }
+        } else if let Some(state) = instance.as_mut() {
+            let mut fx = PlacementFx {
+                opacity: state.instance.opacity,
+                tint: state.instance.tint,
+                ..PlacementFx::default()
+            };
+            read_color_effect(reader, element, &mut fx)?;
+            state.instance.opacity = fx.opacity;
+            state.instance.tint = fx.tint;
+        }
+    }
+    Ok(())
+}
+
+fn read_color_effect(
+    reader: &Reader<&[u8]>,
+    element: &BytesStart<'_>,
+    fx: &mut PlacementFx,
+) -> Result<(), ImportError> {
+    if attr(reader, element, b"alphaMultiplier")?.is_some() {
+        fx.opacity = parse_f32_attr(reader, element, b"alphaMultiplier", 1.0)?.clamp(0.0, 1.0);
+    }
+    if attr(reader, element, b"tintMultiplier")?.is_some() {
+        let amount = parse_f32_attr(reader, element, b"tintMultiplier", 0.0)?;
+        let color = attr(reader, element, b"tintColor")?
+            .map(|value| parse_hex_color(&value))
+            .transpose()?
+            .unwrap_or(Rgba {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255,
+            });
+        fx.tint = Some(q0s_format::v2::TintFx {
+            color,
+            amount: amount.clamp(0.0, 1.0),
+        });
+    }
+    if attr(reader, element, b"brightness")?.is_some() {
+        let brightness = parse_f32_attr(reader, element, b"brightness", 0.0)?;
+        if brightness != 0.0 {
+            let level = if brightness > 0.0 { 255 } else { 0 };
+            fx.tint = Some(q0s_format::v2::TintFx {
+                color: Rgba {
+                    r: level,
+                    g: level,
+                    b: level,
+                    a: 255,
+                },
+                amount: brightness.abs().clamp(0.0, 1.0),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn note_unsupported_frame_element(
     name: &[u8],
     inside_frame: bool,
@@ -2651,6 +2850,8 @@ fn raw_frame(reader: &Reader<&[u8]>, element: &BytesStart<'_>) -> Result<RawFram
         ease_method: attr(reader, element, b"easeMethodName")?,
         ease_intensity: parse_f32_attr(reader, element, b"tweenEasing", 0.0)?,
         custom_ease_points: Vec::new(),
+        sound: crate::audio::RawSound::read(reader, element)?,
+        color_fx: PlacementFx::default(),
         elements: Vec::new(),
     })
 }
@@ -2758,7 +2959,9 @@ pub(crate) fn decode_lossless_bitmap_dat(bytes: &[u8]) -> Result<(u16, u16, Vec<
             .filter(|end| *end <= bytes.len())
             .ok_or_else(|| ImportError::Invalid("truncated lossless bitmap palette".to_string()))?;
         let palette = bytes[28..palette_end]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|rgba| {
                 [
                     rgba[0],
@@ -2871,7 +3074,7 @@ fn decode_jpeg(bytes: &[u8]) -> Result<(u16, u16, Vec<u8>), ImportError> {
     let mut rgba = Vec::with_capacity(count * 4);
     match info.pixel_format {
         jpeg_decoder::PixelFormat::RGB24 => {
-            for pixel in pixels.chunks_exact(3).take(count) {
+            for pixel in pixels.as_chunks::<3>().0.iter().take(count) {
                 rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
             }
         }
@@ -2881,12 +3084,12 @@ fn decode_jpeg(bytes: &[u8]) -> Result<(u16, u16, Vec<u8>), ImportError> {
             }
         }
         jpeg_decoder::PixelFormat::L16 => {
-            for value in pixels.chunks_exact(2).take(count) {
+            for value in pixels.as_chunks::<2>().0.iter().take(count) {
                 rgba.extend_from_slice(&[value[0], value[0], value[0], 255]);
             }
         }
         jpeg_decoder::PixelFormat::CMYK32 => {
-            for pixel in pixels.chunks_exact(4).take(count) {
+            for pixel in pixels.as_chunks::<4>().0.iter().take(count) {
                 let k = u16::from(255 - pixel[3]);
                 let channel = |value: u8| ((u16::from(255 - value) * k) / 255) as u8;
                 rgba.extend_from_slice(&[

@@ -1,0 +1,72 @@
+# Ruler: a stage tool that measures.
+plugin "Ruler" {
+  id = "q0s.ruler"
+  version = "1.0.0"
+  author = "q0s"
+  summary = "Measure distances and angles on the stage."
+  color = "#22d3ee"
+}
+
+page ~~~
+# Ruler
+Pick **Plugins > Ruler > Ruler tool**, then drag across the stage.
+The line shows how long it is in stage pixels, and its angle.
+
+- hold **shift** to keep the angle to steps of 15 degrees
+- the last measure stays until you start a new one
+~~~
+
+settings {
+  color tint "Colour" = "#22d3ee"
+  toggle grid "Show a grid while measuring" = false
+  slider spacing "Grid spacing" = 50 from 10 to 200 step 5
+}
+
+start = null
+finish = null
+
+when tool "Ruler" {
+  say! "drag across the stage to measure"
+}
+
+when press x, y {
+  start = {x: x, y: y}
+  finish = start
+}
+
+when drag x, y {
+  finish = {x: x, y: y}
+  if keys.shift() {
+    angle = atan2(y - start.y, x - start.x)
+    snapped = round(angle / 15) * 15
+    length = hypot(x - start.x, y - start.y)
+    finish = {x: start.x + cos(snapped) * length, y: start.y + sin(snapped) * length}
+  }
+}
+
+when release x, y {
+  if start {
+    print! `measured {round(hypot(finish.x - start.x, finish.y - start.y), 1)} px`
+  }
+}
+
+when draw {
+  if config.grid and start {
+    step = config.spacing
+    for gx in 0..round(project.width() / step) {
+      draw.line! gx * step, 0, gx * step, project.height(), "#80808055", 1
+    }
+    for gy in 0..round(project.height() / step) {
+      draw.line! 0, gy * step, project.width(), gy * step, "#80808055", 1
+    }
+  }
+  if not start {
+    return
+  }
+  draw.line! start.x, start.y, finish.x, finish.y, config.tint, 2
+  draw.circle! start.x, start.y, 4, config.tint
+  draw.circle! finish.x, finish.y, 4, config.tint
+  length = round(hypot(finish.x - start.x, finish.y - start.y), 1)
+  angle = round(atan2(finish.y - start.y, finish.x - start.x), 1)
+  draw.text! finish.x + 10, finish.y + 6, `{length} px  {angle}°`, config.tint, 15
+}
