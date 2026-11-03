@@ -3,6 +3,33 @@
 use super::*;
 use egui::{vec2, Align, Color32, Layout, RichText, Stroke, Ui};
 use q0online::{layer_access, library_access, project_access, Access, Grant, Scope};
+use transport::FileTarget;
+
+/// Right-click a line or message to report it to the moderators.
+fn report_menu(response: &egui::Response, out: &mut Out, kind: &'static str, id: i64) {
+    response.context_menu(|ui| {
+        ui.label(RichText::new("Report to the moderators").small().strong());
+        for reason in chat::REPORT_REASONS {
+            if ui.button(reason).clicked() {
+                out.send.push(Command::Report {
+                    kind,
+                    target_id: id.to_string(),
+                    reason,
+                });
+                ui.close_menu();
+            }
+        }
+    });
+}
+/// A picture or video to send; pictures and videos only, as the server takes.
+fn pick_media() -> Option<std::path::PathBuf> {
+    crate::platform::FileDialog::new()
+        .add_filter(
+            "Pictures and videos",
+            &["png", "jpg", "jpeg", "gif", "webp", "mp4", "webm"],
+        )
+        .pick_file()
+}
 
 const ARM_FOR: Duration = Duration::from_millis(4500);
 const ROW_AVATAR: f32 = 26.0;
@@ -1879,21 +1906,63 @@ impl Online {
             } else {
                 self.person(line.user_id).username
             };
+            let mine = Some(line.user_id) == me;
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                ui.label(
-                    RichText::new(format!("{name}:"))
-                        .strong()
-                        .color(chat::name_colour(line.user_id, dark)),
-                )
-                .on_hover_text(ago(now, line.created_at));
-                ui.label(&line.body);
+                let who = ui
+                    .add(
+                        egui::Label::new(
+                            RichText::new(format!("{name}:"))
+                                .strong()
+                                .color(chat::name_colour(line.user_id, dark)),
+                        )
+                        .sense(egui::Sense::click()),
+                    )
+                    .on_hover_text(if mine {
+                        ago(now, line.created_at)
+                    } else {
+                        format!("{} · right-click to report", ago(now, line.created_at))
+                    });
+                if line.removed {
+                    ui.label(
+                        RichText::new("removed by a moderator")
+                            .italics()
+                            .color(pal.dim),
+                    );
+                } else if !line.body.is_empty() {
+                    ui.label(&line.body);
+                }
+                if !mine && !line.removed {
+                    report_menu(&who, out, "room_message", line.id);
+                }
             });
+            if let Some(file) = line.attachment.as_ref().filter(|_| !line.removed) {
+                ui.indent(("room_chat_file", line.id), |ui| {
+                    self.attachment_ui(ui, pal, file);
+                });
+            }
         }
         ui.add_space(6.0);
         one_line(ui, |ui| {
             let ready = chat::room_body(&self.chat.room_draft).is_some();
             let clicked = primary(ui, pal, "Send", ready).clicked();
+            if ui
+                .button("+")
+                .on_hover_text("Send a picture, gif or video")
+                .clicked()
+            {
+                if let (Some(path), Some(room)) =
+                    (pick_media(), self.room.as_ref().map(|r| r.id.clone()))
+                {
+                    let body = chat::room_body(&std::mem::take(&mut self.chat.room_draft))
+                        .unwrap_or_default();
+                    out.send.push(Command::SendFile {
+                        to: FileTarget::Room(room),
+                        path,
+                        body,
+                    });
+                }
+            }
             let edit = ui.add(
                 egui::TextEdit::singleline(&mut self.chat.room_draft)
                     .id_source("online_room_chat_draft")
@@ -1989,7 +2058,11 @@ impl Online {
             let sub = match &conversation.last {
                 _ if conversation.blocked => "blocked".to_owned(),
                 Some(last) => {
-                    let text: String = last.body.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let text: String =
+                        chat::line_text(&last.body, last.attachment.as_ref(), last.removed)
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ");
                     let text: String = text.chars().take(60).collect();
                     format!(
                         "{}{} · {}",
@@ -2077,9 +2150,17 @@ impl Online {
                 let pad = vec2(10.0, 6.0);
                 let font = egui::TextStyle::Body.resolve(ui.style());
                 let wrap = (ui.available_width() * 0.8 - pad.x * 2.0).max(60.0);
-                let galley = ui.fonts(|fonts| fonts.layout(message.body.clone(), font, text, wrap));
+                let shown = if message.removed {
+                    "removed by a moderator".to_owned()
+                } else {
+                    message.body.clone()
+                };
+                if shown.is_empty() {
+                    return;
+                }
+                let galley = ui.fonts(|fonts| fonts.layout(shown, font, text, wrap));
                 let (rect, response) =
-                    ui.allocate_exact_size(galley.size() + pad * 2.0, egui::Sense::hover());
+                    ui.allocate_exact_size(galley.size() + pad * 2.0, egui::Sense::click());
                 let corner = |near: bool| if near { 3.0 } else { 12.0 };
                 let rounding = egui::Rounding {
                     nw: corner(!mine),
@@ -2094,8 +2175,18 @@ impl Online {
                     Stroke::new(1.0_f32, if mine { fill } else { pal.line }),
                 );
                 ui.painter().galley(rect.min + pad, galley, text);
-                response.on_hover_text(ago(now, message.created_at));
+                let response = response.on_hover_text(if mine {
+                    ago(now, message.created_at)
+                } else {
+                    format!("{} · right-click to report", ago(now, message.created_at))
+                });
+                if !mine && !message.removed {
+                    report_menu(&response, out, "direct_message", message.id);
+                }
             });
+            if let Some(file) = message.attachment.as_ref().filter(|_| !message.removed) {
+                ui.with_layout(layout, |ui| self.attachment_ui(ui, pal, file));
+            }
             ui.add_space(3.0);
         }
         ui.add_space(6.0);
@@ -2115,6 +2206,21 @@ impl Online {
             edit.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
         ui.horizontal(|ui| {
             let ready = chat::dm_body(&self.chat.dm_draft).is_some();
+            if ui
+                .button("+")
+                .on_hover_text("Send a picture, gif or video")
+                .clicked()
+            {
+                if let Some(path) = pick_media() {
+                    let body =
+                        chat::dm_body(&std::mem::take(&mut self.chat.dm_draft)).unwrap_or_default();
+                    out.send.push(Command::SendFile {
+                        to: FileTarget::Dm(with),
+                        path,
+                        body,
+                    });
+                }
+            }
             if primary(ui, pal, "Send", ready).clicked() || (entered && ready) {
                 let text = std::mem::take(&mut self.chat.dm_draft);
                 if let Some(body) = chat::dm_body(&text) {
@@ -2129,6 +2235,50 @@ impl Online {
                 self.chat.dm_draft = self.chat.dm_draft.trim_end_matches('\n').to_owned();
             }
         });
+    }
+
+    /// A picture inline (click to see it full size in the browser), or a
+    /// video, which plays in the browser.
+    fn attachment_ui(&mut self, ui: &mut Ui, pal: &Palette, file: &chat::Attachment) {
+        let url = format!("{}/api/v1/attachments/{}", self.server, file.id);
+        let name = if file.name.is_empty() {
+            "file"
+        } else {
+            file.name.as_str()
+        };
+        if file.is_video() {
+            if ui
+                .button(format!("▶ {name}"))
+                .on_hover_text("Plays in your browser")
+                .clicked()
+            {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+            }
+            return;
+        }
+        match self.preview(&file.id) {
+            Some(texture) => {
+                let size = texture.size_vec2();
+                let scale = (240.0 / size.x).min(180.0 / size.y).min(1.0);
+                let response = ui
+                    .add(
+                        egui::Image::new(egui::load::SizedTexture::new(texture.id(), size * scale))
+                            .rounding(4.0)
+                            .sense(egui::Sense::click()),
+                    )
+                    .on_hover_text(format!("{name} · open full size in your browser"));
+                if response.clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                }
+            }
+            None => {
+                ui.label(
+                    RichText::new(format!("picture · {name}"))
+                        .small()
+                        .color(pal.dim),
+                );
+            }
+        }
     }
 
     // --- the room you're in ------------------------------------------------------

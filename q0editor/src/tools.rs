@@ -96,6 +96,11 @@ pub fn handle(
         if response.clicked() || response.drag_started() {
             app.session.status = if !current_layer_is_visible {
                 "layer is hidden"
+            } else if app
+                .online
+                .locally_locked(app.session.current_q0rg_id, app.session.current_layer_id)
+            {
+                "layer is locked"
             } else if q0s_format::v2::layer_is_read_only(
                 app.session.current_q0rg_id,
                 app.session.current_layer_id,
@@ -1774,6 +1779,31 @@ fn placement_ref_world_bounds(
     let mut visual = placement.clone();
     visual.transform = transform;
     placement_bbox(project, &visual)
+}
+
+/// What a layer shows at `frame`, in stage space: (min x, min y, max x, max y).
+pub(crate) fn layer_world_bounds(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    frame: u16,
+) -> Option<(f32, f32, f32, f32)> {
+    let layer = project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)?
+        .layers
+        .iter()
+        .find(|layer| layer.layer_id == layer_id)?;
+    let references: Vec<PlacementRef> = crate::render::active_placements_at(layer, frame)
+        .into_iter()
+        .map(|(placement_idx, _)| PlacementRef {
+            q0rg_id,
+            layer_id,
+            placement_idx,
+        })
+        .collect();
+    placement_refs_world_bounds(project, &references, frame)
 }
 
 fn placement_refs_world_bounds(

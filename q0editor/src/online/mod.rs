@@ -3,6 +3,7 @@
 mod chat;
 #[cfg(test)]
 mod freeze;
+mod presence;
 #[cfg(test)]
 mod shots;
 mod sync;
@@ -12,6 +13,7 @@ use crate::app::{Action, EditorApp};
 use crate::state::{History, ToolState};
 pub(crate) use chat::CANVAS_RECT;
 use egui::Context;
+pub(crate) use presence::{paint_stage_edits, paint_timeline_markers, timeline_people};
 use q0online::{Member, OperationRequest, Presence, ProjectPatch, Rank, RoomEvent, RoomPolicy};
 use q0s_format::v2::ProjectV2;
 use serde::Deserialize;
@@ -240,12 +242,16 @@ pub struct RoomSession {
     rejection: Option<String>,
     /// Layers this participant may not edit, shown and enforced as locked.
     read_only: Option<ReadOnly>,
+    /// Layers you locked yourself. In a room a lock is a view preference
+    /// like outlines: it is never sent, so it never locks anyone else.
+    local_locks: BTreeSet<(u16, u16)>,
 }
 /// The read-only overlay and what it was computed from.
 struct ReadOnly {
     revision: u64,
     member: Option<Member>,
     policy: RoomPolicy,
+    local: BTreeSet<(u16, u16)>,
     layers: Option<std::sync::Arc<std::collections::HashSet<(u16, u16)>>>,
 }
 impl RoomSession {
@@ -260,10 +266,11 @@ impl RoomSession {
             cached.revision == self.revision
                 && cached.member == member
                 && cached.policy == self.policy
+                && cached.local == self.local_locks
         });
         if !fresh {
             let project = &self.confirmed;
-            let locked: std::collections::HashSet<(u16, u16)> = project
+            let mut locked: std::collections::HashSet<(u16, u16)> = project
                 .q0rgs
                 .iter()
                 .flat_map(|q| q.layers.iter().map(move |l| (q.q0rg_id, l.layer_id)))
@@ -273,10 +280,12 @@ impl RoomSession {
                     })
                 })
                 .collect();
+            locked.extend(self.local_locks.iter().copied());
             self.read_only = Some(ReadOnly {
                 revision: self.revision,
                 member: member.clone(),
                 policy: self.policy.clone(),
+                local: self.local_locks.clone(),
                 layers: (!locked.is_empty()).then(|| std::sync::Arc::new(locked)),
             });
         }
@@ -327,6 +336,10 @@ pub struct Online {
     counter: u64,
     view: ui::View,
     chat: chat::Chat,
+    /// What other people changed lately, outlined on the stage.
+    edits: Vec<presence::RemoteEdit>,
+    /// Loads attachment previews into textures as they arrive.
+    preview_ctx: Context,
 }
 /// q0id.com, or a development server named by `Q0EDITOR_ONLINE_SERVER`.
 /// Read once: `tick` builds a default controller on every frame.
@@ -369,12 +382,35 @@ impl Default for Online {
             counter: 0,
             view: ui::View::default(),
             chat: chat::Chat::default(),
+            edits: Vec::new(),
+            preview_ctx: Context::default(),
         }
     }
 }
 impl Online {
     pub fn connected(&self) -> bool {
         self.room.is_some()
+    }
+    /// The lock button in a room tab: locks or unlocks the layer for you
+    /// only. `None` when `tab` is not the room's document.
+    pub(crate) fn toggle_local_lock(
+        &mut self,
+        tab: Option<u64>,
+        q0rg_id: u16,
+        layer_id: u16,
+    ) -> Option<bool> {
+        let room = self.room.as_mut().filter(|room| Some(room.tab_id) == tab)?;
+        let key = (q0rg_id, layer_id);
+        let locked = !room.local_locks.remove(&key);
+        if locked {
+            room.local_locks.insert(key);
+        }
+        Some(locked)
+    }
+    pub(crate) fn locally_locked(&self, q0rg_id: u16, layer_id: u16) -> bool {
+        self.room
+            .as_ref()
+            .is_some_and(|room| room.local_locks.contains(&(q0rg_id, layer_id)))
     }
     pub(crate) fn editing_tab(&self, tab: Option<u64>) -> bool {
         self.room
@@ -525,6 +561,7 @@ impl Online {
         self.connection = None;
         self.view.left_room();
         self.chat.left_room();
+        self.edits.clear();
         self.say(
             "you left the room. its document stays open as a local copy",
             Tone::Info,
@@ -701,6 +738,9 @@ impl Online {
                 self.learn(batch.people.values().cloned());
                 let chat = std::mem::take(&mut batch.chat);
                 self.room_chat_arrived(&room, chat);
+                if self.room.as_ref().is_some_and(|session| session.id == room) {
+                    self.note_remote_edits(&batch.events);
+                }
                 if let Some(session) = self.room.as_mut().filter(|r| r.id == room) {
                     session.members = batch.members;
                     session.invites.retain(|invite| {
@@ -828,7 +868,8 @@ impl Online {
             | Reply::Inbox(_)
             | Reply::Conversations(_)
             | Reply::Thread { .. }
-            | Reply::DmSent(_)) => self.handle_chat(reply),
+            | Reply::DmSent(_)
+            | Reply::Preview { .. }) => self.handle_chat(reply),
         }
     }
 
@@ -866,6 +907,7 @@ impl Online {
                     sync_job: None,
                     rejection: None,
                     read_only: None,
+                    local_locks: BTreeSet::new(),
                 });
                 app.history = History::new();
                 self.recovery = None;
@@ -967,6 +1009,7 @@ pub fn tick(app: &mut EditorApp, ctx: &Context) {
         return;
     }
     let mut online = std::mem::take(&mut app.online);
+    online.preview_ctx = ctx.clone();
     if online
         .room
         .as_ref()
@@ -1429,6 +1472,23 @@ mod tests {
     }
 
     #[test]
+    fn a_lock_in_a_room_is_yours_alone() {
+        let mut app = regression_room_app();
+        regression_tick(&mut app);
+        let (q0rg, layer) = (app.session.current_q0rg_id, app.session.current_layer_id);
+        let before = app.state.project.clone();
+        app.handle(&Context::default(), Action::ToggleLayerLock(q0rg, layer));
+        regression_tick(&mut app);
+        assert_eq!(app.state.project, before, "a room lock is never sent");
+        assert!(app.state.project.layer_is_locked(q0rg, layer));
+        assert!(app.online.locally_locked(q0rg, layer));
+        app.handle(&Context::default(), Action::ToggleLayerLock(q0rg, layer));
+        regression_tick(&mut app);
+        assert!(!app.state.project.layer_is_locked(q0rg, layer));
+        assert_eq!(app.state.project, before);
+    }
+
+    #[test]
     fn playback_keeps_running_while_someone_else_edits() {
         let mut app = regression_room_app();
         let base = app.online.room.as_ref().unwrap().confirmed.clone();
@@ -1471,6 +1531,61 @@ mod tests {
         );
         assert_eq!(app.state.project.assets.len(), theirs.assets.len());
         assert!(app.session.playing, "a remote edit must not stop playback");
+    }
+
+    #[test]
+    fn other_peoples_strokes_are_outlined_and_their_frame_is_marked() {
+        let mut app = regression_room_app();
+        let base = app.online.room.as_ref().unwrap().confirmed.clone();
+        let mut state = q0online::RoomState::new(1, base.clone()).unwrap();
+        state
+            .set_member(
+                1,
+                Member {
+                    user_id: 2,
+                    rank: Rank::Editor,
+                    grants: Vec::new(),
+                    banned: false,
+                },
+            )
+            .unwrap();
+        let request = |id: &str, size| OperationRequest {
+            operation_id: id.into(),
+            base_revision: 0,
+            patch: ProjectPatch::between(&base, &with_stroke(&base, size)).unwrap(),
+        };
+        let theirs = state.submit(2, request("theirs", 5.0)).unwrap();
+        let mine = state.submit(1, request("mine", 7.0)).unwrap();
+        app.online.note_remote_edits(&[theirs.clone(), mine]);
+        assert_eq!(
+            app.online.edits.len(),
+            1,
+            "only someone else's change glows"
+        );
+        assert_eq!(app.online.edits[0].user_id, 2);
+        // the same event arriving again does not count twice
+        app.online.note_remote_edits(&[theirs]);
+        assert_eq!(app.online.edits.len(), 1);
+
+        let room = app.online.room.as_mut().unwrap();
+        let q0rg_id = room.confirmed.meta.entry_q0rg_id;
+        for user_id in [1, 2] {
+            room.presence.push(PresenceRow {
+                user_id,
+                presence: Presence {
+                    q0rg_id: Some(q0rg_id),
+                    layer_id: Some(1),
+                    frame: Some(4),
+                    x: None,
+                    y: None,
+                },
+            });
+        }
+        let tab = Some(room.tab_id);
+        let markers = app.online.markers(tab, q0rg_id);
+        assert_eq!(markers.len(), 1, "you are not marked for yourself");
+        assert_eq!((markers[0].user_id, markers[0].frame), (2, 4));
+        assert!(app.online.markers(Some(9999), q0rg_id).is_empty());
     }
 
     #[test]

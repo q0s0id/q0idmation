@@ -1471,6 +1471,15 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 app.queue(Action::PlaceLibraryDragOnTimeline(payload, layer_id, frame));
             }
 
+            crate::online::paint_timeline_markers(
+                &painter,
+                &app.online.markers(app.active_project_tab_id(), q0rg_id),
+                &layer_ids,
+                frame_base_x,
+                rect.min.y + ROW_H * (camera_row_count as f32 + 1.0),
+                ROW_H,
+                FRAME_W,
+            );
             draw_timeline_selection(
                 &painter,
                 &theme,
@@ -3485,6 +3494,7 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
         {
             app.queue(Action::CreateShapeTween);
         }
+        crate::online::timeline_people(app, ui);
     });
 }
 

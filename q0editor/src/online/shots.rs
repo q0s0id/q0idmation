@@ -371,6 +371,7 @@ fn room(online: &mut Online, app: &mut EditorApp, me: i64) {
         sync_job: None,
         rejection: None,
         read_only: None,
+        local_locks: BTreeSet::new(),
     });
     online.view.joined_room();
 }
@@ -749,6 +750,8 @@ fn chat_pictures() {
         user_id,
         body: body.into(),
         created_at: now - 300 + id * 20,
+        attachment: None,
+        removed: false,
     };
     online.room_chat_arrived(
         &online.room.as_ref().unwrap().id.clone(),
@@ -792,6 +795,8 @@ fn chat_pictures() {
                 to: 1,
                 body: "want to do the fight scene together tomorrow?".into(),
                 created_at: now - 400,
+                attachment: None,
+                removed: false,
             }),
             unread: 2,
             blocked: false,
@@ -804,6 +809,8 @@ fn chat_pictures() {
                 to: 4,
                 body: "thanks for the brush preset!".into(),
                 created_at: now - 90_000,
+                attachment: None,
+                removed: false,
             }),
             unread: 0,
             blocked: false,
@@ -827,6 +834,8 @@ fn chat_pictures() {
         to: if from == 1 { 2 } else { 1 },
         body: body.into(),
         created_at: now - ago,
+        attachment: None,
+        removed: false,
     };
     online.chat.threads.insert(
         2,

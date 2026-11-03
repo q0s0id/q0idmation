@@ -35,6 +35,8 @@ a room is shared, lasting work: nobody leaving, disconnecting or crashing ever c
 
 everyone in a room can talk, viewers included. new lines float over the bottom left of the canvas for a few seconds and fade, like chat in a game, whether or not the Online panel is open. press **/** (change it in **Keyboard shortcuts**: *Chat (online room)*) or click the small **chat** pill to open the input with the recent conversation above it. **Enter** sends, **Esc** closes. the **chat** tab of the panel keeps the full conversation, and q0id.com shows the same chat on the room's page.
 
+send a picture, gif or video with **+** next to the chat or message box (png, jpeg, gif, webp up to 10 MB; mp4 or webm up to 25 MB). pictures show inline; click one to see it full size, videos play in your browser. right-click a line or message to **report** it to the moderators. a line a moderator removed shows as removed.
+
 direct messages show up there too: a line marked **DM** is a message to or from you. in the chat input, `/r text` answers the last person who wrote to you and `/w name text` (or `/msg`, `/dm`) writes to someone directly.
 
 ## messages
@@ -53,6 +55,12 @@ search by username (at least two characters, matched from the start). answer inc
 - the owner assigns ranks and grants, chooses what each rank edits, and closes, reopens or deletes the room.
 
 layers you can't edit show as locked in the timeline and on the stage while the room tab is active, and the stage says why when you try to draw on one. nothing is drawn and then taken back.
+
+in a room, locking a layer and outlining it are yours alone: they change only your view and are never sent, so nobody else's layers lock or turn to outlines. hiding a layer is still shared. a lock that was saved in the document before the room opened unlocks for everyone.
+
+## seeing each other
+
+everyone in the room has a colour, the same on every screen. on the timeline their current frame gets a wash in their colour, and the cell on the layer they are on is filled. their pictures sit at the right of the timeline buttons; hover for where they are, click to jump there. when someone else changes a layer, what changed is outlined on the stage in their colour with their name for a few seconds.
 
 the assignment tree shows your project's own names: each timeline (main timeline first, symbols with their library folder), its layers top-first with timeline folders indented, and library folders by path. ticking a folder covers everything inside it; rows already covered by a ticked folder or by a rank default say so. a library-folder grant gives authority over that folder's symbols and shared artwork, including their existing instances. the server checks every change; the panel only explains.
 

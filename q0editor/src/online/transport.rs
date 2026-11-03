@@ -124,6 +124,27 @@ pub enum Command {
     ReadDm {
         user_id: i64,
     },
+    /// A small picture of an image attachment, for chat and messages.
+    Preview {
+        id: String,
+    },
+    /// Uploads a picture or video, then sends it with `body`.
+    SendFile {
+        to: FileTarget,
+        path: std::path::PathBuf,
+        body: String,
+    },
+    /// Tells the moderators about a chat line or a message.
+    Report {
+        kind: &'static str,
+        target_id: String,
+        reason: &'static str,
+    },
+}
+#[derive(Clone, Debug)]
+pub enum FileTarget {
+    Room(String),
+    Dm(i64),
 }
 impl Command {
     /// Chat never waits behind a room download, an edit or a list refresh.
@@ -135,6 +156,9 @@ impl Command {
                 | Self::Thread { .. }
                 | Self::SendDm { .. }
                 | Self::ReadDm { .. }
+                | Self::Preview { .. }
+                | Self::SendFile { .. }
+                | Self::Report { .. }
         )
     }
     /// Requests the panel shows as pending. Every keyed command answers with
@@ -166,7 +190,10 @@ impl Command {
             | Self::Conversations
             | Self::Thread { .. }
             | Self::SendDm { .. }
-            | Self::ReadDm { .. } => return None,
+            | Self::ReadDm { .. }
+            | Self::Preview { .. }
+            | Self::SendFile { .. }
+            | Self::Report { .. } => return None,
         })
     }
 }
@@ -240,6 +267,10 @@ pub enum Reply {
         value: Value,
     },
     DmSent(Value),
+    Preview {
+        id: String,
+        image: Option<egui::ColorImage>,
+    },
 }
 #[derive(Debug)]
 struct Failure {
@@ -634,6 +665,101 @@ fn start_inbox(
     }
 }
 
+/// A file from the chosen server as bytes, with this editor's credentials.
+fn fetch_bytes(
+    agent: &ureq::Agent,
+    base: &str,
+    creds: &Arc<Mutex<Credentials>>,
+    path: &str,
+    limit: u64,
+) -> Option<Vec<u8>> {
+    let token = creds
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .access
+        .clone();
+    let response = agent
+        .get(&format!("{base}{path}"))
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+        .ok()?;
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= limit).then_some(bytes)
+}
+/// Uploads one file and answers its attachment id.
+fn upload_file(
+    agent: &ureq::Agent,
+    base: &str,
+    creds: &Arc<Mutex<Credentials>>,
+    path: &std::path::Path,
+) -> Result<String, Failure> {
+    let failure = |message: &str| Failure {
+        status: 400,
+        code: "file".into(),
+        message: message.into(),
+    };
+    let size = std::fs::metadata(path)
+        .map_err(|_| failure("that file can't be read"))?
+        .len();
+    if size > MAX_UPLOAD {
+        return Err(failure("files are limited to 25 MB, pictures to 10 MB"));
+    }
+    let bytes = std::fs::read(path).map_err(|_| failure("that file can't be read"))?;
+    let name: String = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_') {
+                char::from(b).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect();
+    let token = creds
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .access
+        .clone();
+    let response = agent
+        .post(&format!("{base}/api/v1/attachments?name={name}"))
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Content-Type", "application/octet-stream")
+        .send_bytes(&bytes);
+    let (status, response) = match response {
+        Ok(r) => (r.status(), r),
+        Err(ureq::Error::Status(s, r)) => (s, r),
+        Err(e) => {
+            return Err(Failure {
+                status: 0,
+                code: "connection".into(),
+                message: e.to_string(),
+            })
+        }
+    };
+    let value: Value = response
+        .into_string()
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or(Value::Null);
+    if status >= 400 {
+        return Err(decode_failure(status, &value));
+    }
+    value["attachment"]["id"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| failure("the server didn't accept the file"))
+}
+const MAX_UPLOAD: u64 = 25 * 1024 * 1024;
+const PREVIEW_SIZE: u32 = 360;
+
 /// Room chat and direct messages, on their own thread.
 fn chat_worker(
     base: String,
@@ -693,6 +819,61 @@ fn chat_worker(
                         Some(json!({})),
                     )?;
                     Ok(None)
+                }
+                Command::Preview { id } => {
+                    let image = id_path(&id).ok().and_then(|id| {
+                        let bytes = fetch_bytes(
+                            &agent,
+                            &base,
+                            &credentials,
+                            &format!("/api/v1/attachments/{id}"),
+                            MAX_UPLOAD,
+                        )?;
+                        let image = image::load_from_memory(&bytes)
+                            .ok()?
+                            .thumbnail(PREVIEW_SIZE, PREVIEW_SIZE)
+                            .to_rgba8();
+                        Some(egui::ColorImage::from_rgba_unmultiplied(
+                            [image.width() as usize, image.height() as usize],
+                            image.as_raw(),
+                        ))
+                    });
+                    Ok(Some(Reply::Preview { id, image }))
+                }
+                Command::SendFile { to, path, body } => {
+                    let attachment = upload_file(&agent, &base, &credentials, &path)?;
+                    let message = json!({"body": body, "attachment_id": attachment});
+                    Ok(Some(match to {
+                        FileTarget::Room(room) => {
+                            let v = call("POST", &room_path(&room, "/chat")?, Some(message))?;
+                            Reply::ChatSent {
+                                room,
+                                message: v["message"].clone(),
+                            }
+                        }
+                        FileTarget::Dm(user_id) => {
+                            let v = call(
+                                "POST",
+                                &format!("/api/v1/messages/{user_id}"),
+                                Some(message),
+                            )?;
+                            Reply::DmSent(v["message"].clone())
+                        }
+                    }))
+                }
+                Command::Report {
+                    kind,
+                    target_id,
+                    reason,
+                } => {
+                    call(
+                        "POST",
+                        "/api/v1/reports",
+                        Some(json!({"kind": kind, "target_id": target_id, "reason": reason})),
+                    )?;
+                    Ok(Some(Reply::Notice(
+                        "reported. a moderator will look at it".into(),
+                    )))
                 }
                 _ => Ok(None),
             })();
@@ -1011,7 +1192,10 @@ impl Transport {
                             | Command::Conversations
                             | Command::Thread { .. }
                             | Command::SendDm { .. }
-                            | Command::ReadDm { .. } => Ok(None),
+                            | Command::ReadDm { .. }
+                            | Command::Preview { .. }
+                            | Command::SendFile { .. }
+                            | Command::Report { .. } => Ok(None),
                             Command::Invite {
                                 room,
                                 user_id,

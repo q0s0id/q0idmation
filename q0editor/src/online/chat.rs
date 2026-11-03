@@ -27,6 +27,53 @@ pub struct ChatMessage {
     pub body: String,
     #[serde(default)]
     pub created_at: i64,
+    #[serde(default)]
+    pub attachment: Option<Attachment>,
+    #[serde(default)]
+    pub removed: bool,
+}
+/// A picture or video sent with a chat line or message.
+#[derive(Clone, Debug, Deserialize)]
+pub struct Attachment {
+    pub id: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub name: String,
+}
+impl Attachment {
+    pub(super) fn is_video(&self) -> bool {
+        self.kind == "video"
+    }
+}
+/// What a line says, for places that show text only.
+pub(super) fn line_text(body: &str, attachment: Option<&Attachment>, removed: bool) -> String {
+    if removed {
+        return "removed by a moderator".into();
+    }
+    match attachment {
+        Some(file) if body.is_empty() => {
+            format!("[{}]", if file.is_video() { "video" } else { "picture" })
+        }
+        Some(file) => format!(
+            "{body} [{}]",
+            if file.is_video() { "video" } else { "picture" }
+        ),
+        None => body.to_owned(),
+    }
+}
+pub(super) const REPORT_REASONS: [&str; 6] = [
+    "spam",
+    "harassment",
+    "sexual content",
+    "violence or threats",
+    "illegal content",
+    "other",
+];
+pub(super) enum Preview {
+    Requested,
+    Ready(egui::TextureHandle),
+    Missing,
 }
 #[derive(Clone, Debug, Deserialize)]
 pub(super) struct DirectMessage {
@@ -37,6 +84,10 @@ pub(super) struct DirectMessage {
     pub(super) body: String,
     #[serde(default)]
     pub(super) created_at: i64,
+    #[serde(default)]
+    pub(super) attachment: Option<Attachment>,
+    #[serde(default)]
+    pub(super) removed: bool,
 }
 impl DirectMessage {
     pub(super) fn other(&self, me: Option<i64>) -> i64 {
@@ -101,6 +152,8 @@ pub(super) struct Chat {
     pub(super) find: String,
     /// The conversation list was asked for and has not arrived yet.
     pub(super) requested: bool,
+    /// Small pictures of image attachments, by attachment id.
+    pub(super) previews: HashMap<String, Preview>,
 }
 
 impl Chat {
@@ -221,8 +274,8 @@ impl Online {
         self.chat.room_primed = true;
         for line in &lines {
             if primed {
-                self.chat
-                    .push(LineKind::Room, line.user_id, line.body.clone());
+                let text = line_text(&line.body, line.attachment.as_ref(), line.removed);
+                self.chat.push(LineKind::Room, line.user_id, text);
             }
         }
         self.chat.room.extend(lines);
@@ -283,7 +336,8 @@ impl Online {
             } else {
                 LineKind::DmOut
             };
-            self.chat.push(kind, other, message.body);
+            let text = line_text(&message.body, message.attachment.as_ref(), message.removed);
+            self.chat.push(kind, other, text);
         }
     }
     pub(super) fn handle_chat(&mut self, reply: Reply) {
@@ -368,6 +422,13 @@ impl Online {
                     self.dm_arrived(message, false);
                 }
             }
+            Reply::Preview { id, image } => {
+                let preview = match image {
+                    Some(image) => Preview::Ready(self.ctx_texture(&id, image)),
+                    None => Preview::Missing,
+                };
+                self.chat.previews.insert(id, preview);
+            }
             _ => {}
         }
     }
@@ -390,6 +451,25 @@ impl Online {
         self.chat.reply_to.get_or_insert(user_id);
         self.send(Command::SendDm { user_id, body });
         true
+    }
+    fn ctx_texture(&self, id: &str, image: egui::ColorImage) -> egui::TextureHandle {
+        self.preview_ctx.load_texture(
+            format!("q0id-attachment-{id}"),
+            image,
+            egui::TextureOptions::LINEAR,
+        )
+    }
+    /// The preview of an image attachment, asking for it the first time.
+    pub(super) fn preview(&mut self, id: &str) -> Option<egui::TextureHandle> {
+        match self.chat.previews.get(id) {
+            Some(Preview::Ready(texture)) => Some(texture.clone()),
+            Some(_) => None,
+            None => {
+                self.chat.previews.insert(id.to_owned(), Preview::Requested);
+                self.send(Command::Preview { id: id.to_owned() });
+                None
+            }
+        }
     }
     pub(super) fn open_thread(&mut self, user_id: i64) {
         self.chat.thread_with = Some(user_id);
@@ -840,12 +920,15 @@ mod tests {
             sync_job: None,
             rejection: None,
             read_only: None,
+            local_locks: BTreeSet::new(),
         });
         let line = |id: i64| ChatMessage {
             id,
             user_id: 2,
             body: format!("line {id}"),
             created_at: 0,
+            attachment: None,
+            removed: false,
         };
         online.room_chat_arrived("room", vec![line(2), line(1)]);
         assert_eq!(
@@ -875,6 +958,8 @@ mod tests {
             to,
             body: "hey".into(),
             created_at: 0,
+            attachment: None,
+            removed: false,
         };
         online.dm_arrived(dm(1, 7, 1), true);
         online.dm_arrived(dm(2, 1, 8), true);

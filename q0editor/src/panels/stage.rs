@@ -837,6 +837,7 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
     }
     crate::tools::draw_brush_size_preview(app, &painter, &view);
     crate::plugins::paint_stage(app, &painter, &view);
+    crate::online::paint_stage_edits(app, &painter, &view);
     if interactive && !editing_text {
         crate::tools3d::view_bar(app, ui, canvas_rect);
     }

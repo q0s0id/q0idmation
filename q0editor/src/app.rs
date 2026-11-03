@@ -4175,6 +4175,22 @@ impl EditorApp {
                     return;
                 }
                 let metadata = self.state.project.layer_metadata(q0rg_id, layer_id);
+                // In a room a lock is yours alone; a lock already saved in
+                // the shared document still unlocks for everyone.
+                if !metadata.locked {
+                    let tab = self.active_project_tab_id();
+                    if let Some(locked) = self.online.toggle_local_lock(tab, q0rg_id, layer_id) {
+                        self.follow_mask_lock(q0rg_id, layer_id, locked);
+                        self.session.selection = Selection::None;
+                        self.session.status = if locked {
+                            "layer locked for you; nobody else in the room is affected"
+                        } else {
+                            "layer unlocked"
+                        }
+                        .to_string();
+                        return;
+                    }
+                }
                 self.history
                     .snapshot_with_session(&self.state.project, &self.session);
                 self.state.project.layer_metadata.insert(
