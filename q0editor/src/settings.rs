@@ -916,6 +916,49 @@ impl PartialEq for PersistFontSize {
 }
 impl Eq for PersistFontSize {}
 
+/// How far the arrow keys move a stage selection, in stage pixels.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NudgeSteps {
+    pub step: f32,
+    /// With Shift held.
+    pub shift_step: f32,
+}
+
+impl NudgeSteps {
+    pub const RANGE: std::ops::RangeInclusive<f32> = 0.01..=500.0;
+
+    fn sanitize(&mut self) {
+        let fallback = Self::default();
+        for (value, default) in [
+            (&mut self.step, fallback.step),
+            (&mut self.shift_step, fallback.shift_step),
+        ] {
+            *value = if value.is_finite() {
+                value.clamp(*Self::RANGE.start(), *Self::RANGE.end())
+            } else {
+                default
+            };
+        }
+    }
+}
+
+impl Default for NudgeSteps {
+    fn default() -> Self {
+        Self {
+            step: 1.0,
+            shift_step: 0.1,
+        }
+    }
+}
+
+impl PartialEq for NudgeSteps {
+    fn eq(&self, other: &Self) -> bool {
+        (self.step - other.step).abs() < 1e-4 && (self.shift_step - other.shift_step).abs() < 1e-4
+    }
+}
+impl Eq for NudgeSteps {}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ColorRgba {
     pub r: u8,
@@ -1245,6 +1288,8 @@ pub struct Settings {
     /// Keyboard shortcut overrides shared by every project.
     #[serde(default)]
     pub hotkeys: HotkeySettings,
+    #[serde(default)]
+    pub nudge: NudgeSteps,
     /// Width of the timeline's layer-name column, independent of project data.
     #[serde(default = "default_timeline_layer_width")]
     pub timeline_layer_width: u16,
@@ -1339,6 +1384,7 @@ impl Default for Settings {
             last_export_directory: None,
             png_sequence_create_subfolder: default_png_sequence_create_subfolder(),
             hotkeys: HotkeySettings::default(),
+            nudge: NudgeSteps::default(),
             timeline_layer_width: default_timeline_layer_width(),
             new_project_width: default_new_project_width(),
             new_project_height: default_new_project_height(),
@@ -1415,6 +1461,7 @@ impl Settings {
         crate::easing::sanitize_library(&mut settings.easing_presets);
         crate::workspace::sanitize_presets(&mut settings.workspace_layout_presets);
         settings.hotkeys.sanitize();
+        settings.nudge.sanitize();
         settings.prune_recent();
         settings
     }

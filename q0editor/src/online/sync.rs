@@ -52,16 +52,20 @@ pub(super) fn calculate(
             if let Some(waiting) = &mut pending {
                 // keep the in-flight edit's view current, so its acknowledgement
                 // is compared against what the server will actually return
-                waiting.sent_project =
-                    q0online::merge_projects(&previous, &waiting.sent_project, &confirmed, true)
-                        .unwrap_or_else(|_| confirmed.clone());
+                waiting.sent_project = q0online::merge_projects_trusted(
+                    &previous,
+                    &waiting.sent_project,
+                    &confirmed,
+                    true,
+                )
+                .unwrap_or_else(|_| confirmed.clone());
             }
             previous
         };
         project = if project == base {
             confirmed.clone()
         } else {
-            match q0online::merge_projects(&base, &project, &confirmed, true) {
+            match q0online::merge_projects_trusted(&base, &project, &confirmed, true) {
                 Ok(merged) => merged,
                 Err(_) => {
                     rejected = Some(project);

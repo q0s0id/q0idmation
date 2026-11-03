@@ -1329,10 +1329,13 @@ fn bitmap_texture(
                 [usize::from(b.width), usize::from(b.height)],
                 &b.rgba,
             );
+            // Bitmaps keep their pixels, as on the editor stage and in
+            // exports: linear filtering blurred every sprite that sat between
+            // whole pixels, so a moving sprite went soft and snapped back.
             ctx.load_texture(
                 format!("q0player_asset_{}", b.asset_id),
                 image,
-                TextureOptions::LINEAR,
+                TextureOptions::NEAREST,
             )
         })
         .clone()

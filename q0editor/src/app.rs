@@ -11942,6 +11942,33 @@ impl EditorApp {
                         self.session.show_shortcuts = true;
                     }
                 });
+                ui.horizontal(|ui| {
+                    let range = crate::settings::NudgeSteps::RANGE;
+                    let nudge = &mut self.settings.nudge;
+                    ui.label("Arrow keys move the selection by");
+                    let mut changed = ui
+                        .add(
+                            egui::DragValue::new(&mut nudge.step)
+                                .speed(0.1)
+                                .clamp_range(range.clone())
+                                .max_decimals(2)
+                                .suffix(" px"),
+                        )
+                        .changed();
+                    ui.label("with Shift");
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut nudge.shift_step)
+                                .speed(0.1)
+                                .clamp_range(range)
+                                .max_decimals(2)
+                                .suffix(" px"),
+                        )
+                        .changed();
+                    if changed {
+                        self.settings.save();
+                    }
+                });
                 ui.add_space(10.0);
                 crate::theme::section_heading(ui, "Display", "Frame presentation and responsiveness");
                 if ui.checkbox(&mut self.settings.vertical_sync, "Vertical sync (VSync)")
@@ -12389,11 +12416,17 @@ impl EditorApp {
             .resizable(true)
             .fit_to_screen(ctx)
             .show(ctx, |ui| {
-                ui.label("Choose a command, then press the key combination you want to use.");
                 ui.label(
-                    egui::RichText::new("Assigning a shortcut moves it from its previous command.")
-                        .small()
-                        .color(self.settings.theme.text_dim.to_color32()),
+                    "A command can have several shortcuts. Add one, then press the keys; \
+                     click a shortcut to remove it.",
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "Keys follow their position, so Ctrl+Z also works as Ctrl+\u{44f} on a \
+                         Russian layout. Adding a shortcut takes it from the command that had it.",
+                    )
+                    .small()
+                    .color(self.settings.theme.text_dim.to_color32()),
                 );
                 ui.horizontal(|ui| {
                     if ui.button("Reset to factory defaults").clicked() {
@@ -12424,36 +12457,76 @@ impl EditorApp {
                             .spacing([12.0, 7.0])
                             .striped(true)
                             .show(ui, |ui| {
+                                let accent = self.settings.theme.accent.to_color32();
+                                let dim = self.settings.theme.text_dim.to_color32();
                                 for command in ShortcutCommand::ALL.iter().copied() {
                                     ui.label(command.label());
-                                    if self.session.shortcut_capture == Some(command) {
-                                        ui.colored_label(
-                                            self.settings.theme.accent.to_color32(),
-                                            "Press a key... (Esc cancels)",
-                                        );
-                                    } else {
-                                        ui.label(self.settings.hotkeys.display(command));
-                                    }
-                                    if self.session.shortcut_capture == Some(command) {
-                                        if ui.small_button("Cancel").clicked() {
-                                            self.session.shortcut_capture = None;
-                                        }
-                                    } else {
-                                        ui.horizontal(|ui| {
-                                            if ui.small_button("Assign").clicked() {
-                                                self.session.shortcut_capture = Some(command);
-                                                self.session.shortcut_feedback = None;
-                                            }
-                                            if ui.small_button("Clear").clicked() {
-                                                self.settings.hotkeys.set(command, Vec::new());
+                                    let capturing = self.session.shortcut_capture == Some(command);
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        let shortcuts = self.settings.hotkeys.shortcuts(command);
+                                        for chord in shortcuts {
+                                            let chip = egui::Button::new(
+                                                egui::RichText::new(chord.display()).monospace(),
+                                            )
+                                            .small()
+                                            .rounding(4.0);
+                                            if ui
+                                                .add(chip)
+                                                .on_hover_text(format!(
+                                                    "Remove {}",
+                                                    chord.display()
+                                                ))
+                                                .clicked()
+                                            {
+                                                self.settings.hotkeys.remove(command, chord);
                                                 self.settings.save();
                                                 self.session.shortcut_feedback = Some(format!(
-                                                    "{} is now unassigned",
-                                                    command.label()
+                                                    "{} no longer uses {}",
+                                                    command.label(),
+                                                    chord.display()
                                                 ));
                                             }
-                                        });
-                                    }
+                                        }
+                                        if capturing {
+                                            ui.colored_label(accent, "Press keys... (Esc cancels)");
+                                        } else if self
+                                            .settings
+                                            .hotkeys
+                                            .shortcuts(command)
+                                            .is_empty()
+                                        {
+                                            ui.colored_label(dim, "Unassigned");
+                                        }
+                                    });
+                                    ui.horizontal(|ui| {
+                                        if capturing {
+                                            if ui.small_button("Cancel").clicked() {
+                                                self.session.shortcut_capture = None;
+                                            }
+                                        } else if ui
+                                            .small_button("Add")
+                                            .on_hover_text("Add another shortcut")
+                                            .clicked()
+                                        {
+                                            self.session.shortcut_capture = Some(command);
+                                            self.session.shortcut_feedback = None;
+                                        }
+                                        if !self.settings.hotkeys.is_default(command)
+                                            && ui
+                                                .small_button("Reset")
+                                                .on_hover_text("Back to the factory shortcuts")
+                                                .clicked()
+                                        {
+                                            self.settings.hotkeys.reset_command(command);
+                                            self.settings.save();
+                                            self.session.shortcut_feedback = Some(format!(
+                                                "{} is back to {}",
+                                                command.label(),
+                                                self.settings.hotkeys.display(command)
+                                            ));
+                                        }
+                                    });
                                     ui.end_row();
                                 }
                             });
@@ -12493,14 +12566,14 @@ impl EditorApp {
                 self.session.shortcut_capture = None;
                 self.session.shortcut_feedback = Some("Shortcut assignment cancelled".into());
             } else if let Some(chord) = ShortcutChord::from_modifiers(key, modifiers) {
-                let moved = self.settings.hotkeys.assign(command, chord);
+                let moved = self.settings.hotkeys.add(command, chord);
                 self.settings.save();
                 self.session.shortcut_capture = None;
                 self.session.shortcut_feedback = Some(if moved.is_empty() {
-                    format!("{} assigned to {}", command.label(), chord.display())
+                    format!("{} now also uses {}", command.label(), chord.display())
                 } else {
                     format!(
-                        "{} assigned to {}; replaced {}",
+                        "{} now also uses {}; taken from {}",
                         command.label(),
                         chord.display(),
                         moved
@@ -14139,7 +14212,10 @@ impl App for EditorApp {
         }
 
         let native_down = crate::system_clipboard::ctrl_v_down();
-        let native_pressed = native_down && !self.native_paste_key_down;
+        // The native poll sees keys pressed in any application. Pasting into
+        // another program must never paste here too, even while a room keeps
+        // this window repainting in the background.
+        let native_pressed = native_down && !self.native_paste_key_down && raw_input.focused;
         self.native_paste_key_down = native_down;
 
         if !self.project_active
@@ -14200,8 +14276,17 @@ impl App for EditorApp {
 
 impl EditorApp {
     fn update_frame(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
-        self.perf
-            .begin_frame_with_backend(ctx, frame.info().cpu_usage);
+        self.update_frame_with(ctx, frame.info().cpu_usage);
+    }
+
+    /// One editor frame without a window, for tests that drive real input.
+    #[cfg(test)]
+    pub(crate) fn update_headless(&mut self, ctx: &Context) {
+        self.update_frame_with(ctx, None);
+    }
+
+    fn update_frame_with(&mut self, ctx: &Context, backend_cpu_seconds: Option<f32>) {
+        self.perf.begin_frame_with_backend(ctx, backend_cpu_seconds);
         let startup_started = Instant::now();
         // First-frame init: install hardcoded base style, then layer the
         // persisted theme on top so user-picked accents survive restart.

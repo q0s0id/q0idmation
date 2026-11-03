@@ -1,5 +1,8 @@
 //! q0editor online controller: account, friends, rooms and document synchronization.
 //! the panel lives in `ui`; transport is replaceable; authorization lives in q0online.
+mod chat;
+#[cfg(test)]
+mod freeze;
 #[cfg(test)]
 mod shots;
 mod sync;
@@ -7,6 +10,7 @@ mod transport;
 mod ui;
 use crate::app::{Action, EditorApp};
 use crate::state::{History, ToolState};
+pub(crate) use chat::CANVAS_RECT;
 use egui::Context;
 use q0online::{Member, OperationRequest, Presence, ProjectPatch, Rank, RoomEvent, RoomPolicy};
 use q0s_format::v2::ProjectV2;
@@ -56,6 +60,9 @@ pub struct EventBatch {
     pub presence: Vec<Value>,
     #[serde(default)]
     pub people: BTreeMap<String, Person>,
+    /// Room chat newer than the poll's cursor; absent from servers without chat.
+    #[serde(default)]
+    pub chat: Vec<chat::ChatMessage>,
 }
 /// Where another participant is looking. Presence is transient and never saved.
 #[derive(Clone, Debug, Deserialize)]
@@ -319,6 +326,7 @@ pub struct Online {
     follow: Option<Follow>,
     counter: u64,
     view: ui::View,
+    chat: chat::Chat,
 }
 /// q0id.com, or a development server named by `Q0EDITOR_ONLINE_SERVER`.
 /// Read once: `tick` builds a default controller on every frame.
@@ -360,6 +368,7 @@ impl Default for Online {
             follow: None,
             counter: 0,
             view: ui::View::default(),
+            chat: chat::Chat::default(),
         }
     }
 }
@@ -515,6 +524,7 @@ impl Online {
         self.follow = None;
         self.connection = None;
         self.view.left_room();
+        self.chat.left_room();
         self.say(
             "you left the room. its document stays open as a local copy",
             Tone::Info,
@@ -535,6 +545,7 @@ impl Online {
         self.lists_at = None;
         self.busy.clear();
         self.view = ui::View::default();
+        self.chat = chat::Chat::default();
         self.say(message, tone);
     }
     fn refresh(&mut self) {
@@ -686,8 +697,10 @@ impl Online {
                     }
                 }
             }
-            Reply::Events { room, batch } => {
+            Reply::Events { room, mut batch } => {
                 self.learn(batch.people.values().cloned());
+                let chat = std::mem::take(&mut batch.chat);
+                self.room_chat_arrived(&room, chat);
                 if let Some(session) = self.room.as_mut().filter(|r| r.id == room) {
                     session.members = batch.members;
                     session.invites.retain(|invite| {
@@ -748,6 +761,7 @@ impl Online {
                     self.pending_resync = None;
                     self.connection = None;
                     self.view.left_room();
+                    self.chat.left_room();
                     self.send(Command::LeaveRoom);
                     if let Some(notice) = &mut self.notice {
                         notice.text.push_str(
@@ -809,6 +823,12 @@ impl Online {
             Reply::Finished(key) => {
                 self.busy.remove(&key);
             }
+            reply @ (Reply::ChatSent { .. }
+            | Reply::ChatFailed(_)
+            | Reply::Inbox(_)
+            | Reply::Conversations(_)
+            | Reply::Thread { .. }
+            | Reply::DmSent(_)) => self.handle_chat(reply),
         }
     }
 
@@ -955,6 +975,7 @@ pub fn tick(app: &mut EditorApp, ctx: &Context) {
         online.leave();
     }
     online.show_panel(app, ctx);
+    online.show_overlay(app, ctx);
     let mut replies = Vec::new();
     if let Some(transport) = &online.transport {
         while let Ok(reply) = transport.rx.try_recv() {
@@ -1187,8 +1208,12 @@ fn replace_project(app: &mut EditorApp, project: ProjectV2) {
         return;
     }
     let before = std::mem::replace(&mut app.state.project, project);
+    // Reconciliation is built for undo, which stops playback. Someone else's
+    // edit must not: keep playing while the room updates underneath.
+    let playing = app.session.playing;
     app.session
         .reconcile_after_history(&before, &app.state.project);
+    app.session.playing = playing;
     let old_assets: HashMap<_, _> = before
         .assets
         .iter()
@@ -1401,6 +1426,51 @@ mod tests {
             !app.state.project.layer_is_locked(q0rg, layer),
             "another document never inherits the room's locks"
         );
+    }
+
+    #[test]
+    fn playback_keeps_running_while_someone_else_edits() {
+        let mut app = regression_room_app();
+        let base = app.online.room.as_ref().unwrap().confirmed.clone();
+        let mut state = q0online::RoomState::new(1, base.clone()).unwrap();
+        state
+            .set_member(
+                1,
+                Member {
+                    user_id: 2,
+                    rank: Rank::Editor,
+                    grants: Vec::new(),
+                    banned: false,
+                },
+            )
+            .unwrap();
+        let theirs = with_stroke(&base, 5.0);
+        let event = state
+            .submit(
+                2,
+                OperationRequest {
+                    operation_id: "theirs".into(),
+                    base_revision: 0,
+                    patch: ProjectPatch::between(&base, &theirs).unwrap(),
+                },
+            )
+            .unwrap();
+        app.online.room.as_mut().unwrap().events.insert(1, event);
+        app.session.playing = true;
+        for _ in 0..200 {
+            regression_tick(&mut app);
+            if app.online.room.as_ref().unwrap().revision == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            app.online.room.as_ref().unwrap().revision,
+            1,
+            "the edit arrived"
+        );
+        assert_eq!(app.state.project.assets.len(), theirs.assets.len());
+        assert!(app.session.playing, "a remote edit must not stop playback");
     }
 
     #[test]

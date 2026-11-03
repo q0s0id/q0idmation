@@ -22,6 +22,29 @@ pub fn merge_projects(
     theirs: &ProjectV2,
     renumber: bool,
 ) -> Result<ProjectV2> {
+    merge(base, ours, theirs, renumber, true)
+}
+
+/// `merge_projects` for clients carrying their own work across server events.
+/// The structure is still validated, but not the whole-document serialization
+/// round trip: the server performs that on everything it accepts, and on a
+/// large project it is the expensive part.
+pub fn merge_projects_trusted(
+    base: &ProjectV2,
+    ours: &ProjectV2,
+    theirs: &ProjectV2,
+    renumber: bool,
+) -> Result<ProjectV2> {
+    merge(base, ours, theirs, renumber, false)
+}
+
+fn merge(
+    base: &ProjectV2,
+    ours: &ProjectV2,
+    theirs: &ProjectV2,
+    renumber: bool,
+    full: bool,
+) -> Result<ProjectV2> {
     let renumbered = if renumber {
         renumber_created(base, ours, theirs)
     } else {
@@ -40,7 +63,12 @@ pub fn merge_projects(
     }
     merge_order(&mut merged, &b, &o, &t)?;
     let project = project_from_entities(&merged).map_err(|e| unmergeable(e.message))?;
-    validate_project(&project).map_err(|e| match e.code {
+    let checked = if full {
+        validate_project(&project)
+    } else {
+        v2::validate(&project).map_err(|e| error(ErrorCode::InvalidProject, e.to_string()))
+    };
+    checked.map_err(|e| match e.code {
         ErrorCode::TooLarge => e,
         _ => unmergeable(e.message),
     })?;

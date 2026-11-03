@@ -65,6 +65,7 @@ pub enum ShortcutCommand {
     ToolEyedropper,
     ToolText,
     ToolRig,
+    OpenChat,
 }
 
 impl ShortcutCommand {
@@ -128,6 +129,7 @@ impl ShortcutCommand {
         Self::ToolEyedropper,
         Self::ToolText,
         Self::ToolRig,
+        Self::OpenChat,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -191,6 +193,7 @@ impl ShortcutCommand {
             Self::ToolEyedropper => "Eyedropper tool",
             Self::ToolText => "Text tool",
             Self::ToolRig => "Rig tool",
+            Self::OpenChat => "Chat (online room)",
         }
     }
 
@@ -260,6 +263,7 @@ impl ShortcutCommand {
             C::ToolEyedropper => vec![ShortcutChord::key(K::I)],
             C::ToolText => vec![ShortcutChord::key(K::T)],
             C::ToolRig => vec![ShortcutChord::key(K::G)],
+            C::OpenChat => vec![ShortcutChord::key(K::Slash)],
         }
     }
 
@@ -294,6 +298,7 @@ pub enum ShortcutKey {
     Minus,
     Plus,
     Equals,
+    Slash,
     Num0,
     Num1,
     Num2,
@@ -365,6 +370,7 @@ impl ShortcutKey {
             Key::Minus => Self::Minus,
             Key::Plus => Self::Plus,
             Key::Equals => Self::Equals,
+            Key::Slash => Self::Slash,
             Key::Num0 => Self::Num0,
             Key::Num1 => Self::Num1,
             Key::Num2 => Self::Num2,
@@ -437,6 +443,7 @@ impl ShortcutKey {
             Self::Minus => Key::Minus,
             Self::Plus => Key::Plus,
             Self::Equals => Key::Equals,
+            Self::Slash => Key::Slash,
             Self::Num0 => Key::Num0,
             Self::Num1 => Key::Num1,
             Self::Num2 => Key::Num2,
@@ -508,6 +515,7 @@ impl ShortcutKey {
             Self::Minus => "-",
             Self::Plus => "+",
             Self::Equals => "=",
+            Self::Slash => "/",
             Self::Num0 => "0",
             Self::Num1 => "1",
             Self::Num2 => "2",
@@ -731,6 +739,49 @@ impl HotkeySettings {
         moved
     }
 
+    /// Adds a chord next to the command's existing ones, moving it away from
+    /// any other command that used it.
+    pub fn add(
+        &mut self,
+        command: ShortcutCommand,
+        shortcut: ShortcutChord,
+    ) -> Vec<ShortcutCommand> {
+        let mut shortcuts = self.shortcuts(command);
+        let moved = self.assign(command, shortcut);
+        if !shortcuts.contains(&shortcut) {
+            shortcuts.push(shortcut);
+        }
+        self.set(command, shortcuts);
+        moved
+    }
+
+    pub fn remove(&mut self, command: ShortcutCommand, shortcut: ShortcutChord) {
+        let mut shortcuts = self.shortcuts(command);
+        shortcuts.retain(|existing| *existing != shortcut);
+        self.set(command, shortcuts);
+    }
+
+    /// Back to the factory chords for one command. Chords other commands took
+    /// in the meantime stay with them.
+    pub fn reset_command(&mut self, command: ShortcutCommand) {
+        self.overrides.retain(|binding| binding.command != command);
+        let taken = ShortcutCommand::ALL
+            .iter()
+            .copied()
+            .filter(|other| *other != command)
+            .flat_map(|other| self.shortcuts(other))
+            .collect::<Vec<_>>();
+        let mut shortcuts = command.default_shortcuts();
+        if shortcuts.iter().any(|chord| taken.contains(chord)) {
+            shortcuts.retain(|chord| !taken.contains(chord));
+            self.set(command, shortcuts);
+        }
+    }
+
+    pub fn is_default(&self, command: ShortcutCommand) -> bool {
+        self.shortcuts(command) == command.default_shortcuts()
+    }
+
     pub fn set(&mut self, command: ShortcutCommand, shortcuts: Vec<ShortcutChord>) {
         if let Some(binding) = self
             .overrides
@@ -751,5 +802,66 @@ impl HotkeySettings {
         let mut seen = std::collections::HashSet::new();
         self.overrides
             .retain(|binding| seen.insert(binding.command));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_command_keeps_every_shortcut_it_is_given() {
+        let mut hotkeys = HotkeySettings::default();
+        let alt_undo = ShortcutChord::key(ShortcutKey::U);
+        let moved = hotkeys.add(ShortcutCommand::Undo, alt_undo);
+        assert_eq!(
+            hotkeys.shortcuts(ShortcutCommand::Undo),
+            vec![ShortcutChord::cmd(ShortcutKey::Z), alt_undo]
+        );
+        assert!(moved.is_empty());
+        // adding the same chord twice changes nothing
+        hotkeys.add(ShortcutCommand::Undo, alt_undo);
+        assert_eq!(hotkeys.shortcuts(ShortcutCommand::Undo).len(), 2);
+        assert_eq!(hotkeys.command_for(alt_undo), Some(ShortcutCommand::Undo));
+        assert_eq!(
+            hotkeys.command_for(ShortcutChord::cmd(ShortcutKey::Z)),
+            Some(ShortcutCommand::Undo)
+        );
+    }
+
+    #[test]
+    fn adding_a_taken_chord_moves_only_that_chord() {
+        let mut hotkeys = HotkeySettings::default();
+        let ctrl_y = ShortcutChord::cmd(ShortcutKey::Y);
+        let moved = hotkeys.add(ShortcutCommand::Undo, ctrl_y);
+        assert_eq!(moved, vec![ShortcutCommand::Redo]);
+        assert_eq!(
+            hotkeys.shortcuts(ShortcutCommand::Redo),
+            vec![ShortcutChord::cmd_shift(ShortcutKey::Z)]
+        );
+        assert!(hotkeys.shortcuts(ShortcutCommand::Undo).contains(&ctrl_y));
+    }
+
+    #[test]
+    fn removing_and_resetting_one_command() {
+        let mut hotkeys = HotkeySettings::default();
+        hotkeys.remove(ShortcutCommand::Undo, ShortcutChord::cmd(ShortcutKey::Z));
+        assert!(hotkeys.shortcuts(ShortcutCommand::Undo).is_empty());
+        assert!(!hotkeys.is_default(ShortcutCommand::Undo));
+        hotkeys.reset_command(ShortcutCommand::Undo);
+        assert!(hotkeys.is_default(ShortcutCommand::Undo));
+        assert!(hotkeys.overrides.is_empty());
+
+        // a factory chord another command took meanwhile stays with it
+        hotkeys.add(ShortcutCommand::Copy, ShortcutChord::cmd(ShortcutKey::Y));
+        hotkeys.reset_command(ShortcutCommand::Redo);
+        assert_eq!(
+            hotkeys.shortcuts(ShortcutCommand::Redo),
+            vec![ShortcutChord::cmd_shift(ShortcutKey::Z)]
+        );
+        assert_eq!(
+            hotkeys.command_for(ShortcutChord::cmd(ShortcutKey::Y)),
+            Some(ShortcutCommand::Copy)
+        );
     }
 }

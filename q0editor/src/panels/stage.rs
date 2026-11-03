@@ -177,6 +177,9 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
         Sense::click_and_drag(),
     );
     let painter = ui.painter_at(canvas_rect);
+    // online chat lines float over the canvas, never over the timeline
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(egui::Id::new(crate::online::CANVAS_RECT), canvas_rect));
 
     // Clicking the stage leaves any Properties/TextEdit field behind. Without
     // this, egui keeps keyboard focus in the last text box and correctly blocks

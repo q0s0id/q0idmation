@@ -286,7 +286,8 @@ impl BrowserPlayer {
                                     [bitmap.width as usize, bitmap.height as usize],
                                     &bitmap.rgba,
                                 ),
-                                egui::TextureOptions::LINEAR,
+                                // pixels stay crisp, as on the editor stage
+                                egui::TextureOptions::NEAREST,
                             )
                         });
                         let min = egui::pos2(

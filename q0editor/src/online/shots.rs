@@ -591,3 +591,303 @@ fn panel_pictures() {
         &mut app,
     );
 }
+
+fn find_text(shapes: &[egui::epaint::ClippedShape], wanted: &str) -> Option<egui::Pos2> {
+    fn walk(shape: &egui::Shape, wanted: &str) -> Option<egui::Pos2> {
+        match shape {
+            egui::Shape::Text(text) if text.galley.job.text == wanted => {
+                Some(text.pos + text.galley.size() * 0.5)
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| walk(s, wanted)),
+            _ => None,
+        }
+    }
+    shapes.iter().find_map(|s| walk(&s.shape, wanted))
+}
+
+/// Open each dropdown in the panel and keep it open: frames must stay short
+/// and the window must not grow.
+#[test]
+fn online_panel_dropdowns_stay_fast_and_still() {
+    for (label, offset, expanded) in [("Join as", 70.0, None), ("Rank", 60.0, Some(2))] {
+        let mut app = EditorApp::default();
+        let mut online = signed_in(1);
+        room(&mut online, &mut app, 1);
+        online.view.tab = Tab::Room;
+        online.view.expanded = expanded;
+        online.notice = None;
+        let ctx = Context::default();
+        crate::theme::install(&ctx);
+        app.settings.theme.apply(&ctx);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 1400.0));
+        let mut time = 0.0;
+        let mut run = |online: &mut Online, app: &mut EditorApp, events: Vec<egui::Event>| {
+            time += 1.0 / 60.0;
+            let started = Instant::now();
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| online.show_panel(app, ctx),
+            );
+            (output, started.elapsed())
+        };
+        let mut shapes = Vec::new();
+        for _ in 0..6 {
+            shapes = run(&mut online, &mut app, Vec::new()).0.shapes;
+        }
+        let at = find_text(&shapes, label).unwrap_or_else(|| panic!("{label} not drawn"))
+            + egui::vec2(offset, 0.0);
+        let click = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        run(
+            &mut online,
+            &mut app,
+            vec![egui::Event::PointerMoved(at), click(true)],
+        );
+        run(&mut online, &mut app, vec![click(false)]);
+        let before = ctx.memory(|m| m.area_rect(egui::Id::new("q0editor_online")));
+        let mut slowest = Duration::ZERO;
+        for _ in 0..120 {
+            slowest = slowest.max(run(&mut online, &mut app, Vec::new()).1);
+        }
+        let after = ctx.memory(|m| m.area_rect(egui::Id::new("q0editor_online")));
+        let open = ctx.memory(|m| m.any_popup_open());
+        eprintln!("{label}: popup open={open} slowest={slowest:?} window {before:?} -> {after:?}");
+        assert!(open, "{label} dropdown did not open");
+        assert!(
+            slowest < Duration::from_millis(250),
+            "{label}: slow frame {slowest:?}"
+        );
+        assert_eq!(
+            before, after,
+            "{label}: the window moved or grew with the dropdown open"
+        );
+    }
+}
+
+/// The canvas a real editor frame would have, with the online panel closed
+/// or open beside it, and the chat overlay on top.
+fn shoot_canvas(
+    dir: &std::path::Path,
+    name: &str,
+    size: [f32; 2],
+    online: &mut Online,
+    app: &mut EditorApp,
+) {
+    let ctx = Context::default();
+    let _ = crate::q0lang::fonts::install(&ctx, &app.settings.q0lang_font_name);
+    app.settings.theme.apply(&ctx);
+    let mut canvas = Canvas::new(size[0] as usize, size[1] as usize);
+    let mut last = None;
+    for _ in 0..4 {
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size.into())),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let rect = ui.max_rect();
+                    ui.painter()
+                        .rect_filled(rect, 0.0, app.settings.theme.canvas_bg.to_color32());
+                    let stage = egui::Rect::from_center_size(
+                        rect.center(),
+                        egui::vec2(rect.width() * 0.8, rect.height() * 0.7),
+                    );
+                    ui.painter().rect_filled(stage, 0.0, Color32::WHITE);
+                    // a sketch, so the overlay is judged against artwork
+                    for (i, color) in [
+                        Color32::from_rgb(40, 40, 60),
+                        Color32::from_rgb(200, 60, 60),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        ui.painter().circle_filled(
+                            stage.left_bottom() + egui::vec2(120.0 + 90.0 * i as f32, -110.0),
+                            70.0,
+                            color,
+                        );
+                    }
+                    ctx.data_mut(|d| d.insert_temp(egui::Id::new(super::CANVAS_RECT), rect));
+                });
+                online.show_panel(app, ctx);
+                online.show_overlay(app, ctx);
+            },
+        );
+        canvas.textures(&output.textures_delta);
+        last = Some(output);
+    }
+    let output = last.unwrap();
+    let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+    canvas.paint(&primitives);
+    canvas.save(&dir.join(format!("{name}.png")));
+}
+
+#[test]
+#[ignore = "writes review pictures; set Q0EDITOR_ONLINE_SHOTS"]
+fn chat_pictures() {
+    let Some(dir) = std::env::var_os("Q0EDITOR_ONLINE_SHOTS") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let now = unix_now();
+    let mut app = EditorApp::default();
+    let mut online = signed_in(1);
+    room(&mut online, &mut app, 1);
+    let line = |id: i64, user_id: i64, body: &str| chat::ChatMessage {
+        id,
+        user_id,
+        body: body.into(),
+        created_at: now - 300 + id * 20,
+    };
+    online.room_chat_arrived(
+        &online.room.as_ref().unwrap().id.clone(),
+        vec![
+            line(1, 2, "pushed the run cycle to frame 24"),
+            line(2, 1, "nice! the arms look way better"),
+            line(
+                3,
+                3,
+                "can someone unlock the sky layer for me? i only have viewer",
+            ),
+        ],
+    );
+    let id = online.room.as_ref().unwrap().id.clone();
+    online.room_chat_arrived(&id, vec![line(4, 2, "on it, give me a sec")]);
+    online.room_chat_arrived(
+        &id,
+        vec![line(
+            5,
+            1,
+            "@cleo_test you're an editor now, the sky folder is yours. careful with the clouds, they're tweened",
+        )],
+    );
+    online.notice = None;
+    online.view.tab = Tab::Chat;
+    shoot(
+        &dir,
+        "11-room-chat",
+        [460.0, 780.0],
+        "Dark (default)",
+        &mut online,
+        &mut app,
+    );
+
+    online.chat.conversations = vec![
+        chat::Conversation {
+            user_id: 2,
+            last: Some(chat::DirectMessage {
+                id: 9,
+                from: 2,
+                to: 1,
+                body: "want to do the fight scene together tomorrow?".into(),
+                created_at: now - 400,
+            }),
+            unread: 2,
+            blocked: false,
+        },
+        chat::Conversation {
+            user_id: 4,
+            last: Some(chat::DirectMessage {
+                id: 3,
+                from: 1,
+                to: 4,
+                body: "thanks for the brush preset!".into(),
+                created_at: now - 90_000,
+            }),
+            unread: 0,
+            blocked: false,
+        },
+    ];
+    online.chat.conversations_loaded = true;
+    online.chat.unread = 2;
+    online.view.tab = Tab::Messages;
+    shoot(
+        &dir,
+        "12-messages",
+        [460.0, 780.0],
+        "Dark (default)",
+        &mut online,
+        &mut app,
+    );
+
+    let dm = |id: i64, from: i64, body: &str, ago: i64| chat::DirectMessage {
+        id,
+        from,
+        to: if from == 1 { 2 } else { 1 },
+        body: body.into(),
+        created_at: now - ago,
+    };
+    online.chat.threads.insert(
+        2,
+        vec![
+            dm(5, 2, "yo, saw your rooftop chase room", 3000),
+            dm(6, 1, "haha yeah, still blocking it out", 2900),
+            dm(7, 1, "the jump at frame 40 needs work", 2890),
+            dm(
+                8,
+                2,
+                "i can take the fight scene if you want.\nsend me the layers you want me on",
+                500,
+            ),
+            dm(9, 2, "want to do the fight scene together tomorrow?", 400),
+        ],
+    );
+    online.chat.thread_with = Some(2);
+    online.chat.dm_draft = "sure, 6pm?".into();
+    shoot(
+        &dir,
+        "13-thread",
+        [460.0, 780.0],
+        "Dark (default)",
+        &mut online,
+        &mut app,
+    );
+    shoot(
+        &dir,
+        "14-thread-light",
+        [400.0, 780.0],
+        "Light",
+        &mut online,
+        &mut app,
+    );
+
+    // the overlay over the canvas with the panel closed, like in a game
+    online.open = false;
+    online.chat.feed.clear();
+    online.room_chat_arrived(&id, vec![line(6, 2, "frame 40 is fixed, check it")]);
+    online.room_chat_arrived(&id, vec![line(7, 3, "looks sick")]);
+    online.dm_arrived(
+        dm(10, 4, "hey, are you free to review my walk cycle?", 5),
+        true,
+    );
+    shoot_canvas(&dir, "15-overlay", [1100.0, 700.0], &mut online, &mut app);
+    online.chat.input_open = true;
+    online.chat.draft = "/r sure, send it over".into();
+    shoot_canvas(
+        &dir,
+        "16-overlay-typing",
+        [1100.0, 700.0],
+        &mut online,
+        &mut app,
+    );
+    online.chat.input_open = false;
+    online.chat.feed.clear();
+    shoot_canvas(
+        &dir,
+        "17-overlay-idle-pill",
+        [1100.0, 700.0],
+        &mut online,
+        &mut app,
+    );
+}

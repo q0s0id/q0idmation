@@ -831,7 +831,7 @@ fn action_for_shortcut(command: ShortcutCommand) -> Option<Action> {
         C::ToolText => Action::SelectTool(crate::state::Tool::Text),
         C::ToolRig => Action::SelectTool(crate::state::Tool::Rig),
         C::ToggleSnap => Action::ToggleSnap,
-        C::PerformanceSnapshot | C::ClearSelection => return None,
+        C::PerformanceSnapshot | C::ClearSelection | C::OpenChat => return None,
     })
 }
 
@@ -844,6 +844,7 @@ fn dispatch_shortcut(
 ) {
     match command {
         ShortcutCommand::PerformanceSnapshot => app.copy_performance_snapshot(ctx),
+        ShortcutCommand::OpenChat => app.online.open_chat(),
         ShortcutCommand::ClearSelection => {
             if matches!(app.session.tool_state, crate::state::ToolState::Idle) {
                 app.session.selection = crate::state::Selection::None;
@@ -919,7 +920,12 @@ pub fn handle_global_shortcuts(app: &mut EditorApp, ctx: &egui::Context) {
         && matches!(app.session.tool_state, crate::state::ToolState::Idle);
     ctx.input_mut(|i| {
         if stage_selection && !i.modifiers.command && !i.modifiers.alt {
-            let step = if i.modifiers.shift { 0.1 } else { 1.0 };
+            let steps = app.settings.nudge;
+            let step = if i.modifiers.shift {
+                steps.shift_step
+            } else {
+                steps.step
+            };
             let modifiers = i.modifiers;
             for (key, x, y) in [
                 (Key::ArrowLeft, -1.0, 0.0),
@@ -990,6 +996,7 @@ pub fn handle_global_shortcuts(app: &mut EditorApp, ctx: &egui::Context) {
             test(ShortcutCommand::NextFrame);
             test(ShortcutCommand::ClearSelection);
             test(ShortcutCommand::ToggleSnap);
+            test(ShortcutCommand::OpenChat);
         }
         test(ShortcutCommand::InsertFrame);
         test(ShortcutCommand::RemoveFrame);

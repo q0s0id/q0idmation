@@ -108,8 +108,35 @@ pub enum Command {
         user_id: i64,
         url: String,
     },
+    /// A line in the room chat.
+    Say {
+        room: String,
+        body: String,
+    },
+    Conversations,
+    Thread {
+        user_id: i64,
+    },
+    SendDm {
+        user_id: i64,
+        body: String,
+    },
+    ReadDm {
+        user_id: i64,
+    },
 }
 impl Command {
+    /// Chat never waits behind a room download, an edit or a list refresh.
+    fn is_chat(&self) -> bool {
+        matches!(
+            self,
+            Self::Say { .. }
+                | Self::Conversations
+                | Self::Thread { .. }
+                | Self::SendDm { .. }
+                | Self::ReadDm { .. }
+        )
+    }
     /// Requests the panel shows as pending. Every keyed command answers with
     /// `Reply::Finished(key)` after its result, success or failure.
     pub fn busy_key(&self) -> Option<String> {
@@ -134,7 +161,12 @@ impl Command {
             | Self::History { .. }
             | Self::RoomInvites { .. }
             | Self::Presence { .. }
-            | Self::Avatar { .. } => return None,
+            | Self::Avatar { .. }
+            | Self::Say { .. }
+            | Self::Conversations
+            | Self::Thread { .. }
+            | Self::SendDm { .. }
+            | Self::ReadDm { .. } => return None,
         })
     }
 }
@@ -194,6 +226,20 @@ pub enum Reply {
         image: Option<egui::ColorImage>,
     },
     Finished(String),
+    ChatSent {
+        room: String,
+        message: Value,
+    },
+    /// A chat line or message that was not delivered, said where you typed it.
+    ChatFailed(String),
+    /// New direct messages to or from you, from the inbox long poll.
+    Inbox(Value),
+    Conversations(Value),
+    Thread {
+        user_id: i64,
+        value: Value,
+    },
+    DmSent(Value),
 }
 #[derive(Debug)]
 struct Failure {
@@ -432,11 +478,13 @@ fn start_poll(
             .build();
         let mut healthy = true;
         let mut failures = 0u32;
+        // 0 asks for the recent conversation once; then only what is new
+        let mut chat_since = 0i64;
         while !thread_stop.load(Ordering::Acquire) && !quit.load(Ordering::Acquire) {
             let path = match room_path(
                 &id,
                 &format!(
-                    "/events?since={}&wait=15",
+                    "/events?since={}&wait=15&chat_since={chat_since}",
                     thread_revision.load(Ordering::Acquire)
                 ),
             ) {
@@ -449,6 +497,9 @@ fn start_poll(
                 Ok(batch) => {
                     if thread_stop.load(Ordering::Acquire) {
                         break;
+                    }
+                    if let Some(last) = batch.chat.iter().map(|line| line.id).max() {
+                        chat_since = chat_since.max(last);
                     }
                     if !healthy {
                         healthy = true;
@@ -532,6 +583,136 @@ fn start_poll(
     Poll { stop, revision }
 }
 
+/// Direct messages for the signed-in account, followed from sign-in until
+/// sign-out. It starts at the newest message, so history is never replayed.
+fn start_inbox(
+    base: String,
+    creds: Arc<Mutex<Credentials>>,
+    tx: mpsc::Sender<Reply>,
+    ctx: Context,
+    quit: Arc<AtomicBool>,
+) -> Poll {
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    std::thread::spawn(move || {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(5))
+            .timeout_read(Duration::from_secs(30))
+            .build();
+        let mut cursor: Option<i64> = None;
+        let mut failures = 0u64;
+        while !thread_stop.load(Ordering::Acquire) && !quit.load(Ordering::Acquire) {
+            let path = match cursor {
+                Some(since) => format!("/api/v1/messages/feed?since={since}&wait=20"),
+                None => "/api/v1/messages/feed".to_string(),
+            };
+            match request(&agent, &base, &creds, "GET", &path, None, true) {
+                Ok(value) => {
+                    failures = 0;
+                    if thread_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    cursor = value["cursor"].as_i64().or(cursor);
+                    send(&tx, &ctx, Reply::Inbox(value));
+                }
+                // signed out, or a server without messages: nothing to follow
+                Err(e) if matches!(e.status, 401 | 404) => break,
+                Err(_) => {
+                    failures = (failures + 1).min(5);
+                    let until = Instant::now() + Duration::from_secs(3 * failures);
+                    while Instant::now() < until && !thread_stop.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+    Poll {
+        stop,
+        revision: Arc::new(AtomicU64::new(0)),
+    }
+}
+
+/// Room chat and direct messages, on their own thread.
+fn chat_worker(
+    base: String,
+    credentials: Arc<Mutex<Credentials>>,
+    commands: mpsc::Receiver<Command>,
+    replies: mpsc::Sender<Reply>,
+    ctx: Context,
+    stopped: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(5))
+            .timeout_read(Duration::from_secs(20))
+            .build();
+        while !stopped.load(Ordering::Acquire) {
+            let command = match commands.recv_timeout(Duration::from_millis(200)) {
+                Ok(command) => command,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+            let call = |method: &str, path: &str, body: Option<Value>| {
+                request(&agent, &base, &credentials, method, path, body, true)
+            };
+            let result: Result<Option<Reply>, Failure> = (|| match command {
+                Command::Say { room, body } => {
+                    let v = call(
+                        "POST",
+                        &room_path(&room, "/chat")?,
+                        Some(json!({ "body": body })),
+                    )?;
+                    Ok(Some(Reply::ChatSent {
+                        room,
+                        message: v["message"].clone(),
+                    }))
+                }
+                Command::Conversations => Ok(Some(Reply::Conversations(call(
+                    "GET",
+                    "/api/v1/messages",
+                    None,
+                )?))),
+                Command::Thread { user_id } => Ok(Some(Reply::Thread {
+                    user_id,
+                    value: call("GET", &format!("/api/v1/messages/{user_id}"), None)?,
+                })),
+                Command::SendDm { user_id, body } => {
+                    let v = call(
+                        "POST",
+                        &format!("/api/v1/messages/{user_id}"),
+                        Some(json!({ "body": body })),
+                    )?;
+                    Ok(Some(Reply::DmSent(v["message"].clone())))
+                }
+                Command::ReadDm { user_id } => {
+                    call(
+                        "POST",
+                        &format!("/api/v1/messages/{user_id}/read"),
+                        Some(json!({})),
+                    )?;
+                    Ok(None)
+                }
+                _ => Ok(None),
+            })();
+            match result {
+                Ok(Some(reply)) => send(&replies, &ctx, reply),
+                Ok(None) => {}
+                Err(e) if e.status == 404 && e.code == "invalid_response" => send(
+                    &replies,
+                    &ctx,
+                    Reply::ChatFailed(
+                        "this server doesn’t have chat yet. it arrives with the next q0id update"
+                            .into(),
+                    ),
+                ),
+                Err(e) => send(&replies, &ctx, Reply::ChatFailed(e.text())),
+            }
+        }
+    });
+}
+
 /// Avatars are optional decoration: fetched from the chosen server only, size
 /// limited, decoded off the ui thread, and silently replaced by initials.
 fn fetch_avatar(base: &str, url: &str) -> Option<egui::ColorImage> {
@@ -564,6 +745,7 @@ fn fetch_avatar(base: &str, url: &str) -> Option<egui::ColorImage> {
 
 pub struct Transport {
     tx: mpsc::Sender<Command>,
+    chats: mpsc::Sender<Command>,
     /// Room edits, undo/redo and presence: never queued behind list refreshes,
     /// searches or invitations on the general worker.
     edits: mpsc::Sender<Command>,
@@ -598,6 +780,15 @@ impl Transport {
             ctx.clone(),
             quit.clone(),
         );
+        let (chats_tx, chats) = mpsc::channel();
+        chat_worker(
+            base.clone(),
+            shared_credentials.clone(),
+            chats,
+            replies.clone(),
+            ctx.clone(),
+            quit.clone(),
+        );
         std::thread::spawn(move || {
             let agent = ureq::AgentBuilder::new()
                 .timeout_connect(Duration::from_secs(5))
@@ -608,6 +799,7 @@ impl Transport {
             let mut avatar_queue: Vec<(i64, String)> = Vec::new();
             let mut login: Option<(String, Instant, Instant, u64)> = None;
             let mut poll: Option<Poll> = None;
+            let mut inbox: Option<Poll> = None;
             let mut active_room: Option<String> = None;
             while !stopped.load(Ordering::Acquire) {
                 let received = commands.recv_timeout(Duration::from_millis(200));
@@ -666,6 +858,7 @@ impl Transport {
                             }
                             Command::Logout => {
                                 poll = None;
+                                inbox = None;
                                 if let Some(room) = active_room.take() {
                                     leave_request(&base, &credentials, &room);
                                 }
@@ -810,10 +1003,15 @@ impl Transport {
                                 }
                                 Ok(Some(Reply::RoomDeleted { room }))
                             }
-                            // room edits run on their own worker; see `edit_worker`
+                            // room edits and chat run on their own workers
                             Command::Submit { .. }
                             | Command::History { .. }
-                            | Command::Presence { .. } => Ok(None),
+                            | Command::Presence { .. }
+                            | Command::Say { .. }
+                            | Command::Conversations
+                            | Command::Thread { .. }
+                            | Command::SendDm { .. }
+                            | Command::ReadDm { .. } => Ok(None),
                             Command::Invite {
                                 room,
                                 user_id,
@@ -1119,7 +1317,16 @@ impl Transport {
                                     None,
                                     true,
                                 ) {
-                                    Ok(user) => send(&replies, &ctx, Reply::SignedIn(user)),
+                                    Ok(user) => {
+                                        send(&replies, &ctx, Reply::SignedIn(user));
+                                        inbox = Some(start_inbox(
+                                            base.clone(),
+                                            credentials.clone(),
+                                            replies.clone(),
+                                            ctx.clone(),
+                                            stopped.clone(),
+                                        ));
+                                    }
                                     Err(e) => send(
                                         &replies,
                                         &ctx,
@@ -1167,6 +1374,7 @@ impl Transport {
                 }
             }
             drop(poll);
+            drop(inbox);
             if let Some(room) = active_room {
                 leave_request(&base, &credentials, &room);
             }
@@ -1174,6 +1382,7 @@ impl Transport {
         });
         Self {
             tx,
+            chats: chats_tx,
             edits: edits_tx,
             rx,
             quit,
@@ -1191,6 +1400,7 @@ impl Transport {
             Command::Submit { .. } | Command::History { .. } | Command::Presence { .. } => {
                 self.edits.send(command)
             }
+            command if command.is_chat() => self.chats.send(command),
             command => self.tx.send(command),
         };
     }
@@ -1454,6 +1664,7 @@ mod tests {
                     Ok(
                         Reply::Finished(_)
                         | Reply::Avatar { .. }
+                        | Reply::Inbox(_)
                         | Reply::Connection { ok: true, .. },
                     ) => {}
                     Ok(Reply::Failure { message, .. }) => panic!("{what}: {message}"),
@@ -1570,5 +1781,151 @@ mod tests {
                 break;
             }
         }
+    }
+
+    /// The editor's chat paths against a running server: room history and
+    /// live lines through the room poll, sending, and direct messages both
+    /// ways. `Q0EDITOR_ONLINE_E2E_FRIEND_COOKIE` is a second account that is
+    /// a member of the room.
+    #[test]
+    #[ignore = "needs a running q0id server, a room and two browser session cookies"]
+    fn live_server_room_chat_and_direct_messages() {
+        let (Ok(base), Ok(cookie), Ok(room), Ok(friend)) = (
+            std::env::var("Q0EDITOR_ONLINE_E2E"),
+            std::env::var("Q0EDITOR_ONLINE_E2E_COOKIE"),
+            std::env::var("Q0EDITOR_ONLINE_E2E_ROOM"),
+            std::env::var("Q0EDITOR_ONLINE_E2E_FRIEND_COOKIE"),
+        ) else {
+            return;
+        };
+        let transport = Transport::new(base.clone(), Context::default());
+        let wait = |what: &str, wanted: &mut dyn FnMut(&Reply) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(40);
+            loop {
+                match transport.rx.recv_timeout(Duration::from_millis(200)) {
+                    Ok(Reply::Failure { message, .. }) => panic!("{what}: {message}"),
+                    Ok(Reply::ChatFailed(message)) => panic!("{what}: {message}"),
+                    Ok(Reply::LoginEnded { message }) => panic!("{what}: {message}"),
+                    Ok(reply) if wanted(&reply) => return reply,
+                    Ok(_) => {}
+                    Err(_) if Instant::now() < deadline => {}
+                    Err(_) => panic!("{what}: timed out"),
+                }
+            }
+        };
+        let browser = |cookie: &str, path: &str, body: Value| {
+            ureq::post(&format!("{base}{path}"))
+                .set("Cookie", &format!("q0sid={cookie}"))
+                .set("Origin", &base)
+                .set("Content-Type", "application/json")
+                .send_string(&body.to_string())
+                .ok()
+                .and_then(|r| r.into_string().ok())
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .expect("the friend's request failed")
+        };
+        transport.send(Command::Login);
+        let Reply::Login {
+            user_code,
+            verification_uri,
+            ..
+        } = wait("device request", &mut |r| matches!(r, Reply::Login { .. }))
+        else {
+            unreachable!()
+        };
+        let agent = ureq::AgentBuilder::new().redirects(0).build();
+        let page = agent
+            .get(&verification_uri)
+            .set("Cookie", &format!("q0sid={cookie}"))
+            .call()
+            .unwrap()
+            .into_string()
+            .unwrap();
+        let confirmation = page
+            .split("name=\"confirmation\" value=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("confirmation field");
+        agent
+            .post(&format!("{base}/online/authorize"))
+            .set("Cookie", &format!("q0sid={cookie}"))
+            .set("Origin", &base)
+            .send_form(&[
+                ("user_code", user_code.as_str()),
+                ("confirmation", confirmation),
+                ("decision", "approve"),
+            ])
+            .unwrap();
+        let Reply::SignedIn(user) = wait("sign in", &mut |r| matches!(r, Reply::SignedIn(_)))
+        else {
+            unreachable!()
+        };
+        let me = user["id"].as_i64().unwrap();
+
+        transport.send(Command::Join { id: room.clone() });
+        wait("join", &mut |r| matches!(r, Reply::Snapshot(_)));
+        // the first poll brings the recent conversation
+        let mut seen = Vec::new();
+        wait("chat history", &mut |r| match r {
+            Reply::Events { batch, .. } => {
+                seen.extend(batch.chat.iter().map(|line| line.id));
+                !batch.chat.is_empty()
+            }
+            _ => false,
+        });
+        let said = browser(
+            &friend,
+            &format!("/api/v1/rooms/{room}/chat"),
+            json!({"body":"live from the friend"}),
+        );
+        let friend_id = said["message"]["user_id"].as_i64().unwrap();
+        let Reply::Events { batch, .. } = wait(
+            "live chat",
+            &mut |r| matches!(r, Reply::Events { batch, .. } if !batch.chat.is_empty()),
+        ) else {
+            unreachable!()
+        };
+        assert_eq!(batch.chat.len(), 1, "only the new line arrives");
+        assert_eq!(batch.chat[0].body, "live from the friend");
+        assert!(!seen.contains(&batch.chat[0].id));
+
+        transport.send(Command::Say {
+            room: room.clone(),
+            body: "hello from q0editor".into(),
+        });
+        let Reply::ChatSent { message, .. } =
+            wait("say", &mut |r| matches!(r, Reply::ChatSent { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!(message["user_id"], me);
+
+        browser(
+            &friend,
+            &format!("/api/v1/messages/{me}"),
+            json!({"body":"psst, a direct message"}),
+        );
+        wait("inbox", &mut |r| match r {
+            Reply::Inbox(value) => value["messages"]
+                .as_array()
+                .is_some_and(|m| m.iter().any(|m| m["body"] == "psst, a direct message")),
+            _ => false,
+        });
+        transport.send(Command::Thread { user_id: friend_id });
+        let Reply::Thread { value, .. } =
+            wait("thread", &mut |r| matches!(r, Reply::Thread { .. }))
+        else {
+            unreachable!()
+        };
+        assert!(!value["messages"].as_array().unwrap().is_empty());
+        transport.send(Command::SendDm {
+            user_id: friend_id,
+            body: "got it".into(),
+        });
+        let Reply::DmSent(message) = wait("send dm", &mut |r| matches!(r, Reply::DmSent(_))) else {
+            unreachable!()
+        };
+        assert_eq!(message["to"], friend_id);
+        transport.send(Command::LeaveRoom);
     }
 }

@@ -1,6 +1,6 @@
 # q0editor online
 
-open **Online** at the right of the editor menu. the label shows when you are live in a room, or how many invitations and friend requests are waiting.
+open **Online** at the right of the editor menu. the label shows when you are live in a room, or how many invitations, friend requests and unread messages are waiting.
 
 ## signing in
 
@@ -31,6 +31,16 @@ a room is shared, lasting work: nobody leaving, disconnecting or crashing ever c
 - the owner opens a participant to change their rank and assignments, and opens **room settings** to choose what each rank can edit (**everything** or **only what you assign**), inviting rules, the member limit, closing and deleting.
 - in an older room where editors or admins can't edit anything yet, the owner sees who is stuck and can let that rank edit everything in one click.
 
+## chat
+
+everyone in a room can talk, viewers included. new lines float over the bottom left of the canvas for a few seconds and fade, like chat in a game, whether or not the Online panel is open. press **/** (change it in **Keyboard shortcuts**: *Chat (online room)*) or click the small **chat** pill to open the input with the recent conversation above it. **Enter** sends, **Esc** closes. the **chat** tab of the panel keeps the full conversation, and q0id.com shows the same chat on the room's page.
+
+direct messages show up there too: a line marked **DM** is a message to or from you. in the chat input, `/r text` answers the last person who wrote to you and `/w name text` (or `/msg`, `/dm`) writes to someone directly.
+
+## messages
+
+the **messages** tab is your inbox: conversations newest first with unread counts, **find** to write to anyone by username, and **message** in a friend's **⋯** menu. opening a conversation reads it. in a conversation **Enter** sends and **Shift+Enter** starts a new line. the same conversations live at q0id.com/messages, and the website shows an unread badge in its menu. blocking someone (friends tab) stops messages both ways.
+
 ## friends
 
 search by username (at least two characters, matched from the start). answer incoming requests, cancel outgoing ones, and invite friends to the room you are in. remove and block live in each friend's **⋯** menu and need a second click. blocked people are listed at the bottom with **unblock**.
@@ -56,13 +66,13 @@ global runtime settings and the audio layout currently require a complete-projec
 
 ## website
 
-q0id.com/online shows the same account: invitations, rooms with participants and permissions, friends and requests. owners can change ranks, assignments and room settings there too.
+q0id.com/online shows the same account: invitations, rooms with participants, permissions and the room chat, friends and requests. owners can change ranks, assignments and room settings there too. q0id.com/messages holds your direct messages; profiles have a **message** button.
 
 ## implementation and ui handoff
 
 - `q0online/` contains the shared protocol, authoritative permission checks, personal history, and advisory access helpers (`layer_access`, `library_access`, `project_access`, `resource_label`) that interfaces use to explain access.
 - `q0online/` also contains the three-way merge (`merge_projects`) the server and editor share.
-- `q0editor/src/online/` contains the controller (`mod.rs`), background reconciliation (`sync.rs`), the panel (`ui.rs`) and the network workers (`transport.rs`).
+- `q0editor/src/online/` contains the controller (`mod.rs`), background reconciliation (`sync.rs`), the panel (`ui.rs`), chat and messages with the canvas overlay (`chat.rs`) and the network workers (`transport.rs`).
 - `cargo test -p q0editor --lib online::` runs the online tests. `Q0EDITOR_ONLINE_SHOTS=<dir> cargo test -p q0editor --lib online::shots -- --ignored` renders review pictures of the panel without opening a window. an end-to-end test against a running server is described in `transport.rs`.
 - `Q0EDITOR_ONLINE_SERVER=http://127.0.0.1:8080` points a development editor at a local q0id server.
 - the q0id repository contains `ONLINE_HANDOFF.md` with the complete api, persistence and ui notes, and `tools/editor-online/` with a copy of these desktop sources.

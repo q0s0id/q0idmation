@@ -1,5 +1,6 @@
 [workspace]
 members = ["q0online", "q0credits", "q0icon", "q0theme", "q0glblend", "q0vm", "q0s-format", "q0model", "q0physics", "q0ex", "q0video", "q0player", "q0player-android", "q0fla", "q0editor", "q0android", "q0editor-android", "q0shell", "q0term", "canripper"]
+exclude = ["vendor"]
 resolver = "2"
 
 [workspace.package]
@@ -9,3 +10,7 @@ authors = ["q0s"]
 license = "GPL-3.0-or-later"
 repository = "https://github.com/q0s0id/q0idmation"
 homepage = "https://q0id.com"
+
+[patch.crates-io]
+# Non-Latin keyboard layouts: see vendor/egui-winit/VENDORED.md
+egui-winit = { path = "vendor/egui-winit" }

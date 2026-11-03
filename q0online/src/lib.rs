@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod merge;
-pub use merge::merge_projects;
+pub use merge::{merge_projects, merge_projects_trusted};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const STATE_VERSION: u32 = 1;

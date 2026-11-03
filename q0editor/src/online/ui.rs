@@ -10,9 +10,11 @@ const ROW_AVATAR: f32 = 26.0;
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum Tab {
     Room,
+    Chat,
     #[default]
     Rooms,
     Friends,
+    Messages,
 }
 struct MemberDraft {
     user_id: i64,
@@ -67,7 +69,7 @@ impl View {
         self.hold_join = false;
     }
     pub(super) fn left_room(&mut self) {
-        if self.tab == Tab::Room {
+        if matches!(self.tab, Tab::Room | Tab::Chat) {
             self.tab = Tab::Rooms;
         }
         self.forget_room();
@@ -147,6 +149,8 @@ struct Out {
     open_join: bool,
     follow: Option<Follow>,
     history: Option<bool>,
+    /// Open the conversation with this person in the Messages tab.
+    message: Option<i64>,
 }
 impl Out {
     fn say(&mut self, text: impl Into<String>, tone: Tone) {
@@ -758,6 +762,7 @@ impl Online {
             };
         }
         let waiting = self.invites.len()
+            + self.chat.unread.max(0) as usize
             + self
                 .friends
                 .iter()
@@ -809,10 +814,13 @@ impl Online {
                         .id_source("online_panel_scroll")
                         .auto_shrink([false, false])
                         .max_height((ui.available_height() - footer).max(120.0))
+                        .stick_to_bottom(matches!(self.view.tab, Tab::Chat))
                         .show(ui, |ui| match self.view.tab {
                             Tab::Room => self.room_view(app, ui, &pal, &mut out),
+                            Tab::Chat => self.chat_view(app, ui, &pal, &mut out),
                             Tab::Rooms => self.rooms_view(app, ui, &pal, &mut out),
                             Tab::Friends => self.friends_view(ui, &pal, &mut out),
+                            Tab::Messages => self.messages_view(ui, &pal, &mut out),
                         });
                 }
                 self.footer(ui, &pal);
@@ -842,6 +850,10 @@ impl Online {
         }
         if let Some(redo) = out.history {
             self.request_history(redo);
+        }
+        if let Some(id) = out.message {
+            self.view.tab = Tab::Messages;
+            self.open_thread(id);
         }
         if out.open_join {
             self.view.hold_join = false;
@@ -1114,7 +1126,7 @@ impl Online {
     }
 
     fn tabs(&mut self, ui: &mut Ui) {
-        if self.room.is_none() && self.view.tab == Tab::Room {
+        if self.room.is_none() && matches!(self.view.tab, Tab::Room | Tab::Chat) {
             self.view.tab = Tab::Rooms;
         }
         let invites = self.invites.len();
@@ -1123,10 +1135,12 @@ impl Online {
             .iter()
             .filter(|f| f.status == "incoming")
             .count();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if self.room.is_some() {
                 ui.selectable_value(&mut self.view.tab, Tab::Room, "Room")
                     .on_hover_text("The room you're in: people, access and settings");
+                ui.selectable_value(&mut self.view.tab, Tab::Chat, "Chat")
+                    .on_hover_text("Talk to everyone in the room");
             }
             let rooms = if invites > 0 {
                 format!("Rooms ({invites})")
@@ -1142,6 +1156,21 @@ impl Online {
             };
             ui.selectable_value(&mut self.view.tab, Tab::Friends, friends)
                 .on_hover_text("Find people, answer requests and invite friends");
+            let unread = self.chat.unread.max(0);
+            let messages = if unread > 0 {
+                format!("Messages ({unread})")
+            } else {
+                "Messages".into()
+            };
+            if ui
+                .selectable_value(&mut self.view.tab, Tab::Messages, messages)
+                .on_hover_text("Direct messages, also on q0id.com")
+                .clicked()
+            {
+                // the list is refreshed every time you come back to it
+                self.chat.conversations_loaded = false;
+                self.chat.requested = false;
+            }
             if self.busy("refresh") {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spinner().on_hover_text("Refreshing");
@@ -1667,6 +1696,10 @@ impl Online {
                 online,
                 |ui, out, view| {
                     ui.menu_button("⋯", |ui| {
+                        if ui.button("Message").clicked() {
+                            out.message = Some(id);
+                            ui.close_menu();
+                        }
                         if armed_button(
                             ui,
                             view,
@@ -1807,6 +1840,294 @@ impl Online {
                     }
                 });
             });
+        });
+    }
+
+    // --- chat and messages --------------------------------------------------------
+
+    fn chat_view(&mut self, app: &EditorApp, ui: &mut Ui, pal: &Palette, out: &mut Out) {
+        let now = self.server_now();
+        let me = self.actor();
+        let key = app
+            .settings
+            .hotkeys
+            .shortcuts(crate::hotkeys::ShortcutCommand::OpenChat)
+            .first()
+            .map(|chord| chord.display());
+        heading(
+            ui,
+            pal,
+            "Room chat",
+            &match key {
+                Some(key) => format!(
+                    "Everyone in the room sees this, here and on q0id.com. Press {key} anywhere to chat over the canvas."
+                ),
+                None => "Everyone in the room sees this, here and on q0id.com.".into(),
+            },
+        );
+        if self.chat.room.is_empty() {
+            ui.label(
+                RichText::new("Nothing said yet. Say hi.")
+                    .italics()
+                    .color(pal.dim),
+            );
+        }
+        let dark = ui.visuals().dark_mode;
+        for line in self.chat.room.clone() {
+            let name = if Some(line.user_id) == me {
+                "you".to_owned()
+            } else {
+                self.person(line.user_id).username
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.label(
+                    RichText::new(format!("{name}:"))
+                        .strong()
+                        .color(chat::name_colour(line.user_id, dark)),
+                )
+                .on_hover_text(ago(now, line.created_at));
+                ui.label(&line.body);
+            });
+        }
+        ui.add_space(6.0);
+        one_line(ui, |ui| {
+            let ready = chat::room_body(&self.chat.room_draft).is_some();
+            let clicked = primary(ui, pal, "Send", ready).clicked();
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut self.chat.room_draft)
+                    .id_source("online_room_chat_draft")
+                    .hint_text("Message the room")
+                    .char_limit(chat::MAX_ROOM_CHARS)
+                    .desired_width(f32::INFINITY),
+            );
+            let entered = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (clicked || entered) && ready {
+                let text = std::mem::take(&mut self.chat.room_draft);
+                if let Some(room) = self.room.as_ref().map(|r| r.id.clone()) {
+                    if let Some(body) = chat::room_body(&text) {
+                        out.send.push(Command::Say { room, body });
+                    }
+                }
+                edit.request_focus();
+            }
+        });
+    }
+
+    fn messages_view(&mut self, ui: &mut Ui, pal: &Palette, out: &mut Out) {
+        if let Some(with) = self.chat.thread_with {
+            self.thread_view(with, ui, pal, out);
+            return;
+        }
+        let now = self.server_now();
+        let me = self.actor();
+        if !self.chat.conversations_loaded && !self.chat.requested {
+            self.chat.requested = true;
+            out.send.push(Command::Conversations);
+        }
+        heading(
+            ui,
+            pal,
+            "Messages",
+            "Write to anyone on q0id. The same conversations are on q0id.com/messages.",
+        );
+        let searching = self.busy("search");
+        one_line(ui, |ui| {
+            let query = self.chat.find.trim().to_owned();
+            let enabled = query.chars().count() >= 2 && !searching;
+            let clicked = ui
+                .add_enabled(enabled, egui::Button::new("Find"))
+                .on_disabled_hover_text("Type at least 2 characters")
+                .clicked();
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.chat.find)
+                    .id_source("online_dm_find")
+                    .hint_text("New message: username")
+                    .char_limit(20)
+                    .desired_width(f32::INFINITY),
+            );
+            let submit = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if clicked || (submit && enabled) {
+                out.send.push(Command::Search { query });
+            }
+        });
+        if !self.chat.find.trim().is_empty() {
+            if let Some(results) = self.results.clone() {
+                let results: Vec<Person> =
+                    results.into_iter().filter(|p| Some(p.id) != me).collect();
+                if results.is_empty() {
+                    ui.label(RichText::new("Nobody by that name.").small().color(pal.dim));
+                }
+                for person in results {
+                    let id = person.id;
+                    self.person_row(ui, pal, out, &person, None, |ui, out| {
+                        if primary(ui, pal, "Message", true).clicked() {
+                            out.message = Some(id);
+                        }
+                    });
+                }
+                ui.separator();
+            }
+        }
+        if !self.chat.conversations_loaded {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new("Loading…").color(pal.dim));
+            });
+            return;
+        }
+        if self.chat.conversations.is_empty() {
+            ui.label(
+                RichText::new(
+                    "No conversations yet. Find someone above, or use Message on a friend.",
+                )
+                .color(pal.dim),
+            );
+        }
+        for conversation in self.chat.conversations.clone() {
+            let person = self.person(conversation.user_id);
+            let sub = match &conversation.last {
+                _ if conversation.blocked => "blocked".to_owned(),
+                Some(last) => {
+                    let text: String = last.body.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let text: String = text.chars().take(60).collect();
+                    format!(
+                        "{}{} · {}",
+                        if Some(last.from) == me { "you: " } else { "" },
+                        text,
+                        ago(now, last.created_at)
+                    )
+                }
+                None => String::new(),
+            };
+            let id = conversation.user_id;
+            let unread = conversation.unread;
+            self.person_row(ui, pal, out, &person, Some(sub), |ui, out| {
+                let label = if unread > 0 {
+                    format!("Open ({unread})")
+                } else {
+                    "Open".to_owned()
+                };
+                let button = if unread > 0 {
+                    primary(ui, pal, &label, true)
+                } else {
+                    ui.button(label)
+                };
+                if button.clicked() {
+                    out.message = Some(id);
+                }
+            });
+        }
+    }
+
+    fn thread_view(&mut self, with: i64, ui: &mut Ui, pal: &Palette, out: &mut Out) {
+        let now = self.server_now();
+        let me = self.actor();
+        let person = self.person(with);
+        ui.horizontal(|ui| {
+            if ui.button("‹ All messages").clicked() {
+                self.chat.thread_with = None;
+                self.chat.conversations_loaded = false;
+                self.chat.requested = false;
+            }
+            avatar(ui, &self.avatars, &person, ROW_AVATAR, out);
+            ui.label(RichText::new(&person.username).strong());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .small_button("Profile")
+                    .on_hover_text("Open their q0id profile in your browser")
+                    .clicked()
+                {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(format!(
+                        "{}/u/{}",
+                        self.server, person.username
+                    )));
+                }
+            });
+        });
+        ui.separator();
+        let Some(thread) = self.chat.threads.get(&with).cloned() else {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new("Loading…").color(pal.dim));
+            });
+            return;
+        };
+        if thread.is_empty() {
+            ui.label(
+                RichText::new(format!("Say hi to {}.", person.username))
+                    .italics()
+                    .color(pal.dim),
+            );
+        }
+        for message in &thread {
+            let mine = Some(message.from) == me;
+            let layout = if mine {
+                Layout::right_to_left(Align::TOP)
+            } else {
+                Layout::left_to_right(Align::TOP)
+            };
+            ui.with_layout(layout, |ui| {
+                // laid out first, so a bubble is exactly as wide as its text
+                let (fill, text) = if mine {
+                    (pal.accent, pal.on_accent)
+                } else {
+                    (pal.card, pal.text)
+                };
+                let pad = vec2(10.0, 6.0);
+                let font = egui::TextStyle::Body.resolve(ui.style());
+                let wrap = (ui.available_width() * 0.8 - pad.x * 2.0).max(60.0);
+                let galley = ui.fonts(|fonts| fonts.layout(message.body.clone(), font, text, wrap));
+                let (rect, response) =
+                    ui.allocate_exact_size(galley.size() + pad * 2.0, egui::Sense::hover());
+                let corner = |near: bool| if near { 3.0 } else { 12.0 };
+                let rounding = egui::Rounding {
+                    nw: corner(!mine),
+                    ne: corner(mine),
+                    sw: 12.0,
+                    se: 12.0,
+                };
+                ui.painter().rect(
+                    rect,
+                    rounding,
+                    fill,
+                    Stroke::new(1.0_f32, if mine { fill } else { pal.line }),
+                );
+                ui.painter().galley(rect.min + pad, galley, text);
+                response.on_hover_text(ago(now, message.created_at));
+            });
+            ui.add_space(3.0);
+        }
+        ui.add_space(6.0);
+        if self.chat.blocked_with.contains(&with) {
+            ui.label(RichText::new("You can't message each other.").color(pal.dim));
+            return;
+        }
+        let edit = ui.add(
+            egui::TextEdit::multiline(&mut self.chat.dm_draft)
+                .id_source("online_dm_draft")
+                .hint_text("Write a message. Enter sends, Shift+Enter starts a new line")
+                .char_limit(chat::MAX_DM_CHARS)
+                .desired_rows(2)
+                .desired_width(f32::INFINITY),
+        );
+        let entered =
+            edit.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+        ui.horizontal(|ui| {
+            let ready = chat::dm_body(&self.chat.dm_draft).is_some();
+            if primary(ui, pal, "Send", ready).clicked() || (entered && ready) {
+                let text = std::mem::take(&mut self.chat.dm_draft);
+                if let Some(body) = chat::dm_body(&text) {
+                    out.send.push(Command::SendDm {
+                        user_id: with,
+                        body,
+                    });
+                }
+                edit.request_focus();
+            } else if entered {
+                // Enter on an empty message must not leave a blank line behind
+                self.chat.dm_draft = self.chat.dm_draft.trim_end_matches('\n').to_owned();
+            }
         });
     }
 
