@@ -4,7 +4,7 @@ q0idmation has two independent per-user NSIS installers for Windows x64 and Wind
 
 | File pattern | Contents | Association |
 |---|---|---|
-| `dist\q0editor-<version>-windows-<arch>-setup.exe` | `q0editor.exe` only | `.q1s` |
+| `dist\q0editor-<version>-windows-<arch>-setup.exe` | `q0editor.exe` only | `.q1s`, `.q0l`, `.q0lang` |
 | `dist\q0player-<version>-windows-<arch>-setup.exe` | `q0player.exe` only | `.q0s`, `.q0v` |
 
 `<arch>` is `x64` or `arm64`.
@@ -75,7 +75,7 @@ Before sharing the files, complete [`BETA_TEST.md`](../BETA_TEST.md).
 
 ## Installer behavior
 
-q0editor registers `.q1s`; q0player registers both `.q0s` and `.q0v`. All associations live
+q0editor registers `.q1s` and `.q0l` (with `.q0lang`, its other spelling); q0player registers both `.q0s` and `.q0v`. Each type has its own icon from `assets/`. All associations live
 under `HKCU\Software\Classes` and pass the selected path as the first command
 line argument. Each installer creates a Start menu shortcut and offers an
 optional desktop shortcut.

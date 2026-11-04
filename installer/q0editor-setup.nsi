@@ -17,6 +17,63 @@ SetCompressor /SOLID lzma
 !define PROG_FRIENDLY  "q0editor Project"
 !define EXT             ".q1s"
 !define PREVIOUS_PROG_ID_VALUE "PreviousDefaultProgId"
+; .q0l and .q0lang: one format, two spellings. The ProgID and the names of
+; the saved previous defaults are the ones q0editor's own settings use.
+!define Q0L_PROG_ID       "q0editor.Q0langSource"
+!define Q0L_PROG_FRIENDLY "q0lang source"
+
+; Before taking extension EXT for PROG, keep a valid foreign default in
+; PROG's value SAVED. On an upgrade the original backup is kept instead of
+; being replaced with ourselves. ID keeps each copy's labels apart.
+!macro SaveForeignDefault EXT PROG SAVED ID
+  ReadRegStr $0 HKCU "Software\Classes\${EXT}" ""
+  StrCmp $0 "${PROG}" save_${ID}_validate
+  StrCmp $0 "" save_${ID}_clear
+  StrCpy $1 $0 1
+  StrCmp $1 " " save_${ID}_clear
+  StrCmp $1 "$\t" save_${ID}_clear
+  StrCpy $1 $0 1 -1
+  StrCmp $1 " " save_${ID}_clear
+  StrCmp $1 "$\t" save_${ID}_clear
+  WriteRegStr HKCU "Software\Classes\${PROG}" "${SAVED}" "$0"
+  Goto save_${ID}_done
+save_${ID}_validate:
+  ReadRegStr $1 HKCU "Software\Classes\${PROG}" "${SAVED}"
+  StrCmp $1 "" save_${ID}_clear
+  StrCmp $1 "${PROG}" save_${ID}_clear
+  StrCpy $2 $1 1
+  StrCmp $2 " " save_${ID}_clear
+  StrCmp $2 "$\t" save_${ID}_clear
+  StrCpy $2 $1 1 -1
+  StrCmp $2 " " save_${ID}_clear
+  StrCmp $2 "$\t" save_${ID}_clear save_${ID}_done
+save_${ID}_clear:
+  DeleteRegValue HKCU "Software\Classes\${PROG}" "${SAVED}"
+save_${ID}_done:
+!macroend
+
+; On uninstall, give EXT back to what it had before, but only while it is
+; still ours: a later choice of the user's is never changed.
+!macro RestoreForeignDefault EXT PROG SAVED ID
+  ReadRegStr $0 HKCU "Software\Classes\${EXT}" ""
+  StrCmp $0 "${PROG}" restore_${ID}_current restore_${ID}_done
+restore_${ID}_current:
+  ReadRegStr $1 HKCU "Software\Classes\${PROG}" "${SAVED}"
+  StrCmp $1 "" restore_${ID}_remove
+  StrCmp $1 "${PROG}" restore_${ID}_remove
+  StrCpy $2 $1 1
+  StrCmp $2 " " restore_${ID}_remove
+  StrCmp $2 "$\t" restore_${ID}_remove
+  StrCpy $2 $1 1 -1
+  StrCmp $2 " " restore_${ID}_remove
+  StrCmp $2 "$\t" restore_${ID}_remove
+  WriteRegStr HKCU "Software\Classes\${EXT}" "" "$1"
+  Goto restore_${ID}_done
+restore_${ID}_remove:
+  DeleteRegValue HKCU "Software\Classes\${EXT}" ""
+  DeleteRegKey /ifempty HKCU "Software\Classes\${EXT}"
+restore_${ID}_done:
+!macroend
 !define UNINST_KEY      "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}"
 !define APP_REG_KEY     "Software\q0idmation\${APP_NAME}"
 !ifndef APP_BINARY_DIR
@@ -130,6 +187,15 @@ q0editor_install_backup_done:
   WriteRegStr HKCU "Software\Classes\${PROG_ID}\shell\open\command" "" '"$INSTDIR\${APP_EXE}" "%1"'
   WriteRegStr HKCU "Software\Classes\${EXT}" "" "${PROG_ID}"
 
+  ; .q0l and .q0lang -> q0editor.Q0langSource, the same way
+  !insertmacro SaveForeignDefault ".q0l" "${Q0L_PROG_ID}" "${PREVIOUS_PROG_ID_VALUE}.q0l" q0l
+  !insertmacro SaveForeignDefault ".q0lang" "${Q0L_PROG_ID}" "${PREVIOUS_PROG_ID_VALUE}.q0lang" q0lang
+  WriteRegStr HKCU "Software\Classes\${Q0L_PROG_ID}" "" "${Q0L_PROG_FRIENDLY}"
+  WriteRegStr HKCU "Software\Classes\${Q0L_PROG_ID}\DefaultIcon" "" '"$INSTDIR\q0l.ico"'
+  WriteRegStr HKCU "Software\Classes\${Q0L_PROG_ID}\shell\open\command" "" '"$INSTDIR\${APP_EXE}" "%1"'
+  WriteRegStr HKCU "Software\Classes\.q0l" "" "${Q0L_PROG_ID}"
+  WriteRegStr HKCU "Software\Classes\.q0lang" "" "${Q0L_PROG_ID}"
+
   CreateDirectory "$SMPROGRAMS\q0s"
   CreateShortcut "$SMPROGRAMS\q0s\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}" "" "$INSTDIR\${APP_EXE}" 0
 
@@ -156,7 +222,7 @@ SectionEnd
 ;--------------------------------
 ; Component descriptions
 
-LangString DESC_SecEditor  ${LANG_ENGLISH} "Install q0editor and register .q1s with Windows."
+LangString DESC_SecEditor  ${LANG_ENGLISH} "Install q0editor and open .q1s projects and .q0l scripts with it."
 LangString DESC_SecDesktop ${LANG_ENGLISH} "Create a q0editor shortcut on the desktop."
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
@@ -193,6 +259,10 @@ q0editor_uninstall_remove_default:
 q0editor_uninstall_keep_foreign:
 q0editor_uninstall_association_done:
   DeleteRegKey HKCU "Software\Classes\${PROG_ID}"
+
+  !insertmacro RestoreForeignDefault ".q0l" "${Q0L_PROG_ID}" "${PREVIOUS_PROG_ID_VALUE}.q0l" q0l
+  !insertmacro RestoreForeignDefault ".q0lang" "${Q0L_PROG_ID}" "${PREVIOUS_PROG_ID_VALUE}.q0lang" q0lang
+  DeleteRegKey HKCU "Software\Classes\${Q0L_PROG_ID}"
 
   Delete "$INSTDIR\${APP_EXE}"
   Delete "$INSTDIR\q0editor.ico"
