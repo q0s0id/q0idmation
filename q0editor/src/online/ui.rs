@@ -1494,9 +1494,12 @@ impl Online {
             .id_source("online_join_code")
             .show(ui, |ui| {
                 ui.label(
-                    RichText::new("Members can paste a room code from the website or a friend.")
-                        .small()
-                        .color(pal.dim),
+                    RichText::new(
+                        "Paste a room code from a friend or the website to join as a viewer. \
+                         Owners can turn codes off on q0id.com.",
+                    )
+                    .small()
+                    .color(pal.dim),
                 );
                 // button first from the right, field fills the rest: subtracting a
                 // guessed button width made the window grow a little every frame
