@@ -1,12 +1,12 @@
 """
 Generates installer art for q0editor / q0player.
 
+The icons (.ico for the apps and file types, and the Android launcher
+pictures) come from build_icons.py instead, which needs Pillow and numpy;
+they are committed, so an installer build never redraws them.
+
 Produces, in ./assets/ next to this script:
 
-  q0editor.ico        multi-res icon (16/32/48), embedded into q0editor.exe via winres
-  q0player.ico        multi-res icon (16/32/48), embedded into q0player.exe via winres
-  q0s.ico             multi-res icon (16/32/48) for .q0s files in Explorer
-                      (decoded from ./source/q0s.png, if present)
   welcome-editor.bmp  164x314 24-bit BMP, NSIS MUI welcome/finish side panel
   welcome-player.bmp  164x314 24-bit BMP
   header-editor.bmp   150x57  24-bit BMP, NSIS MUI inner-page top banner
@@ -552,15 +552,7 @@ def build_q0s_icon_from_png():
 
 def main():
     print("building installer assets ->", ASSETS)
-    sizes = [16, 32, 48]
-    for kind in ("editor", "player"):
-        imgs = [(s, make_icon(s, kind)) for s in sizes]
-        path = ASSETS / f"q0{kind}.ico"
-        path.write_bytes(encode_ico(imgs))
-        print(f"  {path.name}  ({len(sizes)} sizes)")
-
-    build_q0s_icon_from_png()
-
+    # icons: python build_icons.py (committed; this script leaves them alone)
     for kind in ("editor", "player"):
         pix = make_welcome(164, 314, kind)
         path = ASSETS / f"welcome-{kind}.bmp"

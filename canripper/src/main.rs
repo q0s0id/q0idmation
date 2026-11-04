@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+include!(concat!(env!("OUT_DIR"), "/window_icon.rs"));
+
 use canripper::app::CanRipperApp;
 use canripper::{document::Document, extract::extract_document};
 
@@ -13,7 +15,8 @@ fn main() -> eframe::Result<()> {
     let viewport = egui::ViewportBuilder::default()
         .with_inner_size([1180.0, 760.0])
         .with_min_inner_size([720.0, 420.0])
-        .with_title("CanRipper");
+        .with_title("CanRipper")
+        .with_icon(q0_window_icon());
     let options = eframe::NativeOptions {
         viewport,
         ..Default::default()

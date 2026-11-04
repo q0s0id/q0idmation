@@ -24,6 +24,8 @@ struct AssociationSpec {
     prog_id: &'static str,
     friendly: &'static str,
     previous_value: &'static str,
+    /// An icon installed next to the exe; the exe's own icon when missing.
+    icon_file: &'static str,
 }
 
 const PROJECT_ASSOCIATION: AssociationSpec = AssociationSpec {
@@ -31,18 +33,21 @@ const PROJECT_ASSOCIATION: AssociationSpec = AssociationSpec {
     prog_id: PROJECT_PROG_ID,
     friendly: PROJECT_FRIENDLY,
     previous_value: PREVIOUS_PROG_ID_VALUE,
+    icon_file: "q1s.ico",
 };
 const Q0L_ASSOCIATION: AssociationSpec = AssociationSpec {
     extension: ".q0l",
     prog_id: Q0LANG_PROG_ID,
     friendly: Q0LANG_FRIENDLY,
     previous_value: PREVIOUS_Q0L_PROG_ID_VALUE,
+    icon_file: "q0l.ico",
 };
 const Q0LANG_ASSOCIATION: AssociationSpec = AssociationSpec {
     extension: ".q0lang",
     prog_id: Q0LANG_PROG_ID,
     friendly: Q0LANG_FRIENDLY,
     previous_value: PREVIOUS_Q0LANG_PROG_ID_VALUE,
+    icon_file: "q0l.ico",
 };
 const SHCNE_ASSOCCHANGED: i32 = 0x0800_0000;
 const SHCNF_IDLIST: u32 = 0;
@@ -248,8 +253,14 @@ fn register_spec(spec: AssociationSpec) -> std::io::Result<()> {
     }
 
     prog_key.set_value("", &spec.friendly)?;
+    let icon_value = exe
+        .parent()
+        .map(|directory| directory.join(spec.icon_file))
+        .filter(|path| path.is_file())
+        .map(|path| format!("\"{}\"", path.to_string_lossy()))
+        .unwrap_or_else(|| format!("\"{}\",0", exe_str));
     let (icon_key, _) = prog_key.create_subkey("DefaultIcon")?;
-    icon_key.set_value("", &format!("\"{}\",0", exe_str))?;
+    icon_key.set_value("", &icon_value)?;
     let (command_key, _) = prog_key.create_subkey("shell\\open\\command")?;
     command_key.set_value("", &format!("\"{}\" \"%1\"", exe_str))?;
 

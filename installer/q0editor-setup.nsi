@@ -89,6 +89,8 @@ Section "q0editor (required)" SecEditor
   SetOutPath "$INSTDIR"
   File "${APP_BINARY_DIR}\${APP_EXE}"
   File "assets\q0editor.ico"
+  File "assets\q1s.ico"
+  File "assets\q0l.ico"
   File "LICENSE.txt"
   File "..\q0fla\THIRD_PARTY_LICENSES.md"
 
@@ -124,7 +126,7 @@ q0editor_install_backup_done:
   ; .q1s -> q0editor.Project. Publish the shared extension default only after
   ; the private ProgID is ready.
   WriteRegStr HKCU "Software\Classes\${PROG_ID}" "" "${PROG_FRIENDLY}"
-  WriteRegStr HKCU "Software\Classes\${PROG_ID}\DefaultIcon" "" '"$INSTDIR\${APP_EXE}",0'
+  WriteRegStr HKCU "Software\Classes\${PROG_ID}\DefaultIcon" "" '"$INSTDIR\q1s.ico"'
   WriteRegStr HKCU "Software\Classes\${PROG_ID}\shell\open\command" "" '"$INSTDIR\${APP_EXE}" "%1"'
   WriteRegStr HKCU "Software\Classes\${EXT}" "" "${PROG_ID}"
 
@@ -194,6 +196,8 @@ q0editor_uninstall_association_done:
 
   Delete "$INSTDIR\${APP_EXE}"
   Delete "$INSTDIR\q0editor.ico"
+  Delete "$INSTDIR\q1s.ico"
+  Delete "$INSTDIR\q0l.ico"
   Delete "$INSTDIR\LICENSE.txt"
   Delete "$INSTDIR\THIRD_PARTY_LICENSES.md"
   Delete "$INSTDIR\Uninstall.exe"

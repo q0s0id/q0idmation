@@ -92,6 +92,7 @@ Section "q0player (required)" SecPlayer
   File "${APP_BINARY_DIR}\${APP_EXE}"
   File "assets\q0player.ico"
   File "assets\q0s.ico"
+  File "assets\q0v.ico"
   File "LICENSE.txt"
 
   ; Preserve and register .q0s -> q0player.Movie.
@@ -127,7 +128,7 @@ q0player_install_q0s_backup_done:
   WriteRegStr HKCU "Software\Classes\${Q0S_PROG_ID}\shell\open\command" "" '"$INSTDIR\${APP_EXE}" "%1"'
   WriteRegStr HKCU "Software\Classes\${Q0S_EXT}" "" "${Q0S_PROG_ID}"
 
-  ; Preserve and register .q0v -> q0player.Q0v. q0v uses the player exe icon.
+  ; Preserve and register .q0v -> q0player.Q0v, with an icon of its own.
   ReadRegStr $0 HKCU "Software\Classes\${Q0V_EXT}" ""
   StrCmp $0 "${Q0V_PROG_ID}" q0player_install_q0v_validate_saved
   StrCmp $0 "" q0player_install_q0v_clear_saved
@@ -156,7 +157,7 @@ q0player_install_q0v_clear_saved:
 
 q0player_install_q0v_backup_done:
   WriteRegStr HKCU "Software\Classes\${Q0V_PROG_ID}" "" "${Q0V_PROG_FRIENDLY}"
-  WriteRegStr HKCU "Software\Classes\${Q0V_PROG_ID}\DefaultIcon" "" '"$INSTDIR\${APP_EXE}",0'
+  WriteRegStr HKCU "Software\Classes\${Q0V_PROG_ID}\DefaultIcon" "" '"$INSTDIR\q0v.ico"'
   WriteRegStr HKCU "Software\Classes\${Q0V_PROG_ID}\shell\open\command" "" '"$INSTDIR\${APP_EXE}" "%1"'
   WriteRegStr HKCU "Software\Classes\${Q0V_EXT}" "" "${Q0V_PROG_ID}"
 
@@ -256,6 +257,7 @@ q0player_uninstall_q0v_done:
   Delete "$INSTDIR\${APP_EXE}"
   Delete "$INSTDIR\q0player.ico"
   Delete "$INSTDIR\q0s.ico"
+  Delete "$INSTDIR\q0v.ico"
   Delete "$INSTDIR\LICENSE.txt"
   Delete "$INSTDIR\Uninstall.exe"
   RMDir  "$INSTDIR"

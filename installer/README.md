@@ -35,7 +35,7 @@ files.
 - Rust target `x86_64-pc-windows-msvc` for x64 builds or `aarch64-pc-windows-msvc` for ARM64 builds;
 - Visual Studio C++ build tools for the selected target architecture;
 - Rust and Cargo with the `rustfmt` and `clippy` components;
-- Python 3.10 or newer for the generated icons and BMP files;
+- Python 3.10 or newer for the generated BMP files. The icons in `assets/` (apps and file types) and the Android launcher pictures are committed; redraw them with `python installer/build_icons.py`, which needs Pillow and numpy;
 - NSIS 3.x. The script also checks the standard NSIS install directories.
 - Git with a clean working tree whose current branch is pushed to `origin`.
 

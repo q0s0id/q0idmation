@@ -47,7 +47,7 @@ impl AssociationKind {
                 extension: ".q0v",
                 prog_id: "q0player.Q0v",
                 friendly: "q0v Media",
-                icon_file: None,
+                icon_file: Some("q0v.ico"),
             },
         }
     }

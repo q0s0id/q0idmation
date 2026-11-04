@@ -779,12 +779,14 @@ dependencies = [
  "lyon_path",
  "lyon_tessellation",
  "lzma-rs",
+ "q0icon",
  "q0s-format",
  "q0theme",
  "q0video",
  "rfd",
  "serde",
  "serde_json",
+ "winres",
 ]
 
 [[package]]
