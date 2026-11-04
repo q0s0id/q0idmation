@@ -1,12 +1,32 @@
 use egui::{Color32, ScrollArea, Ui};
 use q0s_format::transform::Affine;
 use q0s_format::v2::{
-    Asset, BlendMode, BlurFx, DropShadowFx, GlowFx, GradientFill, GradientKind, GradientStop,
-    PlacementFx, Q0rgPlayback, Q0rgPlaybackMode, Rgba, Stroke as VStroke, Target, VectorAppearance,
-    VectorAsset, VectorMaterial,
+    Asset, BlendMode, BlurFx, DropShadowFx, GlowFx, GradientFill, PlacementFx, Q0rgPlayback,
+    Q0rgPlaybackMode, Rgba, Stroke as VStroke, Target, VectorAppearance, VectorMaterial,
 };
 
 use crate::app::{Action, EditorApp};
+use crate::color_picker::PaintChange;
+
+/// The paint box for a tool's fill: its colour and gradient.
+fn tool_paint_box(
+    ui: &mut Ui,
+    color: &mut Rgba,
+    gradient: &mut Option<crate::paint::PaintGradient>,
+) {
+    let mut shown = rgba_to_color32(*color);
+    let (_, change) = crate::color_picker::paint_edit_button(ui, &mut shown, gradient);
+    if change == PaintChange::Color {
+        *color = color32_to_rgba(shown);
+    }
+    if let Some(first) = gradient.as_ref().and_then(|g| g.stops.first()) {
+        // the drawing's own colour follows the gradient's first stop, so a
+        // gradient turned off later leaves a colour from it
+        if change == PaintChange::Stops || change == PaintChange::Shape {
+            *color = first.color;
+        }
+    }
+}
 use crate::state::{BrushLibraryFilter, BrushSizePreview, PlacementRef, Selection, Tool};
 
 pub fn render(app: &mut EditorApp, ui: &mut Ui) {
@@ -562,8 +582,11 @@ type Restyle = Box<dyn Fn(&mut VStroke)>;
 /// Stroke and fill of the selected raw parts, editable in place.
 fn selected_stroke_properties(app: &mut EditorApp, ui: &mut Ui) {
     use q0s_format::geom::{CapShape, JoinShape};
-    let crate::tools::SelectedPaint { stroke, fill } =
-        crate::tools::selected_paint(&app.state.project, &app.session.selection);
+    let crate::tools::SelectedPaint {
+        stroke,
+        fill,
+        fill_gradient,
+    } = crate::tools::selected_paint(&app.state.project, &app.session.selection);
     let dim = app.settings.theme.text_dim.to_color32();
     if let Some((stroke, mixed)) = stroke {
         ui.add_space(8.0);
@@ -683,17 +706,22 @@ fn selected_stroke_properties(app: &mut EditorApp, ui: &mut Ui) {
         }
         let mut snapshot = false;
         let mut picked = None;
+        let mut gradient = fill_gradient;
+        let mut gradient_change = PaintChange::None;
         egui::Grid::new("selected_fill_style")
             .num_columns(2)
             .show(ui, |ui| {
-                ui.label("Color");
+                ui.label("Paint");
                 let mut shown = rgba_to_color32(color);
-                let response = crate::color_picker::color_edit_button_srgba(ui, &mut shown);
+                let (response, change) =
+                    crate::color_picker::paint_edit_button(ui, &mut shown, &mut gradient);
                 if response.gained_focus() || response.clicked() {
                     snapshot = true;
                 }
-                if response.changed() {
-                    picked = Some(color32_to_rgba(shown));
+                match change {
+                    PaintChange::Color => picked = Some(color32_to_rgba(shown)),
+                    PaintChange::Stops | PaintChange::Shape => gradient_change = change,
+                    PaintChange::None => {}
                 }
                 ui.end_row();
 
@@ -721,6 +749,15 @@ fn selected_stroke_properties(app: &mut EditorApp, ui: &mut Ui) {
         }
         if let Some(picked) = picked {
             crate::tools::set_selected_fill(app, picked);
+        }
+        if gradient_change != PaintChange::None {
+            crate::tools::paint_selected_fills(
+                app,
+                crate::tools::FillPaint::Gradient {
+                    pick: gradient.as_ref(),
+                    refit: gradient_change == PaintChange::Shape,
+                },
+            );
         }
     }
 }
@@ -1378,11 +1415,12 @@ fn brush_properties(app: &mut EditorApp, ui: &mut Ui) {
             egui::Grid::new("classic_brush_settings")
                 .num_columns(2)
                 .show(ui, |ui| {
-                    ui.label("Fill color");
-                    let mut color = rgba_to_color32(app.session.brush.color);
-                    if crate::color_picker::color_edit_button_srgba(ui, &mut color).changed() {
-                        app.session.brush.color = color32_to_rgba(color);
-                    }
+                    ui.label("Fill");
+                    tool_paint_box(
+                        ui,
+                        &mut app.session.brush.color,
+                        &mut app.session.brush_gradient,
+                    );
                     ui.end_row();
 
                     ui.label("Opacity");
@@ -1467,11 +1505,12 @@ fn brush_properties(app: &mut EditorApp, ui: &mut Ui) {
             egui::Grid::new("advanced_brush_settings")
                 .num_columns(2)
                 .show(ui, |ui| {
-                    ui.label("Color");
-                    let mut color = rgba_to_color32(app.session.advanced_brush.color);
-                    if crate::color_picker::color_edit_button_srgba(ui, &mut color).changed() {
-                        app.session.advanced_brush.color = color32_to_rgba(color);
-                    }
+                    ui.label("Paint");
+                    tool_paint_box(
+                        ui,
+                        &mut app.session.advanced_brush.color,
+                        &mut app.session.brush_gradient,
+                    );
                     ui.end_row();
 
                     ui.label("Opacity");
@@ -1829,11 +1868,8 @@ fn optional_fill_control(app: &mut EditorApp, ui: &mut Ui) {
     ui.end_row();
 
     if let Some(fill) = app.session.fill_color.as_mut() {
-        ui.label("Fill color");
-        let mut color = rgba_to_color32(*fill);
-        if crate::color_picker::color_edit_button_srgba(ui, &mut color).changed() {
-            *fill = color32_to_rgba(color);
-        }
+        ui.label("Fill paint");
+        tool_paint_box(ui, fill, &mut app.session.fill_gradient);
         ui.end_row();
 
         ui.label("Fill opacity");
@@ -1860,11 +1896,8 @@ fn fill_tool_properties(app: &mut EditorApp, ui: &mut Ui) {
     egui::Grid::new("bucket_fill_settings")
         .num_columns(2)
         .show(ui, |ui| {
-            ui.label("Fill color");
-            let mut color = rgba_to_color32(fill);
-            if crate::color_picker::color_edit_button_srgba(ui, &mut color).changed() {
-                fill = color32_to_rgba(color);
-            }
+            ui.label("Fill paint");
+            tool_paint_box(ui, &mut fill, &mut app.session.fill_gradient);
             ui.end_row();
 
             ui.label("Opacity");
@@ -1933,92 +1966,17 @@ fn color32_to_rgba(c: Color32) -> Rgba {
     Rgba { r, g, b, a }
 }
 
-fn default_gradient_for_vector(vector: &VectorAsset) -> GradientFill {
-    let mut min_x = f32::INFINITY;
-    let mut min_y = f32::INFINITY;
-    let mut max_x = f32::NEG_INFINITY;
-    let mut max_y = f32::NEG_INFINITY;
-    for path in &vector.paths {
-        for anchor in &path.anchors {
-            for point in std::iter::once(anchor.point)
-                .chain(anchor.in_handle)
-                .chain(anchor.out_handle)
-            {
-                min_x = min_x.min(point.x);
-                min_y = min_y.min(point.y);
-                max_x = max_x.max(point.x);
-                max_y = max_y.max(point.y);
-            }
-        }
-    }
-    if !min_x.is_finite() || !min_y.is_finite() || !max_x.is_finite() || !max_y.is_finite() {
-        min_x = -50.0;
-        min_y = -50.0;
-        max_x = 50.0;
-        max_y = 50.0;
-    }
-    let center_x = (min_x + max_x) * 0.5;
-    let center_y = (min_y + max_y) * 0.5;
-    let half_width = ((max_x - min_x) * 0.5).max(1.0);
-    let half_height = ((max_y - min_y) * 0.5).max(1.0);
-    GradientFill {
-        kind: GradientKind::Linear,
-        stops: vec![
-            GradientStop {
-                position: 0.0,
-                color: Rgba {
-                    r: 0,
-                    g: 0,
-                    b: 0,
-                    a: 255,
-                },
-            },
-            GradientStop {
-                position: 1.0,
-                color: Rgba {
-                    r: 255,
-                    g: 255,
-                    b: 255,
-                    a: 255,
-                },
-            },
-        ],
-        transform: Affine {
-            a11: half_width,
-            a12: 0.0,
-            a21: 0.0,
-            a22: half_height,
-            tx: center_x,
-            ty: center_y,
-        },
-    }
-}
-
-fn edit_gradient(ui: &mut Ui, id: u16, gradient: &mut GradientFill) -> bool {
+/// Where a gradient sits on its drawing, exactly. The paint box covers
+/// angle and size; this is for nudging its centre and axes by hand.
+fn edit_gradient_placement(ui: &mut Ui, gradient: &mut GradientFill) -> bool {
     let mut changed = false;
-    ui.label("Gradient type");
-    let previous = gradient.kind;
-    egui::ComboBox::from_id_source(format!("asset_gradient_kind_{id}"))
-        .selected_text(match gradient.kind {
-            GradientKind::Linear => "Linear",
-            GradientKind::Radial => "Radial",
-        })
-        .show_ui(ui, |ui| {
-            ui.selectable_value(&mut gradient.kind, GradientKind::Linear, "Linear");
-            ui.selectable_value(&mut gradient.kind, GradientKind::Radial, "Radial");
-        });
-    if gradient.kind != previous {
-        changed = true;
-    }
-    ui.end_row();
-
     let labels = [
-        ("Gradient X axis X", &mut gradient.transform.a11),
-        ("Gradient Y axis X", &mut gradient.transform.a12),
-        ("Gradient X axis Y", &mut gradient.transform.a21),
-        ("Gradient Y axis Y", &mut gradient.transform.a22),
-        ("Gradient center X", &mut gradient.transform.tx),
-        ("Gradient center Y", &mut gradient.transform.ty),
+        ("Centre X", &mut gradient.transform.tx),
+        ("Centre Y", &mut gradient.transform.ty),
+        ("X axis X", &mut gradient.transform.a11),
+        ("X axis Y", &mut gradient.transform.a21),
+        ("Y axis X", &mut gradient.transform.a12),
+        ("Y axis Y", &mut gradient.transform.a22),
     ];
     for (label, value) in labels {
         ui.label(label);
@@ -2026,80 +1984,6 @@ fn edit_gradient(ui: &mut Ui, id: u16, gradient: &mut GradientFill) -> bool {
             changed = true;
         }
         ui.end_row();
-    }
-
-    ui.label("Stops");
-    ui.vertical(|ui| {
-        let mut remove = None;
-        let can_remove = gradient.stops.len() > 2;
-        for (index, stop) in gradient.stops.iter_mut().enumerate() {
-            ui.horizontal(|ui| {
-                ui.label(format!("{}", index + 1));
-                if ui
-                    .add(
-                        egui::DragValue::new(&mut stop.position)
-                            .speed(0.01)
-                            .clamp_range(0.0..=1.0),
-                    )
-                    .changed()
-                {
-                    changed = true;
-                }
-                let mut color = rgba_to_color32(stop.color);
-                if crate::color_picker::color_edit_button_srgba(ui, &mut color).changed() {
-                    stop.color = color32_to_rgba(color);
-                    changed = true;
-                }
-                let mut alpha = stop.color.a;
-                ui.label("A");
-                if ui
-                    .add(egui::DragValue::new(&mut alpha).clamp_range(0..=255))
-                    .changed()
-                {
-                    stop.color.a = alpha;
-                    changed = true;
-                }
-                if crate::ui::icon_button_enabled(
-                    ui,
-                    can_remove,
-                    crate::ui::Icon::Delete,
-                    "Remove gradient stop",
-                )
-                .clicked()
-                {
-                    remove = Some(index);
-                }
-            });
-        }
-        if let Some(index) = remove {
-            gradient.stops.remove(index);
-            changed = true;
-        }
-        if gradient.stops.len() < 256 && ui.small_button("+ stop").clicked() {
-            let color = gradient
-                .stops
-                .last()
-                .map(|stop| stop.color)
-                .unwrap_or(Rgba {
-                    r: 255,
-                    g: 255,
-                    b: 255,
-                    a: 255,
-                });
-            gradient.stops.push(GradientStop {
-                position: 0.5,
-                color,
-            });
-            changed = true;
-        }
-    });
-    ui.end_row();
-    if changed {
-        gradient.stops.sort_by(|a, b| {
-            a.position
-                .partial_cmp(&b.position)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
     }
     changed
 }
@@ -2261,30 +2145,42 @@ fn asset_properties(app: &mut EditorApp, ui: &mut Ui, id: u16) {
                         };
                         dirty = true;
                     }
+                    let bounds = crate::paint::vector_bounds(v).unwrap_or((
+                        q0s_format::v2::Vec2::new(-50.0, -50.0),
+                        q0s_format::v2::Vec2::new(50.0, 50.0),
+                    ));
                     if let Some(fill) = v.fill.as_mut() {
                         let mut c = rgba_to_color32(*fill);
-                        if crate::color_picker::color_edit_button_srgba(ui, &mut c).changed() {
-                            *fill = color32_to_rgba(c);
-                            dirty = true;
+                        let mut pick = gradient
+                            .as_ref()
+                            .map(|g| crate::paint::PaintGradient::from_fill(g, Some(bounds)));
+                        let (_, change) =
+                            crate::color_picker::paint_edit_button(ui, &mut c, &mut pick);
+                        match change {
+                            PaintChange::None => {}
+                            PaintChange::Color => {
+                                *fill = color32_to_rgba(c);
+                                dirty = true;
+                            }
+                            PaintChange::Stops => {
+                                if let (Some(old), Some(pick)) = (gradient.as_mut(), pick.as_ref())
+                                {
+                                    old.stops = pick.stops.clone();
+                                }
+                                gradient_dirty = true;
+                            }
+                            PaintChange::Shape => {
+                                gradient = pick.map(|pick| pick.fit(bounds));
+                                gradient_dirty = true;
+                            }
                         }
                     } else if gradient.take().is_some() {
                         gradient_dirty = true;
                     }
                     ui.end_row();
 
-                    ui.label("Gradient");
-                    let mut has_gradient = gradient.is_some();
-                    if ui
-                        .add_enabled(v.fill.is_some(), egui::Checkbox::new(&mut has_gradient, ""))
-                        .changed()
-                    {
-                        gradient = has_gradient.then(|| default_gradient_for_vector(v));
-                        gradient_dirty = true;
-                    }
-                    ui.end_row();
-
                     if let Some(fill_gradient) = gradient.as_mut() {
-                        if edit_gradient(ui, id, fill_gradient) {
+                        if edit_gradient_placement(ui, fill_gradient) {
                             gradient_dirty = true;
                         }
                     }
@@ -3900,7 +3796,7 @@ mod tests {
         }
 
         assert!(painted_text.contains("Rectangle"));
-        assert!(painted_text.contains("Fill color"));
+        assert!(painted_text.contains("Fill paint"));
         assert!(painted_text.contains("Fill opacity"));
     }
 

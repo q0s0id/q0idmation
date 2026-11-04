@@ -26,6 +26,7 @@ pub mod library_transfer;
 pub mod lights;
 pub mod model_studio;
 pub mod online;
+pub mod paint;
 pub mod panels;
 pub mod particles;
 pub mod perf;

@@ -2333,6 +2333,10 @@ impl EditorApp {
 
     fn autosave_document(&self, tab: &DocumentTab) -> Option<crate::autosave::DocumentInfo> {
         use crate::autosave::{DocumentInfo, SnapshotKind};
+        if !self.online.may_keep_copy(Some(tab.id)) {
+            // no recovery copy of a room you may not keep
+            return None;
+        }
         match &tab.kind {
             DocumentKind::Project { workspace } => {
                 let state = if self.active_document_tab == Some(tab.id) && self.project_active {
@@ -3148,6 +3152,18 @@ impl EditorApp {
     }
 
     pub(crate) fn handle(&mut self, ctx: &Context, action: Action) {
+        if matches!(
+            &action,
+            Action::SaveProject
+                | Action::SaveProjectAs
+                | Action::CopySelection
+                | Action::CutSelection
+        ) && !self.active_document_is_q0lang()
+            && !self.online.may_keep_copy(self.active_project_tab_id())
+        {
+            self.session.status = crate::online::Online::NO_COPIES.to_string();
+            return;
+        }
         if self.online.editing_tab(self.active_project_tab_id())
             && matches!(&action, Action::Undo | Action::Redo)
         {

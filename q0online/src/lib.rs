@@ -64,6 +64,19 @@ pub struct RoomPolicy {
     pub admin_grants: Vec<Grant>,
     pub members_can_invite: bool,
     pub max_members: usize,
+    /// The lowest rank that may keep a copy of the project: save it, export
+    /// it or copy parts of it out of the room. Owners always may. Everyone
+    /// in a room receives the document to draw it, so this is what honest
+    /// editors enforce, not a lock a modified client could not pick.
+    #[serde(skip_serializing_if = "is_default_save_rank")]
+    pub save_rank: Rank,
+}
+fn is_default_save_rank(rank: &Rank) -> bool {
+    *rank == Rank::Editor
+}
+/// Whether this member may save, export or copy the room's project.
+pub fn may_keep_copy(policy: &RoomPolicy, member: &Member) -> bool {
+    !member.banned && (member.rank == Rank::Owner || member.rank >= policy.save_rank)
 }
 impl Default for RoomPolicy {
     /// New rooms let editors and admins edit everything. Owners narrow this to
@@ -80,6 +93,8 @@ impl Default for RoomPolicy {
             admin_grants: everything(),
             members_can_invite: false,
             max_members: 64,
+            // viewers watch; they don't walk off with the project
+            save_rank: Rank::Editor,
         }
     }
 }

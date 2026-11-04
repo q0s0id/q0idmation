@@ -3028,6 +3028,27 @@ fn room_settings(
             }
             ui.checkbox(&mut draft.members_can_invite, "Members may invite their friends (as viewers)");
             ui.horizontal(|ui| {
+                ui.label("Who may save a copy");
+                let label = |rank: Rank| match rank {
+                    Rank::Viewer => "everyone",
+                    Rank::Editor => "editors and up",
+                    Rank::Admin => "admins and you",
+                    Rank::Owner => "only you",
+                };
+                egui::ComboBox::from_id_source("room_save_rank")
+                    .selected_text(label(draft.save_rank))
+                    .show_ui(ui, |ui| {
+                        for rank in [Rank::Viewer, Rank::Editor, Rank::Admin, Rank::Owner] {
+                            ui.selectable_value(&mut draft.save_rank, rank, label(rank));
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Saving, exporting and copying layers or frames out of the room. \
+                         Everyone else can look and draw where they're allowed, but not keep the project.",
+                    );
+            });
+            ui.horizontal(|ui| {
                 ui.label("Member limit");
                 let current = room.members.len().max(1);
                 ui.add(egui::DragValue::new(&mut draft.max_members).clamp_range(current..=256));

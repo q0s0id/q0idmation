@@ -43,6 +43,173 @@ pub fn handle(
     view: &StageView,
     ctx: &Context,
 ) {
+    let paint = gradient_paint_begin(app);
+    handle_tool(app, response, painter, view, ctx);
+    if let Some(paint) = paint {
+        gradient_paint_end(app, paint);
+    }
+}
+
+/// Which colour the current tool paints fills with.
+#[derive(Clone, Copy)]
+enum PaintSlot {
+    Fill,
+    ClassicBrush,
+    AdvancedBrush,
+}
+
+fn paint_slot_color(app: &mut EditorApp, slot: PaintSlot) -> Option<&mut Rgba> {
+    match slot {
+        PaintSlot::Fill => app.session.fill_color.as_mut(),
+        PaintSlot::ClassicBrush => Some(&mut app.session.brush.color),
+        PaintSlot::AdvancedBrush => Some(&mut app.session.advanced_brush.color),
+    }
+}
+
+/// A tool painting with a gradient paints with a marker colour nothing else
+/// in the project has; whatever comes out in that colour gets the gradient,
+/// fitted to its own shape, and the real colour back. The tools stay
+/// unaware of gradients, and new shapes, bucket fills and brush strokes all
+/// work the same way.
+struct GradientPaint {
+    slot: PaintSlot,
+    real: Rgba,
+    marker: Rgba,
+    gradient: Option<crate::paint::PaintGradient>,
+}
+
+fn gradient_paint_begin(app: &mut EditorApp) -> Option<GradientPaint> {
+    let slot = match app.session.current_tool {
+        Tool::Pen | Tool::Pencil | Tool::Rectangle | Tool::Oval | Tool::Bucket => PaintSlot::Fill,
+        Tool::Brush => match app.session.brush_mode {
+            crate::advanced_brush::BrushMode::Classic => PaintSlot::ClassicBrush,
+            crate::advanced_brush::BrushMode::Advanced => PaintSlot::AdvancedBrush,
+        },
+        _ => return None,
+    };
+    let gradient = match slot {
+        PaintSlot::Fill => app.session.fill_gradient.clone(),
+        _ => app.session.brush_gradient.clone(),
+    };
+    // a solid bucket fill still has to take a gradient off what it paints
+    if gradient.is_none() && app.session.current_tool != Tool::Bucket {
+        return None;
+    }
+    let real = *paint_slot_color(app, slot)?;
+    let used: std::collections::HashSet<[u8; 4]> = app
+        .state
+        .project
+        .assets
+        .iter()
+        .filter_map(|asset| match asset {
+            Asset::Vector(vector) => vector.fill.map(|c| [c.r, c.g, c.b, c.a]),
+            _ => None,
+        })
+        .collect();
+    // the nearest colour nobody uses, so even the preview looks right
+    let marker = (1..=24i16)
+        .flat_map(|step| [step, -step])
+        .flat_map(|step| (0..3).map(move |channel| (step, channel)))
+        .find_map(|(step, channel)| {
+            let mut c = [real.r, real.g, real.b, real.a];
+            let moved = i16::from(c[channel]) + step;
+            if !(0..=255).contains(&moved) {
+                return None;
+            }
+            c[channel] = moved as u8;
+            (!used.contains(&c)).then_some(Rgba {
+                r: c[0],
+                g: c[1],
+                b: c[2],
+                a: c[3],
+            })
+        })?;
+    *paint_slot_color(app, slot)? = marker;
+    Some(GradientPaint {
+        slot,
+        real,
+        marker,
+        gradient,
+    })
+}
+
+fn gradient_paint_end(app: &mut EditorApp, paint: GradientPaint) {
+    if let Some(color) = paint_slot_color(app, paint.slot) {
+        if *color == paint.marker {
+            *color = paint.real;
+        }
+    }
+    let project = &mut app.state.project;
+    let mut painted = Vec::new();
+    for asset in &mut project.assets {
+        if let Asset::Vector(vector) = asset {
+            if vector.fill == Some(paint.marker) {
+                vector.fill = Some(paint.real);
+                painted.push((vector.asset_id, crate::paint::vector_bounds(vector)));
+            }
+        }
+    }
+    if painted.is_empty() {
+        return;
+    }
+    for (asset_id, bounds) in &painted {
+        match &paint.gradient {
+            Some(gradient) => {
+                let bounds = bounds.unwrap_or((Vec2::new(-50.0, -50.0), Vec2::new(50.0, 50.0)));
+                project
+                    .asset_appearances
+                    .entry(*asset_id)
+                    .or_insert_with(plain_appearance)
+                    .fill_gradient = Some(gradient.fit(bounds));
+            }
+            None => {
+                clear_fill_gradient(project, *asset_id);
+            }
+        }
+    }
+    app.textures
+        .invalidate_assets(painted.iter().map(|(asset_id, _)| *asset_id));
+    app.state.mark_dirty();
+}
+
+fn plain_appearance() -> q0s_format::v2::VectorAppearance {
+    q0s_format::v2::VectorAppearance {
+        material: q0s_format::v2::VectorMaterial::Solid,
+        erase_mask: Vec::new(),
+        material_source: Vec::new(),
+        clip_mask: Vec::new(),
+        field_transform: Affine::IDENTITY,
+        fill_gradient: None,
+    }
+}
+
+/// Takes a drawing's gradient off, and its appearance with it once nothing
+/// else is left in it. Says whether there was one.
+fn clear_fill_gradient(project: &mut ProjectV2, asset_id: u16) -> bool {
+    let Some(appearance) = project.asset_appearances.get_mut(&asset_id) else {
+        return false;
+    };
+    if appearance.fill_gradient.take().is_none() {
+        return false;
+    }
+    if *appearance
+        == (q0s_format::v2::VectorAppearance {
+            fill_gradient: None,
+            ..plain_appearance()
+        })
+    {
+        project.asset_appearances.remove(&asset_id);
+    }
+    true
+}
+
+fn handle_tool(
+    app: &mut EditorApp,
+    response: &Response,
+    painter: &Painter,
+    view: &StageView,
+    ctx: &Context,
+) {
     // Temporary H/Space hand and MMB pan own the gesture completely. Do not
     // let the underlying brush/select/etc. observe the same primary events.
     // Any gesture that was already being drawn still lives in stage space,
@@ -12178,6 +12345,8 @@ fn fill_for_path_ref(project: &ProjectV2, reference: PathRef) -> Option<Rgba> {
 pub(crate) struct SelectedPaint {
     pub stroke: Option<(VStroke, bool)>,
     pub fill: Option<(Rgba, bool)>,
+    /// the first selected fill's gradient, if it has one
+    pub fill_gradient: Option<crate::paint::PaintGradient>,
 }
 
 pub(crate) fn selected_paint(project: &ProjectV2, selection: &Selection) -> SelectedPaint {
@@ -12196,13 +12365,51 @@ pub(crate) fn selected_paint(project: &ProjectV2, selection: &Selection) -> Sele
     let fill = fill_colors
         .next()
         .map(|first| (first, fill_colors.any(|other| other != first)));
-    SelectedPaint { stroke, fill }
+    let fill_gradient = fills.first().and_then(|reference| {
+        let asset_id = raw_placement_asset_id(
+            project,
+            reference.q0rg_id,
+            reference.layer_id,
+            reference.placement_idx,
+        )?;
+        let gradient = project
+            .asset_appearances
+            .get(&asset_id)?
+            .fill_gradient
+            .as_ref()?;
+        let bounds = match project.assets.iter().find(|asset| asset.id() == asset_id) {
+            Some(Asset::Vector(vector)) => crate::paint::vector_bounds(vector),
+            _ => None,
+        };
+        Some(crate::paint::PaintGradient::from_fill(gradient, bounds))
+    });
+    SelectedPaint {
+        stroke,
+        fill,
+        fill_gradient,
+    }
+}
+
+/// What to paint the selected fills with.
+pub(crate) enum FillPaint<'a> {
+    /// a colour, which also takes a gradient off
+    Color(Rgba),
+    /// `None` takes the gradient off. `refit` places it on each drawing
+    /// afresh; otherwise only its colours change and it stays where it sits.
+    Gradient {
+        pick: Option<&'a crate::paint::PaintGradient>,
+        refit: bool,
+    },
 }
 
 /// Changes the fill of the selected raw parts. Parts sharing a drawing
 /// with others, or with an outline that is not selected, are lifted into
 /// their own first, so only what is selected changes.
 pub(crate) fn set_selected_fill(app: &mut EditorApp, color: Rgba) -> bool {
+    paint_selected_fills(app, FillPaint::Color(color))
+}
+
+pub(crate) fn paint_selected_fills(app: &mut EditorApp, paint: FillPaint) -> bool {
     let selection = app.session.selection.clone();
     let (fills, strokes, segments) = selection_paint_parts(&app.state.project, &selection);
     if fills.is_empty() {
@@ -12239,17 +12446,51 @@ pub(crate) fn set_selected_fill(app: &mut EditorApp, color: Rgba) -> bool {
         })
         .collect();
     let mut changed = false;
+    let project = &mut app.state.project;
     for asset_id in &asset_ids {
-        if let Some(Asset::Vector(vector)) = app
-            .state
-            .project
+        let Some(Asset::Vector(vector)) = project
             .assets
             .iter_mut()
             .find(|asset| asset.id() == *asset_id)
-        {
-            if vector.fill.is_some_and(|fill| fill != color) {
-                vector.fill = Some(color);
-                changed = true;
+        else {
+            continue;
+        };
+        if vector.fill.is_none() {
+            continue;
+        }
+        match &paint {
+            FillPaint::Color(color) => {
+                if vector.fill != Some(*color) {
+                    vector.fill = Some(*color);
+                    changed = true;
+                }
+                changed |= clear_fill_gradient(project, *asset_id);
+            }
+            FillPaint::Gradient { pick: None, .. } => {
+                changed |= clear_fill_gradient(project, *asset_id);
+            }
+            FillPaint::Gradient {
+                pick: Some(pick),
+                refit,
+            } => {
+                let bounds = crate::paint::vector_bounds(vector)
+                    .unwrap_or((Vec2::new(-50.0, -50.0), Vec2::new(50.0, 50.0)));
+                let appearance = project
+                    .asset_appearances
+                    .entry(*asset_id)
+                    .or_insert_with(plain_appearance);
+                let fill = match (&appearance.fill_gradient, refit) {
+                    (Some(old), false) if old.kind == pick.kind => q0s_format::v2::GradientFill {
+                        kind: pick.kind,
+                        stops: pick.stops.clone(),
+                        transform: old.transform,
+                    },
+                    _ => pick.fit(bounds),
+                };
+                if appearance.fill_gradient.as_ref() != Some(&fill) {
+                    appearance.fill_gradient = Some(fill);
+                    changed = true;
+                }
             }
         }
     }
@@ -29754,6 +29995,69 @@ mod sprite_tests {
             out.x > 20.0 && into.x < 80.0,
             "no steep shoulders: {out:?} {into:?}"
         );
+    }
+
+    #[test]
+    fn a_bucket_paints_its_gradient_and_a_solid_fill_takes_it_off() {
+        let mut app = blank_app();
+        filled_square(&mut app);
+        let red = Rgba {
+            r: 200,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        app.session.current_tool = Tool::Bucket;
+        app.session.fill_color = Some(red);
+        let pick =
+            crate::paint::PaintGradient::preset(0, q0s_format::v2::GradientKind::Linear, 0.0);
+        app.session.fill_gradient = Some(pick.clone());
+        let paint = gradient_paint_begin(&mut app).unwrap();
+        assert_ne!(
+            app.session.fill_color,
+            Some(red),
+            "the tool paints a marker"
+        );
+        assert!(bucket_fill_at(&mut app, Vec2::new(50.0, 50.0)));
+        gradient_paint_end(&mut app, paint);
+        assert_eq!(app.session.fill_color, Some(red));
+        let filled = drawings(&app)
+            .into_iter()
+            .find(|vector| vector.fill == Some(red))
+            .expect("the fill keeps the real colour");
+        let gradient = app.state.project.asset_appearances[&filled.asset_id]
+            .fill_gradient
+            .clone()
+            .expect("and gets the gradient");
+        assert_eq!(gradient.stops, pick.stops);
+        // fitted to the square: its left edge starts the gradient
+        assert!(gradient.position_at(Vec2::new(20.0, 50.0)).unwrap() < 0.01);
+        assert_eq!(
+            selected_paint(
+                &app.state.project,
+                &selection_at_point_pub(&app.state.project, 1, 0, Vec2::new(50.0, 50.0)).unwrap()
+            )
+            .fill_gradient
+            .map(|pick| pick.stops),
+            Some(pick.stops)
+        );
+
+        app.session.fill_gradient = None;
+        app.session.fill_color = Some(Rgba {
+            r: 0,
+            g: 0,
+            b: 200,
+            a: 255,
+        });
+        let paint = gradient_paint_begin(&mut app).unwrap();
+        assert!(bucket_fill_at(&mut app, Vec2::new(50.0, 50.0)));
+        gradient_paint_end(&mut app, paint);
+        assert!(drawings(&app).iter().all(|vector| !app
+            .state
+            .project
+            .asset_appearances
+            .get(&vector.asset_id)
+            .is_some_and(|appearance| appearance.fill_gradient.is_some())));
     }
 
     #[test]

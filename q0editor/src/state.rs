@@ -1077,6 +1077,10 @@ pub struct Session {
     pub stroke_color: Rgba,
     pub stroke_width: f32,
     pub fill_color: Option<Rgba>,
+    /// The fill's gradient when it is one: shapes, pen, pencil and bucket.
+    pub fill_gradient: Option<crate::paint::PaintGradient>,
+    /// The brushes' gradient when they paint one.
+    pub brush_gradient: Option<crate::paint::PaintGradient>,
     pub brush: BrushSettings,
     pub brush_mode: BrushMode,
     pub advanced_brush: AdvancedBrushSettings,
@@ -1334,6 +1338,8 @@ impl Session {
             },
             stroke_width: 1.0,
             fill_color: None,
+            fill_gradient: None,
+            brush_gradient: None,
             brush: BrushSettings::default(),
             brush_mode: BrushMode::Classic,
             advanced_brush: AdvancedBrushSettings::default(),

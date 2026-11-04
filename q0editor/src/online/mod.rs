@@ -412,6 +412,17 @@ impl Online {
             .as_ref()
             .is_some_and(|room| room.local_locks.contains(&(q0rg_id, layer_id)))
     }
+    /// Whether you may keep a copy of `tab`: save, export or copy out of it.
+    /// Always true outside a room; in one, the owner decides who may.
+    pub(crate) fn may_keep_copy(&self, tab: Option<u64>) -> bool {
+        let Some(room) = self.room.as_ref().filter(|room| Some(room.tab_id) == tab) else {
+            return true;
+        };
+        room.member(self.actor())
+            .is_some_and(|member| q0online::may_keep_copy(&room.policy, member))
+    }
+    pub(crate) const NO_COPIES: &'static str =
+        "the room's owner doesn't let you save, export or copy this project";
     pub(crate) fn editing_tab(&self, tab: Option<u64>) -> bool {
         self.room
             .as_ref()
@@ -419,6 +430,11 @@ impl Online {
     }
     fn remember_rejected(&mut self, app: &mut EditorApp, project: ProjectV2) {
         if self.rejected_drafts.last() == Some(&project) {
+            return;
+        }
+        let tab = self.room.as_ref().map(|room| room.tab_id);
+        if !self.may_keep_copy(tab) {
+            // a refused draft is the whole project; no copy of it on disk
             return;
         }
         app.autosave.preserve_online_change(project.clone());
@@ -1486,6 +1502,40 @@ mod tests {
         regression_tick(&mut app);
         assert!(!app.state.project.layer_is_locked(q0rg, layer));
         assert_eq!(app.state.project, before);
+    }
+
+    #[test]
+    fn people_the_owner_does_not_trust_cannot_keep_the_project() {
+        let mut app = regression_room_app();
+        regression_tick(&mut app);
+        let tab = app.active_project_tab_id();
+        assert!(app.online.may_keep_copy(tab), "owners always may");
+        let room = app.online.room.as_mut().unwrap();
+        room.members[0].rank = Rank::Viewer;
+        assert!(!app.online.may_keep_copy(tab), "viewers may not by default");
+        assert!(
+            app.autosave_documents()
+                .iter()
+                .all(|document| Some(document.tab_id) != tab),
+            "and nothing of it goes to disk in recovery"
+        );
+        let dirty = app.state.dirty;
+        app.handle(&Context::default(), Action::SaveProject);
+        app.handle(&Context::default(), Action::CopySelection);
+        assert_eq!(app.session.status, Online::NO_COPIES);
+        assert_eq!(app.state.dirty, dirty);
+        let room = app.online.room.as_mut().unwrap();
+        room.members[0].rank = Rank::Editor;
+        assert!(app.online.may_keep_copy(tab));
+        app.online.room.as_mut().unwrap().policy.save_rank = Rank::Owner;
+        assert!(
+            !app.online.may_keep_copy(tab),
+            "an owner can keep it to themselves"
+        );
+        assert!(
+            app.online.may_keep_copy(None),
+            "your own projects are yours"
+        );
     }
 
     #[test]

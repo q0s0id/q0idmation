@@ -2418,6 +2418,52 @@ fn timeline_layer_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
         begin_layer_rename(app, q0rg_id, layer_id);
         ui.close_menu();
     }
+    // whole layers through the clipboard, for hands without Ctrl+C
+    let in_selection = app
+        .session
+        .timeline_layer_selection
+        .is_some_and(|selection| {
+            selection.anchor_layer_id == layer_id || selection.focus_layer_id == layer_id
+        });
+    let select_layers = |app: &mut EditorApp| {
+        if !in_selection {
+            app.session.timeline_layer_selection =
+                Some(crate::state::TimelineLayerSelection::single(layer_id));
+        }
+        app.session.timeline_selection = None;
+        app.session.timeline_cell_selection = None;
+    };
+    ui.horizontal(|ui| {
+        if ui
+            .button("Copy")
+            .on_hover_text("Copy the layer with all its frames")
+            .clicked()
+        {
+            select_layers(app);
+            app.queue(Action::CopySelection);
+            ui.close_menu();
+        }
+        if ui.button("Cut").clicked() {
+            select_layers(app);
+            app.queue(Action::CutSelection);
+            ui.close_menu();
+        }
+        if ui
+            .button("Paste")
+            .on_hover_text("Paste copied layers above this one")
+            .clicked()
+        {
+            app.queue(Action::Paste);
+            ui.close_menu();
+        }
+        if ui.button("Duplicate").clicked() {
+            select_layers(app);
+            app.queue(Action::CopySelection);
+            app.queue(Action::Paste);
+            ui.close_menu();
+        }
+    });
+    ui.separator();
     if ui.button("Move up").clicked() {
         app.queue(Action::MoveLayer(q0rg_id, layer_id, -1));
         ui.close_menu();

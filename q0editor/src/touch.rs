@@ -185,6 +185,7 @@ pub(crate) fn back(app: &mut EditorApp, ctx: &Context) {
     let dismissable = app.touch.menu_open
         || app.text_field_focused
         || app.session.text_editor.is_some()
+        || !matches!(app.session.selection, crate::state::Selection::None)
         || ctx.memory(|memory| memory.any_popup_open())
         || !matches!(app.session.tool_state, crate::state::ToolState::Idle);
     if dismissable {
@@ -249,7 +250,106 @@ pub(crate) fn workspace(app: &mut EditorApp, ctx: &Context) {
         .frame(egui::Frame::none())
         .show(ctx, |ui| crate::panels::stage::render(app, ui));
     drawer(app, ctx, free);
+    selection_bar(app, ctx, free);
     status_toast(app, ctx, free);
+}
+
+/// What a selection can do, over the canvas: Ctrl+C, Ctrl+V, Delete and
+/// the rest of the keyboard's selection keys, for a phone that has none.
+fn selection_bar(app: &mut EditorApp, ctx: &Context, free: Rect) {
+    let selected = !matches!(app.session.selection, crate::state::Selection::None);
+    let can_paste = app.session.clipboard.is_some();
+    let selecting = matches!(
+        app.session.current_tool,
+        crate::state::Tool::Select | crate::state::Tool::Lasso | crate::state::Tool::Subselect
+    );
+    if !selected && !(can_paste && selecting) {
+        return;
+    }
+    if app.touch.drawer != Drawer::Closed || app.touch.menu_open {
+        return;
+    }
+    let mut actions: Vec<(&str, &str, Action)> = Vec::new();
+    if selected {
+        actions.push(("Copy", "Copy the selection", Action::CopySelection));
+        actions.push(("Cut", "Cut the selection", Action::CutSelection));
+    }
+    if can_paste {
+        actions.push(("Paste", "Paste in the middle of the view", Action::Paste));
+    }
+    if selected {
+        actions.push((
+            "Duplicate",
+            "Copy it next to itself",
+            Action::DuplicateSelection,
+        ));
+        actions.push(("Delete", "Delete the selection", Action::DeleteSelection));
+    }
+    egui::Area::new(egui::Id::new("touch_selection_bar"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::pos2(free.center().x, free.top() + 8.0))
+        .pivot(egui::Align2::CENTER_TOP)
+        .constrain(true)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().button_padding = vec2(12.0, 9.0);
+                    for (label, hint, action) in actions {
+                        if ui.button(label).on_hover_text(hint).clicked() {
+                            app.queue(action);
+                        }
+                    }
+                    if !selected {
+                        return;
+                    }
+                    ui.menu_button("More", |ui| {
+                        ui.spacing_mut().button_padding = vec2(12.0, 9.0);
+                        for (label, action) in [
+                            ("Paste in place", Action::PasteInPlace),
+                            ("Convert to symbol", Action::ConvertSelectionToQ0rg),
+                            ("Break apart", Action::BreakApartSelection),
+                            ("Flip horizontal", Action::FlipHorizontal),
+                            ("Flip vertical", Action::FlipVertical),
+                            ("Bring forward", Action::BringForward),
+                            ("Send backward", Action::SendBackward),
+                        ] {
+                            if ui.button(label).clicked() {
+                                app.queue(action);
+                                ui.close_menu();
+                            }
+                        }
+                        ui.separator();
+                        // the arrow keys' nudge; the Shift latch takes the bigger step
+                        let step = if app.touch.modifiers.shift {
+                            app.settings.nudge.shift_step
+                        } else {
+                            app.settings.nudge.step
+                        };
+                        ui.label(egui::RichText::new(format!("Nudge by {step} px")).small());
+                        ui.horizontal(|ui| {
+                            for (arrow, x, y) in [
+                                ("←", -1.0, 0.0),
+                                ("↑", 0.0, -1.0),
+                                ("↓", 0.0, 1.0),
+                                ("→", 1.0, 0.0),
+                            ] {
+                                if ui.button(arrow).clicked() {
+                                    crate::tools::nudge_selection(
+                                        app,
+                                        q0s_format::v2::Vec2::new(x * step, y * step),
+                                    );
+                                }
+                            }
+                        });
+                        ui.separator();
+                        if ui.button("Deselect").clicked() {
+                            app.session.selection = crate::state::Selection::None;
+                            ui.close_menu();
+                        }
+                    });
+                });
+            });
+        });
 }
 
 /// Latching stand-ins for the modifier keys that tools read while dragging.

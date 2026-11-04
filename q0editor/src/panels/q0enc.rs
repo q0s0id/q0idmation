@@ -305,6 +305,13 @@ pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
     if clear_finished_requested {
         app.q0enc.clear_finished();
     }
+    if (enqueue_requested || export_now_requested)
+        && !app.online.may_keep_copy(app.active_project_tab_id())
+    {
+        app.session.status = crate::online::Online::NO_COPIES.to_string();
+        enqueue_requested = false;
+        export_now_requested = false;
+    }
     if enqueue_requested || export_now_requested {
         match app.q0enc.enqueue(&app.state.project) {
             Ok(id) => {
