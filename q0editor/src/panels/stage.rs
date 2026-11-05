@@ -830,6 +830,9 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
         }
         let selection_started = std::time::Instant::now();
         crate::tools::draw_selection_overlay(app, &painter, &view);
+        if interactive {
+            crate::tween_tools::draw_motion_paths(app, &painter, &view);
+        }
         app.perf.record(
             crate::perf::PerfSpan::SelectionOverlay,
             selection_started.elapsed(),
@@ -895,52 +898,137 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
         .record(crate::perf::PerfSpan::Stage, stage_started.elapsed());
 }
 
+/// Which part of the camera frame `pointer` is on: a corner zooms it, just
+/// outside a corner turns it, anywhere else moves it.
+fn camera_drag_mode(
+    corners: &[egui::Pos2; 4],
+    pointer: egui::Pos2,
+) -> crate::state::CameraDragMode {
+    let nearest = corners
+        .iter()
+        .map(|corner| corner.distance(pointer))
+        .fold(f32::INFINITY, f32::min);
+    if nearest <= 9.0 {
+        crate::state::CameraDragMode::Zoom
+    } else if nearest <= 28.0 && !camera_frame_contains(corners, pointer) {
+        crate::state::CameraDragMode::Rotate
+    } else {
+        crate::state::CameraDragMode::Move
+    }
+}
+
+fn camera_frame_contains(corners: &[egui::Pos2; 4], point: egui::Pos2) -> bool {
+    let mut sign = 0.0_f32;
+    for index in 0..4 {
+        let a = corners[index];
+        let b = corners[(index + 1) % 4];
+        let cross = (b.x - a.x) * (point.y - a.y) - (b.y - a.y) * (point.x - a.x);
+        if cross.abs() < 1.0e-6 {
+            continue;
+        }
+        if sign == 0.0 {
+            sign = cross.signum();
+        } else if cross.signum() != sign {
+            return false;
+        }
+    }
+    true
+}
+
+/// The camera track selected: drag its frame on stage to move, zoom (its
+/// corners) or turn it (just outside them). The key this makes inside a
+/// camera tween splits it, so the camera keeps moving on to the next key.
+/// Space and the middle button still pan the view, never the camera.
 fn handle_camera_stage_input(
     app: &mut EditorApp,
     response: &egui::Response,
     view: &StageView,
     ctx: &egui::Context,
 ) {
-    if response.drag_started_by(PointerButton::Primary) {
-        app.history
-            .snapshot_with_session(&app.state.project, &app.session);
-    }
-    if !response.dragged_by(PointerButton::Primary) {
-        return;
-    }
-    let delta = ctx.input(|input| input.pointer.delta());
-    if !delta.x.is_finite() || !delta.y.is_finite() || delta == egui::Vec2::ZERO {
+    let panning = app.session.viewport.hand_active
+        || app.session.viewport.panning
+        || ctx.input(|input| input.key_down(Key::Space) || input.pointer.middle_down());
+    if panning {
+        app.session.camera_stage_drag = None;
         return;
     }
     let frame = app.session.current_frame;
-    let state = app.state.project.camera_state_at(frame);
-    if !app.state.project.runtime.camera.has_keyframe(frame) {
-        for key in &mut app.state.project.runtime.camera.keys {
-            if key.frame < frame
-                && key
-                    .tween
-                    .to_frame()
-                    .is_some_and(|to_frame| frame <= to_frame)
-            {
-                key.tween = key.tween.with_to_frame(frame);
-            }
-        }
-        app.state
-            .project
-            .runtime
-            .camera
-            .keys
-            .push(q0s_format::v2::CameraKey {
-                frame,
-                state,
-                tween: q0s_format::v2::Tween::None,
+    let corners = camera_viewport_corners(app, view, frame);
+    if app.session.camera_stage_drag.is_none() {
+        if let Some(hover) = response.hover_pos() {
+            ctx.set_cursor_icon(match camera_drag_mode(&corners, hover) {
+                crate::state::CameraDragMode::Move => egui::CursorIcon::Grab,
+                crate::state::CameraDragMode::Zoom => egui::CursorIcon::ResizeNwSe,
+                crate::state::CameraDragMode::Rotate => egui::CursorIcon::Alias,
             });
-        app.state
-            .project
-            .runtime
-            .camera
-            .keys
-            .sort_by_key(|key| key.frame);
+        }
+    }
+    if response.drag_started_by(PointerButton::Primary) {
+        let press = ctx
+            .input(|input| input.pointer.press_origin())
+            .or_else(|| response.interact_pointer_pos());
+        if let Some(press) = press {
+            let state = app.state.project.camera_state_at(frame);
+            let center =
+                view.stage_to_screen(q0s_format::v2::Vec2::new(state.center_x, state.center_y));
+            app.history
+                .snapshot_with_session(&app.state.project, &app.session);
+            app.state.project.runtime.camera.insert_key(frame, state);
+            app.state.mark_dirty();
+            app.session.camera_stage_drag = Some(crate::state::CameraStageDrag {
+                mode: camera_drag_mode(&corners, press),
+                start: state,
+                press: (press.x, press.y),
+                center: (center.x, center.y),
+            });
+        }
+    }
+    let Some(drag) = app.session.camera_stage_drag else {
+        return;
+    };
+    if !response.dragged_by(PointerButton::Primary) {
+        if !ctx.input(|input| input.pointer.primary_down()) {
+            app.session.camera_stage_drag = None;
+        }
+        return;
+    }
+    let Some(pointer) = ctx.input(|input| input.pointer.latest_pos()) else {
+        return;
+    };
+    let press = pos2(drag.press.0, drag.press.1);
+    let center = pos2(drag.center.0, drag.center.1);
+    let mut state = drag.start;
+    match drag.mode {
+        crate::state::CameraDragMode::Move => {
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            let from = view.screen_to_stage(press);
+            let to = view.screen_to_stage(pointer);
+            state.center_x += to.x - from.x;
+            state.center_y += to.y - from.y;
+        }
+        crate::state::CameraDragMode::Zoom => {
+            ctx.set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+            let before = press.distance(center).max(1.0);
+            let now = pointer.distance(center).max(1.0);
+            state.zoom = (drag.start.zoom * before / now).clamp(0.02, 64.0);
+        }
+        crate::state::CameraDragMode::Rotate => {
+            ctx.set_cursor_icon(egui::CursorIcon::Alias);
+            let angle = |point: egui::Pos2| (point.y - center.y).atan2(point.x - center.x);
+            let mut turn = angle(pointer) - angle(press);
+            if ctx.input(|input| input.modifiers.shift) {
+                let step = std::f32::consts::PI / 12.0;
+                turn = ((drag.start.rotation + turn) / step).round() * step - drag.start.rotation;
+            }
+            state.rotation = drag.start.rotation + turn;
+        }
+    }
+    if !(state.center_x.is_finite()
+        && state.center_y.is_finite()
+        && state.zoom.is_finite()
+        && state.rotation.is_finite())
+    {
+        return;
     }
     if let Some(key) = app
         .state
@@ -951,14 +1039,21 @@ fn handle_camera_stage_input(
         .iter_mut()
         .find(|key| key.frame == frame)
     {
-        let stage_origin = view.screen_to_stage(pos2(0.0, 0.0));
-        let stage_end = view.screen_to_stage(pos2(delta.x, delta.y));
-        let stage_delta =
-            q0s_format::v2::Vec2::new(stage_end.x - stage_origin.x, stage_end.y - stage_origin.y);
-        key.state.center_x += stage_delta.x;
-        key.state.center_y += stage_delta.y;
+        key.state = state;
         app.state.mark_dirty();
-        app.session.status = format!("camera moved at frame {}", frame + 1);
+        app.session.status = match drag.mode {
+            crate::state::CameraDragMode::Move => format!("camera moved at frame {}", frame + 1),
+            crate::state::CameraDragMode::Zoom => format!(
+                "camera zoom {:.0}% at frame {}",
+                state.zoom * 100.0,
+                frame + 1
+            ),
+            crate::state::CameraDragMode::Rotate => format!(
+                "camera turned {:.0}\u{b0} at frame {}",
+                state.rotation.to_degrees(),
+                frame + 1
+            ),
+        };
     }
 }
 

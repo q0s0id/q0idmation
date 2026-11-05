@@ -726,10 +726,10 @@ fn render_tween_controls(
         .iter()
         .map(|(target, _, _)| *target)
         .collect::<Vec<_>>();
-    let mut requested = None;
+    let mut requested = crate::tween_tools::render_tween_extras(app, ui, &records, common_easing);
     let mut remove = false;
     ui.horizontal_wrapped(|ui| {
-        ui.menu_button("Built-in presets", |ui| {
+        ui.menu_button("More curves", |ui| {
             if ui.button("Linear").clicked() {
                 requested = Some(Easing::Linear);
                 ui.close_menu();

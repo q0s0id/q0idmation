@@ -2733,6 +2733,7 @@ fn advanced_brush(app: &mut EditorApp, response: &Response, view: &StageView, ct
         if let ToolState::AdvancedBrushDrawing { stroke } =
             std::mem::replace(&mut app.session.tool_state, ToolState::Idle)
         {
+            let start = stroke.samples.first().map(|sample| sample.position);
             let region = crate::advanced_brush::advanced_finish(stroke);
             let classic_bridge = crate::brush::BrushSettings {
                 color: settings.color,
@@ -2743,9 +2744,10 @@ fn advanced_brush(app: &mut EditorApp, response: &Response, view: &StageView, ct
                 sync_with_eraser: app.session.brush.sync_with_eraser,
                 ..crate::brush::BrushSettings::default()
             };
-            crate::brush::commit_brush_region_with_material(
+            commit_brush_stroke(
                 app,
                 region,
+                start,
                 classic_bridge,
                 advanced_material(settings),
             );
@@ -2762,12 +2764,10 @@ fn advanced_brush(app: &mut EditorApp, response: &Response, view: &StageView, ct
             .or_else(|| response.hover_pos())
         {
             let time = ctx.input(|input| input.time);
+            let start = screen_to_stage(screen, view);
             let stroke = crate::advanced_brush::advanced_begin(
                 settings,
-                crate::advanced_brush::AdvancedBrushSample::mouse(
-                    screen_to_stage(screen, view),
-                    time,
-                ),
+                crate::advanced_brush::AdvancedBrushSample::mouse(start, time),
             );
             let region = crate::advanced_brush::advanced_finish(stroke);
             let classic_bridge = crate::brush::BrushSettings {
@@ -2779,9 +2779,10 @@ fn advanced_brush(app: &mut EditorApp, response: &Response, view: &StageView, ct
                 sync_with_eraser: app.session.brush.sync_with_eraser,
                 ..crate::brush::BrushSettings::default()
             };
-            crate::brush::commit_brush_region_with_material(
+            commit_brush_stroke(
                 app,
                 region,
+                Some(start),
                 classic_bridge,
                 advanced_material(settings),
             );
@@ -2964,8 +2965,9 @@ fn classic_brush(app: &mut EditorApp, response: &Response, view: &StageView, ctx
         if let ToolState::BrushDrawing { stroke } =
             std::mem::replace(&mut app.session.tool_state, ToolState::Idle)
         {
+            let start = stroke.samples.first().map(|sample| sample.position);
             let region = crate::brush::brush_finish(stroke, settings);
-            crate::brush::commit_brush_region(app, region, settings);
+            commit_brush_stroke(app, region, start, settings, None);
             ctx.request_repaint();
         }
         app.textures.clear_classic_brush_preview();
@@ -3016,18 +3018,156 @@ fn classic_brush(app: &mut EditorApp, response: &Response, view: &StageView, ctx
             .interact_pointer_pos()
             .or_else(|| response.hover_pos())
         {
+            let start = screen_to_stage(screen, view);
             let stroke = crate::brush::brush_begin(
                 settings,
                 crate::brush::BrushSample::pointer(
-                    screen_to_stage(screen, view),
+                    start,
                     pointer_pressure_at(ctx, screen),
                     ctx.input(|input| input.time),
                 ),
             );
             let region = crate::brush::brush_finish(stroke, settings);
-            crate::brush::commit_brush_region(app, region, settings);
+            commit_brush_stroke(app, region, Some(start), settings, None);
         }
     }
+}
+
+/// The bodies of the lines drawn on the current layer, a hair thinner than
+/// they look, so paint kept off them still tucks under their edges.
+fn current_line_bodies(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    frame: u16,
+) -> MultiPolygon<f64> {
+    use geo::Buffer;
+    let Some(layer) = project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+        .and_then(|q0rg| q0rg.layers.iter().find(|layer| layer.layer_id == layer_id))
+    else {
+        return MultiPolygon(Vec::new());
+    };
+    let mut bodies = Vec::new();
+    for placement_idx in active_raw_placement_indices(project, layer, frame) {
+        let Target::Asset(asset_id) = layer.placements[placement_idx].target else {
+            continue;
+        };
+        let Some(Asset::Vector(vector)) =
+            project.assets.iter().find(|asset| asset.id() == asset_id)
+        else {
+            continue;
+        };
+        let Some(stroke) = vector.stroke else {
+            continue;
+        };
+        let reach = (f64::from(stroke.width) * 0.5 - 0.35).max(0.05);
+        for path in &vector.paths {
+            let mut points = flatten_path(path);
+            if path.closed {
+                points.extend(points.first().copied());
+            }
+            if points.len() < 2 {
+                continue;
+            }
+            let line = LineString::new(
+                points
+                    .iter()
+                    .map(|point| Coord {
+                        x: f64::from(point.x),
+                        y: f64::from(point.y),
+                    })
+                    .collect(),
+            );
+            bodies.push(line.buffer(reach));
+        }
+    }
+    geo::unary_union(bodies.iter())
+}
+
+/// The part of a brush stroke's `region` the brush mode lets it paint;
+/// `start` is where the stroke began. Normal paints all of it.
+pub(crate) fn brush_mode_region(
+    app: &EditorApp,
+    region: MultiPolygon<f64>,
+    start: Vec2,
+) -> MultiPolygon<f64> {
+    use crate::settings::PaintMode;
+    let mode = app.settings.aids.paint_mode;
+    if mode == PaintMode::Normal || region.0.is_empty() {
+        return region;
+    }
+    let project = &app.state.project;
+    let (q0rg_id, layer_id, frame) = (
+        app.session.current_q0rg_id,
+        app.session.current_layer_id,
+        app.session.current_frame,
+    );
+    let lines = current_line_bodies(project, q0rg_id, layer_id, frame);
+    let fills = raw_fill_surface_on_layer(project, q0rg_id, layer_id, frame);
+    let allowed = match mode {
+        PaintMode::Normal => return region,
+        PaintMode::Behind => region.difference(&fills),
+        PaintMode::OverFills => region.intersection(&fills),
+        PaintMode::Inside => {
+            let point = Point::new(f64::from(start.x), f64::from(start.y));
+            // Started on paint: stay on that piece of paint. Started in an
+            // empty shape: stay in the shape its lines close off.
+            let on_fill = fills
+                .0
+                .iter()
+                .find(|polygon| polygon.contains(&point))
+                .cloned();
+            let shape = on_fill
+                .map(|polygon| MultiPolygon(vec![polygon]))
+                .or_else(|| {
+                    let gap = app.settings.aids.bucket_gap.pixels();
+                    find_bucket_face(project, q0rg_id, layer_id, frame, start)
+                        .or_else(|| {
+                            (gap > 0.0)
+                                .then(|| {
+                                    find_gap_closed_face(
+                                        project, q0rg_id, layer_id, frame, start, gap,
+                                    )
+                                })
+                                .flatten()
+                        })
+                        .or_else(|| {
+                            find_ink_enclosed_face(project, q0rg_id, layer_id, frame, start)
+                        })
+                });
+            match shape {
+                Some(shape) => region.intersection(&shape),
+                // Out in the open there is no inside: just keep off lines.
+                None => region,
+            }
+        }
+    };
+    allowed.difference(&lines)
+}
+
+/// Lay a finished brush stroke, clipped by the brush mode.
+fn commit_brush_stroke(
+    app: &mut EditorApp,
+    region: MultiPolygon<f64>,
+    start: Option<Vec2>,
+    settings: crate::brush::BrushSettings,
+    material: Option<q0s_format::v2::VectorMaterial>,
+) {
+    let region = match start {
+        Some(start) => brush_mode_region(app, region, start),
+        None => region,
+    };
+    if region.unsigned_area() <= 0.01 {
+        app.session.status = format!(
+            "{} brush: nothing here to paint",
+            app.settings.aids.paint_mode.label()
+        );
+        return;
+    }
+    crate::brush::commit_brush_region_with_material(app, region, settings, material);
 }
 
 pub(crate) fn rect_polygon(rect: (f32, f32, f32, f32)) -> Polygon<f64> {
@@ -13105,15 +13245,20 @@ pub(crate) fn materialize_layer_keyframe_for_edit(
                 frame,
                 target: source.target,
                 transform: state.transform,
-                tween: Tween::None,
+                tween: crate::timeline_edit::continued_motion_tween(source.tween, frame, None),
                 fx: state.fx,
             };
-            // The source now morphs into this keyframe, which carries on to
-            // the original destination.
-            if matches!(source.tween, Tween::Shape { to_frame, .. } if to_frame > frame)
+            // The source now morphs or moves into this keyframe, which
+            // carries on to the original destination.
+            if (matches!(source.tween, Tween::Shape { to_frame, .. } if to_frame > frame)
                 && shape_morph
                     .as_ref()
-                    .is_some_and(|morph| morph.for_placement(source_index).is_some())
+                    .is_some_and(|morph| morph.for_placement(source_index).is_some()))
+                || (source.tween.is_motion()
+                    && source
+                        .tween
+                        .to_frame()
+                        .is_some_and(|to_frame| to_frame > frame))
             {
                 retargeted_sources.push(source_index);
             }
@@ -13945,7 +14090,7 @@ fn commit_vector_path(app: &mut EditorApp, new_path: VPath, mode: DrawingMode) {
     app.history
         .snapshot_with_session(&app.state.project, &app.session);
 
-    let fill = if new_path.closed {
+    let mut fill = if new_path.closed {
         app.session.fill_color
     } else {
         None
@@ -13970,10 +14115,24 @@ fn commit_vector_path(app: &mut EditorApp, new_path: VPath, mode: DrawingMode) {
         return;
     }
 
-    let merge_closed_fill = matches!(mode, DrawingMode::Merge) && new_path.closed && fill.is_some();
+    // Merge drawing keeps a closed shape's fill and outline apart, the way
+    // Animate does: the fill is paint like the brush's, joining paint of its
+    // colour that it touches and covering other colours, and the outline is
+    // a line that other lines cut. Shapes drawn before are split likewise.
+    if let (DrawingMode::Merge, Some(color)) = (mode, fill) {
+        if crate::brush::split_mixed_raw_drawings(&mut app.state.project, q0rg_id, layer_id, frame)
+        {
+            app.textures.invalidate();
+        }
+        if crate::brush::paint_raw_fill(app, vec![new_path.clone()], color, None, false) {
+            app.textures.invalidate();
+            app.session.selection = Selection::None;
+        }
+        fill = None;
+    }
+
     let merge_asset_id = match mode {
         DrawingMode::Object => None,
-        DrawingMode::Merge if merge_closed_fill => None,
         DrawingMode::Merge => find_touching_drawing(
             &app.state.project,
             q0rg_id,
@@ -14006,10 +14165,7 @@ fn commit_vector_path(app: &mut EditorApp, new_path: VPath, mode: DrawingMode) {
             let path_count = v.paths.len();
             app.textures.invalidate_asset(asset_id);
             app.state.mark_dirty();
-            app.session.status = match mode {
-                DrawingMode::Merge => format!("Shape updated ({} paths)", path_count),
-                DrawingMode::Object => unreachable!(),
-            };
+            app.session.status = format!("Shape updated ({} paths)", path_count);
             cut_new_line_at_crossings(app, q0rg_id, layer_id, frame, asset_id, path_count - 1);
             return;
         }
@@ -14050,18 +14206,6 @@ fn commit_vector_path(app: &mut EditorApp, new_path: VPath, mode: DrawingMode) {
     }
     app.textures.invalidate_asset(asset_id);
     cut_new_line_at_crossings(app, q0rg_id, layer_id, frame, asset_id, 0);
-    if merge_closed_fill
-        && crate::brush::merge_touching_raw_fills_after_edit_focused(
-            &mut app.state.project,
-            q0rg_id,
-            layer_id,
-            frame,
-            &std::collections::BTreeSet::from([asset_id]),
-        )
-    {
-        app.textures.invalidate();
-        app.session.selection = Selection::None;
-    }
 }
 
 /// Cuts a freshly drawn line and the lines it crosses where they meet,
@@ -18044,6 +18188,11 @@ fn bucket_fill_at(app: &mut EditorApp, point: Vec2) -> bool {
     if let Some(target) = find_bucket_target(&app.state.project, q0rg_id, layer_id, frame, point) {
         return recolour_bucket_target(app, target, color, region.as_ref());
     }
+    if region.is_none() {
+        // Lines that only overlap, without their middles crossing, still
+        // close a shape on stage; fill what is closed off as it is seen.
+        region = find_ink_enclosed_face(&app.state.project, q0rg_id, layer_id, frame, point);
+    }
 
     let Some(region) = region else {
         return false;
@@ -18536,6 +18685,32 @@ fn find_gap_closed_face(
     cursor: Vec2,
     gap: f32,
 ) -> Option<MultiPolygon<f64>> {
+    gap_closed_face(project, q0rg_id, layer_id, frame, cursor, gap, false)
+}
+
+/// The empty area around `cursor` that what is drawn there closes off as
+/// it looks on stage, its lines as thick as they are drawn: for lines that
+/// overlap at their ends without their middles ever touching. The paint
+/// reaches in under the lines around it, so no seam shows.
+fn find_ink_enclosed_face(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    frame: u16,
+    cursor: Vec2,
+) -> Option<MultiPolygon<f64>> {
+    gap_closed_face(project, q0rg_id, layer_id, frame, cursor, 0.0, true)
+}
+
+fn gap_closed_face(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    frame: u16,
+    cursor: Vec2,
+    gap: f32,
+    under_lines: bool,
+) -> Option<MultiPolygon<f64>> {
     use geo::Buffer;
     if !project.layer_is_visible(q0rg_id, layer_id) || project.layer_is_locked(q0rg_id, layer_id) {
         return None;
@@ -18548,6 +18723,7 @@ fn find_gap_closed_face(
         .iter()
         .find(|layer| layer.layer_id == layer_id)?;
     let mut ink = vec![raw_fill_surface_on_layer(project, q0rg_id, layer_id, frame)];
+    let mut thinnest = f64::INFINITY;
     for placement_idx in active_raw_placement_indices(project, layer, frame) {
         let Target::Asset(asset_id) = layer.placements[placement_idx].target else {
             continue;
@@ -18578,6 +18754,7 @@ fn find_gap_closed_face(
                     .collect(),
             );
             ink.push(line.buffer(f64::from(stroke.width.max(0.5)) * 0.5));
+            thinnest = thinnest.min(f64::from(stroke.width.max(0.5)));
         }
     }
     let ink = geo::unary_union(ink.iter());
@@ -18611,7 +18788,16 @@ fn find_gap_closed_face(
     {
         return None;
     }
-    let region = MultiPolygon(vec![hole]).buffer(half);
+    let grow = if under_lines && thinnest.is_finite() {
+        half + thinnest * 0.5
+    } else {
+        half
+    };
+    let region = if grow > 0.0 {
+        MultiPolygon(vec![hole]).buffer(grow)
+    } else {
+        MultiPolygon(vec![hole])
+    };
     (region.unsigned_area() > 0.05).then_some(region)
 }
 
@@ -18912,7 +19098,12 @@ fn bucket_split_segments_at_intersections(
         .collect();
     let mut indices: Vec<usize> = (0..segments.len()).collect();
     let bvh = bucket_build_segment_bvh(&mut indices, &bounds);
-    let mut splits = vec![vec![0.0_f64, 1.0_f64]; segments.len()];
+    // Each cut keeps the point it is at, worked out once for both segments
+    // that meet there, so the pieces of the two share one graph node.
+    let mut splits: Vec<Vec<(f64, Vec2)>> = segments
+        .iter()
+        .map(|segment| vec![(0.0_f64, segment.a), (1.0_f64, segment.b)])
+        .collect();
     let mut pair_count = 0usize;
     let mut candidates = Vec::new();
 
@@ -18944,15 +19135,14 @@ fn bucket_split_segments_at_intersections(
     }
 
     let mut out = Vec::with_capacity(segments.len());
-    for (segment, mut params) in segments.iter().copied().zip(splits) {
-        params.sort_by(|a, b| a.total_cmp(b));
-        params.dedup_by(|a, b| (*a - *b).abs() <= 1e-7);
+    for mut params in splits {
+        params.sort_by(|a, b| a.0.total_cmp(&b.0));
+        params.dedup_by(|a, b| (a.0 - b.0).abs() <= 1e-7);
         for pair in params.windows(2) {
-            if pair[1] - pair[0] <= 1e-7 {
+            if pair[1].0 - pair[0].0 <= 1e-7 {
                 continue;
             }
-            let a = bucket_lerp(segment, pair[0]);
-            let b = bucket_lerp(segment, pair[1]);
+            let (a, b) = (pair[0].1, pair[1].1);
             if bucket_distance_sq(a, b) > 1e-8 {
                 if out.len() >= MAX_SPLIT_SEGMENTS {
                     return None;
@@ -18967,8 +19157,8 @@ fn bucket_split_segments_at_intersections(
 fn bucket_add_segment_intersections(
     left: BucketBoundarySegment,
     right: BucketBoundarySegment,
-    left_splits: &mut Vec<f64>,
-    right_splits: &mut Vec<f64>,
+    left_splits: &mut Vec<(f64, Vec2)>,
+    right_splits: &mut Vec<(f64, Vec2)>,
 ) {
     let px = left.a.x as f64;
     let py = left.a.y as f64;
@@ -18990,8 +19180,21 @@ fn bucket_add_segment_intersections(
         let t = cross(qpx, qpy, sx, sy) / rxs;
         let u = cross(qpx, qpy, rx, ry) / rxs;
         if (-1e-7..=1.0 + 1e-7).contains(&t) && (-1e-7..=1.0 + 1e-7).contains(&u) {
-            left_splits.push(t.clamp(0.0, 1.0));
-            right_splits.push(u.clamp(0.0, 1.0));
+            let (t, u) = (t.clamp(0.0, 1.0), u.clamp(0.0, 1.0));
+            // An end that the crossing lands on is that end exactly.
+            let point = if t <= 1e-7 {
+                left.a
+            } else if t >= 1.0 - 1e-7 {
+                left.b
+            } else if u <= 1e-7 {
+                right.a
+            } else if u >= 1.0 - 1e-7 {
+                right.b
+            } else {
+                Vec2::new((px + rx * t) as f32, (py + ry * t) as f32)
+            };
+            left_splits.push((t, point));
+            right_splits.push((u, point));
         }
         return;
     }
@@ -19004,26 +19207,18 @@ fn bucket_add_segment_intersections(
     if rr <= EPS || ss <= EPS {
         return;
     }
-    for (x, y) in [(qx, qy), (qx + sx, qy + sy)] {
+    for (x, y, point) in [(qx, qy, right.a), (qx + sx, qy + sy, right.b)] {
         let t = dot(x - px, y - py, rx, ry) / rr;
         if (-1e-7..=1.0 + 1e-7).contains(&t) {
-            left_splits.push(t.clamp(0.0, 1.0));
+            left_splits.push((t.clamp(0.0, 1.0), point));
         }
     }
-    for (x, y) in [(px, py), (px + rx, py + ry)] {
+    for (x, y, point) in [(px, py, left.a), (px + rx, py + ry, left.b)] {
         let u = dot(x - qx, y - qy, sx, sy) / ss;
         if (-1e-7..=1.0 + 1e-7).contains(&u) {
-            right_splits.push(u.clamp(0.0, 1.0));
+            right_splits.push((u.clamp(0.0, 1.0), point));
         }
     }
-}
-
-fn bucket_lerp(segment: BucketBoundarySegment, t: f64) -> Vec2 {
-    let t = t as f32;
-    Vec2::new(
-        segment.a.x + (segment.b.x - segment.a.x) * t,
-        segment.a.y + (segment.b.y - segment.a.y) * t,
-    )
 }
 
 fn bucket_distance_sq(a: Vec2, b: Vec2) -> f32 {
@@ -19032,18 +19227,26 @@ fn bucket_distance_sq(a: Vec2, b: Vec2) -> f32 {
     dx * dx + dy * dy
 }
 
+/// The graph node at `point`: an existing one within a hair of it, or a
+/// new one. Ends a float's width apart are the same corner on screen, so
+/// they must be the same corner to the bucket too.
 fn bucket_graph_node(
     nodes: &mut Vec<Vec2>,
     node_map: &mut std::collections::HashMap<(i64, i64), usize>,
     point: Vec2,
 ) -> usize {
-    const QUANTIZE: f64 = 10_000.0;
-    let key = (
-        (point.x as f64 * QUANTIZE).round() as i64,
-        (point.y as f64 * QUANTIZE).round() as i64,
-    );
-    if let Some(index) = node_map.get(&key) {
-        return *index;
+    const SNAP: f64 = 0.01;
+    let cell = |value: f32| (f64::from(value) / SNAP).floor() as i64;
+    let key = (cell(point.x), cell(point.y));
+    for dx in -1..=1 {
+        for dy in -1..=1 {
+            if let Some(index) = node_map.get(&(key.0 + dx, key.1 + dy)) {
+                let near = nodes[*index];
+                if f64::from(bucket_distance_sq(near, point)) <= SNAP * SNAP {
+                    return *index;
+                }
+            }
+        }
     }
     let index = nodes.len();
     nodes.push(point);
@@ -30498,5 +30701,475 @@ mod sprite_tests {
         assert_eq!(variant_name, format!("{name} ~2"));
         app.handle(&ctx, Action::SwapVariant(root, layer, 0, 1));
         assert_eq!(shown(&app), symbol, "round the family and back");
+    }
+}
+
+#[cfg(test)]
+mod drawing_rework_tests {
+    use super::*;
+
+    fn blank_app() -> EditorApp {
+        let mut app = EditorApp::default();
+        app.state.project.assets.clear();
+        app.state.project.q0rgs[0].layers[0].placements.clear();
+        app.session.current_q0rg_id = app.state.project.q0rgs[0].q0rg_id;
+        app.session.current_layer_id = app.state.project.q0rgs[0].layers[0].layer_id;
+        app.session.current_frame = 0;
+        app.session.stroke_width = 2.0;
+        app.session.fill_color = Some(Rgba {
+            r: 200,
+            g: 40,
+            b: 40,
+            a: 255,
+        });
+        app
+    }
+
+    fn draw_line(app: &mut EditorApp, a: (f32, f32), b: (f32, f32)) {
+        commit_vector_path(
+            app,
+            VPath {
+                anchors: vec![anchor(Vec2::new(a.0, a.1)), anchor(Vec2::new(b.0, b.1))],
+                closed: false,
+            },
+            DrawingMode::Merge,
+        );
+    }
+
+    fn path_count(app: &EditorApp) -> usize {
+        app.state
+            .project
+            .assets
+            .iter()
+            .map(|asset| match asset {
+                Asset::Vector(vector) => vector.paths.len(),
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// Four lines making a lopsided quad, each overhanging both corners.
+    fn crossing_quad(app: &mut EditorApp, order: [usize; 4], scale: f32, offset: f32) -> Vec2 {
+        let lines = [
+            ((103.3, 211.7), (517.9, 188.1)),
+            ((488.2, 151.9), (533.7, 497.3)),
+            ((551.1, 463.6), (131.4, 489.2)),
+            ((157.6, 523.8), (121.9, 170.4)),
+        ];
+        let place = |p: (f32, f32)| (p.0 * scale + offset, p.1 * scale + offset);
+        for index in order {
+            let (a, b) = lines[index];
+            draw_line(app, place(a), place(b));
+        }
+        Vec2::new(320.0 * scale + offset, 340.0 * scale + offset)
+    }
+
+    #[test]
+    fn the_bucket_fills_a_shape_made_of_crossing_lines() {
+        let mut failures = Vec::new();
+        for split in [true, false] {
+            for order in [[0, 1, 2, 3], [0, 2, 1, 3], [3, 1, 2, 0]] {
+                for width in [1.0, 8.0] {
+                    for (scale, offset) in [(1.0, 0.0), (3.7, 1234.5), (0.13, 17.3)] {
+                        let mut app = blank_app();
+                        app.settings.aids.split_crossings = split;
+                        app.session.stroke_width = width;
+                        let inside = crossing_quad(&mut app, order, scale, offset);
+                        if !bucket_fill_at(&mut app, inside) {
+                            failures.push((split, order, width, scale, offset));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "no paint for {failures:?}");
+    }
+
+    #[test]
+    fn lines_through_one_point_do_not_multiply() {
+        let mut app = blank_app();
+        app.session.fill_color = None;
+        let path = primitive_path(
+            PrimitiveKind::Rect,
+            Vec2::new(206.8, 328.6),
+            Vec2::new(412.9, 405.2),
+        )
+        .unwrap();
+        let corner = path.anchors[0].point;
+        commit_vector_path(&mut app, path, DrawingMode::Merge);
+        let started = std::time::Instant::now();
+        for step in 0..10 {
+            let angle = step as f32 * 0.61;
+            let (dx, dy) = (angle.cos() * 150.0, angle.sin() * 150.0);
+            draw_line(
+                &mut app,
+                (corner.x - dx, corner.y - dy),
+                (corner.x + dx, corner.y + dy),
+            );
+            draw_line(
+                &mut app,
+                (corner.x, corner.y),
+                (corner.x + dy, corner.y - dx),
+            );
+        }
+        // Each line through the corner adds a few pieces, not a few times
+        // as many as there were.
+        assert!(path_count(&app) < 200, "{} paths", path_count(&app));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        for asset in &app.state.project.assets {
+            let Asset::Vector(vector) = asset else {
+                continue;
+            };
+            for path in &vector.paths {
+                for pair in path.anchors.windows(2) {
+                    assert!(
+                        (pair[0].point.x - pair[1].point.x).abs()
+                            + (pair[0].point.y - pair[1].point.y).abs()
+                            > 1.0e-4
+                            || pair[0].out_handle.is_some()
+                            || pair[1].in_handle.is_some(),
+                        "a step that goes nowhere"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cut_lines_meet_at_one_shared_point() {
+        let mut app = blank_app();
+        draw_line(&mut app, (10.3, 20.7), (391.9, 288.1));
+        draw_line(&mut app, (17.2, 301.6), (383.4, 3.9));
+        let ends: Vec<Vec2> = app
+            .state
+            .project
+            .assets
+            .iter()
+            .filter_map(|asset| match asset {
+                Asset::Vector(vector) => Some(vector),
+                _ => None,
+            })
+            .flat_map(|vector| vector.paths.iter())
+            .flat_map(|path| [path.anchors[0].point, path.anchors.last().unwrap().point])
+            .collect();
+        assert_eq!(ends.len(), 8, "two lines, two pieces each");
+        let meeting: Vec<Vec2> = ends
+            .iter()
+            .copied()
+            .filter(|point| point.x > 30.0 && point.x < 370.0)
+            .collect();
+        assert_eq!(meeting.len(), 4);
+        assert!(
+            meeting.iter().all(|point| *point == meeting[0]),
+            "{meeting:?}"
+        );
+    }
+
+    #[test]
+    fn the_bucket_fills_between_thick_lines_that_only_overlap() {
+        let mut app = blank_app();
+        app.settings.aids.bucket_gap = crate::settings::GapSize::None;
+        app.settings.aids.split_crossings = false;
+        app.session.stroke_width = 12.0;
+        // A square whose sides stop 3 px short of each other's middles:
+        // their thick ends overlap, their centre lines never meet.
+        draw_line(&mut app, (100.0, 100.0), (297.0, 100.0));
+        draw_line(&mut app, (300.0, 103.0), (300.0, 297.0));
+        draw_line(&mut app, (297.0, 300.0), (103.0, 300.0));
+        draw_line(&mut app, (100.0, 297.0), (100.0, 103.0));
+        assert!(bucket_fill_at(&mut app, Vec2::new(200.0, 200.0)));
+        let filled = app
+            .state
+            .project
+            .assets
+            .iter()
+            .find_map(|asset| match asset {
+                Asset::Vector(vector) if vector.fill.is_some() => Some(vector.clone()),
+                _ => None,
+            })
+            .expect("paint");
+        let surface = crate::brush::vector_fill_geometry(&filled);
+        assert!(surface.contains(&geo::Point::new(200.0, 200.0)));
+        assert!(
+            surface.contains(&geo::Point::new(100.5, 200.0)),
+            "the paint reaches in under the line around it"
+        );
+        assert!(
+            !surface.contains(&geo::Point::new(90.0, 200.0)),
+            "it stays inside"
+        );
+    }
+
+    fn fills(app: &EditorApp) -> Vec<VectorAsset> {
+        let layer = &app.state.project.q0rgs[0].layers[0];
+        layer
+            .placements
+            .iter()
+            .filter_map(|placement| match placement.target {
+                Target::Asset(id) => {
+                    app.state
+                        .project
+                        .assets
+                        .iter()
+                        .find_map(|asset| match asset {
+                            Asset::Vector(vector)
+                                if vector.asset_id == id && vector.fill.is_some() =>
+                            {
+                                Some(vector.clone())
+                            }
+                            _ => None,
+                        })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn red() -> Rgba {
+        Rgba {
+            r: 200,
+            g: 40,
+            b: 40,
+            a: 255,
+        }
+    }
+
+    fn brush(app: &mut EditorApp, rect: (f32, f32, f32, f32), color: Rgba) {
+        crate::brush::commit_brush_region(
+            app,
+            MultiPolygon(vec![rect_polygon(rect)]),
+            crate::brush::BrushSettings {
+                color,
+                ..Default::default()
+            },
+        );
+    }
+
+    fn draw_rect(app: &mut EditorApp) {
+        let path = primitive_path(
+            PrimitiveKind::Rect,
+            Vec2::new(100.0, 100.0),
+            Vec2::new(200.0, 200.0),
+        )
+        .unwrap();
+        commit_vector_path(app, path, DrawingMode::Merge);
+    }
+
+    #[test]
+    fn a_rectangle_is_a_fill_and_an_outline_kept_apart() {
+        let mut app = blank_app();
+        draw_rect(&mut app);
+        let drawn: Vec<VectorAsset> = app
+            .state
+            .project
+            .assets
+            .iter()
+            .filter_map(|asset| match asset {
+                Asset::Vector(vector) => Some(vector.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(drawn.len(), 2, "{drawn:?}");
+        assert!(drawn
+            .iter()
+            .any(|v| v.fill == Some(red()) && v.stroke.is_none()));
+        assert!(drawn.iter().any(|v| v.fill.is_none() && v.stroke.is_some()));
+        // The outline sits above its fill.
+        let layer = &app.state.project.q0rgs[0].layers[0];
+        let fill_at = layer.placements.iter().position(|p| {
+            matches!(p.target, Target::Asset(id) if drawn.iter().any(|v| v.asset_id == id && v.fill.is_some()))
+        });
+        let line_at = layer.placements.iter().position(|p| {
+            matches!(p.target, Target::Asset(id) if drawn.iter().any(|v| v.asset_id == id && v.stroke.is_some()))
+        });
+        assert!(fill_at < line_at);
+    }
+
+    #[test]
+    fn brush_paint_joins_a_rectangle_of_its_colour() {
+        let mut app = blank_app();
+        draw_rect(&mut app);
+        brush(&mut app, (180.0, 140.0, 260.0, 160.0), red());
+        let red_fills: Vec<_> = fills(&app)
+            .into_iter()
+            .filter(|v| v.fill == Some(red()))
+            .collect();
+        assert_eq!(red_fills.len(), 1, "one red fill, not two side by side");
+        let surface = crate::brush::vector_fill_geometry(&red_fills[0]);
+        assert!(surface.contains(&geo::Point::new(150.0, 150.0)));
+        assert!(surface.contains(&geo::Point::new(250.0, 150.0)));
+    }
+
+    #[test]
+    fn brush_paint_of_another_colour_covers_a_rectangle_fill() {
+        let mut app = blank_app();
+        draw_rect(&mut app);
+        let blue = Rgba {
+            r: 30,
+            g: 60,
+            b: 220,
+            a: 255,
+        };
+        brush(&mut app, (140.0, 140.0, 160.0, 160.0), blue);
+        let red_fill = fills(&app)
+            .into_iter()
+            .find(|v| v.fill == Some(red()))
+            .expect("the rectangle keeps its fill");
+        let surface = crate::brush::vector_fill_geometry(&red_fill);
+        assert!(surface.contains(&geo::Point::new(120.0, 120.0)));
+        assert!(
+            !surface.contains(&geo::Point::new(150.0, 150.0)),
+            "the blue paint cut a hole in the red fill"
+        );
+    }
+
+    #[test]
+    fn an_old_shape_with_fill_and_outline_in_one_is_split_when_painted_on() {
+        let mut app = blank_app();
+        let outline = primitive_path(
+            PrimitiveKind::Rect,
+            Vec2::new(100.0, 100.0),
+            Vec2::new(200.0, 200.0),
+        )
+        .unwrap();
+        app.state.project.assets.push(Asset::Vector(VectorAsset {
+            asset_id: 7,
+            paths: vec![outline],
+            fill: Some(red()),
+            stroke: Some(VStroke {
+                color: Rgba {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 255,
+                },
+                width: 2.0,
+                cap: q0s_format::geom::CapShape::Round,
+                join: q0s_format::geom::JoinShape::Round,
+            }),
+        }));
+        app.state.project.q0rgs[0].layers[0]
+            .placements
+            .push(Placement {
+                pivot: None,
+                instance_id: 0,
+                frame: 0,
+                target: Target::Asset(7),
+                transform: Transform2D::IDENTITY,
+                tween: Tween::None,
+                fx: Default::default(),
+            });
+        brush(&mut app, (180.0, 140.0, 260.0, 160.0), red());
+        assert_eq!(
+            fills(&app).iter().filter(|v| v.fill == Some(red())).count(),
+            1,
+            "the old fill and the new paint are one"
+        );
+        assert!(
+            app.state.project.assets.iter().any(|asset| matches!(
+                asset,
+                Asset::Vector(v) if v.fill.is_none() && v.stroke.is_some()
+            )),
+            "the outline is kept as a line"
+        );
+        assert!(app.history.can_undo());
+    }
+
+    fn blue() -> Rgba {
+        Rgba {
+            r: 30,
+            g: 60,
+            b: 220,
+            a: 255,
+        }
+    }
+
+    fn stroke_paint(app: &mut EditorApp, rect: (f32, f32, f32, f32), start: Vec2, color: Rgba) {
+        commit_brush_stroke(
+            app,
+            MultiPolygon(vec![rect_polygon(rect)]),
+            Some(start),
+            crate::brush::BrushSettings {
+                color,
+                ..Default::default()
+            },
+            None,
+        );
+    }
+
+    fn painted(app: &EditorApp, color: Rgba) -> MultiPolygon<f64> {
+        let surfaces: Vec<_> = fills(app)
+            .iter()
+            .filter(|v| v.fill == Some(color))
+            .map(crate::brush::vector_fill_geometry)
+            .collect();
+        geo::unary_union(surfaces.iter())
+    }
+
+    #[test]
+    fn inside_paint_stays_in_the_outline_it_starts_in() {
+        let mut app = blank_app();
+        app.session.fill_color = None;
+        draw_rect(&mut app);
+        app.settings.aids.paint_mode = crate::settings::PaintMode::Inside;
+        // A stroke from inside the square out past its right side.
+        stroke_paint(
+            &mut app,
+            (150.0, 140.0, 260.0, 160.0),
+            Vec2::new(155.0, 150.0),
+            blue(),
+        );
+        let paint = painted(&app, blue());
+        assert!(paint.contains(&geo::Point::new(170.0, 150.0)));
+        assert!(
+            !paint.contains(&geo::Point::new(230.0, 150.0)),
+            "it left the square"
+        );
+        assert!(
+            !paint.contains(&geo::Point::new(200.0, 150.0)),
+            "it went over the line"
+        );
+    }
+
+    #[test]
+    fn behind_paint_leaves_what_is_drawn() {
+        let mut app = blank_app();
+        draw_rect(&mut app);
+        app.settings.aids.paint_mode = crate::settings::PaintMode::Behind;
+        stroke_paint(
+            &mut app,
+            (150.0, 140.0, 260.0, 160.0),
+            Vec2::new(155.0, 150.0),
+            blue(),
+        );
+        assert!(
+            painted(&app, red()).contains(&geo::Point::new(170.0, 150.0)),
+            "red stays"
+        );
+        let paint = painted(&app, blue());
+        assert!(!paint.contains(&geo::Point::new(170.0, 150.0)));
+        assert!(
+            paint.contains(&geo::Point::new(240.0, 150.0)),
+            "paint in the empty part"
+        );
+    }
+
+    #[test]
+    fn over_fills_paint_only_recolours_fills() {
+        let mut app = blank_app();
+        draw_rect(&mut app);
+        app.settings.aids.paint_mode = crate::settings::PaintMode::OverFills;
+        stroke_paint(
+            &mut app,
+            (150.0, 140.0, 260.0, 160.0),
+            Vec2::new(155.0, 150.0),
+            blue(),
+        );
+        let paint = painted(&app, blue());
+        assert!(paint.contains(&geo::Point::new(170.0, 150.0)));
+        assert!(
+            !paint.contains(&geo::Point::new(240.0, 150.0)),
+            "no paint in empty space"
+        );
     }
 }

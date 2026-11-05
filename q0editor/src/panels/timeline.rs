@@ -401,9 +401,9 @@ fn timeline_ruler(
             all_hidden,
             Action::ToggleAllLayerVisibility(q0rg_id),
             if all_hidden {
-                "Show all layers"
+                "Show the layers that Hide all hid. Shift-click: show every layer"
             } else {
-                "Hide all layers"
+                "Hide all layers. Shift-click: show every layer"
             },
         ),
         (
@@ -411,9 +411,9 @@ fn timeline_ruler(
             all_locked,
             Action::ToggleAllLayerLocks(q0rg_id),
             if all_locked {
-                "Unlock all layers"
+                "Unlock the layers that Lock all locked. Shift-click: unlock every layer"
             } else {
-                "Lock all layers"
+                "Lock all layers. Shift-click: unlock every layer"
             },
         ),
     ] {
@@ -456,7 +456,12 @@ fn timeline_ruler(
             _ => draw_lock_icon(&painter, control.shrink2(vec2(2.0, 3.0)), enabled, color),
         }
         if control_response.clicked() {
-            app.queue(action);
+            let shift = ui.input(|input| input.modifiers.shift);
+            app.queue(match action {
+                Action::ToggleAllLayerLocks(id) if shift => Action::UnlockAllLayers(id),
+                Action::ToggleAllLayerVisibility(id) if shift => Action::ShowAllLayers(id),
+                other => other,
+            });
         }
     }
     let frame_painter = ui.painter_at(Rect::from_min_max(pos2(label_edge_x, rect.top()), rect.max));
@@ -863,6 +868,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             let mut click_label_layer: Option<u16> = None;
             let mut open_frame_script: Option<(u16, u16, u16)> = None;
             let mut started_layer_drag: Option<(u16, TimelineLayerSelection)> = None;
+            let mut flag_paints: Vec<Action> = Vec::new();
             for (li, layer_index) in visible_layer_indices
                 .iter()
                 .copied()
@@ -1021,13 +1027,16 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     (
                         visibility_rect,
                         if is_mask {
-                            "Show or hide mask and all its contents"
+                            "Show or hide mask and all its contents. Alt-click: hide all the others"
                         } else {
-                            "Show or hide layer"
+                            "Show or hide layer. Alt-click: hide all the others. Drag down the column to show or hide several"
                         },
                     ),
                     (outline_rect, "Toggle outline for this layer"),
-                    (lock_rect, "Lock or unlock this layer"),
+                    (
+                        lock_rect,
+                        "Lock or unlock this layer. Alt-click: lock all the others. Drag down the column to lock or unlock several",
+                    ),
                 ] {
                     ui.interact(
                         control,
@@ -1040,11 +1049,20 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     )
                     .on_hover_text(hint);
                 }
+                // A state that only a folder gives the layer is drawn faint:
+                // the layer's own switch is still off.
+                let from_folder = |own: bool, effective: bool| {
+                    if effective && !own {
+                        theme.text.to_color32().gamma_multiply(0.4)
+                    } else {
+                        theme.text.to_color32()
+                    }
+                };
                 draw_visibility_icon(
                     &label_painter,
                     visibility_rect.shrink2(vec2(2.0, 4.0)),
                     effective_visible,
-                    theme.text.to_color32(),
+                    from_folder(metadata.hidden, !effective_visible),
                 );
                 if is_mask {
                     draw_mask_art_visibility_icon(
@@ -1068,7 +1086,14 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     &label_painter,
                     lock_rect.shrink2(vec2(2.0, 3.0)),
                     effective_locked,
-                    theme.text.to_color32(),
+                    from_folder(
+                        app.own_layer_flag(
+                            q0rg_id,
+                            row_layer_id,
+                            crate::layer_flags::LayerFlag::Locked,
+                        ),
+                        effective_locked,
+                    ),
                 );
                 label_painter.line_segment(
                     [pos2(label_edge_x, row_y), pos2(label_edge_x, row_y + ROW_H)],
@@ -1169,6 +1194,48 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     }
                 }
 
+                // Pressing on an eye or lock and dragging paints that one new
+                // state down the column, row by row.
+                if response.drag_started_by(PointerButton::Primary) {
+                    let pressed = ui.input(|input| input.pointer.press_origin());
+                    let flag = pressed.and_then(|pos| {
+                        if visibility_rect.contains(pos) {
+                            Some(crate::layer_flags::LayerFlag::Hidden)
+                        } else if lock_rect.contains(pos) {
+                            Some(crate::layer_flags::LayerFlag::Locked)
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(flag) = flag {
+                        let on = !app.own_layer_flag(q0rg_id, row_layer_id, flag);
+                        app.session.layer_flag_drag = Some(crate::layer_flags::LayerFlagDrag {
+                            q0rg_id,
+                            flag,
+                            on,
+                        });
+                        flag_paints.push(Action::PaintLayerFlag(q0rg_id, row_layer_id, flag, on, true));
+                    }
+                } else if let Some(drag) = app
+                    .session
+                    .layer_flag_drag
+                    .filter(|drag| drag.q0rg_id == q0rg_id)
+                {
+                    let over_row = response.dragged_by(PointerButton::Primary)
+                        && ui
+                            .input(|input| input.pointer.interact_pos())
+                            .is_some_and(|pos| pos.y >= row_rect.top() && pos.y < row_rect.bottom());
+                    if over_row && app.own_layer_flag(q0rg_id, row_layer_id, drag.flag) != drag.on {
+                        flag_paints.push(Action::PaintLayerFlag(
+                            q0rg_id,
+                            row_layer_id,
+                            drag.flag,
+                            drag.on,
+                            false,
+                        ));
+                    }
+                }
+
                 // Dragging starts only from the fixed layer-label column.
                 // Frame-strip drags keep their existing rectangular selection
                 // behaviour and never accidentally reorder a layer.
@@ -1207,12 +1274,21 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 // Click in row → set current_layer + current_frame
                 if let Some(pos) = response.interact_pointer_pos() {
                     if row_rect.contains(pos) && response.clicked() {
+                        let alt = ui.input(|input| input.modifiers.alt);
                         if visibility_rect.contains(pos) {
-                            app.queue(Action::ToggleLayerVisibility(q0rg_id, layer.layer_id));
+                            app.queue(if alt {
+                                Action::ToggleOtherLayerVisibility(q0rg_id, layer.layer_id)
+                            } else {
+                                Action::ToggleLayerVisibility(q0rg_id, layer.layer_id)
+                            });
                             continue;
                         }
                         if lock_rect.contains(pos) {
-                            app.queue(Action::ToggleLayerLock(q0rg_id, layer.layer_id));
+                            app.queue(if alt {
+                                Action::ToggleOtherLayerLocks(q0rg_id, layer.layer_id)
+                            } else {
+                                Action::ToggleLayerLock(q0rg_id, layer.layer_id)
+                            });
                             continue;
                         }
                         if outline_rect.contains(pos) && !is_folder {
@@ -1373,6 +1449,14 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 app.queue(Action::OpenFrameScriptEditor(q0rg_id, layer_id, frame));
             }
 
+            for action in flag_paints {
+                app.queue(action);
+            }
+            if app.session.layer_flag_drag.is_some()
+                && !ui.input(|input| input.pointer.primary_down())
+            {
+                app.session.layer_flag_drag = None;
+            }
             if let Some((layer_id, selection)) = started_layer_drag {
                 app.session.timeline_layer_drag = Some(TimelineLayerDrag { q0rg_id, selection });
                 app.session.current_layer_id = layer_id;
@@ -1868,7 +1952,140 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         )
                     });
 
-            if app.session.timeline_layer_drag.is_none() && library_payload.is_none() {
+            // Sound clips are grabbed, not selected: the middle moves one,
+            // its ends trim it.
+            let cell_at = |position: egui::Pos2| {
+                (position.x >= label_edge_x)
+                    .then(|| {
+                        timeline_cell_at_with_label_width(
+                            rect.translate(vec2(-scroll_x, 0.0)),
+                            position,
+                            visible_frames,
+                            &layer_ids,
+                            &folder_layer_ids,
+                            camera_row_count,
+                            label_width,
+                        )
+                    })
+                    .flatten()
+            };
+            let clip_under = |app: &crate::app::EditorApp, position: egui::Pos2| {
+                let (layer_id, frame) = cell_at(position)?;
+                let clip = crate::audio::audio_clip_at_frame(
+                    &app.state.project,
+                    q0rg_id,
+                    layer_id,
+                    frame,
+                )?;
+                let left = frame_base_x + f32::from(clip.start_frame) * FRAME_W;
+                let right = frame_base_x + f32::from(clip.end_frame_exclusive) * FRAME_W;
+                let edge = (FRAME_W * 0.45).min((right - left) * 0.3);
+                let mode = if position.x - left <= edge {
+                    crate::state::AudioClipDragMode::TrimStart
+                } else if right - position.x <= edge {
+                    crate::state::AudioClipDragMode::TrimEnd
+                } else {
+                    crate::state::AudioClipDragMode::Move
+                };
+                Some((clip, frame, mode))
+            };
+            if app.session.timeline_layer_drag.is_none()
+                && library_payload.is_none()
+                && app.session.audio_clip_drag.is_none()
+            {
+                if let Some(hover) = response.hover_pos() {
+                    if let Some((_, _, mode)) = clip_under(app, hover) {
+                        ui.ctx().set_cursor_icon(match mode {
+                            crate::state::AudioClipDragMode::Move => egui::CursorIcon::Grab,
+                            _ => egui::CursorIcon::ResizeHorizontal,
+                        });
+                    }
+                }
+                if response.drag_started_by(PointerButton::Primary) {
+                    if let Some((clip, frame, mode)) = ui
+                        .input(|input| input.pointer.press_origin())
+                        .and_then(|press| clip_under(app, press))
+                    {
+                        app.session.audio_clip_drag = Some(crate::state::AudioClipDrag {
+                            q0rg_id,
+                            clip_idx: clip.clip_idx,
+                            mode,
+                            grab: frame.saturating_sub(clip.start_frame),
+                        });
+                        app.session.timeline_selection = None;
+                        app.session.timeline_cell_selection = None;
+                    }
+                }
+            }
+            // Where the clip being dragged would go: layer, start, end.
+            let audio_drop = app
+                .session
+                .audio_clip_drag
+                .filter(|drag| drag.q0rg_id == q0rg_id)
+                .and_then(|drag| {
+                    let clip = crate::audio::audio_clip_ref(&app.state.project, drag.clip_idx)?;
+                    let source = *app.state.project.audio_clips.get(drag.clip_idx)?;
+                    let pointer = ui.input(|input| input.pointer.latest_pos())?;
+                    let boundary = ((pointer.x - frame_base_x) / FRAME_W)
+                        .round()
+                        .clamp(0.0, f32::from(u16::MAX)) as u16;
+                    let length = clip.end_frame_exclusive - clip.start_frame;
+                    Some(match drag.mode {
+                        crate::state::AudioClipDragMode::Move => {
+                            let (layer_id, frame) = cell_at(pointer)
+                                .unwrap_or((source.layer_id, clip.start_frame + drag.grab));
+                            let start = frame.saturating_sub(drag.grab);
+                            (layer_id, start, start.saturating_add(length))
+                        }
+                        crate::state::AudioClipDragMode::TrimStart => (
+                            source.layer_id,
+                            boundary.min(clip.end_frame_exclusive - 1),
+                            clip.end_frame_exclusive,
+                        ),
+                        crate::state::AudioClipDragMode::TrimEnd => (
+                            source.layer_id,
+                            clip.start_frame,
+                            boundary.max(clip.start_frame + 1),
+                        ),
+                    })
+                });
+            if let (Some(drag), Some((layer_id, start, end))) =
+                (app.session.audio_clip_drag, audio_drop)
+            {
+                ui.ctx().set_cursor_icon(match drag.mode {
+                    crate::state::AudioClipDragMode::Move => egui::CursorIcon::Grabbing,
+                    _ => egui::CursorIcon::ResizeHorizontal,
+                });
+                if let Some(row) = layer_ids.iter().position(|id| *id == layer_id) {
+                    let preview = Rect::from_min_max(
+                        pos2(
+                            frame_base_x + f32::from(start) * FRAME_W,
+                            rect.min.y + ROW_H * (row as f32 + camera_row_count as f32 + 1.0),
+                        ),
+                        pos2(
+                            frame_base_x + f32::from(end) * FRAME_W,
+                            rect.min.y + ROW_H * (row as f32 + camera_row_count as f32 + 2.0),
+                        ),
+                    )
+                    .shrink(1.5);
+                    painter.rect_filled(preview, 3.0, theme.accent.to_color32().gamma_multiply(0.22));
+                    painter.rect_stroke(preview, 3.0, Stroke::new(1.5_f32, theme.accent.to_color32()));
+                }
+                if response.drag_stopped_by(PointerButton::Primary) {
+                    app.session.audio_clip_drag = None;
+                    app.queue(Action::EditAudioClip(drag.clip_idx, layer_id, start, end));
+                }
+            }
+            if app.session.audio_clip_drag.is_some()
+                && !ui.input(|input| input.pointer.primary_down())
+            {
+                app.session.audio_clip_drag = None;
+            }
+
+            if app.session.timeline_layer_drag.is_none()
+                && library_payload.is_none()
+                && app.session.audio_clip_drag.is_none()
+            {
                 if let Some((layer_id, frame)) = frame_drop_cell {
                     if response.drag_started() {
                         app.session.selection = Selection::None;

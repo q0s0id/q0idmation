@@ -71,6 +71,47 @@ pub struct AppearanceTransformSnapshot {
     pub field_transform: Affine,
 }
 
+/// What a drag on the camera frame on stage does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CameraDragMode {
+    /// Anywhere but its corners: the camera moves with the pointer.
+    Move,
+    /// On a corner: the frame grows or shrinks about its middle.
+    Zoom,
+    /// Just outside a corner: the frame turns about its middle.
+    Rotate,
+}
+
+/// A drag on the camera frame, from the state it started at.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CameraStageDrag {
+    pub mode: CameraDragMode,
+    pub start: q0s_format::v2::CameraState,
+    /// Where it was pressed and the frame's middle then, on screen.
+    pub press: (f32, f32),
+    pub center: (f32, f32),
+}
+
+/// What a drag on a sound clip in the timeline does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioClipDragMode {
+    /// Grabbed in the middle: the clip moves, to another layer too.
+    Move,
+    /// Grabbed by its start: the sound starts later or earlier in itself.
+    TrimStart,
+    /// Grabbed by its end: the sound stops sooner or later.
+    TrimEnd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioClipDrag {
+    pub q0rg_id: u16,
+    pub clip_idx: usize,
+    pub mode: AudioClipDragMode,
+    /// For a move: how many frames into the clip it was grabbed.
+    pub grab: u16,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimelineFrameDrag {
     pub q0rg_id: u16,
@@ -1004,6 +1045,12 @@ pub struct Session {
     /// Editor-only mask-source visibility. Hiding a source keeps its clipping
     /// effect active and leaves the source layer editable.
     pub hidden_mask_art_layers: HashSet<(u64, u16, u16)>,
+    /// Layers that "lock all", "hide all" and their Alt-click "all others"
+    /// turned on, so turning them off again leaves the rest as they were.
+    pub layer_flag_memory:
+        HashMap<crate::layer_flags::LayerFlagMemoryKey, std::collections::BTreeSet<u16>>,
+    /// A drag down the timeline's eye or lock column.
+    pub layer_flag_drag: Option<crate::layer_flags::LayerFlagDrag>,
     /// Selected layer rows for layer clipboard operations.
     pub timeline_layer_selection: Option<TimelineLayerSelection>,
     /// One-shot timeline scroll request from selecting a stage object.
@@ -1054,6 +1101,10 @@ pub struct Session {
     pub scene_rename: Option<SceneRename>,
     pub timeline_layer_drag: Option<TimelineLayerDrag>,
     pub timeline_frame_drag: Option<TimelineFrameDrag>,
+    /// A sound clip being moved or trimmed in the timeline.
+    pub audio_clip_drag: Option<AudioClipDrag>,
+    /// The camera frame being moved, zoomed or turned on stage.
+    pub camera_stage_drag: Option<CameraStageDrag>,
     pub timeline_rig_key_selection: Option<TimelineRigKeySelection>,
     pub timeline_rig_key_drag: Option<TimelineRigKeySelection>,
     pub camera_frame_drag: Option<CameraFrameDrag>,
@@ -1279,6 +1330,8 @@ impl Session {
             outline_mode: false,
             outline_layers: HashSet::new(),
             hidden_mask_art_layers: HashSet::new(),
+            layer_flag_memory: HashMap::new(),
+            layer_flag_drag: None,
             timeline_layer_selection: None,
             timeline_scroll_to_layer: None,
             timeline_scroll_to_frame: None,
@@ -1314,6 +1367,8 @@ impl Session {
             frame_label_edit: None,
             scene_rename: None,
             timeline_layer_drag: None,
+            camera_stage_drag: None,
+            audio_clip_drag: None,
             timeline_frame_drag: None,
             timeline_rig_key_selection: None,
             timeline_rig_key_drag: None,

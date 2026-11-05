@@ -1818,6 +1818,35 @@ impl CameraState {
     }
 }
 
+impl CameraTrack {
+    /// Add a key at `frame` holding `state`, unless one is there. A tween
+    /// running across `frame` is split there: it now ends at the new key,
+    /// which carries the rest of it on to where it was going, so the camera
+    /// keeps moving instead of stopping dead and jumping at the end.
+    pub fn insert_key(&mut self, frame: u16, state: CameraState) {
+        if self.has_keyframe(frame) {
+            return;
+        }
+        let mut carried = Tween::None;
+        for key in &mut self.keys {
+            if let Some(to_frame) = key.tween.to_frame() {
+                if key.frame < frame && frame <= to_frame {
+                    if frame < to_frame {
+                        carried = key.tween;
+                    }
+                    key.tween = key.tween.with_to_frame(frame);
+                }
+            }
+        }
+        self.keys.push(CameraKey {
+            frame,
+            state,
+            tween: carried,
+        });
+        self.keys.sort_by_key(|key| key.frame);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CameraKey {

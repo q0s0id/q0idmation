@@ -314,34 +314,7 @@ fn render_camera_properties(app: &mut EditorApp, ui: &mut Ui) {
         if wants_snapshot {
             app.history.snapshot_with_session(&before, &app.session);
         }
-        if !app.state.project.runtime.camera.has_keyframe(frame) {
-            for key in &mut app.state.project.runtime.camera.keys {
-                if key.frame < frame
-                    && key
-                        .tween
-                        .to_frame()
-                        .is_some_and(|to_frame| frame <= to_frame)
-                {
-                    key.tween = key.tween.with_to_frame(frame);
-                }
-            }
-            app.state
-                .project
-                .runtime
-                .camera
-                .keys
-                .push(q0s_format::v2::CameraKey {
-                    frame,
-                    state,
-                    tween: q0s_format::v2::Tween::None,
-                });
-            app.state
-                .project
-                .runtime
-                .camera
-                .keys
-                .sort_by_key(|key| key.frame);
-        }
+        app.state.project.runtime.camera.insert_key(frame, state);
         if let Some(key) = app
             .state
             .project
@@ -1427,6 +1400,24 @@ fn brush_properties(app: &mut EditorApp, ui: &mut Ui) {
                     opacity_control(ui, &mut app.session.brush.color.a);
                     ui.end_row();
 
+                    ui.label("Mode");
+                    let mut mode = app.settings.aids.paint_mode;
+                    egui::ComboBox::from_id_source("classic_brush_mode")
+                        .selected_text(mode.label())
+                        .show_ui(ui, |ui| {
+                            for choice in crate::settings::PaintMode::ALL {
+                                ui.selectable_value(&mut mode, choice, choice.label())
+                                    .on_hover_text(choice.hint());
+                            }
+                        })
+                        .response
+                        .on_hover_text(mode.hint());
+                    if mode != app.settings.aids.paint_mode {
+                        app.settings.aids.paint_mode = mode;
+                        app.settings.save();
+                    }
+                    ui.end_row();
+
                     ui.label("Nib");
                     egui::ComboBox::from_id_source("classic_brush_nib")
                         .selected_text(app.session.brush.nib.label())
@@ -1515,6 +1506,24 @@ fn brush_properties(app: &mut EditorApp, ui: &mut Ui) {
 
                     ui.label("Opacity");
                     opacity_control(ui, &mut app.session.advanced_brush.color.a);
+                    ui.end_row();
+
+                    ui.label("Mode");
+                    let mut mode = app.settings.aids.paint_mode;
+                    egui::ComboBox::from_id_source("advanced_brush_mode")
+                        .selected_text(mode.label())
+                        .show_ui(ui, |ui| {
+                            for choice in crate::settings::PaintMode::ALL {
+                                ui.selectable_value(&mut mode, choice, choice.label())
+                                    .on_hover_text(choice.hint());
+                            }
+                        })
+                        .response
+                        .on_hover_text(mode.hint());
+                    if mode != app.settings.aids.paint_mode {
+                        app.settings.aids.paint_mode = mode;
+                        app.settings.save();
+                    }
                     ui.end_row();
 
                     ui.label("Size");

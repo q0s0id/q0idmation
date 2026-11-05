@@ -1147,6 +1147,27 @@ impl BakedShapes {
     }
 }
 
+/// The tween a keyframe made at `frame` inside `source_tween` carries on
+/// with: the rest of a motion tween, on to where it was going, or to
+/// `next_key` when another new key comes first. Without this the tween
+/// stopped dead at the new key and the object jumped at the old end.
+/// (Shape tweens carry on in [`BakedShapes::keyframe_placements`].)
+pub(crate) fn continued_motion_tween(
+    source_tween: Tween,
+    frame: u16,
+    next_key: Option<u16>,
+) -> Tween {
+    match source_tween.to_frame() {
+        Some(to_frame) if source_tween.is_motion() && to_frame > frame => {
+            let end = next_key
+                .filter(|key| *key > frame && *key < to_frame)
+                .unwrap_or(to_frame);
+            source_tween.with_to_frame(end)
+        }
+        _ => Tween::None,
+    }
+}
+
 /// Convert every selected non-key cell into a real keyframe using the exact
 /// visible state from the original timeline. When a new key splits an incoming
 /// tween, retarget that tween to the first inserted key so metadata and the
@@ -1196,6 +1217,7 @@ pub fn materialize_keyframes_at_cells(
     let mut tween_retargets = HashMap::<(u16, usize), u16>::new();
     let mut created_cells = 0usize;
     let mut baked_shapes = BakedShapes::new(project);
+    let new_keys = selected.clone();
 
     for (layer_id, frame) in selected {
         let layer = q0rg
@@ -1232,7 +1254,11 @@ pub fn materialize_keyframes_at_cells(
             placement.frame = frame;
             placement.transform = state.transform;
             placement.fx = state.fx;
-            placement.tween = Tween::None;
+            let next_key = new_keys
+                .range((layer_id, frame.saturating_add(1))..=(layer_id, u16::MAX))
+                .next()
+                .map(|(_, next)| *next);
+            placement.tween = continued_motion_tween(source.tween, frame, next_key);
             cell_insertions.extend(
                 baked_shapes
                     .keyframe_placements(shape_morph.as_ref(), state.index, source.tween, placement)

@@ -2278,14 +2278,75 @@ pub fn commit_brush_region_with_material(
     if region.0.is_empty() {
         return;
     }
+    // Publish one authoritative new contour, then use that same contour for
+    // cutting and merging. Independently fitting either side creates cracks.
+    let fresh_paths = coverage_to_paths(&region);
+    let (q0rg_id, layer_id, frame) = (
+        app.session.current_q0rg_id,
+        app.session.current_layer_id,
+        app.session.current_frame,
+    );
+    // Shapes drawn before fills and outlines were kept apart are split
+    // first, so the new paint can join and cover their fills too.
+    let snapshot = if mixed_raw_drawings(&app.state.project, q0rg_id, layer_id, frame).is_empty() {
+        true
+    } else {
+        app.history
+            .snapshot_with_session(&app.state.project, &app.session);
+        if crate::tools::materialize_layer_keyframe_for_edit(
+            &mut app.state.project,
+            q0rg_id,
+            layer_id,
+            frame,
+        )
+        .is_none()
+        {
+            return;
+        }
+        split_mixed_raw_drawings(&mut app.state.project, q0rg_id, layer_id, frame);
+        app.textures.invalidate();
+        false
+    };
+    if paint_raw_fill(
+        app,
+        fresh_paths,
+        settings.color,
+        requested_material,
+        snapshot,
+    ) {
+        app.session.selection = crate::state::Selection::None;
+    }
+}
 
+/// Lay new fill paint, outlined by `fresh_paths`, onto the current layer's
+/// drawing the way merge drawing does: it joins the paint of its own colour
+/// that it touches into one fill and covers other colours under it. Returns
+/// whether anything was painted. `snapshot` takes the undo step itself; a
+/// caller that already took one passes false.
+pub(crate) fn paint_raw_fill(
+    app: &mut EditorApp,
+    fresh_paths: Vec<VPath>,
+    color: Rgba,
+    requested_material: Option<VectorMaterial>,
+    snapshot: bool,
+) -> bool {
+    #[cfg(not(feature = "appearance-mask-eraser"))]
+    let requested_material = {
+        let _ = requested_material;
+        None
+    };
+    let settings = BrushSettings {
+        color,
+        ..BrushSettings::default()
+    };
+    if fresh_paths.is_empty() {
+        return false;
+    }
     let q0rg_id = app.session.current_q0rg_id;
     let layer_id = app.session.current_layer_id;
     let frame = app.session.current_frame;
     let candidates =
         collect_raw_fill_candidates(&app.state.project, q0rg_id, layer_id, frame, false);
-    #[cfg(feature = "appearance-mask-eraser")]
-    let freshly_painted = region.clone();
     let requested_style = RawFillStyle {
         color: settings.color,
         stroke: None,
@@ -2296,9 +2357,6 @@ pub fn commit_brush_region_with_material(
     // A raw drawing is one planar paint surface per visual style. Plain vector
     // paint and glowing paint of the same colour must stay distinct; otherwise
     // toggling Glow would silently restyle older artwork.
-    // Publish one authoritative new contour, then use that same contour for
-    // cutting and merging. Independently fitting either side creates cracks.
-    let fresh_paths = coverage_to_paths(&region);
     let fresh_geometry = vector_fill_geometry(&VectorAsset {
         asset_id: 0,
         paths: fresh_paths.clone(),
@@ -2366,14 +2424,14 @@ pub fn commit_brush_region_with_material(
     );
     let painted_paths = sources.paths(&painted);
     if painted_paths.is_empty() {
-        return;
+        return false;
     }
     #[cfg(feature = "appearance-mask-eraser")]
     let merged_appearance = requested_material.map(|material| {
         crate::appearance::merged_brush_appearance(
             &app.state.project,
             &same_style_assets,
-            &freshly_painted,
+            &fresh_geometry,
             material,
         )
     });
@@ -2394,8 +2452,10 @@ pub fn commit_brush_region_with_material(
         }
     }
 
-    app.history
-        .snapshot_with_session(&app.state.project, &app.session);
+    if snapshot {
+        app.history
+            .snapshot_with_session(&app.state.project, &app.session);
+    }
     if crate::tools::materialize_layer_keyframe_for_edit(
         &mut app.state.project,
         q0rg_id,
@@ -2404,7 +2464,7 @@ pub fn commit_brush_region_with_material(
     )
     .is_none()
     {
-        return;
+        return false;
     }
 
     let writable_different = prepare_writable_raw_assets(
@@ -2521,9 +2581,9 @@ pub fn commit_brush_region_with_material(
         app.textures.invalidate_assets(changed_asset_ids);
     }
 
-    app.session.selection = crate::state::Selection::None;
     app.session.status = format!("Brush merge drawing updated ({} regions)", painted.0.len());
     app.state.mark_dirty();
+    true
 }
 
 /// Rebuild same-colour fill-only raw graphics after a transform gesture.
@@ -2549,6 +2609,7 @@ pub(crate) fn merge_touching_raw_fills_after_edit(
     !merge_touching_raw_fills_after_edit_impl(project, q0rg_id, layer_id, frame, None).is_empty()
 }
 
+#[cfg(test)]
 pub(crate) fn merge_touching_raw_fills_after_edit_focused(
     project: &mut ProjectV2,
     q0rg_id: u16,
@@ -2940,6 +3001,127 @@ fn collect_raw_fill_candidates(
             })
         })
         .collect()
+}
+
+/// Raw drawings on the frame stored the old way, fill and outline in one
+/// asset: closed, plain, and on a layer without shape tweens (whose
+/// keyframes are matched drawing by drawing, so they keep their shape).
+pub(crate) fn mixed_raw_drawings(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    frame: u16,
+) -> BTreeSet<u16> {
+    let Some(layer) = project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+        .and_then(|q0rg| q0rg.layers.iter().find(|layer| layer.layer_id == layer_id))
+    else {
+        return BTreeSet::new();
+    };
+    if layer
+        .placements
+        .iter()
+        .any(|placement| placement.tween.is_shape())
+    {
+        return BTreeSet::new();
+    }
+    crate::render::active_placements_at(layer, frame)
+        .into_iter()
+        .filter_map(|(index, _)| {
+            let placement = layer.placements.get(index)?;
+            if placement.transform != Transform2D::IDENTITY
+                || placement.tween.is_motion()
+                || !placement.fx.is_identity()
+            {
+                return None;
+            }
+            let Target::Asset(asset_id) = placement.target else {
+                return None;
+            };
+            let Some(Asset::Vector(vector)) = project.assets.iter().find(|a| a.id() == asset_id)
+            else {
+                return None;
+            };
+            let plain = project.asset_appearances.get(&asset_id).is_none_or(|look| {
+                look.material == VectorMaterial::Solid
+                    && look.erase_mask.is_empty()
+                    && look.clip_mask.is_empty()
+            });
+            let text = project
+                .asset_names
+                .get(&asset_id)
+                .is_some_and(|name| crate::text_tool::decode_source(name).is_some());
+            (vector.fill.is_some()
+                && vector.stroke.is_some()
+                && !vector.paths.is_empty()
+                && vector.paths.iter().all(|path| path.closed)
+                && plain
+                && !text)
+                .then_some(asset_id)
+        })
+        .collect()
+}
+
+/// Merge drawing keeps fills and lines apart: a fill joins and covers
+/// other paint, a line is cut by other lines. Split every drawing on the
+/// frame that holds both (see [`mixed_raw_drawings`]) into its fill, which
+/// keeps the asset, and its outline right above it. Returns whether any
+/// was split. The caller has taken the undo step and made the keyframe.
+pub(crate) fn split_mixed_raw_drawings(
+    project: &mut ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    frame: u16,
+) -> bool {
+    let mixed = mixed_raw_drawings(project, q0rg_id, layer_id, frame);
+    if mixed.is_empty() {
+        return false;
+    }
+    let writable = prepare_writable_raw_assets(project, q0rg_id, layer_id, frame, &mixed);
+    for original in mixed {
+        let asset_id = *writable.get(&original).unwrap_or(&original);
+        let Some(Asset::Vector(vector)) = project
+            .assets
+            .iter_mut()
+            .find(|asset| asset.id() == asset_id)
+        else {
+            continue;
+        };
+        let Some(stroke) = vector.stroke.take() else {
+            continue;
+        };
+        let paths = vector.paths.clone();
+        let outline_id = next_asset_id(project);
+        project.assets.push(Asset::Vector(VectorAsset {
+            asset_id: outline_id,
+            paths,
+            fill: None,
+            stroke: Some(stroke),
+        }));
+        let Some(layer) = project
+            .q0rgs
+            .iter_mut()
+            .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+            .and_then(|q0rg| {
+                q0rg.layers
+                    .iter_mut()
+                    .find(|layer| layer.layer_id == layer_id)
+            })
+        else {
+            continue;
+        };
+        let Some(index) = layer.placements.iter().position(|placement| {
+            placement.frame == frame && placement.target == Target::Asset(asset_id)
+        }) else {
+            continue;
+        };
+        let mut outline = layer.placements[index].clone();
+        outline.target = Target::Asset(outline_id);
+        layer.placements.insert(index + 1, outline);
+    }
+    true
 }
 
 pub(crate) fn prepare_writable_raw_assets(

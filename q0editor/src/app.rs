@@ -814,6 +814,19 @@ pub enum Action {
     ToggleAllLayerLocks(u16),
     ToggleAllLayerVisibility(u16),
     ToggleAllLayerOutlines(u16),
+    /// Alt-click on a layer's lock: lock every other layer, or unlock the
+    /// ones that did.
+    ToggleOtherLayerLocks(u16, u16),
+    /// Alt-click on a layer's eye: hide every other layer, or show the
+    /// ones that did.
+    ToggleOtherLayerVisibility(u16, u16),
+    /// Shift-click on the header lock: unlock every layer and folder.
+    UnlockAllLayers(u16),
+    /// Shift-click on the header eye: show every layer and folder.
+    ShowAllLayers(u16),
+    /// One row of a drag down the eye or lock column: symbol, layer, which
+    /// switch, on, and whether it is the row the drag started on.
+    PaintLayerFlag(u16, u16, crate::layer_flags::LayerFlag, bool, bool),
     DeleteLayer(u16, u16),
     AddQ0rg,
     AddScene,
@@ -839,6 +852,9 @@ pub enum Action {
     PlaceLibraryItemOnTimeline(LibraryItem, u16, u16),
     PlaceLibraryDragAt(LibraryDragPayload, q0s_format::v2::Vec2),
     PlaceLibraryDragOnTimeline(LibraryDragPayload, u16, u16),
+    /// Move or trim sound clip `clip_idx`: onto layer, from start frame to
+    /// end frame (exclusive).
+    EditAudioClip(usize, u16, u16, u16),
     EnterQ0rg(u16),
     EnterQ0rgInPlace {
         q0rg_id: u16,
@@ -1131,6 +1147,11 @@ impl Action {
             Self::ToggleAllLayerLocks(_) => "toggle-all-layer-locks",
             Self::ToggleAllLayerVisibility(_) => "toggle-all-layer-visibility",
             Self::ToggleAllLayerOutlines(_) => "toggle-all-layer-outlines",
+            Self::ToggleOtherLayerLocks(..) => "toggle-other-layer-locks",
+            Self::ToggleOtherLayerVisibility(..) => "toggle-other-layer-visibility",
+            Self::UnlockAllLayers(_) => "unlock-all-layers",
+            Self::ShowAllLayers(_) => "show-all-layers",
+            Self::PaintLayerFlag(..) => "paint-layer-flag",
             Self::DeleteLayer(..) => "delete-layer",
             Self::AddQ0rg => "add-q0rg",
             Self::AddScene => "add-scene",
@@ -1154,6 +1175,7 @@ impl Action {
             Self::PlaceLibraryItemOnTimeline(..) => "place-library-item-on-timeline",
             Self::PlaceLibraryDragAt(..) => "place-library-drag-at",
             Self::PlaceLibraryDragOnTimeline(..) => "place-library-drag-on-timeline",
+            Self::EditAudioClip(..) => "edit-audio-clip",
             Self::EnterQ0rg(_) => "enter-q0rg",
             Self::EnterQ0rgInPlace { .. } => "enter-q0rg-in-place",
             Self::BreadcrumbJumpTo(_) => "breadcrumb-jump-to",
@@ -1737,7 +1759,7 @@ impl EditorApp {
     /// A mask layer previews its masking while it is locked, as in Animate:
     /// locking it cuts what it masks, unlocking shows its shape to draw on.
     /// True when `layer_id` is a mask.
-    fn follow_mask_lock(&mut self, q0rg_id: u16, layer_id: u16, locked: bool) -> bool {
+    pub(crate) fn follow_mask_lock(&mut self, q0rg_id: u16, layer_id: u16, locked: bool) -> bool {
         if self.state.project.layer_metadata(q0rg_id, layer_id).kind != LayerKind::Mask {
             return false;
         }
@@ -4144,6 +4166,23 @@ impl EditorApp {
                 .to_string();
             }
             Action::ToggleLayerVisibility(q0rg_id, layer_id) => {
+                if let Some(folder) =
+                    (!self.own_layer_flag(q0rg_id, layer_id, crate::layer_flags::LayerFlag::Hidden))
+                        .then(|| {
+                            self.folder_setting_layer_flag(
+                                q0rg_id,
+                                layer_id,
+                                crate::layer_flags::LayerFlag::Hidden,
+                            )
+                        })
+                        .flatten()
+                {
+                    self.session.status = format!(
+                        "hidden by its folder \"{}\"; show the folder to show it",
+                        self.layer_name(q0rg_id, folder)
+                    );
+                    return;
+                }
                 let exists = self
                     .state
                     .project
@@ -4180,6 +4219,23 @@ impl EditorApp {
                 .to_string();
             }
             Action::ToggleLayerLock(q0rg_id, layer_id) => {
+                if let Some(folder) =
+                    (!self.own_layer_flag(q0rg_id, layer_id, crate::layer_flags::LayerFlag::Locked))
+                        .then(|| {
+                            self.folder_setting_layer_flag(
+                                q0rg_id,
+                                layer_id,
+                                crate::layer_flags::LayerFlag::Locked,
+                            )
+                        })
+                        .flatten()
+                {
+                    self.session.status = format!(
+                        "locked by its folder \"{}\"; unlock the folder to unlock it",
+                        self.layer_name(q0rg_id, folder)
+                    );
+                    return;
+                }
                 let exists = self
                     .state
                     .project
@@ -4279,35 +4335,30 @@ impl EditorApp {
                 .to_string();
             }
             Action::ToggleAllLayerVisibility(q0rg_id) => {
-                let Some(q0rg) = self
-                    .state
-                    .project
-                    .q0rgs
-                    .iter()
-                    .find(|q0rg| q0rg.q0rg_id == q0rg_id)
-                else {
-                    return;
-                };
-                let hide = q0rg.layers.iter().any(|layer| {
-                    !self.state.project.layer_is_folder(q0rg_id, layer.layer_id)
-                        && self.state.project.layer_is_visible(q0rg_id, layer.layer_id)
-                });
-                self.history
-                    .snapshot_with_session(&self.state.project, &self.session);
-                for layer in &q0rg.layers {
-                    let key = LayerKey::new(q0rg_id, layer.layer_id);
-                    let mut metadata = self.state.project.layer_metadata(q0rg_id, layer.layer_id);
-                    metadata.hidden = hide;
-                    self.state.project.layer_metadata.insert(key, metadata);
-                }
-                self.session.selection = Selection::None;
-                self.state.mark_dirty();
-                self.session.status = if hide {
-                    "all layers hidden"
-                } else {
-                    "all layers shown"
-                }
-                .to_string();
+                self.toggle_all_layer_flags(q0rg_id, crate::layer_flags::LayerFlag::Hidden, None);
+            }
+            Action::ToggleOtherLayerVisibility(q0rg_id, layer_id) => {
+                self.toggle_all_layer_flags(
+                    q0rg_id,
+                    crate::layer_flags::LayerFlag::Hidden,
+                    Some(layer_id),
+                );
+            }
+            Action::ShowAllLayers(q0rg_id) => {
+                self.clear_all_layer_flags(q0rg_id, crate::layer_flags::LayerFlag::Hidden);
+            }
+            Action::ToggleOtherLayerLocks(q0rg_id, layer_id) => {
+                self.toggle_all_layer_flags(
+                    q0rg_id,
+                    crate::layer_flags::LayerFlag::Locked,
+                    Some(layer_id),
+                );
+            }
+            Action::UnlockAllLayers(q0rg_id) => {
+                self.clear_all_layer_flags(q0rg_id, crate::layer_flags::LayerFlag::Locked);
+            }
+            Action::PaintLayerFlag(q0rg_id, layer_id, flag, on, first) => {
+                self.paint_layer_flag(q0rg_id, layer_id, flag, on, first);
             }
             Action::ToggleAllLayerOutlines(q0rg_id) => {
                 let Some(q0rg) = self
@@ -4345,42 +4396,7 @@ impl EditorApp {
                 .to_string();
             }
             Action::ToggleAllLayerLocks(q0rg_id) => {
-                let Some(q0rg) = self
-                    .state
-                    .project
-                    .q0rgs
-                    .iter()
-                    .find(|q0rg| q0rg.q0rg_id == q0rg_id)
-                else {
-                    return;
-                };
-                let any_unlocked = q0rg.layers.iter().any(|layer| {
-                    !self.state.project.layer_is_folder(q0rg_id, layer.layer_id)
-                        && !self.state.project.layer_is_locked(q0rg_id, layer.layer_id)
-                });
-                let lock = any_unlocked;
-                self.history
-                    .snapshot_with_session(&self.state.project, &self.session);
-                let layer_ids = q0rg
-                    .layers
-                    .iter()
-                    .map(|layer| layer.layer_id)
-                    .collect::<Vec<_>>();
-                for layer_id in layer_ids {
-                    let key = LayerKey::new(q0rg_id, layer_id);
-                    let mut metadata = self.state.project.layer_metadata(q0rg_id, layer_id);
-                    metadata.locked = lock;
-                    self.state.project.layer_metadata.insert(key, metadata);
-                    self.follow_mask_lock(q0rg_id, layer_id, lock);
-                }
-                self.session.selection = Selection::None;
-                self.state.mark_dirty();
-                self.session.status = if lock {
-                    "all layers locked"
-                } else {
-                    "all layers unlocked"
-                }
-                .to_string();
+                self.toggle_all_layer_flags(q0rg_id, crate::layer_flags::LayerFlag::Locked, None);
             }
             Action::DeleteLayer(q0rg_id, layer_id) => {
                 self.request_layer_delete(q0rg_id, layer_id);
@@ -5025,6 +5041,9 @@ impl EditorApp {
             }
             Action::PlaceLibraryDragAt(payload, position) => {
                 self.place_library_drag_at(payload, position);
+            }
+            Action::EditAudioClip(clip_idx, layer_id, start, end) => {
+                self.edit_audio_clip(clip_idx, layer_id, start, end);
             }
             Action::PlaceLibraryDragOnTimeline(payload, layer_id, frame) => {
                 self.place_library_drag_on_timeline(payload, layer_id, frame);
@@ -9005,11 +9024,14 @@ impl EditorApp {
         frame: u16,
     ) {
         let q0rg_id = self.session.current_q0rg_id;
-        if self.state.project.layer_is_locked(q0rg_id, target_layer_id)
-            || !self
-                .state
-                .project
-                .layer_is_visible(q0rg_id, target_layer_id)
+        // A sound finds a layer of its own when this one cannot take it.
+        let sound = crate::audio::library_item_is_audio_only(&self.state.project, item);
+        if !sound
+            && (self.state.project.layer_is_locked(q0rg_id, target_layer_id)
+                || !self
+                    .state
+                    .project
+                    .layer_is_visible(q0rg_id, target_layer_id))
         {
             self.session.status =
                 "show and unlock the target layer before placing media".to_string();
@@ -9025,7 +9047,7 @@ impl EditorApp {
             return;
         };
         if frame >= self.state.project.q0rgs[q0rg_index].frame_count
-            || self.state.project.layer_is_folder(q0rg_id, target_layer_id)
+            || (!sound && self.state.project.layer_is_folder(q0rg_id, target_layer_id))
         {
             self.session.status = "drop media on a real timeline frame".to_string();
             return;
@@ -9080,69 +9102,47 @@ impl EditorApp {
             };
             return;
         }
-        let mut end_exclusive = end_exclusive as u16;
-        if audio_only {
-            let Some(layer) = self.state.project.q0rgs[q0rg_index]
-                .layers
-                .iter()
-                .find(|layer| layer.layer_id == target_layer_id)
-            else {
-                self.session.status = "target audio layer is no longer available".to_string();
-                return;
-            };
-            if let Some(next) = layer
-                .keyframe_frames()
-                .into_iter()
-                .filter(|key| *key > frame)
-                .chain(
-                    self.state
-                        .project
-                        .audio_clips
-                        .iter()
-                        .filter(|clip| {
-                            clip.q0rg_id == q0rg_id
-                                && clip.layer_id == target_layer_id
-                                && clip.start_frame > frame
-                        })
-                        .map(|clip| clip.start_frame),
-                )
-                .min()
-            {
-                end_exclusive = end_exclusive.min(next);
-            }
-        }
+        let end_exclusive = end_exclusive as u16;
         let old_frame_count = self.state.project.q0rgs[q0rg_index].frame_count;
         let new_frame_count = old_frame_count.max(end_exclusive);
         if audio_only {
-            if crate::audio::audio_range_intersects(
-                &self.state.project,
-                q0rg_id,
-                target_layer_id,
-                frame,
-                end_exclusive,
-            ) {
-                self.session.status = "audio clips cannot overlap on the same layer".to_string();
-                return;
-            }
-            if crate::audio::visual_content_conflicts_with_audio_range(
-                &self.state.project,
-                q0rg_id,
-                target_layer_id,
-                frame,
-                end_exclusive,
-            ) {
-                self.session.status =
-                    "audio frames must be empty; choose an empty timeline range".to_string();
-                return;
-            }
+            // A sound plays out in full. Where the layer has no room for
+            // all of it, it gets a layer of its own just above instead of
+            // being cut short or refused.
+            let usable = !self.state.project.layer_is_folder(q0rg_id, target_layer_id)
+                && !self.state.project.layer_is_locked(q0rg_id, target_layer_id)
+                && self
+                    .state
+                    .project
+                    .layer_is_visible(q0rg_id, target_layer_id);
+            let fits = usable
+                && !crate::audio::audio_range_intersects(
+                    &self.state.project,
+                    q0rg_id,
+                    target_layer_id,
+                    frame,
+                    end_exclusive,
+                )
+                && !crate::audio::visual_content_conflicts_with_audio_range(
+                    &self.state.project,
+                    q0rg_id,
+                    target_layer_id,
+                    frame,
+                    end_exclusive,
+                );
             self.history
                 .snapshot_with_session(&self.state.project, &self.session);
+            let layer_id = if fits {
+                target_layer_id
+            } else {
+                self.insert_sound_layer(q0rg_id, target_layer_id, asset_id)
+            };
             let q0rg = &mut self.state.project.q0rgs[q0rg_index];
             q0rg.frame_count = new_frame_count;
             let Some(layer) = q0rg
                 .layers
                 .iter_mut()
-                .find(|layer| layer.layer_id == target_layer_id)
+                .find(|layer| layer.layer_id == layer_id)
             else {
                 return;
             };
@@ -9150,24 +9150,22 @@ impl EditorApp {
             layer.extend_timeline_through(end_exclusive.saturating_sub(1));
             self.state.project.audio_clips.push(AudioClip {
                 q0rg_id,
-                layer_id: target_layer_id,
+                layer_id,
                 start_frame: frame,
                 asset_id,
                 gain: 1.0,
                 muted: false,
                 ..Default::default()
             });
-            self.session.current_layer_id = target_layer_id;
+            self.session.current_layer_id = layer_id;
             self.session.current_frame = frame;
-            self.session.timeline_selection = Some(crate::state::TimelineSelection::single(
-                target_layer_id,
-                frame,
-            ));
+            self.session.timeline_selection =
+                Some(crate::state::TimelineSelection::single(layer_id, frame));
             self.session.selection = Selection::None;
             self.state.mark_dirty();
             self.session.status = format!(
-                "placed audio on layer {} at frame {} ({} project frames)",
-                target_layer_id,
+                "placed sound {}at frame {} ({} frames). Drag it on the timeline to move it, or its ends to trim it",
+                if fits { "" } else { "on its own layer " },
                 frame + 1,
                 end_exclusive - frame
             );
@@ -9286,10 +9284,192 @@ impl EditorApp {
         };
     }
 
+    /// Move sound clip `clip_idx` to `layer_id` from `start` to `end`
+    /// (exclusive), or trim it there: a new length keeps the sound where it
+    /// was on the timeline and plays less or more of it.
+    pub(crate) fn edit_audio_clip(&mut self, clip_idx: usize, layer_id: u16, start: u16, end: u16) {
+        let Some(clip) = self.state.project.audio_clips.get(clip_idx).copied() else {
+            return;
+        };
+        let q0rg_id = clip.q0rg_id;
+        let Some(old_end) = q0s_format::v2::audio_clip_end_frame(&self.state.project, clip) else {
+            return;
+        };
+        if end <= start || (layer_id, start, end) == (clip.layer_id, clip.start_frame, old_end) {
+            return;
+        }
+        let project = &self.state.project;
+        if project.layer_is_locked(q0rg_id, clip.layer_id)
+            || project.layer_is_locked(q0rg_id, layer_id)
+            || project.layer_is_folder(q0rg_id, layer_id)
+        {
+            self.session.status = "unlock the sound's layer first".to_string();
+            return;
+        }
+        let fps = u64::from(project.meta.fps.max(1));
+        let rate = u64::from(crate::audio::EDITOR_AUDIO_SAMPLE_RATE);
+        let samples = |frames: u16| u64::from(frames) * rate / fps;
+        let mut edited = clip;
+        edited.layer_id = layer_id;
+        edited.start_frame = start;
+        if end - start != old_end - clip.start_frame || start == clip.start_frame {
+            // A trim: what plays at each moment on the timeline stays put.
+            let shift = i128::from(samples(start)) - i128::from(samples(clip.start_frame));
+            let offset = i128::from(clip.source_offset_samples) + shift;
+            if offset < 0 {
+                self.session.status = "the sound starts there already".to_string();
+                return;
+            }
+            edited.source_offset_samples = offset as u64;
+            let natural = q0s_format::v2::audio_clip_end_frame(
+                project,
+                q0s_format::v2::AudioClip {
+                    duration_frames: None,
+                    ..edited
+                },
+            )
+            .unwrap_or(end);
+            let end = end.min(natural);
+            if end <= start {
+                return;
+            }
+            edited.duration_frames = Some(end - start);
+        }
+        let Some(new_end) = q0s_format::v2::audio_clip_end_frame(project, edited) else {
+            return;
+        };
+        let overlaps = project
+            .audio_clips
+            .iter()
+            .enumerate()
+            .any(|(index, other)| {
+                index != clip_idx
+                    && other.q0rg_id == q0rg_id
+                    && other.layer_id == layer_id
+                    && q0s_format::v2::audio_clip_end_frame(project, *other)
+                        .is_some_and(|other_end| start < other_end && other.start_frame < new_end)
+            });
+        if overlaps {
+            self.session.status = "another sound is already there on that layer".to_string();
+            return;
+        }
+        if crate::audio::visual_content_conflicts_with_audio_range(
+            project, q0rg_id, layer_id, start, new_end,
+        ) {
+            self.session.status =
+                "that layer has artwork there; sounds go on layers of their own".to_string();
+            return;
+        }
+        let Some(q0rg_index) = project
+            .q0rgs
+            .iter()
+            .position(|q0rg| q0rg.q0rg_id == q0rg_id)
+        else {
+            return;
+        };
+        self.history
+            .snapshot_with_session(&self.state.project, &self.session);
+        self.state.project.audio_clips[clip_idx] = edited;
+        let q0rg = &mut self.state.project.q0rgs[q0rg_index];
+        q0rg.frame_count = q0rg.frame_count.max(new_end);
+        if let Some(layer) = q0rg
+            .layers
+            .iter_mut()
+            .find(|layer| layer.layer_id == layer_id)
+        {
+            layer.ensure_explicit_keyframe(start);
+            layer.extend_timeline_through(new_end.saturating_sub(1));
+        }
+        self.session.current_layer_id = layer_id;
+        self.state.mark_dirty();
+        self.session.status = if edited.duration_frames != clip.duration_frames {
+            format!("sound trimmed to frames {}-{}", start + 1, new_end)
+        } else {
+            format!("sound moved to frame {}", start + 1)
+        };
+        if self.session.playing {
+            let _ = self.refresh_audio_playback();
+        }
+    }
+
+    /// A new empty layer named after sound `asset_id`, just above
+    /// `beside_layer_id` and in its folder. Returns its id. The caller has
+    /// taken the undo step.
+    fn insert_sound_layer(&mut self, q0rg_id: u16, beside_layer_id: u16, asset_id: u16) -> u16 {
+        let Some(q0rg_index) = self
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .position(|q0rg| q0rg.q0rg_id == q0rg_id)
+        else {
+            return beside_layer_id;
+        };
+        let parent_folder_id = if self.state.project.layer_is_folder(q0rg_id, beside_layer_id) {
+            Some(beside_layer_id)
+        } else {
+            self.state
+                .project
+                .layer_parent_folder(q0rg_id, beside_layer_id)
+        };
+        let q0rg = &self.state.project.q0rgs[q0rg_index];
+        let insert_at = q0rg
+            .layers
+            .iter()
+            .position(|layer| layer.layer_id == beside_layer_id)
+            .map_or(q0rg.layers.len(), |index| index + 1);
+        let layer_id = q0rg
+            .layers
+            .iter()
+            .map(|layer| layer.layer_id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+            .max(1);
+        let name = self
+            .state
+            .project
+            .asset_names
+            .get(&asset_id)
+            .cloned()
+            .unwrap_or_else(|| format!("Sound {asset_id}"));
+        let q0rg = &mut self.state.project.q0rgs[q0rg_index];
+        q0rg.layers.insert(
+            insert_at.min(q0rg.layers.len()),
+            Layer {
+                layer_id,
+                timeline_frame_count: None,
+                name,
+                explicit_keyframes: vec![0],
+                placements: Vec::new(),
+            },
+        );
+        if let Some(parent_folder_id) = parent_folder_id {
+            self.state.project.layer_metadata.insert(
+                LayerKey::new(q0rg_id, layer_id),
+                LayerMetadata {
+                    kind: LayerKind::Normal,
+                    parent_folder_id: Some(parent_folder_id),
+                    mask_layer_id: None,
+                    collapsed: false,
+                    hidden: false,
+                    locked: false,
+                },
+            );
+        }
+        self.state.mark_dirty();
+        layer_id
+    }
+
     fn place_library_item_at(&mut self, item: LibraryItem, position: q0s_format::v2::Vec2) {
         if crate::audio::library_item_is_audio_only(&self.state.project, item) {
-            self.session.status =
-                "audio lives on the timeline; drag it onto a timeline frame".to_string();
+            // A sound dropped on the stage starts at the playhead, on the
+            // current layer when it has room, else on a new layer above.
+            self.place_library_item_on_timeline(
+                item,
+                self.session.current_layer_id,
+                self.session.current_frame,
+            );
             return;
         }
         if self.current_layer_is_locked() || !self.current_layer_is_visible() {
@@ -10727,32 +10907,7 @@ impl EditorApp {
             .find(|q| q.q0rg_id == entry_id)
             .map(|q| q.frame_count)
             .unwrap_or(0);
-        for key in &mut self.state.project.runtime.camera.keys {
-            if key.frame < target
-                && key
-                    .tween
-                    .to_frame()
-                    .is_some_and(|to_frame| target <= to_frame)
-            {
-                key.tween = key.tween.with_to_frame(target);
-            }
-        }
-        self.state
-            .project
-            .runtime
-            .camera
-            .keys
-            .push(q0s_format::v2::CameraKey {
-                frame: target,
-                state,
-                tween: Tween::None,
-            });
-        self.state
-            .project
-            .runtime
-            .camera
-            .keys
-            .sort_by_key(|key| key.frame);
+        self.state.project.runtime.camera.insert_key(target, state);
         if target >= old_count {
             if let Some(entry) = self
                 .state
@@ -11654,7 +11809,7 @@ impl EditorApp {
                     frame,
                     target: src.target,
                     transform: state.transform,
-                    tween: Tween::None,
+                    tween: crate::timeline_edit::continued_motion_tween(src.tween, frame, None),
                     fx: state.fx,
                 };
                 insertions.extend(
@@ -19305,5 +19460,200 @@ mod tests {
         assert_eq!(document.path, path);
         assert_eq!(document.text, "go 4\n");
         assert!(document.dirty);
+    }
+
+    /// A 24 fps project with a one-second sound on layer 1 from frame 2.
+    fn app_with_a_sound() -> EditorApp {
+        let mut app = EditorApp::default();
+        app.state.project.meta.fps = 24;
+        app.state.project.q0rgs[0].frame_count = 40;
+        app.state.project.q0rgs[0].layers[0]
+            .explicit_keyframes
+            .clear();
+        app.state.project.assets.push(Asset::Q0v(Q0vAsset {
+            asset_id: 77,
+            bytes: (test_audio_q0v_bytes(48_000, 48_000)).into(),
+        }));
+        app.handle(
+            &Context::default(),
+            Action::PlaceLibraryItemOnTimeline(LibraryItem::Asset(77), 1, 2),
+        );
+        assert_eq!(app.state.project.audio_clips.len(), 1);
+        app
+    }
+
+    #[test]
+    fn a_dragged_sound_moves_along_its_layer() {
+        let mut app = app_with_a_sound();
+        app.handle(&Context::default(), Action::EditAudioClip(0, 1, 10, 34));
+        let clip = app.state.project.audio_clips[0];
+        assert_eq!((clip.layer_id, clip.start_frame), (1, 10));
+        assert_eq!(clip.source_offset_samples, 0, "a move plays the same sound");
+        app.handle(&Context::default(), Action::Undo);
+        assert_eq!(app.state.project.audio_clips[0].start_frame, 2);
+    }
+
+    #[test]
+    fn trimming_a_sound_keeps_the_rest_where_it_plays() {
+        let mut app = app_with_a_sound();
+        // Its start dragged 4 frames later: those 4 frames of sound go.
+        app.handle(&Context::default(), Action::EditAudioClip(0, 1, 6, 26));
+        let clip = app.state.project.audio_clips[0];
+        assert_eq!(clip.start_frame, 6);
+        assert_eq!(clip.source_offset_samples, 4 * 2_000);
+        assert_eq!(clip.duration_frames, Some(20));
+        // Its end dragged sooner.
+        app.handle(&Context::default(), Action::EditAudioClip(0, 1, 6, 12));
+        assert_eq!(app.state.project.audio_clips[0].duration_frames, Some(6));
+        // And no longer than the sound itself.
+        app.handle(&Context::default(), Action::EditAudioClip(0, 1, 6, 39));
+        assert_eq!(app.state.project.audio_clips[0].duration_frames, Some(20));
+    }
+
+    #[test]
+    fn a_sound_is_not_dropped_onto_another() {
+        let mut app = app_with_a_sound();
+        app.handle(
+            &Context::default(),
+            Action::PlaceLibraryItemOnTimeline(LibraryItem::Asset(77), 1, 30),
+        );
+        let second = app
+            .state
+            .project
+            .audio_clips
+            .iter()
+            .position(|clip| clip.start_frame == 30)
+            .expect("second sound");
+        let layer = app.state.project.audio_clips[second].layer_id;
+        app.handle(
+            &Context::default(),
+            Action::EditAudioClip(second, layer, 5, 29),
+        );
+        if layer == 1 {
+            assert_eq!(app.state.project.audio_clips[second].start_frame, 30);
+            assert!(app.session.status.contains("another sound"));
+        }
+    }
+
+    #[test]
+    fn a_sound_that_does_not_fit_gets_a_layer_of_its_own() {
+        let mut app = app_with_a_sound();
+        let layers_before = app.state.project.q0rgs[0].layers.len();
+        // Frame 10 is inside the first sound.
+        app.handle(
+            &Context::default(),
+            Action::PlaceLibraryItemOnTimeline(LibraryItem::Asset(77), 1, 10),
+        );
+        assert_eq!(app.state.project.q0rgs[0].layers.len(), layers_before + 1);
+        let clip = *app.state.project.audio_clips.last().unwrap();
+        assert_ne!(clip.layer_id, 1);
+        assert_eq!(clip.start_frame, 10);
+        assert_eq!(clip.duration_frames, None, "played out in full");
+        app.handle(&Context::default(), Action::Undo);
+        assert_eq!(app.state.project.q0rgs[0].layers.len(), layers_before);
+        assert_eq!(app.state.project.audio_clips.len(), 1);
+    }
+
+    #[test]
+    fn a_sound_dropped_on_the_stage_starts_at_the_playhead() {
+        let mut app = app_with_a_sound();
+        app.session.current_layer_id = 1;
+        app.session.current_frame = 30;
+        app.handle(
+            &Context::default(),
+            Action::PlaceLibraryItemAt(LibraryItem::Asset(77), Vec2::new(10.0, 10.0)),
+        );
+        assert!(app
+            .state
+            .project
+            .audio_clips
+            .iter()
+            .any(|clip| clip.start_frame == 30));
+    }
+
+    /// One object tweening from x 0 at frame 0 to x 60 at frame 6.
+    fn tweened_object() -> EditorApp {
+        let mut app = app_with_one_timeline_object(8);
+        app.state.project.q0rgs[0].layers[0].placements[0].tween = Tween::Linear { to_frame: 6 };
+        let mut end = app.state.project.q0rgs[0].layers[0].placements[0].clone();
+        end.frame = 6;
+        end.tween = Tween::None;
+        end.transform.tx = 60.0;
+        app.state.project.q0rgs[0].layers[0].placements.push(end);
+        app
+    }
+
+    fn x_at(app: &EditorApp, frame: u16) -> f32 {
+        let layer = &app.state.project.q0rgs[0].layers[0];
+        crate::render::active_placements_at(layer, frame)
+            .first()
+            .map(|(_, transform)| transform.tx)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_keyframe_made_inside_a_tween_carries_the_tween_on() {
+        let mut app = tweened_object();
+        let before: Vec<f32> = (0..=6).map(|frame| x_at(&app, frame)).collect();
+        app.session.current_frame = 3;
+        app.handle(&Context::default(), Action::InsertKeyframe);
+        let layer = &app.state.project.q0rgs[0].layers[0];
+        let new_key = layer
+            .placements
+            .iter()
+            .find(|placement| placement.frame == 3)
+            .expect("key at 3");
+        assert_eq!(new_key.tween, Tween::Linear { to_frame: 6 });
+        let after: Vec<f32> = (0..=6).map(|frame| x_at(&app, frame)).collect();
+        for (frame, (b, a)) in before.iter().zip(&after).enumerate() {
+            assert!((b - a).abs() < 1e-3, "frame {frame} moved: {b} -> {a}");
+        }
+    }
+
+    #[test]
+    fn editing_an_in_between_frame_keeps_both_halves_moving() {
+        let mut app = tweened_object();
+        crate::tools::materialize_layer_keyframe_for_edit(&mut app.state.project, 1, 1, 3)
+            .expect("a key at 3");
+        let layer = &app.state.project.q0rgs[0].layers[0];
+        assert_eq!(layer.placements[0].tween, Tween::Linear { to_frame: 3 });
+        let new_key = layer
+            .placements
+            .iter()
+            .find(|placement| placement.frame == 3)
+            .unwrap();
+        assert_eq!(new_key.tween, Tween::Linear { to_frame: 6 });
+        assert!(
+            (x_at(&app, 5) - 50.0).abs() < 1e-3,
+            "still moving after the new key"
+        );
+    }
+
+    #[test]
+    fn a_camera_key_inside_a_camera_tween_splits_it() {
+        let mut track = q0s_format::v2::CameraTrack {
+            enabled: true,
+            keys: Vec::new(),
+        };
+        let at = |x: f32| q0s_format::v2::CameraState {
+            center_x: x,
+            center_y: 0.0,
+            zoom: 1.0,
+            rotation: 0.0,
+        };
+        track.keys.push(q0s_format::v2::CameraKey {
+            frame: 0,
+            state: at(0.0),
+            tween: Tween::Linear { to_frame: 10 },
+        });
+        track.keys.push(q0s_format::v2::CameraKey {
+            frame: 10,
+            state: at(100.0),
+            tween: Tween::None,
+        });
+        track.insert_key(4, at(40.0));
+        assert_eq!(track.keys[0].tween, Tween::Linear { to_frame: 4 });
+        assert_eq!(track.keys[1].frame, 4);
+        assert_eq!(track.keys[1].tween, Tween::Linear { to_frame: 10 });
     }
 }

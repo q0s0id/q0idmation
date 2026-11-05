@@ -815,6 +815,8 @@ impl Online {
             .default_pos(egui::pos2(screen.right() - 410.0, screen.top() + 70.0))
             .default_width(380.0)
             .default_height((screen.height() - 140.0).clamp(420.0, 820.0))
+            // Never taller than the screen, whatever its contents ask for.
+            .max_height((screen.height() - 40.0).max(300.0))
             .min_width(300.0)
             .resizable(true)
             .collapsible(true)
@@ -823,24 +825,30 @@ impl Online {
                 let pal = Palette::new(app, ui);
                 if self.user.is_none() {
                     self.signed_out_view(ui, &pal, &mut out);
+                    self.footer(ui, &pal);
                 } else {
                     self.header(ui, &pal, &mut out);
                     ui.separator();
                     self.tabs(ui);
                     ui.add_space(2.0);
-                    // room for the whole message below the scrolling content
-                    let footer = self.notice.as_ref().map_or(0.0, |notice| {
-                        let font = egui::TextStyle::Body.resolve(ui.style());
-                        let width = (ui.available_width() - 30.0).max(60.0);
-                        let galley = ui.fonts(|fonts| {
-                            fonts.layout(notice.text.clone(), font, Color32::WHITE, width)
-                        });
-                        galley.size().y + 22.0
-                    });
+                    // The message sits in a strip of its own at the bottom and
+                    // the scrolling content fills exactly what is left. Sizing
+                    // the content from a guess at the message's height made the
+                    // window a little too tall for itself whenever the guess
+                    // fell short, and a window grows to fit what it holds, so
+                    // it stretched itself taller every frame.
+                    if self.notice.is_some() {
+                        egui::TopBottomPanel::bottom("online_panel_notice")
+                            .resizable(false)
+                            .show_separator_line(true)
+                            .frame(
+                                egui::Frame::none().inner_margin(egui::Margin::symmetric(0.0, 4.0)),
+                            )
+                            .show_inside(ui, |ui| self.notice_row(ui, &pal));
+                    }
                     egui::ScrollArea::vertical()
                         .id_source("online_panel_scroll")
                         .auto_shrink([false, false])
-                        .max_height((ui.available_height() - footer).max(120.0))
                         .stick_to_bottom(matches!(self.view.tab, Tab::Chat))
                         .show(ui, |ui| match self.view.tab {
                             Tab::Room => self.room_view(app, ui, &pal, &mut out),
@@ -850,7 +858,6 @@ impl Online {
                             Tab::Messages => self.messages_view(ui, &pal, &mut out),
                         });
                 }
-                self.footer(ui, &pal);
             });
         self.open = open;
         self.apply(app, ctx, out);
@@ -908,10 +915,18 @@ impl Online {
     }
 
     fn footer(&mut self, ui: &mut Ui, pal: &Palette) {
+        if self.notice.is_none() {
+            return;
+        }
+        ui.separator();
+        self.notice_row(ui, pal);
+    }
+
+    /// The message under the panel, with its dismiss button.
+    fn notice_row(&mut self, ui: &mut Ui, pal: &Palette) {
         let Some(notice) = self.notice.clone() else {
             return;
         };
-        ui.separator();
         ui.horizontal(|ui| {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui

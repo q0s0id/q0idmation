@@ -839,6 +839,46 @@ impl GapSize {
     }
 }
 
+/// Where the brush may lay its paint, as Animate's brush modes do.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum PaintMode {
+    /// Everywhere the stroke goes, over fills and lines.
+    #[default]
+    Normal,
+    /// Only where nothing is drawn yet: paint goes behind the drawing.
+    Behind,
+    /// Only inside the shape or fill the stroke starts in, never over its
+    /// lines: colouring in without going over the lines.
+    Inside,
+    /// Only over fills already there, recolouring them; empty space and
+    /// lines are left alone.
+    OverFills,
+}
+
+impl PaintMode {
+    pub const ALL: [Self; 4] = [Self::Normal, Self::Behind, Self::Inside, Self::OverFills];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Behind => "Behind",
+            Self::Inside => "Inside",
+            Self::OverFills => "Over fills",
+        }
+    }
+
+    pub const fn hint(self) -> &'static str {
+        match self {
+            Self::Normal => "Paint everywhere the brush goes.",
+            Self::Behind => "Paint only where nothing is drawn yet, behind the drawing.",
+            Self::Inside => {
+                "Paint only inside the shape the stroke starts in, never over its lines."
+            }
+            Self::OverFills => "Paint only over fills already there; lines and empty space stay.",
+        }
+    }
+}
+
 /// Snapping and the drawing tools' own switches.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -859,6 +899,8 @@ pub struct DrawingAids {
     pub knife_gap: u8,
     /// The knife cuts along a jagged line instead of the one drawn.
     pub knife_jagged: bool,
+    /// Where the brushes may lay paint.
+    pub paint_mode: PaintMode,
 }
 
 impl Default for DrawingAids {
@@ -867,10 +909,11 @@ impl Default for DrawingAids {
             snap: false,
             transform_box: true,
             from_middle: false,
-            bucket_gap: GapSize::None,
+            bucket_gap: GapSize::Small,
             split_crossings: true,
             knife_gap: 2,
             knife_jagged: false,
+            paint_mode: PaintMode::Normal,
         }
     }
 }

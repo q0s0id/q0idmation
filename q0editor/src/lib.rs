@@ -22,6 +22,7 @@ pub mod hotkeys;
 mod knife;
 pub mod l10n;
 pub mod launch;
+pub(crate) mod layer_flags;
 pub mod library_transfer;
 pub mod lights;
 pub mod model_studio;
@@ -63,6 +64,7 @@ pub mod workspace;
 
 pub mod tools;
 pub mod tools3d;
+pub(crate) mod tween_tools;
 mod variants;
 
 pub use app::EditorApp;

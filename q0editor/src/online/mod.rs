@@ -407,6 +407,25 @@ impl Online {
         }
         Some(locked)
     }
+    /// Set your own lock on a layer in the room on `tab`. False when `tab`
+    /// is not in a room, where locks belong to the document.
+    pub(crate) fn set_local_lock(
+        &mut self,
+        tab: Option<u64>,
+        q0rg_id: u16,
+        layer_id: u16,
+        locked: bool,
+    ) -> bool {
+        let Some(room) = self.room.as_mut().filter(|room| Some(room.tab_id) == tab) else {
+            return false;
+        };
+        if locked {
+            room.local_locks.insert((q0rg_id, layer_id));
+        } else {
+            room.local_locks.remove(&(q0rg_id, layer_id));
+        }
+        true
+    }
     pub(crate) fn locally_locked(&self, q0rg_id: u16, layer_id: u16) -> bool {
         self.room
             .as_ref()

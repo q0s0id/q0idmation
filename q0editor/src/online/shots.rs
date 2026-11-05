@@ -12,7 +12,13 @@ use q0s_format::v2::{Layer, LayerKey, LayerKind, LayerMetadata, LibraryItemRefer
 #[test]
 fn online_panel_idle_layout_does_not_grow() {
     let mut failures = Vec::new();
-    for tab in [Tab::Rooms, Tab::Friends, Tab::Room] {
+    for tab in [
+        Tab::Rooms,
+        Tab::Friends,
+        Tab::Room,
+        Tab::Chat,
+        Tab::Messages,
+    ] {
         for notice in [false, true] {
             let mut app = EditorApp::default();
             let mut online = signed_in(1);
@@ -44,10 +50,11 @@ fn online_panel_idle_layout_does_not_grow() {
                 last = ctx
                     .memory(|memory| memory.area_rect(egui::Id::new("q0editor_online")))
                     .unwrap();
-                if frame == 8 {
+                // It may settle on the first frames, then must hold still.
+                if frame == 2 {
                     settled = Some(last);
                 }
-                if [0, 8, 47].contains(&frame) {
+                if [0, 2, 47].contains(&frame) {
                     eprintln!(
                         "online layout tab={} notice={notice} frame={frame}: {last:?}",
                         tab as u8
