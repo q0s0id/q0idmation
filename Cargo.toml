@@ -4,7 +4,7 @@ exclude = ["vendor"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0-beta.6"
+version = "0.1.0-beta.6.1"
 edition = "2021"
 authors = ["q0s"]
 license = "GPL-3.0-or-later"

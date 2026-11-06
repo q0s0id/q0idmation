@@ -16,9 +16,9 @@ use serde_json::{json, Value};
 
 use crate::app::EditorApp;
 
-/// The q0editor application on Discord's developer portal. Empty until one
-/// is made; Settings can hold another, for testing.
-pub(crate) const APPLICATION_ID: &str = "";
+/// The q0editor application on Discord's developer portal. Settings can
+/// hold another, for testing. Its art asset `q0editor` is the big picture.
+pub(crate) const APPLICATION_ID: &str = "1568309008132210698";
 /// The fewest seconds between two updates sent to Discord.
 const SPACING: Duration = Duration::from_secs(15);
 const RETRY: Duration = Duration::from_secs(20);
