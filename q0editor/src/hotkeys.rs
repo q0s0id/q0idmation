@@ -66,6 +66,10 @@ pub enum ShortcutCommand {
     ToolText,
     ToolRig,
     OpenChat,
+    /// Hide every panel but the stage, and back.
+    StageOnly,
+    /// Borderless full screen, and back.
+    Fullscreen,
 }
 
 impl ShortcutCommand {
@@ -130,6 +134,8 @@ impl ShortcutCommand {
         Self::ToolText,
         Self::ToolRig,
         Self::OpenChat,
+        Self::StageOnly,
+        Self::Fullscreen,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -194,6 +200,8 @@ impl ShortcutCommand {
             Self::ToolText => "Text tool",
             Self::ToolRig => "Rig tool",
             Self::OpenChat => "Chat (online room)",
+            Self::StageOnly => "Show only the stage",
+            Self::Fullscreen => "Full screen",
         }
     }
 
@@ -231,7 +239,7 @@ impl ShortcutCommand {
             C::ZoomIn => vec![ShortcutChord::cmd(K::Plus), ShortcutChord::cmd(K::Equals)],
             C::ZoomOut => vec![ShortcutChord::cmd(K::Minus)],
             C::ZoomReset => vec![ShortcutChord::cmd(K::Num0)],
-            C::ScriptEditor => vec![ShortcutChord::key(K::F9)],
+            C::ScriptEditor => vec![ShortcutChord::alt(K::F9)],
             C::PlaybackToggle => vec![ShortcutChord::key(K::Enter)],
             C::ToggleTimeline => vec![ShortcutChord::cmd_alt(K::T)],
             C::FirstFrame => vec![ShortcutChord::key(K::Home)],
@@ -264,6 +272,8 @@ impl ShortcutCommand {
             C::ToolText => vec![ShortcutChord::key(K::T)],
             C::ToolRig => vec![ShortcutChord::key(K::G)],
             C::OpenChat => vec![ShortcutChord::key(K::Slash)],
+            C::StageOnly => vec![ShortcutChord::key(K::F9)],
+            C::Fullscreen => vec![ShortcutChord::key(K::F11)],
         }
     }
 
@@ -602,6 +612,14 @@ impl ShortcutChord {
             command: false,
             shift: true,
             alt: false,
+        }
+    }
+    pub const fn alt(key: ShortcutKey) -> Self {
+        Self {
+            key,
+            command: false,
+            shift: false,
+            alt: true,
         }
     }
     pub const fn cmd_shift(key: ShortcutKey) -> Self {

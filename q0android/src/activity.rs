@@ -370,6 +370,20 @@ pub fn leave() {
     }
 }
 
+/// Opens a link in the phone's browser.
+pub fn open_url(url: &str) -> Result<(), String> {
+    with_activity(|env, activity| {
+        let url = env.new_string(url)?;
+        env.call_method(
+            activity,
+            "openUrl",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(&url)],
+        )?;
+        Ok(())
+    })
+}
+
 /// Keeps the display from sleeping, for playback.
 pub fn keep_screen_on(on: bool) {
     call_flag("keepScreenOn", on);

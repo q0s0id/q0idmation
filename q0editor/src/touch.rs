@@ -97,69 +97,14 @@ fn main_menu(app: &mut EditorApp, ui: &mut Ui) {
             // Blank text sized like the other bar buttons; the icon is painted over it.
             ui.spacing_mut().button_padding = vec2(14.0, 10.0);
             let menu = ui.menu_button("   ", |ui| {
-                crate::panels::menu::menus(app, ui);
-                ui.separator();
-                if app.has_active_project() && !app.home_visible() {
-                    if ui.button("Project...").clicked() {
-                        app.queue(Action::ToggleProjectTree);
-                        ui.close_menu();
-                    }
-                    if ui.button("Export (q0enc)...").clicked() {
-                        app.queue(Action::ToggleQ0Enc);
-                        ui.close_menu();
-                    }
-                }
-                if app.has_active_project() && !app.home_visible() {
-                    ui.separator();
-                    // Phones have no room for the desktop's tool buttons, so
-                    // the extra tools live here; one that is off in Settings
-                    // switches on when picked.
-                    for (label, on, action) in [
-                        (
-                            "Physics",
-                            app.settings.physics_enabled,
-                            Action::TogglePhysics,
-                        ),
-                        (
-                            "Particles",
-                            app.settings.particles_enabled,
-                            Action::ToggleParticles,
-                        ),
-                        ("Light", app.settings.light_enabled, Action::ToggleLight),
-                    ] {
-                        let open = match action {
-                            Action::TogglePhysics => app.session.physics.open,
-                            Action::ToggleParticles => app.session.particles.open,
-                            _ => app.session.lights.open,
-                        };
-                        if ui
-                            .selectable_label(on && open, format!("{label}..."))
-                            .clicked()
-                        {
-                            if !on {
-                                match action {
-                                    Action::TogglePhysics => app.settings.physics_enabled = true,
-                                    Action::ToggleParticles => {
-                                        app.settings.particles_enabled = true;
-                                    }
-                                    _ => app.settings.light_enabled = true,
-                                }
-                                let _ = app.settings.try_save();
-                            }
-                            app.queue(action);
-                            ui.close_menu();
-                        }
-                    }
-                    ui.separator();
-                }
-                if ui.button("Import Animate files (q0fla)...").clicked() {
-                    app.queue(Action::ToggleQ0Fla);
-                    ui.close_menu();
-                }
-                if ui.button("Settings...").clicked() {
-                    app.queue(Action::ToggleSettings);
-                    ui.close_menu();
-                }
+                // A phone shows the whole menu at a fingertip's size, which
+                // runs past the bottom of the screen: it scrolls instead, so
+                // nothing in it is out of reach.
+                let room = ui.ctx().screen_rect().height() - BAR_HEIGHT - 24.0;
+                ui.set_min_width(260.0_f32.min(ui.ctx().screen_rect().width() - 16.0));
+                egui::ScrollArea::vertical()
+                    .max_height(room.max(120.0))
+                    .show(ui, |ui| main_menu_items(app, ui));
             });
             (menu.response, menu.inner.is_some())
         })
@@ -171,6 +116,80 @@ fn main_menu(app: &mut EditorApp, ui: &mut Ui) {
         Icon::Menu,
         ui.visuals().text_color(),
     );
+}
+
+fn main_menu_items(app: &mut EditorApp, ui: &mut Ui) {
+    crate::panels::menu::menus(app, ui);
+    ui.separator();
+    if app.has_active_project() && !app.home_visible() {
+        if ui.button("Project...").clicked() {
+            app.queue(Action::ToggleProjectTree);
+            ui.close_menu();
+        }
+        if ui.button("Export (q0enc)...").clicked() {
+            app.queue(Action::ToggleQ0Enc);
+            ui.close_menu();
+        }
+    }
+    if app.has_active_project() && !app.home_visible() {
+        ui.separator();
+        // Phones have no room for the desktop's tool buttons, so
+        // the extra tools live here; one that is off in Settings
+        // switches on when picked.
+        for (label, on, action) in [
+            (
+                "Physics",
+                app.settings.physics_enabled,
+                Action::TogglePhysics,
+            ),
+            (
+                "Particles",
+                app.settings.particles_enabled,
+                Action::ToggleParticles,
+            ),
+            ("Light", app.settings.light_enabled, Action::ToggleLight),
+        ] {
+            let open = match action {
+                Action::TogglePhysics => app.session.physics.open,
+                Action::ToggleParticles => app.session.particles.open,
+                _ => app.session.lights.open,
+            };
+            if ui
+                .selectable_label(on && open, format!("{label}..."))
+                .clicked()
+            {
+                if !on {
+                    match action {
+                        Action::TogglePhysics => app.settings.physics_enabled = true,
+                        Action::ToggleParticles => {
+                            app.settings.particles_enabled = true;
+                        }
+                        _ => app.settings.light_enabled = true,
+                    }
+                    let _ = app.settings.try_save();
+                }
+                app.queue(action);
+                ui.close_menu();
+            }
+        }
+        ui.separator();
+    }
+    if ui.button("Import Animate files (q0fla)...").clicked() {
+        app.queue(Action::ToggleQ0Fla);
+        ui.close_menu();
+    }
+    // The desktop's menu bar has Online; phones had no way to it.
+    if ui
+        .selectable_label(app.online.open, app.online.menu_label())
+        .clicked()
+    {
+        app.online.open = !app.online.open;
+        ui.close_menu();
+    }
+    if ui.button("Settings...").clicked() {
+        app.queue(Action::ToggleSettings);
+        ui.close_menu();
+    }
 }
 
 /// The system Back button: closes the most passing thing that is open, and

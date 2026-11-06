@@ -103,6 +103,19 @@ pub(crate) fn leave() {
     android::leave();
 }
 
+/// On Android, links the editor opens (the q0id sign-in page among them)
+/// go to the phone's browser through the activity. egui's own way asks the
+/// system which apps can show a link first, which newer Androids only
+/// answer for apps that declared it, so a link could quietly do nothing.
+pub(crate) fn open_links(ctx: &egui::Context) {
+    #[cfg(target_os = "android")]
+    if let Some(link) = ctx.output_mut(|output| output.open_url.take()) {
+        android::open_url(&link.url);
+    }
+    #[cfg(not(target_os = "android"))]
+    let _ = ctx;
+}
+
 /// Where fast preview snapshots go when q0player is another app.
 #[cfg(target_os = "android")]
 pub(crate) fn preview_dir() -> PathBuf {

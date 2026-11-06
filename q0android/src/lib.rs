@@ -14,7 +14,7 @@ mod startup;
 
 pub use activity::{
     create_document, document_written, export_finished, immersive, keep_screen_on, leave,
-    open_in_player, pick_document, set_waker, take_events, Event, Mp4Encoder, EXTERNAL,
+    open_in_player, open_url, pick_document, set_waker, take_events, Event, Mp4Encoder, EXTERNAL,
     PREVIEW_ALL_SCENES, PREVIEW_SCENE,
 };
 pub use startup::{adopt_app_storage, choose_multisampling, egl_offers_multisampling};

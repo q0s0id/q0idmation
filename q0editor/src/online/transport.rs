@@ -442,6 +442,7 @@ fn request_inner(
             if !access.is_empty() && !refresh_token.is_empty() {
                 current.access = access.into();
                 current.refresh = refresh_token.into();
+                super::keep::save(base, refresh_token);
             }
         }
         drop(current);
@@ -1019,6 +1020,54 @@ impl Transport {
             let mut poll: Option<Poll> = None;
             let mut inbox: Option<Poll> = None;
             let mut active_room: Option<String> = None;
+            if let Some(kept) = super::keep::load(&base) {
+                match request(
+                    &agent,
+                    &base,
+                    &credentials,
+                    "POST",
+                    "/api/v1/auth/refresh",
+                    Some(json!({"refresh_token":kept})),
+                    false,
+                ) {
+                    Ok(tokens) => {
+                        let access = tokens["access_token"].as_str().unwrap_or("").to_string();
+                        let refresh = tokens["refresh_token"].as_str().unwrap_or("").to_string();
+                        if !access.is_empty() && !refresh.is_empty() {
+                            super::keep::save(&base, &refresh);
+                            *credentials.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Credentials { access, refresh };
+                            match request(
+                                &agent,
+                                &base,
+                                &credentials,
+                                "GET",
+                                "/api/v1/auth/me",
+                                None,
+                                true,
+                            ) {
+                                Ok(user) => {
+                                    send(&replies, &ctx, Reply::SignedIn(user));
+                                    inbox = Some(start_inbox(
+                                        base.clone(),
+                                        credentials.clone(),
+                                        replies.clone(),
+                                        ctx.clone(),
+                                        stopped.clone(),
+                                    ));
+                                }
+                                Err(e) => {
+                                    send(&replies, &ctx, Reply::LoginEnded { message: e.text() })
+                                }
+                            }
+                        }
+                    }
+                    // The server no longer takes it: expired, or signed out
+                    // elsewhere. Offline, it is kept for the next start.
+                    Err(e) if matches!(e.status, 400 | 401 | 403) => super::keep::forget(),
+                    Err(_) => {}
+                }
+            }
             while !stopped.load(Ordering::Acquire) {
                 let received = commands.recv_timeout(Duration::from_millis(200));
                 match received {
@@ -1092,6 +1141,7 @@ impl Transport {
                                 login = None;
                                 *credentials.lock().unwrap_or_else(|e| e.into_inner()) =
                                     Credentials::default();
+                                super::keep::forget();
                                 Ok(Some(Reply::SignedOut))
                             }
                             Command::Refresh => {
@@ -1530,6 +1580,7 @@ impl Transport {
                                     },
                                 );
                             } else {
+                                super::keep::save(&base, &refresh);
                                 *credentials.lock().unwrap_or_else(|e| e.into_inner()) =
                                     Credentials { access, refresh };
                                 match request(

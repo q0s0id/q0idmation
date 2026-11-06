@@ -130,8 +130,21 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
 }
 
 /// The File, Edit, Modify, View and Help menus.
+/// One of the menus: a menu of the menu bar on a desktop. On a touch screen
+/// it is a section that folds open in place instead, since a phone has no
+/// room beside a menu for another one to open, and the main menu scrolls.
+fn section(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui)) {
+    if crate::touch::ENABLED {
+        egui::CollapsingHeader::new(egui::RichText::new(title).strong())
+            .id_source(("touch_menu_section", title))
+            .show(ui, add_contents);
+    } else {
+        ui.menu_button(title, add_contents);
+    }
+}
+
 pub fn menus(app: &mut EditorApp, ui: &mut Ui) {
-    ui.menu_button("File", |ui| {
+    section(ui, "File", |ui| {
         if app.has_active_document() && !app.home_visible() {
             if ui.button("Home").clicked() {
                 app.queue(Action::ShowHome);
@@ -162,7 +175,7 @@ pub fn menus(app: &mut EditorApp, ui: &mut Ui) {
         let recent = app.settings.recent_projects.clone();
         let labels = recent_menu_labels(&recent);
         ui.add_enabled_ui(!recent.is_empty(), |ui| {
-            ui.menu_button("Open Recent", |ui| {
+            section(ui, "Open Recent", |ui| {
                 for (path, label) in recent.into_iter().zip(labels) {
                     if ui
                         .button(label)
@@ -256,7 +269,7 @@ pub fn menus(app: &mut EditorApp, ui: &mut Ui) {
     });
 
     if !app.home_visible() && app.has_active_project() {
-        ui.menu_button("Edit", |ui| {
+        section(ui, "Edit", |ui| {
             let can_undo = app.online.connected() || app.history.can_undo();
             let can_redo = app.online.connected() || app.history.can_redo();
             if ui
@@ -373,7 +386,7 @@ pub fn menus(app: &mut EditorApp, ui: &mut Ui) {
             }
         });
 
-        ui.menu_button("Modify", |ui| {
+        section(ui, "Modify", |ui| {
             let can_convert = crate::selection_edit::selection_can_clip(&app.session.selection);
             if ui
                 .add_enabled(
@@ -443,7 +456,7 @@ pub fn menus(app: &mut EditorApp, ui: &mut Ui) {
             }
         });
 
-        ui.menu_button("View", |ui| {
+        section(ui, "View", |ui| {
             if shortcut_button(
                 ui,
                 "Zoom In",
@@ -517,6 +530,26 @@ pub fn menus(app: &mut EditorApp, ui: &mut Ui) {
             }
             if shortcut_button(
                 ui,
+                "Show Only the Stage",
+                app.settings.hotkeys.display(ShortcutCommand::StageOnly),
+            )
+            .clicked()
+            {
+                app.queue(Action::ToggleStageOnly);
+                ui.close_menu();
+            }
+            if shortcut_button(
+                ui,
+                "Full Screen",
+                app.settings.hotkeys.display(ShortcutCommand::Fullscreen),
+            )
+            .clicked()
+            {
+                app.queue(Action::ToggleFullscreen);
+                ui.close_menu();
+            }
+            if shortcut_button(
+                ui,
                 "Show / Hide Timeline",
                 app.settings
                     .hotkeys
@@ -562,11 +595,11 @@ pub fn menus(app: &mut EditorApp, ui: &mut Ui) {
         });
     }
 
-    ui.menu_button("Plugins", |ui| {
+    section(ui, "Plugins", |ui| {
         crate::plugins::menu(app, ui);
     });
 
-    ui.menu_button("Help", |ui| {
+    section(ui, "Help", |ui| {
         if ui.button("Credits...").clicked() {
             app.queue(Action::ToggleCredits);
             ui.close_menu();
@@ -831,6 +864,8 @@ fn action_for_shortcut(command: ShortcutCommand) -> Option<Action> {
         C::ToolText => Action::SelectTool(crate::state::Tool::Text),
         C::ToolRig => Action::SelectTool(crate::state::Tool::Rig),
         C::ToggleSnap => Action::ToggleSnap,
+        C::StageOnly => Action::ToggleStageOnly,
+        C::Fullscreen => Action::ToggleFullscreen,
         C::PerformanceSnapshot | C::ClearSelection | C::OpenChat => return None,
     })
 }
@@ -997,6 +1032,8 @@ pub fn handle_global_shortcuts(app: &mut EditorApp, ctx: &egui::Context) {
             test(ShortcutCommand::ClearSelection);
             test(ShortcutCommand::ToggleSnap);
             test(ShortcutCommand::OpenChat);
+            test(ShortcutCommand::StageOnly);
+            test(ShortcutCommand::Fullscreen);
         }
         test(ShortcutCommand::InsertFrame);
         test(ShortcutCommand::RemoveFrame);

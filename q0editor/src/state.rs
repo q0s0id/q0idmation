@@ -1047,6 +1047,11 @@ pub struct Session {
     pub hidden_mask_art_layers: HashSet<(u64, u16, u16)>,
     /// Layers that "lock all", "hide all" and their Alt-click "all others"
     /// turned on, so turning them off again leaves the rest as they were.
+    /// Layers given their own height in the timeline (Alt-drag a row's
+    /// bottom edge), by symbol and layer. The rest use the setting.
+    pub timeline_row_heights: HashMap<(u16, u16), f32>,
+    /// When the timeline's sizes last changed, to save them once settled.
+    pub timeline_sizes_changed: Option<std::time::Instant>,
     pub layer_flag_memory:
         HashMap<crate::layer_flags::LayerFlagMemoryKey, std::collections::BTreeSet<u16>>,
     /// A drag down the timeline's eye or lock column.
@@ -1330,6 +1335,8 @@ impl Session {
             outline_mode: false,
             outline_layers: HashSet::new(),
             hidden_mask_art_layers: HashSet::new(),
+            timeline_row_heights: HashMap::new(),
+            timeline_sizes_changed: None,
             layer_flag_memory: HashMap::new(),
             layer_flag_drag: None,
             timeline_layer_selection: None,

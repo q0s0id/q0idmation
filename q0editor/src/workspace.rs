@@ -914,6 +914,10 @@ impl Viewer<'_> {
 }
 
 pub(crate) fn render(app: &mut EditorApp, ctx: &Context) {
+    if app.stage_only {
+        render_stage_only(app, ctx);
+        return;
+    }
     let mut workspace = std::mem::take(&mut app.workspace_layout);
     egui::CentralPanel::default()
         .frame(egui::Frame::none())
@@ -1056,6 +1060,73 @@ pub(crate) fn render(app: &mut EditorApp, ctx: &Context) {
                 workspace.collapse_to_icon(panel);
             }
             ui.advance_cursor_after_rect(full);
+        });
+    app.workspace_layout = workspace;
+}
+
+/// Only the stage, filling the window (F9). It is the stage panel last in
+/// use, so its zoom and place stay as they were.
+fn render_stage_only(app: &mut EditorApp, ctx: &Context) {
+    let mut workspace = std::mem::take(&mut app.workspace_layout);
+    let id = workspace
+        .active_stage
+        .filter(|id| workspace.dock.iter_all_tabs().any(|(_, tab)| tab.id == *id))
+        .or_else(|| {
+            workspace
+                .dock
+                .iter_all_tabs()
+                .find(|(_, tab)| tab.panel == Panel::Stage)
+                .map(|(_, tab)| tab.id)
+        })
+        .unwrap_or(1);
+    egui::CentralPanel::default()
+        .frame(egui::Frame::none())
+        .show(ctx, |ui| {
+            let full = ui.available_rect_before_wrap();
+            let mut viewer = Viewer {
+                app: &mut *app,
+                bounds: full,
+                edge_command: None,
+                edge_preview: None,
+                duplicate: None,
+                collapse: None,
+                stage_views: &mut workspace.stage_views,
+                panel_views: &mut workspace.panel_views,
+                active_stage: &mut workspace.active_stage,
+            };
+            let mut tab = PanelTab {
+                panel: Panel::Stage,
+                id,
+            };
+            viewer.panel_ui(ui, &mut tab);
+            // Says how to come back, for a moment.
+            let since = app.stage_only_since.map(|at| at.elapsed().as_secs_f32());
+            if let Some(since) = since.filter(|since| *since < 3.0) {
+                let alpha = ((3.0 - since).min(1.0) * 220.0) as u8;
+                let key = app
+                    .settings
+                    .hotkeys
+                    .display(crate::hotkeys::ShortcutCommand::StageOnly);
+                let text = format!("{key} brings the panels back");
+                let at = egui::pos2(full.center().x, full.top() + 24.0);
+                let galley = ui.painter().layout_no_wrap(
+                    text,
+                    egui::FontId::proportional(14.0),
+                    egui::Color32::from_white_alpha(alpha),
+                );
+                let rect = egui::Rect::from_center_size(at, galley.size() + egui::vec2(20.0, 10.0));
+                ui.painter().rect_filled(
+                    rect,
+                    6.0,
+                    egui::Color32::from_black_alpha(alpha / 2 + 40),
+                );
+                ui.painter().galley(
+                    rect.center() - galley.size() / 2.0,
+                    galley,
+                    egui::Color32::WHITE,
+                );
+                ctx.request_repaint();
+            }
         });
     app.workspace_layout = workspace;
 }

@@ -14,8 +14,117 @@ use crate::state::{
 };
 use crate::ui::{icon_button, icon_button_enabled, icon_toggle, FitToScreen, Icon};
 
-const FRAME_W: f32 = 12.0;
-const ROW_H: f32 = 26.0;
+/// The ruler's height; it keeps it however tall the rows are.
+const RULER_H: f32 = 26.0;
+
+thread_local! {
+    /// Frame width and row height, from the settings, set as each
+    /// timeline is drawn.
+    static SIZES: std::cell::Cell<(f32, f32)> = const { std::cell::Cell::new((12.0, 26.0)) };
+    /// While a layer row is drawn: its own height.
+    static ROW_NOW: std::cell::Cell<Option<f32>> = const { std::cell::Cell::new(None) };
+    /// Each visible layer row's top below the first, and one past the last.
+    static ROW_TOPS: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// How wide a frame is.
+fn frame_w() -> f32 {
+    SIZES.with(|sizes| sizes.get().0)
+}
+
+/// How tall the row being drawn is: a layer row's own height while it is
+/// drawn, otherwise the usual height.
+fn row_h() -> f32 {
+    ROW_NOW.with(std::cell::Cell::get).unwrap_or_else(rows_h)
+}
+
+/// The usual row height: the camera and rig tracks, and layers without
+/// their own.
+fn rows_h() -> f32 {
+    SIZES.with(|sizes| sizes.get().1)
+}
+
+/// Where layer row `index` starts, below the first layer row.
+fn layer_top(index: usize) -> f32 {
+    ROW_TOPS.with(|tops| {
+        let tops = tops.borrow();
+        match tops.get(index) {
+            Some(top) => *top,
+            None => {
+                let known = tops.len().saturating_sub(1).min(index);
+                tops.get(known).copied().unwrap_or(0.0) + (index - known) as f32 * rows_h()
+            }
+        }
+    })
+}
+
+fn layer_height(index: usize) -> f32 {
+    layer_top(index + 1) - layer_top(index)
+}
+
+/// The layer row `offset` below the first one; negative above it.
+fn layer_row_at(offset: f32) -> isize {
+    if offset < 0.0 {
+        return (offset / rows_h()).floor() as isize;
+    }
+    ROW_TOPS.with(|tops| {
+        let tops = tops.borrow();
+        let end = tops.last().copied().unwrap_or(0.0);
+        if tops.len() >= 2 && offset < end {
+            tops.partition_point(|top| *top <= offset) as isize - 1
+        } else {
+            let known = tops.len().saturating_sub(1);
+            known as isize + ((offset - end) / rows_h()).floor() as isize
+        }
+    })
+}
+
+/// Layer rows that show between `top` and `bottom` of the screen.
+fn visible_layer_rows(
+    first_row_y: f32,
+    count: usize,
+    top: f32,
+    bottom: f32,
+) -> std::ops::Range<usize> {
+    let clamp = |row: isize| row.clamp(0, count as isize) as usize;
+    let start = clamp(layer_row_at(top - first_row_y));
+    let end = clamp(layer_row_at(bottom - first_row_y) + 1);
+    start..end.max(start)
+}
+
+/// Reads the sizes for this frame of drawing: the settings' frame width
+/// and row height, and each visible layer's own height where it has one.
+fn set_sizes(app: &EditorApp, q0rg_id: u16, layer_ids: &[u16]) {
+    let frame = app.settings.timeline_frame_width.clamp(
+        *crate::settings::TIMELINE_FRAME_WIDTHS.start(),
+        *crate::settings::TIMELINE_FRAME_WIDTHS.end(),
+    );
+    let row = app.settings.timeline_row_height.clamp(
+        *crate::settings::TIMELINE_ROW_HEIGHTS.start(),
+        *crate::settings::TIMELINE_ROW_HEIGHTS.end(),
+    );
+    SIZES.with(|sizes| sizes.set((frame, row)));
+    ROW_NOW.with(|now| now.set(None));
+    ROW_TOPS.with(|tops| {
+        let mut tops = tops.borrow_mut();
+        tops.clear();
+        let mut y = 0.0;
+        tops.push(y);
+        for layer_id in layer_ids {
+            y += app
+                .session
+                .timeline_row_heights
+                .get(&(q0rg_id, *layer_id))
+                .copied()
+                .unwrap_or(row);
+            tops.push(y);
+        }
+    });
+}
+
+fn layer_row_tops() -> Vec<f32> {
+    ROW_TOPS.with(|tops| tops.borrow().clone())
+}
 const LAYER_LABEL_W: f32 = 174.0;
 /// Gap above and below the cell fill — leaves room for thin row separators
 /// like the original Flash CS3 timeline.
@@ -46,7 +155,7 @@ fn visible_frame_slots(painter: &egui::Painter, base_x: f32, count: u16) -> std:
     let clip = painter.clip_rect();
     let range = visible_slots(
         base_x,
-        FRAME_W,
+        frame_w(),
         usize::from(count),
         clip.left(),
         clip.right(),
@@ -357,7 +466,7 @@ fn timeline_ruler(
     let q0rg_id = app.state.project.q0rgs[q0rg_idx].q0rg_id;
     let frame_count = app.state.project.q0rgs[q0rg_idx].frame_count;
     let (rect, response) =
-        ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click_and_drag());
+        ui.allocate_exact_size(vec2(ui.available_width(), RULER_H), Sense::click_and_drag());
     let label_edge_x = rect.left() + label_width;
     let frame_base_x = label_edge_x - scroll_x;
     let painter = ui.painter_at(rect);
@@ -419,7 +528,7 @@ fn timeline_ruler(
     ] {
         let control = Rect::from_center_size(
             pos2(label_edge_x - offset, rect.center().y),
-            vec2(18.0, ROW_H),
+            vec2(18.0, RULER_H),
         );
         let control_response = ui
             .interact(
@@ -472,8 +581,8 @@ fn timeline_ruler(
         let end = playhead
             .saturating_add(app.session.onion.after)
             .min(visible_frames.saturating_sub(1));
-        let left = frame_base_x + f32::from(start) * FRAME_W;
-        let right = frame_base_x + (f32::from(end) + 1.0) * FRAME_W;
+        let left = frame_base_x + f32::from(start) * frame_w();
+        let right = frame_base_x + (f32::from(end) + 1.0) * frame_w();
         frame_painter.rect_filled(
             Rect::from_min_max(pos2(left, rect.top()), pos2(right, rect.bottom())),
             0.0,
@@ -483,7 +592,7 @@ fn timeline_ruler(
             (true, left, theme.onion_past.to_color32()),
             (false, right, theme.onion_future.to_color32()),
         ] {
-            let handle = Rect::from_center_size(pos2(x, rect.center().y), vec2(8.0, ROW_H))
+            let handle = Rect::from_center_size(pos2(x, rect.center().y), vec2(8.0, RULER_H))
                 .intersect(frame_painter.clip_rect());
             let drag = ui
                 .interact(
@@ -503,7 +612,7 @@ fn timeline_ruler(
                     if app.session.onion.edit_frames {
                         app.session.timeline_cell_selection = None;
                     }
-                    let boundary = ((pointer.x - frame_base_x) / FRAME_W)
+                    let boundary = ((pointer.x - frame_base_x) / frame_w())
                         .round()
                         .clamp(0.0, f32::from(visible_frames))
                         as u16;
@@ -533,7 +642,7 @@ fn timeline_ruler(
     let frame_slots = visible_frame_slots(&frame_painter, frame_base_x, visible_frames);
     let fps = u32::from(app.state.project.meta.fps);
     for f in frame_slots.clone() {
-        let x = frame_base_x + f32::from(f) * FRAME_W;
+        let x = frame_base_x + f32::from(f) * frame_w();
         let frame = u32::from(f) + 1;
         if f >= frame_count {
             continue;
@@ -546,7 +655,7 @@ fn timeline_ruler(
         }
         if frame.is_multiple_of(5) || f == 0 {
             frame_painter.text(
-                pos2(x + FRAME_W * 0.5, rect.top() + ROW_H * 0.55),
+                pos2(x + frame_w() * 0.5, rect.top() + RULER_H * 0.55),
                 Align2::CENTER_CENTER,
                 format!("{frame}"),
                 FontId::proportional(10.0),
@@ -555,7 +664,7 @@ fn timeline_ruler(
         }
         if fps > 0 && frame.is_multiple_of(fps) {
             frame_painter.text(
-                pos2(x + FRAME_W * 0.5, rect.top() + 4.0),
+                pos2(x + frame_w() * 0.5, rect.top() + 4.0),
                 Align2::CENTER_TOP,
                 format!("{}s", frame / fps),
                 FontId::proportional(9.0),
@@ -567,7 +676,7 @@ fn timeline_ruler(
         if key.q0rg_id != q0rg_id || !frame_slots.contains(&key.frame) {
             continue;
         }
-        let x = frame_base_x + f32::from(key.frame) * FRAME_W + 1.0;
+        let x = frame_base_x + f32::from(key.frame) * frame_w() + 1.0;
         let y = rect.top() + 2.0;
         let color = theme.accent.to_color32();
         frame_painter.line_segment([pos2(x, y), pos2(x, y + 9.0)], Stroke::new(1.3_f32, color));
@@ -577,14 +686,14 @@ fn timeline_ruler(
             Stroke::NONE,
         ));
         ui.interact(
-            Rect::from_min_size(pos2(x, rect.top()), vec2(FRAME_W, ROW_H))
+            Rect::from_min_size(pos2(x, rect.top()), vec2(frame_w(), RULER_H))
                 .intersect(frame_painter.clip_rect()),
             egui::Id::new(("frame_label_hover", q0rg_id, key.frame)),
             Sense::hover(),
         )
         .on_hover_text(format!("{label}\nframe {}", u32::from(key.frame) + 1));
     }
-    let edge_x = frame_base_x + f32::from(frame_count) * FRAME_W;
+    let edge_x = frame_base_x + f32::from(frame_count) * frame_w();
     for offset in [0.0, 7.0, 14.0, 21.0] {
         frame_painter.line_segment(
             [
@@ -602,13 +711,13 @@ fn timeline_ruler(
             .interact_pointer_pos()
             .filter(|pos| pos.x >= label_edge_x)
         {
-            let frame = ((pos.x - frame_base_x) / FRAME_W).floor();
+            let frame = ((pos.x - frame_base_x) / frame_w()).floor();
             if frame >= 0.0 && frame < f32::from(visible_frames) {
                 app.session.set_timeline_frame(frame as u16, frame_count);
             }
         }
     }
-    let playhead_x = frame_base_x + (f32::from(app.session.timeline_frame()) + 0.5) * FRAME_W;
+    let playhead_x = frame_base_x + (f32::from(app.session.timeline_frame()) + 0.5) * frame_w();
     frame_painter.add(egui::Shape::convex_polygon(
         vec![
             pos2(playhead_x - 5.0, rect.top()),
@@ -636,6 +745,8 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         112.0,
         (ui.available_width() * 0.65).clamp(LAYER_LABEL_W, 520.0),
     );
+    set_sizes(app, app.session.current_q0rg_id, &[]);
+    save_sizes_when_settled(app, ui.ctx());
     transport_bar(app, &theme, ui);
     ui.separator();
 
@@ -661,11 +772,11 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     let layer_count = visible_layer_indices.len();
     let rig_tracks = rig_timeline_tracks(&app.state.project, q0rg_id, &visible_layer_indices);
     let rig_track_count = rig_tracks.len();
-    let timeline_row_count = layer_count + rig_track_count;
     let layer_ids: Vec<u16> = visible_layer_indices
         .iter()
         .map(|index| app.state.project.q0rgs[q0rg_idx].layers[*index].layer_id)
         .collect();
+    set_sizes(app, q0rg_id, &layer_ids);
     let folder_layer_ids: Vec<u16> = layer_ids
         .iter()
         .copied()
@@ -679,8 +790,8 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         q0rg_id == app.state.project.meta.entry_q0rg_id && app.state.project.runtime.camera.enabled;
     let camera_row_count = usize::from(camera_row_enabled);
 
-    let available_frames_width = (ui.available_width() - label_width - 12.0).max(FRAME_W);
-    let frame_strip_width = f32::from(visible_frames) * FRAME_W;
+    let available_frames_width = (ui.available_width() - label_width - 12.0).max(frame_w());
+    let frame_strip_width = f32::from(visible_frames) * frame_w();
     let max_scroll = (frame_strip_width - available_frames_width).max(0.0);
     app.session.timeline_horizontal_scroll = app
         .session
@@ -688,13 +799,13 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         .clamp(0.0, max_scroll);
     if let Some((target_q0rg, target)) = app.session.timeline_scroll_to_frame.take() {
         if target_q0rg == q0rg_id {
-            let x = f32::from(target.min(frame_count.saturating_sub(1))) * FRAME_W;
+            let x = f32::from(target.min(frame_count.saturating_sub(1))) * frame_w();
             let scroll = &mut app.session.timeline_horizontal_scroll;
             if x < *scroll {
                 *scroll = x;
             }
-            if x + FRAME_W > *scroll + available_frames_width {
-                *scroll = x + FRAME_W - available_frames_width;
+            if x + frame_w() > *scroll + available_frames_width {
+                *scroll = x + frame_w() - available_frames_width;
             }
             *scroll = scroll.clamp(0.0, max_scroll);
         }
@@ -724,14 +835,15 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         .auto_shrink([false, false])
         .max_height(ui.available_height())
         .show(ui, |ui| {
-            let total_h = ROW_H * (timeline_row_count as f32 + camera_row_count as f32 + 1.0);
+            let total_h = rows_h() * (rig_track_count as f32 + camera_row_count as f32 + 1.0)
+                + layer_top(layer_count);
             let (body_rect, response) = ui.allocate_exact_size(
-                vec2(ui.available_width(), total_h - ROW_H),
+                vec2(ui.available_width(), total_h - rows_h()),
                 Sense::click_and_drag(),
             );
             // Row helpers measure from a logical header origin. Only the body
             // occupies this scroll area; the ruler above has its own layout.
-            let rect = Rect::from_min_max(body_rect.min - vec2(0.0, ROW_H), body_rect.max);
+            let rect = Rect::from_min_max(body_rect.min - vec2(0.0, rows_h()), body_rect.max);
             let clip = ui.clip_rect().intersect(body_rect);
             let label_edge_x = rect.min.x + label_width;
             let frame_base_x = label_edge_x - scroll_x;
@@ -741,6 +853,25 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 clip.min,
                 pos2(label_edge_x, clip.bottom()),
             ));
+            // Ctrl+wheel makes frames wider or narrower, keeping the frame
+            // under the pointer where it is.
+            let zoom = ui.input(|input| input.zoom_delta());
+            if zoom != 1.0 {
+                if let Some(pointer) = response.hover_pos().filter(|pos| pos.x >= label_edge_x) {
+                    let old = frame_w();
+                    let new = (old * zoom).clamp(
+                        *crate::settings::TIMELINE_FRAME_WIDTHS.start(),
+                        *crate::settings::TIMELINE_FRAME_WIDTHS.end(),
+                    );
+                    if new != old {
+                        let under = (pointer.x - frame_base_x) / old;
+                        app.settings.timeline_frame_width = new;
+                        app.session.timeline_horizontal_scroll =
+                            (scroll_x + under * (new - old)).max(0.0);
+                        app.session.timeline_sizes_changed = Some(std::time::Instant::now());
+                    }
+                }
+            }
             if response.hovered() {
                 let delta = ui.input(|input| {
                     if input.modifiers.shift {
@@ -781,13 +912,13 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 app.settings.save();
             }
             let frame_slots = visible_frame_slots(&painter, frame_base_x, visible_frames);
-            let layer_rows_y = rect.min.y + ROW_H * (camera_row_count as f32 + 1.0);
+            let layer_rows_y = rect.min.y + rows_h() * (camera_row_count as f32 + 1.0);
             let layer_row_slots =
-                visible_slots(layer_rows_y, ROW_H, layer_count, clip.top(), clip.bottom());
-            let rig_rows_y = layer_rows_y + ROW_H * layer_count as f32;
+                visible_layer_rows(layer_rows_y, layer_count, clip.top(), clip.bottom());
+            let rig_rows_y = layer_rows_y + layer_top(layer_count);
             let rig_row_slots = visible_slots(
                 rig_rows_y,
-                ROW_H,
+                rows_h(),
                 rig_track_count,
                 clip.top(),
                 clip.bottom(),
@@ -799,10 +930,11 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 } else if let Some(row_index) = visible_layer_indices.iter().position(|index| {
                     app.state.project.q0rgs[q0rg_idx].layers[*index].layer_id == target_layer_id
                 }) {
-                    let row_y =
-                        rect.min.y + ROW_H * (row_index as f32 + camera_row_count as f32 + 1.0);
-                    let target_rect =
-                        Rect::from_min_size(pos2(rect.min.x, row_y), vec2(rect.width(), ROW_H));
+                    let row_y = layer_rows_y + layer_top(row_index);
+                    let target_rect = Rect::from_min_size(
+                        pos2(rect.min.x, row_y),
+                        vec2(rect.width(), layer_height(row_index)),
+                    );
                     ui.scroll_to_rect(target_rect, Some(egui::Align::Center));
                     app.session.timeline_scroll_to_layer = None;
                 }
@@ -814,7 +946,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             label_painter.rect_filled(rect, 0.0, theme.window.to_color32());
 
             for f in frame_slots.clone() {
-                let x = frame_base_x + f32::from(f) * FRAME_W;
+                let x = frame_base_x + f32::from(f) * frame_w();
                 let color = if f % 5 == 0 {
                     if f >= frame_count {
                         theme.empty_beyond_5.to_color32()
@@ -832,7 +964,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             // End-of-q0rg marker: dashed amber bar at the right edge of the
             // last real frame so the user can see exactly where `frame_count`
             // ends without confusing it with the solid theme-coloured playhead.
-            let edge_x = frame_base_x + (frame_count as f32) * FRAME_W;
+            let edge_x = frame_base_x + (frame_count as f32) * frame_w();
             let edge_color = Color32::from_rgb(0xC8, 0x95, 0x30);
             let mut y = rect.min.y + ((clip.top() - rect.min.y).max(0.0) / 7.0).floor() * 7.0;
             while edge_x >= clip.left()
@@ -853,7 +985,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     &label_painter,
                     &theme,
                     rect,
-                    rect.min.y + ROW_H,
+                    rect.min.y + rows_h(),
                     frame_count,
                     visible_frames,
                     label_width,
@@ -884,9 +1016,10 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 let is_mask = metadata.kind == q0s_format::v2::LayerKind::Mask;
                 let effective_visible = app.state.project.layer_is_visible(q0rg_id, layer.layer_id);
                 let effective_locked = app.state.project.layer_is_locked(q0rg_id, layer.layer_id);
-                let row_y = rect.min.y + ROW_H * (li as f32 + camera_row_count as f32 + 1.0);
+                let row_y = layer_rows_y + layer_top(li);
+                ROW_NOW.with(|now| now.set(Some(layer_height(li))));
                 let row_rect =
-                    Rect::from_min_size(pos2(rect.min.x, row_y), vec2(rect.width(), ROW_H));
+                    Rect::from_min_size(pos2(rect.min.x, row_y), vec2(rect.width(), row_h()));
                 let is_current_layer = layer.layer_id == app.session.current_layer_id;
                 let is_selected_layer = layer_selection_contains(
                     app.session.timeline_layer_selection,
@@ -913,7 +1046,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 // Label (left-side fixed column) — pull tones from the
                 // panel/window pair so any theme reads as a coherent strip.
                 let label_rect =
-                    Rect::from_min_size(pos2(rect.min.x, row_y), vec2(label_width, ROW_H));
+                    Rect::from_min_size(pos2(rect.min.x, row_y), vec2(label_width, row_h()));
                 let label_bg = if is_current_layer {
                     blend(theme.panel.to_color32(), theme.accent.to_color32(), 0.25)
                 } else if li % 2 == 0 {
@@ -961,19 +1094,19 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 let indent = hierarchy_indent;
                 let visibility_rect = Rect::from_center_size(
                     label_rect.right_center() - vec2(31.0, 0.0),
-                    vec2(18.0, ROW_H),
+                    vec2(18.0, row_h()),
                 );
                 let outline_rect = Rect::from_center_size(
                     label_rect.right_center() - vec2(49.0, 0.0),
-                    vec2(18.0, ROW_H),
+                    vec2(18.0, row_h()),
                 );
                 let lock_rect = Rect::from_center_size(
                     label_rect.right_center() - vec2(13.0, 0.0),
-                    vec2(18.0, ROW_H),
+                    vec2(18.0, row_h()),
                 );
                 let mask_art_rect = Rect::from_center_size(
                     label_rect.right_center() - vec2(72.0, 0.0),
-                    vec2(18.0, ROW_H),
+                    vec2(18.0, row_h()),
                 );
                 let mask_art_hidden = app.session.hidden_mask_art_layers.contains(&(
                     app.active_project_tab_id().unwrap_or(0),
@@ -1096,15 +1229,15 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     ),
                 );
                 label_painter.line_segment(
-                    [pos2(label_edge_x, row_y), pos2(label_edge_x, row_y + ROW_H)],
+                    [pos2(label_edge_x, row_y), pos2(label_edge_x, row_y + row_h())],
                     Stroke::new(1.0_f32, theme.stroke_dark.to_color32()),
                 );
 
                 // Bottom row separator — hairline in the theme's stroke colour.
                 label_painter.line_segment(
                     [
-                        pos2(rect.min.x, row_y + ROW_H),
-                        pos2(rect.min.x + rect.width(), row_y + ROW_H),
+                        pos2(rect.min.x, row_y + row_h()),
+                        pos2(rect.min.x + rect.width(), row_y + row_h()),
                     ],
                     Stroke::new(1.0_f32, theme.stroke_dark.to_color32()),
                 );
@@ -1151,8 +1284,8 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     let folder_strip = Rect::from_min_size(
                         pos2(frame_base_x, row_y + CELL_PAD_Y),
                         vec2(
-                            (layer_frame_count as f32) * FRAME_W,
-                            ROW_H - CELL_PAD_Y * 2.0,
+                            (layer_frame_count as f32) * frame_w(),
+                            row_h() - CELL_PAD_Y * 2.0,
                         ),
                     );
                     painter.rect_filled(
@@ -1163,9 +1296,9 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 }
 
                 if is_current_layer && !is_folder {
-                    let frame_x = frame_base_x + f32::from(app.session.current_frame) * FRAME_W;
+                    let frame_x = frame_base_x + f32::from(app.session.current_frame) * frame_w();
                     let active_cell =
-                        Rect::from_min_size(pos2(frame_x, row_y), vec2(FRAME_W, ROW_H));
+                        Rect::from_min_size(pos2(frame_x, row_y), vec2(frame_w(), row_h()));
                     painter.rect_stroke(
                         active_cell.shrink(0.5),
                         0.0,
@@ -1177,7 +1310,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         if row_rect.contains(pos) && !label_rect.contains(pos) {
                             let rel_x = pos.x - (frame_base_x);
                             if pos.x >= label_edge_x && rel_x >= 0.0 {
-                                let frame = (rel_x / FRAME_W).floor() as u16;
+                                let frame = (rel_x / frame_w()).floor() as u16;
                                 if frame < frame_count
                                     && app.state.project.runtime.frame_scripts.iter().any(
                                         |script| {
@@ -1292,7 +1425,11 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                             continue;
                         }
                         if outline_rect.contains(pos) && !is_folder {
-                            app.queue(Action::ToggleLayerOutline(q0rg_id, layer.layer_id));
+                            app.queue(if alt {
+                                Action::ToggleOtherLayerOutlines(q0rg_id, layer.layer_id)
+                            } else {
+                                Action::ToggleLayerOutline(q0rg_id, layer.layer_id)
+                            });
                             continue;
                         }
                         if label_rect.contains(pos) {
@@ -1313,7 +1450,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                             }
                             let rel_x = pos.x - (frame_base_x);
                             if pos.x >= label_edge_x && rel_x >= 0.0 {
-                                let f = (rel_x / FRAME_W).floor() as i32;
+                                let f = (rel_x / frame_w()).floor() as i32;
                                 if f >= 0 && f < visible_frames as i32 {
                                     click_frame = Some(f as u16);
                                 }
@@ -1325,6 +1462,16 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 }
             }
 
+            ROW_NOW.with(|now| now.set(None));
+            row_edges(
+                app,
+                ui,
+                q0rg_id,
+                &layer_ids,
+                layer_rows_y,
+                (rect.min.x, label_edge_x),
+                layer_row_slots.clone(),
+            );
             // Rig tracks are dedicated sublayers after the artwork rows. They
             // only exist for layers with an actual rig binding or deformer.
             for (track_index, track) in rig_tracks
@@ -1333,11 +1480,11 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 .take(rig_row_slots.end)
                 .skip(rig_row_slots.start)
             {
-                let row_y = rig_rows_y + ROW_H * track_index as f32;
+                let row_y = rig_rows_y + row_h() * track_index as f32;
                 let row_rect =
-                    Rect::from_min_size(pos2(rect.min.x, row_y), vec2(rect.width(), ROW_H));
+                    Rect::from_min_size(pos2(rect.min.x, row_y), vec2(rect.width(), row_h()));
                 let label_rect =
-                    Rect::from_min_size(pos2(rect.min.x, row_y), vec2(label_width, ROW_H));
+                    Rect::from_min_size(pos2(rect.min.x, row_y), vec2(label_width, row_h()));
                 let selection = app.session.timeline_rig_key_selection.filter(|selection| {
                     selection.q0rg_id == q0rg_id && selection.layer_id == track.layer_id
                 });
@@ -1384,23 +1531,23 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     theme.accent.to_color32(),
                 );
                 label_painter.line_segment(
-                    [pos2(label_edge_x, row_y), pos2(label_edge_x, row_y + ROW_H)],
+                    [pos2(label_edge_x, row_y), pos2(label_edge_x, row_y + row_h())],
                     Stroke::new(1.0_f32, theme.stroke_dark.to_color32()),
                 );
                 label_painter.line_segment(
                     [
-                        pos2(rect.min.x, row_y + ROW_H),
-                        pos2(rect.max.x, row_y + ROW_H),
+                        pos2(rect.min.x, row_y + row_h()),
+                        pos2(rect.max.x, row_y + row_h()),
                     ],
                     Stroke::new(1.0_f32, theme.stroke_dark.to_color32()),
                 );
                 if let Some(selection) = selection {
                     let selected_rect = Rect::from_min_size(
                         pos2(
-                            frame_base_x + f32::from(selection.frame) * FRAME_W,
+                            frame_base_x + f32::from(selection.frame) * frame_w(),
                             row_y + CELL_PAD_Y,
                         ),
-                        vec2(FRAME_W, ROW_H - CELL_PAD_Y * 2.0),
+                        vec2(frame_w(), row_h() - CELL_PAD_Y * 2.0),
                     );
                     painter.rect_stroke(
                         selected_rect,
@@ -1413,8 +1560,8 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         continue;
                     }
                     let center = pos2(
-                        frame_base_x + (f32::from(*frame) + 0.5) * FRAME_W,
-                        row_y + ROW_H * 0.5,
+                        frame_base_x + (f32::from(*frame) + 0.5) * frame_w(),
+                        row_y + row_h() * 0.5,
                     );
                     let radius = 4.0_f32;
                     let fill = if selection.is_some_and(|selection| selection.frame == *frame) {
@@ -1433,7 +1580,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         Stroke::new(0.8_f32, theme.stroke_dark.to_color32()),
                     ));
                     ui.interact(
-                        Rect::from_center_size(center, vec2(FRAME_W, ROW_H)).intersect(frame_clip),
+                        Rect::from_center_size(center, vec2(frame_w(), row_h())).intersect(frame_clip),
                         egui::Id::new(("rig_timeline_key", q0rg_id, track.layer_id, frame)),
                         Sense::hover(),
                     )
@@ -1527,10 +1674,10 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     {
                         let cell = Rect::from_min_size(
                             pos2(
-                                frame_base_x + frame as f32 * FRAME_W,
-                                rect.min.y + ROW_H * (row as f32 + camera_row_count as f32 + 1.0),
+                                frame_base_x + frame as f32 * frame_w(),
+                                layer_rows_y + layer_top(row),
                             ),
-                            vec2(FRAME_W, ROW_H),
+                            vec2(frame_w(), layer_height(row)),
                         )
                         .shrink(1.0);
                         painter.rect_filled(
@@ -1560,9 +1707,9 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 &app.online.markers(app.active_project_tab_id(), q0rg_id),
                 &layer_ids,
                 frame_base_x,
-                rect.min.y + ROW_H * (camera_row_count as f32 + 1.0),
-                ROW_H,
-                FRAME_W,
+                layer_rows_y,
+                &layer_row_tops(),
+                frame_w(),
             );
             draw_timeline_selection(
                 &painter,
@@ -1570,7 +1717,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 app.session.timeline_selection,
                 &layer_ids,
                 frame_base_x,
-                rect.min.y + ROW_H * (camera_row_count as f32 + 1.0),
+                layer_rows_y,
                 visible_frames,
             );
             if let Some((selected_q0rg, cells)) = app.session.timeline_cell_selection.as_ref() {
@@ -1581,14 +1728,14 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         cells,
                         &layer_ids,
                         frame_base_x,
-                        rect.min.y + ROW_H * (camera_row_count as f32 + 1.0),
+                        layer_rows_y,
                         visible_frames,
                     );
                 }
             }
 
             // Playhead
-            let playhead_x = frame_base_x + (app.session.timeline_frame() as f32 + 0.5) * FRAME_W;
+            let playhead_x = frame_base_x + (app.session.timeline_frame() as f32 + 0.5) * frame_w();
             painter.line_segment(
                 [
                     pos2(playhead_x, rect.min.y),
@@ -1599,8 +1746,8 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
 
             let camera_row_rect = camera_row_enabled.then(|| {
                 Rect::from_min_size(
-                    pos2(rect.min.x, rect.min.y + ROW_H),
-                    vec2(rect.width(), ROW_H),
+                    pos2(rect.min.x, rect.min.y + rows_h()),
+                    vec2(rect.width(), rows_h()),
                 )
             });
             let camera_pointer_frame = response.interact_pointer_pos().and_then(|pos| {
@@ -1608,7 +1755,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 if !row.contains(pos) || pos.x < label_edge_x {
                     return None;
                 }
-                let frame = ((pos.x - (frame_base_x)) / FRAME_W).floor() as i32;
+                let frame = ((pos.x - (frame_base_x)) / frame_w()).floor() as i32;
                 (frame >= 0 && frame < i32::from(visible_frames)).then_some(frame as u16)
             });
             let pointer_on_camera_row = response
@@ -1617,8 +1764,8 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 .is_some_and(|(pos, row)| row.contains(pos));
             let rig_track_pointer_row = response.interact_pointer_pos().and_then(|pos| {
                 let relative_y = pos.y - rig_rows_y;
-                (relative_y >= 0.0 && relative_y < ROW_H * rig_track_count as f32)
-                    .then_some((relative_y / ROW_H).floor() as usize)
+                (relative_y >= 0.0 && relative_y < rows_h() * rig_track_count as f32)
+                    .then_some((relative_y / rows_h()).floor() as usize)
                     .filter(|index| *index < rig_track_count)
             });
             let rig_track_pointer_cell = response.interact_pointer_pos().and_then(|pos| {
@@ -1630,7 +1777,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 if relative_x < 0.0 {
                     return None;
                 }
-                let frame = (relative_x / FRAME_W).floor() as i32;
+                let frame = (relative_x / frame_w()).floor() as i32;
                 (frame >= 0 && frame < i32::from(visible_frames))
                     .then_some((track_index, frame as u16))
             });
@@ -1638,10 +1785,10 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 .input(|input| input.pointer.latest_pos())
                 .and_then(|pos| {
                     let relative_y = pos.y - rig_rows_y;
-                    if relative_y < 0.0 || relative_y >= ROW_H * rig_track_count as f32 {
+                    if relative_y < 0.0 || relative_y >= row_h() * rig_track_count as f32 {
                         return None;
                     }
-                    let track_index = (relative_y / ROW_H).floor() as usize;
+                    let track_index = (relative_y / row_h()).floor() as usize;
                     if pos.x < label_edge_x {
                         return None;
                     }
@@ -1649,7 +1796,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     if relative_x < 0.0 || track_index >= rig_track_count {
                         return None;
                     }
-                    let frame = (relative_x / FRAME_W).floor() as i32;
+                    let frame = (relative_x / frame_w()).floor() as i32;
                     (frame >= 0 && frame < i32::from(visible_frames))
                         .then_some((rig_tracks[track_index].layer_id, frame as u16))
                 });
@@ -1756,10 +1903,10 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         .unwrap_or_default();
                     let preview = Rect::from_min_size(
                         pos2(
-                            frame_base_x + f32::from(target_frame) * FRAME_W,
-                            rig_rows_y + ROW_H * track_index as f32 + CELL_PAD_Y,
+                            frame_base_x + f32::from(target_frame) * frame_w(),
+                            rig_rows_y + row_h() * track_index as f32 + CELL_PAD_Y,
                         ),
-                        vec2(FRAME_W, ROW_H - CELL_PAD_Y * 2.0),
+                        vec2(frame_w(), row_h() - CELL_PAD_Y * 2.0),
                     );
                     painter.rect_filled(
                         preview,
@@ -1829,10 +1976,10 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     .saturating_add(1);
                 let preview = Rect::from_min_size(
                     pos2(
-                        frame_base_x + f32::from(target_frame) * FRAME_W,
-                        rect.min.y + ROW_H + CELL_PAD_Y,
+                        frame_base_x + f32::from(target_frame) * frame_w(),
+                        rect.min.y + row_h() + CELL_PAD_Y,
                     ),
-                    vec2(f32::from(width) * FRAME_W, ROW_H - CELL_PAD_Y * 2.0),
+                    vec2(f32::from(width) * frame_w(), row_h() - CELL_PAD_Y * 2.0),
                 );
                 painter.rect_filled(preview, 1.0, theme.accent.to_color32().gamma_multiply(0.18));
                 painter.rect_stroke(
@@ -1977,9 +2124,9 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     layer_id,
                     frame,
                 )?;
-                let left = frame_base_x + f32::from(clip.start_frame) * FRAME_W;
-                let right = frame_base_x + f32::from(clip.end_frame_exclusive) * FRAME_W;
-                let edge = (FRAME_W * 0.45).min((right - left) * 0.3);
+                let left = frame_base_x + f32::from(clip.start_frame) * frame_w();
+                let right = frame_base_x + f32::from(clip.end_frame_exclusive) * frame_w();
+                let edge = (frame_w() * 0.45).min((right - left) * 0.3);
                 let mode = if position.x - left <= edge {
                     crate::state::AudioClipDragMode::TrimStart
                 } else if right - position.x <= edge {
@@ -2026,7 +2173,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     let clip = crate::audio::audio_clip_ref(&app.state.project, drag.clip_idx)?;
                     let source = *app.state.project.audio_clips.get(drag.clip_idx)?;
                     let pointer = ui.input(|input| input.pointer.latest_pos())?;
-                    let boundary = ((pointer.x - frame_base_x) / FRAME_W)
+                    let boundary = ((pointer.x - frame_base_x) / frame_w())
                         .round()
                         .clamp(0.0, f32::from(u16::MAX)) as u16;
                     let length = clip.end_frame_exclusive - clip.start_frame;
@@ -2059,12 +2206,12 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 if let Some(row) = layer_ids.iter().position(|id| *id == layer_id) {
                     let preview = Rect::from_min_max(
                         pos2(
-                            frame_base_x + f32::from(start) * FRAME_W,
-                            rect.min.y + ROW_H * (row as f32 + camera_row_count as f32 + 1.0),
+                            frame_base_x + f32::from(start) * frame_w(),
+                            layer_rows_y + layer_top(row),
                         ),
                         pos2(
-                            frame_base_x + f32::from(end) * FRAME_W,
-                            rect.min.y + ROW_H * (row as f32 + camera_row_count as f32 + 2.0),
+                            frame_base_x + f32::from(end) * frame_w(),
+                            layer_rows_y + layer_top(row + 1),
                         ),
                     )
                     .shrink(1.5);
@@ -2147,11 +2294,13 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                             .unwrap_or(1);
                         let preview = Rect::from_min_size(
                             pos2(
-                                frame_base_x + target_frame as f32 * FRAME_W,
-                                rect.min.y
-                                    + ROW_H * (target_row as f32 + camera_row_count as f32 + 1.0),
+                                frame_base_x + target_frame as f32 * frame_w(),
+                                layer_rows_y + layer_top(target_row),
                             ),
-                            vec2(width as f32 * FRAME_W, source_rows as f32 * ROW_H),
+                            vec2(
+                                width as f32 * frame_w(),
+                                layer_top(target_row + source_rows) - layer_top(target_row),
+                            ),
                         )
                         .shrink(1.0);
                         painter.rect_filled(
@@ -2235,7 +2384,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 if let Some(pos) = response.interact_pointer_pos() {
                     let rel_x = pos.x - (frame_base_x);
                     let clicked_frame = if rel_x >= 0.0 {
-                        let frame = (rel_x / FRAME_W).floor() as i32;
+                        let frame = (rel_x / frame_w()).floor() as i32;
                         (frame >= 0 && frame < visible_frames as i32).then_some(frame as u16)
                     } else {
                         None
@@ -2272,9 +2421,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         app.session.set_timeline_frame(frame, frame_count);
                     } else {
                         // Identify which ordinary layer row was clicked.
-                        let row_idx = ((pos.y - rect.min.y) / ROW_H).floor() as i32
-                            - 1
-                            - camera_row_count as i32;
+                        let row_idx = layer_row_at(pos.y - layer_rows_y) as i32;
                         if row_idx >= 0 {
                             if let Some(layer_index) = visible_layer_indices.get(row_idx as usize) {
                                 let layer = &app.state.project.q0rgs[q0rg_idx].layers[*layer_index];
@@ -2430,8 +2577,8 @@ fn layer_drop_target_at(
     }
     let camera_rows =
         usize::from(q0rg_id == project.meta.entry_q0rg_id && project.runtime.camera.enabled);
-    let first_row_y = rect.min.y + ROW_H * (camera_rows as f32 + 1.0);
-    let raw_row = ((pos.y - first_row_y) / ROW_H).floor() as isize;
+    let first_row_y = rect.min.y + rows_h() * (camera_rows as f32 + 1.0);
+    let raw_row = layer_row_at(pos.y - first_row_y);
     if raw_row >= row_count as isize {
         return None;
     }
@@ -2446,8 +2593,8 @@ fn layer_drop_target_at(
     }
     let target_metadata = project.layer_metadata(q0rg_id, target_id);
 
-    let row_y = first_row_y + row_index as f32 * ROW_H;
-    let row_fraction = ((pos.y - row_y) / ROW_H).clamp(0.0, 1.0);
+    let row_y = first_row_y + layer_top(row_index);
+    let row_fraction = ((pos.y - row_y) / layer_height(row_index)).clamp(0.0, 1.0);
     let requested_parent =
         layer_parent_for_drop_lane(project, q0rg_id, target_id, pos.x, rect.min.x);
 
@@ -2529,10 +2676,10 @@ fn draw_layer_drop_preview(
             else {
                 return;
             };
-            let row_y = rect.min.y + ROW_H * (index as f32 + camera_rows as f32 + 1.0);
+            let row_y = rect.min.y + rows_h() * (camera_rows as f32 + 1.0) + layer_top(index);
             let highlight = Rect::from_min_size(
                 pos2(rect.min.x + 1.0, row_y + 1.0),
-                vec2(label_width - 2.0, ROW_H - 2.0),
+                vec2(label_width - 2.0, layer_height(index) - 2.0),
             );
             painter.rect_filled(
                 highlight,
@@ -2585,8 +2732,8 @@ fn draw_layer_drop_preview(
             };
             let line_after = !before;
             let y = rect.min.y
-                + ROW_H * (line_index as f32 + camera_rows as f32 + 1.0)
-                + if line_after { ROW_H } else { 0.0 };
+                + rows_h() * (camera_rows as f32 + 1.0)
+                + layer_top(line_index + usize::from(line_after));
             let indent = parent_folder_id
                 .map(|parent_id| {
                     (project.layer_folder_depth(q0rg_id, parent_id) as f32 + 1.0) * 14.0
@@ -3066,7 +3213,7 @@ fn draw_camera_layer_row(
     frame_painter: &egui::Painter,
 ) {
     let selected = app.session.camera_track_selected;
-    let row_rect = Rect::from_min_size(pos2(rect.min.x, row_y), vec2(rect.width(), ROW_H));
+    let row_rect = Rect::from_min_size(pos2(rect.min.x, row_y), vec2(rect.width(), row_h()));
     frame_painter.rect_filled(row_rect, 0.0, theme.empty_beyond.to_color32());
     draw_empty_cells(
         frame_painter,
@@ -3078,7 +3225,7 @@ fn draw_camera_layer_row(
         selected,
     );
 
-    let label_rect = Rect::from_min_size(pos2(rect.min.x, row_y), vec2(label_width, ROW_H));
+    let label_rect = Rect::from_min_size(pos2(rect.min.x, row_y), vec2(label_width, row_h()));
     let base_label = if selected {
         theme.panel.to_color32()
     } else {
@@ -3121,14 +3268,14 @@ fn draw_camera_layer_row(
     painter.line_segment(
         [
             pos2(rect.min.x + label_width, row_y),
-            pos2(rect.min.x + label_width, row_y + ROW_H),
+            pos2(rect.min.x + label_width, row_y + row_h()),
         ],
         Stroke::new(1.0_f32, theme.stroke_dark.to_color32()),
     );
     painter.line_segment(
         [
-            pos2(rect.min.x, row_y + ROW_H),
-            pos2(rect.min.x + rect.width(), row_y + ROW_H),
+            pos2(rect.min.x, row_y + row_h()),
+            pos2(rect.min.x + rect.width(), row_y + row_h()),
         ],
         Stroke::new(1.0_f32, theme.stroke_dark.to_color32()),
     );
@@ -3153,12 +3300,12 @@ fn draw_camera_layer_row(
             let fill = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 54);
             let selected_rect = Rect::from_min_max(
                 pos2(
-                    frame_base_x + f32::from(first) * FRAME_W,
+                    frame_base_x + f32::from(first) * frame_w(),
                     row_y + CELL_PAD_Y,
                 ),
                 pos2(
-                    frame_base_x + (f32::from(last) + 1.0) * FRAME_W,
-                    row_y + ROW_H - CELL_PAD_Y,
+                    frame_base_x + (f32::from(last) + 1.0) * frame_w(),
+                    row_y + row_h() - CELL_PAD_Y,
                 ),
             );
             frame_painter.rect_filled(selected_rect, 0.0, fill);
@@ -3187,7 +3334,7 @@ fn draw_camera_spans(
         return;
     }
     let cell_top = row_y + CELL_PAD_Y;
-    let cell_bot = row_y + ROW_H - CELL_PAD_Y;
+    let cell_bot = row_y + row_h() - CELL_PAD_Y;
     let static_base = if is_current_layer {
         theme.extension_active.to_color32()
     } else {
@@ -3221,15 +3368,15 @@ fn draw_camera_spans(
             .find(|key| key.frame == keyframe)
             .and_then(|key| key.tween.to_frame())
             .is_some();
-        let x0 = base_x + f32::from(keyframe) * FRAME_W;
-        let x1 = base_x + (f32::from(span_end) + 1.0) * FRAME_W;
+        let x0 = base_x + f32::from(keyframe) * frame_w();
+        let x1 = base_x + (f32::from(span_end) + 1.0) * frame_w();
         painter.rect_filled(
             Rect::from_min_max(pos2(x0, cell_top), pos2(x1, cell_bot)),
             0.0,
             if has_tween { tween_fill } else { static_fill },
         );
         if !has_tween && span_end > keyframe {
-            let cap_x = base_x + (f32::from(span_end) + 1.0) * FRAME_W - 1.0;
+            let cap_x = base_x + (f32::from(span_end) + 1.0) * frame_w() - 1.0;
             painter.line_segment(
                 [pos2(cap_x, cell_top + 1.0), pos2(cap_x, cell_bot - 1.0)],
                 Stroke::new(1.0_f32, stroke_dark),
@@ -3241,7 +3388,7 @@ fn draw_camera_spans(
     for keyframe in
         keyframe_separator_frames(&keyframes).filter(|frame| frame_slots.contains(frame))
     {
-        let x = base_x + f32::from(keyframe) * FRAME_W;
+        let x = base_x + f32::from(keyframe) * frame_w();
         painter.line_segment(
             [pos2(x, cell_top), pos2(x, cell_bot)],
             Stroke::new(1.0_f32, stroke_dark),
@@ -3254,9 +3401,9 @@ fn draw_camera_spans(
         if key.frame >= frame_slots.end || to_frame < frame_slots.start || to_frame >= frame_count {
             continue;
         }
-        let from_x = base_x + (f32::from(key.frame) + 0.5) * FRAME_W + 4.0;
-        let to_x = base_x + (f32::from(to_frame) + 0.5) * FRAME_W - 4.0;
-        let mid_y = row_y + ROW_H * 0.5;
+        let from_x = base_x + (f32::from(key.frame) + 0.5) * frame_w() + 4.0;
+        let to_x = base_x + (f32::from(to_frame) + 0.5) * frame_w() - 4.0;
+        let mid_y = row_y + row_h() * 0.5;
         if to_x > from_x + 2.0 {
             painter.line_segment(
                 [pos2(from_x, mid_y), pos2(to_x, mid_y)],
@@ -3272,13 +3419,13 @@ fn draw_camera_spans(
             );
         }
     }
-    let keyframe_y = row_y + ROW_H - 5.0;
+    let keyframe_y = row_y + row_h() - 5.0;
     let keyframe_color = blend(theme.keyframe.to_color32(), theme.accent.to_color32(), 0.22);
     for keyframe in keyframes
         .into_iter()
         .filter(|frame| frame_slots.contains(frame))
     {
-        let x = base_x + (f32::from(keyframe) + 0.5) * FRAME_W;
+        let x = base_x + (f32::from(keyframe) + 0.5) * frame_w();
         painter.circle_filled(pos2(x, keyframe_y), 2.8, keyframe_color);
     }
 }
@@ -4488,7 +4635,7 @@ fn draw_empty_cells(
     is_current_layer: bool,
 ) {
     let cell_top = row_y + CELL_PAD_Y;
-    let cell_bot = row_y + ROW_H - CELL_PAD_Y;
+    let cell_bot = row_y + row_h() - CELL_PAD_Y;
     let inside = if is_current_layer {
         theme.empty_inside_active.to_color32()
     } else {
@@ -4497,8 +4644,8 @@ fn draw_empty_cells(
     let beyond = theme.empty_beyond.to_color32();
     let beyond_5 = theme.empty_beyond_5.to_color32();
     for f in visible_frame_slots(painter, base_x, visible_frames) {
-        let x0 = base_x + (f as f32) * FRAME_W;
-        let x1 = x0 + FRAME_W;
+        let x0 = base_x + (f as f32) * frame_w();
+        let x1 = x0 + frame_w();
         let cell = Rect::from_min_max(pos2(x0, cell_top), pos2(x1, cell_bot));
         let fill = if f < frame_count {
             inside
@@ -4528,7 +4675,7 @@ fn draw_frame_script_markers(
         {
             continue;
         }
-        let x = layout.base_x + f32::from(script.frame) * FRAME_W + FRAME_W * 0.5;
+        let x = layout.base_x + f32::from(script.frame) * frame_w() + frame_w() * 0.5;
         painter.text(
             pos2(x, layout.row_y + 3.0),
             Align2::CENTER_TOP,
@@ -4571,11 +4718,11 @@ fn draw_audio_waveforms(
         if end <= clip.start_frame {
             continue;
         }
-        let left = base_x + f32::from(clip.start_frame) * FRAME_W;
-        let right = base_x + f32::from(end) * FRAME_W;
+        let left = base_x + f32::from(clip.start_frame) * frame_w();
+        let right = base_x + f32::from(end) * frame_w();
         let rect = Rect::from_min_max(
             pos2(left + 0.5, row_y + 2.0),
-            pos2(right - 0.5, row_y + ROW_H - 2.0),
+            pos2(right - 0.5, row_y + row_h() - 2.0),
         );
         let visible = rect.intersect(painter.clip_rect());
         if !visible.is_positive() {
@@ -4638,7 +4785,7 @@ fn draw_audio_waveforms(
         let source_samples =
             waveform.samples_per_channel as f64 * 48_000.0 / f64::from(waveform.sample_rate.max(1));
         let sample_at_x = |x: f32| -> f64 {
-            f64::from(((x - base_x) / FRAME_W - f32::from(clip.start_frame)).max(0.0)) * 48_000.0
+            f64::from(((x - base_x) / frame_w() - f32::from(clip.start_frame)).max(0.0)) * 48_000.0
                 / f64::from(project.meta.fps.max(1))
         };
         let length =
@@ -4705,7 +4852,7 @@ fn draw_layer_spans(
     }
 
     let cell_top = row_y + CELL_PAD_Y;
-    let cell_bot = row_y + ROW_H - CELL_PAD_Y;
+    let cell_bot = row_y + row_h() - CELL_PAD_Y;
     let static_fill = if is_current_layer {
         theme.extension_active.to_color32()
     } else {
@@ -4740,8 +4887,8 @@ fn draw_layer_spans(
             .placements
             .iter()
             .any(|placement| placement.frame == keyframe && placement.tween.is_shape());
-        let x0 = base_x + f32::from(keyframe) * FRAME_W;
-        let x1 = base_x + (f32::from(span_end) + 1.0) * FRAME_W;
+        let x0 = base_x + f32::from(keyframe) * frame_w();
+        let x1 = base_x + (f32::from(span_end) + 1.0) * frame_w();
         painter.rect_filled(
             egui::Rect::from_min_max(pos2(x0, cell_top), pos2(x1, cell_bot)),
             0.0,
@@ -4754,7 +4901,7 @@ fn draw_layer_spans(
             },
         );
         if !has_tween && span_end > keyframe {
-            let cap_x = base_x + (f32::from(span_end) + 1.0) * FRAME_W - 1.0;
+            let cap_x = base_x + (f32::from(span_end) + 1.0) * frame_w() - 1.0;
             painter.line_segment(
                 [pos2(cap_x, cell_top + 1.0), pos2(cap_x, cell_bot - 1.0)],
                 Stroke::new(1.0_f32, stroke_dark),
@@ -4770,7 +4917,7 @@ fn draw_layer_spans(
     for keyframe in
         keyframe_separator_frames(&keyframes).filter(|frame| frame_slots.contains(frame))
     {
-        let x = base_x + f32::from(keyframe) * FRAME_W;
+        let x = base_x + f32::from(keyframe) * frame_w();
         painter.line_segment(
             [pos2(x, cell_top), pos2(x, cell_bot)],
             Stroke::new(1.0_f32, stroke_dark),
@@ -4794,9 +4941,9 @@ fn draw_layer_spans(
         } else {
             tween_arrow
         };
-        let from_x = base_x + (f32::from(from_frame) + 0.5) * FRAME_W + 4.0;
-        let to_x = base_x + (f32::from(to_frame) + 0.5) * FRAME_W - 4.0;
-        let mid_y = row_y + ROW_H * 0.5;
+        let from_x = base_x + (f32::from(from_frame) + 0.5) * frame_w() + 4.0;
+        let to_x = base_x + (f32::from(to_frame) + 0.5) * frame_w() - 4.0;
+        let mid_y = row_y + row_h() * 0.5;
         if to_x > from_x + 2.0 {
             painter.line_segment(
                 [pos2(from_x, mid_y), pos2(to_x, mid_y)],
@@ -4814,12 +4961,12 @@ fn draw_layer_spans(
     }
 
     let keyframe_color = theme.keyframe.to_color32();
-    let keyframe_y = row_y + ROW_H - 5.0;
+    let keyframe_y = row_y + row_h() - 5.0;
     for keyframe in keyframes
         .into_iter()
         .filter(|frame| frame_slots.contains(frame))
     {
-        let x = base_x + (f32::from(keyframe) + 0.5) * FRAME_W;
+        let x = base_x + (f32::from(keyframe) + 0.5) * frame_w();
         if layer.is_blank_keyframe(keyframe) {
             painter.circle_stroke(
                 pos2(x, keyframe_y),
@@ -4953,11 +5100,11 @@ fn timeline_cell_at_with_label_width(
     if rel_x < 0.0 {
         return None;
     }
-    let frame = (rel_x / FRAME_W).floor() as i32;
+    let frame = (rel_x / frame_w()).floor() as i32;
     if frame < 0 || frame >= i32::from(frame_count) {
         return None;
     }
-    let row = ((pos.y - rect.min.y) / ROW_H).floor() as i32 - 1 - camera_row_count as i32;
+    let row = layer_row_at(pos.y - rect.min.y - rows_h() * (camera_row_count as f32 + 1.0)) as i32;
     if row < 0 {
         return None;
     }
@@ -4990,20 +5137,14 @@ fn draw_timeline_selection(
     let stroke = Stroke::new(1.0_f32, accent);
 
     let clip = painter.clip_rect();
-    let rows = visible_slots(
-        first_row_y,
-        ROW_H,
-        layer_ids.len(),
-        clip.top(),
-        clip.bottom(),
-    );
+    let rows = visible_layer_rows(first_row_y, layer_ids.len(), clip.top(), clip.bottom());
     for layer_index in first_layer.max(rows.start)..last_layer.saturating_add(1).min(rows.end) {
-        let row_y = first_row_y + layer_index as f32 * ROW_H;
-        let x0 = base_x + f32::from(first_frame) * FRAME_W;
-        let x1 = base_x + (f32::from(last_frame) + 1.0) * FRAME_W;
+        let row_y = first_row_y + layer_top(layer_index);
+        let x0 = base_x + f32::from(first_frame) * frame_w();
+        let x1 = base_x + (f32::from(last_frame) + 1.0) * frame_w();
         let selected = Rect::from_min_max(
             pos2(x0, row_y + CELL_PAD_Y),
-            pos2(x1, row_y + ROW_H - CELL_PAD_Y),
+            pos2(x1, row_y + layer_height(layer_index) - CELL_PAD_Y),
         );
         painter.rect_filled(selected, 0.0, fill);
         painter.rect_stroke(selected, 0.0, stroke);
@@ -5031,10 +5172,10 @@ fn draw_timeline_cell_selection(
         };
         let rect = Rect::from_min_size(
             pos2(
-                base_x + f32::from(frame) * FRAME_W,
-                first_row_y + row as f32 * ROW_H + CELL_PAD_Y,
+                base_x + f32::from(frame) * frame_w(),
+                first_row_y + layer_top(row) + CELL_PAD_Y,
             ),
-            vec2(FRAME_W, ROW_H - CELL_PAD_Y * 2.0),
+            vec2(frame_w(), layer_height(row) - CELL_PAD_Y * 2.0),
         );
         painter.rect_filled(rect, 1.0, fill);
         painter.rect_stroke(rect, 1.0, stroke);
@@ -5066,9 +5207,108 @@ fn truncate_label(text: &str, max_chars: usize) -> String {
     shortened
 }
 
+/// Writes the timeline's sizes once they stop changing, not every frame of
+/// a drag or a wheel.
+fn save_sizes_when_settled(app: &mut EditorApp, ctx: &egui::Context) {
+    let Some(at) = app.session.timeline_sizes_changed else {
+        return;
+    };
+    if at.elapsed() >= std::time::Duration::from_millis(600)
+        && !ctx.input(|input| input.pointer.any_down())
+    {
+        app.session.timeline_sizes_changed = None;
+        app.settings.save();
+    } else {
+        ctx.request_repaint_after(std::time::Duration::from_millis(650));
+    }
+}
+
+/// The bottom edge of each layer row, in the names column. Dragging it
+/// makes every row taller or shorter; with Alt held, only that layer, which
+/// then keeps a height of its own until its edge is double-clicked. A
+/// double-click on a shared edge puts every row back to the usual height.
+fn row_edges(
+    app: &mut EditorApp,
+    ui: &mut Ui,
+    q0rg_id: u16,
+    layer_ids: &[u16],
+    first_row_y: f32,
+    (left, right): (f32, f32),
+    rows: std::ops::Range<usize>,
+) {
+    let range = crate::settings::TIMELINE_ROW_HEIGHTS;
+    for index in rows {
+        let Some(&layer_id) = layer_ids.get(index) else {
+            continue;
+        };
+        let bottom = first_row_y + layer_top(index + 1);
+        let edge = Rect::from_min_max(pos2(left, bottom - 3.0), pos2(right, bottom + 2.0));
+        let response = ui
+            .interact(
+                edge,
+                ui.id().with(("timeline_row_edge", q0rg_id, layer_id)),
+                Sense::click_and_drag(),
+            )
+            .on_hover_cursor(egui::CursorIcon::ResizeVertical)
+            .on_hover_text(
+                "Drag to make every row taller or shorter; hold Alt for this layer alone. \
+                 Double-click to put it back",
+            );
+        let key = (q0rg_id, layer_id);
+        let own = app.session.timeline_row_heights.get(&key).copied();
+        if response.dragged() {
+            let delta = response.drag_delta().y;
+            let alone = ui.input(|input| input.modifiers.alt);
+            if delta != 0.0 {
+                if own.is_some() || alone {
+                    let height = own.unwrap_or_else(rows_h);
+                    app.session
+                        .timeline_row_heights
+                        .insert(key, (height + delta).clamp(*range.start(), *range.end()));
+                } else {
+                    app.settings.timeline_row_height =
+                        (rows_h() + delta).clamp(*range.start(), *range.end());
+                }
+                app.session.timeline_sizes_changed = Some(std::time::Instant::now());
+            }
+        }
+        if response.double_clicked() {
+            if own.is_some() {
+                app.session.timeline_row_heights.remove(&key);
+            } else {
+                app.settings.timeline_row_height = 26.0;
+                app.session.timeline_sizes_changed = Some(std::time::Instant::now());
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rows_of_their_own_height_still_line_up() {
+        // Rows of 26, 60 and 26 points.
+        ROW_TOPS.with(|tops| *tops.borrow_mut() = vec![0.0, 26.0, 86.0, 112.0]);
+        assert_eq!(layer_top(2), 86.0);
+        assert_eq!(layer_height(1), 60.0);
+        assert_eq!(layer_row_at(10.0), 0);
+        assert_eq!(layer_row_at(26.0), 1);
+        assert_eq!(layer_row_at(85.0), 1);
+        assert_eq!(layer_row_at(90.0), 2);
+        assert_eq!(layer_row_at(-1.0), -1);
+        // Past the table, rows have the usual height.
+        assert_eq!(layer_row_at(112.0 + 30.0), 4);
+        assert_eq!(layer_top(5), 112.0 + 2.0 * rows_h());
+        assert_eq!(visible_layer_rows(100.0, 3, 130.0, 190.0), 1..3);
+        ROW_TOPS.with(|tops| tops.borrow_mut().clear());
+        assert_eq!(
+            layer_row_at(53.0),
+            2,
+            "without a table every row is the usual height"
+        );
+    }
     use q0s_format::v2::{Layer, Placement, Target, Transform2D, Tween};
 
     #[test]
@@ -5077,7 +5317,7 @@ mod tests {
         assert_eq!(visible_slots(-1200.0, 12.0, 65_535, 0.5, 600.5), 99..152);
         assert_eq!(visible_slots(174.0, 12.0, 10, 500.0, 800.0), 0..0);
         assert_eq!(visible_slots(174.0, 12.0, 10, 0.0, 170.0), 0..0);
-        assert_eq!(visible_slots(0.0, ROW_H, 1000, 260.0, 390.0), 9..16);
+        assert_eq!(visible_slots(0.0, row_h(), 1000, 260.0, 390.0), 9..16);
     }
 
     #[test]
@@ -5087,7 +5327,7 @@ mod tests {
             let output = ctx.run(Default::default(), |ctx| {
                 let painter = ctx
                     .layer_painter(egui::LayerId::background())
-                    .with_clip_rect(Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, ROW_H)));
+                    .with_clip_rect(Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, row_h())));
                 draw_empty_cells(
                     &painter,
                     &Theme::default(),
@@ -5121,7 +5361,7 @@ mod tests {
         let output = ctx.run(Default::default(), |ctx| {
             let painter = ctx
                 .layer_painter(egui::LayerId::background())
-                .with_clip_rect(Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, ROW_H)));
+                .with_clip_rect(Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, row_h())));
             draw_layer_spans(
                 &painter,
                 &Theme::default(),
@@ -5470,11 +5710,11 @@ mod tests {
         let visible = [3, 2, 1];
 
         assert_eq!(
-            layer_drop_target_at(&project, 1, rect, pos2(50.0, ROW_H * 2.5), &visible, &[3],),
+            layer_drop_target_at(&project, 1, rect, pos2(50.0, row_h() * 2.5), &visible, &[3],),
             Some(LayerDropTarget::IntoFolder(2))
         );
         assert_eq!(
-            layer_drop_target_at(&project, 1, rect, pos2(8.0, ROW_H * 3.75), &visible, &[1],),
+            layer_drop_target_at(&project, 1, rect, pos2(8.0, row_h() * 3.75), &visible, &[1],),
             Some(LayerDropTarget::After {
                 layer_id: 1,
                 parent_folder_id: None,
@@ -5489,7 +5729,7 @@ mod tests {
         assert_eq!(
             timeline_cell_at(
                 rect,
-                pos2(LAYER_LABEL_W + FRAME_W * 2.5, ROW_H * 1.5),
+                pos2(LAYER_LABEL_W + frame_w() * 2.5, row_h() * 1.5),
                 5,
                 &layers,
                 &[],
@@ -5500,7 +5740,7 @@ mod tests {
         assert_eq!(
             timeline_cell_at(
                 rect,
-                pos2(LAYER_LABEL_W + 2.0, ROW_H * 0.5),
+                pos2(LAYER_LABEL_W + 2.0, row_h() * 0.5),
                 5,
                 &layers,
                 &[],
@@ -5511,7 +5751,7 @@ mod tests {
         assert_eq!(
             timeline_cell_at(
                 rect,
-                pos2(LAYER_LABEL_W + FRAME_W * 6.0, ROW_H * 1.5),
+                pos2(LAYER_LABEL_W + frame_w() * 6.0, row_h() * 1.5),
                 35,
                 &layers,
                 &[],
@@ -5522,7 +5762,7 @@ mod tests {
         assert_eq!(
             timeline_cell_at(
                 rect,
-                pos2(LAYER_LABEL_W + FRAME_W * 36.0, ROW_H * 1.5),
+                pos2(LAYER_LABEL_W + frame_w() * 36.0, row_h() * 1.5),
                 35,
                 &layers,
                 &[],
@@ -5539,7 +5779,7 @@ mod tests {
         assert_eq!(
             timeline_cell_at(
                 rect,
-                pos2(LAYER_LABEL_W + FRAME_W * 2.5, ROW_H * 1.5),
+                pos2(LAYER_LABEL_W + frame_w() * 2.5, row_h() * 1.5),
                 20,
                 &layers,
                 &[],
@@ -5551,7 +5791,7 @@ mod tests {
         assert_eq!(
             timeline_cell_at(
                 rect,
-                pos2(LAYER_LABEL_W + FRAME_W * 2.5, ROW_H * 2.5),
+                pos2(LAYER_LABEL_W + frame_w() * 2.5, row_h() * 2.5),
                 20,
                 &layers,
                 &[],

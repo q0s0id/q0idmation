@@ -242,18 +242,24 @@ pub(crate) fn paint_timeline_markers(
     layer_ids: &[u16],
     base_x: f32,
     first_row_y: f32,
-    row_h: f32,
+    // Each row's top from the first row, and one past the last: rows may
+    // differ in height.
+    row_tops: &[f32],
     frame_w: f32,
 ) {
-    let rows = layer_ids.len() as f32;
+    let height = row_tops.last().copied().unwrap_or(0.0);
     for marker in markers {
         let x0 = base_x + f32::from(marker.frame) * frame_w;
-        let column = Rect::from_min_size(Pos2::new(x0, first_row_y), vec2(frame_w, rows * row_h));
+        let column = Rect::from_min_size(Pos2::new(x0, first_row_y), vec2(frame_w, height));
         painter.rect_filled(column, 0.0, marker.colour.gamma_multiply(0.12));
-        if let Some(row) = layer_ids.iter().position(|id| *id == marker.layer_id) {
-            let cell = Rect::from_min_size(
-                Pos2::new(x0, first_row_y + row as f32 * row_h),
-                vec2(frame_w, row_h),
+        if let Some(row) = layer_ids
+            .iter()
+            .position(|id| *id == marker.layer_id)
+            .filter(|row| row + 1 < row_tops.len())
+        {
+            let cell = Rect::from_min_max(
+                Pos2::new(x0, first_row_y + row_tops[row]),
+                Pos2::new(x0 + frame_w, first_row_y + row_tops[row + 1]),
             )
             .shrink(1.0);
             painter.rect_filled(cell, 2.0, marker.colour.gamma_multiply(0.45));

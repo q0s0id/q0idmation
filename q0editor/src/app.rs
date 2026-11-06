@@ -361,6 +361,8 @@ pub struct EditorApp {
     pub session: Session,
     pub history: History,
     pub online: crate::online::Online,
+    /// What Discord shows about this editor.
+    pub(crate) discord: crate::discord::Presence,
     pub textures: TextureCache,
     pub(crate) animation_preview_textures: TextureCache,
     pub(crate) fast_preview: crate::fast_preview::FastPreview,
@@ -436,6 +438,10 @@ pub struct EditorApp {
     pub(crate) workspace_layout: crate::workspace::WorkspaceLayout,
     new_project_dialog: Option<NewProjectSpec>,
     pub close_requested: bool,
+    /// Every panel but the stage is hidden (F9).
+    pub(crate) stage_only: bool,
+    /// When it was switched, for the hint that says how to come back.
+    pub(crate) stage_only_since: Option<Instant>,
 }
 
 struct MediaImportJob {
@@ -787,6 +793,10 @@ pub enum Action {
     SelectTool(Tool),
     TogglePlay,
     ToggleTimeline,
+    /// Hide every panel but the stage (F9), and back.
+    ToggleStageOnly,
+    /// Borderless full screen (F11), and back.
+    ToggleFullscreen,
     ToggleOutlineMode,
     /// Snapping on or off.
     ToggleSnap,
@@ -820,6 +830,8 @@ pub enum Action {
     /// Alt-click on a layer's lock: lock every other layer, or unlock the
     /// ones that did.
     ToggleOtherLayerLocks(u16, u16),
+    /// Outline every layer but this one, or put them back.
+    ToggleOtherLayerOutlines(u16, u16),
     /// Alt-click on a layer's eye: hide every other layer, or show the
     /// ones that did.
     ToggleOtherLayerVisibility(u16, u16),
@@ -1031,6 +1043,8 @@ impl Action {
             "redo" => Self::Redo,
             "toggle-play" => Self::TogglePlay,
             "toggle-timeline" => Self::ToggleTimeline,
+            "toggle-stage-only" => Self::ToggleStageOnly,
+            "toggle-fullscreen" => Self::ToggleFullscreen,
             "toggle-outline-mode" => Self::ToggleOutlineMode,
             "toggle-snap" => Self::ToggleSnap,
             "first-frame" => Self::FirstFrame,
@@ -1120,6 +1134,8 @@ impl Action {
             Self::SelectTool(_) => "select-tool",
             Self::TogglePlay => "toggle-play",
             Self::ToggleTimeline => "toggle-timeline",
+            Self::ToggleStageOnly => "toggle-stage-only",
+            Self::ToggleFullscreen => "toggle-fullscreen",
             Self::ToggleOutlineMode => "toggle-outline-mode",
             Self::ToggleSnap => "toggle-snap",
             Self::StrokesToOwnLayer => "strokes-to-own-layer",
@@ -1151,6 +1167,7 @@ impl Action {
             Self::ToggleAllLayerVisibility(_) => "toggle-all-layer-visibility",
             Self::ToggleAllLayerOutlines(_) => "toggle-all-layer-outlines",
             Self::ToggleOtherLayerLocks(..) => "toggle-other-layer-locks",
+            Self::ToggleOtherLayerOutlines(..) => "toggle-other-layer-outlines",
             Self::ToggleOtherLayerVisibility(..) => "toggle-other-layer-visibility",
             Self::UnlockAllLayers(_) => "unlock-all-layers",
             Self::ShowAllLayers(_) => "show-all-layers",
@@ -1434,6 +1451,7 @@ impl Default for EditorApp {
             session,
             history: History::new(),
             online: crate::online::Online::default(),
+            discord: crate::discord::Presence::default(),
             textures: TextureCache::default(),
             animation_preview_textures: TextureCache::default(),
             fast_preview: crate::fast_preview::FastPreview::default(),
@@ -1491,6 +1509,8 @@ impl Default for EditorApp {
             workspace_layout,
             new_project_dialog: None,
             close_requested: false,
+            stage_only: false,
+            stage_only_since: None,
         }
     }
 }
@@ -1693,6 +1713,8 @@ impl EditorApp {
 
     /// Files the platform picked or received, its messages and Back.
     fn poll_platform(&mut self, ctx: &Context) {
+        // Links asked for last frame.
+        crate::platform::open_links(ctx);
         for event in crate::platform::take_events(ctx) {
             match event {
                 crate::platform::PlatformEvent::Run(action) => self.queue(action),
@@ -3646,6 +3668,15 @@ impl EditorApp {
                     self.session.status = "paused".to_string();
                 }
             }
+            Action::ToggleStageOnly => {
+                self.stage_only = !self.stage_only;
+                self.stage_only_since = Some(Instant::now());
+                ctx.request_repaint();
+            }
+            Action::ToggleFullscreen => {
+                let on = ctx.input(|input| input.viewport().fullscreen.unwrap_or(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!on));
+            }
             Action::ToggleTimeline => {
                 self.workspace_layout
                     .toggle(crate::workspace::Panel::Timeline);
@@ -4161,6 +4192,13 @@ impl EditorApp {
                 .to_string();
             }
             Action::ToggleLayerVisibility(q0rg_id, layer_id) => {
+                if self.undo_others_by_click(
+                    q0rg_id,
+                    layer_id,
+                    crate::layer_flags::LayerFlag::Hidden,
+                ) {
+                    return;
+                }
                 if let Some(folder) =
                     (!self.own_layer_flag(q0rg_id, layer_id, crate::layer_flags::LayerFlag::Hidden))
                         .then(|| {
@@ -4214,6 +4252,13 @@ impl EditorApp {
                 .to_string();
             }
             Action::ToggleLayerLock(q0rg_id, layer_id) => {
+                if self.undo_others_by_click(
+                    q0rg_id,
+                    layer_id,
+                    crate::layer_flags::LayerFlag::Locked,
+                ) {
+                    return;
+                }
                 if let Some(folder) =
                     (!self.own_layer_flag(q0rg_id, layer_id, crate::layer_flags::LayerFlag::Locked))
                         .then(|| {
@@ -4279,6 +4324,13 @@ impl EditorApp {
                 .to_string();
             }
             Action::ToggleLayerOutline(q0rg_id, layer_id) => {
+                if self.undo_others_by_click(
+                    q0rg_id,
+                    layer_id,
+                    crate::layer_flags::LayerFlag::Outline,
+                ) {
+                    return;
+                }
                 let exists = self
                     .state
                     .project
@@ -4346,6 +4398,13 @@ impl EditorApp {
                 self.toggle_all_layer_flags(
                     q0rg_id,
                     crate::layer_flags::LayerFlag::Locked,
+                    Some(layer_id),
+                );
+            }
+            Action::ToggleOtherLayerOutlines(q0rg_id, layer_id) => {
+                self.toggle_all_layer_flags(
+                    q0rg_id,
+                    crate::layer_flags::LayerFlag::Outline,
                     Some(layer_id),
                 );
             }
@@ -12219,6 +12278,36 @@ impl EditorApp {
                         .color(self.settings.theme.text_dim.to_color32()));
                 }
                 ui.add_space(10.0);
+                crate::theme::section_heading(ui, "Discord", "What your Discord profile says while q0editor is open");
+                let mut discord_changed = ui
+                    .checkbox(&mut self.settings.discord_presence, "Show what I'm working on")
+                    .on_hover_text("Discord shows \"Editing <project>\" and the frame you are on, while the Discord app is running on this computer.")
+                    .changed();
+                ui.add_enabled_ui(self.settings.discord_presence, |ui| {
+                    discord_changed |= ui
+                        .checkbox(&mut self.settings.discord_show_project, "Name the project")
+                        .on_hover_text("Off, Discord only says you are animating.")
+                        .changed();
+                    ui.horizontal(|ui| {
+                        ui.label("Application id");
+                        discord_changed |= ui
+                            .add(
+                                egui::TextEdit::singleline(&mut self.settings.discord_application_id)
+                                    .hint_text(if crate::discord::APPLICATION_ID.is_empty() {
+                                        "paste one"
+                                    } else {
+                                        "q0editor's own"
+                                    })
+                                    .desired_width(170.0),
+                            )
+                            .on_hover_text("The Discord application to show as. Leave it empty for q0editor's own.")
+                            .changed();
+                    });
+                });
+                if discord_changed {
+                    let _ = self.settings.try_save();
+                }
+                ui.add_space(10.0);
                 crate::theme::section_heading(ui, "Extra tools", "Bigger features that stay out of sight until you turn them on");
                 if ui
                     .checkbox(&mut self.settings.physics_enabled, "Physics editor")
@@ -14567,9 +14656,11 @@ impl EditorApp {
             .record(crate::perf::PerfSpan::AppPrelude, prelude_started.elapsed());
 
         let menu_started = Instant::now();
+        // F9 leaves the stage alone on screen, menus and tabs too.
+        let stage_only = self.stage_only && !self.show_home && self.project_active;
         if crate::touch::ENABLED {
             crate::touch::top_bar(self, ctx);
-        } else {
+        } else if !stage_only {
             egui::TopBottomPanel::top("menu_bar")
                 .resizable(false)
                 .show(ctx, |ui| {
@@ -14719,6 +14810,7 @@ impl EditorApp {
             }
         }
         crate::online::tick(self, ctx);
+        crate::discord::Presence::update(self);
         crate::workspace::persist(self, ctx);
         crate::autosave::tick(self, ctx);
         self.perf.record(

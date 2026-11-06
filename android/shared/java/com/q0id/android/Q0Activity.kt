@@ -245,6 +245,18 @@ abstract class Q0Activity : GameActivity() {
         }
     }
 
+    /** Native side: a link from the editor, like q0id's sign-in page. */
+    @Suppress("unused")
+    fun openUrl(url: String) {
+        runOnUiThread {
+            try {
+                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+            } catch (error: ActivityNotFoundException) {
+                nativeStatus("no browser to open $url")
+            }
+        }
+    }
+
     /** Native side: Back with nothing left to close goes home, like other apps. */
     @Suppress("unused")
     fun leave() {

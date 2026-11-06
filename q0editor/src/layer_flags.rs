@@ -3,8 +3,10 @@
 //! * Locking (or hiding) all layers remembers which ones it turned on, and
 //!   turning them all back off restores the rest as they were: a layer you
 //!   had locked yourself stays locked.
-//! * Alt-clicking a layer's eye or lock does the same to every *other*
-//!   layer, so one layer can be worked on alone and the rest come back.
+//! * Alt-clicking a layer's eye, lock or outline does the same to every
+//!   *other* layer, so one layer can be worked on alone. A plain click on
+//!   that same switch then gives the others back, as long as none of them
+//!   was changed since; otherwise it is an ordinary click.
 //! * Pressing on an eye or lock and dragging down the column sets every
 //!   row it passes to the same state, in one undo step.
 //! * A folder's lock or eye covers what is in it without changing their
@@ -22,6 +24,8 @@ use crate::state::Selection;
 pub enum LayerFlag {
     Locked,
     Hidden,
+    /// Drawn as outlines only; kept for this session, not in the file.
+    Outline,
 }
 
 impl LayerFlag {
@@ -29,6 +33,7 @@ impl LayerFlag {
         match self {
             Self::Locked => "locked",
             Self::Hidden => "hidden",
+            Self::Outline => "outlined",
         }
     }
 
@@ -36,6 +41,7 @@ impl LayerFlag {
         match self {
             Self::Locked => "unlocked",
             Self::Hidden => "shown",
+            Self::Outline => "filled in",
         }
     }
 }
@@ -70,6 +76,7 @@ impl EditorApp {
         match flag {
             LayerFlag::Hidden => metadata.hidden,
             LayerFlag::Locked => metadata.locked || self.online.locally_locked(q0rg_id, layer_id),
+            LayerFlag::Outline => self.session.outline_layers.contains(&(q0rg_id, layer_id)),
         }
     }
 
@@ -86,7 +93,35 @@ impl EditorApp {
                 self.state.project.layer_is_locked(q0rg_id, layer_id)
                     || self.online.locally_locked(q0rg_id, layer_id)
             }
+            LayerFlag::Outline => self.session.outline_layers.contains(&(q0rg_id, layer_id)),
         }
+    }
+
+    /// A plain click on the switch a layer was Alt-clicked on: when every
+    /// other layer still has it on, the others go back as they were and
+    /// true says the click is used up. When one of them was changed since,
+    /// the Alt-click is forgotten and the click is an ordinary one.
+    pub(crate) fn undo_others_by_click(
+        &mut self,
+        q0rg_id: u16,
+        layer_id: u16,
+        flag: LayerFlag,
+    ) -> bool {
+        let key = self.layer_flag_memory_key(q0rg_id, flag, Some(layer_id));
+        let Some(turned) = self.session.layer_flag_memory.get(&key) else {
+            return false;
+        };
+        let untouched = !turned.is_empty()
+            && self
+                .drawable_layers(q0rg_id, Some(layer_id))
+                .iter()
+                .all(|id| self.effective_layer_flag(q0rg_id, *id, flag));
+        if !untouched {
+            self.session.layer_flag_memory.remove(&key);
+            return false;
+        }
+        self.toggle_all_layer_flags(q0rg_id, flag, Some(layer_id));
+        true
     }
 
     /// Set the layer's own switch. In a room a new lock is yours alone,
@@ -95,9 +130,18 @@ impl EditorApp {
         if self.own_layer_flag(q0rg_id, layer_id, flag) == on {
             return;
         }
+        if flag == LayerFlag::Outline {
+            if on {
+                self.session.outline_layers.insert((q0rg_id, layer_id));
+            } else {
+                self.session.outline_layers.remove(&(q0rg_id, layer_id));
+            }
+            return;
+        }
         let tab = self.active_project_tab_id();
         let mut metadata: LayerMetadata = self.state.project.layer_metadata(q0rg_id, layer_id);
         match flag {
+            LayerFlag::Outline => {}
             LayerFlag::Hidden => metadata.hidden = on,
             LayerFlag::Locked => {
                 if on {
@@ -388,6 +432,34 @@ mod tests {
         app.handle(&ctx, Action::ToggleOtherLayerLocks(q0rg, layers[0]));
         assert!(!locked(&app, q0rg, layers[1]));
         assert!(locked(&app, q0rg, layers[2]));
+    }
+
+    #[test]
+    fn a_plain_click_on_the_alt_clicked_layer_gives_the_others_back() {
+        let (mut app, q0rg, layers) = three_layers();
+        let ctx = Context::default();
+        app.handle(&ctx, Action::ToggleOtherLayerLocks(q0rg, layers[0]));
+        assert!(locked(&app, q0rg, layers[1]) && locked(&app, q0rg, layers[2]));
+        app.handle(&ctx, Action::ToggleLayerLock(q0rg, layers[0]));
+        assert!(
+            !locked(&app, q0rg, layers[0]),
+            "the click went to the others"
+        );
+        assert!(!locked(&app, q0rg, layers[1]) && !locked(&app, q0rg, layers[2]));
+
+        // Once another layer was unlocked by hand, the click is ordinary.
+        app.handle(&ctx, Action::ToggleOtherLayerLocks(q0rg, layers[0]));
+        app.handle(&ctx, Action::ToggleLayerLock(q0rg, layers[1]));
+        app.handle(&ctx, Action::ToggleLayerLock(q0rg, layers[0]));
+        assert!(locked(&app, q0rg, layers[0]));
+        assert!(!locked(&app, q0rg, layers[1]) && locked(&app, q0rg, layers[2]));
+
+        // Outlines work the same way.
+        app.handle(&ctx, Action::ToggleOtherLayerOutlines(q0rg, layers[2]));
+        assert!(app.session.outline_layers.contains(&(q0rg, layers[0])));
+        assert!(!app.session.outline_layers.contains(&(q0rg, layers[2])));
+        app.handle(&ctx, Action::ToggleLayerOutline(q0rg, layers[2]));
+        assert!(app.session.outline_layers.is_empty());
     }
 
     #[test]

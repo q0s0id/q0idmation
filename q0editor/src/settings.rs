@@ -1263,7 +1263,7 @@ fn sanitize_advanced_brush_presets(presets: &mut Vec<AdvancedBrushPreset>) {
     presets.truncate(64);
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Settings {
     #[serde(default)]
@@ -1306,6 +1306,21 @@ pub struct Settings {
     /// Which buttons the timeline bar shows.
     #[serde(default)]
     pub timeline_bar: TimelineBar,
+    /// Show what is being worked on in Discord, while Discord is open.
+    #[serde(default = "default_true")]
+    pub discord_presence: bool,
+    /// Name the project there; off says only "Animating".
+    #[serde(default = "default_true")]
+    pub discord_show_project: bool,
+    /// Another Discord application to show as, for trying one out.
+    #[serde(default)]
+    pub discord_application_id: String,
+    /// How wide a frame is in the timeline (Ctrl+wheel there).
+    #[serde(default = "default_timeline_frame_width")]
+    pub timeline_frame_width: f32,
+    /// How tall a layer row is (drag a row's bottom edge).
+    #[serde(default = "default_timeline_row_height")]
+    pub timeline_row_height: f32,
     /// Font name used inside the q0lang script editor. Resolved via
     /// `q0lang::fonts::resolve` at install time; if the system can't find
     /// it, falls back to bundled monospace and warns once in status.
@@ -1422,6 +1437,11 @@ impl Default for Settings {
             workspace_layout: serde_json::Value::Null,
             workspace_layout_presets: Vec::new(),
             timeline_bar: TimelineBar::default(),
+            discord_presence: true,
+            discord_show_project: true,
+            discord_application_id: String::new(),
+            timeline_frame_width: default_timeline_frame_width(),
+            timeline_row_height: default_timeline_row_height(),
             q0lang_font_name: default_q0lang_font_name(),
             q0lang_font_size: default_q0lang_font_size(),
             q0lang_show_line_numbers: default_q0lang_show_line_numbers(),
@@ -1974,4 +1994,19 @@ impl TimelineBar {
     pub fn shows(&self, button: TimelineButton) -> bool {
         !self.hidden.contains(&button)
     }
+}
+
+pub(crate) const TIMELINE_FRAME_WIDTHS: std::ops::RangeInclusive<f32> = 4.0..=64.0;
+pub(crate) const TIMELINE_ROW_HEIGHTS: std::ops::RangeInclusive<f32> = 16.0..=160.0;
+
+fn default_timeline_frame_width() -> f32 {
+    12.0
+}
+
+fn default_timeline_row_height() -> f32 {
+    26.0
+}
+
+fn default_true() -> bool {
+    true
 }

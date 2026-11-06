@@ -11,6 +11,7 @@ pub mod brush;
 mod brush_geometry;
 pub(crate) mod color_picker;
 mod crossings;
+mod discord;
 pub mod easing;
 pub mod export;
 pub(crate) mod fast_preview;

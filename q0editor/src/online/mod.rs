@@ -3,6 +3,7 @@
 mod chat;
 #[cfg(test)]
 mod freeze;
+mod keep;
 mod presence;
 #[cfg(test)]
 mod shots;
@@ -310,6 +311,8 @@ impl RoomSession {
 }
 pub struct Online {
     pub open: bool,
+    /// The kept sign-in was tried at start (see `keep`).
+    resume_tried: bool,
     server: String,
     transport: Option<Transport>,
     user: Option<Person>,
@@ -357,6 +360,7 @@ impl Default for Online {
     fn default() -> Self {
         Self {
             open: false,
+            resume_tried: false,
             server: default_server().into(),
             transport: None,
             user: None,
@@ -549,6 +553,10 @@ impl Online {
                 .as_nanos(),
             self.counter
         )
+    }
+    /// How many belong to the room this editor is in, if it is in one.
+    pub(crate) fn room_size(&self) -> Option<usize> {
+        self.room.as_ref().map(|room| room.members.len())
     }
     fn ensure_transport(&mut self, ctx: &Context) -> bool {
         if self.transport.is_some() {
@@ -1041,6 +1049,14 @@ const PRESENCE_HEARTBEAT: Duration = Duration::from_secs(20);
 
 /// Runs after normal editor actions, with every network operation on a worker.
 pub fn tick(app: &mut EditorApp, ctx: &Context) {
+    // A sign-in kept from last time signs back in at start, Online open or
+    // not, so rooms and messages are there without asking again.
+    if !app.online.resume_tried {
+        app.online.resume_tried = true;
+        if app.online.transport.is_none() && keep::remembered(&app.online.server) {
+            app.online.ensure_transport(ctx);
+        }
+    }
     if !app.online.open && app.online.transport.is_none() && !app.online.connected() {
         return;
     }

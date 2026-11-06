@@ -177,6 +177,12 @@ pub(super) fn leave() {
     q0android::leave();
 }
 
+pub(super) fn open_url(url: &str) {
+    if let Err(error) = q0android::open_url(url) {
+        eprintln!("could not open {url}: {error}");
+    }
+}
+
 /// The folder q0player can be handed files from.
 pub(super) fn preview_dir() -> PathBuf {
     std::env::temp_dir().join("preview")
