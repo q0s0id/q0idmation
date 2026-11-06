@@ -709,3 +709,49 @@ fn bounce_in_out_has_symmetric_endpoints() {
     assert_eq!(easing.sample(1.0), 1.0);
     assert!((easing.sample(0.25) + easing.sample(0.75) - 1.0).abs() < 1e-5);
 }
+
+#[test]
+fn a_packed_q1s_reads_back_exactly_and_is_smaller() {
+    use q0s_format::v2::{wire_equivalent, write_packed, Q1S_CONTAINER_PACKED};
+    let mut project = sample_v2_project();
+    project
+        .assets
+        .retain(|asset| !matches!(asset, Asset::Bitmap(_)));
+    project.assets.push(Asset::Bitmap(BitmapAsset {
+        asset_id: 1,
+        width: 64,
+        height: 64,
+        rgba: std::sync::Arc::new(vec![200; 64 * 64 * 4]),
+    }));
+    project.assets.push(Asset::Vector(VectorAsset {
+        asset_id: 200,
+        paths: vec![Path {
+            anchors: (0..400)
+                .map(|i| Anchor {
+                    point: Vec2::new(i as f32 * 0.35, (i as f32 * 0.1).sin() * 40.0),
+                    in_handle: None,
+                    out_handle: None,
+                })
+                .collect(),
+            closed: false,
+        }],
+        fill: None,
+        stroke: None,
+    }));
+    let plain = write(&project).unwrap();
+    let packed = write_packed(&project).unwrap();
+    assert_eq!(
+        u16::from_le_bytes([packed[4], packed[5]]),
+        Q1S_CONTAINER_PACKED
+    );
+    assert!(
+        packed.len() * 4 < plain.len(),
+        "{} vs {}",
+        packed.len(),
+        plain.len()
+    );
+    let back = parse(&packed).unwrap();
+    assert!(wire_equivalent(&project, &back));
+    // The plain layout older editors wrote still opens.
+    assert!(wire_equivalent(&project, &parse(&plain).unwrap()));
+}

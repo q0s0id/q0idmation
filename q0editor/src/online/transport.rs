@@ -319,9 +319,12 @@ fn request_inner(
     auth: bool,
     refresh: bool,
 ) -> Result<Value, Failure> {
+    // This editor reads packed room documents; without the header the
+    // server unpacks them for older editors.
     let mut req = agent
         .request(method, &format!("{base}{path}"))
-        .set("Accept", "application/json");
+        .set("Accept", "application/json")
+        .set(q0online::wire::WIRE_HEADER, q0online::wire::WIRE_PACKED);
     let original_token = if auth {
         creds
             .lock()
@@ -1119,7 +1122,10 @@ impl Transport {
                                     &credentials,
                                     "POST",
                                     "/api/v1/rooms",
-                                    Some(json!({"name":name,"project":project})),
+                                    // sent packed: a tenth of its JSON or less
+                                    Some(
+                                        json!({"name":name,"project":q0online::wire::Packed(&project)}),
+                                    ),
                                     true,
                                 )?)?;
                                 if active_room.as_deref() != Some(room.id.as_str()) {

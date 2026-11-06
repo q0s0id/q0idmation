@@ -3530,6 +3530,8 @@ dependencies = [
 name = "q0online"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "flate2",
  "q0s-format",
  "serde",
  "serde_json",

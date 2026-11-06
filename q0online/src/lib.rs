@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod merge;
+pub mod wire;
 pub use merge::{merge_projects, merge_projects_trusted};
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -290,7 +291,9 @@ pub enum ResourceValue {
 #[serde(deny_unknown_fields)]
 pub struct Change {
     pub key: ResourceKey,
+    #[serde(with = "wire::packed_when_big", default)]
     pub before: Option<ResourceValue>,
+    #[serde(with = "wire::packed_when_big", default)]
     pub after: Option<ResourceValue>,
 }
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -333,6 +336,7 @@ pub struct ResourceGeneration {
 pub struct RoomSnapshot {
     pub protocol_version: u32,
     pub revision: Revision,
+    #[serde(with = "wire::packed")]
     pub project: ProjectV2,
     pub members: BTreeMap<UserId, Member>,
     pub policy: RoomPolicy,
@@ -402,6 +406,7 @@ pub struct RoomState {
     #[serde(default = "state_version")]
     pub state_version: u32,
     pub owner_id: UserId,
+    #[serde(with = "wire::packed")]
     pub project: ProjectV2,
     pub revision: Revision,
     pub members: BTreeMap<UserId, Member>,
@@ -426,10 +431,14 @@ fn state_version() -> u32 {
 
 pub const MAX_PATCH_CHANGES: usize = 4096;
 pub const MAX_PATCH_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_PROJECT_BYTES: usize = 64 * 1024 * 1024;
+/// The most a room's project may hold, as plain JSON. Rooms store and send
+/// it packed (see [`wire`]), a fraction of that, so this is about how much
+/// work a room may be, not how much it moves.
+pub const MAX_PROJECT_BYTES: usize = 384 * 1024 * 1024;
 
-/// Validate references/geometry with the same format validator as the editor.
-/// A JSON round trip additionally rejects non-finite numbers from in-process callers.
+/// Validate references/geometry with the same format validator as the editor,
+/// and the size limit. Numbers that JSON cannot hold never reach a room: the
+/// server reads everything from JSON, which refuses them.
 pub fn validate_project(project: &ProjectV2) -> Result<()> {
     if project
         .runtime
@@ -444,20 +453,14 @@ pub fn validate_project(project: &ProjectV2) -> Result<()> {
         ));
     }
     v2::validate(project).map_err(|e| error(ErrorCode::InvalidProject, e.to_string()))?;
-    let bytes =
-        serde_json::to_vec(project).map_err(|e| error(ErrorCode::InvalidProject, e.to_string()))?;
-    if bytes.len() > MAX_PROJECT_BYTES {
+    // Counted, not built: this runs for every change a room takes.
+    let size = wire::json_len(project).map_err(|e| error(ErrorCode::InvalidProject, e))?;
+    if size > MAX_PROJECT_BYTES as u64 {
         return Err(error(
             ErrorCode::TooLarge,
             "project exceeds the room document limit",
         ));
     }
-    serde_json::from_slice::<ProjectV2>(&bytes).map_err(|e| {
-        error(
-            ErrorCode::InvalidProject,
-            format!("project contains invalid numeric data: {e}"),
-        )
-    })?;
     Ok(())
 }
 
@@ -1959,6 +1962,26 @@ fn canonicalize_wire_maps(value: &mut serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rooms stored before packing hold their project as plain JSON; they
+    /// must still load, and come out packed when stored again.
+    #[test]
+    fn a_room_stored_before_packing_still_loads() {
+        let state = RoomState::new(1, project()).unwrap();
+        let mut old = serde_json::to_value(&state).unwrap();
+        assert!(
+            old["project"].get(wire::PACKED_KEY).is_some(),
+            "stored packed now"
+        );
+        wire::unpack_value(&mut old, 1 << 26).unwrap();
+        assert!(
+            old["project"]["meta"].is_object(),
+            "as an older server stored it"
+        );
+        let loaded: RoomState = serde_json::from_value(old).unwrap();
+        loaded.validate_loaded().unwrap();
+        assert_eq!(loaded.project, state.project);
+    }
     use v2::LayerKind;
     use v2::{Anchor, Path, Placement, Q0rg, Rgba, Target, Transform2D, Tween, Vec2, VectorAsset};
     fn project() -> ProjectV2 {

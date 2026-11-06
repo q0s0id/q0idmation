@@ -237,6 +237,22 @@ pub fn import_library_item(
     destination: &ProjectV2,
     root: LibraryItem,
 ) -> Result<(ProjectV2, LibraryItem), String> {
+    let (mut out, root) = import_library_item_copied(source, destination, root)?;
+    // Media the destination has already is used as it is, not copied again.
+    let merged = merged_duplicate_media(&mut out);
+    let root = match root {
+        LibraryItem::Asset(id) => LibraryItem::Asset(*merged.get(&id).unwrap_or(&id)),
+        other => other,
+    };
+    Ok((out, root))
+}
+
+/// [`import_library_item`], every item copied, media too.
+fn import_library_item_copied(
+    source: &ProjectV2,
+    destination: &ProjectV2,
+    root: LibraryItem,
+) -> Result<(ProjectV2, LibraryItem), String> {
     let closure = collect_transfer_closure(source, root)?;
     let q0rg_ids = allocate_ids(destination.q0rgs.iter().map(|q| q.q0rg_id), &closure.q0rgs)?;
     let asset_ids = allocate_ids(destination.assets.iter().map(Asset::id), &closure.assets)?;
@@ -373,11 +389,108 @@ pub fn import_library_item(
 /// Give a symbol its own complete editable dependency graph. Shared references
 /// inside the copy stay shared, but none of its assets or nested symbols alias
 /// the original. Keep the copies in their source library folders.
+/// Collapse video and sound assets whose bytes are the same into one: the
+/// one with the lowest id stays and everything that used another now uses
+/// it. Media never changes once imported, so a symbol duplicated ninety
+/// times can share one clip instead of holding ninety. The `.q1s` stores
+/// shared bytes once either way, but a room's document cannot, and there
+/// ninety copies of one video were gigabytes. Returns how many went.
+pub fn merge_duplicate_media(project: &mut ProjectV2) -> usize {
+    merged_duplicate_media(project).len()
+}
+
+/// Media bytes by asset id.
+type MediaBytes = (u16, std::sync::Arc<Vec<u8>>);
+
+/// [`merge_duplicate_media`], telling which asset each removed one became.
+fn merged_duplicate_media(project: &mut ProjectV2) -> HashMap<u16, u16> {
+    use std::hash::{Hash, Hasher};
+    let mut keep_by_content: HashMap<u64, Vec<MediaBytes>> = HashMap::new();
+    let mut replace: HashMap<u16, u16> = HashMap::new();
+    let mut media: Vec<MediaBytes> = project
+        .assets
+        .iter()
+        .filter_map(|asset| match asset {
+            Asset::Q0v(video) => Some((video.asset_id, video.bytes.clone())),
+            _ => None,
+        })
+        .collect();
+    media.sort_by_key(|(id, _)| *id);
+    for (id, bytes) in media {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        bytes.len().hash(&mut hasher);
+        // The ends and a stride through the middle tell clips apart without
+        // reading all of every large one; equal ones are compared in full.
+        let step = (bytes.len() / 4096).max(1);
+        for byte in bytes.iter().step_by(step).take(8192) {
+            byte.hash(&mut hasher);
+        }
+        let bucket = keep_by_content.entry(hasher.finish()).or_default();
+        match bucket.iter().find(|(_, kept)| {
+            std::sync::Arc::ptr_eq(kept, &bytes) || kept.as_slice() == bytes.as_slice()
+        }) {
+            Some((kept_id, _)) => {
+                replace.insert(id, *kept_id);
+            }
+            None => bucket.push((id, bytes)),
+        }
+    }
+    if replace.is_empty() {
+        return replace;
+    }
+    let remap = |target: &mut Target| {
+        if let Target::Asset(id) = target {
+            if let Some(kept) = replace.get(id) {
+                *id = *kept;
+            }
+        }
+    };
+    for q0rg in &mut project.q0rgs {
+        for layer in &mut q0rg.layers {
+            for placement in &mut layer.placements {
+                remap(&mut placement.target);
+            }
+        }
+    }
+    for clip in &mut project.audio_clips {
+        if let Some(kept) = replace.get(&clip.asset_id) {
+            clip.asset_id = *kept;
+        }
+    }
+    for asset in &mut project.assets {
+        if let Asset::Rig(rig) = asset {
+            for variant in &mut rig.variants {
+                for choice in &mut variant.choices {
+                    remap(&mut choice.target);
+                }
+            }
+        }
+    }
+    for emitter in &mut project.runtime.particles.emitters {
+        if let q0s_format::particles::ParticleLook::Item(target) = &mut emitter.look {
+            remap(target);
+        }
+    }
+    project.assets.retain(
+        |asset| !matches!(asset, Asset::Q0v(video) if replace.contains_key(&video.asset_id)),
+    );
+    for id in replace.keys() {
+        project.asset_names.remove(id);
+        project.asset_appearances.remove(id);
+        project
+            .runtime
+            .library_item_folders
+            .remove(&q0s_format::v2::LibraryItemReference::Asset(*id));
+    }
+    replace
+}
+
 pub fn duplicate_symbol(project: &ProjectV2, root_id: u16) -> Result<(ProjectV2, u16), String> {
     use q0s_format::v2::LibraryItemReference;
 
     let closure = collect_transfer_closure(project, LibraryItem::Q0rg(root_id))?;
-    let (mut out, imported) = import_library_item(project, project, LibraryItem::Q0rg(root_id))?;
+    let (mut out, imported) =
+        import_library_item_copied(project, project, LibraryItem::Q0rg(root_id))?;
     let LibraryItem::Q0rg(new_root_id) = imported else {
         return Err("duplicated library item is not a symbol".to_string());
     };
@@ -425,6 +538,7 @@ pub fn duplicate_symbol(project: &ProjectV2, root_id: u16) -> Result<(ProjectV2,
                 .insert(LibraryItemReference::Asset(copied.id()), folder.clone());
         }
     }
+    merge_duplicate_media(&mut out);
     q0s_format::v2::validate(&out)
         .map_err(|error| format!("duplicated symbol is invalid: {error}"))?;
     Ok((out, new_root_id))
@@ -659,5 +773,116 @@ mod tests {
         );
         assert_eq!(imported.assets.len(), destination.assets.len() + 1);
         q0s_format::v2::validate(&imported).unwrap();
+    }
+
+    /// A real little sound, `frames` samples long.
+    fn sound(frames: u32) -> Vec<u8> {
+        let spec = q0video::q0v::Q0vSpec {
+            width: 0,
+            height: 0,
+            fps: 48_000,
+            timeline_frames: frames,
+            video: false,
+            audio: true,
+            audio_sample_rate: 48_000,
+            audio_channels: 2,
+        };
+        let mut writer =
+            q0video::q0v::Q0vWriter::new(std::io::Cursor::new(Vec::new()), spec).unwrap();
+        let pcm: Vec<i16> = (0..frames * 2).map(|i| (i % 7) as i16 * 900).collect();
+        writer.write_audio_pcm_i16(&pcm).unwrap();
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn media_project() -> ProjectV2 {
+        use q0s_format::v2::{AudioClip, Q0vAsset};
+        let mut project = crate::state::default_project();
+        let clip = std::sync::Arc::new(sound(4800));
+        // Two copies sharing the bytes, one with equal bytes of its own, and
+        // one that differs.
+        for (id, bytes) in [
+            (40, clip.clone()),
+            (41, clip.clone()),
+            (42, std::sync::Arc::new(sound(4800))),
+            (43, std::sync::Arc::new(sound(2400))),
+        ] {
+            project.assets.push(Asset::Q0v(Q0vAsset {
+                asset_id: id,
+                bytes,
+            }));
+            project.asset_names.insert(id, format!("clip {id}"));
+        }
+        let layer = &mut project.q0rgs[0].layers[0];
+        for (frame, id) in [(0, 41), (1, 42), (2, 43)] {
+            layer.placements.push(Placement {
+                pivot: None,
+                instance_id: 0,
+                frame,
+                target: Target::Asset(id),
+                transform: Transform2D::IDENTITY,
+                tween: Tween::None,
+                fx: Default::default(),
+            });
+        }
+        project.audio_clips.push(AudioClip {
+            q0rg_id: project.q0rgs[0].q0rg_id,
+            layer_id: 99,
+            start_frame: 0,
+            asset_id: 42,
+            gain: 1.0,
+            muted: false,
+            ..Default::default()
+        });
+        project
+    }
+
+    #[test]
+    fn identical_media_is_kept_once_and_every_use_follows() {
+        let mut project = media_project();
+        assert_eq!(merge_duplicate_media(&mut project), 2);
+        let ids: Vec<u16> = project
+            .assets
+            .iter()
+            .filter_map(|asset| match asset {
+                Asset::Q0v(video) => Some(video.asset_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec![40, 43]);
+        let targets: Vec<Target> = project.q0rgs[0].layers[0]
+            .placements
+            .iter()
+            .map(|placement| placement.target)
+            .collect();
+        assert_eq!(
+            targets,
+            vec![Target::Asset(40), Target::Asset(40), Target::Asset(43)]
+        );
+        assert_eq!(project.audio_clips[0].asset_id, 40);
+        assert!(!project.asset_names.contains_key(&41));
+        assert_eq!(
+            merge_duplicate_media(&mut project),
+            0,
+            "nothing left to merge"
+        );
+    }
+
+    #[test]
+    fn a_duplicated_symbol_shares_its_video() {
+        let mut project = media_project();
+        project.audio_clips.clear();
+        merge_duplicate_media(&mut project);
+        let symbol = project.q0rgs[0].q0rg_id;
+        let videos = |project: &ProjectV2| {
+            project
+                .assets
+                .iter()
+                .filter(|asset| matches!(asset, Asset::Q0v(_)))
+                .count()
+        };
+        let before = videos(&project);
+        let (duplicated, _) = duplicate_symbol(&project, symbol).unwrap();
+        assert_eq!(videos(&duplicated), before, "no second copy of the clip");
+        q0s_format::v2::validate(&duplicated).unwrap();
     }
 }

@@ -84,7 +84,7 @@ fn serialize_for_native_format(document: &Document) -> Result<Vec<u8>, String> {
 }
 
 fn serialize_q1s_v2(project: &v2::ProjectV2) -> Result<Vec<u8>, String> {
-    let bytes = v2::write(project).map_err(|error| format!("serialize q1s: {error}"))?;
+    let bytes = v2::write_packed(project).map_err(|error| format!("serialize q1s: {error}"))?;
     let parsed = v2::parse(&bytes).map_err(|error| format!("q1s parse-back: {error}"))?;
     if !v2::wire_equivalent(&parsed, project) {
         return Err("q1s parse-back changed the canonical project".to_string());

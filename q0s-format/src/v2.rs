@@ -139,6 +139,12 @@ pub const Q1S_VERSION_SHADOW_QUALITY: u16 = 43;
 /// lights, bone poses), appended after the lighting block.
 pub const Q1S_VERSION_THREE_D: u16 = 44;
 pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_THREE_D;
+/// A packed `.q1s`: not a body version but a container around one, as
+/// `.q0s` v42 is. After it come the body's own version and length, then the
+/// body, with packed paths, deflated. A tenth of the size or less for most
+/// drawings, and bitmaps shrink to almost nothing. Body versions stay below
+/// it.
+pub const Q1S_CONTAINER_PACKED: u16 = 900;
 /// Kept as an alias so external code that imported the v2-era constant keeps
 /// compiling. It now means "the current write-out version".
 pub const Q1S_V2_VERSION: u16 = Q1S_VERSION_CURRENT;
@@ -4741,6 +4747,60 @@ pub fn write(project: &ProjectV2) -> Result<Vec<u8>, Error> {
     write_with(project, false)
 }
 
+/// How hard a packed `.q1s` is deflated. Saving happens often, autosave
+/// included, so it is quick rather than smallest; drawings and bitmaps still
+/// shrink by most of their size, and media that is compressed already
+/// passes through fast.
+const Q1S_PACK_LEVEL: u8 = 3;
+
+/// `write`, packed: what a saved `.q1s` holds (see [`Q1S_CONTAINER_PACKED`]).
+/// Reads back to exactly the same project.
+pub fn write_packed(project: &ProjectV2) -> Result<Vec<u8>, Error> {
+    let body = write_with(project, true)?;
+    if body.len() < 6 {
+        return Err(Error::Validation("v2 writer returned a short buffer"));
+    }
+    let body_version = u16::from_le_bytes([body[4], body[5]]);
+    let raw = &body[6..];
+    let len = u32::try_from(raw.len()).map_err(|_| Error::Overflow("q1s body exceeds 4 GiB"))?;
+    let packed = miniz_oxide::deflate::compress_to_vec(raw, Q1S_PACK_LEVEL);
+    let mut out = Vec::with_capacity(12 + packed.len());
+    out.extend_from_slice(&Q1S_V2_MAGIC);
+    out.extend_from_slice(&Q1S_CONTAINER_PACKED.to_le_bytes());
+    out.extend_from_slice(&body_version.to_le_bytes());
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&packed);
+    Ok(out)
+}
+
+/// Inflate a packed body that says it is `len` bytes long.
+pub(crate) fn inflate_body(packed: &[u8], len: usize, offset: usize) -> Result<Vec<u8>, Error> {
+    // Deflate shrinks at most about a thousandfold, so a size past that is
+    // a lie, and is not allocated.
+    if len > packed.len().saturating_mul(1032).saturating_add(64) {
+        return Err(Error::Validation("packed body is too large"));
+    }
+    let mut body = vec![0; len];
+    let mut state =
+        miniz_oxide::inflate::stream::InflateState::new_boxed(miniz_oxide::DataFormat::Raw);
+    let result = miniz_oxide::inflate::stream::inflate(
+        &mut state,
+        packed,
+        &mut body,
+        miniz_oxide::MZFlush::Finish,
+    );
+    if result.status != Ok(miniz_oxide::MZStatus::StreamEnd) || result.bytes_written != len {
+        return Err(Error::Validation("packed body is damaged"));
+    }
+    if result.bytes_consumed != packed.len() {
+        return Err(Error::TrailingBytes {
+            offset: offset + result.bytes_consumed,
+            remaining: packed.len() - result.bytes_consumed,
+        });
+    }
+    Ok(body)
+}
+
 /// Body flag: vector paths are packed (see `write_packed_paths`).
 pub(crate) const BODY_FLAG_PACKED_PATHS: u16 = 1;
 
@@ -7049,6 +7109,17 @@ pub fn parse(bytes: &[u8]) -> Result<ProjectV2, Error> {
     }
 
     let version = c.read_u16()?;
+    if version == Q1S_CONTAINER_PACKED {
+        let body_version = c.read_u16()?;
+        if !is_known_version(body_version) {
+            return Err(Error::UnsupportedVersion(body_version));
+        }
+        let len = c.read_u32()? as usize;
+        let offset = bytes.len() - c.remaining();
+        let packed = c.read_exact(c.remaining())?;
+        let body = inflate_body(packed, len, offset)?;
+        return parse_body_bytes(&body, body_version);
+    }
     if !is_known_version(version) {
         return Err(Error::UnsupportedVersion(version));
     }

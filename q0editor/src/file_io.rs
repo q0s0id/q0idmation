@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use q0s_format::v2::{
-    parse as parse_v2, wire_equivalent, write as write_v2, ProjectV2, Q1S_V2_MAGIC,
+    parse as parse_v2, wire_equivalent, write_packed as write_v2, ProjectV2, Q1S_V2_MAGIC,
 };
 use q0s_format::{migrate_v1_to_v2, parse_q1s, Q1S_MAGIC};
 
@@ -139,6 +139,11 @@ pub fn load_project(path: &Path) -> Result<ProjectV2, FileError> {
         }
         if version == q0s_format::v2::Q1S_VERSION_AUDIO_CLIP_FX {
             crate::audio::migrate_legacy_audio_placements(&mut project);
+            q0s_format::v2::validate(&project)?;
+        }
+        // Symbols duplicated by older editors each copied their videos and
+        // sounds; they share one copy now.
+        if crate::library_transfer::merge_duplicate_media(&mut project) > 0 {
             q0s_format::v2::validate(&project)?;
         }
         Ok(project)

@@ -257,29 +257,14 @@ fn parse_packed(bytes: &[u8]) -> Result<ProjectV2, Error> {
     let len = c.read_u32()? as usize;
     let offset = bytes.len() - c.remaining();
     let packed = c.read_exact(c.remaining())?;
-    // Deflate shrinks at most about a thousandfold, so a size past that is
-    // a lie, and is not allocated.
-    if len > MAX_PACKED_BODY || len > packed.len().saturating_mul(1032).saturating_add(64) {
+    if len > MAX_PACKED_BODY {
         return Err(Error::Validation("q0s body is too large"));
     }
-    let mut body = vec![0; len];
-    let mut state =
-        miniz_oxide::inflate::stream::InflateState::new_boxed(miniz_oxide::DataFormat::Raw);
-    let result = miniz_oxide::inflate::stream::inflate(
-        &mut state,
-        packed,
-        &mut body,
-        miniz_oxide::MZFlush::Finish,
-    );
-    if result.status != Ok(miniz_oxide::MZStatus::StreamEnd) || result.bytes_written != len {
-        return Err(Error::Validation("q0s body is damaged"));
-    }
-    if result.bytes_consumed != packed.len() {
-        return Err(Error::TrailingBytes {
-            offset: offset + result.bytes_consumed,
-            remaining: packed.len() - result.bytes_consumed,
-        });
-    }
+    let body = v2::inflate_body(packed, len, offset).map_err(|error| match error {
+        Error::Validation("packed body is too large") => Error::Validation("q0s body is too large"),
+        Error::Validation("packed body is damaged") => Error::Validation("q0s body is damaged"),
+        other => other,
+    })?;
     v2::parse_body_bytes(&body, body_version)
 }
 

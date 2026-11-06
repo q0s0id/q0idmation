@@ -41,6 +41,7 @@ pub struct RoomSnapshot {
     pub name: String,
     pub owner_id: i64,
     pub revision: u64,
+    #[serde(deserialize_with = "q0online::wire::packed::deserialize")]
     pub project: ProjectV2,
     #[serde(deserialize_with = "member_list")]
     pub members: Vec<Member>,
