@@ -213,8 +213,15 @@ when tool "Spray" { ... }              # a stage tool; press, drag, release and 
 when press x, y { ... }
 when draw { ... }                      # drawing over the stage
 when key "ctrl+shift+k" { ... }
+when key "@next" { ... }               # the keys picked in the plugin's `key next` setting
 when frame n { ... }
 when setting "size" value { ... }      # a setting changed, or its button was pressed
+when action "undo" name { ... }        # after an editor command; bare `when action` hears them all
+when message "hello" data, from { ... }  # another plugin's plugin.send!
+when stage_menu "Scatter here" x, y { ... }       # items in the editor's right-click menus
+when layer_menu "Key every frame" layer { ... }
+when frame_menu "Hold 5 frames" layer, frame { ... }
+when library_menu "Place twice" item { ... }
 ```
 
 The [api reference](api.md#events) lists them all with what they pass.
@@ -288,6 +295,62 @@ when window "Brush" {
 }
 ```
 
+## reaching further
+
+Plugins work the timeline the way its buttons do, locks and all:
+
+```q0ex
+layer = editor.layer()
+layer.keyframe!(12)                 # F6
+layer.blank!(20)                    # F7
+layer.clear!(12)                    # Shift+F6
+layer.add_frames!(5, 3)             # three hold frames at frame 5
+layer.remove_frames!(5, 3)
+layer.tween!(1, "motion")           # or "shape", or "none"
+project.label!(1, "intro")
+for cell in editor.cells() {
+  print! cell.layer.name, cell.frame
+}
+```
+
+They reach drawings point by point, bring files in and put them on the stage:
+
+```q0ex
+obj = first(project.selection())
+paths = obj.paths
+for path in paths {
+  path.points = map(path.points, fn(p) { {x: p.x + random(-2, 2), y: p.y + random(-2, 2)} })
+}
+obj.paths = paths
+
+picture = file.pick("A picture to trace", ["png", "jpg"])
+if picture != null {
+  item = project.import!(picture)
+  if item != null {
+    project.place!(item, 320, 240)
+  }
+}
+```
+
+They hear what the editor does and talk to each other:
+
+```q0ex
+when action "insert-keyframe" name {
+  say! "a new keyframe"
+}
+when action name {
+  if name == "undo" {
+    plugin.send!("*", "undone", editor.frame())
+  }
+}
+when message "undone" data, from {
+  print! from, "undid something on frame", data
+}
+```
+
+`file.pick`, `file.pick_save` and `file.pick_folder` ask with the system's own dialogs. `draw.arrow!` and
+`draw.image!` join the other `draw` words.
+
 ## settings
 
 ```q0ex
@@ -300,12 +363,16 @@ settings {
   color tint "Tint" = "#ff4488"
   choice mode "Mode" = "fill" of "fill", "line", "both"
   button reset "Reset everything"
+  key toggle "Toggle key" = "ctrl+k"
   note "Changes apply right away."
 }
 ```
 
 The plugin's page shows them the way q0editor's own settings look. Code reads `config.size`, may set
 `config.size = 20`, and hears changes and button presses with `when setting "size" value`.
+
+A `key` setting is a shortcut people pick for themselves: its row on the plugin's page listens for the
+keys pressed next. `when key "@toggle"` runs whenever those keys go down.
 
 ## page markup
 
@@ -331,6 +398,9 @@ wheel to zoom. The Card, Page, Settings and Pictures tabs fill in the rest of th
 
 **Pro** is the whole file as text, with colours, line numbers and the line of a mistake marked. Typing
 part of a word offers the rest (Tab takes it), the Reference lists every word, and clicking one types it.
+It edits like a code editor: Enter keeps the indent, Backspace in an indent goes back a whole step, Tab
+and Shift+Tab shift every selected line, Ctrl+Shift+K deletes a line, Ctrl+D copies it, Alt+Up and
+Alt+Down move it and Ctrl+/ comments it out.
 
 Both edit the same file: switch whenever you like. **Run** saves the plugin and turns it on (or restarts
 it), **Save** keeps it in the plugin folder, and **Export .qx** writes a copy to share.

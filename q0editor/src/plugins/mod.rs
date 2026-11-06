@@ -205,6 +205,15 @@ struct Toast {
     born: Instant,
 }
 
+/// A message one plugin sends others with `plugin.send!`.
+pub(crate) struct Message {
+    pub from: String,
+    /// A plugin id, or `*` for every running plugin but the sender.
+    pub to: String,
+    pub name: String,
+    pub data: Value,
+}
+
 /// A plugin about to be installed, waiting for the person to agree.
 pub(crate) struct PendingInstall {
     pub plugin: Plugin,
@@ -229,6 +238,8 @@ pub(crate) struct Plugins {
     pub open_windows: HashSet<(String, String)>,
     /// Things that happened for plugins to hear about next frame.
     pending_events: Vec<(String, Vec<Value>)>,
+    /// Messages between plugins, delivered next frame.
+    pub(crate) messages: Vec<Message>,
     last_tick: Option<Instant>,
     last_frame: Option<(u16, u16)>,
     last_selection: Option<Vec<crate::state::PlacementRef>>,
@@ -634,6 +645,93 @@ fn run_handler(
     }
 }
 
+/// Runs the handlers of `event` in plugin `index` that take `word`: those
+/// quoted with it, and those quoted with nothing, which hear every one.
+fn dispatch_matching(
+    app: &mut EditorApp,
+    ctx: &Context,
+    index: usize,
+    event: &str,
+    word: &str,
+    args: Vec<Value>,
+) {
+    for (handler, arg) in app.plugins.list[index].handlers(event) {
+        if arg.as_deref().is_none_or(|arg| arg == word) {
+            run_handler(
+                app,
+                ctx,
+                index,
+                handler,
+                args.clone(),
+                BUDGET_ACTION,
+                Scene::default(),
+            );
+        }
+    }
+}
+
+/// The value of one of a plugin's settings, or its default.
+fn setting_of(app: &EditorApp, index: usize, key: &str) -> Option<Value> {
+    let plugin = app.plugins.list.get(index)?;
+    let decl = plugin.settings.iter().find(|decl| decl.key == key)?;
+    Some(
+        app.settings
+            .plugins
+            .values
+            .get(&plugin.meta.id)
+            .and_then(|values| values.get(key))
+            .map(Value::from_json)
+            .unwrap_or_else(|| manager::default_value(decl)),
+    )
+}
+
+/// Menu items plugins add to one of the editor's right-click menus
+/// (`when stage_menu "..."` and the rest). Clicking one runs it with `args`.
+pub(crate) fn menu_items(app: &mut EditorApp, ui: &mut Ui, event: &str, args: Vec<Value>) {
+    let items = app
+        .plugins
+        .list
+        .iter()
+        .filter(|plugin| plugin.running())
+        .flat_map(|plugin| {
+            plugin
+                .handlers(event)
+                .into_iter()
+                .filter_map(|(_, label)| {
+                    Some((plugin.meta.id.clone(), plugin.meta.name.clone(), label?))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        return;
+    }
+    ui.separator();
+    for (id, plugin, label) in items {
+        if ui
+            .button(&label)
+            .on_hover_text(format!("from the plugin {plugin}"))
+            .clicked()
+        {
+            let ctx = ui.ctx().clone();
+            dispatch_arg(app, &ctx, &id, event, &label, args.clone());
+            ui.close_menu();
+        }
+    }
+}
+
+/// Handles for the editor's menus to hand plugins.
+pub(crate) fn layer_value(q0rg_id: u16, layer_id: u16) -> Value {
+    host::layer_handle(q0rg_id, layer_id)
+}
+
+pub(crate) fn library_value(item: crate::state::LibraryItem) -> Value {
+    match item {
+        crate::state::LibraryItem::Asset(id) => host::asset_handle(id),
+        crate::state::LibraryItem::Q0rg(id) => host::timeline_handle(id),
+    }
+}
+
 /// Runs every handler of `event` in plugin `index`.
 fn dispatch_one(
     app: &mut EditorApp,
@@ -711,8 +809,11 @@ fn parse_chord(text: &str) -> Option<(egui::Modifiers, egui::Key)> {
             "shift" => modifiers.shift = true,
             "alt" | "option" => modifiers.alt = true,
             other => {
-                key = egui::Key::from_name(other)
-                    .or_else(|| egui::Key::from_name(&other.to_uppercase()));
+                key = egui::Key::ALL.iter().copied().find(|key| {
+                    key.name().eq_ignore_ascii_case(other)
+                        || key.symbol_or_name().eq_ignore_ascii_case(other)
+                        || format!("{key:?}").eq_ignore_ascii_case(other)
+                });
                 key?;
             }
         }
@@ -801,7 +902,38 @@ pub(crate) fn update(app: &mut EditorApp, ctx: &Context) {
     }
     let events = std::mem::take(&mut app.plugins.pending_events);
     for (event, args) in events {
-        dispatch(app, ctx, &event, args, BUDGET_ACTION);
+        if event == "action" {
+            // `when action "undo"` hears only undo; a bare `when action` all.
+            let word = args.first().map(Value::to_text).unwrap_or_default();
+            for index in 0..app.plugins.list.len() {
+                if app.plugins.list[index].running() {
+                    dispatch_matching(app, ctx, index, "action", &word, args.clone());
+                }
+            }
+        } else {
+            dispatch(app, ctx, &event, args, BUDGET_ACTION);
+        }
+    }
+    let messages = std::mem::take(&mut app.plugins.messages);
+    for message in messages {
+        for index in 0..app.plugins.list.len() {
+            let plugin = &app.plugins.list[index];
+            let addressed = if message.to == "*" {
+                plugin.meta.id != message.from
+            } else {
+                plugin.meta.id == message.to
+            };
+            if addressed && plugin.running() {
+                dispatch_matching(
+                    app,
+                    ctx,
+                    index,
+                    "message",
+                    &message.name,
+                    vec![message.data.clone(), Value::str(&message.from)],
+                );
+            }
+        }
     }
 
     // Keys, while no text field has them.
@@ -809,7 +941,13 @@ pub(crate) fn update(app: &mut EditorApp, ctx: &Context) {
         let mut hits = Vec::new();
         for (index, plugin) in app.plugins.list.iter().enumerate() {
             for (handler, arg) in plugin.handlers("key") {
-                let Some((modifiers, key)) = arg.as_deref().and_then(parse_chord) else {
+                let chord = match arg.as_deref() {
+                    Some(setting) if setting.starts_with('@') => {
+                        setting_of(app, index, &setting[1..]).map(|value| value.to_text())
+                    }
+                    other => other.map(str::to_string),
+                };
+                let Some((modifiers, key)) = chord.as_deref().and_then(parse_chord) else {
                     continue;
                 };
                 if ctx.input(|input| {
@@ -1335,6 +1473,135 @@ when menu "Draw" {
             app.plugins.list[index].error
         );
         assert_eq!(said(&app), ["Renamed by raw Plugin layer true"]);
+    }
+
+    #[test]
+    fn plugins_work_the_timeline_even_on_a_locked_layer() {
+        let (mut app, ctx, index) = editor_with(
+            r##"plugin "Frames" {
+  id = "t.frames"
+}
+when menu "Key" {
+  layer = editor.layer()
+  layer.locked = true
+  layer.keyframe!(4)
+  layer.blank!(8)
+  project.label!(4, "four")
+  say! layer.keyframes, len(project.labels())
+}
+when menu "Clear" {
+  layer = editor.layer()
+  layer.clear!(8)
+  say! layer.keyframes
+}
+"##,
+        );
+        app.session.current_frame = 9;
+        dispatch_arg(&mut app, &ctx, "t.frames", "menu", "Key", vec![]);
+        assert!(
+            app.plugins.list[index].running(),
+            "{:?}",
+            app.plugins.list[index].error
+        );
+        assert_eq!(said(&app), ["[1, 4, 8] 1"]);
+        assert_eq!(app.session.current_frame, 9, "the playhead stays put");
+        dispatch_arg(&mut app, &ctx, "t.frames", "menu", "Clear", vec![]);
+        assert_eq!(said(&app)[1], "[1, 4]");
+    }
+
+    #[test]
+    fn plugins_hear_commands_messages_their_own_keys_and_menus() {
+        let (mut app, ctx, _) = editor_with(
+            r##"plugin "Ears" {
+  id = "t.ears"
+}
+settings {
+  key go "Go" = "ctrl+shift+g"
+}
+when action "insert-keyframe" name {
+  say! "heard", name
+}
+when message "ping" data, from {
+  say! "ping", data, from
+}
+when key "@go" {
+  say! "go", config.go
+}
+when frame_menu "Mark" layer, frame {
+  say! "mark", layer.name, frame
+}
+"##,
+        );
+        let (mut other, _, _) = editor_with("plugin \"Mouth\" {\n  id = \"t.mouth\"\n}\nwhen menu \"Send\" {\n  plugin.send!(\"*\", \"ping\", 42)\n}\n");
+        // Two plugins in one editor: the second one's file joins the first.
+        let mouth = other.plugins.list.pop().unwrap();
+        app.plugins
+            .list
+            .push(Plugin::from_source(mouth.path, mouth.source));
+        let mouth = app.plugins.list.len() - 1;
+        start(&mut app, &ctx, mouth);
+
+        app.session.current_frame = 5;
+        app.handle(&ctx, Action::InsertKeyframe);
+        dispatch_arg(&mut app, &ctx, "t.mouth", "menu", "Send", vec![]);
+        update(&mut app, &ctx);
+        assert_eq!(said(&app), ["heard insert-keyframe", "ping 42 t.mouth"]);
+
+        // The key comes from the setting, and follows it when changed.
+        let ears = app.plugins.index_of("t.ears").unwrap();
+        assert_eq!(
+            setting_of(&app, ears, "go").map(|value| value.to_text()),
+            Some("ctrl+shift+g".into())
+        );
+        let chord = parse_chord("ctrl+shift+g").unwrap();
+        assert_eq!(chord.1, egui::Key::G);
+        assert_eq!(
+            parse_chord("ctrl+space").map(|chord| chord.1),
+            Some(egui::Key::Space)
+        );
+        assert_eq!(
+            parse_chord("shift+arrowright").map(|chord| chord.1),
+            Some(egui::Key::ArrowRight)
+        );
+
+        let layer = layer_value(app.session.current_q0rg_id, app.session.current_layer_id);
+        dispatch_arg(
+            &mut app,
+            &ctx,
+            "t.ears",
+            "frame_menu",
+            "Mark",
+            vec![layer, Value::Num(3.0)],
+        );
+        assert_eq!(said(&app).last().unwrap(), "mark Layer 1 3");
+    }
+
+    #[test]
+    fn a_plugin_reshapes_a_drawing_point_by_point() {
+        let (mut app, ctx, index) = editor_with(
+            r##"plugin "Points" {
+  id = "t.points"
+}
+when menu "Go" {
+  project.line! 10, 10, 110, 10, "#000000", 2
+  obj = last(project.objects())
+  paths = obj.paths
+  say! len(paths), paths[0].points
+  paths[0].points = [[10, 10], [60, 50], [110, 10]]
+  obj.paths = paths
+  say! obj.paths[0].points
+}
+"##,
+        );
+        dispatch_arg(&mut app, &ctx, "t.points", "menu", "Go", vec![]);
+        assert!(
+            app.plugins.list[index].running(),
+            "{:?}",
+            app.plugins.list[index].error
+        );
+        let said = said(&app);
+        assert_eq!(said[0], "1 [{x: 10, y: 10}, {x: 110, y: 10}]");
+        assert_eq!(said[1], "[{x: 10, y: 10}, {x: 60, y: 50}, {x: 110, y: 10}]");
     }
 
     #[test]

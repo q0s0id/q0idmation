@@ -1466,7 +1466,11 @@ fn default_arg(name: &str) -> &'static str {
         }
         "x2" | "y2" | "w" | "h" | "high" | "max" | "to" | "b" => "100",
         "r" | "width" | "px" | "size" => "10",
-        "frame" | "n" | "times" | "fps" | "zoom" | "t" | "amount" => "1",
+        "frame" | "n" | "times" | "fps" | "zoom" | "t" | "amount" | "count" => "1",
+        "kind" => "\"motion\"",
+        "kinds" => "[\"png\"]",
+        "title" => "\"Pick one\"",
+        "item" | "data" => "null",
         "color" | "fill" | "line" => "\"#9d4eff\"",
         "on" | "closed" => "true",
         "list" | "points" | "objects" | "options" => "[]",

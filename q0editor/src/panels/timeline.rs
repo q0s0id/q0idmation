@@ -6,7 +6,7 @@ use egui::{
 
 use crate::app::{Action, EditorApp, LayerDropTarget};
 use crate::hotkeys::ShortcutCommand;
-use crate::settings::Theme;
+use crate::settings::{Theme, TimelineButton};
 use crate::state::{
     CameraFrameDrag, CameraTimelineSelection, FrameLabelEdit, LayerRename, LibraryDragPayload,
     Selection, TimelineFrameDrag, TimelineLayerDrag, TimelineLayerSelection,
@@ -2752,6 +2752,9 @@ fn timeline_layer_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
                 .italics(),
         );
     }
+    let layer =
+        crate::plugins::layer_value(app.session.current_q0rg_id, app.session.current_layer_id);
+    crate::plugins::menu_items(app, ui, "layer_menu", vec![layer]);
 }
 
 fn timeline_frame_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
@@ -2813,7 +2816,7 @@ fn timeline_frame_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
     if let Some(audio) =
         crate::audio::audio_clip_at_frame(&app.state.project, q0rg_id, layer_id, zero_frame)
     {
-        let locked = app.state.project.layer_is_locked(q0rg_id, layer_id);
+        let locked = app.layer_refuses_timeline_edits(q0rg_id, layer_id);
         if ui
             .add_enabled(
                 !locked && zero_frame > audio.start_frame,
@@ -2969,6 +2972,17 @@ fn timeline_frame_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
         app.queue(Action::CreateShapeTween);
         ui.close_menu();
     }
+    let layer =
+        crate::plugins::layer_value(app.session.current_q0rg_id, app.session.current_layer_id);
+    crate::plugins::menu_items(
+        app,
+        ui,
+        "frame_menu",
+        vec![
+            layer,
+            q0ex::Value::Num(f64::from(app.session.current_frame) + 1.0),
+        ],
+    );
 }
 
 fn rig_timeline_context_menu(app: &mut EditorApp, ui: &mut Ui) {
@@ -3269,8 +3283,74 @@ fn draw_camera_spans(
     }
 }
 
+/// The bar over the timeline, in one row like Animate's: layer and frame
+/// buttons on the left, playback in the middle, the view on the right.
+/// It wraps only when the panel is too narrow for one row, and every
+/// button can be switched off from the bar's own menu.
 fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
-    ui.horizontal_wrapped(|ui| {
+    const GAP: f32 = 14.0;
+    let id = ui.id().with("timeline_bar_widths");
+    let widths: [f32; 3] = ui.data(|data| data.get_temp(id)).unwrap_or([0.0; 3]);
+    let full = ui.available_rect_before_wrap();
+    let height = crate::ui::ICON_CONTROL_SIZE + 2.0;
+    let known = widths.iter().all(|width| *width > 0.0);
+    let one_row = known && widths.iter().sum::<f32>() + GAP * 2.0 <= full.width();
+    let measured = if one_row {
+        let row = Rect::from_min_size(full.min, vec2(full.width(), height));
+        let group = |ui: &mut Ui, rect: Rect| {
+            let mut child = ui.child_ui(rect, egui::Layout::left_to_right(egui::Align::Center));
+            child.set_clip_rect(ui.clip_rect().intersect(row));
+            child
+        };
+        let mut left = group(ui, row);
+        bar_layers_and_frames(app, &mut left);
+        let left_width = left.min_rect().width();
+        let right_x = (row.right() - widths[2]).max(row.left() + left_width + GAP);
+        let mut right = group(
+            ui,
+            Rect::from_min_max(egui::pos2(right_x, row.top()), row.max),
+        );
+        bar_view(app, theme, &mut right);
+        let right_width = right.min_rect().width();
+        let center_x = (row.center().x - widths[1] / 2.0)
+            .max(row.left() + left_width + GAP)
+            .min(right_x - GAP - widths[1]);
+        let mut center = group(
+            ui,
+            Rect::from_min_max(
+                egui::pos2(center_x, row.top()),
+                egui::pos2(right_x - GAP, row.bottom()),
+            ),
+        );
+        bar_playback(app, &mut center);
+        let center_width = center.min_rect().width();
+        ui.allocate_rect(row, egui::Sense::hover());
+        [left_width, center_width, right_width]
+    } else {
+        // Too narrow, or not measured yet: the groups follow one another and
+        // wrap between groups, never inside one.
+        ui.horizontal_wrapped(|ui| {
+            let left = ui.horizontal(|ui| bar_layers_and_frames(app, ui)).response;
+            let center = ui.horizontal(|ui| bar_playback(app, ui)).response;
+            let right = ui.horizontal(|ui| bar_view(app, theme, ui)).response;
+            [left.rect.width(), center.rect.width(), right.rect.width()]
+        })
+        .inner
+    };
+    if measured != widths {
+        ui.data_mut(|data| data.insert_temp(id, measured));
+        if !known {
+            ui.ctx().request_repaint();
+        }
+    }
+}
+
+fn shows(app: &EditorApp, button: TimelineButton) -> bool {
+    app.settings.timeline_bar.shows(button)
+}
+
+fn bar_layers_and_frames(app: &mut EditorApp, ui: &mut Ui) {
+    if shows(app, TimelineButton::Camera) {
         let camera_available = app.session.current_q0rg_id == app.state.project.meta.entry_q0rg_id;
         let camera_enabled = app.state.project.runtime.camera.enabled;
         let camera_response = ui
@@ -3298,7 +3378,254 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
                 "camera track disabled".to_string()
             };
         }
+    }
+    if shows(app, TimelineButton::Delete) {
+        let selected_rig_key_exists = app
+            .session
+            .timeline_rig_key_selection
+            .filter(|selection| selection.q0rg_id == app.session.current_q0rg_id)
+            .is_some_and(|selection| {
+                crate::timeline_edit::rig_key_frames_for_layer(
+                    &app.state.project,
+                    selection.q0rg_id,
+                    selection.layer_id,
+                )
+                .contains(&selection.frame)
+            });
+        let has_selected_frame_cells = app.session.timeline_selection.is_some()
+            || app
+                .session
+                .timeline_cell_selection
+                .as_ref()
+                .is_some_and(|(_, cells)| !cells.is_empty());
+        let can_delete = selected_rig_key_exists
+            || has_selected_frame_cells
+            || (app.camera_track_is_selected()
+                && app
+                    .state
+                    .project
+                    .runtime
+                    .camera
+                    .has_keyframe(app.session.current_frame))
+            || super::menu::selection_can_be_deleted(&app.session.selection);
+        let delete_hint = if has_selected_frame_cells {
+            app.settings.hotkeys.hint(
+                ShortcutCommand::RemoveFrame,
+                "Remove selected frames from these layers",
+            )
+        } else {
+            app.settings
+                .hotkeys
+                .hint(ShortcutCommand::Delete, "Delete selection")
+        };
+        if icon_button_enabled(
+            ui,
+            can_delete,
+            if has_selected_frame_cells {
+                Icon::RemoveFrames
+            } else {
+                Icon::Delete
+            },
+            &delete_hint,
+        )
+        .clicked()
+        {
+            if has_selected_frame_cells {
+                app.queue(Action::RemoveSelectedTimelineFrames);
+            } else {
+                app.queue(Action::DeleteSelection);
+            }
+        }
+    }
+    let q0rg_id = app.session.current_q0rg_id;
+    let layer_id = app.session.current_layer_id;
+    let layer_buttons = [
+        TimelineButton::AddLayer,
+        TimelineButton::AddFolder,
+        TimelineButton::AddMask,
+        TimelineButton::LayerUp,
+        TimelineButton::LayerDown,
+        TimelineButton::Indent,
+        TimelineButton::Outdent,
+        TimelineButton::NewSymbol,
+    ];
+    if layer_buttons.iter().any(|button| shows(app, *button)) {
         ui.separator();
+    }
+    if shows(app, TimelineButton::AddLayer) && icon_button(ui, Icon::Layer, "Add layer").clicked() {
+        app.queue(Action::AddLayer);
+    }
+    if shows(app, TimelineButton::AddFolder)
+        && icon_button(ui, Icon::Folder, "Add layer folder").clicked()
+    {
+        app.queue(Action::AddLayerFolder);
+    }
+    if shows(app, TimelineButton::AddMask)
+        && icon_button(ui, Icon::Mask, "Add a mask for the selected layer").clicked()
+    {
+        app.queue(Action::AddLayerMask);
+    }
+    if shows(app, TimelineButton::LayerUp)
+        && layer_move_icon_button(ui, LayerMoveIcon::Up, "Move layer up").clicked()
+    {
+        app.queue(Action::MoveLayer(q0rg_id, layer_id, -1));
+    }
+    if shows(app, TimelineButton::LayerDown)
+        && layer_move_icon_button(ui, LayerMoveIcon::Down, "Move layer down").clicked()
+    {
+        app.queue(Action::MoveLayer(q0rg_id, layer_id, 1));
+    }
+    if shows(app, TimelineButton::Indent)
+        && layer_move_icon_button(ui, LayerMoveIcon::Indent, "Move layer into folder above")
+            .clicked()
+    {
+        app.queue(Action::IndentLayer(q0rg_id, layer_id));
+    }
+    if shows(app, TimelineButton::Outdent)
+        && layer_move_icon_button(ui, LayerMoveIcon::Outdent, "Move layer out of folder").clicked()
+    {
+        app.queue(Action::OutdentLayer(q0rg_id, layer_id));
+    }
+    if shows(app, TimelineButton::NewSymbol)
+        && icon_button(ui, Icon::Symbol, "Create q0rg symbol").clicked()
+    {
+        app.queue(Action::AddQ0rg);
+    }
+    let frame_buttons = [
+        TimelineButton::InsertFrame,
+        TimelineButton::Keyframe,
+        TimelineButton::BlankKeyframe,
+        TimelineButton::RemoveColumns,
+        TimelineButton::MotionTween,
+        TimelineButton::ShapeTween,
+    ];
+    if frame_buttons.iter().any(|button| shows(app, *button)) {
+        ui.separator();
+    }
+    let rig_track_selected = app
+        .session
+        .timeline_rig_key_selection
+        .is_some_and(|selection| selection.q0rg_id == q0rg_id)
+        && matches!(&app.session.selection, Selection::None);
+    if shows(app, TimelineButton::InsertFrame)
+        && icon_button(
+            ui,
+            Icon::Frame,
+            &app.settings
+                .hotkeys
+                .hint(ShortcutCommand::InsertFrame, "Insert hold frame"),
+        )
+        .clicked()
+    {
+        app.queue(Action::InsertFrame);
+    }
+    let keyframes_enabled = rig_track_selected
+        || app.camera_track_is_selected()
+        || app.session.timeline_selection.is_some()
+        || !app
+            .state
+            .project
+            .layer_is_folder(app.session.current_q0rg_id, app.session.current_layer_id);
+    if shows(app, TimelineButton::Keyframe)
+        && icon_button_enabled(
+            ui,
+            keyframes_enabled,
+            Icon::Keyframe,
+            &app.settings.hotkeys.hint(
+                ShortcutCommand::InsertKeyframe,
+                if rig_track_selected {
+                    "Insert or update rig key"
+                } else {
+                    "Insert keyframe"
+                },
+            ),
+        )
+        .clicked()
+    {
+        app.queue(Action::InsertKeyframe);
+    }
+    if shows(app, TimelineButton::BlankKeyframe)
+        && icon_button_enabled(
+            ui,
+            keyframes_enabled && !app.camera_track_is_selected() && !rig_track_selected,
+            Icon::BlankKeyframe,
+            &app.settings.hotkeys.hint(
+                ShortcutCommand::InsertBlankKeyframe,
+                "Insert blank keyframe",
+            ),
+        )
+        .clicked()
+    {
+        app.queue(Action::InsertBlankKeyframe);
+    }
+    if shows(app, TimelineButton::RemoveColumns)
+        && icon_button(
+            ui,
+            Icon::RemoveColumns,
+            "Remove time columns across all layers and close the gap",
+        )
+        .clicked()
+    {
+        app.queue(Action::RemoveFrame);
+    }
+    let can_tween = (app.session.timeline_selection.is_some() || app.camera_track_is_selected())
+        && app.session.pending_timeline_frame.is_none();
+    if shows(app, TimelineButton::MotionTween)
+        && icon_button_enabled(
+            ui,
+            can_tween,
+            Icon::Tween,
+            &app.settings.hotkeys.hint(
+                ShortcutCommand::MotionTween,
+                "Create motion tween between keyframes",
+            ),
+        )
+        .clicked()
+    {
+        app.queue(Action::CreateMotionTween);
+    }
+    if shows(app, TimelineButton::ShapeTween)
+        && icon_button_enabled(
+            ui,
+            can_tween && !app.camera_track_is_selected(),
+            Icon::ShapeTween,
+            &app.settings.hotkeys.hint(
+                ShortcutCommand::ShapeTween,
+                "Create shape tween: morph this keyframe's drawing into the next",
+            ),
+        )
+        .clicked()
+    {
+        app.queue(Action::CreateShapeTween);
+    }
+}
+
+fn bar_playback(app: &mut EditorApp, ui: &mut Ui) {
+    if shows(app, TimelineButton::First)
+        && icon_button(
+            ui,
+            Icon::First,
+            &app.settings
+                .hotkeys
+                .hint(ShortcutCommand::FirstFrame, "First frame"),
+        )
+        .clicked()
+    {
+        app.queue(Action::FirstFrame);
+    }
+    if shows(app, TimelineButton::Previous)
+        && icon_button(
+            ui,
+            Icon::Previous,
+            &app.settings
+                .hotkeys
+                .hint(ShortcutCommand::PreviousFrame, "Previous frame"),
+        )
+        .clicked()
+    {
+        app.queue(Action::PreviousFrame);
+    }
+    if shows(app, TimelineButton::Play) {
         let play_label = app.settings.hotkeys.hint(
             ShortcutCommand::PlaybackToggle,
             if app.session.playing { "Pause" } else { "Play" },
@@ -3317,39 +3644,9 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
         {
             app.queue(Action::TogglePlay);
         }
-        if icon_toggle(
-            ui,
-            Icon::Record,
-            "Record held objects: while on, dragging an object keys every frame (F6 keys one at a time)",
-            app.session.record_held,
-        )
-        .clicked()
-        {
-            app.session.record_held = !app.session.record_held;
-        }
-        if icon_button(
-            ui,
-            Icon::First,
-            &app.settings
-                .hotkeys
-                .hint(ShortcutCommand::FirstFrame, "First frame"),
-        )
-        .clicked()
-        {
-            app.queue(Action::FirstFrame);
-        }
-        if icon_button(
-            ui,
-            Icon::Previous,
-            &app.settings
-                .hotkeys
-                .hint(ShortcutCommand::PreviousFrame, "Previous frame"),
-        )
-        .clicked()
-        {
-            app.queue(Action::PreviousFrame);
-        }
-        if icon_button(
+    }
+    if shows(app, TimelineButton::Next)
+        && icon_button(
             ui,
             Icon::Next,
             &app.settings
@@ -3357,10 +3654,11 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
                 .hint(ShortcutCommand::NextFrame, "Next frame"),
         )
         .clicked()
-        {
-            app.queue(Action::NextFrame);
-        }
-        if icon_button(
+    {
+        app.queue(Action::NextFrame);
+    }
+    if shows(app, TimelineButton::Last)
+        && icon_button(
             ui,
             Icon::Last,
             &app.settings
@@ -3368,18 +3666,22 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
                 .hint(ShortcutCommand::LastFrame, "Last frame"),
         )
         .clicked()
-        {
-            app.queue(Action::LastFrame);
-        }
-        ui.separator();
-        let frame_count = app
-            .state
-            .project
-            .q0rgs
-            .iter()
-            .find(|q| q.q0rg_id == app.session.current_q0rg_id)
-            .map(|q| q.frame_count)
-            .unwrap_or(1);
+    {
+        app.queue(Action::LastFrame);
+    }
+    if shows(app, TimelineButton::Record)
+        && icon_toggle(
+            ui,
+            Icon::Record,
+            "Record held objects: while on, dragging an object keys every frame (F6 keys one at a time)",
+            app.session.record_held,
+        )
+        .clicked()
+    {
+        app.session.record_held = !app.session.record_held;
+    }
+    if shows(app, TimelineButton::FrameNumber) {
+        let frame_count = current_frame_count(app);
         let max = frame_count
             .saturating_add(VIRTUAL_FRAMES_BUFFER)
             .saturating_sub(1);
@@ -3397,7 +3699,23 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
             app.session
                 .set_timeline_frame((displayed_frame - 1) as u16, frame_count);
         }
-        let q0rg_id = app.session.current_q0rg_id;
+    }
+}
+
+fn current_frame_count(app: &EditorApp) -> u16 {
+    app.state
+        .project
+        .q0rgs
+        .iter()
+        .find(|q| q.q0rg_id == app.session.current_q0rg_id)
+        .map(|q| q.frame_count)
+        .unwrap_or(1)
+}
+
+fn bar_view(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
+    let frame_count = current_frame_count(app);
+    let q0rg_id = app.session.current_q0rg_id;
+    if shows(app, TimelineButton::LoopRange) {
         let mut range = app
             .session
             .preview_loop_ranges
@@ -3470,6 +3788,8 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
         if range != range_before {
             app.session.preview_loop_ranges.insert(q0rg_id, range);
         }
+    }
+    if shows(app, TimelineButton::Labels) {
         ui.menu_button("labels", |ui| {
             frame_label_context_menu(app, ui);
             let mut labels = app
@@ -3507,258 +3827,203 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
                     .color(theme.accent.to_color32()),
             );
         }
-        ui.separator();
-
-        // Onion skin: toggle (SelectableLabel highlights when on) + before/
-        // after spinners (visible only while it's on so the bar stays compact
-        // otherwise).
-        if icon_toggle(
+    }
+    // Onion skin: its before/after counts show only while it is on, so the
+    // bar stays short otherwise.
+    if shows(app, TimelineButton::Onion)
+        && icon_toggle(
             ui,
             Icon::Onion,
             "Onion skin: show neighbouring frames on the active layer",
             app.session.onion.enabled,
         )
         .clicked()
-        {
-            app.session.onion.enabled = !app.session.onion.enabled;
-            if app.session.onion.enabled {
-                crate::frame_edit::disable(app);
-            }
+    {
+        app.session.onion.enabled = !app.session.onion.enabled;
+        if app.session.onion.enabled {
+            crate::frame_edit::disable(app);
         }
-        if ui
+    }
+    if shows(app, TimelineButton::EditFrames)
+        && ui
             .selectable_label(app.session.onion.edit_frames, "Edit frames")
             .on_hover_text(
                 "Edit objects across a frame range. Drag the coloured range handles on the ruler.",
             )
             .clicked()
-        {
-            if app.session.onion.edit_frames {
-                crate::frame_edit::disable(app);
-            } else {
-                crate::frame_edit::enable(app);
-            }
+    {
+        if app.session.onion.edit_frames {
+            crate::frame_edit::disable(app);
+        } else {
+            crate::frame_edit::enable(app);
         }
-        if app.session.onion.enabled || app.session.onion.edit_frames {
-            ui.checkbox(&mut app.session.onion.all_unlocked_layers, "all unlocked")
-                .on_hover_text(
-                    "Off: onion skin only on the active layer. On: all visible, unlocked layers.",
-                );
-            ui.label(
-                egui::RichText::new("Before")
-                    .color(theme.text_dim.to_color32())
-                    .small(),
+    }
+    if app.session.onion.enabled || app.session.onion.edit_frames {
+        ui.checkbox(&mut app.session.onion.all_unlocked_layers, "all unlocked")
+            .on_hover_text(
+                "Off: onion skin only on the active layer. On: all visible, unlocked layers.",
             );
-            ui.add(
-                egui::DragValue::new(&mut app.session.onion.before)
-                    .clamp_range(0..=u16::MAX)
-                    .speed(0.1),
-            )
-            .on_hover_text("Frames to ghost before current");
-            ui.label(
-                egui::RichText::new("After")
-                    .color(theme.text_dim.to_color32())
-                    .small(),
-            );
-            ui.add(
-                egui::DragValue::new(&mut app.session.onion.after)
-                    .clamp_range(0..=u16::MAX)
-                    .speed(0.1),
-            )
-            .on_hover_text("Frames to ghost after current");
-        }
-        ui.separator();
+        ui.label(
+            egui::RichText::new("Before")
+                .color(theme.text_dim.to_color32())
+                .small(),
+        );
+        ui.add(
+            egui::DragValue::new(&mut app.session.onion.before)
+                .clamp_range(0..=u16::MAX)
+                .speed(0.1),
+        )
+        .on_hover_text("Frames to ghost before current");
+        ui.label(
+            egui::RichText::new("After")
+                .color(theme.text_dim.to_color32())
+                .small(),
+        );
+        ui.add(
+            egui::DragValue::new(&mut app.session.onion.after)
+                .clamp_range(0..=u16::MAX)
+                .speed(0.1),
+        )
+        .on_hover_text("Frames to ghost after current");
+    }
+    if shows(app, TimelineButton::Fps) {
         ui.label(
             egui::RichText::new(format!("{} fps", app.state.project.meta.fps))
                 .color(theme.text_dim.to_color32()),
         );
-    });
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().button_padding = vec2(8.0, 4.0);
-        let selected_rig_key_exists = app
-            .session
-            .timeline_rig_key_selection
-            .filter(|selection| selection.q0rg_id == app.session.current_q0rg_id)
-            .is_some_and(|selection| {
-                crate::timeline_edit::rig_key_frames_for_layer(
-                    &app.state.project,
-                    selection.q0rg_id,
-                    selection.layer_id,
-                )
-                .contains(&selection.frame)
-            });
-        let has_selected_frame_cells = app.session.timeline_selection.is_some()
-            || app
-                .session
-                .timeline_cell_selection
-                .as_ref()
-                .is_some_and(|(_, cells)| !cells.is_empty());
-        let can_delete = selected_rig_key_exists
-            || app.session.timeline_selection.is_some()
-            || app
-                .session
-                .timeline_cell_selection
-                .as_ref()
-                .is_some_and(|(_, cells)| !cells.is_empty())
-            || (app.camera_track_is_selected()
-                && app
-                    .state
-                    .project
-                    .runtime
-                    .camera
-                    .has_keyframe(app.session.current_frame))
-            || super::menu::selection_can_be_deleted(&app.session.selection);
-        let delete_hint = if has_selected_frame_cells {
-            app.settings.hotkeys.hint(
-                ShortcutCommand::RemoveFrame,
-                "Remove selected frames from these layers",
+    }
+    crate::online::timeline_people(app, ui);
+    bar_chooser(app, ui);
+}
+
+/// The bar's own menu: every button, to switch on and off.
+fn bar_chooser(app: &mut EditorApp, ui: &mut Ui) {
+    let open_id = ui.id().with("timeline_bar_chooser");
+    let mut open = ui
+        .data(|data| data.get_temp::<bool>(open_id))
+        .unwrap_or(false);
+    let button = icon_toggle(ui, Icon::Menu, "Choose the timeline's buttons", open);
+    if button.clicked() {
+        open = !open;
+    }
+    if open {
+        // The timeline usually sits at the bottom: open upward there.
+        let upward = button.rect.center().y > ui.ctx().screen_rect().center().y;
+        let (at, pivot) = if upward {
+            (
+                button.rect.right_top() - vec2(0.0, 4.0),
+                egui::Align2::RIGHT_BOTTOM,
             )
         } else {
-            app.settings
-                .hotkeys
-                .hint(ShortcutCommand::Delete, "Delete selection")
+            (
+                button.rect.right_bottom() + vec2(0.0, 4.0),
+                egui::Align2::RIGHT_TOP,
+            )
         };
-        if icon_button_enabled(
-            ui,
-            can_delete,
-            if has_selected_frame_cells {
-                Icon::RemoveFrames
-            } else {
-                Icon::Delete
-            },
-            &delete_hint,
-        )
-        .clicked()
-        {
-            if has_selected_frame_cells {
-                app.queue(Action::RemoveSelectedTimelineFrames);
-            } else {
-                app.queue(Action::DeleteSelection);
-            }
+        let area = egui::Area::new(open_id.with("area"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(at)
+            .pivot(pivot)
+            .constrain(true)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_max_width(330.0);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Timeline buttons").strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add_enabled(
+                                    !app.settings.timeline_bar.hidden.is_empty(),
+                                    egui::Button::new("Show all"),
+                                )
+                                .clicked()
+                            {
+                                app.settings.timeline_bar.hidden.clear();
+                                app.settings.save();
+                            }
+                        });
+                    });
+                    ui.label(
+                        egui::RichText::new("Click one to hide or show it on the bar.")
+                            .small()
+                            .color(ui.visuals().weak_text_color()),
+                    );
+                    ui.add_space(4.0);
+                    let groups: [&[TimelineButton]; 3] = [
+                        &TimelineButton::ALL[..16],
+                        &TimelineButton::ALL[16..23],
+                        &TimelineButton::ALL[23..],
+                    ];
+                    let mut changed = None;
+                    for group in groups {
+                        ui.horizontal_wrapped(|ui| {
+                            for button in group {
+                                let visible = app.settings.timeline_bar.shows(*button);
+                                let response = match chooser_icon(*button) {
+                                    Some(icon) => icon_toggle(ui, icon, button.label(), visible),
+                                    None => ui.selectable_label(visible, button.label()),
+                                };
+                                if response.clicked() {
+                                    changed = Some(*button);
+                                }
+                            }
+                        });
+                        ui.add_space(2.0);
+                    }
+                    if let Some(button) = changed {
+                        let hidden = &mut app.settings.timeline_bar.hidden;
+                        if !hidden.remove(&button) {
+                            hidden.insert(button);
+                        }
+                        app.settings.save();
+                    }
+                });
+            });
+        let clicked_outside = ui.input(|input| {
+            input.pointer.any_pressed()
+                && input.pointer.interact_pos().is_some_and(|pos| {
+                    !area.response.rect.contains(pos) && !button.rect.contains(pos)
+                })
+        });
+        if clicked_outside || ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+            open = false;
         }
-        ui.separator();
-        if icon_button(ui, Icon::Layer, "Add layer").clicked() {
-            app.queue(Action::AddLayer);
-        }
-        if icon_button(ui, Icon::Folder, "Add layer folder").clicked() {
-            app.queue(Action::AddLayerFolder);
-        }
-        if icon_button(ui, Icon::Mask, "Add a mask for the selected layer").clicked() {
-            app.queue(Action::AddLayerMask);
-        }
-        let q0rg_id = app.session.current_q0rg_id;
-        let layer_id = app.session.current_layer_id;
-        let rig_track_selected = app
-            .session
-            .timeline_rig_key_selection
-            .is_some_and(|selection| selection.q0rg_id == q0rg_id)
-            && matches!(&app.session.selection, Selection::None);
-        if layer_move_icon_button(ui, LayerMoveIcon::Up, "Move layer up").clicked() {
-            app.queue(Action::MoveLayer(q0rg_id, layer_id, -1));
-        }
-        if layer_move_icon_button(ui, LayerMoveIcon::Down, "Move layer down").clicked() {
-            app.queue(Action::MoveLayer(q0rg_id, layer_id, 1));
-        }
-        if layer_move_icon_button(ui, LayerMoveIcon::Indent, "Move layer into folder above")
-            .clicked()
-        {
-            app.queue(Action::IndentLayer(q0rg_id, layer_id));
-        }
-        if layer_move_icon_button(ui, LayerMoveIcon::Outdent, "Move layer out of folder").clicked()
-        {
-            app.queue(Action::OutdentLayer(q0rg_id, layer_id));
-        }
-        if icon_button(ui, Icon::Symbol, "Create q0rg symbol").clicked() {
-            app.queue(Action::AddQ0rg);
-        }
-        ui.separator();
-        if icon_button(
-            ui,
-            Icon::Frame,
-            &app.settings
-                .hotkeys
-                .hint(ShortcutCommand::InsertFrame, "Insert hold frame"),
-        )
-        .clicked()
-        {
-            app.queue(Action::InsertFrame);
-        }
-        let keyframes_enabled = rig_track_selected
-            || app.camera_track_is_selected()
-            || app.session.timeline_selection.is_some()
-            || !app
-                .state
-                .project
-                .layer_is_folder(app.session.current_q0rg_id, app.session.current_layer_id);
-        if icon_button_enabled(
-            ui,
-            keyframes_enabled,
-            Icon::Keyframe,
-            &app.settings.hotkeys.hint(
-                ShortcutCommand::InsertKeyframe,
-                if rig_track_selected {
-                    "Insert or update rig key"
-                } else {
-                    "Insert keyframe"
-                },
-            ),
-        )
-        .clicked()
-        {
-            app.queue(Action::InsertKeyframe);
-        }
-        if icon_button_enabled(
-            ui,
-            keyframes_enabled && !app.camera_track_is_selected() && !rig_track_selected,
-            Icon::BlankKeyframe,
-            &app.settings.hotkeys.hint(
-                ShortcutCommand::InsertBlankKeyframe,
-                "Insert blank keyframe",
-            ),
-        )
-        .clicked()
-        {
-            app.queue(Action::InsertBlankKeyframe);
-        }
-        if icon_button(
-            ui,
-            Icon::RemoveColumns,
-            "Remove time columns across all layers and close the gap",
-        )
-        .clicked()
-        {
-            app.queue(Action::RemoveFrame);
-        }
-        let can_tween = (app.session.timeline_selection.is_some()
-            || app.camera_track_is_selected())
-            && app.session.pending_timeline_frame.is_none();
-        if icon_button_enabled(
-            ui,
-            can_tween,
-            Icon::Tween,
-            &app.settings.hotkeys.hint(
-                ShortcutCommand::MotionTween,
-                "Create motion tween between keyframes",
-            ),
-        )
-        .clicked()
-        {
-            app.queue(Action::CreateMotionTween);
-        }
-        if icon_button_enabled(
-            ui,
-            can_tween && !app.camera_track_is_selected(),
-            Icon::ShapeTween,
-            &app.settings.hotkeys.hint(
-                ShortcutCommand::ShapeTween,
-                "Create shape tween: morph this keyframe's drawing into the next",
-            ),
-        )
-        .clicked()
-        {
-            app.queue(Action::CreateShapeTween);
-        }
-        crate::online::timeline_people(app, ui);
-    });
+    }
+    ui.data_mut(|data| data.insert_temp(open_id, open));
+}
+
+fn chooser_icon(button: TimelineButton) -> Option<Icon> {
+    Some(match button {
+        TimelineButton::Camera => Icon::Camera,
+        TimelineButton::Delete => Icon::Delete,
+        TimelineButton::AddLayer => Icon::Layer,
+        TimelineButton::AddFolder => Icon::Folder,
+        TimelineButton::AddMask => Icon::Mask,
+        TimelineButton::LayerUp => Icon::Up,
+        TimelineButton::LayerDown => Icon::Down,
+        TimelineButton::Indent => Icon::Indent,
+        TimelineButton::Outdent => Icon::Outdent,
+        TimelineButton::NewSymbol => Icon::Symbol,
+        TimelineButton::InsertFrame => Icon::Frame,
+        TimelineButton::Keyframe => Icon::Keyframe,
+        TimelineButton::BlankKeyframe => Icon::BlankKeyframe,
+        TimelineButton::RemoveColumns => Icon::RemoveColumns,
+        TimelineButton::MotionTween => Icon::Tween,
+        TimelineButton::ShapeTween => Icon::ShapeTween,
+        TimelineButton::First => Icon::First,
+        TimelineButton::Previous => Icon::Previous,
+        TimelineButton::Play => Icon::Play,
+        TimelineButton::Next => Icon::Next,
+        TimelineButton::Last => Icon::Last,
+        TimelineButton::Record => Icon::Record,
+        TimelineButton::Onion => Icon::Onion,
+        TimelineButton::FrameNumber
+        | TimelineButton::LoopRange
+        | TimelineButton::Labels
+        | TimelineButton::EditFrames
+        | TimelineButton::Fps
+        | TimelineButton::Unknown => return None,
+    })
 }
 
 fn begin_layer_rename(app: &mut EditorApp, q0rg_id: u16, layer_id: u16) {

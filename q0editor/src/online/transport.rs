@@ -12,6 +12,11 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 const MAX_RESPONSE: u64 = 128 * 1024 * 1024;
+/// The most the q0id server takes in one request.
+const MAX_REQUEST: usize = 64 * 1024 * 1024;
+/// Past this, a dropped connection is more likely the server refusing a
+/// body than the network going away.
+const BIG_REQUEST: usize = 16 * 1024 * 1024;
 const MAX_AVATAR: u64 = 2 * 1024 * 1024;
 const AVATAR_SIZE: u32 = 64;
 const AVATAR_WORKERS: usize = 3;
@@ -290,6 +295,9 @@ impl Failure {
                     .into()
             }
             (401, _) => "your q0id sign-in expired. sign in again to continue".into(),
+            (413, _) if self.message.is_empty() => {
+                "that is too big for q0id. make the project smaller and try again".into()
+            }
             (429, _) => "too many requests at once. wait a moment and try again".into(),
             (500..=599, _) => "q0id couldn’t finish that request. try again shortly".into(),
             _ if self.message.is_empty() => "the request failed".into(),
@@ -345,15 +353,41 @@ fn request_inner(
         }
         req = req.set("Authorization", &format!("Bearer {token}"));
     }
-    let response = match body.as_ref() {
-        Some(value) => req
+    let text = body.as_ref().map(Value::to_string);
+    let sent = text.as_ref().map_or(0, String::len);
+    let megabytes = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+    if sent > MAX_REQUEST {
+        // Said here: the server would only drop the connection, which
+        // looked like the network being down.
+        return Err(Failure {
+            status: 413,
+            code: "too_large".into(),
+            message: format!(
+                "this is {:.0} MB to send and q0id takes {:.0} MB at once. big videos and pictures                  are usually what makes a project this large",
+                megabytes(sent),
+                megabytes(MAX_REQUEST)
+            ),
+        });
+    }
+    let response = match text {
+        Some(text) => req
             .set("Content-Type", "application/json")
-            .send_string(&value.to_string()),
+            .send_string(&text),
         None => req.call(),
     };
     let (status, response) = match response {
         Ok(r) => (r.status(), r),
         Err(ureq::Error::Status(s, r)) => (s, r),
+        Err(e) if sent > BIG_REQUEST => {
+            return Err(Failure {
+                status: 0,
+                code: "upload_dropped".into(),
+                message: format!(
+                    "the connection dropped while sending {:.0} MB ({e}). check your connection,                      or make the project smaller",
+                    megabytes(sent)
+                ),
+            })
+        }
         Err(e) => {
             return Err(Failure {
                 status: 0,

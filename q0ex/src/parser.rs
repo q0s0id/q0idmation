@@ -377,7 +377,7 @@ impl Parser {
             let kind = SettingKind::from_word(&word).ok_or_else(|| {
                 self.error(format!(
                     "`{word}` is not a setting kind; use slider, number, toggle, text, color, \
-                     choice, button, heading or note"
+                     choice, button, key, heading or note"
                 ))
             })?;
             let key = if kind.has_key() {

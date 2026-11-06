@@ -247,10 +247,19 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
         ui.ctx().request_repaint();
     }
 
-    let scale = (fit_scale * app.session.viewport.zoom).clamp(ZOOM_MIN, fit_scale * ZOOM_MAX);
+    // The free 3D camera looks from the middle of the canvas. Seen through
+    // the 2D pan and zoom, the scene it circles sat wherever the canvas had
+    // been slid to, so turning and coming closer happened off to one side.
+    // The 2D view is kept for when the free camera is put away.
+    let (zoom, pan) = if app.session.tools3d.orbit.is_some() {
+        (1.0, egui::Vec2::ZERO)
+    } else {
+        let pan = app.session.viewport.pan;
+        (app.session.viewport.zoom, vec2(pan.x, pan.y))
+    };
+    let scale = (fit_scale * zoom).clamp(ZOOM_MIN, fit_scale * ZOOM_MAX);
     let scaled = vec2(stage_w * scale, stage_h * scale);
-    let center =
-        canvas_rect.center() + vec2(app.session.viewport.pan.x, app.session.viewport.pan.y);
+    let center = canvas_rect.center() + pan;
     let stage_rect = Rect::from_min_size(
         pos2(center.x - scaled.x * 0.5, center.y - scaled.y * 0.5),
         scaled,
@@ -879,6 +888,12 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
         }
     }
     if interactive && !editing_text {
+        if response.secondary_clicked() {
+            // Where the menu was opened, for plugins' stage menu items.
+            let at = app.session.stage_cursor;
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(egui::Id::new("stage_menu_at"), at));
+        }
         response.context_menu(|ui| stage_context_menu(app, ui));
     }
 
@@ -1860,6 +1875,18 @@ fn stage_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
                 .small(),
         );
     }
+    let at = ui
+        .ctx()
+        .data(|data| data.get_temp::<Option<q0s_format::v2::Vec2>>(egui::Id::new("stage_menu_at")))
+        .flatten()
+        .or(app.session.stage_cursor);
+    let args = at.map_or_else(Vec::new, |at| {
+        vec![
+            q0ex::Value::Num(f64::from(at.x)),
+            q0ex::Value::Num(f64::from(at.y)),
+        ]
+    });
+    crate::plugins::menu_items(app, ui, "stage_menu", args);
 }
 
 fn selected_has_stroke(app: &EditorApp) -> bool {

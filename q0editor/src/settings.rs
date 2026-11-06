@@ -1303,6 +1303,9 @@ pub struct Settings {
     pub workspace_layout: serde_json::Value,
     #[serde(default)]
     pub workspace_layout_presets: Vec<crate::workspace::LayoutPreset>,
+    /// Which buttons the timeline bar shows.
+    #[serde(default)]
+    pub timeline_bar: TimelineBar,
     /// Font name used inside the q0lang script editor. Resolved via
     /// `q0lang::fonts::resolve` at install time; if the system can't find
     /// it, falls back to bundled monospace and warns once in status.
@@ -1418,6 +1421,7 @@ impl Default for Settings {
             easing_presets: Vec::new(),
             workspace_layout: serde_json::Value::Null,
             workspace_layout_presets: Vec::new(),
+            timeline_bar: TimelineBar::default(),
             q0lang_font_name: default_q0lang_font_name(),
             q0lang_font_size: default_q0lang_font_size(),
             q0lang_show_line_numbers: default_q0lang_show_line_numbers(),
@@ -1568,6 +1572,17 @@ fn read_limited(path: &Path, max_bytes: u64, label: &str) -> std::io::Result<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeline_buttons_switched_off_survive_a_version_without_them() {
+        let bar: TimelineBar =
+            serde_json::from_str(r#"{"hidden": ["layer_up", "a_button_from_later"]}"#).unwrap();
+        assert!(!bar.shows(TimelineButton::LayerUp));
+        assert!(bar.shows(TimelineButton::Play));
+        assert!(TimelineButton::ALL
+            .iter()
+            .all(|button| *button != TimelineButton::Unknown && !button.label().is_empty()));
+    }
 
     #[test]
     fn missing_settings_fields_use_current_defaults() {
@@ -1840,5 +1855,123 @@ mod tests {
                 .count(),
             1
         );
+    }
+}
+
+/// A button on the timeline bar that can be switched off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimelineButton {
+    Camera,
+    Delete,
+    AddLayer,
+    AddFolder,
+    AddMask,
+    LayerUp,
+    LayerDown,
+    Indent,
+    Outdent,
+    NewSymbol,
+    InsertFrame,
+    Keyframe,
+    BlankKeyframe,
+    RemoveColumns,
+    MotionTween,
+    ShapeTween,
+    First,
+    Previous,
+    Play,
+    Next,
+    Last,
+    Record,
+    FrameNumber,
+    LoopRange,
+    Labels,
+    Onion,
+    EditFrames,
+    Fps,
+    /// A button a later version has and this one does not.
+    #[serde(other)]
+    Unknown,
+}
+
+impl TimelineButton {
+    /// Every button, in the order the bar shows them.
+    pub const ALL: [Self; 28] = [
+        Self::Camera,
+        Self::Delete,
+        Self::AddLayer,
+        Self::AddFolder,
+        Self::AddMask,
+        Self::LayerUp,
+        Self::LayerDown,
+        Self::Indent,
+        Self::Outdent,
+        Self::NewSymbol,
+        Self::InsertFrame,
+        Self::Keyframe,
+        Self::BlankKeyframe,
+        Self::RemoveColumns,
+        Self::MotionTween,
+        Self::ShapeTween,
+        Self::First,
+        Self::Previous,
+        Self::Play,
+        Self::Next,
+        Self::Last,
+        Self::Record,
+        Self::FrameNumber,
+        Self::LoopRange,
+        Self::Labels,
+        Self::Onion,
+        Self::EditFrames,
+        Self::Fps,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Camera => "Camera track",
+            Self::Delete => "Delete",
+            Self::AddLayer => "New layer",
+            Self::AddFolder => "New folder",
+            Self::AddMask => "New mask",
+            Self::LayerUp => "Layer up",
+            Self::LayerDown => "Layer down",
+            Self::Indent => "Into folder",
+            Self::Outdent => "Out of folder",
+            Self::NewSymbol => "New symbol",
+            Self::InsertFrame => "Insert frame",
+            Self::Keyframe => "Keyframe",
+            Self::BlankKeyframe => "Blank keyframe",
+            Self::RemoveColumns => "Remove columns",
+            Self::MotionTween => "Motion tween",
+            Self::ShapeTween => "Shape tween",
+            Self::First => "First frame",
+            Self::Previous => "Previous frame",
+            Self::Play => "Play",
+            Self::Next => "Next frame",
+            Self::Last => "Last frame",
+            Self::Record => "Record",
+            Self::FrameNumber => "Frame number",
+            Self::LoopRange => "Loop range",
+            Self::Labels => "Labels",
+            Self::Onion => "Onion skin",
+            Self::EditFrames => "Edit frames",
+            Self::Fps => "Frame rate",
+            Self::Unknown => "",
+        }
+    }
+}
+
+/// The timeline bar's buttons the person switched off.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TimelineBar {
+    pub hidden: std::collections::BTreeSet<TimelineButton>,
+}
+
+impl TimelineBar {
+    pub fn shows(&self, button: TimelineButton) -> bool {
+        !self.hidden.contains(&button)
     }
 }

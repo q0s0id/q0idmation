@@ -1037,6 +1037,12 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                                                 }
                                             }
                                         });
+                                        crate::plugins::menu_items(
+                                            app,
+                                            ui,
+                                            "library_menu",
+                                            vec![crate::plugins::library_value(payload)],
+                                        );
                                     });
                                 }
                                 if response.clicked() || response.drag_started() {

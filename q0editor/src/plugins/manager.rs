@@ -37,7 +37,7 @@ pub(crate) fn default_value(decl: &SettingDecl) -> Value {
     match decl.kind {
         SettingKind::Slider | SettingKind::Number => Value::Num(decl.min.unwrap_or(0.0)),
         SettingKind::Toggle => Value::Bool(false),
-        SettingKind::Text => Value::str(""),
+        SettingKind::Text | SettingKind::Key => Value::str(""),
         SettingKind::Color => Value::str("#ffffff"),
         SettingKind::Choice => decl
             .options
@@ -46,6 +46,80 @@ pub(crate) fn default_value(decl: &SettingDecl) -> Value {
             .unwrap_or_default(),
         SettingKind::Button | SettingKind::Heading | SettingKind::Note => Value::Null,
     }
+}
+
+/// A button showing a key chord; click it, then press the keys to use.
+/// Escape keeps the old one, Backspace or Delete clears it. Gives back the
+/// new chord when one was picked.
+pub(crate) fn key_picker(ui: &mut Ui, id: impl std::hash::Hash, chord: &str) -> Option<String> {
+    let id = ui.make_persistent_id(id);
+    let listening = ui.data(|data| data.get_temp::<bool>(id)).unwrap_or(false);
+    let label = if listening {
+        "press keys...".to_string()
+    } else if chord.is_empty() {
+        "none".to_string()
+    } else {
+        chord.to_string()
+    };
+    let response = ui
+        .add(egui::Button::new(RichText::new(label).monospace()).selected(listening))
+        .on_hover_text(
+            "Click, then press the keys. Escape keeps the old ones; Backspace clears them.",
+        );
+    if response.clicked() {
+        ui.data_mut(|data| data.insert_temp(id, !listening));
+        return None;
+    }
+    if !listening {
+        return None;
+    }
+    let mut picked = None;
+    let mut done = response.clicked_elsewhere();
+    ui.input_mut(|input| {
+        for event in &input.events {
+            let egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            done = true;
+            match key {
+                egui::Key::Escape => {}
+                egui::Key::Backspace | egui::Key::Delete if modifiers.is_none() => {
+                    picked = Some(String::new());
+                }
+                key => {
+                    let mut chord = String::new();
+                    if modifiers.command || modifiers.ctrl {
+                        chord.push_str("ctrl+");
+                    }
+                    if modifiers.alt {
+                        chord.push_str("alt+");
+                    }
+                    if modifiers.shift {
+                        chord.push_str("shift+");
+                    }
+                    chord.push_str(&key.name().to_lowercase());
+                    picked = Some(chord);
+                }
+            }
+            break;
+        }
+        if done {
+            // The keys picked are not also typed, or run as shortcuts.
+            input
+                .events
+                .retain(|event| !matches!(event, egui::Event::Key { .. } | egui::Event::Text(_)));
+        }
+    });
+    if done {
+        ui.data_mut(|data| data.insert_temp(id, false));
+    }
+    picked
 }
 
 /// An on/off switch that slides.
@@ -615,6 +689,11 @@ fn setting_row(ui: &mut Ui, decl: &SettingDecl, current: &Value, accent: Color32
                 if ui.color_edit_button_srgba(&mut color).changed() {
                     let [r, g, b, a] = color.to_srgba_unmultiplied();
                     out = Some(Value::str(q0ex::stdlib::color_text([r, g, b, a])));
+                }
+            }
+            SettingKind::Key => {
+                if let Some(chord) = key_picker(ui, ("plugin-key", &decl.key), &current.to_text()) {
+                    out = Some(Value::str(chord));
                 }
             }
             SettingKind::Choice => {

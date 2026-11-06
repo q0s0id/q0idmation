@@ -23,7 +23,13 @@ Every word a plugin can use besides the language itself. Words ending in `!` do 
 | `when selection` |  | Something else got selected. |
 | `when opened` |  | Another project or tab became the current one. |
 | `when saved` | path | The project was saved. |
-| `when key "ctrl+k"` |  | A key or chord like ctrl+shift+k, while no text field is being typed in. |
+| `when key "ctrl+k"` |  | A key or chord like ctrl+shift+k, while no text field is being typed in. "@name" takes the keys from the plugin's `key name` setting, so people can pick their own. |
+| `when action "insert-keyframe"` | name | An editor command ran: a button, a menu item, a shortcut or editor.action!. Without a quoted name it hears every command, and name says which. |
+| `when message "hello"` | data, from | Another plugin sent this one a message with plugin.send!; from is its id. |
+| `when stage_menu "Do this here"` | x, y | Adds an item to the stage's right-click menu; x, y is where it was opened. |
+| `when layer_menu "Do this to the layer"` | layer | Adds an item to a layer's right-click menu in the timeline. |
+| `when frame_menu "Do this on the frame"` | layer, frame | Adds an item to the timeline's right-click menu on frames. |
+| `when library_menu "Do this to the item"` | item | Adds an item to the library's right-click menu; item is the library item, or a symbol's timeline. |
 | `when setting "name"` | value | A setting of this plugin changed, or its button was pressed. |
 
 ## control
@@ -56,6 +62,8 @@ Every word a plugin can use besides the language itself. Words ending in `!` do 
 | `editor.width` |  | The width new lines get. → value |
 | `editor.width!` | width | Sets the width new lines get. |
 | `editor.mouse` |  | Where the pointer is on the stage, as {x, y}, or null. → value |
+| `editor.layer` |  | The layer being drawn on. → value |
+| `editor.cells` |  | The frames picked in the timeline, as {layer, frame} each. → value |
 | `editor.version` |  | q0editor's version. → value |
 | `editor.dark` |  | Whether the theme is dark. → value |
 | `editor.accent` |  | The theme's accent colour. → value |
@@ -87,6 +95,10 @@ Every word a plugin can use besides the language itself. Words ending in `!` do 
 | `project.layers` |  | The layers of the timeline being edited, top first. → value |
 | `project.layer` | name | The current layer, the one with that name, or makes a given layer current. → value |
 | `project.add_layer!` | name | Adds a layer above the current one and gives it back. |
+| `project.labels` |  | This timeline's frame labels, as {frame, name} each. → value |
+| `project.label!` | frame, name | Names a frame of this timeline; null takes the label off. |
+| `project.import!` | path | Brings a picture, sound or video into the library. Gives back a picture at once; a sound or video turns up a moment later. → value |
+| `project.place!` | item, x, y | Puts a library item or symbol on the stage, on the current layer and frame, and gives back the object. → value |
 | `project.objects` | frame | Every object on a frame (the current one when left out). → value |
 | `project.selection` |  | The selected objects. → value |
 | `project.select!` | objects | Selects objects. |
@@ -114,9 +126,16 @@ Every word a plugin can use besides the language itself. Words ending in `!` do 
 | `object.copy!` | dx, dy | Copies an object and gives the copy back. |
 | `object.remove!` |  | Deletes an object. |
 | `object.select!` |  | Selects just this object. |
+| `object.paths` |  | A drawing's lines and shapes as {points, handles, closed}, points as {x, y} in stage pixels; set it to reshape the drawing. A bare list of points is an open line. → value |
 | `layer.objects` | frame | A layer's objects on a frame. Layers also have name, kind, visible, locked, keyframes and raw. → value |
 | `layer.select!` |  | Makes a layer the current one. |
 | `layer.remove!` |  | Deletes a layer. |
+| `layer.keyframe!` | frame | Makes a keyframe there, as F6 does; locked layers take it too. |
+| `layer.blank!` | frame | Makes an empty keyframe there, as F7 does. |
+| `layer.clear!` | frame | Takes the keyframe there away, as Shift+F6 does. |
+| `layer.add_frames!` | frame, count | Holds frames there, as F5 does. |
+| `layer.remove_frames!` | frame, count | Takes frames out of this layer and closes the gap. |
+| `layer.tween!` | frame, kind | Tweens the keyframe span there: "motion", "shape" or "none". |
 | `timeline.layers` |  | A timeline's layers. Timelines also have name, frames, script and raw. → value |
 | `timeline.enter!` |  | Opens a symbol's timeline for editing. |
 
@@ -157,6 +176,8 @@ Every word a plugin can use besides the language itself. Words ending in `!` do 
 | `draw.text!` | x, y, text, color, size | Text over the stage. |
 | `draw.path!` | points, color, width | Lines through [x, y] points. |
 | `draw.poly!` | points, color | A filled convex shape. |
+| `draw.arrow!` | x1, y1, x2, y2, color, width | A line with a head at its end. |
+| `draw.image!` | blob, x, y, width | One of the plugin's pictures over the stage; width is in stage pixels. |
 
 ## math
 
@@ -238,6 +259,9 @@ Every word a plugin can use besides the language itself. Words ending in `!` do 
 | `file.folder!` | path | Makes a folder and those above it. |
 | `file.dir` |  | A folder for this plugin's files. → value |
 | `file.home` |  | Your home folder. → value |
+| `file.pick` | title, kinds | Asks for a file to open, like ["png", "jpg"]; null when nothing was picked. → value |
+| `file.pick_save` | title, kinds | Asks where to save a file; null when nothing was picked. → value |
+| `file.pick_folder` | title | Asks for a folder; null when nothing was picked. → value |
 | `settings.get` | path | One of q0editor's own settings, like theme.accent or autosave_enabled. → value |
 | `settings.set!` | path, value | Changes one of q0editor's settings. |
 | `settings.all` |  | All of q0editor's settings as data. → value |
@@ -255,6 +279,8 @@ Every word a plugin can use besides the language itself. Words ending in `!` do 
 | `plugin.open!` | title | Opens one of the plugin's windows. |
 | `plugin.close!` | title | Closes one of the plugin's windows. |
 | `plugin.tool!` | name | Makes the plugin's tool the one in use; null puts it away. |
+| `plugin.send!` | plugin, name, data | Sends a message another plugin hears with `when message`; "*" sends it to every plugin that is on. |
+| `plugin.running` |  | The ids of the plugins that are on, to send messages to. → value |
 | `plugin.blob` | name | A blob of the plugin as text. → value |
 | `config.reset!` |  | Puts every setting back to its default. |
 | `config.all` |  | Every setting as a map. → value |

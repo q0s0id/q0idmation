@@ -1,7 +1,7 @@
 //! Small, font-independent controls shared by the editor's working panels.
 use egui::{pos2, vec2, Color32, Painter, Rect, Response, Sense, Shape, Stroke, Ui};
 
-const ICON_CONTROL_SIZE: f32 = 26.0;
+pub(crate) const ICON_CONTROL_SIZE: f32 = 26.0;
 
 /// Logical screen size the editor's layout is designed never to go below.
 pub(crate) const MIN_SCREEN_SIZE: egui::Vec2 = vec2(900.0, 560.0);
@@ -215,6 +215,11 @@ pub(crate) enum Icon {
     Undo,
     Redo,
     Properties,
+    Library,
+    Tools,
+    Timeline,
+    /// Two chevrons pointing left: put everything back.
+    Expand,
 }
 
 pub(crate) fn icon_button(ui: &mut Ui, icon: Icon, label: &str) -> Response {
@@ -750,6 +755,41 @@ pub(crate) fn paint_icon(painter: &Painter, rect: Rect, icon: Icon, color: Color
                 line((0.12, y), (0.88, y));
                 painter.circle_filled(p(knob, y), rect.width() * 0.09, color);
             }
+        }
+        Icon::Library => {
+            // Three books, the last leaning on the others.
+            painter.rect_stroke(r(0.12, 0.2, 0.3, 0.86), 1.0, stroke);
+            painter.rect_stroke(r(0.36, 0.12, 0.54, 0.86), 1.0, stroke);
+            path(&[
+                (0.6, 0.3),
+                (0.76, 0.24),
+                (0.92, 0.82),
+                (0.76, 0.88),
+                (0.6, 0.3),
+            ]);
+            line((0.12, 0.34), (0.3, 0.34));
+            line((0.36, 0.26), (0.54, 0.26));
+        }
+        Icon::Tools => polygon(&[
+            (0.28, 0.1),
+            (0.28, 0.8),
+            (0.46, 0.62),
+            (0.6, 0.9),
+            (0.7, 0.85),
+            (0.56, 0.58),
+            (0.8, 0.56),
+        ]),
+        Icon::Timeline => {
+            painter.rect_stroke(r(0.08, 0.3, 0.92, 0.7), 1.0, stroke);
+            for x in [0.29, 0.5, 0.71] {
+                line((x, 0.3), (x, 0.7));
+            }
+            painter.circle_filled(p(0.185, 0.5), rect.width() * 0.07, color);
+            line((0.6, 0.1), (0.6, 0.9));
+        }
+        Icon::Expand => {
+            path(&[(0.5, 0.22), (0.22, 0.5), (0.5, 0.78)]);
+            path(&[(0.8, 0.22), (0.52, 0.5), (0.8, 0.78)]);
         }
     }
 }

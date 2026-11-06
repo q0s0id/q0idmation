@@ -785,8 +785,13 @@ pub fn render_standalone(app: &mut EditorApp, ui: &mut egui::Ui) {
     });
 }
 
-/// Editing keys behave identically for standalone, scene and frame scripts.
-pub(super) fn edit_shortcuts(
+/// Editing keys behave identically for standalone, scene and frame scripts,
+/// and in the Plugin Studio:
+/// Enter keeps the indent, Tab and Shift+Tab indent and outdent (every
+/// selected line when the selection spans lines), Backspace in a line's
+/// indent goes back a whole step, Ctrl+Shift+K deletes the line, Ctrl+D
+/// copies it, Alt+Up/Down moves it and Ctrl+/ comments it.
+pub(crate) fn edit_shortcuts(
     ctx: &Context,
     id: egui::Id,
     text: &mut String,
@@ -795,21 +800,44 @@ pub(super) fn edit_shortcuts(
     if !ctx.memory(|memory| memory.has_focus(id)) {
         return false;
     }
-    let (duplicate, comment, up, down, enter, tab, outdent_key) = ctx.input_mut(|input| {
-        (
-            input.consume_key(Modifiers::COMMAND, Key::D),
-            input.consume_key(Modifiers::COMMAND, Key::Slash),
-            input.consume_key(Modifiers::ALT, Key::ArrowUp),
-            input.consume_key(Modifiers::ALT, Key::ArrowDown),
-            input.consume_key(Modifiers::NONE, Key::Enter),
-            input.consume_key(Modifiers::NONE, Key::Tab),
-            input.consume_key(Modifiers::SHIFT, Key::Tab),
-        )
-    });
-    if !(duplicate || comment || up || down || enter || tab || outdent_key) {
+    let tab_width = tab_width.max(1);
+    let (duplicate, comment, up, down, enter, tab, outdent_key, delete_line) =
+        ctx.input_mut(|input| {
+            // egui matches keys ignoring Shift, so the Shift ones go first:
+            // a plain Tab would take Shift+Tab, and Enter Shift+Enter.
+            let shift = input.modifiers.shift;
+            let delete_line = input.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::K);
+            let outdent_key = input.consume_key(Modifiers::SHIFT, Key::Tab);
+            (
+                input.consume_key(Modifiers::COMMAND, Key::D),
+                input.consume_key(Modifiers::COMMAND, Key::Slash),
+                input.consume_key(Modifiers::ALT, Key::ArrowUp),
+                input.consume_key(Modifiers::ALT, Key::ArrowDown),
+                !shift && input.consume_key(Modifiers::NONE, Key::Enter),
+                !shift && input.consume_key(Modifiers::NONE, Key::Tab),
+                outdent_key,
+                delete_line,
+            )
+        });
+    // Backspace is only taken when it can do better than one character.
+    let backspace = !(duplicate || comment || up || down || enter || tab || outdent_key)
+        && ctx.input(|input| input.key_pressed(Key::Backspace) && input.modifiers.is_none())
+        && indent_step_before_cursor(ctx, id, text, tab_width).is_some()
+        && ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Backspace));
+    if !(duplicate
+        || comment
+        || up
+        || down
+        || enter
+        || tab
+        || outdent_key
+        || delete_line
+        || backspace)
+    {
         return false;
     }
     let before = text.clone();
+    let spans_lines = selection_spans_lines(ctx, id, text);
     if duplicate {
         duplicate_current_line(ctx, id, text);
     } else if comment {
@@ -818,12 +846,125 @@ pub(super) fn edit_shortcuts(
         move_current_line(ctx, id, text, if up { -1 } else { 1 });
     } else if enter {
         apply_auto_indent(ctx, id, text, tab_width);
+    } else if delete_line {
+        delete_current_line(ctx, id, text);
+    } else if backspace {
+        if let Some((from, to)) = indent_step_before_cursor(ctx, id, text, tab_width) {
+            let (start, end) = (char_to_byte(text, from), char_to_byte(text, to));
+            text.replace_range(start..end, "");
+            set_cursor_range(ctx, id, from, from);
+        }
+    } else if tab && spans_lines {
+        shift_selected_lines(ctx, id, text, tab_width, false);
     } else if tab {
         insert_tab(ctx, id, text, tab_width);
+    } else if spans_lines {
+        shift_selected_lines(ctx, id, text, tab_width, true);
     } else {
         outdent(ctx, id, text, tab_width);
     }
+    ctx.request_repaint();
     *text != before
+}
+
+/// The spaces Backspace takes when the cursor sits in a line's indent with
+/// nothing selected: back to the previous indent step, as code editors do.
+/// None when Backspace should just take one character.
+fn indent_step_before_cursor(
+    ctx: &Context,
+    id: egui::Id,
+    text: &str,
+    tab_width: usize,
+) -> Option<(usize, usize)> {
+    let range = TextEditState::load(ctx, id)?.cursor.char_range()?;
+    if range.primary.index != range.secondary.index {
+        return None;
+    }
+    let cursor = range.primary.index.min(text.chars().count());
+    let (line_start, _) = line_bounds_chars(text, cursor);
+    let column = cursor - line_start;
+    if column < 2
+        || !text
+            .chars()
+            .skip(line_start)
+            .take(column)
+            .all(|ch| ch == ' ')
+    {
+        return None;
+    }
+    let step = (column - 1) % tab_width + 1;
+    (step > 1).then_some((cursor - step, cursor))
+}
+
+fn selection_spans_lines(ctx: &Context, id: egui::Id, text: &str) -> bool {
+    TextEditState::load(ctx, id)
+        .and_then(|state| state.cursor.char_range())
+        .is_some_and(|range| {
+            let (a, b) = (
+                range.primary.index.min(range.secondary.index),
+                range.primary.index.max(range.secondary.index),
+            );
+            text.chars().skip(a).take(b - a).any(|ch| ch == '\n')
+        })
+}
+
+/// Indents or outdents every line the selection touches, keeping them
+/// selected.
+fn shift_selected_lines(
+    ctx: &Context,
+    id: egui::Id,
+    text: &mut String,
+    tab_width: usize,
+    outdent: bool,
+) {
+    let Some(range) = TextEditState::load(ctx, id).and_then(|state| state.cursor.char_range())
+    else {
+        return;
+    };
+    let min = range.primary.index.min(range.secondary.index);
+    let max = range.primary.index.max(range.secondary.index);
+    let (start, _) = line_bounds_chars(text, min);
+    // A selection ending at the start of a line leaves that line alone.
+    let last = if max > min && text.chars().nth(max - 1) == Some('\n') {
+        max - 1
+    } else {
+        max
+    };
+    let (_, end) = line_bounds_chars(text, last);
+    let (start_byte, end_byte) = (char_to_byte(text, start), char_to_byte(text, end));
+    let pad = " ".repeat(tab_width);
+    let shifted = text[start_byte..end_byte]
+        .split('\n')
+        .map(|line| {
+            if outdent {
+                let spaces = line.chars().take_while(|ch| *ch == ' ').count();
+                line[spaces.min(tab_width)..].to_string()
+            } else if line.trim().is_empty() {
+                line.to_string()
+            } else {
+                format!("{pad}{line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    text.replace_range(start_byte..end_byte, &shifted);
+    set_cursor_range(ctx, id, start, start + shifted.chars().count());
+}
+
+fn delete_current_line(ctx: &Context, id: egui::Id, text: &mut String) {
+    let cursor = current_cursor_index(ctx, id, text.chars().count());
+    let (start, end) = line_bounds_chars(text, cursor);
+    let total = text.chars().count();
+    // Take the line's newline too, or the one before it on the last line.
+    let (from, to) = if end < total {
+        (start, end + 1)
+    } else {
+        (start.saturating_sub(1), end)
+    };
+    let (from_byte, to_byte) = (char_to_byte(text, from), char_to_byte(text, to));
+    text.replace_range(from_byte..to_byte, "");
+    let (line_start, _) = line_bounds_chars(text, from.min(text.chars().count()));
+    set_cursor_range(ctx, id, line_start, line_start);
 }
 
 fn visible_lines(
@@ -1329,5 +1470,95 @@ fn timeline_target_label(target: &super::runtime::TimelineTarget) -> String {
     match target {
         TimelineTarget::Frame(frame) => frame.to_string(),
         TimelineTarget::Label(label) => label.clone(),
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+
+    /// Presses `key` with `modifiers` in a focused editor holding `text`,
+    /// with the cursor (or selection) at `cursor`; gives back the text and
+    /// the cursor afterwards.
+    fn press(
+        text: &str,
+        cursor: (usize, usize),
+        key: Key,
+        modifiers: Modifiers,
+    ) -> (String, (usize, usize)) {
+        let ctx = Context::default();
+        let id = egui::Id::new("key_test_editor");
+        let mut state = TextEditState::default();
+        state.cursor.set_char_range(Some(CCursorRange::two(
+            CCursor::new(cursor.0),
+            CCursor::new(cursor.1),
+        )));
+        state.store(&ctx, id);
+        ctx.begin_frame(egui::RawInput {
+            modifiers,
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        });
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        let mut text = text.to_string();
+        edit_shortcuts(&ctx, id, &mut text, 4);
+        let _ = ctx.end_frame();
+        let range = TextEditState::load(&ctx, id)
+            .and_then(|state| state.cursor.char_range())
+            .unwrap();
+        (text, (range.secondary.index, range.primary.index))
+    }
+
+    #[test]
+    fn backspace_in_an_indent_goes_back_a_whole_step() {
+        // An emptied line can be emptied for good: nothing puts the indent back.
+        let (text, cursor) = press(
+            "a {\n        \n}",
+            (12, 12),
+            Key::Backspace,
+            Modifiers::NONE,
+        );
+        assert_eq!(text, "a {\n    \n}");
+        assert_eq!(cursor, (8, 8));
+        let (text, _) = press("a {\n    \n}", (8, 8), Key::Backspace, Modifiers::NONE);
+        assert_eq!(text, "a {\n\n}");
+        // Out of the indent, Backspace is left to take one character.
+        let (text, _) = press("    ab", (6, 6), Key::Backspace, Modifiers::NONE);
+        assert_eq!(text, "    ab");
+        // Part way to a step, it goes back to the step.
+        let (text, _) = press("      x", (6, 6), Key::Backspace, Modifiers::NONE);
+        assert_eq!(text, "    x");
+    }
+
+    #[test]
+    fn tab_and_shift_tab_shift_every_selected_line() {
+        let (text, cursor) = press("a\nb\nc", (0, 3), Key::Tab, Modifiers::NONE);
+        assert_eq!(text, "    a\n    b\nc");
+        assert_eq!(cursor, (0, 11));
+        let (text, _) = press("    a\n    b\nc", (0, 11), Key::Tab, Modifiers::SHIFT);
+        assert_eq!(text, "a\nb\nc");
+    }
+
+    #[test]
+    fn ctrl_shift_k_deletes_the_line() {
+        let shortcut = Modifiers::COMMAND | Modifiers::SHIFT;
+        let (text, cursor) = press("one\ntwo\nthree", (5, 5), Key::K, shortcut);
+        assert_eq!(text, "one\nthree");
+        assert_eq!(cursor, (4, 4));
+        let (text, _) = press("one\ntwo", (6, 6), Key::K, shortcut);
+        assert_eq!(text, "one");
+    }
+
+    #[test]
+    fn enter_keeps_the_indent() {
+        let (text, cursor) = press("    if x {", (10, 10), Key::Enter, Modifiers::NONE);
+        assert_eq!(text, "    if x {\n        ");
+        assert_eq!(cursor, (19, 19));
     }
 }

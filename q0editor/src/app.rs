@@ -615,6 +615,9 @@ pub(crate) struct Q0langDocument {
     pub(crate) show_replace: bool,
 }
 
+/// Said when a room layer this editor may only watch refuses a timeline edit.
+const ROOM_READ_ONLY: &str = "you can only watch that layer in this room";
+
 enum DocumentKind {
     Project {
         workspace: Option<Box<ProjectWorkspace>>,
@@ -3227,7 +3230,11 @@ impl EditorApp {
             .map(|q| q.frame_count);
         let history_revision = self.history.snapshot_revision();
         let history_transition = matches!(&action, Action::Undo | Action::Redo);
+        let command = action.perf_label();
         self.handle_inner(ctx, action);
+        // Plugins hear every command after it ran: `when action "undo"`.
+        self.plugins
+            .notify("action", vec![q0ex::Value::str(command)]);
         if !history_transition && self.history.snapshot_revision() != history_revision {
             self.history.set_undo_pivot_state(before_pivot);
         }
@@ -3710,13 +3717,8 @@ impl EditorApp {
                             && matches!(&self.session.selection, Selection::None)
                     })
                 {
-                    if self
-                        .state
-                        .project
-                        .layer_is_locked(selection.q0rg_id, selection.layer_id)
-                    {
-                        self.session.status =
-                            "rig keys on locked layers cannot be edited".to_string();
+                    if self.layer_refuses_timeline_edits(selection.q0rg_id, selection.layer_id) {
+                        self.session.status = ROOM_READ_ONLY.to_string();
                         return;
                     }
                     let before = self.state.project.clone();
@@ -4062,12 +4064,9 @@ impl EditorApp {
             Action::MoveTimelineFrames(selection, target_layer_id, target_frame) => {
                 if self.timeline_selection_touches_locked_layer(selection)
                     || self
-                        .state
-                        .project
-                        .layer_is_locked(self.session.current_q0rg_id, target_layer_id)
+                        .layer_refuses_timeline_edits(self.session.current_q0rg_id, target_layer_id)
                 {
-                    self.session.status =
-                        "locked layers cannot be moved or overwritten".to_string();
+                    self.session.status = ROOM_READ_ONLY.to_string();
                     return;
                 }
                 self.history
@@ -4092,13 +4091,9 @@ impl EditorApp {
             }
             Action::MoveRigTimelineKey(selection, target_frame) => {
                 if selection.q0rg_id != self.session.current_q0rg_id
-                    || self
-                        .state
-                        .project
-                        .layer_is_locked(selection.q0rg_id, selection.layer_id)
+                    || self.layer_refuses_timeline_edits(selection.q0rg_id, selection.layer_id)
                 {
-                    self.session.status =
-                        "locked or inactive rig tracks cannot be moved".to_string();
+                    self.session.status = "that rig track can't be moved from here".to_string();
                     return;
                 }
                 let before = self.state.project.clone();
@@ -4941,13 +4936,8 @@ impl EditorApp {
                             && matches!(&self.session.selection, Selection::None)
                     })
                 {
-                    if self
-                        .state
-                        .project
-                        .layer_is_locked(selection.q0rg_id, selection.layer_id)
-                    {
-                        self.session.status =
-                            "rig keys on locked layers cannot be deleted".to_string();
+                    if self.layer_refuses_timeline_edits(selection.q0rg_id, selection.layer_id) {
+                        self.session.status = ROOM_READ_ONLY.to_string();
                         return;
                     }
                     let before = self.state.project.clone();
@@ -5314,7 +5304,7 @@ impl EditorApp {
                 }
                 if let Some(selection) = self.session.timeline_selection {
                     if self.timeline_selection_touches_locked_layer(selection) {
-                        self.session.status = "locked timeline frames cannot be cut".to_string();
+                        self.session.status = ROOM_READ_ONLY.to_string();
                         return;
                     }
                     let Some(frames) = crate::timeline_edit::capture_frames(
@@ -5405,10 +5395,11 @@ impl EditorApp {
                 }
                 match payload.timeline.clone() {
                     Some(TimelineClipboard::Frames(frames)) => {
-                        if self.current_layer_is_locked() || !self.current_layer_is_visible() {
-                            self.session.status =
-                                "show and unlock the target layer before pasting frames"
-                                    .to_string();
+                        if self.layer_refuses_timeline_edits(
+                            self.session.current_q0rg_id,
+                            self.session.current_layer_id,
+                        ) {
+                            self.session.status = ROOM_READ_ONLY.to_string();
                             return;
                         }
                         if self.current_layer_is_folder() {
@@ -5646,8 +5637,7 @@ impl EditorApp {
                 }
                 if let Some(selection) = self.session.timeline_selection {
                     if self.timeline_selection_touches_locked_layer(selection) {
-                        self.session.status =
-                            "locked timeline frames cannot be duplicated".to_string();
+                        self.session.status = ROOM_READ_ONLY.to_string();
                         return;
                     }
                     let before = self.state.project.clone();
@@ -6635,6 +6625,14 @@ impl EditorApp {
             .layer_is_visible(self.session.current_q0rg_id, self.session.current_layer_id)
     }
 
+    /// Whether timeline edits (keyframes, frames, tweens, moving and
+    /// deleting cells) must leave this layer alone. A lock only protects the
+    /// artwork on the stage, as in Animate; only a room layer this editor
+    /// may not edit refuses its frames too.
+    pub(crate) fn layer_refuses_timeline_edits(&self, q0rg_id: u16, layer_id: u16) -> bool {
+        q0s_format::v2::layer_is_read_only(q0rg_id, layer_id)
+    }
+
     fn timeline_selection_touches_locked_layer(&self, selection: TimelineSelection) -> bool {
         let q0rg_id = self.session.current_q0rg_id;
         let Some(q0rg) = self
@@ -6664,7 +6662,7 @@ impl EditorApp {
         let last = anchor.max(focus);
         q0rg.layers[first..=last].iter().any(|layer| {
             !self.state.project.layer_is_folder(q0rg_id, layer.layer_id)
-                && self.state.project.layer_is_locked(q0rg_id, layer.layer_id)
+                && self.layer_refuses_timeline_edits(q0rg_id, layer.layer_id)
         })
     }
 
@@ -6780,7 +6778,7 @@ impl EditorApp {
             .is_some_and(|q0rg| {
                 q0rg.layers.iter().any(|layer| {
                     !self.state.project.layer_is_folder(q0rg_id, layer.layer_id)
-                        && self.state.project.layer_is_locked(q0rg_id, layer.layer_id)
+                        && self.layer_refuses_timeline_edits(q0rg_id, layer.layer_id)
                 })
             })
     }
@@ -9298,14 +9296,14 @@ impl EditorApp {
         if end <= start || (layer_id, start, end) == (clip.layer_id, clip.start_frame, old_end) {
             return;
         }
-        let project = &self.state.project;
-        if project.layer_is_locked(q0rg_id, clip.layer_id)
-            || project.layer_is_locked(q0rg_id, layer_id)
-            || project.layer_is_folder(q0rg_id, layer_id)
+        if self.layer_refuses_timeline_edits(q0rg_id, clip.layer_id)
+            || self.layer_refuses_timeline_edits(q0rg_id, layer_id)
+            || self.state.project.layer_is_folder(q0rg_id, layer_id)
         {
-            self.session.status = "unlock the sound's layer first".to_string();
+            self.session.status = "that sound can't move there".to_string();
             return;
         }
+        let project = &self.state.project;
         let fps = u64::from(project.meta.fps.max(1));
         let rate = u64::from(crate::audio::EDITOR_AUDIO_SAMPLE_RATE);
         let samples = |frames: u16| u64::from(frames) * rate / fps;
@@ -9461,7 +9459,11 @@ impl EditorApp {
         layer_id
     }
 
-    fn place_library_item_at(&mut self, item: LibraryItem, position: q0s_format::v2::Vec2) {
+    pub(crate) fn place_library_item_at(
+        &mut self,
+        item: LibraryItem,
+        position: q0s_format::v2::Vec2,
+    ) {
         if crate::audio::library_item_is_audio_only(&self.state.project, item) {
             // A sound dropped on the stage starts at the playhead, on the
             // current layer when it has room, else on a new layer above.
@@ -9855,7 +9857,7 @@ impl EditorApp {
         }
         let selection = self.session.timeline_selection?;
         if self.timeline_selection_touches_locked_layer(selection) {
-            self.session.status = "locked timeline frames cannot be cleared".to_string();
+            self.session.status = ROOM_READ_ONLY.to_string();
             return None;
         }
         let q0rg_id = self.session.current_q0rg_id;
@@ -10055,9 +10057,9 @@ impl EditorApp {
         }
         if cells
             .iter()
-            .any(|(layer_id, _)| self.state.project.layer_is_locked(q0rg_id, *layer_id))
+            .any(|(layer_id, _)| self.layer_refuses_timeline_edits(q0rg_id, *layer_id))
         {
-            self.session.status = "unlock selected layers before removing frame cells".to_string();
+            self.session.status = ROOM_READ_ONLY.to_string();
             return;
         }
 
@@ -10143,9 +10145,9 @@ impl EditorApp {
         }
         if cells
             .iter()
-            .any(|(layer_id, _)| self.state.project.layer_is_locked(q0rg_id, *layer_id))
+            .any(|(layer_id, _)| self.layer_refuses_timeline_edits(q0rg_id, *layer_id))
         {
-            self.session.status = "locked timeline frames cannot be cleared".to_string();
+            self.session.status = ROOM_READ_ONLY.to_string();
             return None;
         }
 
@@ -10600,7 +10602,7 @@ impl EditorApp {
             return;
         };
         if self.timeline_selection_touches_locked_layer(selection) {
-            self.session.status = "locked timeline frames cannot be changed".to_string();
+            self.session.status = ROOM_READ_ONLY.to_string();
             return;
         }
         let before = self.state.project.clone();
@@ -10629,7 +10631,7 @@ impl EditorApp {
         if let Some(selection) = self.session.timeline_selection {
             if self.timeline_selection_touches_audio(selection) {
                 if self.timeline_selection_touches_locked_layer(selection) {
-                    self.session.status = "unlock selected layers before cutting audio".into();
+                    self.session.status = ROOM_READ_ONLY.into();
                     return;
                 }
                 let cells = crate::timeline_edit::selected_frame_cells_including_virtual(
@@ -11071,12 +11073,8 @@ impl EditorApp {
                 self.session.status = "folders cannot contain frames".to_string();
                 return;
             }
-            if self
-                .state
-                .project
-                .layer_is_locked(q0rg_id, fallback_layer_id)
-            {
-                self.session.status = "locked timeline frames cannot be changed".to_string();
+            if self.layer_refuses_timeline_edits(q0rg_id, fallback_layer_id) {
+                self.session.status = ROOM_READ_ONLY.to_string();
                 return;
             }
             let before = self.state.project.clone();
@@ -11157,9 +11155,9 @@ impl EditorApp {
             .collect::<std::collections::BTreeSet<_>>();
         if selected_layers
             .iter()
-            .any(|layer_id| self.state.project.layer_is_locked(q0rg_id, *layer_id))
+            .any(|layer_id| self.layer_refuses_timeline_edits(q0rg_id, *layer_id))
         {
-            self.session.status = "unlock selected layers before inserting hold frames".to_string();
+            self.session.status = ROOM_READ_ONLY.to_string();
             return;
         }
         if selected_cells.iter().any(|(layer_id, frame)| {
@@ -11219,7 +11217,7 @@ impl EditorApp {
         frame: u16,
         continue_audio: bool,
     ) -> bool {
-        if self.state.project.layer_is_locked(q0rg_id, layer_id) {
+        if self.layer_refuses_timeline_edits(q0rg_id, layer_id) {
             return false;
         }
         self.history
@@ -11479,10 +11477,9 @@ impl EditorApp {
                 .collect::<std::collections::BTreeSet<_>>();
             if selected_layers
                 .iter()
-                .any(|layer_id| self.state.project.layer_is_locked(q0rg_id, *layer_id))
+                .any(|layer_id| self.layer_refuses_timeline_edits(q0rg_id, *layer_id))
             {
-                self.session.status =
-                    "unlock selected layers before inserting keyframes".to_string();
+                self.session.status = ROOM_READ_ONLY.to_string();
                 return;
             }
 
@@ -11660,8 +11657,8 @@ impl EditorApp {
     fn insert_blank_keyframe_at(&mut self, frame: u16) -> bool {
         let q0rg_id = self.session.current_q0rg_id;
         let layer_id = self.session.current_layer_id;
-        if self.state.project.layer_is_locked(q0rg_id, layer_id) {
-            self.session.status = "layer is locked".to_string();
+        if self.layer_refuses_timeline_edits(q0rg_id, layer_id) {
+            self.session.status = ROOM_READ_ONLY.to_string();
             return false;
         }
         if crate::audio::audio_clip_at_frame(&self.state.project, q0rg_id, layer_id, frame)
@@ -11755,8 +11752,8 @@ impl EditorApp {
         let q0rg_id = self.session.current_q0rg_id;
         let layer_id = self.session.current_layer_id;
         let selection_before = self.session.selection.clone();
-        if self.state.project.layer_is_locked(q0rg_id, layer_id) {
-            self.session.status = "layer is locked".to_string();
+        if self.layer_refuses_timeline_edits(q0rg_id, layer_id) {
+            self.session.status = ROOM_READ_ONLY.to_string();
             return 0;
         }
         if crate::audio::audio_clip_at_frame(&self.state.project, q0rg_id, layer_id, frame)
@@ -11892,7 +11889,7 @@ impl EditorApp {
             TimelineSelection::single(self.session.current_layer_id, self.session.current_frame)
         });
         if self.timeline_selection_touches_locked_layer(selection) {
-            self.session.status = "locked keyframes cannot be cleared".to_string();
+            self.session.status = ROOM_READ_ONLY.to_string();
             return;
         }
         let before = self.state.project.clone();
@@ -11922,7 +11919,7 @@ impl EditorApp {
     /// the right shifts left, including blank keys and tween destinations.
     fn remove_frame(&mut self) {
         if self.current_q0rg_has_locked_artwork_layer() {
-            self.session.status = "unlock layers before removing a global frame column".to_string();
+            self.session.status = ROOM_READ_ONLY.to_string();
             return;
         }
         if self.session.pending_timeline_frame.is_some() {
@@ -11990,8 +11987,8 @@ impl EditorApp {
         });
         if self.timeline_selection_touches_locked_layer(selection) {
             self.session.tween_warning =
-                Some("Unlock the selected layer before editing its tween.".to_string());
-            self.session.status = "layer is locked".to_string();
+                Some("You can only watch this layer in this room.".to_string());
+            self.session.status = ROOM_READ_ONLY.to_string();
             return;
         }
         if self.timeline_selection_touches_audio(selection) {
@@ -13350,6 +13347,11 @@ impl EditorApp {
                     Action::CloseDocumentTab(_) | Action::Exit => {
                         if self.project_active {
                             self.state.dirty = false;
+                        } else if self.active_document_is_plugin_studio() {
+                            // The studio keeps its plugin outside the tab, so
+                            // dropping the tab alone left it unsaved and the
+                            // question came straight back.
+                            self.plugins.studio.discard();
                         } else if let Some(document) = self.active_q0lang_document_mut() {
                             document.dirty = false;
                         }
@@ -18646,13 +18648,25 @@ mod tests {
             Action::ToggleLayerLock(q0rg_id, layer_id),
         );
         assert!(app.state.project.layer_is_locked(q0rg_id, layer_id));
+        // A lock keeps the artwork safe, not the frames: keyframes still go
+        // in and out, as in Animate.
+        app.session.current_frame = 3;
+        app.handle(&Context::default(), Action::InsertBlankKeyframe);
+        assert!(app.state.project.q0rgs[0].layers[0].has_keyframe(3));
+        app.handle(&Context::default(), Action::ClearKeyframe);
+        assert!(!app.state.project.q0rgs[0].layers[0].has_keyframe(3));
+        // Only a room layer this editor may only watch refuses them.
+        q0s_format::v2::set_read_only_layers(Some(std::sync::Arc::new(
+            [(q0rg_id, layer_id)].into_iter().collect(),
+        )));
         let before = app.state.project.clone();
         app.handle(&Context::default(), Action::InsertBlankKeyframe);
+        q0s_format::v2::set_read_only_layers(None);
         assert_eq!(
             app.state.project, before,
-            "locked layer must reject frame edits"
+            "a watched room layer refuses frame edits"
         );
-        assert_eq!(app.session.status, "layer is locked");
+        assert_eq!(app.session.status, ROOM_READ_ONLY);
 
         app.handle(
             &Context::default(),

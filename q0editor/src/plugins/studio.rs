@@ -15,8 +15,11 @@ use super::api::{self, Cat};
 use super::blocks::BlockEditor;
 use crate::app::EditorApp;
 
+/// Spaces in one indent step of q0ex code.
+const PRO_INDENT: usize = 2;
+
 /// Plugins to start from, shipped with the editor.
-pub(crate) const EXAMPLES: [(&str, &str); 4] = [
+pub(crate) const EXAMPLES: [(&str, &str); 5] = [
     (
         "Hello",
         include_str!("../../../docs/q0ex/examples/hello.qx"),
@@ -33,6 +36,7 @@ pub(crate) const EXAMPLES: [(&str, &str); 4] = [
         "Scatter",
         include_str!("../../../docs/q0ex/examples/scatter.qx"),
     ),
+    ("Keys", include_str!("../../../docs/q0ex/examples/keys.qx")),
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -143,6 +147,12 @@ impl Studio {
 
     pub fn dirty(&self) -> bool {
         self.draft.as_ref().is_some_and(|draft| draft.dirty)
+    }
+
+    /// Drops the plugin being made without saving it.
+    pub fn discard(&mut self) {
+        self.draft = None;
+        self.suggestions.clear();
     }
 
     pub fn open_plugin(&mut self, id: &str) {
@@ -912,6 +922,21 @@ fn setting_details(ui: &mut Ui, decl: &mut SettingDecl, index: usize) {
                     decl.default = Some(q0ex::Expr::new(q0ex::ExprKind::Str(text), 0));
                 }
             }
+            SettingKind::Key => {
+                let chord = match decl.default.as_ref().map(|expr| &expr.kind) {
+                    Some(q0ex::ExprKind::Str(text)) => text.clone(),
+                    _ => String::new(),
+                };
+                ui.label("starts as");
+                if let Some(chord) = super::manager::key_picker(ui, ("studio-key", index), &chord) {
+                    decl.default = Some(q0ex::Expr::new(q0ex::ExprKind::Str(chord), 0));
+                }
+                ui.label(
+                    RichText::new(format!("runs `when key \"@{}\"`", decl.key))
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                );
+            }
             SettingKind::Choice => {
                 let mut options = decl
                     .options
@@ -1104,6 +1129,13 @@ fn pro(app: &mut EditorApp, ui: &mut Ui) {
             super::manager::console(ui, app, name.as_deref());
         });
     let draft = app.plugins.studio.draft.as_mut().expect("a plugin is open");
+    // The same editing keys as the q0lang editor, read before the text
+    // field sees them: Enter keeps the indent, Backspace takes a whole
+    // indent step, Tab and Shift+Tab shift lines, Ctrl+Shift+K deletes one.
+    if crate::q0lang::edit_shortcuts(&ctx, editor_id, &mut draft.text, PRO_INDENT) {
+        draft.dirty = true;
+        draft.reparse();
+    }
     let error_line = draft.error.as_ref().map(|error| error.line);
     let line_count = draft.text.lines().count().max(1) + usize::from(draft.text.ends_with('\n'));
     let row_height = ctx.fonts(|fonts| fonts.row_height(&font));
@@ -1210,7 +1242,6 @@ fn pro(app: &mut EditorApp, ui: &mut Ui) {
             });
         });
     if changed {
-        auto_indent(&ctx, editor_id, &mut draft.text);
         draft.dirty = true;
         draft.reparse();
     }
@@ -1248,50 +1279,6 @@ fn pro(app: &mut EditorApp, ui: &mut Ui) {
             }
         }
     }
-}
-
-/// After Enter, the new line starts as indented as the one above, or a
-/// step more after a `{`.
-fn auto_indent(ctx: &Context, id: egui::Id, text: &mut String) {
-    let Some(mut state) = egui::TextEdit::load_state(ctx, id) else {
-        return;
-    };
-    let Some(range) = state.cursor.char_range() else {
-        return;
-    };
-    let cursor = range.primary.index;
-    let chars = text.chars().collect::<Vec<_>>();
-    if cursor == 0 || cursor > chars.len() || chars[cursor - 1] != '\n' {
-        return;
-    }
-    // Only right after Enter: nothing typed on the new line yet.
-    if chars.get(cursor).is_some_and(|c| *c != '\n') {
-        return;
-    }
-    let line_start = chars[..cursor - 1]
-        .iter()
-        .rposition(|c| *c == '\n')
-        .map_or(0, |at| at + 1);
-    let previous: String = chars[line_start..cursor - 1].iter().collect();
-    let mut indent: String = previous.chars().take_while(|c| *c == ' ').collect();
-    if previous.trim_end().ends_with('{') {
-        indent.push_str("  ");
-    }
-    if indent.is_empty() {
-        return;
-    }
-    let at = text
-        .char_indices()
-        .nth(cursor)
-        .map_or(text.len(), |(at, _)| at);
-    text.insert_str(at, &indent);
-    let new_cursor = cursor + indent.chars().count();
-    state
-        .cursor
-        .set_char_range(Some(egui::text::CCursorRange::one(
-            egui::text::CCursor::new(new_cursor),
-        )));
-    state.store(ctx, id);
 }
 
 /// Every word, by category, searchable; clicking one types it.

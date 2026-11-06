@@ -1,0 +1,63 @@
+# Keys: timeline helpers in the right-click menus.
+plugin "Keys" {
+  id = "q0s.keys"
+  version = "1.0.0"
+  author = "q0s"
+  summary = "Keyframe every few frames, clear a run of keys, step ahead with a key you pick."
+  color = "#ffb020"
+}
+
+page ~~~
+# Keys
+Right-click frames in the timeline for **Key every few frames from here** and
+**Clear keys after here**. Right-click a layer for **Key every frame**.
+
+Press the **step key** to put a keyframe a few frames on and go there. It is
+ctrl+shift+right until you pick another on the Settings tab.
+
+Locked layers take these too: a lock keeps the artwork safe, not the frames.
+~~~
+
+settings {
+  number step "Frames between keys" = 2 from 1 to 24 step 1
+  key next "Step key" = "ctrl+shift+arrowright"
+  toggle count "Count keyframes in the console" = false
+}
+
+made = 0
+
+when frame_menu "Key every few frames from here" layer, frame {
+  n = frame
+  while n <= editor.frames() {
+    layer.keyframe!(n)
+    n += config.step
+  }
+}
+
+when frame_menu "Clear keys after here" layer, frame {
+  for key in layer.keyframes {
+    if key > frame {
+      layer.clear!(key)
+    }
+  }
+}
+
+when layer_menu "Key every frame" layer {
+  for n in range(1, editor.frames() + 1) {
+    layer.keyframe!(n)
+  }
+}
+
+when key "@next" {
+  target = editor.frame() + config.step
+  layer = editor.layer()
+  layer.keyframe!(target)
+  editor.goto!(target)
+}
+
+when action "insert-keyframe" name {
+  made += 1
+  if config.count {
+    print! "keyframes made:", made
+  }
+}

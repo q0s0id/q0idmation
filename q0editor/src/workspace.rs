@@ -34,6 +34,17 @@ impl Panel {
         Self::Properties,
     ];
 
+    fn icon(self) -> crate::ui::Icon {
+        use crate::ui::Icon;
+        match self {
+            Self::Stage => Icon::Fit,
+            Self::Tools => Icon::Tools,
+            Self::Timeline => Icon::Timeline,
+            Self::Library => Icon::Library,
+            Self::Properties => Icon::Properties,
+        }
+    }
+
     fn title(self) -> &'static str {
         match self {
             Self::Stage => "Stage",
@@ -166,6 +177,9 @@ struct SavedLayout {
     version: u8,
     main: Option<LayoutNode>,
     floating: Vec<FloatingPanel>,
+    /// Panels collapsed to the icon strip, top first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    icons: Vec<Panel>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -196,6 +210,11 @@ impl SavedLayout {
         if layout.version != 1 || layout.floating.len() > MAX_PANEL_TABS {
             return None;
         }
+        let mut layout = layout;
+        let mut seen = HashSet::new();
+        layout
+            .icons
+            .retain(|panel| *panel != Panel::Stage && seen.insert(*panel));
         let mut count = 0;
         if let Some(node) = &layout.main {
             if !node.valid(0, &mut count) {
@@ -360,6 +379,10 @@ pub(crate) struct WorkspaceLayout {
     stage_views: HashMap<(u64, u64), StagePaneState>,
     panel_views: HashMap<(u64, u64), PanelViewState>,
     active_stage: Option<u64>,
+    /// Panels collapsed to the icon strip at the workspace's right edge.
+    icons: Vec<Panel>,
+    /// The collapsed panel open beside the strip.
+    flyout: Option<Panel>,
 }
 
 impl Default for WorkspaceLayout {
@@ -377,6 +400,8 @@ impl Default for WorkspaceLayout {
             stage_views: HashMap::new(),
             panel_views: HashMap::new(),
             active_stage: None,
+            icons: Vec::new(),
+            flyout: None,
         }
     }
 }
@@ -391,12 +416,18 @@ impl WorkspaceLayout {
         self.stage_views.clear();
         self.panel_views.clear();
         self.active_stage = None;
+        self.icons.clear();
+        self.flyout = None;
     }
 
     pub(crate) fn from_settings(settings: &Settings) -> Self {
         let saved = SavedLayout::decode(&settings.workspace_layout);
         Self {
             dock: saved.as_ref().map_or_else(default_dock, SavedLayout::dock),
+            icons: saved
+                .as_ref()
+                .map(|saved| saved.icons.clone())
+                .unwrap_or_default(),
             last_observed: saved,
             restore_windows: true,
             ..Self::default()
@@ -449,7 +480,41 @@ impl WorkspaceLayout {
         self.changed_at = Some(Instant::now());
     }
 
+    /// Whether a panel is anywhere: docked, floating or on the icon strip.
+    fn shown(&self, panel: Panel) -> bool {
+        self.find_panel(panel).is_some() || self.icons.contains(&panel)
+    }
+
+    /// Takes a panel out of the dock and onto the icon strip, as Animate
+    /// collapses panels to icons. Its place is remembered for docking again.
+    fn collapse_to_icon(&mut self, panel: Panel) {
+        if panel == Panel::Stage || self.icons.contains(&panel) {
+            return;
+        }
+        if self.find_panel(panel).is_some() {
+            self.toggle(panel);
+        }
+        self.icons.push(panel);
+        self.changed_at = Some(Instant::now());
+    }
+
+    /// Puts a collapsed panel back where it was docked.
+    fn dock_icon(&mut self, panel: Panel) {
+        self.icons.retain(|other| *other != panel);
+        if self.flyout == Some(panel) {
+            self.flyout = None;
+        }
+        if self.find_panel(panel).is_none() {
+            self.toggle(panel);
+        }
+        self.changed_at = Some(Instant::now());
+    }
+
     pub(crate) fn toggle(&mut self, panel: Panel) {
+        if self.icons.contains(&panel) {
+            self.dock_icon(panel);
+            return;
+        }
         if let Some(location) = self.find_panel(panel) {
             let before = self.dock.clone();
             self.dock.remove_tab(location);
@@ -534,11 +599,14 @@ impl WorkspaceLayout {
             version: 1,
             main: LayoutNode::capture(self.dock.main_surface(), NodeIndex::root()),
             floating,
+            icons: self.icons.clone(),
         }
     }
 
     fn apply(&mut self, saved: &SavedLayout) {
         self.dock = saved.dock();
+        self.icons.clone_from(&saved.icons);
+        self.flyout = None;
         self.last_observed = None;
         self.restore_windows = true;
         self.changed_at = Some(Instant::now());
@@ -658,6 +726,7 @@ struct Viewer<'a> {
     edge_command: Option<(PanelTab, Split)>,
     edge_preview: Option<Split>,
     duplicate: Option<PanelTab>,
+    collapse: Option<Panel>,
     stage_views: &'a mut HashMap<(u64, u64), StagePaneState>,
     panel_views: &'a mut HashMap<(u64, u64), PanelViewState>,
     active_stage: &'a mut Option<u64>,
@@ -707,6 +776,15 @@ impl TabViewer for Viewer<'_> {
     fn context_menu(&mut self, ui: &mut Ui, tab: &mut PanelTab, _: SurfaceIndex, _: NodeIndex) {
         if ui.button("duplicate panel").clicked() {
             self.duplicate = Some(*tab);
+            ui.close_menu();
+        }
+        if tab.panel != Panel::Stage
+            && ui
+                .button("Collapse to icon")
+                .on_hover_text("Keep it as an icon at the right edge; click the icon to open it")
+                .clicked()
+        {
+            self.collapse = Some(tab.panel);
             ui.close_menu();
         }
         ui.menu_button("Dock to workspace edge", |ui| {
@@ -840,7 +918,12 @@ pub(crate) fn render(app: &mut EditorApp, ctx: &Context) {
     egui::CentralPanel::default()
         .frame(egui::Frame::none())
         .show(ctx, |ui| {
-            let bounds = ui.available_rect_before_wrap();
+            let full = ui.available_rect_before_wrap();
+            let mut bounds = full;
+            let strip = (!workspace.icons.is_empty()).then(|| {
+                bounds.max.x -= ICON_STRIP_WIDTH;
+                Rect::from_min_max(egui::pos2(bounds.right(), full.top()), full.max)
+            });
             workspace.restore_window_bounds(bounds);
             if let Some(active) = workspace.active_stage {
                 workspace.stage_views.insert(
@@ -886,6 +969,7 @@ pub(crate) fn render(app: &mut EditorApp, ctx: &Context) {
                 edge_command: None,
                 edge_preview: None,
                 duplicate: None,
+                collapse: None,
                 stage_views: &mut workspace.stage_views,
                 panel_views: &mut workspace.panel_views,
                 active_stage: &mut workspace.active_stage,
@@ -896,13 +980,15 @@ pub(crate) fn render(app: &mut EditorApp, ctx: &Context) {
             ui.spacing_mut().window_margin = egui::Margin::ZERO;
             ui.visuals_mut().window_stroke = egui::Stroke::NONE;
             ui.visuals_mut().window_rounding = egui::Rounding::ZERO;
+            let mut dock_ui = ui.child_ui(bounds, *ui.layout());
             DockArea::new(&mut workspace.dock)
                 .id(Id::new("editor_workspace"))
                 .style(style)
                 .window_bounds(bounds)
                 .show_window_close_buttons(false)
                 .show_window_collapse_buttons(false)
-                .show_inside(ui, &mut viewer);
+                .show_inside(&mut dock_ui, &mut viewer);
+            let collapse = viewer.collapse.take();
             if let Some(split) = viewer.edge_preview {
                 let mut preview = bounds;
                 match split {
@@ -963,9 +1049,187 @@ pub(crate) fn render(app: &mut EditorApp, ctx: &Context) {
             if let Some(tab) = duplicate {
                 workspace.new_panel(tab.panel, Some(tab));
             }
+            if let Some(strip) = strip {
+                icon_strip(app, ui, &mut workspace, strip, full);
+            }
+            if let Some(panel) = collapse {
+                workspace.collapse_to_icon(panel);
+            }
+            ui.advance_cursor_after_rect(full);
         });
     app.workspace_layout = workspace;
 }
+
+const ICON_STRIP_WIDTH: f32 = 36.0;
+
+/// The column of collapsed panels at the workspace's right edge, and the one
+/// open beside it. A click on an icon opens or closes its panel; a click
+/// anywhere else closes it again, as in Animate.
+fn icon_strip(
+    app: &mut EditorApp,
+    ui: &mut Ui,
+    workspace: &mut WorkspaceLayout,
+    strip: Rect,
+    full: Rect,
+) {
+    ui.painter()
+        .rect_filled(strip, 0.0, ui.visuals().panel_fill);
+    ui.painter().line_segment(
+        [strip.left_top(), strip.left_bottom()],
+        egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
+    );
+    let mut column = ui.child_ui(
+        strip.shrink2(egui::vec2(4.0, 4.0)),
+        egui::Layout::top_down(egui::Align::Center),
+    );
+    let mut dock_all = false;
+    let mut dock_one = None;
+    let mut toggled = None;
+    let mut flyout_anchor = None;
+    if crate::ui::sized_icon_button(
+        &mut column,
+        crate::ui::Icon::Expand,
+        "Put these panels back in the dock",
+        22.0,
+    )
+    .clicked()
+    {
+        dock_all = true;
+    }
+    column.add_space(4.0);
+    for panel in workspace.icons.clone() {
+        let open = workspace.flyout == Some(panel);
+        let response =
+            crate::ui::sized_icon_toggle(&mut column, panel.icon(), panel.title(), open, 28.0);
+        if response.clicked() {
+            toggled = Some(panel);
+        }
+        if open {
+            flyout_anchor = Some(response.rect);
+        }
+        response.context_menu(|ui| {
+            if ui.button("Dock again").clicked() {
+                dock_one = Some(panel);
+                ui.close_menu();
+            }
+        });
+    }
+    if let Some(panel) = toggled {
+        workspace.flyout = (workspace.flyout != Some(panel)).then_some(panel);
+        flyout_anchor = None;
+    }
+    if let (Some(panel), Some(anchor)) = (workspace.flyout, flyout_anchor) {
+        flyout(app, ui.ctx(), workspace, panel, anchor, strip, full);
+    }
+    if dock_all {
+        for panel in workspace.icons.clone() {
+            workspace.dock_icon(panel);
+        }
+    } else if let Some(panel) = dock_one {
+        workspace.dock_icon(panel);
+    }
+}
+
+/// A collapsed panel, open beside its icon.
+fn flyout(
+    app: &mut EditorApp,
+    ctx: &Context,
+    workspace: &mut WorkspaceLayout,
+    panel: Panel,
+    anchor: Rect,
+    strip: Rect,
+    full: Rect,
+) {
+    let size_id = Id::new(("workspace_flyout_size", panel as u8));
+    let default = match panel {
+        Panel::Timeline => egui::vec2(full.width() * 0.75, 280.0),
+        Panel::Tools => egui::vec2(96.0, full.height() * 0.7),
+        _ => egui::vec2(310.0, full.height() * 0.8),
+    };
+    let size = ctx
+        .data(|data| data.get_temp::<egui::Vec2>(size_id))
+        .unwrap_or(default)
+        .min(full.size() - egui::vec2(ICON_STRIP_WIDTH + 8.0, 0.0))
+        .max(egui::vec2(80.0, 120.0));
+    let top = anchor.top().min(full.bottom() - size.y).max(full.top());
+    let right_top = egui::pos2(strip.left() - 2.0, top);
+    let rect = Rect::from_min_size(right_top - egui::vec2(size.x, 0.0), size);
+    let area = egui::Area::new(Id::new("workspace_flyout"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(rect.min)
+        .show(ctx, |ui| {
+            egui::Frame::window(ui.style())
+                .inner_margin(egui::Margin::same(4.0))
+                .show(ui, |ui| {
+                    let inner = size - egui::vec2(8.0, 8.0);
+                    ui.set_min_size(inner);
+                    ui.set_max_size(inner);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(panel.title()).strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if crate::ui::icon_button(ui, crate::ui::Icon::Close, "Close").clicked()
+                            {
+                                workspace.flyout = None;
+                            }
+                            if ui
+                                .small_button("Dock")
+                                .on_hover_text("Put this panel back in the dock")
+                                .clicked()
+                            {
+                                workspace.dock_icon(panel);
+                            }
+                        });
+                    });
+                    ui.separator();
+                    let mut viewer = Viewer {
+                        app: &mut *app,
+                        bounds: full,
+                        edge_command: None,
+                        edge_preview: None,
+                        duplicate: None,
+                        collapse: None,
+                        stage_views: &mut workspace.stage_views,
+                        panel_views: &mut workspace.panel_views,
+                        active_stage: &mut workspace.active_stage,
+                    };
+                    // A tab of its own, so its scroll and search stay its own.
+                    let mut tab = PanelTab {
+                        panel,
+                        id: FLYOUT_TAB_ID + panel as u64,
+                    };
+                    viewer.panel_ui(ui, &mut tab);
+                });
+            // The left edge widens and narrows it.
+            let edge = Rect::from_min_max(
+                rect.left_top(),
+                egui::pos2(rect.left() + 5.0, rect.bottom()),
+            );
+            let handle = ui.interact(edge, Id::new("workspace_flyout_edge"), egui::Sense::drag());
+            if handle.hovered() || handle.dragged() {
+                ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            }
+            if handle.dragged() {
+                let wider = size + egui::vec2(-handle.drag_delta().x, 0.0);
+                ctx.data_mut(|data| data.insert_temp(size_id, wider));
+            }
+        });
+    let pressed_outside = ctx.input(|input| {
+        input.pointer.any_pressed()
+            && input
+                .pointer
+                .interact_pos()
+                .is_some_and(|pos| !area.response.rect.contains(pos) && !strip.contains(pos))
+    });
+    // A menu or drop-down opened from the panel lives outside its rect.
+    let menu_open =
+        ctx.memory(|memory| memory.any_popup_open()) || egui::DragAndDrop::has_any_payload(ctx);
+    if pressed_outside && !menu_open {
+        workspace.flyout = None;
+    }
+}
+
+/// Ids of the panels open beside the icon strip, far from docked tabs' ids.
+const FLYOUT_TAB_ID: u64 = 1 << 40;
 
 pub(crate) fn persist(app: &mut EditorApp, ctx: &Context) {
     let mut workspace = std::mem::take(&mut app.workspace_layout);
@@ -1020,7 +1284,7 @@ pub(crate) fn render_menu(app: &mut EditorApp, ui: &mut Ui) {
         });
         ui.weak("Panels");
         for panel in Panel::ALL {
-            let mut visible = workspace.find_panel(panel).is_some();
+            let mut visible = workspace.shown(panel);
             if ui.checkbox(&mut visible, panel.title()).changed() {
                 workspace.toggle(panel);
             }
@@ -1194,6 +1458,36 @@ pub(crate) fn sanitize_presets(presets: &mut Vec<LayoutPreset>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panels_collapse_to_icons_and_dock_back_where_they_were() {
+        let mut workspace = WorkspaceLayout::default();
+        let docked = topology(&workspace.dock);
+        workspace.collapse_to_icon(Panel::Library);
+        workspace.collapse_to_icon(Panel::Properties);
+        assert!(workspace.find_panel(Panel::Library).is_none());
+        assert_eq!(workspace.icons, vec![Panel::Library, Panel::Properties]);
+        assert!(
+            workspace.shown(Panel::Library),
+            "the Layout menu still ticks it"
+        );
+        workspace.collapse_to_icon(Panel::Stage);
+        assert!(
+            !workspace.icons.contains(&Panel::Stage),
+            "the stage stays put"
+        );
+
+        // The strip is part of the saved layout.
+        let saved = serde_json::to_value(workspace.capture(&Context::default())).unwrap();
+        let back = SavedLayout::decode(&saved).unwrap();
+        assert_eq!(back.icons, vec![Panel::Library, Panel::Properties]);
+
+        // Docking them again, last first, puts the dock back as it was.
+        workspace.toggle(Panel::Properties);
+        workspace.dock_icon(Panel::Library);
+        assert!(workspace.icons.is_empty());
+        assert_eq!(topology(&workspace.dock), docked);
+    }
 
     fn panel_rect(workspace: &WorkspaceLayout, panel: Panel) -> Rect {
         let (surface, node, _) = workspace.find_panel(panel).expect("panel is visible");

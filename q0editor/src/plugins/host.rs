@@ -15,9 +15,10 @@ use q0s_format::v2::{
 };
 
 use super::{LineKind, Scene};
+use crate::app::Action;
 use crate::app::EditorApp;
 use crate::render::StageView;
-use crate::state::{PlacementRef, Selection};
+use crate::state::{LibraryItem, PlacementRef, Selection, TimelineSelection};
 
 /// Namespaces and core commands the host answers for.
 const NAMESPACES: [&str; 13] = [
@@ -138,11 +139,11 @@ fn point_value(x: f32, y: f32) -> Value {
     ])
 }
 
-fn timeline_handle(q0rg_id: u16) -> Value {
+pub(super) fn timeline_handle(q0rg_id: u16) -> Value {
     Value::handle("timeline", vec![i64::from(q0rg_id)])
 }
 
-fn layer_handle(q0rg_id: u16, layer_id: u16) -> Value {
+pub(super) fn layer_handle(q0rg_id: u16, layer_id: u16) -> Value {
     Value::handle("layer", vec![i64::from(q0rg_id), i64::from(layer_id)])
 }
 
@@ -153,7 +154,7 @@ fn object_handle(q0rg_id: u16, layer_id: u16, index: usize) -> Value {
     )
 }
 
-fn asset_handle(asset_id: u16) -> Value {
+pub(super) fn asset_handle(asset_id: u16) -> Value {
     Value::handle("asset", vec![i64::from(asset_id)])
 }
 
@@ -494,6 +495,189 @@ impl<'a> EditorHost<'a> {
         })
     }
 
+    /// Runs an editor command on cells of a layer, as if they were picked
+    /// in the timeline, then puts the person's own selection and playhead
+    /// back. The command does what its button does, locks and all.
+    fn on_cells(
+        &mut self,
+        (q0rg_id, layer_id): (u16, u16),
+        first: u16,
+        last: u16,
+        action: Action,
+    ) -> Result<(), String> {
+        if q0rg_id != self.app.session.current_q0rg_id {
+            return Err(
+                "that layer is on another timeline; open it first with timeline.enter!".into(),
+            );
+        }
+        let session = &mut self.app.session;
+        let kept = (
+            session.current_layer_id,
+            session.current_frame,
+            session.timeline_selection.take(),
+            session.timeline_cell_selection.take(),
+            session.timeline_layer_selection.take(),
+            std::mem::replace(&mut session.selection, Selection::None),
+        );
+        session.current_layer_id = layer_id;
+        session.current_frame = first;
+        session.timeline_selection = Some(TimelineSelection {
+            anchor_layer_id: layer_id,
+            anchor_frame: first,
+            focus_layer_id: layer_id,
+            focus_frame: last,
+        });
+        let revision = self.app.state.revision();
+        self.app.handle(&self.ctx, action);
+        let changed = self.app.state.revision() != revision;
+        let session = &mut self.app.session;
+        session.current_layer_id = kept.0;
+        session.current_frame = kept.1;
+        session.timeline_selection = kept.2;
+        session.timeline_cell_selection = kept.3;
+        session.timeline_layer_selection = kept.4;
+        session.selection = kept.5;
+        session.reconcile_with(&self.app.state.project);
+        if !changed && !self.app.session.status.is_empty() {
+            // The command said why it did nothing; so does the plugin.
+            self.app
+                .plugins
+                .log(&self.name, LineKind::Info, self.app.session.status.clone());
+        }
+        Ok(())
+    }
+
+    /// A frame number from code (from 1) as the editor's (from 0).
+    fn frame_number(&self, args: &[Value], index: usize, what: &str) -> Result<u16, String> {
+        let frame = num(args, index, what)?;
+        if !(1.0..=f64::from(u16::MAX)).contains(&frame) {
+            return Err(format!("{what}: frames count from 1"));
+        }
+        Ok(frame as u16 - 1)
+    }
+
+    /// The paths of a drawing object, in stage pixels.
+    fn drawing_paths(&self, handle: &Handle) -> Result<Value, String> {
+        let placement = self.placement(handle)?;
+        let Target::Asset(asset_id) = placement.target else {
+            return Ok(Value::Null);
+        };
+        let Asset::Vector(vector) = self.asset(asset_id)? else {
+            return Ok(Value::Null);
+        };
+        let to_stage = q0s_format::transform::Affine::from_transform(placement.transform);
+        let point = |p: Vec2| {
+            let at = to_stage.apply(p);
+            point_value(at.x, at.y)
+        };
+        Ok(Value::list(
+            vector
+                .paths
+                .iter()
+                .map(|path| {
+                    Value::map([
+                        (
+                            "points".to_string(),
+                            Value::list(path.anchors.iter().map(|a| point(a.point)).collect()),
+                        ),
+                        (
+                            "handles".to_string(),
+                            Value::list(
+                                path.anchors
+                                    .iter()
+                                    .map(|a| {
+                                        Value::list(vec![
+                                            a.in_handle.map_or(Value::Null, point),
+                                            a.out_handle.map_or(Value::Null, point),
+                                        ])
+                                    })
+                                    .collect(),
+                            ),
+                        ),
+                        ("closed".to_string(), Value::Bool(path.closed)),
+                    ])
+                })
+                .collect(),
+        ))
+    }
+
+    fn set_drawing_paths(&mut self, handle: &Handle, value: &Value) -> Result<(), String> {
+        let placement = self.placement(handle)?;
+        let Target::Asset(asset_id) = placement.target else {
+            return Err("only drawings have paths".into());
+        };
+        let to_local = q0s_format::transform::Affine::from_transform(placement.transform)
+            .inverse()
+            .ok_or("the drawing is squashed flat; its paths cannot be set")?;
+        let local = |value: &Value| -> Option<Vec2> {
+            let at = point_of(value)?;
+            Some(to_local.apply(at))
+        };
+        let Value::List(items) = value else {
+            return Err(format!(
+                "paths takes a list of paths, not {}",
+                value.type_name()
+            ));
+        };
+        let mut paths = Vec::new();
+        for item in items.borrow().iter() {
+            let (points, handles, closed) = match item {
+                Value::Map(map) => {
+                    let map = map.borrow();
+                    (
+                        map.get("points").cloned().unwrap_or_default(),
+                        map.get("handles").cloned(),
+                        map.get("closed").is_some_and(Value::truthy),
+                    )
+                }
+                // A bare list of points is an open path through them.
+                other => (other.clone(), None, false),
+            };
+            let Value::List(points) = points else {
+                return Err("a path's points are a list of [x, y]".into());
+            };
+            let handles = match handles {
+                Some(Value::List(handles)) => handles.borrow().clone(),
+                _ => Vec::new(),
+            };
+            let mut anchors = Vec::new();
+            for (index, point) in points.borrow().iter().enumerate() {
+                let point = local(point).ok_or("a path's points are [x, y] pairs")?;
+                let (in_handle, out_handle) = match handles.get(index) {
+                    Some(Value::List(pair)) => {
+                        let pair = pair.borrow();
+                        (pair.first().and_then(local), pair.get(1).and_then(local))
+                    }
+                    _ => (None, None),
+                };
+                anchors.push(Anchor {
+                    point,
+                    in_handle,
+                    out_handle,
+                });
+            }
+            if anchors.len() >= 2 {
+                paths.push(VPath { anchors, closed });
+            }
+        }
+        if paths.is_empty() {
+            return Err("a drawing needs a path of two points or more".into());
+        }
+        self.touch_artwork();
+        match self
+            .app
+            .state
+            .project
+            .assets
+            .iter_mut()
+            .find(|asset| asset.id() == asset_id)
+        {
+            Some(Asset::Vector(vector)) => vector.paths = paths,
+            _ => return Err("only drawings have paths".into()),
+        }
+        Ok(())
+    }
+
     fn config_value(&self, key: &str) -> Option<Value> {
         let plugin = &self.app.plugins.list[self.index];
         let decl = plugin.settings.iter().find(|decl| decl.key == key)?;
@@ -562,6 +746,259 @@ impl q0ex::Host for EditorHost<'_> {
     fn call(&mut self, it: &mut Interp, name: &str, args: Vec<Value>) -> Result<Value, String> {
         let a = &args;
         Ok(match name {
+            // --------------------------------------------- timeline, more
+            "editor.layer" => layer_handle(
+                self.app.session.current_q0rg_id,
+                self.app.session.current_layer_id,
+            ),
+            "editor.cells" => {
+                let q0rg_id = self.app.session.current_q0rg_id;
+                let mut cells = self
+                    .app
+                    .session
+                    .timeline_selection
+                    .and_then(|selection| {
+                        crate::timeline_edit::selected_frame_cells(
+                            &self.app.state.project,
+                            q0rg_id,
+                            selection,
+                        )
+                    })
+                    .unwrap_or_default();
+                if let Some((owner, more)) = &self.app.session.timeline_cell_selection {
+                    if *owner == q0rg_id {
+                        cells.extend(more.iter().copied());
+                    }
+                }
+                cells.sort_unstable();
+                cells.dedup();
+                Value::list(
+                    cells
+                        .into_iter()
+                        .map(|(layer_id, frame)| {
+                            Value::map([
+                                ("layer".to_string(), layer_handle(q0rg_id, layer_id)),
+                                ("frame".to_string(), Value::Num(f64::from(frame) + 1.0)),
+                            ])
+                        })
+                        .collect(),
+                )
+            }
+            "project.labels" => {
+                let q0rg_id = self.app.session.current_q0rg_id;
+                let mut labels = self
+                    .app
+                    .state
+                    .project
+                    .runtime
+                    .frame_labels
+                    .iter()
+                    .filter(|(key, _)| key.q0rg_id == q0rg_id)
+                    .map(|(key, label)| (key.frame, label.clone()))
+                    .collect::<Vec<_>>();
+                labels.sort();
+                Value::list(
+                    labels
+                        .into_iter()
+                        .map(|(frame, label)| {
+                            Value::map([
+                                ("frame".to_string(), Value::Num(f64::from(frame) + 1.0)),
+                                ("name".to_string(), Value::str(label)),
+                            ])
+                        })
+                        .collect(),
+                )
+            }
+            "project.label!" => {
+                let frame = self.frame_number(a, 0, "label!")?;
+                let label = match a.get(1) {
+                    None | Some(Value::Null) => None,
+                    Some(value) => Some(value.to_text()).filter(|text| !text.trim().is_empty()),
+                };
+                let q0rg_id = self.app.session.current_q0rg_id;
+                self.app
+                    .handle(&self.ctx, Action::SetFrameLabel(q0rg_id, frame, label));
+                Value::Null
+            }
+            "project.import!" => {
+                let path = std::path::PathBuf::from(text(a, 0, "the file to import")?);
+                if !path.is_file() {
+                    return Err(format!("there is no file at {}", path.display()));
+                }
+                let before = self
+                    .app
+                    .state
+                    .project
+                    .assets
+                    .iter()
+                    .map(Asset::id)
+                    .max()
+                    .unwrap_or(0);
+                self.app
+                    .handle(&self.ctx, Action::ImportMediaFromPath(path));
+                // Pictures come in at once; a video or sound is still being
+                // read, and turns up in the library a moment later.
+                self.app
+                    .state
+                    .project
+                    .assets
+                    .iter()
+                    .map(Asset::id)
+                    .filter(|id| *id > before)
+                    .max()
+                    .map_or(Value::Null, asset_handle)
+            }
+            "project.place!" => {
+                let item = match a.first() {
+                    Some(Value::Handle(handle)) if handle.kind == "asset" => {
+                        LibraryItem::Asset(id16(handle, 0)?)
+                    }
+                    Some(Value::Handle(handle)) if handle.kind == "timeline" => {
+                        LibraryItem::Q0rg(id16(handle, 0)?)
+                    }
+                    _ => return Err("place! takes a library item or a symbol's timeline".into()),
+                };
+                let x = num_or(
+                    a,
+                    1,
+                    "place!",
+                    f64::from(self.app.state.project.meta.stage_width) / 2.0,
+                )?;
+                let y = num_or(
+                    a,
+                    2,
+                    "place!",
+                    f64::from(self.app.state.project.meta.stage_height) / 2.0,
+                )?;
+                let (q0rg_id, layer_id) = (
+                    self.app.session.current_q0rg_id,
+                    self.app.session.current_layer_id,
+                );
+                let count = |app: &EditorApp| {
+                    app.state
+                        .project
+                        .q0rgs
+                        .iter()
+                        .find(|q| q.q0rg_id == q0rg_id)
+                        .and_then(|q| q.layers.iter().find(|l| l.layer_id == layer_id))
+                        .map_or(0, |layer| layer.placements.len())
+                };
+                let before = count(self.app);
+                self.app
+                    .place_library_item_at(item, Vec2::new(x as f32, y as f32));
+                let after = count(self.app);
+                if after > before {
+                    object_handle(q0rg_id, layer_id, after - 1)
+                } else {
+                    Value::Null
+                }
+            }
+            #[cfg(not(target_os = "android"))]
+            "file.pick" | "file.pick_save" | "file.pick_folder" => {
+                let mut dialog = rfd::FileDialog::new();
+                if let Some(title) = a.first().filter(|value| !matches!(value, Value::Null)) {
+                    dialog = dialog.set_title(title.to_text());
+                }
+                if let Some(Value::List(kinds)) = a.get(1) {
+                    let kinds = kinds
+                        .borrow()
+                        .iter()
+                        .map(|kind| kind.to_text().trim_start_matches('.').to_string())
+                        .collect::<Vec<_>>();
+                    if !kinds.is_empty() {
+                        dialog = dialog.add_filter("files", &kinds);
+                    }
+                }
+                let picked = match name {
+                    "file.pick" => dialog.pick_file(),
+                    "file.pick_save" => dialog.save_file(),
+                    _ => dialog.pick_folder(),
+                };
+                picked.map_or(Value::Null, |path| Value::str(path.display().to_string()))
+            }
+            "plugin.send!" => {
+                let to = text(
+                    a,
+                    0,
+                    "who to send to: a plugin id, or \"*\" for every plugin",
+                )?;
+                let message = text(a, 1, "the message's name")?;
+                let data = a.get(2).cloned().unwrap_or_default();
+                self.app.plugins.messages.push(super::Message {
+                    from: self.id.clone(),
+                    to,
+                    name: message,
+                    data,
+                });
+                Value::Null
+            }
+            "plugin.running" => Value::list(
+                self.app
+                    .plugins
+                    .list
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, plugin)| plugin.running() || *index == self.index)
+                    .map(|(_, plugin)| Value::str(&plugin.meta.id))
+                    .collect(),
+            ),
+            "draw.arrow!" => {
+                let (painter, view) = self.painter()?;
+                let from = view
+                    .stage_to_screen(Vec2::new(num(a, 0, "x1")? as f32, num(a, 1, "y1")? as f32));
+                let to = view
+                    .stage_to_screen(Vec2::new(num(a, 2, "x2")? as f32, num(a, 3, "y2")? as f32));
+                let color = color32(color_arg(
+                    a,
+                    4,
+                    "colour",
+                    Rgba {
+                        r: 255,
+                        g: 64,
+                        b: 160,
+                        a: 255,
+                    },
+                )?);
+                let width = num_or(a, 5, "width", 2.0)? as f32;
+                let stroke = egui::Stroke::new(width, color);
+                painter.line_segment([from, to], stroke);
+                let along = (to - from).normalized();
+                if along.is_finite() {
+                    let back = -along * (8.0 + width * 2.0);
+                    let side = egui::vec2(-along.y, along.x) * (4.0 + width);
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![to, to + back + side, to + back - side],
+                        color,
+                        egui::Stroke::NONE,
+                    ));
+                }
+                Value::Null
+            }
+            "draw.image!" => {
+                let (painter, view) = self.painter()?;
+                let wanted = text(a, 0, "the picture's blob name")?;
+                let bytes = self.app.plugins.list[self.index]
+                    .doc
+                    .as_ref()
+                    .and_then(|doc| doc.blob(&wanted))
+                    .and_then(|blob| blob.bytes())
+                    .ok_or_else(|| format!("this plugin has no picture `{wanted}`"))?;
+                let texture =
+                    super::cached_texture(&self.ctx, &format!("{}:{wanted}", self.id), &bytes)
+                        .ok_or_else(|| format!("`{wanted}` is not a picture"))?;
+                let at =
+                    view.stage_to_screen(Vec2::new(num(a, 1, "x")? as f32, num(a, 2, "y")? as f32));
+                let size = texture.size_vec2();
+                let width = num_or(a, 3, "width", f64::from(size.x))? as f32 * view.scale;
+                let height = width * size.y / size.x.max(1.0);
+                painter.image(
+                    texture.id(),
+                    egui::Rect::from_min_size(at, egui::vec2(width, height)),
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+                Value::Null
+            }
             // ------------------------------------------------------ core
             "say!" => {
                 let text = self.line(LineKind::Say, a);
@@ -1590,9 +2027,10 @@ impl q0ex::Host for EditorHost<'_> {
                         placement_idx: handle.ids[2] as usize,
                     })),
                     "raw" => to_json(placement)?,
+                    "paths" => return self.drawing_paths(handle),
                     _ => {
                         return Err(format!(
-                            "an object has no `{field}`; it has x, y, rotation, scale_x, scale_y, skew_x, skew_y, alpha, frame, kind, asset, symbol, layer, timeline, id, name, selected and raw"
+                            "an object has no `{field}`; it has x, y, rotation, scale_x, scale_y, skew_x, skew_y, alpha, frame, kind, asset, symbol, layer, timeline, id, name, selected, paths and raw"
                         ))
                     }
                 })
@@ -1749,6 +2187,9 @@ impl q0ex::Host for EditorHost<'_> {
                     }
                     return Ok(());
                 }
+                if field == "paths" {
+                    return self.set_drawing_paths(handle, &value);
+                }
                 if field == "raw" {
                     let replacement: Placement = from_json(&value, "object.raw")?;
                     self.placement(handle)?;
@@ -1870,6 +2311,72 @@ impl q0ex::Host for EditorHost<'_> {
                     return Err("that layer is on another timeline".into());
                 }
                 self.app.session.current_layer_id = layer_id;
+                Ok(Value::Null)
+            }
+            ("layer", "keyframe!" | "blank!" | "clear!") => {
+                let layer = self.layer_of(handle)?;
+                let frame = match args.first() {
+                    Some(_) => self.frame_number(&args, 0, name)?,
+                    None => self.app.session.current_frame,
+                };
+                let action = match name {
+                    "keyframe!" => Action::InsertKeyframe,
+                    "blank!" => Action::InsertBlankKeyframe,
+                    _ => Action::ClearKeyframe,
+                };
+                self.on_cells(layer, frame, frame, action)?;
+                Ok(Value::Null)
+            }
+            ("layer", "add_frames!" | "remove_frames!") => {
+                let layer = self.layer_of(handle)?;
+                let frame = self.frame_number(&args, 0, name)?;
+                let count = num_or(&args, 1, name, 1.0)?.round().clamp(1.0, 10_000.0) as u16;
+                if name == "add_frames!" {
+                    // One hold frame a press, as F5 does.
+                    for _ in 0..count {
+                        self.on_cells(layer, frame, frame, Action::InsertFrame)?;
+                    }
+                } else {
+                    let last = frame.saturating_add(count - 1);
+                    self.on_cells(layer, frame, last, Action::RemoveSelectedTimelineFrames)?;
+                }
+                Ok(Value::Null)
+            }
+            ("layer", "tween!") => {
+                let layer = self.layer_of(handle)?;
+                let frame = self.frame_number(&args, 0, "tween!")?;
+                let kind = args
+                    .get(1)
+                    .map_or("motion".to_string(), |kind| kind.to_text().to_lowercase());
+                match kind.as_str() {
+                    "motion" => self.on_cells(layer, frame, frame, Action::CreateMotionTween)?,
+                    "shape" => self.on_cells(layer, frame, frame, Action::CreateShapeTween)?,
+                    "none" => {
+                        let (q0rg_id, layer_id) = layer;
+                        let q0rg = self.q0rg(q0rg_id)?;
+                        let key = q0rg
+                            .layers
+                            .iter()
+                            .find(|layer| layer.layer_id == layer_id)
+                            .and_then(|layer| active_key(q0rg, layer, frame));
+                        if let Some(key) = key {
+                            self.touch_artwork();
+                            for placement in self
+                                .layer_mut(q0rg_id, layer_id)?
+                                .placements
+                                .iter_mut()
+                                .filter(|placement| placement.frame == key)
+                            {
+                                placement.tween = Tween::None;
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(format!(
+                            "tween! takes \"motion\", \"shape\" or \"none\", not {other}"
+                        ))
+                    }
+                }
                 Ok(Value::Null)
             }
             ("layer", "remove!") => {

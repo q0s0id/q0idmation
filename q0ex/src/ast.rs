@@ -329,10 +329,13 @@ pub enum SettingKind {
     Button,
     Heading,
     Note,
+    /// A key or chord the person picks, like `ctrl+k`: `when key "@name"`
+    /// runs when it is pressed.
+    Key,
 }
 
 impl SettingKind {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Slider,
         Self::Number,
         Self::Toggle,
@@ -342,6 +345,7 @@ impl SettingKind {
         Self::Button,
         Self::Heading,
         Self::Note,
+        Self::Key,
     ];
 
     pub fn word(self) -> &'static str {
@@ -355,6 +359,7 @@ impl SettingKind {
             Self::Button => "button",
             Self::Heading => "heading",
             Self::Note => "note",
+            Self::Key => "key",
         }
     }
 
