@@ -155,13 +155,15 @@ impl StageWorkTimings {
     }
 }
 
-const VECTOR_MESH_BATCH_VERTEX_LIMIT: usize = 65_536;
-
-/// Collects ordinary vector triangles in paint order and submits fewer egui shapes.
+/// Collects ordinary vector artwork in paint order and draws it in one paint
+/// callback. Each shape's fill and stroke triangles stay on the GPU in its own
+/// coordinates; a frame sends only their transforms and colours. Copying every
+/// vertex to the screen on the CPU and re-sending it each frame made a stage
+/// of imported Animate art (half a million vertices) cost ~40 ms per frame.
 /// Callers flush before drawing anything that needs a separate rendering path.
 #[derive(Default)]
 struct VectorMeshBatch {
-    mesh: Mesh,
+    run: Vec<(Arc<Mesh>, q0glblend::GradientMeshPaint)>,
     instances: u64,
     batches: u64,
     vertices: u64,
@@ -170,11 +172,11 @@ struct VectorMeshBatch {
 }
 
 impl VectorMeshBatch {
+    /// A plain vector: one solid fill and one stroke at most.
     #[allow(clippy::too_many_arguments)]
     fn append(
         &mut self,
-        painter: &Painter,
-        geometry: &CachedVectorRenderGeometry,
+        textures: &mut TextureCache,
         vector: &VectorAsset,
         transform: Affine,
         view: &StageView,
@@ -182,105 +184,130 @@ impl VectorMeshBatch {
         stroke_scale_compensation: f32,
         color_transform: q0glblend::ColorTransform,
     ) -> bool {
-        let fill_color = vector
-            .fill
-            .map(|color| color_transform.apply(modulate(rgba_to_color32(color), tint)))
-            .unwrap_or(Color32::TRANSPARENT);
-        let has_fill = fill_color != Color32::TRANSPARENT
-            && !geometry.fill_vertices.is_empty()
-            && !geometry.fill_indices.is_empty();
-        let stroke_color = vector
-            .stroke
-            .map(|stroke| color_transform.apply(modulate(rgba_to_color32(stroke.color), tint)));
-        let has_stroke = stroke_color.is_some();
-
-        if !has_fill && !has_stroke {
+        let fill = vector.fill.filter(|_| tint.a() > 0).and_then(|color| {
+            textures
+                .vector_group_fill(vector)
+                .map(|cached| (color, cached))
+        });
+        let Some(stroke) = self.stroke_part(textures, vector, transform, stroke_scale_compensation)
+        else {
             return false;
+        };
+        if fill.is_none() && stroke.is_none() {
+            return vector.fill.is_none() && vector.stroke.is_none();
         }
-        if has_stroke
-            && ((stroke_scale_compensation - 1.0).abs() > 1.0e-6
-                || !affine_is_similarity(transform)
-                || geometry.stroke_vertices.is_empty()
-                || geometry.stroke_indices.is_empty())
-        {
-            return false;
+        if let Some((color, cached)) = fill {
+            let mut paint = solid_vector_group_paint(&cached, transform, view);
+            paint.stops = stops_of_color(&cached.stops, color);
+            self.push(cached.mesh, paint, tint, color_transform);
         }
-
-        let fill_vertex_count = if has_fill {
-            geometry.fill_vertices.len()
-        } else {
-            0
-        };
-        let stroke_vertex_count = if has_stroke {
-            geometry.stroke_vertices.len()
-        } else {
-            0
-        };
-        let vertex_count = fill_vertex_count.saturating_add(stroke_vertex_count);
-        let fill_index_count = if has_fill {
-            geometry.fill_indices.len()
-        } else {
-            0
-        };
-        let stroke_index_count = if has_stroke {
-            geometry.stroke_indices.len()
-        } else {
-            0
-        };
-        let index_count = fill_index_count.saturating_add(stroke_index_count);
-        if self.mesh.vertices.len().saturating_add(vertex_count) > VECTOR_MESH_BATCH_VERTEX_LIMIT
-            && !self.mesh.is_empty()
-        {
-            self.flush(painter);
-        }
-        let Ok(base) = u32::try_from(self.mesh.vertices.len()) else {
-            return false;
-        };
-        let Ok(fill_vertex_count_u32) = u32::try_from(fill_vertex_count) else {
-            return false;
-        };
-        if u32::try_from(self.mesh.vertices.len().saturating_add(vertex_count)).is_err() {
-            return false;
-        }
-        let Some(stroke_base) = base.checked_add(fill_vertex_count_u32) else {
-            return false;
-        };
-        self.mesh.vertices.reserve(vertex_count);
-        self.mesh.indices.reserve(index_count);
-
-        if has_fill {
-            append_transformed_vector_part(
-                &mut self.mesh,
-                &geometry.fill_vertices,
-                &geometry.fill_indices,
-                base,
-                transform,
-                view,
-                fill_color,
-            );
-        }
-        if let Some(color) = stroke_color {
-            append_transformed_vector_part(
-                &mut self.mesh,
-                &geometry.stroke_vertices,
-                &geometry.stroke_indices,
-                stroke_base,
-                transform,
-                view,
-                color,
-            );
+        if let Some((color, cached)) = stroke {
+            let mut paint = solid_vector_group_paint(&cached, transform, view);
+            paint.stops = stops_of_color(&cached.stops, color);
+            self.push(cached.mesh, paint, tint, color_transform);
         }
         self.instances = self.instances.saturating_add(1);
-        self.vertices = self.vertices.saturating_add(vertex_count as u64);
-        self.indices = self.indices.saturating_add(index_count as u64);
         true
     }
 
+    /// A vector whose fill is an Animate gradient. Only plain gradients come
+    /// here: soft materials and mask paths keep their own renderers.
+    #[allow(clippy::too_many_arguments)]
+    fn append_gradient(
+        &mut self,
+        textures: &mut TextureCache,
+        vector: &VectorAsset,
+        appearance: &VectorAppearance,
+        transform: Affine,
+        view: &StageView,
+        tint: Color32,
+        stroke_scale_compensation: f32,
+        color_transform: q0glblend::ColorTransform,
+    ) -> bool {
+        if !matches!(appearance.material, q0s_format::v2::VectorMaterial::Solid)
+            || !appearance.erase_mask.is_empty()
+            || !appearance.clip_mask.is_empty()
+            || appearance.fill_gradient.is_none()
+        {
+            return false;
+        }
+        let Some(stroke) = self.stroke_part(textures, vector, transform, stroke_scale_compensation)
+        else {
+            return false;
+        };
+        let geometry = textures.gradient_render_geometry(vector, appearance);
+        if let (Some(mesh), Some(paint)) = (
+            geometry.mesh.as_ref(),
+            gradient_mesh_paint(geometry, transform, view, Color32::WHITE),
+        ) {
+            let mesh = Arc::clone(mesh);
+            self.push(mesh, paint, tint, color_transform);
+        }
+        if let Some((color, cached)) = stroke {
+            let mut paint = solid_vector_group_paint(&cached, transform, view);
+            paint.stops = stops_of_color(&cached.stops, color);
+            self.push(cached.mesh, paint, tint, color_transform);
+        }
+        self.instances = self.instances.saturating_add(1);
+        true
+    }
+
+    /// The stroke as cached triangles, `Some(None)` when there is none to
+    /// draw, or `None` when only the screen-space stroke renderer can draw it:
+    /// the cached triangles hold their shape only under a similarity.
+    fn stroke_part(
+        &mut self,
+        textures: &mut TextureCache,
+        vector: &VectorAsset,
+        transform: Affine,
+        stroke_scale_compensation: f32,
+    ) -> Option<Option<(q0s_format::v2::Rgba, CachedVectorGroupFill)>> {
+        let Some(stroke) = vector.stroke else {
+            return Some(None);
+        };
+        if (stroke_scale_compensation - 1.0).abs() > 1.0e-6 || !affine_is_similarity(transform) {
+            return None;
+        }
+        let cached = textures.vector_group_stroke(vector)?;
+        Some(Some((stroke.color, cached)))
+    }
+
+    fn push(
+        &mut self,
+        mesh: Arc<Mesh>,
+        mut paint: q0glblend::GradientMeshPaint,
+        tint: Color32,
+        color_transform: q0glblend::ColorTransform,
+    ) {
+        paint.tint = tint;
+        paint.color_transform = color_transform;
+        self.vertices = self.vertices.saturating_add(mesh.vertices.len() as u64);
+        self.indices = self.indices.saturating_add(mesh.indices.len() as u64);
+        self.run.push((mesh, paint));
+    }
+
     fn flush(&mut self, painter: &Painter) {
-        if self.mesh.is_empty() {
+        if self.run.is_empty() {
             return;
         }
-        painter.add(Shape::Mesh(std::mem::take(&mut self.mesh)));
+        #[cfg(test)]
+        FLUSHED_RUN_BOUNDS.with(|bounds| {
+            bounds
+                .borrow_mut()
+                .extend(self.run.iter().map(|(mesh, paint)| {
+                    let t = paint.transform;
+                    let mut rect = Rect::NOTHING;
+                    for vertex in &mesh.vertices {
+                        let d = vertex.pos - t.source_origin;
+                        rect.extend_with(pos2(
+                            t.target_origin.x + t.linear[0] * d.x + t.linear[1] * d.y,
+                            t.target_origin.y + t.linear[2] * d.x + t.linear[3] * d.y,
+                        ));
+                    }
+                    rect
+                }));
+        });
+        q0glblend::paint_gradient_mesh_run(painter, std::mem::take(&mut self.run));
         self.batches = self.batches.saturating_add(1);
     }
 
@@ -289,22 +316,39 @@ impl VectorMeshBatch {
     }
 }
 
-fn append_transformed_vector_part(
-    mesh: &mut Mesh,
-    vertices: &[Vec2],
-    indices: &[u32],
-    base: u32,
-    transform: Affine,
-    view: &StageView,
-    color: Color32,
-) {
-    mesh.vertices.extend(vertices.iter().map(|point| Vertex {
-        pos: stage_to_screen(transform.apply(*point), view),
-        uv: Pos2::ZERO,
-        color,
-    }));
-    mesh.indices
-        .extend(indices.iter().map(|index| base + *index));
+#[cfg(test)]
+thread_local! {
+    /// Screen bounds of every batched mesh flushed: the batch draws through
+    /// a paint callback, so tests cannot read its triangles off egui shapes.
+    static FLUSHED_RUN_BOUNDS: std::cell::RefCell<Vec<Rect>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Batched meshes flushed since the last call, in screen space.
+#[cfg(test)]
+fn take_flushed_run_bounds() -> Vec<Rect> {
+    FLUSHED_RUN_BOUNDS.with(|bounds| std::mem::take(&mut *bounds.borrow_mut()))
+}
+
+/// `cached` when it is still of `color`, else two stops of it. The cached
+/// meshes keep the colour they were built with; an edit may have changed it.
+fn stops_of_color(
+    cached: &Arc<Vec<q0s_format::v2::GradientStop>>,
+    color: q0s_format::v2::Rgba,
+) -> Arc<Vec<q0s_format::v2::GradientStop>> {
+    if cached.iter().all(|stop| stop.color == color) {
+        return Arc::clone(cached);
+    }
+    Arc::new(vec![
+        q0s_format::v2::GradientStop {
+            position: 0.0,
+            color,
+        },
+        q0s_format::v2::GradientStop {
+            position: 1.0,
+            color,
+        },
+    ])
 }
 
 struct ClassicBrushPreviewTexture {
@@ -1049,6 +1093,9 @@ pub struct TextureCache {
     canvas_background: Option<CachedCanvasBackground>,
     vector_render_by_asset: HashMap<u16, CachedVectorRenderGeometry>,
     vector_group_fill_by_asset: HashMap<u16, CachedVectorGroupFill>,
+    /// Stroke triangles in the vector's own coordinates, kept on the GPU by
+    /// the batched stage renderer.
+    vector_group_stroke_by_asset: HashMap<u16, CachedVectorGroupFill>,
     gradient_render_by_asset: HashMap<u16, CachedGradientRenderGeometry>,
     vector_bounds_by_asset: HashMap<u16, Option<(f32, f32, f32, f32)>>,
     vector_bounds_revision: Option<(u64, u64)>,
@@ -1982,6 +2029,7 @@ impl TextureCache {
         self.by_asset_id.clear();
         self.vector_render_by_asset.clear();
         self.vector_group_fill_by_asset.clear();
+        self.vector_group_stroke_by_asset.clear();
         self.vector_bounds_by_asset.clear();
         // Video sources are immutable. Transform/undo invalidation must not
         // decode and upload them again; source identity is checked on access.
@@ -2032,6 +2080,7 @@ impl TextureCache {
         self.by_asset_id.remove(&asset_id);
         self.vector_render_by_asset.remove(&asset_id);
         self.vector_group_fill_by_asset.remove(&asset_id);
+        self.vector_group_stroke_by_asset.remove(&asset_id);
         self.vector_bounds_by_asset.remove(&asset_id);
         // Media pixels are keyed by immutable source, not editable item ID.
         // Source synchronization drops unused payloads after a model change.
@@ -2271,6 +2320,48 @@ impl TextureCache {
             ]),
         };
         self.vector_group_fill_by_asset
+            .insert(vector.asset_id, cached.clone());
+        Some(cached)
+    }
+
+    /// The vector's stroke triangles as a GPU-resident mesh, built once.
+    fn vector_group_stroke(&mut self, vector: &VectorAsset) -> Option<CachedVectorGroupFill> {
+        if let Some(cached) = self.vector_group_stroke_by_asset.get(&vector.asset_id) {
+            return Some(cached.clone());
+        }
+        let stroke = vector.stroke?;
+        let geometry = self.vector_render_geometry(vector);
+        if geometry.stroke_vertices.is_empty() || geometry.stroke_indices.is_empty() {
+            return None;
+        }
+        let mut bounds = Rect::NOTHING;
+        let mut mesh = Mesh::default();
+        mesh.vertices.reserve(geometry.stroke_vertices.len());
+        for point in &geometry.stroke_vertices {
+            let pos = pos2(point.x, point.y);
+            bounds.extend_with(pos);
+            mesh.vertices.push(Vertex {
+                pos,
+                uv: Pos2::ZERO,
+                color: Color32::WHITE,
+            });
+        }
+        mesh.indices.clone_from(&geometry.stroke_indices);
+        let cached = CachedVectorGroupFill {
+            mesh: Arc::new(mesh),
+            bounds,
+            stops: Arc::new(vec![
+                q0s_format::v2::GradientStop {
+                    position: 0.0,
+                    color: stroke.color,
+                },
+                q0s_format::v2::GradientStop {
+                    position: 1.0,
+                    color: stroke.color,
+                },
+            ]),
+        };
+        self.vector_group_stroke_by_asset
             .insert(vector.asset_id, cached.clone());
         Some(cached)
     }
@@ -2740,9 +2831,12 @@ impl TextureCache {
             self.vector_render_by_asset
                 .insert(remainder_asset_id, remainder);
             self.vector_group_fill_by_asset.remove(&remainder_asset_id);
+            self.vector_group_stroke_by_asset
+                .remove(&remainder_asset_id);
         }
         self.vector_render_by_asset.insert(asset_id, seed.render);
         self.vector_group_fill_by_asset.remove(&asset_id);
+        self.vector_group_stroke_by_asset.remove(&asset_id);
         self.selection_stage_mesh_by_key.insert(
             SelectionStageMeshKey {
                 asset_id,
@@ -6861,21 +6955,32 @@ fn render_q0rg_with_vector_batch(
                         };
                         let dynamic_instance_id = deformed.as_ref().map(|_| placement.instance_id);
                         let appearance = project.asset_appearances.get(&asset_id);
-                        if color_only && deformed.is_none() && appearance.is_none() {
+                        if color_only && deformed.is_none() {
                             if let Asset::Vector(vector) = asset {
                                 let compensation =
                                     textures.live_raw_stroke_scale_compensation(vector.asset_id);
-                                let geometry = textures.vector_render_geometry(vector);
-                                if vector_batch.append(
-                                    painter,
-                                    geometry,
-                                    vector,
-                                    composed,
-                                    view,
-                                    tint,
-                                    compensation,
-                                    color_transform,
-                                ) {
+                                let batched = match appearance {
+                                    None => vector_batch.append(
+                                        textures,
+                                        vector,
+                                        composed,
+                                        view,
+                                        tint,
+                                        compensation,
+                                        color_transform,
+                                    ),
+                                    Some(appearance) => vector_batch.append_gradient(
+                                        textures,
+                                        vector,
+                                        appearance,
+                                        composed,
+                                        view,
+                                        tint,
+                                        compensation,
+                                        color_transform,
+                                    ),
+                                };
+                                if batched {
                                     continue;
                                 }
                             }
@@ -9214,6 +9319,147 @@ fn q0rg_local_bbox(project: &ProjectV2, q0rg_id: u16, depth: u8) -> Option<(f32,
     }
 }
 
+/// The frame `placement`'s symbol shows while its own timeline (`q0rg_id`)
+/// is at `frame`, or `None` for artwork or a placement not on that frame.
+pub(crate) fn placement_shown_frame(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    layer: &q0s_format::v2::Layer,
+    placement_idx: usize,
+    frame: u16,
+) -> Option<u16> {
+    let Target::Q0rg(child_id) = layer.placements.get(placement_idx)?.target else {
+        return None;
+    };
+    let frame_count = project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)?
+        .frame_count;
+    let local = if frame_count > 0 {
+        frame % frame_count
+    } else {
+        0
+    };
+    let active = q0s_format::raster::active_placement_states_at(layer, local)
+        .into_iter()
+        .find(|active| active.index == placement_idx)?;
+    Some(q0s_format::v2::resolve_q0rg_playback_frame(
+        project,
+        child_id,
+        local,
+        active.playback_start_frame,
+        active.fx.q0rg_playback,
+    ))
+}
+
+/// The local box the selection frame, its handles and the drag maths share
+/// for a placement while its timeline (`q0rg_id`) is at `frame`: what its
+/// symbol shows then, or the whole artwork for anything else.
+pub(crate) fn placement_shown_local_bbox(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    layer: &q0s_format::v2::Layer,
+    placement_idx: usize,
+    frame: u16,
+) -> Option<(f32, f32, f32, f32)> {
+    let target = layer.placements.get(placement_idx)?.target;
+    match (
+        target,
+        placement_shown_frame(project, q0rg_id, layer, placement_idx, frame),
+    ) {
+        (Target::Q0rg(child_id), Some(shown)) => {
+            q0rg_shown_bbox(project, child_id, shown, Q0RG_RECURSION_LIMIT)
+        }
+        _ => target_local_bbox(project, target, None),
+    }
+}
+
+/// Bounds of `placement` with its symbol showing `shown_frame`: what is on
+/// screen, where `placement_bbox` covers every frame the symbol has. A head
+/// symbol that turns through nine poses used to get a box around all nine.
+pub(crate) fn placement_frame_bbox(
+    project: &ProjectV2,
+    placement: &Placement,
+    shown_frame: u16,
+) -> Option<(f32, f32, f32, f32)> {
+    placement_frame_bbox_at_depth(project, placement, shown_frame, Q0RG_RECURSION_LIMIT)
+}
+
+fn placement_frame_bbox_at_depth(
+    project: &ProjectV2,
+    placement: &Placement,
+    shown_frame: u16,
+    depth: u8,
+) -> Option<(f32, f32, f32, f32)> {
+    let Target::Q0rg(child_id) = placement.target else {
+        return placement_bbox_at_depth(project, placement, depth);
+    };
+    if depth == 0 {
+        return None;
+    }
+    let local = q0rg_shown_bbox(project, child_id, shown_frame, depth - 1)?;
+    transformed_rect_bounds(local, Affine::from_transform(placement.transform))
+}
+
+/// What a symbol shows at `frame`, in its own coordinates, down through
+/// the frames its nested symbols show.
+fn q0rg_shown_bbox(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    frame: u16,
+    depth: u8,
+) -> Option<(f32, f32, f32, f32)> {
+    if depth == 0 {
+        return None;
+    }
+    let q0rg = project.q0rgs.iter().find(|q0rg| q0rg.q0rg_id == q0rg_id)?;
+    let local = if q0rg.frame_count > 0 {
+        frame % q0rg.frame_count
+    } else {
+        0
+    };
+    let mut bounds = None;
+    for layer in &q0rg.layers {
+        if !symbol_content_layer_is_visible(project, q0rg_id, layer.layer_id) {
+            continue;
+        }
+        for active in q0s_format::raster::active_placement_states_at(layer, local) {
+            let Some(placement) = layer.placements.get(active.index) else {
+                continue;
+            };
+            let mut shown = placement.clone();
+            shown.transform = active.transform;
+            let placed = match shown.target {
+                Target::Asset(_) => placement_bbox_at_depth(project, &shown, depth),
+                Target::Q0rg(child_id) => {
+                    let child_frame = q0s_format::v2::resolve_q0rg_playback_frame(
+                        project,
+                        child_id,
+                        local,
+                        active.playback_start_frame,
+                        active.fx.q0rg_playback,
+                    );
+                    placement_frame_bbox_at_depth(project, &shown, child_frame, depth)
+                }
+            };
+            bounds = union_bbox(bounds, placed);
+        }
+    }
+    bounds
+}
+
+fn union_bbox(
+    a: Option<(f32, f32, f32, f32)>,
+    b: Option<(f32, f32, f32, f32)>,
+) -> Option<(f32, f32, f32, f32)> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some((a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))),
+        (a, None) => a,
+        (None, b) => b,
+    }
+}
+
 /// Reusable project indexes and recursive bounds for drawing a large
 /// multi-selection. Selection outlines often contain many instances of the
 /// same nested symbol; resolving each one independently used to rescan the
@@ -9225,6 +9471,9 @@ pub(crate) struct PlacementBoundsCache {
     #[allow(clippy::type_complexity)]
     q0rg_local_bounds: HashMap<(u16, u8), Option<(f32, f32, f32, f32)>>,
     q0rg_static_body_bounds: HashMap<(u16, u8), bool>,
+    /// What a symbol shows at one frame: (symbol, frame, depth).
+    #[allow(clippy::type_complexity)]
+    q0rg_frame_bounds: HashMap<(u16, u16, u8), Option<(f32, f32, f32, f32)>>,
     asset_outlines: HashMap<u16, Vec<Vec2>>,
 }
 
@@ -9245,6 +9494,7 @@ impl PlacementBoundsCache {
             layer_indices,
             q0rg_local_bounds: HashMap::new(),
             q0rg_static_body_bounds: HashMap::new(),
+            q0rg_frame_bounds: HashMap::new(),
             asset_outlines: HashMap::new(),
         }
     }
@@ -9252,6 +9502,107 @@ impl PlacementBoundsCache {
     fn invalidate_placement_transforms(&mut self) {
         self.q0rg_local_bounds.clear();
         self.q0rg_static_body_bounds.clear();
+        self.q0rg_frame_bounds.clear();
+    }
+
+    /// `placement_shown_local_bbox`, sharing work between outlines.
+    pub(crate) fn placement_shown_local_bbox(
+        &mut self,
+        project: &ProjectV2,
+        q0rg_id: u16,
+        layer_id: u16,
+        placement_idx: usize,
+        frame: u16,
+    ) -> Option<(f32, f32, f32, f32)> {
+        let layer = self.layer(project, q0rg_id, layer_id)?;
+        let target = layer.placements.get(placement_idx)?.target;
+        match (
+            target,
+            placement_shown_frame(project, q0rg_id, layer, placement_idx, frame),
+        ) {
+            (Target::Q0rg(child_id), Some(shown)) => {
+                self.q0rg_frame_bbox(project, child_id, shown, Q0RG_RECURSION_LIMIT)
+            }
+            _ => self.target_local_bbox(project, target),
+        }
+    }
+
+    /// `placement_frame_bbox`, sharing work between frames and outlines.
+    pub(crate) fn placement_frame_bbox(
+        &mut self,
+        project: &ProjectV2,
+        placement: &Placement,
+        shown_frame: u16,
+    ) -> Option<(f32, f32, f32, f32)> {
+        self.placement_frame_bbox_at_depth(project, placement, shown_frame, Q0RG_RECURSION_LIMIT)
+    }
+
+    fn placement_frame_bbox_at_depth(
+        &mut self,
+        project: &ProjectV2,
+        placement: &Placement,
+        shown_frame: u16,
+        depth: u8,
+    ) -> Option<(f32, f32, f32, f32)> {
+        let Target::Q0rg(child_id) = placement.target else {
+            return self.placement_bbox_at_depth(project, placement, depth);
+        };
+        if depth == 0 {
+            return None;
+        }
+        let local = self.q0rg_frame_bbox(project, child_id, shown_frame, depth - 1)?;
+        transformed_rect_bounds(local, Affine::from_transform(placement.transform))
+    }
+
+    fn q0rg_frame_bbox(
+        &mut self,
+        project: &ProjectV2,
+        q0rg_id: u16,
+        frame: u16,
+        depth: u8,
+    ) -> Option<(f32, f32, f32, f32)> {
+        if depth == 0 {
+            return None;
+        }
+        let q0rg = self.q0rg(project, q0rg_id)?;
+        let local = if q0rg.frame_count > 0 {
+            frame % q0rg.frame_count
+        } else {
+            0
+        };
+        if let Some(cached) = self.q0rg_frame_bounds.get(&(q0rg_id, local, depth)) {
+            return *cached;
+        }
+        let mut bounds = None;
+        for layer in &q0rg.layers {
+            if !symbol_content_layer_is_visible(project, q0rg_id, layer.layer_id) {
+                continue;
+            }
+            for active in q0s_format::raster::active_placement_states_at(layer, local) {
+                let Some(placement) = layer.placements.get(active.index) else {
+                    continue;
+                };
+                let mut shown = placement.clone();
+                shown.transform = active.transform;
+                let placed = match shown.target {
+                    Target::Asset(_) => self.placement_bbox_at_depth(project, &shown, depth),
+                    Target::Q0rg(child_id) => {
+                        let child_frame = q0s_format::v2::resolve_q0rg_playback_frame(
+                            project,
+                            child_id,
+                            local,
+                            active.playback_start_frame,
+                            active.fx.q0rg_playback,
+                        );
+                        self.placement_frame_bbox_at_depth(project, &shown, child_frame, depth)
+                    }
+                };
+                bounds = union_bbox(bounds, placed);
+            }
+        }
+        self.q0rg_frame_bounds
+            .insert((q0rg_id, local, depth), bounds);
+        bounds
     }
 
     fn invalidate_asset(&mut self, asset_id: u16) {
@@ -10855,8 +11206,13 @@ mod tests {
             for clipped in &output.shapes {
                 mesh_bounds(&clipped.shape, &mut bounds);
             }
+            // Authored drawings are batched GPU meshes, not egui meshes.
+            for batched in take_flushed_run_bounds() {
+                bounds = bounds.union(batched);
+            }
             bounds
         };
+        take_flushed_run_bounds();
 
         // Halfway between 0..20 and 100..140, and again a quarter of the way.
         let half = painted(2);
@@ -10953,6 +11309,115 @@ mod tests {
                 Some((90.0, 70.0, 130.0, 110.0))
             );
         }
+    }
+
+    /// A symbol that shows a different drawing on each frame (a head turning
+    /// through its poses) is boxed round the frame it shows, not round every
+    /// frame it has. The selection box used to cover all of them.
+    #[test]
+    fn a_symbol_is_boxed_round_the_frame_it_shows() {
+        let mut project = crate::state::default_project();
+        project.assets.push(Asset::Vector(VectorAsset {
+            asset_id: 90,
+            paths: vec![VPath {
+                anchors: [
+                    Vec2::new(0.0, 0.0),
+                    Vec2::new(20.0, 0.0),
+                    Vec2::new(20.0, 20.0),
+                    Vec2::new(0.0, 20.0),
+                ]
+                .into_iter()
+                .map(|point| Anchor {
+                    point,
+                    in_handle: None,
+                    out_handle: None,
+                })
+                .collect(),
+                closed: true,
+            }],
+            fill: Some(Rgba {
+                r: 10,
+                g: 20,
+                b: 30,
+                a: 255,
+            }),
+            stroke: None,
+        }));
+        let square_at = |frame: u16, tx: f32| Placement {
+            pivot: None,
+            instance_id: 0,
+            frame,
+            target: Target::Asset(90),
+            transform: Transform2D {
+                tx,
+                ..Transform2D::IDENTITY
+            },
+            tween: Tween::None,
+            fx: PlacementFx::default(),
+        };
+        // Two poses far apart, one per frame, and a symbol nesting it so the
+        // frame has to reach two levels down.
+        project.q0rgs.push(q0s_format::v2::Q0rg {
+            q0rg_id: 50,
+            name: "poses".into(),
+            frame_count: 2,
+            script: String::new(),
+            layers: vec![q0s_format::v2::Layer {
+                layer_id: 1,
+                timeline_frame_count: None,
+                name: "poses".into(),
+                explicit_keyframes: Vec::new(),
+                placements: vec![square_at(0, 0.0), square_at(1, 300.0)],
+            }],
+        });
+        project.q0rgs.push(q0s_format::v2::Q0rg {
+            q0rg_id: 51,
+            name: "head".into(),
+            frame_count: 2,
+            script: String::new(),
+            layers: vec![q0s_format::v2::Layer {
+                layer_id: 1,
+                timeline_frame_count: None,
+                name: "head".into(),
+                explicit_keyframes: Vec::new(),
+                placements: vec![Placement {
+                    target: Target::Q0rg(50),
+                    ..square_at(0, 0.0)
+                }],
+            }],
+        });
+        let head = Placement {
+            target: Target::Q0rg(51),
+            ..square_at(0, 100.0)
+        };
+        project.q0rgs[0].frame_count = 2;
+        project.q0rgs[0].layers[0].placements.push(head.clone());
+        let stage_layer = project.q0rgs[0].layers[0].clone();
+        let index = stage_layer.placements.len() - 1;
+
+        let shown = |frame| placement_shown_frame(&project, 1, &stage_layer, index, frame);
+        assert_eq!(shown(0), Some(0));
+        assert_eq!(shown(1), Some(1));
+        assert_eq!(
+            placement_frame_bbox(&project, &head, 0),
+            Some((100.0, 0.0, 120.0, 20.0))
+        );
+        assert_eq!(
+            placement_frame_bbox(&project, &head, 1),
+            Some((400.0, 0.0, 420.0, 20.0))
+        );
+        let mut cache = PlacementBoundsCache::new(&project);
+        for frame in [0, 1] {
+            assert_eq!(
+                cache.placement_frame_bbox(&project, &head, frame),
+                placement_frame_bbox(&project, &head, frame)
+            );
+        }
+        // The whole-timeline bounds hit-testing uses still span both poses.
+        assert_eq!(
+            placement_bbox(&project, &head),
+            Some((100.0, 0.0, 420.0, 20.0))
+        );
     }
     #[test]
     fn glow_and_shadow_keep_the_body_on_the_vector_render_path() {

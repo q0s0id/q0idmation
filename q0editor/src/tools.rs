@@ -15,8 +15,7 @@ use q0s_format::v2::{
 
 use crate::app::EditorApp;
 use crate::render::{
-    flatten_path, flatten_path_for_stroke, placement_bbox, placement_local_bbox, StageView,
-    TextureCache,
+    flatten_path, flatten_path_for_stroke, placement_bbox, StageView, TextureCache,
 };
 #[cfg(feature = "appearance-mask-eraser")]
 use crate::render::{
@@ -1945,7 +1944,17 @@ fn placement_ref_world_bounds(
     )?;
     let mut visual = placement.clone();
     visual.transform = transform;
-    placement_bbox(project, &visual)
+    // The box goes round what the symbol shows now, as in Animate.
+    match crate::render::placement_shown_frame(
+        project,
+        reference.q0rg_id,
+        layer,
+        reference.placement_idx,
+        frame,
+    ) {
+        Some(shown) => crate::render::placement_frame_bbox(project, &visual, shown),
+        None => placement_bbox(project, &visual),
+    }
 }
 
 /// What a layer shows at `frame`, in stage space: (min x, min y, max x, max y).
@@ -2049,14 +2058,33 @@ impl SelectionOverlayGeometry {
             reference.placement_idx,
             frame,
         )?;
-        let placement = self
+        self.shown_placement_bbox(project, reference, transform, frame)
+    }
+
+    /// The placement's box with its symbol on the frame it shows at `frame`,
+    /// like the plain `placement_ref_world_bounds` the transform handles use.
+    fn shown_placement_bbox(
+        &mut self,
+        project: &ProjectV2,
+        reference: PlacementRef,
+        transform: Transform2D,
+        frame: u16,
+    ) -> Option<(f32, f32, f32, f32)> {
+        let layer = self
             .bounds
-            .layer(project, reference.q0rg_id, reference.layer_id)?
-            .placements
-            .get(reference.placement_idx)?;
-        let mut visual = placement.clone();
+            .layer(project, reference.q0rg_id, reference.layer_id)?;
+        let mut visual = layer.placements.get(reference.placement_idx)?.clone();
         visual.transform = transform;
-        self.bounds.placement_bbox(project, &visual)
+        match crate::render::placement_shown_frame(
+            project,
+            reference.q0rg_id,
+            layer,
+            reference.placement_idx,
+            frame,
+        ) {
+            Some(shown) => self.bounds.placement_frame_bbox(project, &visual, shown),
+            None => self.bounds.placement_bbox(project, &visual),
+        }
     }
 
     fn placement_refs_world_bounds(
@@ -2084,14 +2112,7 @@ impl SelectionOverlayGeometry {
         let (_, visual_affine, _, _) = self
             .placement_local_visual_frame_scoped(project, textures, revision, reference, frame)?;
         let transform = crate::app::affine_to_transform(visual_affine)?;
-        let placement = self
-            .bounds
-            .layer(project, reference.q0rg_id, reference.layer_id)?
-            .placements
-            .get(reference.placement_idx)?;
-        let mut visual = placement.clone();
-        visual.transform = transform;
-        self.bounds.placement_bbox(project, &visual)
+        self.shown_placement_bbox(project, reference, transform, frame)
     }
 
     #[allow(clippy::type_complexity)]
@@ -2112,15 +2133,21 @@ impl SelectionOverlayGeometry {
             reference.placement_idx,
             frame,
         )?;
-        let (target, instance_id) = {
-            let placement = self
-                .bounds
-                .layer(project, reference.q0rg_id, reference.layer_id)?
-                .placements
-                .get(reference.placement_idx)?;
-            (placement.target, placement.instance_id)
-        };
-        let local_bounds = self.bounds.target_local_bbox(project, target);
+        let instance_id = self
+            .bounds
+            .layer(project, reference.q0rg_id, reference.layer_id)?
+            .placements
+            .get(reference.placement_idx)?
+            .instance_id;
+        // Round what the symbol shows now: the outline, its handles, the hit
+        // test and the drag maths all use this one box.
+        let local_bounds = self.bounds.placement_shown_local_bbox(
+            project,
+            reference.q0rg_id,
+            reference.layer_id,
+            reference.placement_idx,
+            frame,
+        );
         let local_frame = self.bounds.q0rg(project, reference.q0rg_id).map(|q0rg| {
             if q0rg.frame_count > 0 {
                 frame % q0rg.frame_count
@@ -13166,13 +13193,20 @@ fn drag_start_data(
         .iter()
         .find(|q| q.q0rg_id == q0rg_id)
         .and_then(|q| q.layers.iter().find(|l| l.layer_id == layer_id))?;
-    let pl = layer.placements.get(placement_idx)?;
     let (active_transform, rig_bound) =
         placement_transform_for_edit(project, q0rg_id, layer_id, placement_idx, frame)?;
-    let mut visual = pl.clone();
-    visual.transform = active_transform;
-    let world = placement_bbox(project, &visual)?;
-    let local = placement_local_bbox(project, &visual)?;
+    // The same box the selection frame shows: what the symbol shows now.
+    let world = placement_ref_world_bounds(
+        project,
+        PlacementRef {
+            q0rg_id,
+            layer_id,
+            placement_idx,
+        },
+        frame,
+    )?;
+    let local =
+        crate::render::placement_shown_local_bbox(project, q0rg_id, layer, placement_idx, frame)?;
     Some((world, local, active_transform, rig_bound))
 }
 

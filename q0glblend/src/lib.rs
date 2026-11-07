@@ -1,6 +1,5 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::num::NonZeroU32;
 use std::sync::{Arc, Weak};
 
 use egui::{pos2, Color32, Mesh, PaintCallback, Painter, Pos2, Rect, Shape, TextureId};
@@ -333,6 +332,10 @@ struct CachedFilteredGroup {
 
 #[cfg(not(target_arch = "wasm32"))]
 const FILTERED_GROUP_CACHE_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+/// Gradient meshes kept on the GPU at once. Imported Animate libraries put
+/// thousands of gradient shapes on one stage.
+#[cfg(not(target_arch = "wasm32"))]
+const GRADIENT_BUFFER_CAPACITY: usize = 8192;
 
 #[cfg(not(target_arch = "wasm32"))]
 const FILTERED_GROUP_CACHE_MAX_ENTRIES: usize = 512;
@@ -356,6 +359,7 @@ struct GpuFilterTimer {
     next_write: usize,
     next_poll: usize,
     filtered_callbacks: u64,
+    polls: u64,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -388,12 +392,16 @@ impl GpuFilterTimer {
             slots,
             next_write: 0,
             next_poll: 0,
+            polls: 0,
             filtered_callbacks: 0,
         }
     }
 
     unsafe fn poll_one(&mut self, gl: &glow::Context) {
-        if self.slots.is_empty() {
+        // Asking whether a query is done waits on the driver like any GL
+        // query. Samples begin once per stride, so poll as often.
+        self.polls = self.polls.wrapping_add(1);
+        if self.slots.is_empty() || !self.polls.is_multiple_of(GPU_FILTER_SAMPLE_STRIDE) {
             return;
         }
         for _ in 0..self.slots.len() {
@@ -508,6 +516,8 @@ struct GlResources {
     gradient_kind_uniform: Option<glow::UniformLocation>,
     gradient_stop_count_uniform: Option<glow::UniformLocation>,
     gradient_stops_uniform: Option<glow::UniformLocation>,
+    gradient_uniform_flag_uniform: Option<glow::UniformLocation>,
+    gradient_uniform_color_uniform: Option<glow::UniformLocation>,
     gradient_tint_uniform: Option<glow::UniformLocation>,
     gradient_additive_uniform: Option<glow::UniformLocation>,
     gradient_color_scale_uniform: Option<glow::UniformLocation>,
@@ -516,6 +526,15 @@ struct GlResources {
     gradient_offscreen_uniform: Option<glow::UniformLocation>,
     gradient_buffers: HashMap<usize, CachedSolidMeshBuffers>,
     gradient_stop_data: Vec<f32>,
+    /// The stops the stop texture holds now. Shapes imported together often
+    /// share a gradient, and re-sending the same stops for each one costs an
+    /// upload into a texture the previous draw is still reading.
+    gradient_stops_uploaded: Vec<GradientStop>,
+    /// The framebuffer egui has bound for the running paint callback, where
+    /// its output belongs. Asking GL for the binding instead stalls until the
+    /// driver catches up (NVIDIA's threaded optimisation), and every filtered
+    /// group asked twice: ~0.3 ms each, 15 ms a frame on a stage of glows.
+    target_framebuffer: Option<glow::Framebuffer>,
     mask_apply_program: glow::Program,
     mask_apply_source_uniform: Option<glow::UniformLocation>,
     mask_apply_mask_uniform: Option<glow::UniformLocation>,
@@ -529,7 +548,8 @@ struct GlResources {
     combine_program: glow::Program,
     combine_body_uniform: Option<glow::UniformLocation>,
     combine_glow_uniform: Option<glow::UniformLocation>,
-    combine_uv_max_uniform: Option<glow::UniformLocation>,
+    combine_body_uv_max_uniform: Option<glow::UniformLocation>,
+    combine_glow_uv_max_uniform: Option<glow::UniformLocation>,
     combine_glow_color_uniform: Option<glow::UniformLocation>,
     combine_glow_strength_uniform: Option<glow::UniformLocation>,
     filter_textures: [glow::Texture; 3],
@@ -653,6 +673,7 @@ pub fn paint_solid_mesh_group_with_opacity_on_opaque_backdrop(
                 let Some(resources) = resources.get_mut(&context_key) else {
                     return;
                 };
+                resources.target_framebuffer = glow_painter.intermediate_fbo();
                 unsafe {
                     resources.paint_solid_group(
                         gl,
@@ -873,6 +894,7 @@ pub fn paint_cached_mesh_affine_color(
                 let Some(resources) = resources.get_mut(&context_key) else {
                     return;
                 };
+                resources.target_framebuffer = glow_painter.intermediate_fbo();
                 unsafe {
                     resources.paint_cached_mesh(
                         gl,
@@ -1474,6 +1496,7 @@ pub fn paint_vector_masked_placements_on_opaque_backdrop(
                 let Some(resources) = resources.get_mut(&context_key) else {
                     return;
                 };
+                resources.target_framebuffer = glow_painter.intermediate_fbo();
                 unsafe {
                     resources.paint_vector_masked_placements(
                         glow_painter,
@@ -1577,6 +1600,7 @@ fn paint_vector_group_fx_impl(
                 let Some(resources) = resources.get_mut(&context_key) else {
                     return;
                 };
+                resources.target_framebuffer = glow_painter.intermediate_fbo();
                 unsafe {
                     resources.paint_vector_group(
                         glow_painter,
@@ -1653,6 +1677,7 @@ pub fn paint_gradient_mesh(
                 let Some(resources) = resources.get_mut(&context_key) else {
                     return;
                 };
+                resources.target_framebuffer = glow_painter.intermediate_fbo();
                 unsafe {
                     resources.paint_gradient(
                         gl,
@@ -1662,6 +1687,83 @@ pub fn paint_gradient_mesh(
                         info.pixels_per_point,
                         info.screen_size_px,
                     );
+                }
+            });
+        });
+        record_paint_callback(painter, rect, None);
+        painter.add(Shape::Callback(PaintCallback {
+            rect,
+            callback: Arc::new(callback),
+        }));
+    }
+}
+
+/// Draw a run of vector meshes, in order, in one paint callback. Solid fills
+/// and strokes ride the gradient shader with a single colour, so once their
+/// meshes are on the GPU a frame sends only transforms and colours. Drawing
+/// a stage of imported Animate art this way replaces thousands of callbacks
+/// and the per-frame upload of every vertex.
+pub fn paint_gradient_mesh_run(painter: &Painter, items: Vec<(Arc<Mesh>, GradientMeshPaint)>) {
+    if items.is_empty() {
+        return;
+    }
+    let rect = painter.clip_rect();
+    if !rect.is_positive() {
+        return;
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        for (mesh, paint) in items {
+            paint_gradient_mesh(painter, rect, mesh, paint);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let items = Arc::new(items);
+        let callback = egui_glow::CallbackFn::new(move |info, glow_painter| {
+            let Some(region) = callback_region(
+                info.viewport,
+                info.clip_rect,
+                info.pixels_per_point,
+                info.screen_size_px,
+            ) else {
+                return;
+            };
+            let gl = glow_painter.gl();
+            let context_key = Arc::as_ptr(gl) as usize;
+            GL_RESOURCES.with(|resources| {
+                let mut resources = resources.borrow_mut();
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    resources.entry(context_key)
+                {
+                    if gl_unavailable(context_key) {
+                        return;
+                    }
+                    let created = match unsafe { GlResources::new(gl) } {
+                        Ok(created) => created,
+                        Err(error) => {
+                            mark_gl_unavailable(context_key, &error);
+                            return;
+                        }
+                    };
+                    entry.insert(created);
+                }
+                let Some(resources) = resources.get_mut(&context_key) else {
+                    return;
+                };
+                resources.target_framebuffer = glow_painter.intermediate_fbo();
+                unsafe {
+                    resources.begin_screen_gradients(
+                        gl,
+                        region,
+                        info.pixels_per_point,
+                        info.screen_size_px,
+                    );
+                    for (mesh, paint) in items.iter() {
+                        resources.draw_gradient(gl, mesh, paint);
+                    }
                 }
             });
         });
@@ -1753,6 +1855,7 @@ fn paint_texture_impl(
                 let Some(resources) = resources.get_mut(&context_key) else {
                     return;
                 };
+                resources.target_framebuffer = glow_painter.intermediate_fbo();
                 unsafe {
                     if fixed_opaque {
                         resources.paint_opaque_fixed(
@@ -1794,6 +1897,27 @@ fn blend_mode_tag(mode: BlendMode) -> i32 {
         BlendMode::Screen => 2,
         BlendMode::Add => 3,
         BlendMode::Overlay => 4,
+    }
+}
+
+/// The part of a reusable target a pass reads: its first `region` texels,
+/// in that texture's own UV space.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SampleWindow {
+    uv_max: [f32; 2],
+    texel: [f32; 2],
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl SampleWindow {
+    fn of(region: CallbackRegion, texture_size: (i32, i32)) -> Self {
+        let width = texture_size.0.max(1) as f32;
+        let height = texture_size.1.max(1) as f32;
+        Self {
+            uv_max: [region.width as f32 / width, region.height as f32 / height],
+            texel: [1.0 / width, 1.0 / height],
+        }
     }
 }
 
@@ -1967,6 +2091,9 @@ impl GlResources {
         let gradient_kind_uniform = gl.get_uniform_location(gradient_program, "u_gradient_kind");
         let gradient_stop_count_uniform = gl.get_uniform_location(gradient_program, "u_stop_count");
         let gradient_stops_uniform = gl.get_uniform_location(gradient_program, "u_stops");
+        let gradient_uniform_flag_uniform = gl.get_uniform_location(gradient_program, "u_uniform");
+        let gradient_uniform_color_uniform =
+            gl.get_uniform_location(gradient_program, "u_uniform_color");
         let gradient_tint_uniform = gl.get_uniform_location(gradient_program, "u_tint");
         let gradient_additive_uniform = gl.get_uniform_location(gradient_program, "u_additive");
         let gradient_color_scale_uniform =
@@ -1989,7 +2116,8 @@ impl GlResources {
         let combine_program = create_filter_combine_program(gl)?;
         let combine_body_uniform = gl.get_uniform_location(combine_program, "u_body");
         let combine_glow_uniform = gl.get_uniform_location(combine_program, "u_glow");
-        let combine_uv_max_uniform = gl.get_uniform_location(combine_program, "u_uv_max");
+        let combine_body_uv_max_uniform = gl.get_uniform_location(combine_program, "u_body_uv_max");
+        let combine_glow_uv_max_uniform = gl.get_uniform_location(combine_program, "u_glow_uv_max");
         let combine_glow_color_uniform = gl.get_uniform_location(combine_program, "u_glow_color");
         let combine_glow_strength_uniform =
             gl.get_uniform_location(combine_program, "u_glow_strength");
@@ -2067,6 +2195,8 @@ impl GlResources {
             gradient_kind_uniform,
             gradient_stop_count_uniform,
             gradient_stops_uniform,
+            gradient_uniform_flag_uniform,
+            gradient_uniform_color_uniform,
             gradient_tint_uniform,
             gradient_additive_uniform,
             gradient_color_scale_uniform,
@@ -2075,6 +2205,8 @@ impl GlResources {
             gradient_offscreen_uniform,
             gradient_buffers: HashMap::new(),
             gradient_stop_data: vec![0.0; 256 * 2 * 4],
+            gradient_stops_uploaded: Vec::new(),
+            target_framebuffer: None,
             mask_apply_program,
             mask_apply_source_uniform,
             mask_apply_mask_uniform,
@@ -2088,7 +2220,8 @@ impl GlResources {
             combine_program,
             combine_body_uniform,
             combine_glow_uniform,
-            combine_uv_max_uniform,
+            combine_body_uv_max_uniform,
+            combine_glow_uv_max_uniform,
             combine_glow_color_uniform,
             combine_glow_strength_uniform,
             filter_textures,
@@ -2404,6 +2537,148 @@ impl GlResources {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// GPU buffers for a gradient mesh: uploaded once, kept while the mesh
+    /// lives. A whole stage of gradient shapes stays resident; this used to
+    /// hold 64 and empty itself when full, so a stage with a thousand
+    /// gradients re-created and re-uploaded nearly every mesh each frame.
+    unsafe fn gradient_mesh_buffers(
+        &mut self,
+        gl: &glow::Context,
+        mesh: &Arc<Mesh>,
+    ) -> (glow::Buffer, glow::Buffer, i32) {
+        let key = Arc::as_ptr(mesh) as usize;
+        if let Some(cached) = self.gradient_buffers.get(&key) {
+            if cached
+                .source
+                .upgrade()
+                .is_some_and(|source| Arc::ptr_eq(&source, mesh))
+            {
+                return (cached.vbo, cached.ebo, cached.index_count);
+            }
+        }
+        if let Some(stale) = self.gradient_buffers.remove(&key) {
+            gl.delete_buffer(stale.vbo);
+            gl.delete_buffer(stale.ebo);
+        }
+        if self.gradient_buffers.len() >= GRADIENT_BUFFER_CAPACITY {
+            // Meshes that are gone first; everything only if all are alive.
+            let mut gone: Vec<usize> = self
+                .gradient_buffers
+                .iter()
+                .filter(|(_, cached)| cached.source.strong_count() == 0)
+                .map(|(key, _)| *key)
+                .collect();
+            if gone.is_empty() {
+                gone = self.gradient_buffers.keys().copied().collect();
+            }
+            for key in gone {
+                if let Some(stale) = self.gradient_buffers.remove(&key) {
+                    gl.delete_buffer(stale.vbo);
+                    gl.delete_buffer(stale.ebo);
+                }
+            }
+        }
+        let vbo = gl.create_buffer().expect("create gradient mesh VBO");
+        let ebo = gl.create_buffer().expect("create gradient mesh EBO");
+        let mut positions = Vec::with_capacity(mesh.vertices.len() * 2);
+        for vertex in &mesh.vertices {
+            positions.extend_from_slice(&[vertex.pos.x, vertex.pos.y]);
+        }
+        let vertex_bytes = std::slice::from_raw_parts(
+            positions.as_ptr().cast::<u8>(),
+            positions.len() * std::mem::size_of::<f32>(),
+        );
+        let index_bytes = std::slice::from_raw_parts(
+            mesh.indices.as_ptr().cast::<u8>(),
+            mesh.indices.len() * std::mem::size_of::<u32>(),
+        );
+        // The element binding belongs to whichever vertex array is bound;
+        // upload through the gradient one, which every draw rebinds anyway.
+        gl.bind_vertex_array(Some(self.gradient_vao));
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, vertex_bytes, glow::STATIC_DRAW);
+        gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(ebo));
+        gl.buffer_data_u8_slice(glow::ELEMENT_ARRAY_BUFFER, index_bytes, glow::STATIC_DRAW);
+        let index_count = mesh.indices.len() as i32;
+        self.gradient_buffers.insert(
+            key,
+            CachedSolidMeshBuffers {
+                source: Arc::downgrade(mesh),
+                vbo,
+                ebo,
+                index_count,
+            },
+        );
+        (vbo, ebo, index_count)
+    }
+
+    /// Give the gradient program, already in use, the colours for `stops`.
+    /// One colour throughout (every solid fill and stroke) is a uniform;
+    /// real gradients go in the stop texture on unit 0, sent only when it
+    /// does not already hold them, and only the stops in use.
+    unsafe fn bind_gradient_stops(&mut self, gl: &glow::Context, stops: &[GradientStop]) {
+        let stops = &stops[..stops.len().min(256)];
+        let Some(first) = stops.first() else {
+            gl.uniform_1_i32(self.gradient_stop_count_uniform.as_ref(), 0);
+            gl.uniform_1_i32(self.gradient_uniform_flag_uniform.as_ref(), 0);
+            return;
+        };
+        gl.uniform_1_i32(
+            self.gradient_stop_count_uniform.as_ref(),
+            stops.len() as i32,
+        );
+        if stops.iter().all(|stop| stop.color == first.color) {
+            gl.uniform_1_i32(self.gradient_uniform_flag_uniform.as_ref(), 1);
+            gl.uniform_4_f32(
+                self.gradient_uniform_color_uniform.as_ref(),
+                f32::from(first.color.r) / 255.0,
+                f32::from(first.color.g) / 255.0,
+                f32::from(first.color.b) / 255.0,
+                f32::from(first.color.a) / 255.0,
+            );
+            return;
+        }
+        gl.uniform_1_i32(self.gradient_uniform_flag_uniform.as_ref(), 0);
+        gl.uniform_1_i32(self.gradient_stops_uniform.as_ref(), 0);
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(self.gradient_stop_texture));
+        if self.gradient_stops_uploaded.as_slice() == stops {
+            return;
+        }
+        let count = stops.len();
+        let data = &mut self.gradient_stop_data;
+        data.clear();
+        for stop in stops {
+            data.extend_from_slice(&[stop.position.clamp(0.0, 1.0), 0.0, 0.0, 0.0]);
+        }
+        for stop in stops {
+            data.extend_from_slice(&[
+                f32::from(stop.color.r) / 255.0,
+                f32::from(stop.color.g) / 255.0,
+                f32::from(stop.color.b) / 255.0,
+                f32::from(stop.color.a) / 255.0,
+            ]);
+        }
+        // Row 0 holds positions and row 1 colours, `count` texels each.
+        let bytes = std::slice::from_raw_parts(
+            data.as_ptr().cast::<u8>(),
+            data.len() * std::mem::size_of::<f32>(),
+        );
+        gl.tex_sub_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            0,
+            0,
+            count as i32,
+            2,
+            glow::RGBA,
+            glow::FLOAT,
+            glow::PixelUnpackData::Slice(bytes),
+        );
+        self.gradient_stops_uploaded.clear();
+        self.gradient_stops_uploaded.extend_from_slice(stops);
+    }
+
     unsafe fn paint_gradient(
         &mut self,
         gl: &glow::Context,
@@ -2413,93 +2688,19 @@ impl GlResources {
         pixels_per_point: f32,
         screen_size_px: [u32; 2],
     ) {
-        let key = Arc::as_ptr(mesh) as usize;
-        let reusable = self
-            .gradient_buffers
-            .get(&key)
-            .and_then(|cached| cached.source.upgrade())
-            .is_some_and(|source| Arc::ptr_eq(&source, mesh));
-        if !reusable {
-            if let Some(stale) = self.gradient_buffers.remove(&key) {
-                gl.delete_buffer(stale.vbo);
-                gl.delete_buffer(stale.ebo);
-            }
-            if self.gradient_buffers.len() >= 64 {
-                let stale: Vec<_> = self
-                    .gradient_buffers
-                    .drain()
-                    .map(|(_, value)| value)
-                    .collect();
-                for stale in stale {
-                    gl.delete_buffer(stale.vbo);
-                    gl.delete_buffer(stale.ebo);
-                }
-            }
-            let vbo = gl.create_buffer().expect("create gradient mesh VBO");
-            let ebo = gl.create_buffer().expect("create gradient mesh EBO");
-            let mut positions = Vec::with_capacity(mesh.vertices.len() * 2);
-            for vertex in &mesh.vertices {
-                positions.extend_from_slice(&[vertex.pos.x, vertex.pos.y]);
-            }
-            let vertex_bytes = std::slice::from_raw_parts(
-                positions.as_ptr().cast::<u8>(),
-                positions.len() * std::mem::size_of::<f32>(),
-            );
-            let index_bytes = std::slice::from_raw_parts(
-                mesh.indices.as_ptr().cast::<u8>(),
-                mesh.indices.len() * std::mem::size_of::<u32>(),
-            );
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, vertex_bytes, glow::STATIC_DRAW);
-            gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(ebo));
-            gl.buffer_data_u8_slice(glow::ELEMENT_ARRAY_BUFFER, index_bytes, glow::STATIC_DRAW);
-            self.gradient_buffers.insert(
-                key,
-                CachedSolidMeshBuffers {
-                    source: Arc::downgrade(mesh),
-                    vbo,
-                    ebo,
-                    index_count: mesh.indices.len() as i32,
-                },
-            );
-        }
-        let cached = self
-            .gradient_buffers
-            .get(&key)
-            .expect("gradient mesh inserted above");
+        self.begin_screen_gradients(gl, region, pixels_per_point, screen_size_px);
+        self.draw_gradient(gl, mesh, paint);
+    }
 
-        // Stop data is a tiny 256x2 floating-point data table, not a spatial
-        // gradient bitmap. The fragment shader still evaluates the field at the
-        // exact screen fragment, so zoom never reveals texels or requires a reraster.
-        let stop_data = &mut self.gradient_stop_data;
-        let stop_count = paint.stops.len().min(256);
-        for (index, stop) in paint.stops.iter().take(stop_count).enumerate() {
-            let position = index * 4;
-            stop_data[position] = stop.position.clamp(0.0, 1.0);
-            let color = 256 * 4 + position;
-            stop_data[color] = f32::from(stop.color.r) / 255.0;
-            stop_data[color + 1] = f32::from(stop.color.g) / 255.0;
-            stop_data[color + 2] = f32::from(stop.color.b) / 255.0;
-            stop_data[color + 3] = f32::from(stop.color.a) / 255.0;
-        }
-        let stop_bytes = std::slice::from_raw_parts(
-            stop_data.as_ptr().cast::<u8>(),
-            stop_data.len() * std::mem::size_of::<f32>(),
-        );
-        gl.active_texture(glow::TEXTURE0);
-        gl.bind_texture(glow::TEXTURE_2D, Some(self.gradient_stop_texture));
-        gl.tex_sub_image_2d(
-            glow::TEXTURE_2D,
-            0,
-            0,
-            0,
-            256,
-            2,
-            glow::RGBA,
-            glow::FLOAT,
-            glow::PixelUnpackData::Slice(stop_bytes),
-        );
-
+    /// State for gradient meshes drawn straight to the screen: set once per
+    /// callback however many meshes follow.
+    unsafe fn begin_screen_gradients(
+        &mut self,
+        gl: &glow::Context,
+        region: CallbackRegion,
+        pixels_per_point: f32,
+        screen_size_px: [u32; 2],
+    ) {
         gl.viewport(0, 0, screen_size_px[0] as i32, screen_size_px[1] as i32);
         gl.enable(glow::SCISSOR_TEST);
         gl.scissor(region.left, region.bottom, region.width, region.height);
@@ -2516,22 +2717,33 @@ impl GlResources {
         );
         gl.use_program(Some(self.gradient_program));
         gl.bind_vertex_array(Some(self.gradient_vao));
-        gl.bind_buffer(glow::ARRAY_BUFFER, Some(cached.vbo));
-        gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(cached.ebo));
-        gl.enable_vertex_attrib_array(0);
-        gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 8, 0);
-
-        let screen_size_points = [
-            screen_size_px[0] as f32 / pixels_per_point,
-            screen_size_px[1] as f32 / pixels_per_point,
-        ];
         gl.uniform_2_f32(
             self.gradient_screen_size_uniform.as_ref(),
-            screen_size_points[0],
-            screen_size_points[1],
+            screen_size_px[0] as f32 / pixels_per_point,
+            screen_size_px[1] as f32 / pixels_per_point,
         );
         gl.uniform_2_f32(self.gradient_screen_offset_uniform.as_ref(), 0.0, 0.0);
         gl.uniform_1_i32(self.gradient_offscreen_uniform.as_ref(), 0);
+    }
+
+    /// One mesh through the gradient program, which must be in use with its
+    /// target uniforms set. The mesh stays on the GPU between frames; only
+    /// its transform and colours are sent.
+    unsafe fn draw_gradient(
+        &mut self,
+        gl: &glow::Context,
+        mesh: &Arc<Mesh>,
+        paint: &GradientMeshPaint,
+    ) {
+        if mesh.indices.is_empty() || mesh.vertices.is_empty() || paint.stops.is_empty() {
+            return;
+        }
+        let (vbo, ebo, index_count) = self.gradient_mesh_buffers(gl, mesh);
+        self.bind_gradient_stops(gl, &paint.stops);
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(ebo));
+        gl.enable_vertex_attrib_array(0);
+        gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 8, 0);
         gl.uniform_2_f32(
             self.gradient_source_origin_uniform.as_ref(),
             paint.transform.source_origin.x,
@@ -2569,8 +2781,6 @@ impl GlResources {
                 GradientKind::Radial => 1,
             },
         );
-        gl.uniform_1_i32(self.gradient_stop_count_uniform.as_ref(), stop_count as i32);
-        gl.uniform_1_i32(self.gradient_stops_uniform.as_ref(), 0);
         gl.uniform_1_i32(
             self.gradient_additive_uniform.as_ref(),
             i32::from(paint.additive),
@@ -2595,13 +2805,19 @@ impl GlResources {
             paint.color_transform.offset[1],
             paint.color_transform.offset[2],
         );
-        gl.draw_elements(glow::TRIANGLES, cached.index_count, glow::UNSIGNED_INT, 0);
+        gl.draw_elements(glow::TRIANGLES, index_count, glow::UNSIGNED_INT, 0);
     }
 
+    /// One blur pass. `source_size` is the size `source` was allocated at.
+    /// The group and filter targets grow separately (a masked layer grows
+    /// the filter ones to the whole screen), and reading one by the size of
+    /// the other samples a shrunken corner of the drawing.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn run_filter_pass(
         &mut self,
         gl: &glow::Context,
         source: glow::Texture,
+        source_size: (i32, i32),
         destination_fbo: glow::Framebuffer,
         region: CallbackRegion,
         direction: [f32; 2],
@@ -2618,15 +2834,16 @@ impl GlResources {
         gl.active_texture(glow::TEXTURE0);
         gl.bind_texture(glow::TEXTURE_2D, Some(source));
         gl.uniform_1_i32(self.filter_source_uniform.as_ref(), 0);
+        let window = SampleWindow::of(region, source_size);
         gl.uniform_2_f32(
             self.filter_uv_max_uniform.as_ref(),
-            region.width as f32 / self.filter_size.0 as f32,
-            region.height as f32 / self.filter_size.1 as f32,
+            window.uv_max[0],
+            window.uv_max[1],
         );
         gl.uniform_2_f32(
             self.filter_texel_uniform.as_ref(),
-            1.0 / self.filter_size.0 as f32,
-            1.0 / self.filter_size.1 as f32,
+            window.texel[0],
+            window.texel[1],
         );
         gl.uniform_2_f32(
             self.filter_direction_uniform.as_ref(),
@@ -2637,10 +2854,12 @@ impl GlResources {
         gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
     }
 
+    #[allow(clippy::too_many_arguments)]
     unsafe fn blur_group_texture(
         &mut self,
         gl: &glow::Context,
         source: glow::Texture,
+        source_size: (i32, i32),
         radius_points: [f32; 2],
         quality: u8,
         region: CallbackRegion,
@@ -2650,19 +2869,23 @@ impl GlResources {
         let (radii_x, _) = gaussian_box_radii(radius_points[0].max(0.0) * pixels_per_point, passes);
         let (radii_y, _) = gaussian_box_radii(radius_points[1].max(0.0) * pixels_per_point, passes);
         let mut current = source;
+        let mut current_size = source_size;
         for index in 0..passes {
             self.run_filter_pass(
                 gl,
                 current,
+                current_size,
                 self.filter_fbos[0],
                 region,
                 [1.0, 0.0],
                 radii_x[index],
             );
             current = self.filter_textures[0];
+            current_size = self.filter_size;
             self.run_filter_pass(
                 gl,
                 current,
+                current_size,
                 self.filter_fbos[1],
                 region,
                 [0.0, 1.0],
@@ -2699,10 +2922,14 @@ impl GlResources {
         );
     }
 
+    /// `glow_mask` is always a filter target; `body` is one too or the
+    /// group target, so each is sampled by its own size.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn combine_body_and_glow(
         &mut self,
         gl: &glow::Context,
         body: glow::Texture,
+        body_size: (i32, i32),
         glow_mask: glow::Texture,
         destination_fbo: glow::Framebuffer,
         fx: VectorGroupFx,
@@ -2722,10 +2949,17 @@ impl GlResources {
         gl.active_texture(glow::TEXTURE1);
         gl.bind_texture(glow::TEXTURE_2D, Some(glow_mask));
         gl.uniform_1_i32(self.combine_glow_uniform.as_ref(), 1);
+        let body_window = SampleWindow::of(region, body_size);
         gl.uniform_2_f32(
-            self.combine_uv_max_uniform.as_ref(),
-            region.width as f32 / self.filter_size.0 as f32,
-            region.height as f32 / self.filter_size.1 as f32,
+            self.combine_body_uv_max_uniform.as_ref(),
+            body_window.uv_max[0],
+            body_window.uv_max[1],
+        );
+        let glow_window = SampleWindow::of(region, self.filter_size);
+        gl.uniform_2_f32(
+            self.combine_glow_uv_max_uniform.as_ref(),
+            glow_window.uv_max[0],
+            glow_window.uv_max[1],
         );
         let [r, g, b, a] = fx.glow_color.to_array();
         gl.uniform_4_f32(
@@ -2993,10 +3227,8 @@ impl GlResources {
 
         let gpu_timer_query = self.gpu_filter_timer.begin_sample(gl, filtered);
 
-        let read_binding = gl.get_parameter_i32(glow::READ_FRAMEBUFFER_BINDING);
-        let draw_binding = gl.get_parameter_i32(glow::DRAW_FRAMEBUFFER_BINDING);
-        let read_framebuffer = native_framebuffer(read_binding);
-        let draw_framebuffer = native_framebuffer(draw_binding);
+        let read_framebuffer = self.target_framebuffer;
+        let draw_framebuffer = self.target_framebuffer;
 
         let target_setup_started = std::time::Instant::now();
         self.ensure_group_targets(gl, region.width, region.height);
@@ -3227,116 +3459,8 @@ impl GlResources {
                     primitive_count = primitive_count.saturating_add(1);
                     vertex_count = vertex_count.saturating_add(mesh.vertices.len() as u64);
                     index_count = index_count.saturating_add(mesh.indices.len() as u64);
-                    let key = Arc::as_ptr(mesh) as usize;
-                    let gradient_buffer_started = std::time::Instant::now();
-                    let reusable = self
-                        .gradient_buffers
-                        .get(&key)
-                        .and_then(|cached| cached.source.upgrade())
-                        .is_some_and(|source| Arc::ptr_eq(&source, mesh));
-                    if !reusable {
-                        if let Some(stale) = self.gradient_buffers.remove(&key) {
-                            gl.delete_buffer(stale.vbo);
-                            gl.delete_buffer(stale.ebo);
-                        }
-                        if self.gradient_buffers.len() >= 64 {
-                            let stale: Vec<_> = self
-                                .gradient_buffers
-                                .drain()
-                                .map(|(_, value)| value)
-                                .collect();
-                            for stale in stale {
-                                gl.delete_buffer(stale.vbo);
-                                gl.delete_buffer(stale.ebo);
-                            }
-                        }
-                        let vbo = gl.create_buffer().expect("create group gradient VBO");
-                        let ebo = gl.create_buffer().expect("create group gradient EBO");
-                        let mut positions = Vec::with_capacity(mesh.vertices.len() * 2);
-                        for vertex in &mesh.vertices {
-                            positions.extend_from_slice(&[vertex.pos.x, vertex.pos.y]);
-                        }
-                        let vertex_bytes = std::slice::from_raw_parts(
-                            positions.as_ptr().cast::<u8>(),
-                            positions.len() * std::mem::size_of::<f32>(),
-                        );
-                        let index_bytes = std::slice::from_raw_parts(
-                            mesh.indices.as_ptr().cast::<u8>(),
-                            mesh.indices.len() * std::mem::size_of::<u32>(),
-                        );
-                        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-                        gl.buffer_data_u8_slice(
-                            glow::ARRAY_BUFFER,
-                            vertex_bytes,
-                            glow::STATIC_DRAW,
-                        );
-                        gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(ebo));
-                        gl.buffer_data_u8_slice(
-                            glow::ELEMENT_ARRAY_BUFFER,
-                            index_bytes,
-                            glow::STATIC_DRAW,
-                        );
-                        self.gradient_buffers.insert(
-                            key,
-                            CachedSolidMeshBuffers {
-                                source: Arc::downgrade(mesh),
-                                vbo,
-                                ebo,
-                                index_count: mesh.indices.len() as i32,
-                            },
-                        );
-                    }
-                    raster_upload_ns = raster_upload_ns.saturating_add(
-                        gradient_buffer_started
-                            .elapsed()
-                            .as_nanos()
-                            .min(u128::from(u64::MAX)) as u64,
-                    );
-                    let cached = self
-                        .gradient_buffers
-                        .get(&key)
-                        .expect("group gradient buffers");
-                    let stop_data = &mut self.gradient_stop_data;
-                    let stop_count = paint.stops.len().min(256);
-                    for (index, stop) in paint.stops.iter().take(stop_count).enumerate() {
-                        let position = index * 4;
-                        stop_data[position] = stop.position.clamp(0.0, 1.0);
-                        let color = 256 * 4 + position;
-                        stop_data[color] = f32::from(stop.color.r) / 255.0;
-                        stop_data[color + 1] = f32::from(stop.color.g) / 255.0;
-                        stop_data[color + 2] = f32::from(stop.color.b) / 255.0;
-                        stop_data[color + 3] = f32::from(stop.color.a) / 255.0;
-                    }
-                    let stop_bytes = std::slice::from_raw_parts(
-                        stop_data.as_ptr().cast::<u8>(),
-                        stop_data.len() * std::mem::size_of::<f32>(),
-                    );
-                    gl.active_texture(glow::TEXTURE0);
-                    gl.bind_texture(glow::TEXTURE_2D, Some(self.gradient_stop_texture));
-                    let stop_upload_started = std::time::Instant::now();
-                    gl.tex_sub_image_2d(
-                        glow::TEXTURE_2D,
-                        0,
-                        0,
-                        0,
-                        256,
-                        2,
-                        glow::RGBA,
-                        glow::FLOAT,
-                        glow::PixelUnpackData::Slice(stop_bytes),
-                    );
-                    raster_upload_ns = raster_upload_ns.saturating_add(
-                        stop_upload_started
-                            .elapsed()
-                            .as_nanos()
-                            .min(u128::from(u64::MAX)) as u64,
-                    );
                     gl.use_program(Some(self.gradient_program));
                     gl.bind_vertex_array(Some(self.gradient_vao));
-                    gl.bind_buffer(glow::ARRAY_BUFFER, Some(cached.vbo));
-                    gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(cached.ebo));
-                    gl.enable_vertex_attrib_array(0);
-                    gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 8, 0);
                     gl.uniform_2_f32(
                         self.gradient_screen_size_uniform.as_ref(),
                         group_size_points[0],
@@ -3348,71 +3472,8 @@ impl GlResources {
                         group_offset_points[1],
                     );
                     gl.uniform_1_i32(self.gradient_offscreen_uniform.as_ref(), 1);
-                    gl.uniform_2_f32(
-                        self.gradient_source_origin_uniform.as_ref(),
-                        paint.transform.source_origin.x,
-                        paint.transform.source_origin.y,
-                    );
-                    gl.uniform_2_f32(
-                        self.gradient_target_origin_uniform.as_ref(),
-                        paint.transform.target_origin.x,
-                        paint.transform.target_origin.y,
-                    );
-                    gl.uniform_4_f32(
-                        self.gradient_linear_uniform.as_ref(),
-                        paint.transform.linear[0],
-                        paint.transform.linear[1],
-                        paint.transform.linear[2],
-                        paint.transform.linear[3],
-                    );
-                    let inv = paint.gradient_inverse;
-                    gl.uniform_4_f32(
-                        self.gradient_inverse_linear_uniform.as_ref(),
-                        inv[0],
-                        inv[1],
-                        inv[2],
-                        inv[3],
-                    );
-                    gl.uniform_2_f32(
-                        self.gradient_inverse_translation_uniform.as_ref(),
-                        inv[4],
-                        inv[5],
-                    );
-                    gl.uniform_1_i32(
-                        self.gradient_kind_uniform.as_ref(),
-                        match paint.kind {
-                            GradientKind::Linear => 0,
-                            GradientKind::Radial => 1,
-                        },
-                    );
-                    gl.uniform_1_i32(self.gradient_stop_count_uniform.as_ref(), stop_count as i32);
-                    gl.uniform_1_i32(self.gradient_stops_uniform.as_ref(), 0);
-                    gl.uniform_1_i32(
-                        self.gradient_additive_uniform.as_ref(),
-                        i32::from(paint.additive),
-                    );
-                    let [tr, tg, tb, ta] = paint.tint.to_srgba_unmultiplied();
-                    gl.uniform_4_f32(
-                        self.gradient_tint_uniform.as_ref(),
-                        f32::from(tr) / 255.0,
-                        f32::from(tg) / 255.0,
-                        f32::from(tb) / 255.0,
-                        f32::from(ta) / 255.0,
-                    );
-                    gl.uniform_3_f32(
-                        self.gradient_color_scale_uniform.as_ref(),
-                        paint.color_transform.scale[0],
-                        paint.color_transform.scale[1],
-                        paint.color_transform.scale[2],
-                    );
-                    gl.uniform_3_f32(
-                        self.gradient_color_offset_uniform.as_ref(),
-                        paint.color_transform.offset[0],
-                        paint.color_transform.offset[1],
-                        paint.color_transform.offset[2],
-                    );
                     let draw_started = std::time::Instant::now();
-                    gl.draw_elements(glow::TRIANGLES, cached.index_count, glow::UNSIGNED_INT, 0);
+                    self.draw_gradient(gl, mesh, paint);
                     raster_draw_ns = raster_draw_ns.saturating_add(
                         draw_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
                     );
@@ -3455,6 +3516,7 @@ impl GlResources {
             let glow_result = self.blur_group_texture(
                 gl,
                 self.group_texture,
+                self.group_size,
                 fx.glow_radius_points,
                 fx.glow_quality,
                 region,
@@ -3470,6 +3532,7 @@ impl GlResources {
             source_texture = self.blur_group_texture(
                 gl,
                 self.group_texture,
+                self.group_size,
                 fx.blur_radius_points,
                 fx.blur_quality,
                 region,
@@ -3489,6 +3552,7 @@ impl GlResources {
                 self.combine_body_and_glow(
                     gl,
                     source_texture,
+                    source_size,
                     glow_mask,
                     self.group_fbo,
                     fx,
@@ -3501,6 +3565,7 @@ impl GlResources {
                 self.combine_body_and_glow(
                     gl,
                     self.group_texture,
+                    self.group_size,
                     glow_mask,
                     self.filter_fbos[0],
                     fx,
@@ -3649,10 +3714,8 @@ impl GlResources {
         pixels_per_point: f32,
         screen_size_px: [u32; 2],
     ) {
-        let read_framebuffer =
-            native_framebuffer(gl.get_parameter_i32(glow::READ_FRAMEBUFFER_BINDING));
-        let draw_framebuffer =
-            native_framebuffer(gl.get_parameter_i32(glow::DRAW_FRAMEBUFFER_BINDING));
+        let read_framebuffer = self.target_framebuffer;
+        let draw_framebuffer = self.target_framebuffer;
         self.ensure_group_targets(gl, region.width, region.height);
         self.ensure_filter_targets(
             gl,
@@ -3764,10 +3827,8 @@ impl GlResources {
         pixels_per_point: f32,
         screen_size_px: [u32; 2],
     ) {
-        let read_binding = gl.get_parameter_i32(glow::READ_FRAMEBUFFER_BINDING);
-        let draw_binding = gl.get_parameter_i32(glow::DRAW_FRAMEBUFFER_BINDING);
-        let read_framebuffer = native_framebuffer(read_binding);
-        let draw_framebuffer = native_framebuffer(draw_binding);
+        let read_framebuffer = self.target_framebuffer;
+        let draw_framebuffer = self.target_framebuffer;
 
         self.ensure_group_targets(gl, region.width, region.height);
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.group_msaa_fbo));
@@ -3949,10 +4010,8 @@ impl GlResources {
         source_srgb: bool,
         opacity: f32,
     ) {
-        let read_binding = gl.get_parameter_i32(glow::READ_FRAMEBUFFER_BINDING);
-        let draw_binding = gl.get_parameter_i32(glow::DRAW_FRAMEBUFFER_BINDING);
-        let read_framebuffer = native_framebuffer(read_binding);
-        let draw_framebuffer = native_framebuffer(draw_binding);
+        let read_framebuffer = self.target_framebuffer;
+        let draw_framebuffer = self.target_framebuffer;
 
         let backdrop_capacity =
             grown_target_capacity(self.backdrop_size, (region.width, region.height));
@@ -4055,11 +4114,6 @@ impl GlResources {
         );
         gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
     }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn native_framebuffer(raw: i32) -> Option<glow::Framebuffer> {
-    NonZeroU32::new(raw as u32).map(glow::NativeFramebuffer)
 }
 
 unsafe fn create_program(gl: &glow::Context) -> Result<glow::Program, String> {
@@ -4427,6 +4481,8 @@ uniform vec2 u_gradient_inverse_translation;
 uniform int u_gradient_kind;
 uniform int u_stop_count;
 uniform sampler2D u_stops;
+uniform int u_uniform;
+uniform vec4 u_uniform_color;
 uniform vec4 u_tint;
 uniform int u_additive;
 in vec2 v_local;
@@ -4469,7 +4525,7 @@ void main() {
             + u_gradient_inverse_translation.y
     );
     float t = u_gradient_kind == 0 ? (g.x + 1.0) * 0.5 : length(g);
-    vec4 color = sample_gradient(t);
+    vec4 color = u_uniform != 0 ? u_uniform_color : sample_gradient(t);
     color *= u_tint;
     color.rgb = color.rgb * u_color_scale + u_color_offset;
     // q0/egui compositing is premultiplied-alpha; no alpha adds the light.
@@ -4609,15 +4665,15 @@ void main() {
     const FRAGMENT: &str = r#"#version 140
 uniform sampler2D u_body;
 uniform sampler2D u_glow;
-uniform vec2 u_uv_max;
+uniform vec2 u_body_uv_max;
+uniform vec2 u_glow_uv_max;
 uniform vec4 u_glow_color;
 uniform float u_glow_strength;
 in vec2 v_uv;
 out vec4 out_color;
 void main() {
-    vec2 uv = v_uv * u_uv_max;
-    vec4 body = texture(u_body, uv);
-    float glow_alpha = clamp(texture(u_glow, uv).a * u_glow_color.a * u_glow_strength, 0.0, 1.0);
+    vec4 body = texture(u_body, v_uv * u_body_uv_max);
+    float glow_alpha = clamp(texture(u_glow, v_uv * u_glow_uv_max).a * u_glow_color.a * u_glow_strength, 0.0, 1.0);
     vec4 glow = vec4(u_glow_color.rgb * glow_alpha, glow_alpha);
     out_color = body + glow * (1.0 - body.a);
 }
@@ -4801,6 +4857,31 @@ void main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A masked layer grows the filter targets to the screen while the group
+    /// target stays small. Each pass has to read its source by that source's
+    /// own size: reading the 256-wide group texture as if it were 1536 wide
+    /// saw a sixth of the drawing, which made glows into offset, cut-off blobs.
+    #[test]
+    fn a_pass_reads_its_source_by_its_own_size() {
+        let region = CallbackRegion {
+            left: 300,
+            bottom: 200,
+            width: 240,
+            height: 80,
+            source_uv_min: [0.0, 0.0],
+            source_uv_max: [1.0, 1.0],
+        };
+        let group = SampleWindow::of(region, (256, 256));
+        assert_eq!(group.uv_max, [240.0 / 256.0, 80.0 / 256.0]);
+        assert_eq!(group.texel, [1.0 / 256.0, 1.0 / 256.0]);
+        let filter = SampleWindow::of(region, (1536, 1024));
+        assert_eq!(filter.uv_max, [240.0 / 1536.0, 80.0 / 1024.0]);
+        assert_ne!(group, filter);
+        // The same texels are covered either way.
+        assert_eq!(group.uv_max[0] / group.texel[0], 240.0);
+        assert_eq!(filter.uv_max[1] / filter.texel[1], 80.0);
+    }
 
     #[test]
     fn paint_diagnostics_count_filter_passes_and_visible_work() {
