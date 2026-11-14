@@ -123,19 +123,32 @@ fn raw_graphics_ctrl_g_shortcut_reaches_convert_action() {
 
     invoke_shortcut(&mut app, egui::Key::G, egui::Modifiers::COMMAND);
 
-    let layer = app
-        .state
-        .project
-        .q0rgs
-        .iter()
-        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
-        .unwrap()
-        .layers
-        .iter()
-        .find(|layer| layer.layer_id == layer_id)
-        .unwrap();
+    let placements = |app: &EditorApp| {
+        app.state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+            .unwrap()
+            .layers
+            .iter()
+            .find(|layer| layer.layer_id == layer_id)
+            .unwrap()
+            .placements
+            .clone()
+    };
+    // Ctrl+G asks for the symbol's name and folder first: nothing is made
+    // until the prompt is confirmed, which runs the convert action.
     assert!(matches!(
-        layer.placements.as_slice(),
+        placements(&app).as_slice(),
+        [Placement {
+            target: Target::Asset(_),
+            ..
+        }]
+    ));
+    drive_one(&mut app, Action::ConvertSelectionToQ0rg);
+    assert!(matches!(
+        placements(&app).as_slice(),
         [Placement {
             target: Target::Q0rg(_),
             ..

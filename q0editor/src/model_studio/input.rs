@@ -28,7 +28,13 @@ fn start_handle(studio: &mut ModelStudio, handle: Handle, press: Pos2) {
                 OpKind::Grab
             };
             let label = ["yz plane", "xz plane", "xy plane"][i];
-            view::begin(studio, kind, press, Constraint::Plane(axes[i]), label)
+            view::begin(
+                studio,
+                kind,
+                press,
+                Constraint::Plane(gizmo::plane_normal(axes, i)),
+                label,
+            )
         }
         Handle::Ring(i) => view::begin(
             studio,

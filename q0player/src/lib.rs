@@ -6,6 +6,35 @@ mod transport;
 #[cfg(feature = "native-ui")]
 pub mod ui;
 
+/// What scripts read as `app.*` and `save.*` (q0.app). A QIR app fills it
+/// from its manifest; a movie opened in the player from its file name.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AppGlobals {
+    pub name: String,
+    pub id: String,
+    pub version: String,
+    pub author: String,
+    /// Running as an app of its own, built by Q0Build.
+    pub packaged: bool,
+    pub debug: bool,
+    /// The command line after the program, separated by spaces.
+    pub args: String,
+    pub saves: std::collections::BTreeMap<String, q0s_format::q0lang::runtime::RuntimeValue>,
+}
+
+/// `app.platform`.
+pub const PLATFORM: &str = if cfg!(target_os = "android") {
+    "android"
+} else if cfg!(target_arch = "wasm32") {
+    "web"
+} else if cfg!(windows) {
+    "windows"
+} else if cfg!(target_os = "macos") {
+    "macos"
+} else {
+    "linux"
+};
+
 #[cfg(target_arch = "wasm32")]
 pub mod web;
 
@@ -141,6 +170,8 @@ pub struct Player {
     solids: Vec<(LayerRef, String)>,
     /// What scripts asked of the window, for the app to pick up.
     window_requests: Vec<WindowCommand>,
+    /// Who the app is and what it saved: `app.*` and `save.*`.
+    app: AppGlobals,
     window: WindowInfo,
     /// The movie's scripts read `input.up` or `input.down`: touch screens
     /// show a four-way pad.
@@ -440,6 +471,7 @@ impl Player {
             collision: None,
             solids: Vec::new(),
             window_requests: Vec::new(),
+            app: AppGlobals::default(),
             window: WindowInfo::default(),
             four_way: false,
             objects: objects::ObjectWorld::default(),
@@ -508,6 +540,7 @@ impl Player {
                 collision: None,
                 solids: Vec::new(),
                 window_requests: Vec::new(),
+                app: AppGlobals::default(),
                 window: WindowInfo::default(),
                 four_way: false,
                 objects: objects::ObjectWorld::default(),
@@ -578,6 +611,7 @@ impl Player {
                 collision: None,
                 solids: Vec::new(),
                 window_requests: Vec::new(),
+                app: AppGlobals::default(),
                 window: WindowInfo::default(),
                 four_way: false,
                 objects: objects::ObjectWorld::default(),
@@ -1341,11 +1375,25 @@ impl Player {
             .collect::<Vec<_>>();
         let fixed_dt = 1.0 / f64::from(self.fps().max(1));
         let window = self.window_globals();
+        let app = self.app_globals();
+        let (current_frame, total_frames) = (self.current_frame(), self.total_frames());
         let Some(runtime) = self.q0lang.as_mut() else {
             return;
         };
+        // Flash's names for the root timeline, for converted movies: 1-based.
+        runtime.vars.insert(
+            "_currentframe".into(),
+            RuntimeValue::Number(current_frame as f64 + 1.0),
+        );
+        runtime.vars.insert(
+            "_totalframes".into(),
+            RuntimeValue::Number(total_frames as f64),
+        );
         for (name, value) in window {
             runtime.vars.insert(name.into(), value);
+        }
+        for (name, value) in app {
+            runtime.vars.insert(name, value);
         }
         runtime
             .vars
@@ -1465,6 +1513,8 @@ impl Player {
     ) {
         for action in actions {
             match action {
+                RuntimeAction::GoRun(TimelineTarget::Here) => self.playing = true,
+                RuntimeAction::GoStop(TimelineTarget::Here) => self.playing = false,
                 RuntimeAction::GoRun(target) => {
                     if let Some(frame) = self.resolve_timeline_target(target) {
                         self.playing = true;
@@ -1516,6 +1566,19 @@ impl Player {
                     self.apply_live_action(action);
                 }
                 RuntimeAction::Layer(command) => self.apply_layer_command(command),
+                // `rootrun!`/`rootstop!`: what the main timeline's own
+                // `gorun!`/`gostop!` (or `play!`/`stop!`) would do.
+                RuntimeAction::Window(WindowCommand::RootTimeline { play, target }) => {
+                    let step = if *play {
+                        RuntimeAction::GoRun(target.clone())
+                    } else {
+                        RuntimeAction::GoStop(target.clone())
+                    };
+                    self.apply_q0lang_actions_with_budget(
+                        std::slice::from_ref(&step),
+                        transition_budget,
+                    );
+                }
                 RuntimeAction::Window(command) => self.request_window(command.clone()),
             }
         }
@@ -1719,6 +1782,9 @@ impl Player {
     fn resolve_timeline_target(&self, target: &TimelineTarget) -> Option<usize> {
         match target {
             TimelineTarget::Frame(frame) => Some(usize::from(*frame)),
+            TimelineTarget::Here => Some(self.current_frame()),
+            TimelineTarget::Next => Some(self.current_frame() + 1),
+            TimelineTarget::Previous => Some(self.current_frame().saturating_sub(1)),
             TimelineTarget::Label(label) => {
                 let named = match &self.inner {
                     Inner::V2 {
@@ -4108,6 +4174,94 @@ hidden_hit = q0layer.touches("bones", "soul")
         assert!(
             (90..170).contains(&line),
             "the walls are half see-through: {line}"
+        );
+    }
+
+    #[test]
+    fn the_q0app_example_in_the_docs_parses() {
+        let docs = include_str!("../../docs/q0lang/builtins.md");
+        let start = docs.find("## q0.app").expect("q0.app section");
+        // Line endings differ between checkouts (autocrlf), so the fence's
+        // line ends wherever its newline is.
+        let example = docs[start..]
+            .split("```q0lang")
+            .nth(1)
+            .and_then(|rest| rest.split_once('\n'))
+            .and_then(|(_, rest)| rest.split("```").next())
+            .expect("an example");
+        let program = q0s_format::q0lang::parser::parse(example);
+        assert!(program.diagnostics.is_empty(), "{:?}", program.diagnostics);
+    }
+
+    #[test]
+    fn scripts_save_log_and_open_links_through_q0app() {
+        let bytes = q0s_v2_with_entry_script(
+            r#"import q0.app
+q0app.save! "best", 42
+q0app.log! "saved", 42
+q0app.open! "https://q0id.com"
+q0app.open! "file:///etc/passwd"
+"#,
+            1,
+        );
+        let mut player = Player::from_bytes(&bytes).expect("app script");
+        let requests = player.take_window_requests();
+        assert!(requests.contains(&WindowCommand::AppSave {
+            key: "best".into(),
+            value: RuntimeValue::Number(42.0),
+        }));
+        assert!(requests.contains(&WindowCommand::AppLog("saved 42".into())));
+        assert!(requests.contains(&WindowCommand::AppOpen("https://q0id.com".into())));
+        assert!(
+            !requests.iter().any(
+                |request| matches!(request, WindowCommand::AppOpen(url) if url.starts_with("file:"))
+            ),
+            "only web pages open"
+        );
+        player.tick(1.0 / 30.0);
+        assert_eq!(runtime_var(&player, "save.best").as_deref(), Some("42"));
+        assert_eq!(
+            runtime_var(&player, "app.platform").as_deref(),
+            Some(crate::PLATFORM)
+        );
+        assert_eq!(
+            runtime_var(&player, "app.packaged").as_deref(),
+            Some("false")
+        );
+    }
+
+    #[test]
+    fn scripts_choose_what_fills_the_window_around_the_movie() {
+        use q0s_format::q0lang::runtime::Backdrop;
+        let bytes = q0s_v2_with_entry_script(
+            r##"import q0.window
+q0window.background! "#102030"
+q0window.background! "stage"
+q0window.background! 255, 0, 8
+q0window.background! null
+q0window.background! "nonsense"
+q0window.background! 300, 0, 0
+"##,
+            1,
+        );
+        let mut player = Player::from_bytes(&bytes).expect("background script");
+        let backgrounds: Vec<_> = player
+            .take_window_requests()
+            .into_iter()
+            .filter_map(|request| match request {
+                WindowCommand::Background(choice) => Some(choice),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            backgrounds,
+            [
+                Backdrop::Color([0x10, 0x20, 0x30]),
+                Backdrop::Stage,
+                Backdrop::Color([255, 0, 8]),
+                Backdrop::Default,
+            ],
+            "bad colours are reported, not applied"
         );
     }
 

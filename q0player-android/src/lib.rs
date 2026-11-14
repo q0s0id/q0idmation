@@ -31,11 +31,36 @@ fn android_main(app: AndroidApp) {
     );
     log::info!("framebuffer multisampling: {multisampling}x");
 
+    // A QIR app carries its movie in its assets: Q0Build put it there.
+    let qir = app
+        .asset_manager()
+        .open(c"qir/app.qir")
+        .and_then(|mut asset| {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            asset.read_to_end(&mut bytes).ok()?;
+            match q0qir::Bundle::decode(&bytes, true) {
+                Ok(bundle) => Some(bundle),
+                Err(error) => {
+                    log::error!("the app's bundle cannot be read: {error}");
+                    None
+                }
+            }
+        });
+    if let Some(bundle) = &qir {
+        log::info!(
+            "QIR app: {} {}",
+            bundle.manifest.app.name,
+            bundle.manifest.app.version
+        );
+    }
+
     let launch = Launch {
         multisampling,
         event_loop_builder: Some(Box::new(move |builder| {
             builder.with_android_app(app);
         })),
+        qir,
         ..Launch::default()
     };
     if let Err(error) = q0player::ui::launch::run(launch) {

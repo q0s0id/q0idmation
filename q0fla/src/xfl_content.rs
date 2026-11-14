@@ -3061,7 +3061,7 @@ pub(crate) fn decode_lossless_bitmap_dat(bytes: &[u8]) -> Result<(u16, u16, Vec<
     Ok((width, height, rgba))
 }
 /// A JPEG bitmap, which Animate keeps in `bin/` exactly as imported.
-fn decode_jpeg(bytes: &[u8]) -> Result<(u16, u16, Vec<u8>), ImportError> {
+pub(crate) fn decode_jpeg(bytes: &[u8]) -> Result<(u16, u16, Vec<u8>), ImportError> {
     let mut decoder = jpeg_decoder::Decoder::new(bytes);
     let pixels = decoder
         .decode()

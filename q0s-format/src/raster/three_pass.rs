@@ -22,6 +22,8 @@ struct Group {
     h: u32,
     /// Stage space to this buffer's pixels.
     to_output: Affine,
+    /// Remove the flat camera affine when projecting through the moved 3D camera.
+    remove_camera_affine: Affine,
     look: SceneLook,
     items: Vec<DrawItem>,
     flat: FlatCut,
@@ -29,6 +31,16 @@ struct Group {
     layer_lit: bool,
     /// Liquids on this frame, drawn when their layer comes round.
     liquids: Vec<(u16, DrawItem)>,
+}
+
+impl Group {
+    fn view(&self, project: &ProjectV2) -> crate::three::draw::View3d {
+        self.look.view(
+            project,
+            Affine::compose(self.to_output, self.remove_camera_affine),
+            [self.w, self.h],
+        )
+    }
 }
 
 thread_local! {
@@ -61,6 +73,7 @@ pub(crate) fn begin_root(
     w: u32,
     h: u32,
     scene_state: &RuntimeSceneState,
+    timeline_camera_frame: Option<u16>,
 ) -> bool {
     if !frame::project_uses_3d(project) {
         return false;
@@ -83,11 +96,19 @@ pub(crate) fn begin_root(
     } else {
         frame::liquid_items(project, q0rg_id, local_frame)
     };
+    let remove_camera_affine = if CARD.with(Cell::get) == 0 {
+        timeline_camera_frame.map_or(Affine::IDENTITY, |frame| {
+            look.apply_timeline_camera(project, q0rg_id, frame)
+        })
+    } else {
+        Affine::IDENTITY
+    };
     let group = Group {
         buffer: ptr(buffer),
         w,
         h,
         to_output: root,
+        remove_camera_affine,
         flat: look.flat_cut(),
         look,
         items: Vec::new(),
@@ -118,6 +139,7 @@ pub(crate) fn begin_scope(buffer: &[u8], w: u32, h: u32, dx: f32, dy: f32) -> bo
                 },
                 top.to_output,
             ),
+            remove_camera_affine: top.remove_camera_affine,
             look: top.look.clone(),
             items: Vec::new(),
             flat: FlatCut::OFF,
@@ -138,7 +160,7 @@ pub(crate) fn flush(project: &ProjectV2, buffer: &mut [u8]) {
             return None;
         }
         Some(Frame3d {
-            view: top.look.view(project, top.to_output, [top.w, top.h]),
+            view: top.view(project),
             rig: top.look.rig.clone(),
             items: std::mem::take(&mut top.items),
             overlay: None,
@@ -160,7 +182,7 @@ pub(crate) fn end(project: &ProjectV2, buffer: &mut [u8]) {
 }
 
 /// The next root layer: is its flat art lit by the 3D lights?
-pub(crate) fn next_layer(layer_id: u16) -> bool {
+pub(crate) fn next_layer(layer_id: u16, visible: bool) -> bool {
     STACK.with(|stack| {
         let mut stack = stack.borrow_mut();
         let Some(top) = stack.last_mut() else {
@@ -171,10 +193,48 @@ pub(crate) fn next_layer(layer_id: u16) -> bool {
                 .into_iter()
                 .partition(|(layer, _)| *layer == layer_id);
             top.liquids = later;
-            top.items.extend(here.into_iter().map(|(_, item)| item));
+            if visible {
+                top.items.extend(here.into_iter().map(|(_, item)| item));
+            }
         }
         top.layer_lit = top.flat.layer(layer_id);
         top.layer_lit
+    })
+}
+
+fn placement_asset(project: &ProjectV2, target: Target) -> Option<&Asset> {
+    match target {
+        Target::Asset(id) => project.assets.iter().find(|asset| asset.id() == id),
+        Target::Q0rg(_) => None,
+    }
+}
+
+fn lit_flat_asset(asset: Option<&Asset>, layer_lit: bool) -> bool {
+    layer_lit
+        && matches!(
+            asset,
+            Some(Asset::Vector(_) | Asset::Bitmap(_) | Asset::Q0v(_))
+        )
+}
+
+/// Flat bounds cannot crop a model, a projected card, or a symbol whose
+/// children may be drawn by this 3D group.
+pub(crate) fn needs_projected_bounds(
+    project: &ProjectV2,
+    placement: &Placement,
+    fx: &PlacementFx,
+    buffer: &[u8],
+) -> bool {
+    STACK.with(|stack| {
+        stack.borrow().last().is_some_and(|group| {
+            if group.buffer != ptr(buffer) {
+                return false;
+            }
+            let asset = placement_asset(project, placement.target);
+            matches!(placement.target, Target::Q0rg(_))
+                || frame::is_3d(asset, fx)
+                || lit_flat_asset(asset, group.layer_lit)
+        })
     })
 }
 
@@ -201,15 +261,8 @@ pub(crate) fn take(
         if top.buffer != ptr(buffer) {
             return false;
         }
-        let asset = match placement.target {
-            Target::Asset(id) => project.assets.iter().find(|asset| asset.id() == id),
-            Target::Q0rg(_) => None,
-        };
-        let lit_flat = top.layer_lit
-            && matches!(
-                asset,
-                Some(Asset::Vector(_) | Asset::Bitmap(_) | Asset::Q0v(_))
-            );
+        let asset = placement_asset(project, placement.target);
+        let lit_flat = lit_flat_asset(asset, top.layer_lit);
         if !frame::is_3d(asset, fx) && !lit_flat {
             return false;
         }
@@ -220,7 +273,7 @@ pub(crate) fn take(
         let matrix = frame::placement_space_matrix(&lift(stage_parent), local, fx, placement.pivot);
         let space = fx.three.unwrap_or_default();
         let elapsed = local_frame.saturating_sub(playback_start_frame);
-        let view = top.look.view(project, top.to_output, [top.w, top.h]);
+        let view = top.view(project);
         let opacity = fx.opacity.clamp(0.0, 1.0);
         match (placement.target, asset) {
             (_, Some(Asset::Model(model))) => frame::model_items(

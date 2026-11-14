@@ -224,6 +224,9 @@ impl Default for Runtime {
 
 fn resolve_timeline_target(value: RuntimeValue) -> TimelineTarget {
     match value {
+        RuntimeValue::String(label) if label == TIMELINE_HERE => TimelineTarget::Here,
+        RuntimeValue::String(label) if label == TIMELINE_NEXT => TimelineTarget::Next,
+        RuntimeValue::String(label) if label == TIMELINE_PREVIOUS => TimelineTarget::Previous,
         RuntimeValue::Number(number) if number >= 0.0 => TimelineTarget::Frame(number as u16),
         RuntimeValue::String(label) | RuntimeValue::Ident(label) | RuntimeValue::Raw(label) => {
             TimelineTarget::Label(label)
@@ -494,11 +497,72 @@ fn emit_window_command(command: &str, args: &[RuntimeValue], report: &mut Execut
         ("minimize", []) => Some(WindowCommand::Minimize),
         ("perf", []) => Some(WindowCommand::PerformanceLog),
         ("quit", []) => Some(WindowCommand::Quit),
+        ("background", []) | ("background", [RuntimeValue::Null]) => {
+            Some(WindowCommand::Background(Backdrop::Default))
+        }
+        ("background", [choice]) => backdrop(choice).map(WindowCommand::Background),
+        ("background", [r, g, b]) => [r, g, b]
+            .map(finite_number)
+            .into_iter()
+            .collect::<Option<Vec<f64>>>()
+            .filter(|channels| {
+                channels
+                    .iter()
+                    .all(|channel| (0.0..=255.0).contains(channel))
+            })
+            .map(|channels| {
+                WindowCommand::Background(Backdrop::Color([
+                    channels[0] as u8,
+                    channels[1] as u8,
+                    channels[2] as u8,
+                ]))
+            }),
+        ("app.save", [key, value]) => save_key(key).map(|key| WindowCommand::AppSave {
+            key,
+            value: value.clone(),
+        }),
+        ("app.forget", []) => Some(WindowCommand::AppForget(None)),
+        ("app.forget", [key]) => save_key(key).map(|key| WindowCommand::AppForget(Some(key))),
+        (super::parser::ROOT_RUN | super::parser::ROOT_STOP, []) => {
+            Some(WindowCommand::RootTimeline {
+                play: command == super::parser::ROOT_RUN,
+                target: TimelineTarget::Here,
+            })
+        }
+        (super::parser::ROOT_RUN | super::parser::ROOT_STOP, [target]) => {
+            Some(WindowCommand::RootTimeline {
+                play: command == super::parser::ROOT_RUN,
+                target: resolve_timeline_target(target.clone()),
+            })
+        }
+        ("app.open", [url]) => {
+            let url = url.display_lossy();
+            (url.starts_with("https://") || url.starts_with("http://"))
+                .then_some(WindowCommand::AppOpen(url))
+        }
+        ("app.log", values) if !values.is_empty() => Some(WindowCommand::AppLog(
+            values
+                .iter()
+                .map(RuntimeValue::display_lossy)
+                .collect::<Vec<_>>()
+                .join(" "),
+        )),
         (
             "fullscreen" | "ui" | "hotkeys" | "top" | "move" | "size" | "center" | "title"
-            | "minimize" | "perf" | "quit" | "icon" | "decorations" | "titlebar",
+            | "minimize" | "perf" | "quit" | "icon" | "decorations" | "titlebar" | "background"
+            | "app.save" | "app.forget" | "app.open" | "app.log" | "root.run" | "root.stop",
             _,
         ) => None,
+        _ if command.starts_with(super::parser::APP_COMMAND_PREFIX) => {
+            report.diagnostics.push(RuntimeDiagnostic::at_line(
+                0,
+                format!(
+                    "unknown q0.app command `q0app.{}!`",
+                    &command[super::parser::APP_COMMAND_PREFIX.len()..]
+                ),
+            ));
+            return;
+        }
         _ => {
             report.diagnostics.push(RuntimeDiagnostic::at_line(
                 0,
@@ -510,10 +574,26 @@ fn emit_window_command(command: &str, args: &[RuntimeValue], report: &mut Execut
     match action {
         Some(action) => report.actions.push(RuntimeAction::Window(action)),
         None => {
+            if let Some(app) = command.strip_prefix(super::parser::APP_COMMAND_PREFIX) {
+                let usage = match app {
+                    "save" => "expects a name and a value: q0app.save! \"best\", score",
+                    "forget" => "expects a saved name, or nothing to forget every save",
+                    "open" => "expects a web address starting with https:// or http://",
+                    _ => "expects something to write",
+                };
+                report.diagnostics.push(RuntimeDiagnostic::at_line(
+                    0,
+                    format!("q0app.{app}! {usage}"),
+                ));
+                return;
+            }
             let usage = match command {
                 "move" => "q0window.move! expects: q0window.move! x, y",
                 "size" => "q0window.size! expects: q0window.size! width, height",
                 "title" => "q0window.title! expects: q0window.title! text",
+                "background" => {
+                    "expects a colour: \"#101820\", r, g, b (0-255), \"stage\", \"black\", or null for the app's own"
+                }
                 "icon" => "expects a library bitmap name/id, or null to restore the player icon",
                 "fullscreen" | "ui" | "hotkeys" | "top" | "decorations" | "titlebar" => {
                     "expects on or off: true, false, \"on\" or \"off\""
@@ -785,6 +865,68 @@ pub enum WindowCommand {
     /// Copies the performance log, as F4 does.
     PerformanceLog,
     Quit,
+    /// `q0app.save!`: keeps a value in the app's save file; scripts read it
+    /// back as `save.<key>`, this run and the next.
+    AppSave {
+        key: String,
+        value: RuntimeValue,
+    },
+    /// `q0app.forget!`: one saved value, or every one.
+    AppForget(Option<String>),
+    /// `q0app.open!`: a web page in the system browser.
+    AppOpen(String),
+    /// `rootrun!` / `rootstop!`: the main timeline, from any script, the way
+    /// Flash code says `_root.gotoAndPlay(...)`.
+    RootTimeline {
+        play: bool,
+        target: TimelineTarget,
+    },
+    /// `q0app.log!`: a line in the app's log and console.
+    AppLog(String),
+    /// `q0window.background!`: the colour around the movie.
+    Background(Backdrop),
+}
+
+/// What shows around the movie when the window's shape is not the stage's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backdrop {
+    /// The app's own choice (its manifest), or the player's theme.
+    Default,
+    /// The movie's stage colour.
+    Stage,
+    Color([u8; 3]),
+}
+
+/// `"#rrggbb"`, `"#rgb"`, `"stage"` or `"black"`.
+fn backdrop(value: &RuntimeValue) -> Option<Backdrop> {
+    let text = value.display_lossy();
+    let text = text.trim();
+    match text.to_ascii_lowercase().as_str() {
+        "stage" => return Some(Backdrop::Stage),
+        "black" => return Some(Backdrop::Color([0, 0, 0])),
+        "white" => return Some(Backdrop::Color([255, 255, 255])),
+        _ => {}
+    }
+    let hex = text.strip_prefix('#')?;
+    let channel = |digits: &str| u8::from_str_radix(digits, 16).ok();
+    match hex.len() {
+        6 => Some(Backdrop::Color([
+            channel(&hex[0..2])?,
+            channel(&hex[2..4])?,
+            channel(&hex[4..6])?,
+        ])),
+        3 => {
+            let short = |at: usize| channel(&hex[at..at + 1]).map(|value| value * 17);
+            Some(Backdrop::Color([short(0)?, short(1)?, short(2)?]))
+        }
+        _ => None,
+    }
+}
+
+/// A save name scripts can read back as `save.<name>`.
+fn save_key(value: &RuntimeValue) -> Option<String> {
+    let key = value.display_lossy();
+    super::parser::is_name(&key).then_some(key)
 }
 
 /// Lights are named by the name given in the light editor; colours run 0
@@ -875,7 +1017,19 @@ pub enum ParticlesCommand {
 pub enum TimelineTarget {
     Frame(u16),
     Label(String),
+    /// `stop!` / `play!`: stay on the current frame without running it again.
+    Here,
+    /// `gonext!`: the frame after the current one.
+    Next,
+    /// `goprev!`: the frame before the current one.
+    Previous,
 }
+
+/// Reserved targets `stop!`, `play!`, `gonext!` and `goprev!` compile to.
+/// They start with a control character, so no label can collide with them.
+pub const TIMELINE_HERE: &str = "\u{1}here";
+pub const TIMELINE_NEXT: &str = "\u{1}next";
+pub const TIMELINE_PREVIOUS: &str = "\u{1}previous";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutionReport {
@@ -922,6 +1076,60 @@ gostop! label
                 RuntimeAction::GoRun(TimelineTarget::Frame(2)),
                 RuntimeAction::GoStop(TimelineTarget::Label("intro".to_string())),
             ]
+        );
+    }
+
+    #[test]
+    fn flash_style_stop_play_and_steps_stay_or_step_without_a_target() {
+        let source = "stop!
+play!
+gonext!
+goprev!
+";
+        let mut runtime = Runtime::new();
+        let report = runtime.execute_source(source);
+        assert_eq!(report.diagnostics, Vec::new());
+        assert_eq!(
+            report.actions,
+            vec![
+                RuntimeAction::GoStop(TimelineTarget::Here),
+                RuntimeAction::GoRun(TimelineTarget::Here),
+                RuntimeAction::GoStop(TimelineTarget::Next),
+                RuntimeAction::GoStop(TimelineTarget::Previous),
+            ]
+        );
+        let program = crate::q0lang::parser::parse(source);
+        assert_eq!(
+            crate::q0lang::printer::print_program(&program.statements).0,
+            source
+        );
+    }
+
+    #[test]
+    fn root_run_and_stop_reach_the_main_timeline_on_the_window_channel() {
+        let source = "rootrun! \"intro\"
+rootstop!
+";
+        let mut runtime = Runtime::new();
+        let report = runtime.execute_source(source);
+        assert_eq!(report.diagnostics, Vec::new());
+        assert_eq!(
+            report.actions,
+            vec![
+                RuntimeAction::Window(WindowCommand::RootTimeline {
+                    play: true,
+                    target: resolve_timeline_target(RuntimeValue::String("intro".into())),
+                }),
+                RuntimeAction::Window(WindowCommand::RootTimeline {
+                    play: false,
+                    target: TimelineTarget::Here,
+                }),
+            ]
+        );
+        let program = crate::q0lang::parser::parse(source);
+        assert_eq!(
+            crate::q0lang::printer::print_program(&program.statements).0,
+            source
         );
     }
 

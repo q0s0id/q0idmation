@@ -22,7 +22,20 @@ pub(crate) fn render_animation_preview(app: &mut EditorApp, ctx: &egui::Context)
         }
         return;
     }
-    let root = app.state.project.meta.entry_q0rg_id;
+    let project = &app.state.project;
+    let active = app
+        .session
+        .breadcrumb
+        .first()
+        .copied()
+        .unwrap_or(app.session.current_q0rg_id);
+    let root = if project.is_scene_root(active) {
+        active
+    } else {
+        project.meta.entry_q0rg_id
+    };
+    let timeline_camera_applied =
+        root == project.meta.entry_q0rg_id && project.runtime.camera.enabled;
     let frame_count = app
         .state
         .project
@@ -119,7 +132,7 @@ pub(crate) fn render_animation_preview(app: &mut EditorApp, ctx: &egui::Context)
                 origin: rect.min,
                 scale,
                 stage_rect: rect,
-                edit_transform: if app.state.project.runtime.camera.enabled {
+                edit_transform: if timeline_camera_applied {
                     app.state.project.camera_affine_at(frame)
                 } else {
                     q0s_format::transform::Affine::IDENTITY
@@ -139,7 +152,8 @@ pub(crate) fn render_animation_preview(app: &mut EditorApp, ctx: &egui::Context)
                 &app.state.project,
                 &mut app.animation_preview_textures,
                 Some(revision),
-            );
+            )
+            .through_timeline_camera(timeline_camera_applied);
             pass.render(
                 &painter,
                 root,
@@ -266,6 +280,7 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
     );
 
     let free_view = crate::tools3d::free_view(app);
+    let _free_view = q0glblend::FreeViewGuard::set(free_view);
     if free_view.is_none() {
         // Drop shadow — fixed translucent black, theme-independent.
         painter.rect_filled(
@@ -326,7 +341,8 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
     if interactive && camera_editing && !library_drag_active && !editing_text {
         handle_camera_stage_input(app, &response, &view, &ctx);
     }
-    if app.session.current_q0rg_id == app.state.project.meta.entry_q0rg_id
+    if free_view.is_none()
+        && app.session.current_q0rg_id == app.state.project.meta.entry_q0rg_id
         && app.state.project.runtime.camera.enabled
     {
         draw_camera_background_outside_stage(
@@ -353,11 +369,24 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
     // identity only after interaction has finished for this frame.
     let q0rg_id = app.session.current_q0rg_id;
     let frame = app.session.current_frame;
+    let timeline = app
+        .state
+        .project
+        .q0rgs
+        .iter()
+        .find(|q| q.q0rg_id == q0rg_id);
+    let frame_count = timeline.map_or(0, |q| q.frame_count);
+    let onion_enabled = app.session.onion.enabled
+        && (!app.session.playing || app.settings.onion_skin_during_playback)
+        && ((app.session.onion.before > 0 && frame > 0)
+            || (app.session.onion.after > 0 && frame.saturating_add(1) < frame_count));
     let outlined_layers = app
         .session
         .outline_layers
         .iter()
-        .filter_map(|(outlined_q0rg, layer_id)| (*outlined_q0rg == q0rg_id).then_some(*layer_id))
+        .filter_map(|(outlined_q0rg, layer_id)| {
+            (free_view.is_none() && *outlined_q0rg == q0rg_id).then_some(*layer_id)
+        })
         .collect::<std::collections::HashSet<_>>();
     let text_preview = crate::text_tool::scene_preview(app, &ctx);
     // A running physics preview draws its baked copy of the project instead.
@@ -392,7 +421,7 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
     app.textures.interactive_transform = ui.input(|i| i.pointer.primary_down());
     app.textures.gpu_filter_cache_enabled = !app.session.playing
         && !app.textures.interactive_transform
-        && !app.session.onion.enabled
+        && !onion_enabled
         && !app.session.onion.edit_frames;
 
     // Editing inside a q0rg uses a subtle full-stage veil. The veil is drawn
@@ -430,7 +459,7 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
     app.textures.reset_stage_traversal_stats();
     q0glblend::reset_paint_diagnostics();
     let scene_started = std::time::Instant::now();
-    let render_pass = StageRenderPass::new_with_revision(
+    let mut render_pass = StageRenderPass::new_with_revision(
         text_preview
             .as_ref()
             .map(|p| p.project.as_ref())
@@ -460,10 +489,16 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
     }
     // Seen from aside, everything goes through the 3D pass.
     let _free_view = q0glblend::FreeViewGuard::set(free_view);
+    let free_view_onion = free_view.is_some() && onion_enabled;
     if free_view.is_some() {
         crate::tools3d::paint_ground(app, &painter, &view);
+        if free_view_onion {
+            render_pass.draw_free_view_paper_separately(&painter, q0rg_id, frame, &view);
+        }
+    }
+    if free_view.is_some() && !free_view_onion {
         render_pass.render(&painter, q0rg_id, frame, &view, &mut app.textures, ui.ctx());
-    } else if app.session.outline_mode {
+    } else if free_view.is_none() && app.session.outline_mode {
         crate::render::render_stage_outline(
             &painter,
             &render_pass,
@@ -476,33 +511,28 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
         // Onion skin: render `before` past frames + `after` upcoming frames with
         // a colour-tinted alpha behind the live frame. Past frames get a cool
         // (blueish) tint, upcoming a warm (orange) tint — Flash convention.
-        let onion_split = if app.session.onion.enabled && !app.session.onion.all_unlocked_layers {
-            app.state
-                .project
-                .q0rgs
-                .iter()
-                .find(|q| q.q0rg_id == q0rg_id)
-                .and_then(|q| {
-                    q.layers
-                        .iter()
-                        .position(|layer| {
-                            layer.layer_id == app.session.current_layer_id
-                                && app.state.project.layer_is_visible(q0rg_id, layer.layer_id)
-                                && !app.state.project.layer_is_locked(q0rg_id, layer.layer_id)
-                                && !app.state.project.layer_is_folder(q0rg_id, layer.layer_id)
-                        })
-                        .map(|index| {
-                            let below: std::collections::HashSet<_> = q.layers[..index]
-                                .iter()
-                                .map(|layer| layer.layer_id)
-                                .collect();
-                            let above: std::collections::HashSet<_> = q.layers[index..]
-                                .iter()
-                                .map(|layer| layer.layer_id)
-                                .collect();
-                            (below, above)
-                        })
-                })
+        let onion_split = if onion_enabled && !app.session.onion.all_unlocked_layers {
+            timeline.and_then(|q| {
+                q.layers
+                    .iter()
+                    .position(|layer| {
+                        layer.layer_id == app.session.current_layer_id
+                            && app.state.project.layer_is_visible(q0rg_id, layer.layer_id)
+                            && !app.state.project.layer_is_locked(q0rg_id, layer.layer_id)
+                            && !app.state.project.layer_is_folder(q0rg_id, layer.layer_id)
+                    })
+                    .map(|index| {
+                        let below: std::collections::HashSet<_> = q.layers[..index]
+                            .iter()
+                            .map(|layer| layer.layer_id)
+                            .collect();
+                        let above: std::collections::HashSet<_> = q.layers[index..]
+                            .iter()
+                            .map(|layer| layer.layer_id)
+                            .collect();
+                        (below, above)
+                    })
+            })
         } else {
             None
         };
@@ -545,13 +575,8 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
                 );
             }
         }
-        if app.session.onion.enabled {
-            let excluded_layers: std::collections::HashSet<_> = app
-                .state
-                .project
-                .q0rgs
-                .iter()
-                .find(|q| q.q0rg_id == q0rg_id)
+        if onion_enabled {
+            let excluded_layers: std::collections::HashSet<_> = timeline
                 .into_iter()
                 .flat_map(|q| &q.layers)
                 .filter(|layer| {
@@ -561,27 +586,13 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
                 })
                 .map(|layer| layer.layer_id)
                 .collect();
-            let has_onion_layers = app
-                .state
-                .project
-                .q0rgs
-                .iter()
-                .find(|q| q.q0rg_id == q0rg_id)
-                .is_some_and(|q| {
-                    q.layers.iter().any(|layer| {
-                        !excluded_layers.contains(&layer.layer_id)
-                            && !app.state.project.layer_is_folder(q0rg_id, layer.layer_id)
-                            && app.state.project.layer_is_visible(q0rg_id, layer.layer_id)
-                    })
-                });
-            let frame_count = app
-                .state
-                .project
-                .q0rgs
-                .iter()
-                .find(|q| q.q0rg_id == q0rg_id)
-                .map(|q| q.frame_count)
-                .unwrap_or(0);
+            let has_onion_layers = timeline.is_some_and(|q| {
+                q.layers.iter().any(|layer| {
+                    !excluded_layers.contains(&layer.layer_id)
+                        && !app.state.project.layer_is_folder(q0rg_id, layer.layer_id)
+                        && app.state.project.layer_is_visible(q0rg_id, layer.layer_id)
+                })
+            });
             if frame_count > 0 && has_onion_layers {
                 for offset in (-(app.session.onion.before as i32)
                     ..=(app.session.onion.after as i32))
@@ -660,7 +671,7 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
             );
         }
     }
-    drop(_free_view);
+
     let scene_elapsed = scene_started.elapsed();
     let traversal = app.textures.stage_traversal_stats();
     app.textures.record_stage_work_timings(&mut app.perf);
@@ -828,7 +839,7 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
     }
 
     // Canvas text UI and transient overlays stay above the freshly rendered scene.
-    let editing_text = interactive && crate::text_tool::render_canvas(app, ui, &view);
+    let editing_text = interactive && crate::text_tool::render_canvas(app, ui, &view, canvas_rect);
     if !editing_text && app.session.onion.edit_frames {
         crate::frame_edit::draw_overlay(app, &painter, &view);
     } else if app.session.tools3d.active() {
@@ -984,8 +995,10 @@ fn handle_camera_stage_input(
             .or_else(|| response.interact_pointer_pos());
         if let Some(press) = press {
             let state = app.state.project.camera_state_at(frame);
+            // Zoom and turn round where the camera is shown, parent and all.
+            let shown = app.state.project.camera_world_state_at(frame);
             let center =
-                view.stage_to_screen(q0s_format::v2::Vec2::new(state.center_x, state.center_y));
+                view.stage_to_screen(q0s_format::v2::Vec2::new(shown.center_x, shown.center_y));
             app.history
                 .snapshot_with_session(&app.state.project, &app.session);
             app.state.project.runtime.camera.insert_key(frame, state);
@@ -1073,7 +1086,7 @@ fn handle_camera_stage_input(
 }
 
 fn draw_camera_overlay(app: &EditorApp, painter: &egui::Painter, view: &StageView, frame: u16) {
-    let state = app.state.project.camera_state_at(frame);
+    let state = app.state.project.camera_world_state_at(frame);
     let corners = camera_viewport_corners(app, view, frame);
     let selected = app.session.camera_track_selected;
     let color = if selected {
@@ -1159,7 +1172,7 @@ fn draw_camera_background_outside_stage(
 }
 
 fn camera_viewport_corners(app: &EditorApp, view: &StageView, frame: u16) -> [egui::Pos2; 4] {
-    let state = app.state.project.camera_state_at(frame);
+    let state = app.state.project.camera_world_state_at(frame);
     let half_w = f32::from(app.state.project.meta.stage_width) * 0.5 / state.zoom.max(0.01);
     let half_h = f32::from(app.state.project.meta.stage_height) * 0.5 / state.zoom.max(0.01);
     let (sin, cos) = state.rotation.sin_cos();
@@ -1695,7 +1708,9 @@ fn stage_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
                 ))
                 .clicked()
         {
-            app.queue(Action::ConvertSelectionToQ0rg);
+            app.queue(Action::PromptSymbol(
+                crate::symbol_prompt::SymbolRequest::Convert,
+            ));
             ui.close_menu();
         }
         if ui
@@ -1816,7 +1831,13 @@ fn stage_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
                     )
                     .clicked()
                 {
-                    app.queue(Action::DuplicateSymbol(q0rg_id, layer_id, placement_idx));
+                    app.queue(Action::PromptSymbol(
+                        crate::symbol_prompt::SymbolRequest::Duplicate(
+                            q0rg_id,
+                            layer_id,
+                            placement_idx,
+                        ),
+                    ));
                     ui.close_menu();
                 }
                 if ui.button("Replace q0rg").clicked() {
@@ -1985,5 +2006,134 @@ mod tests {
 
         release_canvas_keyboard_focus(&ctx, true);
         assert_eq!(ctx.memory(|memory| memory.focused()), None);
+    }
+
+    #[test]
+    fn onion_skin_paints_3d_ghosts_through_both_stage_cameras() {
+        use crate::app::{Action, EditorApp};
+        use crate::tools3d::{Orbit, Tool3d};
+        use q0s_format::three::{Space3d, V3};
+        use q0s_format::v2::{Asset, BitmapAsset, Placement, PlacementFx, Target};
+
+        let ctx = egui::Context::default();
+        let mut app = EditorApp::default();
+        app.handle(&ctx, Action::CreateProject(Default::default()));
+        app.handle(&ctx, Action::NewModel);
+        let project = &mut app.state.project;
+        project.assets.push(Asset::Bitmap(BitmapAsset {
+            asset_id: 1234,
+            width: 16,
+            height: 16,
+            rgba: std::sync::Arc::new(vec![255; 16 * 16 * 4]),
+        }));
+        let q0rg = &mut project.q0rgs[0];
+        q0rg.frame_count = 3;
+        let layer = &mut q0rg.layers[0];
+        let model = layer.placements.pop().unwrap();
+        layer.placements = vec![
+            Placement {
+                target: Target::Asset(1234),
+                fx: PlacementFx {
+                    three: Some(Space3d {
+                        tilt_y: 45.0,
+                        z: 60.0,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                ..model.clone()
+            },
+            Placement {
+                frame: 1,
+                ..model.clone()
+            },
+            Placement { frame: 2, ..model },
+        ];
+        let mut blank = layer.clone();
+        blank.layer_id += 1;
+        blank.placements.clear();
+        let (art_layer, blank_layer) = (layer.layer_id, blank.layer_id);
+        q0rg.layers.push(blank);
+        let (w, h) = (
+            f32::from(project.meta.stage_width),
+            f32::from(project.meta.stage_height),
+        );
+        let orbit = Orbit {
+            target: V3::new(w * 0.5, h * 0.5, 0.0),
+            yaw: 0.6,
+            pitch: 0.3,
+            distance: w,
+        };
+        app.state.mark_render_dirty();
+        app.session.current_frame = 1;
+        app.session.selection = crate::state::Selection::None;
+        app.session.onion.before = 1;
+        app.session.onion.after = 1;
+        app.session.tools3d.tool = Some(Tool3d::View);
+        crate::theme::install(&ctx);
+        app.settings.theme.apply(&ctx);
+
+        let passes = |app: &mut EditorApp| {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1100.0, 700.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .show(ctx, |ui| super::render_view(app, ui, false));
+                },
+            );
+            output
+                .shapes
+                .iter()
+                .filter(|shape| matches!(shape.shape, egui::Shape::Callback(_)))
+                .count()
+        };
+
+        for camera in [None, Some(orbit)] {
+            app.session.tools3d.orbit = camera;
+            app.session.current_layer_id = art_layer;
+            app.session.playing = false;
+            app.settings.onion_skin_during_playback = false;
+            app.session.onion.enabled = false;
+            assert_eq!(passes(&mut app), 1, "live 3D pass");
+
+            app.session.onion.enabled = true;
+            let paper = usize::from(camera.is_some());
+            for all_unlocked in [false, true] {
+                app.session.onion.all_unlocked_layers = all_unlocked;
+                assert_eq!(
+                    passes(&mut app),
+                    paper + 3,
+                    "past card, future model and live model"
+                );
+            }
+
+            app.session.playing = true;
+            assert_eq!(passes(&mut app), 1, "playing hides ghosts by default");
+            assert!(
+                app.session.onion.enabled,
+                "playback keeps the editing preference"
+            );
+            app.settings.onion_skin_during_playback = true;
+            assert_eq!(
+                passes(&mut app),
+                paper + 3,
+                "the playback switch keeps ghosts visible"
+            );
+            app.session.playing = false;
+
+            app.session.current_layer_id = blank_layer;
+            app.session.onion.all_unlocked_layers = false;
+            assert_eq!(
+                passes(&mut app),
+                paper + 1,
+                "active layer filters the ghost passes"
+            );
+        }
     }
 }

@@ -27,12 +27,66 @@ fn startup_action(argument: Option<OsString>) -> StartupAction {
 
 fn print_help() {
     println!(
-        "q0player {}\n\nUsage: q0player [OPTIONS] [MOVIE.q0s]\n\nOptions:\n  -h, --help       Show this help\n  -V, --version    Show version\n  --preview       Play the scene without player panels (Esc closes)\n  --all-scenes    Play document scenes in order in preview mode\n  --delete-after-load  Remove an editor-owned temporary preview after loading",
+        "q0player {}\n\nUsage: q0player [OPTIONS] [MOVIE.q0s]\n\nOptions:\n  -h, --help       Show this help\n  -V, --version    Show version\n  --preview       Play the scene without player panels (Esc closes)\n  --all-scenes    Play document scenes in order in preview mode\n  --delete-after-load  Remove an editor-owned temporary preview after loading\n  --qir FILE      Run a QIR bundle as its app would (Q0Build test runs)",
         env!("CARGO_PKG_VERSION")
     );
 }
 
+/// The app this program carries, when Q0Build made it a QIR app; or the
+/// bundle `--qir file` names, for Q0Build's test runs.
+fn qir_bundle(arguments: &[OsString]) -> Option<Result<q0qir::Bundle, String>> {
+    let path = match arguments {
+        [flag, path, ..] if flag == "--qir" => PathBuf::from(path),
+        _ => {
+            let exe = std::env::current_exe().ok()?;
+            // Only the tail is read: a plain q0player has no bundle there.
+            let mut file = std::fs::File::open(&exe).ok()?;
+            use std::io::{Read, Seek, SeekFrom};
+            file.seek(SeekFrom::End(-(q0qir::TRAILER_LEN as i64)))
+                .ok()?;
+            let mut tail = [0_u8; q0qir::TRAILER_LEN];
+            file.read_exact(&mut tail).ok()?;
+            q0qir::Trailer::read(&tail).ok()?;
+            exe
+        }
+    };
+    let bundle = match q0qir::Bundle::read_from_file(&path, false) {
+        Ok(bundle) if bundle.manifest.diagnostics.verify_on_start => {
+            q0qir::Bundle::read_from_file(&path, true)
+        }
+        other => other,
+    };
+    Some(bundle.map_err(|error| error.to_string()))
+}
+
 fn main() -> Result<(), eframe::Error> {
+    let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
+    if let Some(bundle) = qir_bundle(&arguments) {
+        let bundle = match bundle {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_title("This app cannot start")
+                    .set_description(format!(
+                        "{error}\n\nDownload it again or ask its author for a new copy."
+                    ))
+                    .show();
+                return Ok(());
+            }
+        };
+        let skip = usize::from(arguments.first().is_some_and(|flag| flag == "--qir")) * 2;
+        let args = arguments
+            .iter()
+            .skip(skip)
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        return launch::run(Launch {
+            qir: Some(bundle),
+            args,
+            ..Launch::default()
+        });
+    }
     let mut preview = PreviewOptions::default();
     let mut file = None;
     for argument in std::env::args_os().skip(1) {

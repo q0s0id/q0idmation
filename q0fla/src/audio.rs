@@ -97,7 +97,7 @@ pub(crate) struct ImportedSound {
 
 pub(crate) type SoundMap = HashMap<String, ImportedSound>;
 
-fn wrap_audio(
+pub(crate) fn wrap_audio(
     source: &[u8],
     encoded: bool,
     rate: u32,

@@ -487,7 +487,55 @@ impl Player {
         std::mem::take(&mut self.window_requests)
     }
 
+    /// Who the app is and what it saved, for `app.*` and `save.*`.
+    pub fn set_app(&mut self, app: crate::AppGlobals) {
+        self.app = app;
+    }
+
+    pub(crate) fn app_globals(&self) -> Vec<(String, RuntimeValue)> {
+        let text = |value: &str| RuntimeValue::String(value.to_string());
+        let mut globals = vec![
+            ("app.name".to_string(), text(&self.app.name)),
+            ("app.id".to_string(), text(&self.app.id)),
+            ("app.version".to_string(), text(&self.app.version)),
+            ("app.author".to_string(), text(&self.app.author)),
+            ("app.platform".to_string(), text(crate::PLATFORM)),
+            (
+                "app.packaged".to_string(),
+                RuntimeValue::Bool(self.app.packaged),
+            ),
+            ("app.debug".to_string(), RuntimeValue::Bool(self.app.debug)),
+            ("app.args".to_string(), text(&self.app.args)),
+        ];
+        globals.extend(
+            self.app
+                .saves
+                .iter()
+                .map(|(key, value)| (format!("save.{key}"), value.clone())),
+        );
+        globals
+    }
+
     pub(crate) fn request_window(&mut self, command: WindowCommand) {
+        // Saves read back at once, this frame and every one after.
+        match &command {
+            WindowCommand::AppSave { key, value } => {
+                self.app.saves.insert(key.clone(), value.clone());
+            }
+            WindowCommand::AppForget(key) => {
+                let forgotten: Vec<String> = match key {
+                    Some(key) => vec![key.clone()],
+                    None => self.app.saves.keys().cloned().collect(),
+                };
+                for key in forgotten {
+                    self.app.saves.remove(&key);
+                    if let Some(runtime) = self.q0lang.as_mut() {
+                        runtime.vars.remove(&format!("save.{key}"));
+                    }
+                }
+            }
+            _ => {}
+        }
         // Later scripts of the same frame read where the window is going.
         match &command {
             WindowCommand::Move { x, y } => {

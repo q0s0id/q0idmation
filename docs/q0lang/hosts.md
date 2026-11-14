@@ -45,7 +45,13 @@ gorun! start
 
 Frame indices in code start at zero. A non-negative numeric target becomes a u16: the fraction is dropped and values that are too large saturate at 65535. The host clamps it to the last frame. Use finite whole numbers within the timeline.
 
-A string target like `"12"` is taken as a numeric index. Named labels like `"intro"` do not resolve yet. Playback still starts or stops even when the target does not resolve. There is no automatic `frame` or `label` variable in the root runtime; inside an object script, `frame` holds that object's own frame.
+A string target like `"12"` is taken as a numeric index; any other string names a frame label, such as `gorun! "intro"`. A label that does not exist is reported and leaves playback as it was. There is no automatic `frame` or `label` variable in the root runtime; inside an object script, `frame` holds that object's own frame.
+
+The Flash words need no target. `stop!` and `play!` stop or play where the timeline is, without a jump. `gonext!` and `goprev!` go one frame on or back and stop there, like Flash's `nextFrame()` and `prevFrame()`.
+
+`rootrun! target` and `rootstop! target` do what `gorun!` and `gostop!` do, but always on the main timeline, from any script: an object script uses them where Flash code says `_root.gotoAndPlay("intro")`. Without a target they play or stop the main timeline where it is.
+
+For movies converted from Flash, q0player also sets `_currentframe` (counted from one, as in Flash) and `_totalframes` for the main timeline and for every object script, and `name._currentframe` and `name._totalframes` for each named copy on the main timeline.
 
 An unconditional jump from a frame to itself runs the same code again. The editor and the player stop a chain of jumps after 64 transitions. To stop on a frame without looping, use a flag variable, or put the command in the general script.
 
@@ -94,7 +100,7 @@ Every placed copy of a symbol (q0rg) that has code of its own, a general script 
 
 - The symbol's general script runs once when the copy appears on stage.
 - Its frame code runs whenever the copy's own frame changes. With `q0.object`, `q0.input` or `q0.mouse` imported, it runs every tick instead.
-- `gorun!` and `gostop!` inside an object script drive that copy's own timeline.
+- `gorun!` and `gostop!` inside an object script drive that copy's own timeline; `rootrun!` and `rootstop!` drive the main one.
 - Mouse events reach the copy under the pointer, see [events](events.md).
 
 | name | access | value |

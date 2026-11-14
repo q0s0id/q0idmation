@@ -1,7 +1,7 @@
 //! Editable text stored as vector outlines. The source, size and font live in the
 //! existing q1s asset-name field; old readers still render the vector paths.
 
-use egui::{Color32, Context, PointerButton, Response};
+use egui::{Color32, Context, PointerButton, Pos2, Rect, Response, Sense, Shape, Stroke};
 use q0s_format::transform::Affine;
 use q0s_format::v2::{
     Anchor, Asset, Path, Placement, ProjectV2, Rgba, Target, Transform2D, Tween, Vec2, VectorAsset,
@@ -24,7 +24,6 @@ struct TextSource {
 #[derive(Debug, Clone)]
 pub struct TextDraft {
     pub asset_id: Option<u16>,
-    pub origin: Vec2,
     pub placement: Option<crate::state::PlacementRef>,
     pub q0rg_id: u16,
     pub layer_id: u16,
@@ -80,7 +79,7 @@ pub(crate) fn scene_preview(app: &EditorApp, ctx: &Context) -> Option<ScenePrevi
         q0rg: draft.q0rg_id,
         layer: draft.layer_id,
         frame: draft.frame,
-        origin: draft.origin,
+        origin: Vec2::new(draft.transform.tx, draft.transform.ty),
         font: draft.font.clone(),
         text: draft.text.clone(),
         size: draft.size.to_bits(),
@@ -165,8 +164,8 @@ pub(crate) fn scene_preview(app: &EditorApp, ctx: &Context) -> Option<ScenePrevi
                 frame: draft.frame,
                 target: Target::Asset(asset_id),
                 transform: Transform2D {
-                    tx: draft.origin.x,
-                    ty: draft.origin.y,
+                    tx: draft.transform.tx,
+                    ty: draft.transform.ty,
                     ..Transform2D::IDENTITY
                 },
                 tween: Tween::None,
@@ -205,7 +204,6 @@ impl Default for TextDraft {
     fn default() -> Self {
         Self {
             asset_id: None,
-            origin: Vec2::new(0.0, 0.0),
             placement: None,
             q0rg_id: 1,
             layer_id: 1,
@@ -447,16 +445,19 @@ fn draft_for_asset(app: &EditorApp, asset_id: u16) -> Option<TextDraft> {
                 .find(|q| q.q0rg_id == r.q0rg_id)
                 .and_then(|q| q.layers.iter().find(|l| l.layer_id == r.layer_id))
                 .and_then(|l| {
-                    crate::render::active_placements_at(l, app.session.current_frame)
-                        .into_iter()
-                        .find(|(i, _)| *i == r.placement_idx)
+                    crate::tools::active_visual_affine_for_placement(
+                        &app.state.project,
+                        r.q0rg_id,
+                        l,
+                        r.placement_idx,
+                        app.session.current_frame,
+                    )
                 })
-                .map(|(_, t)| Affine::from_transform(t))
+                .map(|(affine, _)| affine)
         })
         .unwrap_or(Affine::IDENTITY);
     Some(TextDraft {
         asset_id: Some(asset_id),
-        origin: transform.apply(Vec2::new(0.0, 0.0)),
         placement,
         q0rg_id: app.session.current_q0rg_id,
         layer_id: placement.map_or(app.session.current_layer_id, |p| p.layer_id),
@@ -505,10 +506,16 @@ pub fn handle_stage(app: &mut EditorApp, response: &Response, cursor: Option<Vec
         }
     }
     let mut draft = app.session.text_defaults.clone();
-    draft.origin = point;
+    let inset = cached_font(&draft.font)
+        .and_then(|(bytes, index)| {
+            let face = Face::parse(&bytes, index).ok()?;
+            Some(draft.size - blank_line_height(&face, draft.size))
+        })
+        .unwrap_or(0.0);
+    // Keep the baseline stable as the user types characters of different heights.
     draft.transform = Affine {
         tx: point.x,
-        ty: point.y,
+        ty: point.y - inset,
         ..Affine::IDENTITY
     };
     draft.q0rg_id = app.session.current_q0rg_id;
@@ -626,11 +633,97 @@ fn canvas_font(ctx: &Context, name: &str) -> egui::FontFamily {
     }
 }
 
+struct CanvasTextFrame {
+    to_screen: Affine,
+    rect: Rect,
+    corners: [Pos2; 4],
+}
+
+impl CanvasTextFrame {
+    fn new(transform: Affine, ink_origin: Vec2, size: egui::Vec2, font_size: f32) -> Self {
+        let origin = transform.apply(ink_origin);
+        let to_screen = Affine {
+            tx: origin.x,
+            ty: origin.y,
+            ..transform
+        };
+        let padding = 2.0 / transform.a11.hypot(transform.a21).max(0.01);
+        let rect = Rect::from_min_size(
+            Pos2::ZERO,
+            egui::vec2((size.x + padding).max(font_size * 0.3), size.y),
+        );
+        let corners = projected_rect(to_screen, rect);
+        Self {
+            to_screen,
+            rect,
+            corners,
+        }
+    }
+
+    fn local_pointer(&self, point: Pos2) -> Option<Pos2> {
+        self.to_screen
+            .inverse()
+            .map(|inverse| project_point(inverse, point))
+    }
+}
+
+fn project_point(transform: Affine, point: Pos2) -> Pos2 {
+    let p = transform.apply(Vec2::new(point.x, point.y));
+    egui::pos2(p.x, p.y)
+}
+
+fn projected_rect(transform: Affine, rect: Rect) -> [Pos2; 4] {
+    [
+        rect.left_top(),
+        rect.right_top(),
+        rect.right_bottom(),
+        rect.left_bottom(),
+    ]
+    .map(|point| project_point(transform, point))
+}
+
+fn paint_canvas_selection(
+    painter: &egui::Painter,
+    frame: &CanvasTextFrame,
+    galley: &egui::Galley,
+    range: &egui::text_selection::CursorRange,
+    color: Color32,
+) {
+    let [start, end] = range.sorted_cursors().map(|cursor| cursor.rcursor);
+    for row_index in start.row..=end.row {
+        let row = &galley.rows[row_index];
+        let left = if row_index == start.row {
+            row.x_offset(start.column)
+        } else {
+            row.rect.left()
+        };
+        let right = if row_index == end.row {
+            row.x_offset(end.column)
+        } else if row.ends_with_newline {
+            row.rect.right() + row.height() * 0.5
+        } else {
+            row.rect.right()
+        };
+        let selected = Rect::from_min_max(
+            egui::pos2(left, row.min_y()),
+            egui::pos2(right.min(frame.rect.right()), row.max_y()),
+        );
+        if selected.is_positive() {
+            painter.add(Shape::convex_polygon(
+                projected_rect(frame.to_screen, selected).to_vec(),
+                color,
+                Stroke::NONE,
+            ));
+        }
+    }
+}
+
 /// Inline canvas editing owns the pointer until a click outside its bounds.
 pub(crate) fn render_canvas(
     app: &mut EditorApp,
     ui: &mut egui::Ui,
     view: &crate::render::StageView,
+    canvas_rect: Rect,
 ) -> bool {
     if app.session.text_canvas_click_consumed {
         if !ui.input(|i| i.pointer.primary_down()) {
@@ -641,37 +734,19 @@ pub(crate) fn render_canvas(
     let Some(mut draft) = app.session.text_editor.take() else {
         return false;
     };
-    let scale = view.effective_scale() * draft.transform.uniform_scale().max(0.01);
-    let mut origin = view.stage_to_screen(draft.origin);
+    let size = draft.size;
+    let to_screen = Affine::compose(view.screen_transform(), draft.transform);
     let family = canvas_font(ui.ctx(), &draft.font);
     let metrics = ui
         .ctx()
         .data(|d| d.get_temp::<f32>(egui::Id::new("q0text_canvas_font").with("metrics")))
         .unwrap_or(1.0);
-    let font = egui::FontId::new((draft.size * scale * metrics).clamp(4.0, 1024.0), family);
+    let font = egui::FontId::new((size * metrics).clamp(4.0, 1024.0), family);
     let face_bytes = cached_font(&draft.font);
-    let lay_out = |text: &str| {
-        let (bytes, index) = face_bytes.as_ref()?;
-        let face = Face::parse(bytes, *index).ok()?;
-        Some(CanvasTextLayout::new(&face, text, draft.size))
-    };
-    // The box hugs the text: the caret's width past the widest line, and a
-    // little room to start typing into when it is empty.
-    let layout = lay_out(&draft.text);
-    let text_width = layout.as_ref().map_or(0.0, |layout| layout.width * scale);
-    let height = layout.as_ref().map_or(draft.size * scale, |layout| {
-        (layout.bottom - layout.top) * scale
-    });
-    if let Some(layout) = &layout {
-        origin.y += layout.top * scale;
-    }
-    let width = (text_width + 2.0).max(draft.size * scale * 0.3);
-    let rect = egui::Rect::from_min_size(origin, egui::vec2(width, height));
-    let mut entry_rect = rect;
-    let mut editor_id = egui::Id::NULL;
-    let mut editor_had_focus = false;
-    let line_height = draft.size * scale * 1.25;
-    let mut layouter = |ui: &egui::Ui, text: &str, _width: f32| {
+    let face = face_bytes
+        .as_ref()
+        .and_then(|(bytes, index)| Face::parse(bytes, *index).ok());
+    let layout_text = |ui: &egui::Ui, text: &str| {
         let mut job = egui::text::LayoutJob::simple(
             text.to_owned(),
             font.clone(),
@@ -679,54 +754,136 @@ pub(crate) fn render_canvas(
             f32::INFINITY,
         );
         for section in &mut job.sections {
-            section.format.line_height = Some(line_height);
+            section.format.line_height = Some(size * 1.25);
         }
         let galley = ui.fonts(|f| f.layout_job(job));
-        match lay_out(text) {
-            Some(layout) => {
-                let mut aligned = (*galley).clone();
-                align_galley(&mut aligned, &layout, scale);
-                std::sync::Arc::new(aligned)
-            }
-            None => galley,
+        if let Some(face) = &face {
+            let layout = CanvasTextLayout::new(face, text, size);
+            let mut aligned = (*galley).clone();
+            align_galley(&mut aligned, &layout);
+            (
+                std::sync::Arc::new(aligned),
+                Vec2::new(layout.left, layout.top),
+            )
+        } else {
+            (galley, Vec2::new(0.0, 0.0))
         }
     };
-    let focus_requested = draft.focus_requested;
-    ui.allocate_ui_at_rect(rect, |ui| {
-        ui.visuals_mut().extreme_bg_color = Color32::TRANSPARENT;
-        let response = ui.add(
-            egui::TextEdit::multiline(&mut draft.text)
-                .id_source("canvas_text_entry")
-                // The layouter supplies the real row/caret metrics. TextEdit's
-                // separate minimum row height must not add the font's em box back.
-                .font(egui::FontId::new(1.0, font.family.clone()))
-                .layouter(&mut layouter)
-                .text_color(Color32::TRANSPARENT)
-                .frame(false)
-                .desired_width(width)
-                .desired_rows(1)
-                .char_limit(MAX_CHARS)
-                .margin(egui::Vec2::ZERO),
-        );
-        entry_rect = response.rect;
-        editor_id = response.id;
-        editor_had_focus = response.has_focus() || response.lost_focus();
-        if draft.focus_requested {
-            response.request_focus();
-            draft.focus_requested = false;
+
+    let (galley, original_ink_origin) = layout_text(ui, &draft.text);
+    let mut ink_origin = original_ink_origin;
+    let frame = CanvasTextFrame::new(to_screen, ink_origin, galley.size(), size);
+    let editor_id = ui.make_persistent_id("canvas_text_entry");
+    let focus_requested = std::mem::take(&mut draft.focus_requested);
+    if focus_requested {
+        egui::TextEdit::store_state(ui.ctx(), editor_id, Default::default());
+        ui.memory_mut(|memory| memory.request_focus(editor_id));
+    }
+
+    // TextEdit handles keyboard editing and IME locally. Its screen-aligned
+    // painting and mouse interaction are replaced by the projected field.
+    let mut keyboard_ui =
+        ui.child_ui_with_id_source(frame.rect, egui::Layout::default(), "canvas_text_keyboard");
+    keyboard_ui.set_clip_rect(Rect::NOTHING);
+    let mut layouter = |ui: &egui::Ui, text: &str, _width: f32| {
+        if text == galley.text() {
+            ink_origin = original_ink_origin;
+            return galley.clone();
         }
-        ui.painter().rect_stroke(
-            response.rect,
-            0.0,
-            egui::Stroke::new(1.0_f32, app.settings.theme.accent.to_color32()),
+        let (galley, origin) = layout_text(ui, text);
+        ink_origin = origin;
+        galley
+    };
+    let mut output = egui::TextEdit::multiline(&mut draft.text)
+        .id(editor_id)
+        .font(egui::FontId::new(1.0, font.family.clone()))
+        .layouter(&mut layouter)
+        .text_color(Color32::TRANSPARENT)
+        .frame(false)
+        .desired_width(frame.rect.width())
+        .desired_rows(1)
+        .char_limit(MAX_CHARS)
+        .margin(egui::Vec2::ZERO)
+        .show(&mut keyboard_ui);
+
+    let frame = CanvasTextFrame::new(to_screen, ink_origin, output.galley.size(), size);
+    let entry_rect = Rect::from_points(&frame.corners);
+    let mut pointer_response = ui.interact(
+        entry_rect.intersect(canvas_rect),
+        editor_id.with("pointer"),
+        Sense {
+            focusable: false,
+            ..Sense::click_and_drag()
+        },
+    );
+    let pointer = ui.ctx().pointer_interact_pos();
+    let local_pointer = pointer.and_then(|point| frame.local_pointer(point));
+    let pointer_inside = local_pointer.is_some_and(|point| frame.rect.contains(point))
+        && pointer.is_some_and(|point| canvas_rect.contains(point));
+    pointer_response.hovered &= pointer_inside;
+    if pointer_response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+        ui.output_mut(|output| output.mutable_text_under_cursor = true);
+    }
+    let dragging = pointer_response.dragged_by(PointerButton::Primary)
+        || pointer_response.drag_stopped_by(PointerButton::Primary);
+    let pointer_edited = local_pointer
+        .filter(|_| pointer_inside || dragging)
+        .is_some_and(|point| {
+            let cursor = output.galley.cursor_from_pos(point.to_vec2());
+            output.state.cursor.pointer_interaction(
+                ui,
+                &pointer_response,
+                cursor,
+                &output.galley,
+                dragging,
+            )
+        });
+    if pointer_edited {
+        output.response.request_focus();
+    }
+
+    let painter = ui.painter_at(canvas_rect);
+    painter.add(Shape::closed_line(
+        frame.corners.to_vec(),
+        Stroke::new(1.0_f32, app.settings.theme.accent.to_color32()),
+    ));
+    if let Some(range) = output
+        .state
+        .cursor
+        .range(&output.galley)
+        .filter(|_| output.response.has_focus() && painter.clip_rect().intersects(entry_rect))
+    {
+        paint_canvas_selection(
+            &painter,
+            &frame,
+            &output.galley,
+            &range,
+            ui.visuals().selection.bg_fill.linear_multiply(0.5),
         );
-    });
+        let caret = output.galley.pos_from_cursor(&range.primary);
+        painter.line_segment(
+            [caret.center_top(), caret.center_bottom()]
+                .map(|point| project_point(frame.to_screen, point)),
+            ui.visuals().text_cursor,
+        );
+        ui.output_mut(|output| {
+            output.ime = Some(egui::output::IMEOutput {
+                rect: entry_rect,
+                cursor_rect: Rect::from_points(&projected_rect(frame.to_screen, caret)).expand(1.0),
+            });
+        });
+    }
+    if pointer_edited {
+        output.state.store(ui.ctx(), editor_id);
+    }
     // The visible glyphs are painted by the stage through scene_preview.
     // On a touch screen a text box under the on-screen keyboard, or past
     // the canvas edge, is moved into view: typing into something hidden is
     // no use.
+    let editor_had_focus = output.response.has_focus() || output.response.lost_focus();
     if editor_had_focus && crate::touch::ENABLED {
-        let visible = ui.clip_rect().shrink(8.0);
+        let visible = painter.clip_rect().shrink(8.0);
         let shift = egui::vec2(
             if entry_rect.width() > visible.width() || entry_rect.left() < visible.left() {
                 visible.left() - entry_rect.left()
@@ -757,9 +914,9 @@ pub(crate) fn render_canvas(
         && (ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter))
             || ui.input(|i| {
                 i.pointer.primary_pressed()
-                    && i.pointer.interact_pos().is_some_and(|p| {
-                        !entry_rect.contains(p)
-                            && !properties_rect.is_some_and(|rect| rect.contains(p))
+                    && !pointer_inside
+                    && pointer.is_some_and(|point| {
+                        !properties_rect.is_some_and(|rect| rect.contains(point))
                     })
             })
             || draft.q0rg_id != app.session.current_q0rg_id
@@ -1188,8 +1345,8 @@ fn commit(app: &mut EditorApp, draft: &TextDraft) -> Result<(), String> {
             frame,
             target: Target::Asset(asset_id),
             transform: Transform2D {
-                tx: draft.origin.x,
-                ty: draft.origin.y,
+                tx: draft.transform.tx,
+                ty: draft.transform.ty,
                 ..Transform2D::IDENTITY
             },
             tween: Tween::None,
@@ -1353,12 +1510,15 @@ fn layout_lines(face: &Face, text: &str, size: f32) -> Vec<Vec<Placed>> {
     lines
 }
 
-/// How wide each laid-out line is.
-fn line_widths(lines: &[Vec<Placed>]) -> Vec<f32> {
-    lines
-        .iter()
-        .map(|line| line.last().map_or(0.0, |last| last.x + last.advance))
-        .collect()
+fn line_width(line: &[Placed]) -> f32 {
+    line.last().map_or(0.0, |last| last.x + last.advance)
+}
+
+fn blank_line_height(face: &Face, size: f32) -> f32 {
+    face.capital_height()
+        .map(|height| f32::from(height) * (size / f32::from(face.units_per_em())))
+        .filter(|height| *height > 0.0)
+        .unwrap_or(size * 0.75)
 }
 
 /// Ink bounds in the same coordinates as outline_text. Blank lines still need
@@ -1367,7 +1527,8 @@ struct CanvasTextLayout {
     lines: Vec<Vec<Placed>>,
     rows: Vec<[f32; 2]>,
     size: f32,
-    width: f32,
+    left: f32,
+    right: f32,
     top: f32,
     bottom: f32,
 }
@@ -1376,11 +1537,12 @@ impl CanvasTextLayout {
     fn new(face: &Face, text: &str, size: f32) -> Self {
         let lines = layout_lines(face, text, size);
         let scale = size / f32::from(face.units_per_em());
-        let empty_height = face
-            .capital_height()
-            .map(|height| f32::from(height) * scale)
-            .filter(|height| *height > 0.0)
-            .unwrap_or(size * 0.75);
+        let empty_height = blank_line_height(face, size);
+        let mut left = 0.0_f32;
+        let mut right = lines
+            .iter()
+            .map(|line| line_width(line))
+            .fold(0.0, f32::max);
         let rows: Vec<_> = lines
             .iter()
             .enumerate()
@@ -1393,6 +1555,8 @@ impl CanvasTextLayout {
                         .glyph_index(placed.character)
                         .and_then(|glyph| face.glyph_bounding_box(glyph))
                     {
+                        left = left.min(placed.x + f32::from(bounds.x_min) * scale);
+                        right = right.max(placed.x + f32::from(bounds.x_max) * scale);
                         top = top.min(baseline - f32::from(bounds.y_max) * scale);
                         bottom = bottom.max(baseline - f32::from(bounds.y_min) * scale);
                     }
@@ -1406,7 +1570,8 @@ impl CanvasTextLayout {
             .collect();
         Self {
             size,
-            width: line_widths(&lines).into_iter().fold(0.0f32, f32::max),
+            left,
+            right,
             top: rows.iter().map(|row| row[0]).fold(f32::INFINITY, f32::min),
             bottom: rows
                 .iter()
@@ -1441,10 +1606,8 @@ fn outline_text(font: &[u8], index: u32, text: &str, size: f32) -> Result<Vec<Pa
     Ok(builder.paths)
 }
 
-/// Moves egui's carets onto `layout`, laid out at `scale` screen pixels per
-/// text pixel: egui measures with its own font engine, and its idea of
-/// where letters are drifts from the outlines the stage draws.
-fn align_galley(galley: &mut egui::Galley, layout: &CanvasTextLayout, scale: f32) {
+/// Use the same local coordinates for egui's carets as for the vector outlines.
+fn align_galley(galley: &mut egui::Galley, layout: &CanvasTextLayout) {
     if galley.rows.len() != layout.lines.len()
         || galley
             .rows
@@ -1458,25 +1621,22 @@ fn align_galley(galley: &mut egui::Galley, layout: &CanvasTextLayout, scale: f32
         let [top, bottom] = layout.rows[index];
         let baseline = layout.size + index as f32 * layout.size * 1.25;
         for (glyph, placed) in row.glyphs.iter_mut().zip(line) {
-            glyph.pos.x = placed.x * scale;
-            glyph.size.x = placed.advance * scale;
-            glyph.pos.y = (baseline - layout.top) * scale;
-            glyph.ascent = (baseline - top) * scale;
-            glyph.size.y = (bottom - top) * scale;
+            glyph.pos.x = placed.x - layout.left;
+            glyph.size.x = placed.advance;
+            glyph.pos.y = baseline - layout.top;
+            glyph.ascent = baseline - top;
+            glyph.size.y = bottom - top;
         }
-        row.rect = egui::Rect::from_min_max(
-            egui::pos2(0.0, (top - layout.top) * scale),
-            egui::pos2(
-                line.last().map_or(0.0, |last| last.x + last.advance) * scale,
-                (bottom - layout.top) * scale,
-            ),
+        row.rect = Rect::from_min_max(
+            egui::pos2(-layout.left, top - layout.top),
+            egui::pos2(line_width(line) - layout.left, bottom - layout.top),
         );
         // Only the stage paints glyphs; this galley supplies editing geometry.
         row.visuals = Default::default();
     }
-    galley.rect = egui::Rect::from_min_size(
-        egui::Pos2::ZERO,
-        egui::vec2(layout.width * scale, (layout.bottom - layout.top) * scale),
+    galley.rect = Rect::from_min_size(
+        Pos2::ZERO,
+        egui::vec2(layout.right - layout.left, layout.bottom - layout.top),
     );
     galley.mesh_bounds = egui::Rect::NOTHING;
     galley.num_vertices = 0;
@@ -1547,6 +1707,17 @@ mod tests {
         ctx: &Context,
         events: Vec<egui::Event>,
     ) -> egui::FullOutput {
+        canvas_frame_with_view(app, ctx, events, Pos2::ZERO, 1.0, Affine::IDENTITY)
+    }
+
+    fn canvas_frame_with_view(
+        app: &mut EditorApp,
+        ctx: &Context,
+        events: Vec<egui::Event>,
+        origin: Pos2,
+        scale: f32,
+        edit_transform: Affine,
+    ) -> egui::FullOutput {
         ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -1565,21 +1736,197 @@ mod tests {
                             egui::Sense::click_and_drag(),
                         );
                         let view = crate::render::StageView {
-                            origin: egui::Pos2::ZERO,
-                            scale: 1.0,
+                            origin,
+                            scale,
                             stage_rect: rect,
-                            edit_transform: q0s_format::transform::Affine::IDENTITY,
+                            edit_transform,
                         };
-                        if !render_canvas(app, ui, &view) {
+                        if !render_canvas(app, ui, &view, rect) {
                             handle_stage(
                                 app,
                                 &response,
-                                response.hover_pos().map(|p| Vec2::new(p.x, p.y)),
+                                response
+                                    .interact_pointer_pos()
+                                    .map(|p| view.screen_to_stage(p)),
                             );
                         }
                     });
             },
         )
+    }
+
+    fn text_frame_corners<'a>(app: &EditorApp, output: &'a egui::FullOutput) -> &'a [Pos2] {
+        let stroke = Stroke::new(1.0_f32, app.settings.theme.accent.to_color32());
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                Shape::Path(path) if path.closed && path.stroke == stroke => Some(&path.points[..]),
+                _ => None,
+            })
+            .expect("canvas text field outline")
+    }
+
+    fn pointer_button(pos: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        }
+    }
+
+    #[test]
+    fn new_text_frame_starts_at_the_clicked_point() {
+        let mut app = EditorApp::default();
+        let ctx = Context::default();
+        let click = egui::pos2(165.0, 128.0);
+        let mut frame = |events| {
+            canvas_frame_with_view(
+                &mut app,
+                &ctx,
+                events,
+                egui::pos2(30.0, 40.0),
+                2.5,
+                Affine::IDENTITY,
+            )
+        };
+        frame(vec![]);
+        frame(vec![
+            egui::Event::PointerMoved(click),
+            pointer_button(click, true),
+        ]);
+        frame(vec![pointer_button(click, false)]);
+        let output = frame(vec![]);
+        let projected = text_frame_corners(&app, &output);
+        assert!((projected[0] - click).length() < 0.1, "{projected:?}");
+    }
+
+    #[test]
+    fn transformed_text_frame_renders_and_selects_in_text_coordinates() {
+        let mut app = EditorApp::default();
+        let ctx = Context::default();
+        let draft = TextDraft {
+            text: "text".into(),
+            ..Default::default()
+        };
+        let Some((bytes, index)) = font_bytes(&draft.font) else {
+            return;
+        };
+        let face = Face::parse(&bytes, index).unwrap();
+        let layout = CanvasTextLayout::new(&face, &draft.text, draft.size);
+        let transform = Transform2D {
+            tx: 215.0,
+            ty: 90.0,
+            sx: -1.3,
+            sy: 1.6,
+            rotation: -0.25,
+            skew_x: -0.95,
+            skew_y: 0.2,
+        };
+        commit(&mut app, &draft).unwrap();
+        let asset = selected_asset_id(&app, &app.session.selection).unwrap();
+        app.state.project.q0rgs[0].layers[0].placements[0].transform = transform;
+        begin_edit(&mut app, asset);
+
+        let view = crate::render::StageView {
+            origin: egui::pos2(30.0, 25.0),
+            scale: 1.4,
+            stage_rect: Rect::NOTHING,
+            edit_transform: Affine::from_transform(Transform2D {
+                rotation: 0.09,
+                skew_y: -0.22,
+                ..Transform2D::IDENTITY
+            }),
+        };
+        let frame = |app: &mut EditorApp, events| {
+            canvas_frame_with_view(
+                app,
+                &ctx,
+                events,
+                view.origin,
+                view.scale,
+                view.edit_transform,
+            )
+        };
+        let output = frame(&mut app, vec![]);
+        let project = |x, y| view.stage_to_screen(crate::render::apply(transform, Vec2::new(x, y)));
+        let corners = text_frame_corners(&app, &output);
+        let assert_point = |actual: Pos2, expected: Pos2| {
+            assert!(
+                (actual - expected).length() < 0.1,
+                "{actual:?} vs {expected:?}"
+            );
+        };
+        assert_point(corners[0], project(layout.left, layout.top));
+        assert_point(corners[3], project(layout.left, layout.bottom));
+        let x_dir = project(1.0, 0.0) - project(0.0, 0.0);
+        assert_point(
+            corners[1],
+            project(layout.right + 2.0 / x_dir.length(), layout.top),
+        );
+        assert_point(
+            corners[2],
+            project(layout.right + 2.0 / x_dir.length(), layout.bottom),
+        );
+
+        let line = &layout.lines[0];
+        let middle_y = (layout.top + layout.bottom) * 0.5;
+        let start = project(line[1].x, middle_y);
+        let end = project(line[3].x, middle_y);
+        frame(&mut app, vec![egui::Event::PointerMoved(start)]);
+        let output = frame(&mut app, vec![pointer_button(start, true)]);
+        let cursor_color = ctx.style().visuals.text_cursor;
+        let caret = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                Shape::LineSegment { points, stroke } if *stroke == cursor_color => Some(*points),
+                _ => None,
+            })
+            .expect("transformed caret");
+        assert_point(caret[0], project(line[1].x, layout.top));
+        assert_point(caret[1], project(line[1].x, layout.bottom));
+        let output = frame(&mut app, vec![egui::Event::PointerMoved(end)]);
+        let selection_color = ctx.style().visuals.selection.bg_fill.linear_multiply(0.5);
+        let selection = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                Shape::Path(path) if path.fill == selection_color => Some(&path.points),
+                _ => None,
+            })
+            .expect("transformed selection");
+        assert_point(selection[0], project(line[1].x, layout.top));
+        assert_point(selection[2], project(line[3].x, layout.bottom));
+        frame(&mut app, vec![pointer_button(end, false)]);
+        frame(&mut app, vec![egui::Event::Text("X".into())]);
+        assert_eq!(app.session.text_editor.as_ref().unwrap().text, "tXt");
+
+        let output = frame(&mut app, vec![]);
+        let corners = text_frame_corners(&app, &output);
+        let view_bounds = Rect::from_points(corners);
+        let outside = view_bounds.left_top() + egui::vec2(1.0, 1.0);
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(outside),
+                pointer_button(outside, true),
+            ],
+        );
+        assert!(
+            app.session.text_editor.is_none(),
+            "a click outside the skewed frame applies"
+        );
+        let placement = &app.state.project.q0rgs[0].layers[0].placements[0];
+        assert_eq!(placement.transform, transform);
+        let edited_id = selected_asset_id(&app, &app.session.selection).unwrap();
+        assert_eq!(
+            decode_source(&app.state.project.asset_names[&edited_id])
+                .unwrap()
+                .0,
+            "tXt"
+        );
     }
 
     #[test]
@@ -1594,9 +1941,13 @@ mod tests {
                     let mut app = EditorApp::default();
                     let origin = Vec2::new(30.0, 40.0);
                     let size = 48.0;
+                    let transform = Affine {
+                        tx: origin.x,
+                        ty: origin.y,
+                        ..Affine::from_uniform_scale(scale)
+                    };
                     app.session.text_editor = Some(TextDraft {
-                        origin,
-                        transform: Affine::from_uniform_scale(scale),
+                        transform,
                         text: text.into(),
                         size,
                         font: font.into(),
@@ -1616,19 +1967,7 @@ mod tests {
                         )));
                     state.store(&ctx, editor_id);
                     let output = canvas_frame(&mut app, &ctx, vec![]);
-                    let accent = app.settings.theme.accent.to_color32();
-                    let field = output
-                        .shapes
-                        .iter()
-                        .find_map(|shape| match &shape.shape {
-                            egui::Shape::Rect(rect)
-                                if rect.stroke == egui::Stroke::new(1.0_f32, accent) =>
-                            {
-                                Some(rect.rect)
-                            }
-                            _ => None,
-                        })
-                        .expect("canvas text field outline");
+                    let field = Rect::from_points(text_frame_corners(&app, &output));
                     let bounds: Vec<_> = text
                         .chars()
                         .filter_map(|character| {
@@ -1655,15 +1994,18 @@ mod tests {
                         .shapes
                         .iter()
                         .find_map(|shape| match &shape.shape {
-                            egui::Shape::Rect(rect) if rect.fill == selection_color => {
-                                Some(rect.rect)
+                            Shape::Path(path) if path.fill == selection_color => {
+                                Some(Rect::from_points(&path.points))
                             }
                             _ => None,
                         })
                         .expect("text selection highlight");
                     assert!((selection.top() - field.top()).abs() < 0.1);
                     assert!((selection.bottom() - field.bottom()).abs() < 0.1);
-                    assert_eq!(app.session.text_editor.as_ref().unwrap().origin, origin);
+                    assert_eq!(
+                        app.session.text_editor.as_ref().unwrap().transform,
+                        transform
+                    );
                 }
             }
         }
@@ -1727,13 +2069,13 @@ hi ";
             }));
         });
         let mut galley = (*galley.unwrap()).clone();
-        align_galley(&mut galley, &CanvasTextLayout::new(&face, text, 48.0), 2.0);
+        let layout = CanvasTextLayout::new(&face, text, 48.0);
+        align_galley(&mut galley, &layout);
         for (row, line) in galley.rows.iter().zip(&lines) {
             for (glyph, placed) in row.glyphs.iter().zip(line) {
-                assert_eq!(glyph.pos.x, placed.x * 2.0);
+                assert_eq!(glyph.pos.x, placed.x - layout.left);
             }
-            let width = line_widths(std::slice::from_ref(line))[0] * 2.0;
-            assert!((row.rect.right() - width).abs() < 1.0e-3);
+            assert!((row.rect.right() - (line_width(line) - layout.left)).abs() < 1.0e-3);
         }
     }
 
@@ -1743,8 +2085,13 @@ hi ";
             return;
         }
         let mut app = EditorApp::default();
+        let transform = Affine {
+            tx: 30.0,
+            ty: 40.0,
+            ..Affine::IDENTITY
+        };
         app.session.text_editor = Some(TextDraft {
-            origin: Vec2::new(30.0, 40.0),
+            transform,
             ..Default::default()
         });
         let ctx = Context::default();
@@ -1792,8 +2139,8 @@ hi ";
         );
         begin_edit(&mut app, id);
         assert_eq!(
-            app.session.text_editor.as_ref().unwrap().origin,
-            Vec2::new(30.0, 40.0)
+            app.session.text_editor.as_ref().unwrap().transform,
+            transform
         );
         canvas_frame(&mut app, &ctx, vec![]);
         canvas_frame(
@@ -1870,7 +2217,11 @@ hi ";
         let mut app = EditorApp::default();
         let draft = TextDraft {
             asset_id: None,
-            origin: Vec2::new(24.0, 42.0),
+            transform: Affine {
+                tx: 24.0,
+                ty: 42.0,
+                ..Affine::IDENTITY
+            },
             text: "Hello q0e".into(),
             size: 48.0,
             font: default_font(),

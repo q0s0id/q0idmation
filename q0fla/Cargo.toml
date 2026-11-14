@@ -17,6 +17,7 @@ zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
 ttf-parser = "0.25"
 flate2 = "1.0"
 jpeg-decoder = { version = "0.3", default-features = false }
+swf = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"

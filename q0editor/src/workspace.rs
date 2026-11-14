@@ -23,15 +23,17 @@ pub(crate) enum Panel {
     Timeline,
     Library,
     Properties,
+    FramePicker,
 }
 
 impl Panel {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Stage,
         Self::Tools,
         Self::Timeline,
         Self::Library,
         Self::Properties,
+        Self::FramePicker,
     ];
 
     fn icon(self) -> crate::ui::Icon {
@@ -42,6 +44,7 @@ impl Panel {
             Self::Timeline => Icon::Timeline,
             Self::Library => Icon::Library,
             Self::Properties => Icon::Properties,
+            Self::FramePicker => Icon::Frame,
         }
     }
 
@@ -52,8 +55,14 @@ impl Panel {
             Self::Timeline => "Timeline",
             Self::Library => "Library",
             Self::Properties => "Properties",
+            Self::FramePicker => "Frame Picker",
         }
     }
+}
+
+fn floating_window_id(surface: SurfaceIndex) -> Id {
+    // Match the area ID used by egui_dock 0.12.
+    Id::new(format!("window {surface:?}"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -510,6 +519,23 @@ impl WorkspaceLayout {
         self.changed_at = Some(Instant::now());
     }
 
+    pub(crate) fn open_frame_picker(&mut self, ctx: &Context) {
+        if self.find_panel(Panel::FramePicker).is_none() {
+            self.toggle(Panel::FramePicker);
+        }
+        if let Some(location @ (surface, node, _)) = self.find_panel(Panel::FramePicker) {
+            self.dock.set_active_tab(location);
+            self.dock.set_focused_node_and_surface((surface, node));
+            if surface != SurfaceIndex::main() {
+                ctx.move_to_top(egui::LayerId::new(
+                    egui::Order::Middle,
+                    floating_window_id(surface),
+                ));
+            }
+        }
+        ctx.request_repaint();
+    }
+
     pub(crate) fn toggle(&mut self, panel: Panel) {
         if self.icons.contains(&panel) {
             self.dock_icon(panel);
@@ -541,6 +567,14 @@ impl WorkspaceLayout {
                     .unwrap_or(0)
                     + 1,
             };
+            if panel == Panel::FramePicker {
+                let surface = self.dock.add_window(vec![tab]);
+                if let Some(window) = self.dock.get_window_state_mut(surface) {
+                    window.set_size(egui::vec2(340.0, 300.0));
+                }
+                self.changed_at = Some(Instant::now());
+                return;
+            }
             let tree = self.dock.main_surface_mut();
             if tree.is_empty() {
                 tree.push_to_first_leaf(tab);
@@ -569,7 +603,7 @@ impl WorkspaceLayout {
                     // egui_dock's WindowState does not update its rect in 0.12.
                     // The actual egui area stores the position/size. Floating
                     // docks have no frame margins, so this is also the content size.
-                    let id = Id::new(format!("window {:?}", SurfaceIndex(index)));
+                    let id = floating_window_id(SurfaceIndex(index));
                     let rect = ctx
                         .memory(|m| m.area_rect(id))
                         .unwrap_or(Rect::from_min_size(
@@ -803,6 +837,8 @@ impl TabViewer for Viewer<'_> {
     }
 
     fn ui(&mut self, ui: &mut Ui, tab: &mut PanelTab) {
+        // The stage keeps its own canvas colour.
+        crate::ui::panel_backdrop(ui, tab.panel != Panel::Stage);
         ui.push_id(tab.id, |ui| self.panel_ui(ui, tab));
     }
 }
@@ -896,6 +932,7 @@ impl Viewer<'_> {
             }
             Panel::Library => crate::panels::library::render(app, ui),
             Panel::Properties => crate::panels::properties::render(app, ui),
+            Panel::FramePicker => crate::panels::properties::render_frame_picker(app, ui),
         });
         if matches!(tab.panel, Panel::Library | Panel::Timeline) {
             self.panel_views
@@ -907,7 +944,7 @@ impl Viewer<'_> {
             Panel::Tools => crate::perf::PerfSpan::Toolbar,
             Panel::Timeline => crate::perf::PerfSpan::Timeline,
             Panel::Library => crate::perf::PerfSpan::Library,
-            Panel::Properties => crate::perf::PerfSpan::Properties,
+            Panel::Properties | Panel::FramePicker => crate::perf::PerfSpan::Properties,
         };
         app.perf.record(span, started.elapsed());
     }
@@ -928,7 +965,8 @@ pub(crate) fn render(app: &mut EditorApp, ctx: &Context) {
                 bounds.max.x -= ICON_STRIP_WIDTH;
                 Rect::from_min_max(egui::pos2(bounds.right(), full.top()), full.max)
             });
-            workspace.restore_window_bounds(bounds);
+            let floating_bounds = ctx.screen_rect();
+            workspace.restore_window_bounds(floating_bounds);
             if let Some(active) = workspace.active_stage {
                 workspace.stage_views.insert(
                     (app.active_project_tab_id().unwrap_or(0), active),
@@ -953,7 +991,42 @@ pub(crate) fn render(app: &mut EditorApp, ctx: &Context) {
             }
             let mut style = egui_dock::Style::from_egui(ui.style());
             style.dock_area_padding = Some(egui::Margin::ZERO);
-            style.tab_bar.height = 26.0;
+            style.tab_bar.height = crate::ui::TAB_BAR_HEIGHT;
+            if crate::ui::chrome(ui.ctx()).enabled {
+                // The bars' gradient goes underneath, in `tab_bars` below.
+                // Tabs at rest sit on it unboxed; the open tab is a piece
+                // of its panel, rounded at the top.
+                style.tab_bar.bg_fill = egui::Color32::TRANSPARENT;
+                let top = egui::Rounding {
+                    nw: 6.0,
+                    ne: 6.0,
+                    sw: 0.0,
+                    se: 0.0,
+                };
+                for tab in [
+                    &mut style.tab.active,
+                    &mut style.tab.inactive,
+                    &mut style.tab.focused,
+                    &mut style.tab.hovered,
+                    &mut style.tab.inactive_with_kb_focus,
+                ] {
+                    tab.rounding = top;
+                }
+                for tab in [
+                    &mut style.tab.inactive,
+                    &mut style.tab.inactive_with_kb_focus,
+                ] {
+                    tab.bg_fill = egui::Color32::TRANSPARENT;
+                    tab.outline_color = egui::Color32::TRANSPARENT;
+                }
+                style.tab.hovered.bg_fill = ui
+                    .visuals()
+                    .widgets
+                    .hovered
+                    .weak_bg_fill
+                    .gamma_multiply(0.6);
+                style.tab.hovered.outline_color = egui::Color32::TRANSPARENT;
+            }
             style.tab.tab_body.inner_margin = egui::Margin::same(3.0);
             // A thin line between panels, still easy to grab.
             style.separator.width = 2.0;
@@ -985,13 +1058,15 @@ pub(crate) fn render(app: &mut EditorApp, ctx: &Context) {
             ui.visuals_mut().window_stroke = egui::Stroke::NONE;
             ui.visuals_mut().window_rounding = egui::Rounding::ZERO;
             let mut dock_ui = ui.child_ui(bounds, *ui.layout());
+            let tab_bars = dock_ui.painter().add(egui::Shape::Noop);
             DockArea::new(&mut workspace.dock)
                 .id(Id::new("editor_workspace"))
                 .style(style)
-                .window_bounds(bounds)
+                .window_bounds(floating_bounds)
                 .show_window_close_buttons(false)
                 .show_window_collapse_buttons(false)
                 .show_inside(&mut dock_ui, &mut viewer);
+            crate::ui::paint_tab_bars(&dock_ui, tab_bars);
             let collapse = viewer.collapse.take();
             if let Some(split) = viewer.edge_preview {
                 let mut preview = bounds;
@@ -1531,6 +1606,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn floating_panels_can_overlap_editor_chrome() {
+        let mut app = EditorApp::default();
+        app.workspace_layout.collapse_to_icon(Panel::Properties);
+        let surface = app.workspace_layout.dock.add_window(vec![PanelTab {
+            panel: Panel::FramePicker,
+            id: 73,
+        }]);
+        app.workspace_layout
+            .dock
+            .get_window_state_mut(surface)
+            .unwrap()
+            .set_position(egui::pos2(960.0, 0.0))
+            .set_size(egui::vec2(240.0, 210.0));
+        let ctx = Context::default();
+        for _ in 0..3 {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200.0, 800.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::TopBottomPanel::top("test_menu")
+                        .exact_height(60.0)
+                        .show(ctx, |ui| {
+                            ui.label("menu");
+                        });
+                    render(&mut app, ctx);
+                },
+            );
+        }
+        let rect = ctx
+            .memory(|memory| memory.area_rect(floating_window_id(surface)))
+            .unwrap();
+        assert!(
+            rect.top() < 60.0 && rect.right() > 1200.0 - ICON_STRIP_WIDTH,
+            "{rect:?}"
+        );
+    }
+
+    #[test]
     fn panels_collapse_to_icons_and_dock_back_where_they_were() {
         let mut workspace = WorkspaceLayout::default();
         let docked = topology(&workspace.dock);
@@ -1571,16 +1689,17 @@ mod tests {
     #[test]
     fn regression_duplicate_panels_have_unique_ids_and_survive_layout_reload() {
         let mut workspace = WorkspaceLayout::default();
+        workspace.new_panel(Panel::FramePicker, None);
         for panel in Panel::ALL {
             workspace.new_panel(panel, None);
         }
-        assert_eq!(workspace.dock.iter_all_tabs().count(), 10);
+        assert_eq!(workspace.dock.iter_all_tabs().count(), 2 * Panel::ALL.len());
         let ids: HashSet<_> = workspace
             .dock
             .iter_all_tabs()
             .map(|(_, tab)| tab.id)
             .collect();
-        assert_eq!(ids.len(), 10);
+        assert_eq!(ids.len(), 2 * Panel::ALL.len());
         let saved = workspace.capture(&Context::default());
         let restored = SavedLayout::decode(&serde_json::to_value(saved).unwrap())
             .unwrap()
@@ -1608,6 +1727,191 @@ mod tests {
             workspace.find_panel(Panel::Stage).is_some(),
             "closing one stage closed the other"
         );
+    }
+
+    #[test]
+    fn frame_picker_opens_from_properties_and_edits_the_selected_instance() {
+        use crate::app::Action;
+        use crate::state::Selection;
+        use q0s_format::v2::{
+            Placement, PlacementFx, Q0rgPlayback, Q0rgPlaybackMode, Target, Transform2D, Tween,
+        };
+
+        fn label_position(output: &egui::FullOutput, label: &str, within: Rect) -> egui::Pos2 {
+            output
+                .shapes
+                .iter()
+                .rev()
+                .find_map(|painted| {
+                    let egui::epaint::Shape::Text(text) = &painted.shape else {
+                        return None;
+                    };
+                    let point = text.visual_bounding_rect().center();
+                    (text.galley.job.text == label
+                        && within.contains(point)
+                        && painted.clip_rect.contains(point))
+                    .then_some(point)
+                })
+                .unwrap_or_else(|| panic!("missing {label:?} in {within:?}"))
+        }
+
+        for mode in [
+            Q0rgPlaybackMode::Loop,
+            Q0rgPlaybackMode::SingleFrame,
+            Q0rgPlaybackMode::Manual,
+        ] {
+            let ctx = Context::default();
+            let mut app = EditorApp::default();
+            crate::theme::install(&ctx);
+            app.settings.theme.apply(&ctx);
+            let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 1150.0));
+            let render_frame = |app: &mut EditorApp, events| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| render(app, ctx),
+                )
+            };
+            let click = |app: &mut EditorApp, pos| {
+                for pressed in [true, false] {
+                    let _ = render_frame(
+                        app,
+                        vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                    );
+                }
+                app.flush_pending_actions();
+            };
+
+            let mut symbol = app.state.project.q0rgs[0].clone();
+            symbol.q0rg_id = 2;
+            symbol.name = "Expressions".into();
+            symbol.frame_count = 4;
+            app.state.project.q0rgs.push(symbol);
+            let placement = Placement {
+                frame: 0,
+                target: Target::Q0rg(2),
+                transform: Transform2D::IDENTITY,
+                pivot: None,
+                instance_id: 1,
+                tween: Tween::None,
+                fx: PlacementFx {
+                    q0rg_playback: Q0rgPlayback {
+                        mode,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            };
+            let parent = &mut app.state.project.q0rgs[0];
+            parent.frame_count = 10;
+            let original = vec![
+                placement.clone(),
+                Placement {
+                    instance_id: 2,
+                    ..placement.clone()
+                },
+                Placement {
+                    frame: 8,
+                    instance_id: 2,
+                    ..placement.clone()
+                },
+                Placement {
+                    frame: 8,
+                    ..placement.clone()
+                },
+            ];
+            parent.layers[0].placements = original.clone();
+            app.session.current_frame = 5;
+            app.session.selection = Selection::Placement {
+                q0rg_id: 1,
+                layer_id: 1,
+                placement_idx: 0,
+            };
+            app.workspace_layout.toggle(Panel::Library);
+
+            let _ = render_frame(&mut app, vec![]);
+            let output = render_frame(&mut app, vec![]);
+            assert!(!app.workspace_layout.shown(Panel::FramePicker));
+            let button = label_position(
+                &output,
+                "Frame Picker…",
+                panel_rect(&app.workspace_layout, Panel::Properties),
+            );
+            click(&mut app, button);
+            let (surface, _, _) = app
+                .workspace_layout
+                .find_panel(Panel::FramePicker)
+                .expect("open from Properties");
+            assert_ne!(surface, SurfaceIndex::main());
+            app.handle(&ctx, Action::OpenFramePicker);
+            assert_eq!(
+                app.workspace_layout
+                    .dock
+                    .iter_all_tabs()
+                    .filter(|(_, tab)| tab.panel == Panel::FramePicker)
+                    .count(),
+                1
+            );
+            app.workspace_layout.toggle(Panel::Properties);
+            let _ = render_frame(&mut app, vec![]);
+            let output = render_frame(&mut app, vec![]);
+            let window = ctx
+                .memory(|m| m.area_rect(floating_window_id(surface)))
+                .expect("floating window is visible");
+            let frame_three = label_position(&output, "3", window);
+            click(&mut app, frame_three);
+
+            let layer = &app.state.project.q0rgs[0].layers[0];
+            assert_eq!(layer.placements.len(), 6);
+            assert_eq!(layer.placements[..3], original[..3]);
+            let edited = &layer.placements[4];
+            assert_eq!(edited.frame, 5);
+            assert_eq!(edited.instance_id, 1);
+            assert_eq!(layer.placements[5].fx, placement.fx);
+            let playback = edited.fx.q0rg_playback;
+            assert_eq!(playback.mode, mode);
+            if mode == Q0rgPlaybackMode::Loop {
+                assert_eq!((playback.first_frame, playback.last_frame), (2, Some(3)));
+            } else {
+                assert_eq!(playback.single_frame, 2);
+            }
+            let later_playback = if mode == Q0rgPlaybackMode::Manual {
+                playback
+            } else {
+                placement.fx.q0rg_playback
+            };
+            assert_eq!(layer.placements[3].fx.q0rg_playback, later_playback);
+            assert_eq!(
+                app.session.selection,
+                Selection::Placement {
+                    q0rg_id: 1,
+                    layer_id: 1,
+                    placement_idx: 4
+                }
+            );
+            app.handle(&ctx, Action::Undo);
+            assert_eq!(app.state.project.q0rgs[0].layers[0].placements, original);
+
+            let saved = app.workspace_layout.capture(&ctx);
+            let restored = SavedLayout::decode(&serde_json::to_value(saved).unwrap())
+                .unwrap()
+                .dock();
+            assert!(restored
+                .iter_all_tabs()
+                .any(|((surface, _), tab)| surface != SurfaceIndex::main()
+                    && tab.panel == Panel::FramePicker));
+        }
     }
 
     #[test]
@@ -1741,10 +2045,11 @@ mod tests {
     fn closing_and_reopening_stage_restores_its_dock_position() {
         let mut workspace = WorkspaceLayout::default();
         let before = topology(&workspace.dock);
+        let panel_count = workspace.dock.iter_all_tabs().count();
 
         workspace.toggle(Panel::Stage);
         assert!(workspace.find_panel(Panel::Stage).is_none());
-        assert_eq!(workspace.dock.iter_all_tabs().count(), Panel::ALL.len() - 1);
+        assert_eq!(workspace.dock.iter_all_tabs().count(), panel_count - 1);
 
         workspace.toggle(Panel::Stage);
         assert_eq!(topology(&workspace.dock), before);
@@ -1771,8 +2076,8 @@ mod tests {
         assert!(restored.find_panel(Panel::Stage).is_none());
 
         restored.toggle(Panel::Stage);
-        for panel in Panel::ALL {
-            assert!(restored.find_panel(panel).is_some());
+        for (_, tab) in default_dock().iter_all_tabs() {
+            assert!(restored.find_panel(tab.panel).is_some());
         }
     }
 
@@ -1780,7 +2085,9 @@ mod tests {
     fn empty_workspace_survives_reload_and_can_restore_stage() {
         let mut workspace = WorkspaceLayout::default();
         for panel in Panel::ALL {
-            workspace.toggle(panel);
+            if workspace.shown(panel) {
+                workspace.toggle(panel);
+            }
         }
         let settings = Settings {
             workspace_layout: serde_json::to_value(workspace.capture(&Context::default())).unwrap(),

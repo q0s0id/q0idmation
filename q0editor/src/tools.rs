@@ -1762,7 +1762,7 @@ fn selected_transform_hit(
         app.textures
             .store_placement_bounds_cache(geometry.bounds, revision);
         if let Some((Some(local_bbox), visual_affine, rig_bound, transform)) = placement_frame {
-            let hit = if rig_bound {
+            let hit = if rig_bound || supports_axis_resize(transform) {
                 hit_test_transform_frame(
                     affine_transform_frame(local_bbox, visual_affine),
                     view,
@@ -1771,7 +1771,7 @@ fn selected_transform_hit(
                     false,
                 )
             } else {
-                hit_test_placement_transform(local_bbox, transform, view, cursor_screen)
+                None
             };
             if let Some(hit) = hit {
                 return Some(hit);
@@ -1922,6 +1922,59 @@ fn transform_axis_aligned_bounds(
     result
 }
 
+fn placement_3d_projection_for_ref(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    placement_idx: usize,
+    frame: u16,
+    override_local_affine: Option<Affine>,
+    local_2d_bounds: Option<(f32, f32, f32, f32)>,
+) -> Option<crate::render::Placement3dStageProjection> {
+    let layer = project
+        .q0rgs
+        .iter()
+        .find(|q| q.q0rg_id == q0rg_id)?
+        .layers
+        .iter()
+        .find(|l| l.layer_id == layer_id)?;
+    crate::render::placement_3d_stage_projection(
+        project,
+        q0rg_id,
+        layer,
+        placement_idx,
+        frame,
+        override_local_affine,
+        local_2d_bounds,
+    )
+}
+
+pub(crate) fn stage_point_to_placement_plane(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    placement_idx: usize,
+    frame: u16,
+    stage_point: Vec2,
+) -> Vec2 {
+    placement_3d_projection_for_ref(project, q0rg_id, layer_id, placement_idx, frame, None, None)
+        .map(|proj| proj.stage_to_plane(stage_point))
+        .unwrap_or(stage_point)
+}
+
+fn placement_plane_point_to_stage(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    placement_idx: usize,
+    frame: u16,
+    plane_point: Vec2,
+) -> Vec2 {
+    placement_3d_projection_for_ref(project, q0rg_id, layer_id, placement_idx, frame, None, None)
+        .map(|proj| proj.plane_to_stage(plane_point))
+        .unwrap_or(plane_point)
+}
+
 fn placement_ref_world_bounds(
     project: &ProjectV2,
     reference: PlacementRef,
@@ -1942,6 +1995,17 @@ fn placement_ref_world_bounds(
         reference.placement_idx,
         frame,
     )?;
+    if let Some(proj) = crate::render::placement_3d_stage_projection(
+        project,
+        reference.q0rg_id,
+        layer,
+        reference.placement_idx,
+        frame,
+        Some(Affine::from_transform(transform)),
+        None,
+    ) {
+        return proj.stage_bounds;
+    }
     let mut visual = placement.clone();
     visual.transform = transform;
     // The box goes round what the symbol shows now, as in Animate.
@@ -2070,9 +2134,27 @@ impl SelectionOverlayGeometry {
         transform: Transform2D,
         frame: u16,
     ) -> Option<(f32, f32, f32, f32)> {
+        let local_bounds = self.bounds.placement_shown_local_bbox(
+            project,
+            reference.q0rg_id,
+            reference.layer_id,
+            reference.placement_idx,
+            frame,
+        );
         let layer = self
             .bounds
             .layer(project, reference.q0rg_id, reference.layer_id)?;
+        if let Some(proj) = crate::render::placement_3d_stage_projection(
+            project,
+            reference.q0rg_id,
+            layer,
+            reference.placement_idx,
+            frame,
+            Some(Affine::from_transform(transform)),
+            local_bounds,
+        ) {
+            return proj.stage_bounds;
+        }
         let mut visual = layer.placements.get(reference.placement_idx)?.clone();
         visual.transform = transform;
         match crate::render::placement_shown_frame(
@@ -2109,10 +2191,34 @@ impl SelectionOverlayGeometry {
         reference: PlacementRef,
         frame: u16,
     ) -> Option<(f32, f32, f32, f32)> {
-        let (_, visual_affine, _, _) = self
-            .placement_local_visual_frame_scoped(project, textures, revision, reference, frame)?;
-        let transform = crate::app::affine_to_transform(visual_affine)?;
-        self.shown_placement_bbox(project, reference, transform, frame)
+        let transform = self.active_transform_scoped(
+            project,
+            textures,
+            revision,
+            reference.q0rg_id,
+            reference.layer_id,
+            reference.placement_idx,
+            frame,
+        )?;
+        let instance_id = self
+            .bounds
+            .layer(project, reference.q0rg_id, reference.layer_id)?
+            .placements
+            .get(reference.placement_idx)?
+            .instance_id;
+        let local_frame = self.bounds.q0rg(project, reference.q0rg_id).map(|q0rg| {
+            if q0rg.frame_count > 0 {
+                frame % q0rg.frame_count
+            } else {
+                0
+            }
+        })?;
+        let base_affine = textures
+            .scoped_rig_pose(project, revision, reference.q0rg_id, local_frame)
+            .and_then(|pose| pose.binding_transform(instance_id))
+            .unwrap_or_else(|| Affine::from_transform(transform));
+        let base_transform = crate::app::affine_to_transform(base_affine)?;
+        self.shown_placement_bbox(project, reference, base_transform, frame)
     }
 
     #[allow(clippy::type_complexity)]
@@ -2160,6 +2266,27 @@ impl SelectionOverlayGeometry {
             .and_then(|pose| pose.binding_transform(instance_id));
         let rig_bound = rig_transform.is_some();
         let visual_affine = rig_transform.unwrap_or_else(|| Affine::from_transform(transform));
+        if let Some(layer) = self
+            .bounds
+            .layer(project, reference.q0rg_id, reference.layer_id)
+        {
+            if let Some(proj) = crate::render::placement_3d_stage_projection(
+                project,
+                reference.q0rg_id,
+                layer,
+                reference.placement_idx,
+                frame,
+                Some(visual_affine),
+                local_bounds,
+            ) {
+                return Some((
+                    proj.effective_local_bbox,
+                    proj.effective_visual_affine,
+                    rig_bound,
+                    transform,
+                ));
+            }
+        }
         Some((local_bounds, visual_affine, rig_bound, transform))
     }
 
@@ -2280,6 +2407,28 @@ fn selection_transform_bounds_scoped(app: &mut EditorApp) -> Option<(f32, f32, f
     result
 }
 
+fn placement_default_local_pivot(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    placement_idx: usize,
+    frame: u16,
+) -> Option<Vec2> {
+    let layer = project
+        .q0rgs
+        .iter()
+        .find(|q| q.q0rg_id == q0rg_id)?
+        .layers
+        .iter()
+        .find(|layer| layer.layer_id == layer_id)?;
+    let placement = layer.placements.get(placement_idx)?;
+    if let Some(pivot) = placement.pivot {
+        return Some(pivot);
+    }
+    crate::render::placement_shown_local_bbox(project, q0rg_id, layer, placement_idx, frame)
+        .map(|(x0, y0, x1, y1)| Vec2::new((x0 + x1) * 0.5, (y0 + y1) * 0.5))
+}
+
 fn selection_default_pivot(app: &EditorApp) -> Option<Vec2> {
     if matches!(app.session.selection, Selection::StrokeSegment(_)) {
         return None;
@@ -2297,24 +2446,28 @@ fn selection_default_pivot(app: &EditorApp) -> Option<Vec2> {
             placement_idx,
             app.session.current_frame,
         )?;
-        let placement = app
-            .state
-            .project
-            .q0rgs
-            .iter()
-            .find(|q| q.q0rg_id == q0rg_id)?
-            .layers
-            .iter()
-            .find(|layer| layer.layer_id == layer_id)?
-            .placements
-            .get(placement_idx)?;
-        let local_center = placement.pivot.unwrap_or_else(|| {
+        let local_center = placement_default_local_pivot(
+            &app.state.project,
+            q0rg_id,
+            layer_id,
+            placement_idx,
+            app.session.current_frame,
+        )
+        .unwrap_or_else(|| {
             Vec2::new(
                 (local_bbox.0 + local_bbox.2) * 0.5,
                 (local_bbox.1 + local_bbox.3) * 0.5,
             )
         });
-        return Some(Affine::from_transform(transform).apply(local_center));
+        let plane_pivot = Affine::from_transform(transform).apply(local_center);
+        return Some(placement_plane_point_to_stage(
+            &app.state.project,
+            q0rg_id,
+            layer_id,
+            placement_idx,
+            app.session.current_frame,
+            plane_pivot,
+        ));
     }
     selection_transform_bounds(app)
         .map(|bounds| Vec2::new((bounds.0 + bounds.2) * 0.5, (bounds.1 + bounds.3) * 0.5))
@@ -2366,21 +2519,58 @@ fn set_selection_transform_pivot(app: &mut EditorApp, point: Vec2) {
                     .iter()
                     .find(|layer| layer.layer_id == reference.layer_id)?;
                 let placement = layer.placements.get(reference.placement_idx)?;
-                let transform = if placement.frame == app.session.current_frame {
-                    placement.transform
-                } else {
-                    crate::render::active_transform_for_placement(
-                        layer,
-                        reference.placement_idx,
-                        app.session.current_frame,
-                    )?
-                };
-                let local = Affine::from_transform(transform).inverse()?.apply(point);
-                Some((reference, local))
+                let transform = placement_transform_for_edit(
+                    &app.state.project,
+                    reference.q0rg_id,
+                    reference.layer_id,
+                    reference.placement_idx,
+                    app.session.current_frame,
+                )
+                .map(|(t, _)| t)
+                .or_else(|| {
+                    if placement.frame == app.session.current_frame {
+                        Some(placement.transform)
+                    } else {
+                        crate::render::active_transform_for_placement(
+                            layer,
+                            reference.placement_idx,
+                            app.session.current_frame,
+                        )
+                    }
+                })?;
+                let plane_point = stage_point_to_placement_plane(
+                    &app.state.project,
+                    reference.q0rg_id,
+                    reference.layer_id,
+                    reference.placement_idx,
+                    app.session.current_frame,
+                    point,
+                );
+                let local = Affine::from_transform(transform)
+                    .inverse()?
+                    .apply(plane_point);
+                let default_local = placement_default_local_pivot(
+                    &app.state.project,
+                    reference.q0rg_id,
+                    reference.layer_id,
+                    reference.placement_idx,
+                    app.session.current_frame,
+                );
+                let is_3d_placement = placement_3d_projection_for_ref(
+                    &app.state.project,
+                    reference.q0rg_id,
+                    reference.layer_id,
+                    reference.placement_idx,
+                    app.session.current_frame,
+                    None,
+                    None,
+                )
+                .is_some();
+                Some((reference, local, default_local, is_3d_placement))
             })
             .collect::<Vec<_>>();
     let mut changed = Vec::new();
-    for (reference, local) in anchors {
+    for (reference, local, default_local, is_3d_placement) in anchors {
         if let Some(placement) = app
             .state
             .project
@@ -2394,9 +2584,16 @@ fn set_selection_transform_pivot(app: &mut EditorApp, point: Vec2) {
             })
             .and_then(|layer| layer.placements.get_mut(reference.placement_idx))
         {
-            if placement.pivot.is_none_or(|saved| {
-                (saved.x - local.x).abs() > 1.0e-4 || (saved.y - local.y).abs() > 1.0e-4
-            }) {
+            let keep_default_none = placement.pivot.is_none()
+                && is_3d_placement
+                && default_local.is_some_and(|def| {
+                    (def.x - local.x).abs() <= 1.0e-3 && (def.y - local.y).abs() <= 1.0e-3
+                });
+            if !keep_default_none
+                && placement.pivot.is_none_or(|saved| {
+                    (saved.x - local.x).abs() > 1.0e-3 || (saved.y - local.y).abs() > 1.0e-3
+                })
+            {
                 placement.pivot = Some(local);
                 changed.push((
                     reference.q0rg_id,
@@ -3820,10 +4017,22 @@ fn lasso_selection(project: &ProjectV2, q0rg_id: u16, frame: u16, points: &[Vec2
             else {
                 return false;
             };
-            let mut visual = placement.clone();
-            visual.transform = transform;
-            placement_bbox(project, &visual)
-                .is_some_and(|bbox| region.intersects(&rect_polygon(bbox)))
+            let bbox = crate::render::placement_3d_stage_projection(
+                project,
+                reference.q0rg_id,
+                layer,
+                reference.placement_idx,
+                frame,
+                Some(Affine::from_transform(transform)),
+                None,
+            )
+            .and_then(|proj| proj.stage_bounds)
+            .or_else(|| {
+                let mut visual = placement.clone();
+                visual.transform = transform;
+                placement_bbox(project, &visual)
+            });
+            bbox.is_some_and(|bbox| region.intersects(&rect_polygon(bbox)))
         })
         .collect();
     if let Some(mut selection) = select_raw_area_by_clip(
@@ -5231,10 +5440,9 @@ pub(crate) fn nudge_selection(app: &mut EditorApp, delta: Vec2) -> bool {
                 if changed {
                     app.mark_placement_transforms_changed(&[(*q0rg_id, *layer_id, *placement_idx)]);
                     if let Some(pivot) = pivot {
-                        set_selection_transform_pivot(
-                            app,
-                            Vec2::new(pivot.x + delta.x, pivot.y + delta.y),
-                        );
+                        let next_pivot = selection_default_pivot(app)
+                            .unwrap_or_else(|| Vec2::new(pivot.x + delta.x, pivot.y + delta.y));
+                        set_selection_transform_pivot(app, next_pivot);
                     }
                 }
                 changed
@@ -5667,7 +5875,24 @@ fn apply_group_transform(
         )
     });
     for (reference, source) in object_updates {
-        let composed = Affine::compose(transform, Affine::from_transform(source));
+        let object_transform = placement_3d_projection_for_ref(
+            &app.state.project,
+            reference.q0rg_id,
+            reference.layer_id,
+            reference.placement_idx,
+            app.session.current_frame,
+            Some(Affine::from_transform(source)),
+            None,
+        )
+        .and_then(|proj| {
+            let inv = proj.plane_to_stage_affine.inverse()?;
+            Some(Affine::compose(
+                inv,
+                Affine::compose(transform, proj.plane_to_stage_affine),
+            ))
+        })
+        .unwrap_or(transform);
+        let composed = Affine::compose(object_transform, Affine::from_transform(source));
         let Some(next) = crate::app::affine_to_transform(composed) else {
             continue;
         };
@@ -5775,19 +6000,6 @@ pub(crate) fn flip_selected_placements(app: &mut EditorApp, horizontal: bool) ->
         .filter(|pivot| pivot.selection == previous_selection)
         .map(|pivot| pivot.point)
         .unwrap_or_else(|| Vec2::new((min_x + max_x) * 0.5, (min_y + max_y) * 0.5));
-    let reflection = if horizontal {
-        Affine {
-            a11: -1.0,
-            tx: pivot.x * 2.0,
-            ..Affine::IDENTITY
-        }
-    } else {
-        Affine {
-            a22: -1.0,
-            ty: pivot.y * 2.0,
-            ..Affine::IDENTITY
-        }
-    };
     let Some(transform_data) = references
         .iter()
         .map(|reference| {
@@ -5798,8 +6010,29 @@ pub(crate) fn flip_selected_placements(app: &mut EditorApp, horizontal: bool) ->
                 reference.placement_idx,
                 frame,
             )?;
+            let plane_pivot = stage_point_to_placement_plane(
+                &app.state.project,
+                reference.q0rg_id,
+                reference.layer_id,
+                reference.placement_idx,
+                frame,
+                pivot,
+            );
+            let plane_reflection = if horizontal {
+                Affine {
+                    a11: -1.0,
+                    tx: plane_pivot.x * 2.0,
+                    ..Affine::IDENTITY
+                }
+            } else {
+                Affine {
+                    a22: -1.0,
+                    ty: plane_pivot.y * 2.0,
+                    ..Affine::IDENTITY
+                }
+            };
             let transformed = crate::app::affine_to_transform(Affine::compose(
-                reflection,
+                plane_reflection,
                 Affine::from_transform(current),
             ))?;
             Some((transformed, rig_bound))
@@ -6952,7 +7185,15 @@ fn begin_dragging_placement_inner(
     if let Some(pivot) = start_pivot {
         set_selection_transform_pivot(app, pivot);
     }
-    let cursor_offset = Vec2::new(transform.tx - start_cursor.x, transform.ty - start_cursor.y);
+    let plane_start = stage_point_to_placement_plane(
+        &app.state.project,
+        q0rg_id,
+        layer_id,
+        placement_idx,
+        app.session.current_frame,
+        start_cursor,
+    );
+    let cursor_offset = Vec2::new(transform.tx - plane_start.x, transform.ty - plane_start.y);
     let pivot_cursor_offset =
         start_pivot.map(|pivot| Vec2::new(pivot.x - start_cursor.x, pivot.y - start_cursor.y));
     app.session.tool_state = ToolState::DraggingPlacement {
@@ -7613,7 +7854,17 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 ) {
                     if let Some(hit) = transform_hit {
                         let transform_pivot = selection_transform_pivot(app);
-                        let pivot_local = transform_pivot.and_then(|point| {
+                        let plane_pivot = transform_pivot.map(|point| {
+                            stage_point_to_placement_plane(
+                                &app.state.project,
+                                q0rg_id,
+                                layer_id,
+                                placement_idx,
+                                app.session.current_frame,
+                                point,
+                            )
+                        });
+                        let pivot_local = plane_pivot.and_then(|point| {
                             Affine::from_transform(start_t)
                                 .inverse()
                                 .map(|inverse| inverse.apply(point))
@@ -7642,6 +7893,14 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                         if let Some(point) = transform_pivot {
                             set_selection_transform_pivot(app, point);
                         }
+                        let plane_p = stage_point_to_placement_plane(
+                            &app.state.project,
+                            q0rg_id,
+                            layer_id,
+                            placement_idx,
+                            app.session.current_frame,
+                            p,
+                        );
                         match hit {
                             TransformHit::Scale(handle) => {
                                 app.session.tool_state = ToolState::DraggingHandle {
@@ -7657,12 +7916,21 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                                 app.session.status = "Resizing selection".to_string();
                             }
                             TransformHit::Rotate(_) => {
-                                let default_center_local = Vec2::new(
-                                    (local_bbox.0 + local_bbox.2) * 0.5,
-                                    (local_bbox.1 + local_bbox.3) * 0.5,
-                                );
+                                let default_center_local = placement_default_local_pivot(
+                                    &app.state.project,
+                                    q0rg_id,
+                                    layer_id,
+                                    placement_idx,
+                                    app.session.current_frame,
+                                )
+                                .unwrap_or_else(|| {
+                                    Vec2::new(
+                                        (local_bbox.0 + local_bbox.2) * 0.5,
+                                        (local_bbox.1 + local_bbox.3) * 0.5,
+                                    )
+                                });
                                 let affine = Affine::from_transform(start_t);
-                                let center_world = transform_pivot
+                                let center_world = plane_pivot
                                     .unwrap_or_else(|| affine.apply(default_center_local));
                                 let center_local = affine
                                     .inverse()
@@ -7675,7 +7943,8 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                                     start_transform: start_t,
                                     center_local,
                                     center_world,
-                                    start_angle: (p.y - center_world.y).atan2(p.x - center_world.x),
+                                    start_angle: (plane_p.y - center_world.y)
+                                        .atan2(plane_p.x - center_world.x),
                                 };
                                 app.session.status = "Rotating selection".to_string();
                             }
@@ -7691,7 +7960,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                                     edge,
                                     start_transform: start_t,
                                     start_local_bbox: local_bbox,
-                                    start_cursor_local: inverse.apply(p),
+                                    start_cursor_local: inverse.apply(plane_p),
                                     pivot_local,
                                 };
                                 app.session.status = "Skewing selection".to_string();
@@ -7838,6 +8107,14 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                         shift_down,
                     );
                     let constrained = Vec2::new(start_cursor.x + delta.x, start_cursor.y + delta.y);
+                    let plane_constrained = stage_point_to_placement_plane(
+                        &app.state.project,
+                        q0rg_id,
+                        layer_id,
+                        placement_idx,
+                        app.session.current_frame,
+                        constrained,
+                    );
                     let moved = placement_transform_for_edit(
                         &app.state.project,
                         q0rg_id,
@@ -7846,8 +8123,8 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                         app.session.current_frame,
                     )
                     .is_some_and(|(mut transform, _)| {
-                        transform.tx = constrained.x + cursor_offset.x;
-                        transform.ty = constrained.y + cursor_offset.y;
+                        transform.tx = plane_constrained.x + cursor_offset.x;
+                        transform.ty = plane_constrained.y + cursor_offset.y;
                         set_placement_transform_for_edit(
                             app,
                             q0rg_id,
@@ -7863,10 +8140,10 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                             placement_idx,
                         )]);
                         if let Some(offset) = pivot_cursor_offset {
-                            set_selection_transform_pivot(
-                                app,
-                                Vec2::new(constrained.x + offset.x, constrained.y + offset.y),
-                            );
+                            let next_pivot = selection_default_pivot(app).unwrap_or_else(|| {
+                                Vec2::new(constrained.x + offset.x, constrained.y + offset.y)
+                            });
+                            set_selection_transform_pivot(app, next_pivot);
                         }
                     }
                 }
@@ -8145,13 +8422,21 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 pivot_local,
             } => {
                 if let Some(p) = cursor {
+                    let plane_p = stage_point_to_placement_plane(
+                        &app.state.project,
+                        q0rg_id,
+                        layer_id,
+                        placement_idx,
+                        app.session.current_frame,
+                        p,
+                    );
                     let mut next_transform = start_transform;
                     let changed = apply_handle_drag(
                         &mut next_transform,
                         start_transform,
                         start_local_bbox,
                         handle,
-                        p,
+                        plane_p,
                         pivot_local,
                         ScaleDragModifiers {
                             ignore_pivot: ctrl_down,
@@ -8166,8 +8451,17 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                     );
                     let next_pivot = changed
                         .then(|| {
-                            pivot_local
-                                .map(|local| Affine::from_transform(next_transform).apply(local))
+                            pivot_local.map(|local| {
+                                let plane_pt = Affine::from_transform(next_transform).apply(local);
+                                placement_plane_point_to_stage(
+                                    &app.state.project,
+                                    q0rg_id,
+                                    layer_id,
+                                    placement_idx,
+                                    app.session.current_frame,
+                                    plane_pt,
+                                )
+                            })
                         })
                         .flatten();
                     if changed {
@@ -8192,8 +8486,17 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 start_angle,
             } => {
                 if let Some(p) = cursor {
+                    let plane_p = stage_point_to_placement_plane(
+                        &app.state.project,
+                        q0rg_id,
+                        layer_id,
+                        placement_idx,
+                        app.session.current_frame,
+                        p,
+                    );
                     let delta = snap_rotation_delta(
-                        (p.y - center_world.y).atan2(p.x - center_world.x) - start_angle,
+                        (plane_p.y - center_world.y).atan2(plane_p.x - center_world.x)
+                            - start_angle,
                         shift_down,
                     );
                     let next_transform = rotate_placement_about_local_point(
@@ -8228,12 +8531,20 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 pivot_local,
             } => {
                 if let Some(p) = cursor {
+                    let plane_p = stage_point_to_placement_plane(
+                        &app.state.project,
+                        q0rg_id,
+                        layer_id,
+                        placement_idx,
+                        app.session.current_frame,
+                        p,
+                    );
                     if let Some(next) = skew_placement_from_cursor(
                         start_transform,
                         start_local_bbox,
                         edge,
                         start_cursor_local,
-                        p,
+                        plane_p,
                         pivot_local,
                     ) {
                         let changed = set_placement_transform_for_edit(
@@ -8250,9 +8561,17 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                                 placement_idx,
                             )]);
                             if let Some(local) = pivot_local {
+                                let plane_pt = Affine::from_transform(next).apply(local);
                                 set_selection_transform_pivot(
                                     app,
-                                    Affine::from_transform(next).apply(local),
+                                    placement_plane_point_to_stage(
+                                        &app.state.project,
+                                        q0rg_id,
+                                        layer_id,
+                                        placement_idx,
+                                        app.session.current_frame,
+                                        plane_pt,
+                                    ),
                                 );
                             }
                         }
@@ -13195,6 +13514,24 @@ fn drag_start_data(
         .and_then(|q| q.layers.iter().find(|l| l.layer_id == layer_id))?;
     let (active_transform, rig_bound) =
         placement_transform_for_edit(project, q0rg_id, layer_id, placement_idx, frame)?;
+    let local =
+        crate::render::placement_shown_local_bbox(project, q0rg_id, layer, placement_idx, frame);
+    if let Some(proj) = crate::render::placement_3d_stage_projection(
+        project,
+        q0rg_id,
+        layer,
+        placement_idx,
+        frame,
+        Some(Affine::from_transform(active_transform)),
+        local,
+    ) {
+        return Some((
+            proj.stage_bounds?,
+            proj.effective_local_bbox?,
+            active_transform,
+            rig_bound,
+        ));
+    }
     // The same box the selection frame shows: what the symbol shows now.
     let world = placement_ref_world_bounds(
         project,
@@ -13205,9 +13542,7 @@ fn drag_start_data(
         },
         frame,
     )?;
-    let local =
-        crate::render::placement_shown_local_bbox(project, q0rg_id, layer, placement_idx, frame)?;
-    Some((world, local, active_transform, rig_bound))
+    Some((world, local?, active_transform, rig_bound))
 }
 
 /// Materialize the complete visible layer state at `frame` before an edit.
@@ -13520,6 +13855,9 @@ fn affine_transform_frame(local_bbox: (f32, f32, f32, f32), affine: Affine) -> T
     ])
 }
 
+/// Only the tests still frame a plain transform; the stage uses the
+/// shown (parented or rigged) affine.
+#[cfg(test)]
 fn placement_transform_frame(
     local_bbox: (f32, f32, f32, f32),
     transform: Transform2D,
@@ -13679,6 +14017,9 @@ fn hit_test_raw_transform(
     )
 }
 
+/// Only the tests still frame a plain transform; the stage uses the
+/// shown (parented or rigged) affine.
+#[cfg(test)]
 fn hit_test_placement_transform(
     local_bbox: (f32, f32, f32, f32),
     transform: Transform2D,
@@ -14370,11 +14711,14 @@ pub(crate) fn placement_transform_for_edit(
         .find(|layer| layer.layer_id == layer_id)?;
     let (visual_affine, rig_bound) =
         active_visual_affine_for_placement(project, q0rg_id, layer, placement_idx, frame)?;
-    let transform = if rig_bound {
-        crate::app::affine_to_transform(visual_affine)?
-    } else {
-        crate::render::active_transform_for_placement(layer, placement_idx, frame)?
-    };
+    // Edits work on what is shown: a parented object's place on the stage,
+    // which `set_placement_transform_for_edit` turns back into its parent's.
+    let transform =
+        if rig_bound || q0s_format::parenting::parent_of(project, q0rg_id, layer_id).is_some() {
+            crate::app::affine_to_transform(visual_affine)?
+        } else {
+            crate::render::active_transform_for_placement(layer, placement_idx, frame)?
+        };
     Some((transform, rig_bound))
 }
 
@@ -14458,6 +14802,17 @@ pub(crate) fn set_placement_transform_for_edit(
         }
     }
 
+    // A parented object is stored relative to its parent's object.
+    let frame = app.session.current_frame;
+    let transform =
+        match q0s_format::parenting::parent_world(&app.state.project, q0rg_id, layer_id, frame) {
+            Some(parent) => parent
+                .inverse()
+                .map(|inverse| Affine::compose(inverse, Affine::from_transform(transform)))
+                .and_then(q0s_format::parenting::affine_to_transform)
+                .unwrap_or(transform),
+            None => transform,
+        };
     let Some(placement) = placement_mut(app, q0rg_id, layer_id, placement_idx) else {
         return false;
     };
@@ -14653,12 +15008,22 @@ fn collect_placements_in_rect(
             if is_raw_graphics_placement(project, placement) {
                 continue;
             }
-            let Some(transform) = crate::app::affine_to_transform(visual_affine) else {
-                continue;
-            };
-            let mut visual = placement.clone();
-            visual.transform = transform;
-            let Some(bbox) = placement_bbox(project, &visual) else {
+            let Some(bbox) = crate::render::placement_3d_stage_projection(
+                project,
+                q0rg_id,
+                layer,
+                idx,
+                frame,
+                Some(visual_affine),
+                None,
+            )
+            .and_then(|proj| proj.stage_bounds)
+            .or_else(|| {
+                let transform = crate::app::affine_to_transform(visual_affine)?;
+                let mut visual = placement.clone();
+                visual.transform = transform;
+                placement_bbox(project, &visual)
+            }) else {
                 continue;
             };
             // AABB-vs-AABB overlap.
@@ -14848,7 +15213,10 @@ fn active_raw_placement_indices(
 }
 
 pub(crate) fn is_raw_graphics_placement(project: &ProjectV2, placement: &Placement) -> bool {
-    if placement.transform != Transform2D::IDENTITY || placement.tween.is_motion() {
+    if placement.transform != Transform2D::IDENTITY
+        || placement.tween.is_motion()
+        || placement.fx.three.is_some()
+    {
         return false;
     }
     if let Target::Asset(asset_id) = placement.target {
@@ -14875,7 +15243,10 @@ fn is_raw_graphics_placement_cached(
     placement: &Placement,
     bounds: &crate::render::PlacementBoundsCache,
 ) -> bool {
-    if placement.transform != Transform2D::IDENTITY || placement.tween.is_motion() {
+    if placement.transform != Transform2D::IDENTITY
+        || placement.tween.is_motion()
+        || placement.fx.three.is_some()
+    {
         return false;
     }
     if let Target::Asset(asset_id) = placement.target {
@@ -14990,8 +15361,9 @@ fn active_visual_states(
     layer: &q0s_format::v2::Layer,
     frame: u16,
 ) -> Vec<(usize, Affine, bool, q0s_format::v2::PlacementFx)> {
-    let rig_pose = q0s_format::rig::rig_for_q0rg(project, q0rg_id)
-        .map(|rig| q0s_format::rig::evaluate_rig(rig, f32::from(frame), &[]));
+    // Parented layers are bound like rigged instances, so what is hit and
+    // framed is where they are shown.
+    let rig_pose = q0s_format::parenting::q0rg_pose(project, q0rg_id, f32::from(frame), &[]);
     active_visual_states_with_rig_pose(layer, frame, rig_pose.as_ref())
 }
 
@@ -15004,13 +15376,27 @@ fn active_visual_states_with_rig_pose(
         .into_iter()
         .filter_map(|active| {
             let placement = layer.placements.get(active.index)?;
-            let bound = rig_pose
-                .as_ref()
-                .and_then(|pose| pose.binding_transform(placement.instance_id));
+            let binding = rig_pose.as_ref().and_then(|pose| {
+                (placement.instance_id != 0)
+                    .then(|| {
+                        pose.bindings
+                            .iter()
+                            .find(|binding| binding.instance_id == placement.instance_id)
+                    })
+                    .flatten()
+            });
+            // A layer parent places the object but, unlike a bone, leaves
+            // it keyed and edited like any other.
+            let rig_bound = binding.is_some_and(|binding| {
+                binding.node_id != q0s_format::parenting::PARENT_BINDING_NODE
+            });
             Some((
                 active.index,
-                bound.unwrap_or_else(|| Affine::from_transform(active.transform)),
-                bound.is_some(),
+                binding.map_or_else(
+                    || Affine::from_transform(active.transform),
+                    |binding| binding.transform,
+                ),
+                rig_bound,
                 active.fx,
             ))
         })
@@ -15029,7 +15415,7 @@ fn active_visual_affines(
         .collect()
 }
 
-fn active_visual_affine_for_placement(
+pub(crate) fn active_visual_affine_for_placement(
     project: &ProjectV2,
     q0rg_id: u16,
     layer: &q0s_format::v2::Layer,
@@ -15070,7 +15456,7 @@ fn q0rg_visible_body_contains_point(
     revision: Option<(u64, u64)>,
     depth: u8,
 ) -> bool {
-    if depth > 8 {
+    if depth > q0s_format::MAX_Q0RG_NESTING_DEPTH {
         return false;
     }
     if bounds_cache.q0rg_body_bounds_are_static(project, q0rg_id) {
@@ -15102,13 +15488,8 @@ fn q0rg_visible_body_contains_point(
         (Some(textures), Some(revision)) => {
             textures.scoped_rig_pose(project, revision, q0rg_id, local_frame)
         }
-        _ => q0s_format::rig::rig_for_q0rg(project, q0rg_id).map(|rig| {
-            std::rc::Rc::new(q0s_format::rig::evaluate_rig(
-                rig,
-                f32::from(local_frame),
-                &[],
-            ))
-        }),
+        _ => q0s_format::parenting::q0rg_pose(project, q0rg_id, f32::from(local_frame), &[])
+            .map(std::rc::Rc::new),
     };
     for layer in q0rg.layers.iter().rev() {
         // A nested symbol's mask is not its selectable artwork. Do not clip
@@ -15186,6 +15567,9 @@ fn q0rg_visible_body_contains_point(
 #[allow(clippy::too_many_arguments)]
 fn selectable_placement_body_contains_point(
     project: &ProjectV2,
+    q0rg_id: u16,
+    layer: &q0s_format::v2::Layer,
+    placement_idx: usize,
     placement: &Placement,
     playback_start_frame: u16,
     visual_affine: Affine,
@@ -15197,6 +15581,22 @@ fn selectable_placement_body_contains_point(
     bounds_cache: &mut crate::render::PlacementBoundsCache,
     revision: Option<(u64, u64)>,
 ) -> bool {
+    let local_bounds = bounds_cache.placement_shown_local_bbox(
+        project,
+        q0rg_id,
+        layer.layer_id,
+        placement_idx,
+        frame,
+    );
+    let proj_3d = crate::render::placement_3d_stage_projection(
+        project,
+        q0rg_id,
+        layer,
+        placement_idx,
+        frame,
+        Some(visual_affine),
+        local_bounds,
+    );
     match placement.target {
         Target::Q0rg(child_id) => {
             let child_frame = q0s_format::v2::resolve_q0rg_playback_frame(
@@ -15206,12 +15606,20 @@ fn selectable_placement_body_contains_point(
                 playback_start_frame,
                 resolved_fx.q0rg_playback,
             );
+            let test_point = if let Some(proj) = proj_3d {
+                let Some(local_card_pt) = proj.stage_to_local_card(point) else {
+                    return false;
+                };
+                visual_affine.apply(local_card_pt)
+            } else {
+                point
+            };
             q0rg_visible_body_contains_point(
                 project,
                 child_id,
                 child_frame,
                 visual_affine,
-                point,
+                test_point,
                 slop.edge,
                 textures,
                 bounds_cache,
@@ -15221,9 +15629,28 @@ fn selectable_placement_body_contains_point(
         }
         // Display-object vectors/media keep oriented local-bounds semantics, but
         // the bounds follow the resolved rig affine rather than the stale placement key.
-        Target::Asset(_) => bounds_cache
-            .target_local_bbox(project, placement.target)
-            .is_some_and(|bbox| affine_local_bbox_contains(bbox, visual_affine, point)),
+        Target::Asset(_) => {
+            if let Some(proj) = proj_3d {
+                if let Some(eff_bbox) = proj.effective_local_bbox {
+                    if affine_local_bbox_contains(eff_bbox, proj.effective_visual_affine, point) {
+                        return true;
+                    }
+                }
+                if let (Some(bbox), Some(local_card_pt)) = (
+                    bounds_cache.target_local_bbox(project, placement.target),
+                    proj.stage_to_local_card(point),
+                ) {
+                    return local_card_pt.x >= bbox.0
+                        && local_card_pt.x <= bbox.2
+                        && local_card_pt.y >= bbox.1
+                        && local_card_pt.y <= bbox.3;
+                }
+                return false;
+            }
+            bounds_cache
+                .target_local_bbox(project, placement.target)
+                .is_some_and(|bbox| affine_local_bbox_contains(bbox, visual_affine, point))
+        }
     }
 }
 fn hit_test_selectable_placement(
@@ -15341,8 +15768,8 @@ fn hit_test_selectable_placement_with_bounds(
         (Some(textures), Some(revision)) => {
             textures.scoped_rig_pose(project, revision, q0rg_id, frame)
         }
-        _ => q0s_format::rig::rig_for_q0rg(project, q0rg_id)
-            .map(|rig| std::rc::Rc::new(q0s_format::rig::evaluate_rig(rig, f32::from(frame), &[]))),
+        _ => q0s_format::parenting::q0rg_pose(project, q0rg_id, f32::from(frame), &[])
+            .map(std::rc::Rc::new),
     };
     for layer in q.layers.iter().rev() {
         if !project.layer_is_visible(q0rg_id, layer.layer_id)
@@ -15371,6 +15798,9 @@ fn hit_test_selectable_placement_with_bounds(
                 .unwrap_or_else(|| Affine::from_transform(active.transform));
             if selectable_placement_body_contains_point(
                 project,
+                q0rg_id,
+                layer,
+                idx,
                 placement,
                 active.playback_start_frame,
                 visual_affine,
@@ -16227,19 +16657,14 @@ fn draw_selection_content_overlay(
             painter.circle_stroke(center, 8.0, Stroke::new(1.0_f32, accent));
             return;
         };
-        let authored_pivot = project
-            .q0rgs
-            .iter()
-            .find(|q| q.q0rg_id == q0rg_id)
-            .and_then(|q| q.layers.iter().find(|layer| layer.layer_id == layer_id))
-            .and_then(|layer| layer.placements.get(placement_idx))
-            .and_then(|placement| placement.pivot);
-        let local_center = authored_pivot.unwrap_or_else(|| {
-            Vec2::new(
-                (local_bbox.0 + local_bbox.2) * 0.5,
-                (local_bbox.1 + local_bbox.3) * 0.5,
-            )
-        });
+        let local_center =
+            placement_default_local_pivot(project, q0rg_id, layer_id, placement_idx, current_frame)
+                .unwrap_or_else(|| {
+                    Vec2::new(
+                        (local_bbox.0 + local_bbox.2) * 0.5,
+                        (local_bbox.1 + local_bbox.3) * 0.5,
+                    )
+                });
         *placement_pivot = Some(visual_affine.apply(local_center));
         let frame = affine_transform_frame(local_bbox, visual_affine);
         let outline: Vec<Pos2> = frame
@@ -16283,35 +16708,9 @@ fn draw_object_reference_outlines(
 ) {
     let accent = selection_color(app);
     for reference in objects {
-        let Some(layer) = app
-            .state
-            .project
-            .q0rgs
-            .iter()
-            .find(|q0rg| q0rg.q0rg_id == reference.q0rg_id)
-            .and_then(|q0rg| {
-                q0rg.layers
-                    .iter()
-                    .find(|layer| layer.layer_id == reference.layer_id)
-            })
+        let Some((min_x, min_y, max_x, max_y)) =
+            placement_ref_world_bounds(&app.state.project, *reference, app.session.current_frame)
         else {
-            continue;
-        };
-        let Some(placement) = layer.placements.get(reference.placement_idx) else {
-            continue;
-        };
-        let Some((transform, _)) = placement_transform_for_edit(
-            &app.state.project,
-            reference.q0rg_id,
-            reference.layer_id,
-            reference.placement_idx,
-            app.session.current_frame,
-        ) else {
-            continue;
-        };
-        let mut visual = placement.clone();
-        visual.transform = transform;
-        let Some((min_x, min_y, max_x, max_y)) = placement_bbox(&app.state.project, &visual) else {
             continue;
         };
         let rect = egui::Rect::from_min_max(
@@ -31205,5 +31604,396 @@ mod drawing_rework_tests {
             !paint.contains(&geo::Point::new(240.0, 150.0)),
             "no paint in empty space"
         );
+    }
+
+    #[test]
+    fn select_3d_perspective_bbox_and_hit_test() {
+        let mut app = blank_app();
+        let rect = primitive_path(
+            PrimitiveKind::Rect,
+            Vec2::new(20.0, 20.0),
+            Vec2::new(120.0, 120.0),
+        )
+        .unwrap();
+        app.state.project.assets.push(Asset::Vector(VectorAsset {
+            asset_id: 42,
+            paths: vec![rect],
+            fill: Some(red()),
+            stroke: None,
+        }));
+        let q0rg_id = app.state.project.q0rgs[0].q0rg_id;
+        let layer_id = app.state.project.q0rgs[0].layers[0].layer_id;
+        // Identity 2D transform at (20..120, 20..120), pushed deep into 3D (z = 1800)
+        // so perspective pulls its projected stage position strongly toward the stage center.
+        let space = q0s_format::three::Space3d {
+            z: 1800.0,
+            ..Default::default()
+        };
+        app.state.project.q0rgs[0].layers[0]
+            .placements
+            .push(Placement {
+                pivot: None,
+                instance_id: 1,
+                frame: 0,
+                target: Target::Asset(42),
+                transform: Transform2D::IDENTITY,
+                tween: Tween::None,
+                fx: q0s_format::v2::PlacementFx {
+                    three: Some(space),
+                    ..Default::default()
+                },
+            });
+        let placement_idx = app.state.project.q0rgs[0].layers[0].placements.len() - 1;
+        let reference = PlacementRef {
+            q0rg_id,
+            layer_id,
+            placement_idx,
+        };
+
+        // Must not be treated as a flat 2D raw drawing at z = 0.
+        assert!(!is_raw_graphics_placement(
+            &app.state.project,
+            &app.state.project.q0rgs[0].layers[0].placements[placement_idx]
+        ));
+
+        let projected = placement_ref_world_bounds(&app.state.project, reference, 0)
+            .expect("projected 3D stage bounds");
+        // At z = 1800, top-left (20, 20) projects well inside (> 200, > 150) rather than (20..120).
+        assert!(
+            projected.0 > 180.0 && projected.1 > 120.0,
+            "expected perspective-shifted bbox, got {projected:?}"
+        );
+
+        // SelectionOverlayGeometry frame corners must match the projected bbox, not (20..120).
+        let revision = (0, app.state.render_revision());
+        let mut geometry = SelectionOverlayGeometry::new(&app.state.project);
+        let (local_bbox, visual_affine, _, _) = geometry
+            .placement_local_visual_frame_scoped(
+                &app.state.project,
+                &mut app.textures,
+                revision,
+                reference,
+                0,
+            )
+            .expect("visual frame");
+        let frame = affine_transform_frame(local_bbox.expect("local bbox"), visual_affine);
+        assert!((frame.corners[0].x - projected.0).abs() < 1.0e-2);
+        assert!((frame.corners[0].y - projected.1).abs() < 1.0e-2);
+        assert!((frame.corners[2].x - projected.2).abs() < 1.0e-2);
+        assert!((frame.corners[2].y - projected.3).abs() < 1.0e-2);
+
+        // Old unprojected 2D position (70, 70) is empty space and must NOT hit!
+        assert_eq!(
+            hit_test_selectable_placement(&app.state.project, q0rg_id, 0, Vec2::new(70.0, 70.0)),
+            None,
+            "must not hit empty space at old z = 0 coordinates"
+        );
+        // True projected center must hit the placement!
+        let projected_center = Vec2::new(
+            (projected.0 + projected.2) * 0.5,
+            (projected.1 + projected.3) * 0.5,
+        );
+        assert_eq!(
+            hit_test_selectable_placement(&app.state.project, q0rg_id, 0, projected_center),
+            Some((layer_id, placement_idx)),
+            "must hit at perspective-projected stage position"
+        );
+
+        // Marquee over old z = 0 position must not select it; marquee over projected position must.
+        assert!(collect_placements_in_rect(
+            &app.state.project,
+            q0rg_id,
+            0,
+            (10.0, 10.0, 130.0, 130.0)
+        )
+        .is_empty());
+        assert_eq!(
+            collect_placements_in_rect(
+                &app.state.project,
+                q0rg_id,
+                0,
+                (
+                    projected.0 - 5.0,
+                    projected.1 - 5.0,
+                    projected.2 + 5.0,
+                    projected.3 + 5.0
+                ),
+            ),
+            vec![reference]
+        );
+    }
+
+    #[test]
+    fn select_3d_model_bbox_and_drag_track_perspective() {
+        let mut app = blank_app();
+        let cube = q0model::new_model(q0model::prim::Primitive::Cube, 120.0);
+        app.state
+            .project
+            .assets
+            .push(Asset::Model(q0s_format::three::ModelAsset {
+                asset_id: 77,
+                data: std::sync::Arc::new(cube),
+            }));
+        let q0rg_id = app.state.project.q0rgs[0].q0rg_id;
+        let layer_id = app.state.project.q0rgs[0].layers[0].layer_id;
+        app.state.project.q0rgs[0].layers[0]
+            .placements
+            .push(Placement {
+                pivot: None,
+                instance_id: 2,
+                frame: 0,
+                target: Target::Asset(77),
+                transform: Transform2D {
+                    tx: 150.0,
+                    ty: 120.0,
+                    ..Transform2D::IDENTITY
+                },
+                tween: Tween::None,
+                fx: q0s_format::v2::PlacementFx {
+                    three: Some(q0s_format::three::Space3d {
+                        z: 1500.0,
+                        tilt_x: 25.0,
+                        tilt_y: -30.0,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            });
+        let placement_idx = app.state.project.q0rgs[0].layers[0].placements.len() - 1;
+        let reference = PlacementRef {
+            q0rg_id,
+            layer_id,
+            placement_idx,
+        };
+
+        let bounds_before = placement_ref_world_bounds(&app.state.project, reference, 0)
+            .expect("projected model bounds");
+        let center_before = Vec2::new(
+            (bounds_before.0 + bounds_before.2) * 0.5,
+            (bounds_before.1 + bounds_before.3) * 0.5,
+        );
+        // At z = 1500, projected center is pulled far from (150, 120) toward stage center.
+        assert!(
+            center_before.x > 250.0 && center_before.y > 180.0,
+            "unexpected model projected center: {center_before:?}"
+        );
+        assert_eq!(
+            hit_test_selectable_placement(&app.state.project, q0rg_id, 0, Vec2::new(150.0, 120.0)),
+            None
+        );
+        assert_eq!(
+            hit_test_selectable_placement(&app.state.project, q0rg_id, 0, center_before),
+            Some((layer_id, placement_idx))
+        );
+
+        // Dragging the 3D model by +60 px in X and +40 px in Y on stage must move its
+        // projected bbox by (+60, +40) on stage without jumping at drag start.
+        assert!(begin_dragging_placement(
+            &mut app,
+            q0rg_id,
+            layer_id,
+            placement_idx,
+            center_before,
+            "Moving object"
+        ));
+        let ToolState::DraggingPlacement {
+            start_cursor,
+            cursor_offset,
+            ..
+        } = app.session.tool_state.clone()
+        else {
+            panic!("expected DraggingPlacement");
+        };
+        let target_stage = Vec2::new(start_cursor.x + 60.0, start_cursor.y + 40.0);
+        let plane_target = stage_point_to_placement_plane(
+            &app.state.project,
+            q0rg_id,
+            layer_id,
+            placement_idx,
+            0,
+            target_stage,
+        );
+        let (mut next_t, _) =
+            placement_transform_for_edit(&app.state.project, q0rg_id, layer_id, placement_idx, 0)
+                .unwrap();
+        next_t.tx = plane_target.x + cursor_offset.x;
+        next_t.ty = plane_target.y + cursor_offset.y;
+        set_placement_transform_for_edit(&mut app, q0rg_id, layer_id, placement_idx, next_t);
+
+        let origin_stage_before = placement_plane_point_to_stage(
+            &app.state.project,
+            q0rg_id,
+            layer_id,
+            placement_idx,
+            0,
+            Vec2::new(150.0, 120.0),
+        );
+        let origin_stage_after = placement_plane_point_to_stage(
+            &app.state.project,
+            q0rg_id,
+            layer_id,
+            placement_idx,
+            0,
+            Vec2::new(next_t.tx, next_t.ty),
+        );
+        assert!(
+            (origin_stage_after.x - (origin_stage_before.x + 60.0)).abs() < 1.0e-2
+                && (origin_stage_after.y - (origin_stage_before.y + 40.0)).abs() < 1.0e-2,
+            "projected origin must move by exact stage delta (+60, +40): before={origin_stage_before:?}, after={origin_stage_after:?}"
+        );
+
+        let bounds_after = placement_ref_world_bounds(&app.state.project, reference, 0)
+            .expect("projected model bounds after drag");
+        let center_after = Vec2::new(
+            (bounds_after.0 + bounds_after.2) * 0.5,
+            (bounds_after.1 + bounds_after.3) * 0.5,
+        );
+        assert_eq!(
+            hit_test_selectable_placement(&app.state.project, q0rg_id, 0, center_after),
+            Some((layer_id, placement_idx))
+        );
+    }
+
+    #[test]
+    fn select_3d_anchor_point_never_drifts_across_interactions() {
+        let mut app = blank_app();
+        let rect = primitive_path(
+            PrimitiveKind::Rect,
+            Vec2::new(20.0, 40.0),
+            Vec2::new(140.0, 120.0),
+        )
+        .unwrap();
+        app.state.project.assets.push(Asset::Vector(VectorAsset {
+            asset_id: 88,
+            paths: vec![rect],
+            fill: Some(red()),
+            stroke: None,
+        }));
+        let q0rg_id = app.state.project.q0rgs[0].q0rg_id;
+        let layer_id = app.state.project.q0rgs[0].layers[0].layer_id;
+        app.state.project.q0rgs[0].layers[0]
+            .placements
+            .push(Placement {
+                pivot: None,
+                instance_id: 3,
+                frame: 0,
+                target: Target::Asset(88),
+                transform: Transform2D {
+                    tx: 120.0,
+                    ty: 90.0,
+                    ..Transform2D::IDENTITY
+                },
+                tween: Tween::None,
+                fx: q0s_format::v2::PlacementFx {
+                    three: Some(q0s_format::three::Space3d {
+                        z: 1400.0,
+                        tilt_x: 20.0,
+                        tilt_y: -15.0,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            });
+        let placement_idx = app.state.project.q0rgs[0].layers[0].placements.len() - 1;
+        app.session.selection = Selection::Placement {
+            q0rg_id,
+            layer_id,
+            placement_idx,
+        };
+
+        let initial_pivot = selection_transform_pivot(&app).expect("initial stage pivot");
+        // Repeatedly starting drags / clicking must not shift the anchor point or mutate default None pivot.
+        for _ in 0..5 {
+            assert!(begin_dragging_placement(
+                &mut app,
+                q0rg_id,
+                layer_id,
+                placement_idx,
+                initial_pivot,
+                "Moving object"
+            ));
+            let after_click_pivot =
+                selection_transform_pivot(&app).expect("pivot after drag start");
+            assert!(
+                (after_click_pivot.x - initial_pivot.x).abs() < 1.0e-3
+                    && (after_click_pivot.y - initial_pivot.y).abs() < 1.0e-3,
+                "anchor point drifted on drag start: initial={initial_pivot:?}, now={after_click_pivot:?}"
+            );
+            assert_eq!(
+                app.state.project.q0rgs[0].layers[0].placements[placement_idx].pivot, None,
+                "default pivot on 3D placement must remain None so 3D tilt origin does not jump"
+            );
+        }
+
+        // Resize around default pivot must keep the stage anchor point completely stationary.
+        let (_, local_bbox, start_t, _) =
+            drag_start_data(&app.state.project, q0rg_id, layer_id, placement_idx, 0).unwrap();
+        let plane_pivot = stage_point_to_placement_plane(
+            &app.state.project,
+            q0rg_id,
+            layer_id,
+            placement_idx,
+            0,
+            initial_pivot,
+        );
+        let pivot_local = Affine::from_transform(start_t)
+            .inverse()
+            .unwrap()
+            .apply(plane_pivot);
+        let mut scaled_t = start_t;
+        let handle_plane = Affine::from_transform(start_t)
+            .apply(Vec2::new(local_bbox.2 + 45.0, local_bbox.3 + 30.0));
+        assert!(apply_handle_drag(
+            &mut scaled_t,
+            start_t,
+            local_bbox,
+            Handle::BottomRight,
+            handle_plane,
+            Some(pivot_local),
+            ScaleDragModifiers {
+                ignore_pivot: false,
+                lock_aspect: false,
+            },
+        ));
+        set_placement_transform_for_edit(&mut app, q0rg_id, layer_id, placement_idx, scaled_t);
+        let next_stage_pivot = placement_plane_point_to_stage(
+            &app.state.project,
+            q0rg_id,
+            layer_id,
+            placement_idx,
+            0,
+            Affine::from_transform(scaled_t).apply(pivot_local),
+        );
+        set_selection_transform_pivot(&mut app, next_stage_pivot);
+        let after_scale_pivot = selection_transform_pivot(&app).expect("pivot after scale");
+        assert!(
+            (after_scale_pivot.x - initial_pivot.x).abs() < 1.0e-3
+                && (after_scale_pivot.y - initial_pivot.y).abs() < 1.0e-3,
+            "anchor point drifted during scale: initial={initial_pivot:?}, after={after_scale_pivot:?}"
+        );
+
+        // Explicit Alt-pivot placement to a custom stage point must round-trip without drifting.
+        let custom_stage_pivot = Vec2::new(initial_pivot.x + 35.0, initial_pivot.y - 25.0);
+        set_selection_transform_pivot(&mut app, custom_stage_pivot);
+        let saved_custom_local = app.state.project.q0rgs[0].layers[0].placements[placement_idx]
+            .pivot
+            .expect("custom local pivot saved");
+        for _ in 0..5 {
+            let current = selection_transform_pivot(&app).expect("custom stage pivot");
+            assert!(
+                (current.x - custom_stage_pivot.x).abs() < 1.0e-2
+                    && (current.y - custom_stage_pivot.y).abs() < 1.0e-2,
+                "custom anchor point drifted: expected={custom_stage_pivot:?}, got={current:?}"
+            );
+            set_selection_transform_pivot(&mut app, current);
+            let local_now = app.state.project.q0rgs[0].layers[0].placements[placement_idx]
+                .pivot
+                .expect("custom local pivot");
+            assert!(
+                (local_now.x - saved_custom_local.x).abs() < 1.0e-3
+                    && (local_now.y - saved_custom_local.y).abs() < 1.0e-3,
+                "saved local pivot drifted across interactions: before={saved_custom_local:?}, now={local_now:?}"
+            );
+        }
     }
 }

@@ -1,5 +1,6 @@
 mod audio;
 mod binary_fla;
+pub mod flash;
 pub mod fonts;
 mod masks;
 mod text_outline;
@@ -16,7 +17,7 @@ use q0s_format::v2::{
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 
-pub const IMPORT_EXTENSIONS: &[&str] = &["fla", "xfl"];
+pub const IMPORT_EXTENSIONS: &[&str] = &["fla", "xfl", "swf"];
 // Guards against zip bombs, not against big projects: a sprite pack with
 // everything on its stage keeps it all in DOMDocument.xml, and libraries of
 // ten thousand symbols are ordinary.
@@ -329,9 +330,11 @@ pub fn import_path(path: &Path) -> Result<ImportedProject, ImportError> {
         import_fla(path).map(report_dropped)
     } else if extension.eq_ignore_ascii_case("xfl") {
         import_xfl(path).map(report_dropped)
+    } else if extension.eq_ignore_ascii_case("swf") {
+        flash::import_swf(path).map(report_dropped)
     } else {
         Err(ImportError::Unsupported(format!(
-            "expected .fla or .xfl, got {}",
+            "expected .fla, .xfl or .swf, got {}",
             path.display()
         )))
     }

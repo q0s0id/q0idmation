@@ -10,6 +10,7 @@ mod drawer;
 pub mod launch;
 mod perf;
 mod platform;
+pub mod qir;
 pub mod recent;
 pub mod render;
 pub mod settings;

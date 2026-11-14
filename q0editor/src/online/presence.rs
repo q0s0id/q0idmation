@@ -144,7 +144,9 @@ pub(crate) fn paint_stage_edits(
 
 /// The people on this timeline, each a colour-ringed picture on the
 /// timeline bar. Clicking one jumps to their frame.
-pub(crate) fn timeline_people(app: &mut EditorApp, ui: &mut egui::Ui) {
+pub(crate) fn timeline_people(app: &mut EditorApp, ui: &mut egui::Ui, beside: Option<Rect>) {
+    const SIZE: f32 = 20.0;
+    const GAP: f32 = 4.0;
     let tab = app.active_project_tab_id();
     let markers = app.online.markers(tab, app.session.current_q0rg_id);
     let online = &mut app.online;
@@ -167,24 +169,25 @@ pub(crate) fn timeline_people(app: &mut EditorApp, ui: &mut egui::Ui) {
     if everyone.is_empty() {
         return;
     }
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
+    let width = everyone.len() as f32 * (SIZE + GAP) - GAP;
+    let layout = Layout::right_to_left(Align::Center).with_main_wrap(true);
+    let draw = |ui: &mut egui::Ui| {
+        ui.spacing_mut().item_spacing.x = GAP;
         for (user_id, place) in everyone {
             let person = online.person(user_id);
             let colour = person_colour(user_id);
-            let size = 20.0;
-            let (rect, response) = ui.allocate_exact_size(vec2(size, size), egui::Sense::click());
+            let (rect, response) = ui.allocate_exact_size(vec2(SIZE, SIZE), egui::Sense::click());
             let painter = ui.painter();
             match online.avatars.get(&user_id) {
                 Some(Avatar::Ready(texture)) => {
                     egui::Image::new(egui::load::SizedTexture::new(texture.id(), rect.size()))
-                        .rounding(size * 0.5)
+                        .rounding(SIZE * 0.5)
                         .paint_at(ui, rect.shrink(1.5));
                 }
                 found => {
                     painter.circle_filled(
                         rect.center(),
-                        size * 0.5 - 1.5,
+                        SIZE * 0.5 - 1.5,
                         colour.gamma_multiply(0.55),
                     );
                     let initial = person
@@ -207,7 +210,7 @@ pub(crate) fn timeline_people(app: &mut EditorApp, ui: &mut egui::Ui) {
             }
             ui.painter().circle_stroke(
                 rect.center(),
-                size * 0.5 - 0.5,
+                SIZE * 0.5 - 0.5,
                 Stroke::new(2.0_f32, colour),
             );
             let here = markers.iter().find(|m| m.user_id == user_id);
@@ -230,8 +233,16 @@ pub(crate) fn timeline_people(app: &mut EditorApp, ui: &mut egui::Ui) {
                 }
             }
         }
-        ui.label(RichText::new("here:").small().weak());
-    });
+    };
+    // Avatars use spare room beside the controls. On a narrow timeline they
+    // wrap below the bar, outside the width measurements for its buttons.
+    if let Some(rect) = beside.filter(|rect| rect.width() >= width) {
+        let mut child = ui.child_ui(rect, layout);
+        child.set_clip_rect(ui.clip_rect().intersect(rect));
+        draw(&mut child);
+    } else {
+        ui.with_layout(layout, draw);
+    }
 }
 
 /// Their frame on the timeline: a column wash in their colour and a solid

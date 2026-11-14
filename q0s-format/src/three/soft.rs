@@ -513,11 +513,6 @@ fn render_once(frame: &Frame3d) -> Vec<u8> {
         }
     }
     let mut depth = vec![f32::INFINITY; (w * h) as usize];
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .clamp(1, 16);
-    let rows_per_band = ((h as usize).div_ceil(threads * 2)).max(8);
     let shadows: Vec<ShadowMap> = shadow_views(frame)
         .into_iter()
         .map(|view| ShadowMap::build(frame, view))
@@ -529,22 +524,34 @@ fn render_once(frame: &Frame3d) -> Vec<u8> {
         width: w as usize,
         shadows: &shadows,
     };
-    std::thread::scope(|scope| {
-        let mut color_rest: &mut [f32] = &mut color;
-        let mut depth_rest: &mut [f32] = &mut depth;
-        let mut y0 = 0usize;
-        let ctx = &ctx;
-        while y0 < h as usize {
-            let rows = rows_per_band.min(h as usize - y0);
-            let (color_band, c_rest) = color_rest.split_at_mut(rows * w as usize * 4);
-            let (depth_band, d_rest) = depth_rest.split_at_mut(rows * w as usize);
-            color_rest = c_rest;
-            depth_rest = d_rest;
-            let band_y = y0;
-            scope.spawn(move || ctx.band(band_y, rows, color_band, depth_band));
-            y0 += rows;
-        }
-    });
+    // The browser can flatten a 3D scene to a texture, but its WASM runtime
+    // does not support spawning Rust threads.
+    #[cfg(target_arch = "wasm32")]
+    ctx.band(0, h as usize, &mut color, &mut depth);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, 16);
+        let rows_per_band = ((h as usize).div_ceil(threads * 2)).max(8);
+        std::thread::scope(|scope| {
+            let mut color_rest: &mut [f32] = &mut color;
+            let mut depth_rest: &mut [f32] = &mut depth;
+            let mut y0 = 0usize;
+            let ctx = &ctx;
+            while y0 < h as usize {
+                let rows = rows_per_band.min(h as usize - y0);
+                let (color_band, c_rest) = color_rest.split_at_mut(rows * w as usize * 4);
+                let (depth_band, d_rest) = depth_rest.split_at_mut(rows * w as usize);
+                color_rest = c_rest;
+                depth_rest = d_rest;
+                let band_y = y0;
+                scope.spawn(move || ctx.band(band_y, rows, color_band, depth_band));
+                y0 += rows;
+            }
+        });
+    }
     color
         .iter()
         .map(|c| (c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
@@ -620,11 +627,11 @@ impl ShadowMap {
                 }
             };
         for item in &frame.items {
+            if !item.casts_shadow() {
+                continue;
+            }
             match item {
                 DrawItem::Mesh(mesh) => {
-                    if mesh.opacity < 0.5 {
-                        continue;
-                    }
                     let positions = mesh
                         .posed
                         .as_ref()
@@ -645,9 +652,6 @@ impl ShadowMap {
                     }
                 }
                 DrawItem::Plane(plane) => {
-                    if plane.layered || plane.opacity < 0.5 {
-                        continue;
-                    }
                     let [x0, y0, x1, y1] = plane.rect;
                     let corner = |x, y| to_map(plane.matrix.transform_point(V3::new(x, y, 0.0)));
                     let sampler = image_sampler(&plane.image);
@@ -678,23 +682,34 @@ impl ShadowMap {
         if c[3] <= 1.0e-6 {
             return 1.0;
         }
-        let (x, y, z) = (c[0] / c[3], c[1] / c[3], c[2] / c[3] * 0.5 + 0.5);
-        if !(-1.0..=1.0).contains(&x) || !(-1.0..=1.0).contains(&y) || z > 1.0 {
+        let (x, y) = (c[0] / c[3], c[1] / c[3]);
+        if !(-1.0..=1.0).contains(&x) || !(-1.0..=1.0).contains(&y) {
             return 1.0;
         }
-        let fx = (x * 0.5 + 0.5) * size as f32 - 0.5;
-        let fy = (y * 0.5 + 0.5) * size as f32 - 0.5;
+        // Receivers past the far plane still compare against the stored casters.
+        let z = (c[2] / c[3] * 0.5 + 0.5 - 0.0005).min(1.0);
+        let taps = |coord: f32| {
+            let uv = (coord * 0.5 + 0.5) * size as f32;
+            let centre = uv as i32;
+            let f = uv - centre as f32;
+            let inv = 1.0 - f;
+            // Same quadratic weights as the GPU's three-tap filter.
+            let weights = [0.5 * inv * inv, 0.5 + f * inv, 0.5 * f * f];
+            let offsets =
+                [centre - 1, centre, centre + 1].map(|i| i.clamp(0, size as i32 - 1) as usize);
+            offsets.into_iter().zip(weights)
+        };
+        let xs = taps(x);
         let mut lit = 0.0;
-        for dy in -1..=1 {
-            for dx in -1..=1 {
-                let sx = (fx.round() as isize + dx).clamp(0, size as isize - 1) as usize;
-                let sy = (fy.round() as isize + dy).clamp(0, size as isize - 1) as usize;
-                if z - 0.0005 <= self.depth[sy * size + sx] {
-                    lit += 1.0;
+        for (sy, wy) in taps(y) {
+            let row = sy * size;
+            for (sx, wx) in xs.clone() {
+                if z <= self.depth[row + sx] {
+                    lit += wx * wy;
                 }
             }
         }
-        lit / 9.0
+        lit.min(1.0)
     }
 }
 
@@ -926,6 +941,33 @@ mod tests {
         mesh.node = Some(0);
         model.meshes.push(mesh);
         model
+    }
+
+    #[test]
+    fn a_shadow_edge_changes_continuously_across_a_texel_boundary() {
+        let mut depth = vec![1.0; SOFT_SHADOW * SOFT_SHADOW];
+        for row in depth.as_chunks_mut::<SOFT_SHADOW>().0.iter_mut() {
+            row[..SOFT_SHADOW / 2].fill(0.25);
+        }
+        let map = ShadowMap {
+            view: ShadowView {
+                light: 0,
+                matrix: Mat4::IDENTITY,
+                texel: 0.0,
+            },
+            depth,
+            texel: 0.0,
+        };
+        let visibility =
+            |offset: f32| map.visible(V3::X * (offset * 2.0 / SOFT_SHADOW as f32), V3::ZERO);
+        let left = visibility(-0.01);
+        let right = visibility(0.01);
+        assert!(
+            left < 0.5 && right > 0.5 && right - left < 0.03,
+            "{left} to {right}"
+        );
+        assert_eq!(visibility(-2.0), 0.0);
+        assert_eq!(visibility(2.0), 1.0);
     }
 
     #[test]

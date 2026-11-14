@@ -1,4 +1,4 @@
-use egui::epaint::PathShape;
+use egui::epaint::{CubicBezierShape, PathShape};
 use egui::{
     pos2, vec2, Color32, Painter, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, WidgetInfo,
     WidgetType,
@@ -108,26 +108,10 @@ pub(crate) fn render_snap_button(app: &mut EditorApp, ui: &mut Ui) {
     let text = app.settings.theme.text.to_color32();
     let accent = app.settings.theme.accent.to_color32();
     if ui.is_rect_visible(rect) {
+        crate::ui::paint_control(ui, &response, rect.shrink(1.0), 5.0, on);
         let painter = ui.painter_at(rect);
-        let fill = if on {
-            accent.gamma_multiply(0.35)
-        } else if response.hovered() {
-            app.settings.theme.panel.to_color32().gamma_multiply(1.4)
-        } else {
-            Color32::TRANSPARENT
-        };
-        painter.rect(
-            rect.shrink(1.0),
-            4.0,
-            fill,
-            Stroke::new(1.0_f32, if on { accent } else { Color32::TRANSPARENT }),
-        );
-        paint_magnet(
-            &painter,
-            rect.center(),
-            rect.width() * 0.3,
-            if on { accent } else { text },
-        );
+        let _ = accent;
+        paint_magnet(&painter, rect.center(), rect.width() * 0.3, text);
     }
     let hint = app.settings.hotkeys.hint(
         crate::hotkeys::ShortcutCommand::ToggleSnap,
@@ -170,44 +154,20 @@ fn render_tool3d_button(app: &mut EditorApp, ui: &mut Ui, tool: crate::tools3d::
     response
         .widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, selected, tool.label()));
     let text = app.settings.theme.text.to_color32();
-    let panel = app.settings.theme.panel.to_color32();
     let accent = app.settings.theme.accent.to_color32();
     if ui.is_rect_visible(rect) {
-        if selected {
-            ui.painter().rect(
-                rect.shrink(1.0),
-                6.0,
-                blend_rgb(panel, accent, 0.30),
-                Stroke::new(1.5_f32, accent),
-            );
-            ui.painter().rect_filled(
-                Rect::from_min_max(
-                    pos2(rect.left() + 1.0, rect.top() + 4.0),
-                    pos2(rect.left() + 3.5, rect.bottom() - 4.0),
-                ),
-                1.25,
-                accent,
-            );
-        } else if response.hovered() || response.has_focus() {
-            let visuals = ui.style().interact(&response);
-            ui.painter().rect(
-                rect.shrink(1.0),
-                visuals.rounding,
-                visuals.weak_bg_fill,
-                visuals.bg_stroke,
-            );
-        }
+        crate::ui::paint_control(
+            ui,
+            &response,
+            rect.shrink(1.0),
+            (size * 0.25).round(),
+            selected,
+        );
         let icon = Rect::from_center_size(
             rect.center(),
             vec2(TOOL_ICON_SIZE, TOOL_ICON_SIZE) * (size / TOOL_BUTTON_SIZE),
         );
-        crate::tools3d::paint_icon(
-            ui.painter(),
-            icon,
-            tool,
-            if selected { accent } else { text },
-            accent,
-        );
+        crate::tools3d::paint_icon(ui.painter(), icon, tool, text, accent);
     }
     if response.on_hover_text(tool.hint()).clicked() && crate::text_tool::finish_edit(app) {
         app.plugins.active_tool = None;
@@ -271,12 +231,11 @@ fn tool_button(
     tool: Tool,
     selected: bool,
     text: Color32,
-    panel: Color32,
+    _panel: Color32,
     accent: Color32,
 ) -> Response {
     let size = tool_button_size();
-    let desired_size = vec2(size, size);
-    let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click());
+    let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::click());
     response.widget_info(|| {
         WidgetInfo::selected(
             WidgetType::SelectableLabel,
@@ -284,37 +243,21 @@ fn tool_button(
             tool.label().to_string(),
         )
     });
-
     if ui.is_rect_visible(rect) {
-        let hovered = response.hovered() || response.highlighted() || response.has_focus();
-        if selected {
-            let background = blend_rgb(panel, accent, 0.30);
-            ui.painter().rect(
-                rect.shrink(1.0),
-                6.0,
-                background,
-                Stroke::new(1.5_f32, accent),
-            );
-            ui.painter().rect_filled(
-                Rect::from_min_max(
-                    pos2(rect.left() + 1.0, rect.top() + 4.0),
-                    pos2(rect.left() + 3.5, rect.bottom() - 4.0),
-                ),
-                1.25,
-                accent,
-            );
-        } else if hovered {
-            let visuals = ui.style().interact(&response);
-            ui.painter().rect(
-                rect.shrink(1.0),
-                visuals.rounding,
-                visuals.weak_bg_fill,
-                visuals.bg_stroke,
-            );
-        }
-
+        crate::ui::paint_control(
+            ui,
+            &response,
+            rect.shrink(1.0),
+            (size * 0.25).round(),
+            selected,
+        );
+        let sink = if response.is_pointer_button_down_on() {
+            vec2(0.0, 0.5)
+        } else {
+            egui::Vec2::ZERO
+        };
         let icon_rect = Rect::from_center_size(
-            rect.center(),
+            rect.center() + sink,
             vec2(TOOL_ICON_SIZE, TOOL_ICON_SIZE) * (size / TOOL_BUTTON_SIZE),
         );
         let (primary, secondary) = tool_icon_colors(text, accent, selected);
@@ -326,17 +269,7 @@ fn tool_button(
             secondary,
         );
     }
-
     response
-}
-
-fn blend_rgb(a: Color32, b: Color32, t: f32) -> Color32 {
-    let mix = |x: u8, y: u8| {
-        (x as f32 + (y as f32 - x as f32) * t)
-            .round()
-            .clamp(0.0, 255.0) as u8
-    };
-    Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
 }
 
 fn tool_icon_colors(text: Color32, accent: Color32, _selected: bool) -> (Color32, Color32) {
@@ -346,6 +279,7 @@ fn tool_icon_colors(text: Color32, accent: Color32, _selected: bool) -> (Color32
     (text, accent)
 }
 
+/// Unit-square drawing helpers for the tool icons.
 #[derive(Clone, Copy)]
 struct IconCanvas {
     rect: Rect,
@@ -363,330 +297,361 @@ impl IconCanvas {
         Rect::from_min_max(self.point(x0, y0), self.point(x1, y1))
     }
 
-    fn polyline(self, painter: &Painter, points: &[(f32, f32)], stroke: Stroke) {
-        painter.add(Shape::line(
-            points.iter().map(|&(x, y)| self.point(x, y)).collect(),
-            stroke,
-        ));
+    fn unit(self) -> f32 {
+        self.rect.width().min(self.rect.height())
     }
 
-    fn polygon(self, painter: &Painter, points: &[(f32, f32)], fill: Color32, stroke: Stroke) {
-        painter.add(Shape::Path(PathShape {
-            points: points.iter().map(|&(x, y)| self.point(x, y)).collect(),
-            closed: true,
-            fill,
-            stroke,
-        }));
+    /// `t` of the way from `tip` to `end`, pushed `side` across the line.
+    fn along(self, tip: (f32, f32), end: (f32, f32), t: f32, side: f32) -> Pos2 {
+        let (dx, dy) = (end.0 - tip.0, end.1 - tip.1);
+        let length = (dx * dx + dy * dy).sqrt().max(f32::EPSILON);
+        let (nx, ny) = (-dy / length, dx / length);
+        self.point(tip.0 + dx * t + nx * side, tip.1 + dy * t + ny * side)
+    }
+
+    /// The slice of a stick from `t0` to `t1`, `half` thick on each side.
+    fn band(self, tip: (f32, f32), end: (f32, f32), t0: f32, t1: f32, half: f32) -> Vec<Pos2> {
+        vec![
+            self.along(tip, end, t0, -half),
+            self.along(tip, end, t1, -half),
+            self.along(tip, end, t1, half),
+            self.along(tip, end, t0, half),
+        ]
+    }
+
+    /// A pill from `a` to `b`, `radius` round at both ends.
+    fn capsule(self, a: (f32, f32), b: (f32, f32), radius: f32) -> Vec<Pos2> {
+        use std::f32::consts::{FRAC_PI_2, PI};
+        let angle = (b.1 - a.1).atan2(b.0 - a.0);
+        let arc = |center: (f32, f32), from: f32| {
+            (0..=8).map(move |step| {
+                let turn = from + PI * step as f32 / 8.0;
+                (
+                    center.0 + turn.cos() * radius,
+                    center.1 + turn.sin() * radius,
+                )
+            })
+        };
+        arc(b, angle - FRAC_PI_2)
+            .chain(arc(a, angle + FRAC_PI_2))
+            .map(|(x, y)| self.point(x, y))
+            .collect()
+    }
+
+    fn ellipse(self, cx: f32, cy: f32, rx: f32, ry: f32) -> Vec<Pos2> {
+        (0..32)
+            .map(|step| {
+                let angle = std::f32::consts::TAU * step as f32 / 32.0;
+                self.point(cx + angle.cos() * rx, cy + angle.sin() * ry)
+            })
+            .collect()
+    }
+
+    fn pts(self, points: &[(f32, f32)]) -> Vec<Pos2> {
+        points.iter().map(|&(x, y)| self.point(x, y)).collect()
     }
 }
 
+fn fill(painter: &Painter, points: Vec<Pos2>, color: Color32, stroke: Stroke) {
+    painter.add(Shape::Path(PathShape {
+        points,
+        closed: true,
+        fill: color,
+        stroke,
+    }));
+}
+
+/// The tool icons: the tool's own shape outlined in the text colour, with
+/// the part that does the work (a nib, bristles, paint) in the accent.
 fn draw_tool_icon(
     painter: &Painter,
     rect: Rect,
     icon: ToolIcon,
     primary: Color32,
-    secondary: Color32,
+    accent: Color32,
 ) {
     let c = IconCanvas { rect };
-    let line = Stroke::new(1.45_f32, primary);
-    let fine = Stroke::new(1.05_f32, secondary);
+    let unit = c.unit();
+    let width = (unit * 0.085).clamp(1.3, 2.6);
+    let line = Stroke::new(width, primary);
+    let fine = Stroke::new(width * 0.7, primary);
+    let soft = primary.gamma_multiply(0.22);
+    let glow = accent.gamma_multiply(0.26);
+    let none = Stroke::NONE;
+    // Diagonal tools lie from the lower left (their working end) up.
+    let tip = (0.13, 0.87);
+    let end = (0.87, 0.13);
 
     match icon {
-        ToolIcon::SelectPointer => draw_select_pointer(painter, c, primary, secondary),
-        ToolIcon::Lasso => {
-            let loop_points: Vec<_> = (0..=22)
-                .map(|step| {
-                    let angle = std::f32::consts::TAU * step as f32 / 22.0;
-                    c.point(0.48 + angle.cos() * 0.34, 0.43 + angle.sin() * 0.29)
-                })
-                .collect();
-            painter.add(Shape::line(loop_points, line));
-            painter.line_segment([c.point(0.76, 0.62), c.point(0.89, 0.9)], fine);
-            painter.circle_filled(c.point(0.89, 0.9), 1.7, secondary);
+        ToolIcon::SelectPointer => {
+            fill(
+                painter,
+                c.pts(&[(0.24, 0.08), (0.24, 0.78), (0.74, 0.58)]),
+                primary,
+                none,
+            );
+            painter.line_segment(
+                [c.point(0.44, 0.62), c.point(0.57, 0.88)],
+                Stroke::new(unit * 0.13, primary),
+            );
+            painter.circle_filled(c.point(0.57, 0.88), unit * 0.065, primary);
         }
-        ToolIcon::Hand => draw_hand(painter, c, primary, secondary),
-        ToolIcon::SubselectPointer => draw_subselect_pointer(painter, c, primary, secondary),
-        ToolIcon::Pen => draw_pen(painter, c, primary, secondary),
-        ToolIcon::Pencil => draw_pencil(painter, c, primary, secondary),
-        ToolIcon::Brush => draw_brush(painter, c, primary, secondary),
-        ToolIcon::Eraser => draw_eraser(painter, c, primary, secondary),
-        ToolIcon::Knife => draw_knife(painter, c, primary, secondary),
+        ToolIcon::SubselectPointer => {
+            fill(
+                painter,
+                c.pts(&[(0.20, 0.10), (0.20, 0.76), (0.66, 0.57)]),
+                soft,
+                line,
+            );
+            fill(
+                painter,
+                c.pts(&[(0.37, 0.62), (0.47, 0.58), (0.59, 0.84), (0.49, 0.88)]),
+                soft,
+                line,
+            );
+            painter.rect(c.rect(0.70, 0.12, 0.90, 0.32), unit * 0.03, accent, fine);
+        }
+        ToolIcon::Lasso => {
+            fill(painter, c.ellipse(0.52, 0.40, 0.35, 0.26), glow, line);
+            painter.add(CubicBezierShape::from_points_stroke(
+                [
+                    c.point(0.30, 0.60),
+                    c.point(0.20, 0.72),
+                    c.point(0.40, 0.80),
+                    c.point(0.30, 0.92),
+                ],
+                false,
+                Color32::TRANSPARENT,
+                Stroke::new(width, accent),
+            ));
+            painter.circle_filled(c.point(0.30, 0.60), unit * 0.06, accent);
+        }
+        ToolIcon::Hand => {
+            // Fingers, palm and thumb as one solid shape.
+            let finger = |x: f32, top: f32, radius: f32| {
+                fill(
+                    painter,
+                    c.capsule((x, 0.56), (x, top), radius),
+                    primary,
+                    none,
+                );
+            };
+            finger(0.36, 0.20, 0.058);
+            finger(0.50, 0.12, 0.058);
+            finger(0.64, 0.17, 0.058);
+            finger(0.77, 0.32, 0.052);
+            painter.rect_filled(c.rect(0.30, 0.46, 0.83, 0.88), unit * 0.17, primary);
+            fill(
+                painter,
+                c.capsule((0.36, 0.72), (0.15, 0.50), 0.06),
+                primary,
+                none,
+            );
+            painter.line_segment(
+                [c.point(0.40, 0.80), c.point(0.72, 0.80)],
+                Stroke::new(width * 0.8, accent),
+            );
+        }
+        ToolIcon::Pen => {
+            fill(
+                painter,
+                c.pts(&[
+                    (0.50, 0.90),
+                    (0.26, 0.54),
+                    (0.35, 0.32),
+                    (0.65, 0.32),
+                    (0.74, 0.54),
+                ]),
+                glow,
+                line,
+            );
+            painter.line_segment([c.point(0.50, 0.60), c.point(0.50, 0.88)], fine);
+            painter.circle_filled(c.point(0.50, 0.57), unit * 0.055, primary);
+            painter.rect_filled(c.rect(0.35, 0.10, 0.65, 0.26), unit * 0.04, primary);
+        }
+        ToolIcon::Pencil => {
+            let half = 0.11;
+            fill(painter, c.band(tip, end, 0.24, 0.80, half), accent, line);
+            fill(
+                painter,
+                vec![
+                    c.along(tip, end, 0.0, 0.0),
+                    c.along(tip, end, 0.24, -half),
+                    c.along(tip, end, 0.24, half),
+                ],
+                soft,
+                line,
+            );
+            fill(
+                painter,
+                vec![
+                    c.along(tip, end, 0.0, 0.0),
+                    c.along(tip, end, 0.09, -half * 0.38),
+                    c.along(tip, end, 0.09, half * 0.38),
+                ],
+                primary,
+                none,
+            );
+            fill(painter, c.band(tip, end, 0.80, 0.86, half), primary, none);
+            fill(painter, c.band(tip, end, 0.86, 0.99, half), soft, line);
+        }
+        ToolIcon::Brush => {
+            fill(painter, c.band(tip, end, 0.52, 1.0, 0.05), primary, none);
+            fill(painter, c.band(tip, end, 0.38, 0.52, 0.085), soft, line);
+            fill(
+                painter,
+                vec![
+                    c.along(tip, end, 0.0, 0.0),
+                    c.along(tip, end, 0.12, -0.075),
+                    c.along(tip, end, 0.38, -0.088),
+                    c.along(tip, end, 0.38, 0.088),
+                    c.along(tip, end, 0.12, 0.075),
+                ],
+                accent,
+                fine,
+            );
+        }
+        ToolIcon::Eraser => {
+            let (a, b) = ((0.14, 0.66), (0.86, 0.34));
+            fill(painter, c.band(a, b, 0.0, 0.42, 0.17), accent, none);
+            fill(painter, c.band(a, b, 0.42, 1.0, 0.17), soft, none);
+            fill(
+                painter,
+                c.band(a, b, 0.0, 1.0, 0.17),
+                Color32::TRANSPARENT,
+                line,
+            );
+            painter.line_segment(
+                [c.along(a, b, 0.42, -0.17), c.along(a, b, 0.42, 0.17)],
+                fine,
+            );
+            painter.line_segment(
+                [c.point(0.10, 0.92), c.point(0.60, 0.92)],
+                Stroke::new(width * 0.8, primary.gamma_multiply(0.55)),
+            );
+        }
+        ToolIcon::Knife => {
+            fill(
+                painter,
+                vec![
+                    c.along(tip, end, 0.0, 0.0),
+                    c.along(tip, end, 0.6, -0.10),
+                    c.along(tip, end, 0.6, 0.03),
+                    c.along(tip, end, 0.3, 0.055),
+                ],
+                soft,
+                line,
+            );
+            painter.line_segment(
+                [
+                    c.along(tip, end, 0.10, 0.03),
+                    c.along(tip, end, 0.52, 0.045),
+                ],
+                Stroke::new(width * 0.9, accent),
+            );
+            fill(painter, c.band(tip, end, 0.63, 0.98, 0.075), primary, none);
+        }
         ToolIcon::Line => {
-            painter.line_segment([c.point(0.15, 0.82), c.point(0.85, 0.18)], line);
-            painter.circle_filled(c.point(0.15, 0.82), 1.7, secondary);
-            painter.circle_filled(c.point(0.85, 0.18), 1.7, secondary);
+            painter.line_segment([c.point(0.17, 0.83), c.point(0.83, 0.17)], line);
+            for (x, y) in [(0.17, 0.83), (0.83, 0.17)] {
+                painter.circle(c.point(x, y), unit * 0.085, accent, fine);
+            }
         }
         ToolIcon::Rectangle => {
-            painter.rect_stroke(c.rect(0.14, 0.22, 0.86, 0.78), 1.5, line);
-            painter.line_segment([c.point(0.14, 0.22), c.point(0.30, 0.22)], fine);
+            painter.rect(c.rect(0.12, 0.22, 0.88, 0.78), unit * 0.07, glow, line);
         }
         ToolIcon::Oval => {
-            let points: Vec<Pos2> = (0..=28)
-                .map(|index| {
-                    let angle = std::f32::consts::TAU * index as f32 / 28.0;
-                    c.point(0.5 + angle.cos() * 0.37, 0.5 + angle.sin() * 0.29)
-                })
-                .collect();
-            painter.add(Shape::line(points, line));
-            painter.circle_filled(c.point(0.50, 0.21), 1.4, secondary);
+            fill(painter, c.ellipse(0.5, 0.5, 0.38, 0.29), glow, line);
         }
-        ToolIcon::Bucket => draw_bucket(painter, c, primary, secondary),
-        ToolIcon::Eyedropper => draw_eyedropper(painter, c, primary, secondary),
+        ToolIcon::Bucket => {
+            // A pail tipped to the right, paint running from its lip.
+            let (cx, cy, turn) = (0.42, 0.50, 0.55_f32);
+            let rotate = |x: f32, y: f32| {
+                let (sin, cos) = turn.sin_cos();
+                (cx + x * cos - y * sin, cy + x * sin + y * cos)
+            };
+            let corners = [
+                rotate(-0.25, -0.20),
+                rotate(0.25, -0.20),
+                rotate(0.19, 0.22),
+                rotate(-0.19, 0.22),
+            ];
+            fill(painter, c.pts(&corners), soft, line);
+            let (left, right) = (corners[0], corners[1]);
+            painter.add(CubicBezierShape::from_points_stroke(
+                [
+                    c.point(left.0, left.1),
+                    c.point(left.0 - 0.14, left.1 - 0.30),
+                    c.point(right.0 - 0.30, right.1 - 0.26),
+                    c.point(right.0, right.1),
+                ],
+                false,
+                Color32::TRANSPARENT,
+                fine,
+            ));
+            fill(
+                painter,
+                c.pts(&[(0.80, 0.50), (0.88, 0.70), (0.72, 0.70)]),
+                accent,
+                none,
+            );
+            painter.circle_filled(c.point(0.80, 0.73), unit * 0.085, accent);
+            painter.line_segment(
+                [c.point(right.0, right.1), c.point(0.80, 0.52)],
+                Stroke::new(width, accent),
+            );
+        }
+        ToolIcon::Eyedropper => {
+            fill(
+                painter,
+                c.capsule(
+                    (0.13 + 0.74 * 0.80, 0.87 - 0.74 * 0.80),
+                    (0.13 + 0.74 * 0.96, 0.87 - 0.74 * 0.96),
+                    0.10,
+                ),
+                primary,
+                none,
+            );
+            fill(painter, c.band(tip, end, 0.70, 0.78, 0.12), primary, none);
+            fill(painter, c.band(tip, end, 0.12, 0.70, 0.065), soft, line);
+            fill(painter, c.band(tip, end, 0.15, 0.42, 0.040), accent, none);
+            painter.line_segment(
+                [c.along(tip, end, 0.0, 0.0), c.along(tip, end, 0.12, 0.0)],
+                line,
+            );
+        }
         ToolIcon::Text => {
-            painter.line_segment([c.point(0.14, 0.2), c.point(0.86, 0.2)], line);
-            painter.line_segment([c.point(0.5, 0.2), c.point(0.5, 0.82)], line);
-            painter.line_segment([c.point(0.3, 0.82), c.point(0.7, 0.82)], line);
-            painter.line_segment([c.point(0.14, 0.2), c.point(0.14, 0.37)], fine);
-            painter.line_segment([c.point(0.86, 0.2), c.point(0.86, 0.37)], fine);
+            painter.rect_filled(c.rect(0.10, 0.14, 0.72, 0.26), unit * 0.02, primary);
+            painter.rect_filled(c.rect(0.10, 0.14, 0.17, 0.36), unit * 0.02, primary);
+            painter.rect_filled(c.rect(0.65, 0.14, 0.72, 0.36), unit * 0.02, primary);
+            painter.rect_filled(c.rect(0.34, 0.14, 0.48, 0.86), 0.0, primary);
+            painter.rect_filled(c.rect(0.25, 0.80, 0.57, 0.88), unit * 0.02, primary);
+            let caret = Stroke::new(width, accent);
+            painter.line_segment([c.point(0.86, 0.40), c.point(0.86, 0.90)], caret);
+            painter.line_segment([c.point(0.80, 0.40), c.point(0.92, 0.40)], caret);
+            painter.line_segment([c.point(0.80, 0.90), c.point(0.92, 0.90)], caret);
         }
         ToolIcon::Rig => {
-            painter.line_segment([c.point(0.22, 0.70), c.point(0.50, 0.42)], line);
-            painter.line_segment([c.point(0.50, 0.42), c.point(0.80, 0.20)], line);
-            for (x, y) in [(0.22, 0.70), (0.50, 0.42), (0.80, 0.20)] {
-                painter.circle_filled(c.point(x, y), 3.0, secondary);
-                painter.circle_stroke(c.point(x, y), 3.0, Stroke::new(1.0_f32, primary));
+            let joints = [(0.20, 0.78), (0.50, 0.47), (0.82, 0.20)];
+            for pair in joints.windows(2) {
+                let (a, b) = (pair[0], pair[1]);
+                fill(
+                    painter,
+                    vec![
+                        c.point(a.0, a.1),
+                        c.along(a, b, 0.25, 0.08),
+                        c.point(b.0, b.1),
+                        c.along(a, b, 0.25, -0.08),
+                    ],
+                    soft,
+                    line,
+                );
+            }
+            for (x, y) in joints {
+                painter.circle(c.point(x, y), unit * 0.09, accent, fine);
             }
         }
     }
-}
-
-fn draw_select_pointer(painter: &Painter, c: IconCanvas, primary: Color32, accent: Color32) {
-    c.polygon(
-        painter,
-        &[
-            (0.17, 0.10),
-            (0.74, 0.58),
-            (0.51, 0.61),
-            (0.68, 0.88),
-            (0.55, 0.96),
-            (0.39, 0.67),
-            (0.23, 0.84),
-        ],
-        primary,
-        Stroke::new(0.9_f32, accent),
-    );
-}
-
-fn draw_subselect_pointer(painter: &Painter, c: IconCanvas, primary: Color32, accent: Color32) {
-    c.polygon(
-        painter,
-        &[
-            (0.16, 0.10),
-            (0.68, 0.54),
-            (0.48, 0.58),
-            (0.62, 0.82),
-            (0.51, 0.89),
-            (0.36, 0.64),
-            (0.22, 0.78),
-        ],
-        Color32::TRANSPARENT,
-        Stroke::new(1.45_f32, primary),
-    );
-    painter.rect_filled(c.rect(0.67, 0.13, 0.88, 0.34), 1.0, accent);
-    painter.rect_stroke(
-        c.rect(0.67, 0.13, 0.88, 0.34),
-        1.0,
-        Stroke::new(0.9_f32, primary),
-    );
-}
-
-fn draw_hand(painter: &Painter, c: IconCanvas, primary: Color32, accent: Color32) {
-    // A real open palm: four separate fingers, a side thumb, palm and wrist.
-    // This deliberately does not reuse the four-way move-arrow silhouette.
-    let finger_width = c.rect.width() * 0.15;
-    let finger_radius = finger_width * 0.5;
-    for (x, top, bottom) in [
-        (0.35, 0.19, 0.55),
-        (0.47, 0.08, 0.55),
-        (0.59, 0.13, 0.55),
-        (0.70, 0.23, 0.58),
-    ] {
-        painter.line_segment(
-            [c.point(x, top + 0.04), c.point(x, bottom)],
-            Stroke::new(finger_width, primary),
-        );
-        painter.circle_filled(c.point(x, top + 0.04), finger_radius, primary);
-    }
-    painter.rect_filled(c.rect(0.28, 0.43, 0.76, 0.82), finger_radius, primary);
-    painter.line_segment(
-        [c.point(0.32, 0.62), c.point(0.13, 0.48)],
-        Stroke::new(finger_width * 1.05, primary),
-    );
-    painter.circle_filled(c.point(0.13, 0.48), finger_radius * 1.05, primary);
-    painter.rect_filled(c.rect(0.38, 0.76, 0.66, 0.95), 1.5, primary);
-    painter.line_segment(
-        [c.point(0.34, 0.78), c.point(0.70, 0.78)],
-        Stroke::new(1.0_f32, accent),
-    );
-}
-
-fn draw_pen(painter: &Painter, c: IconCanvas, primary: Color32, accent: Color32) {
-    c.polygon(
-        painter,
-        &[(0.50, 0.08), (0.78, 0.42), (0.50, 0.90), (0.22, 0.42)],
-        Color32::TRANSPARENT,
-        Stroke::new(1.45_f32, primary),
-    );
-    painter.line_segment(
-        [c.point(0.50, 0.14), c.point(0.50, 0.59)],
-        Stroke::new(1.2_f32, accent),
-    );
-    painter.circle_stroke(c.point(0.50, 0.55), 2.0, Stroke::new(1.0_f32, primary));
-    c.polyline(
-        painter,
-        &[(0.22, 0.42), (0.50, 0.55), (0.78, 0.42)],
-        Stroke::new(1.0_f32, accent),
-    );
-}
-
-fn draw_pencil(painter: &Painter, c: IconCanvas, primary: Color32, accent: Color32) {
-    c.polygon(
-        painter,
-        &[(0.16, 0.75), (0.62, 0.19), (0.81, 0.35), (0.34, 0.91)],
-        Color32::TRANSPARENT,
-        Stroke::new(1.45_f32, primary),
-    );
-    c.polygon(
-        painter,
-        &[(0.16, 0.75), (0.34, 0.91), (0.10, 0.96)],
-        accent,
-        Stroke::new(0.8_f32, primary),
-    );
-    painter.line_segment(
-        [c.point(0.57, 0.25), c.point(0.76, 0.41)],
-        Stroke::new(1.1_f32, accent),
-    );
-}
-
-fn draw_brush(painter: &Painter, c: IconCanvas, primary: Color32, accent: Color32) {
-    painter.line_segment(
-        [c.point(0.66, 0.16), c.point(0.42, 0.58)],
-        Stroke::new(4.2_f32, primary),
-    );
-    painter.line_segment(
-        [c.point(0.68, 0.13), c.point(0.43, 0.55)],
-        Stroke::new(1.1_f32, accent),
-    );
-    c.polygon(
-        painter,
-        &[
-            (0.35, 0.48),
-            (0.55, 0.64),
-            (0.38, 0.90),
-            (0.12, 0.92),
-            (0.25, 0.75),
-        ],
-        primary,
-        Stroke::new(0.9_f32, accent),
-    );
-}
-
-fn draw_eraser(painter: &Painter, c: IconCanvas, primary: Color32, accent: Color32) {
-    c.polygon(
-        painter,
-        &[(0.18, 0.66), (0.52, 0.20), (0.84, 0.45), (0.50, 0.88)],
-        Color32::TRANSPARENT,
-        Stroke::new(1.5_f32, primary),
-    );
-    painter.line_segment(
-        [c.point(0.34, 0.45), c.point(0.67, 0.70)],
-        Stroke::new(1.15_f32, accent),
-    );
-    painter.line_segment(
-        [c.point(0.13, 0.91), c.point(0.57, 0.91)],
-        Stroke::new(1.15_f32, accent),
-    );
-}
-
-fn draw_knife(painter: &Painter, c: IconCanvas, primary: Color32, accent: Color32) {
-    // A blade leaning right, its handle below, over a zigzag cut.
-    c.polygon(
-        painter,
-        &[(0.80, 0.10), (0.86, 0.16), (0.44, 0.62), (0.34, 0.56)],
-        Color32::TRANSPARENT,
-        Stroke::new(1.45_f32, primary),
-    );
-    painter.line_segment(
-        [c.point(0.38, 0.60), c.point(0.20, 0.80)],
-        Stroke::new(3.2_f32, primary),
-    );
-    painter.add(Shape::line(
-        vec![
-            c.point(0.10, 0.92),
-            c.point(0.26, 0.84),
-            c.point(0.38, 0.94),
-            c.point(0.52, 0.84),
-            c.point(0.64, 0.94),
-            c.point(0.80, 0.86),
-        ],
-        Stroke::new(1.15_f32, accent),
-    ));
-}
-
-fn draw_bucket(painter: &Painter, c: IconCanvas, primary: Color32, accent: Color32) {
-    // Classic tilted paint bucket: oval rim, tapered body, arched handle,
-    // visible paint at the lip and one falling drop.
-    let rim: Vec<Pos2> = (0..=20)
-        .map(|index| {
-            let angle = std::f32::consts::TAU * index as f32 / 20.0;
-            c.point(
-                0.43 + angle.cos() * 0.25,
-                0.34 + angle.sin() * 0.105 + angle.cos() * -0.055,
-            )
-        })
-        .collect();
-    painter.add(Shape::line(rim, Stroke::new(1.45_f32, primary)));
-
-    c.polygon(
-        painter,
-        &[(0.19, 0.34), (0.67, 0.23), (0.76, 0.65), (0.34, 0.78)],
-        Color32::TRANSPARENT,
-        Stroke::new(1.45_f32, primary),
-    );
-    painter.line_segment(
-        [c.point(0.31, 0.69), c.point(0.74, 0.57)],
-        Stroke::new(1.0_f32, primary),
-    );
-
-    let handle: Vec<Pos2> = (0..=18)
-        .map(|index| {
-            let t = index as f32 / 18.0;
-            let angle = std::f32::consts::PI * (1.08 + 0.84 * t);
-            c.point(0.44 + angle.cos() * 0.31, 0.34 + angle.sin() * 0.34)
-        })
-        .collect();
-    painter.add(Shape::line(handle, Stroke::new(1.15_f32, primary)));
-    painter.circle_filled(c.point(0.14, 0.39), 1.5, primary);
-    painter.circle_filled(c.point(0.70, 0.26), 1.5, primary);
-
-    c.polyline(
-        painter,
-        &[(0.23, 0.35), (0.36, 0.37), (0.48, 0.32), (0.62, 0.31)],
-        Stroke::new(2.0_f32, accent),
-    );
-    painter.line_segment(
-        [c.point(0.69, 0.35), c.point(0.80, 0.58)],
-        Stroke::new(2.0_f32, accent),
-    );
-    painter.circle_filled(c.point(0.84, 0.72), 2.2, accent);
-}
-
-fn draw_eyedropper(painter: &Painter, c: IconCanvas, primary: Color32, accent: Color32) {
-    painter.line_segment(
-        [c.point(0.68, 0.21), c.point(0.29, 0.67)],
-        Stroke::new(4.0_f32, primary),
-    );
-    painter.line_segment(
-        [c.point(0.68, 0.21), c.point(0.29, 0.67)],
-        Stroke::new(1.1_f32, accent),
-    );
-    painter.circle_stroke(c.point(0.73, 0.17), 4.0, Stroke::new(1.4_f32, primary));
-    c.polygon(
-        painter,
-        &[(0.24, 0.62), (0.34, 0.71), (0.14, 0.91)],
-        accent,
-        Stroke::new(0.8_f32, primary),
-    );
 }
 
 #[cfg(test)]

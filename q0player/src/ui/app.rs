@@ -71,6 +71,13 @@ pub struct PlayerApp {
     /// One-shot file path passed via the binary's CLI args (file association
     /// double-click). Loaded on the first `update()` so we have a valid ctx.
     pending_open: Option<PathBuf>,
+    /// Running as a QIR app: its manifest and session.
+    qir: Option<super::qir::QirSession>,
+    /// Where `q0app.save!` writes for the open movie.
+    saves: Option<super::qir::SaveFile>,
+    /// What the movie's scripts chose to show around it
+    /// (`q0window.background!`).
+    script_backdrop: Option<q0s_format::q0lang::runtime::Backdrop>,
     timeline_audio: Option<TimelineAudioPlayback>,
     observed_scene_generation: u64,
     last_pointer_stage: Option<(f32, f32, bool)>,
@@ -272,6 +279,9 @@ impl PlayerApp {
             dialog_tab: DialogTab::Settings,
             credits_opened_at: Instant::now(),
             pending_open: initial_file,
+            qir: None,
+            saves: None,
+            script_backdrop: None,
             timeline_audio: None,
             observed_scene_generation: 0,
             last_pointer_stage: None,
@@ -302,6 +312,167 @@ impl PlayerApp {
     pub fn with_preview(mut self, options: PreviewOptions) -> Self {
         self.preview = options;
         self
+    }
+
+    /// Plays the app inside a QIR bundle: no player around it, the
+    /// manifest's window, keys and save folder.
+    pub fn with_qir(mut self, session: super::qir::QirSession) -> Self {
+        self.preview.enabled = true;
+        self.preview.all_scenes = session.manifest.behaviour.all_scenes;
+        self.qir = Some(session);
+        self
+    }
+
+    /// Who the movie is for `app.*`, and its saves for `save.*`.
+    fn attach_app(&mut self, movie: Option<&Path>) {
+        self.script_backdrop = None;
+        self.saves = match (&self.qir, movie) {
+            (Some(qir), _) => Some(qir.saves()),
+            (None, Some(path)) => super::qir::SaveFile::for_movie(path),
+            (None, None) => None,
+        };
+        let saves = self
+            .saves
+            .as_ref()
+            .map(|saves| saves.values.clone())
+            .unwrap_or_default();
+        let app = match &self.qir {
+            Some(qir) => crate::AppGlobals {
+                name: qir.manifest.app.name.clone(),
+                id: qir.manifest.app.id.clone(),
+                version: qir.manifest.app.version.clone(),
+                author: qir.manifest.app.author.clone(),
+                packaged: true,
+                debug: qir.manifest.diagnostics.debug,
+                args: qir.args.join(" "),
+                saves,
+            },
+            None => crate::AppGlobals {
+                name: movie
+                    .and_then(Path::file_stem)
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                saves,
+                ..crate::AppGlobals::default()
+            },
+        };
+        if let Some(player) = self.player.as_mut() {
+            player.set_app(app);
+        }
+    }
+
+    /// A line in a QIR app's log, or on the error stream of a plain player.
+    fn app_log(&mut self, line: &str) {
+        match self.qir.as_mut() {
+            Some(qir) => qir.log(line),
+            None => eprintln!("{line}"),
+        }
+    }
+
+    /// Opens the movie a QIR bundle carried.
+    fn open_qir_movie(&mut self, ctx: &Context, movie: &[u8]) {
+        let Some(qir) = self.qir.as_ref() else {
+            return;
+        };
+        let manifest = qir.manifest.clone();
+        match Player::from_bytes(movie) {
+            Ok(mut player) => {
+                player.set_loop_enabled(manifest.behaviour.loop_playback);
+                if manifest.behaviour.all_scenes {
+                    player.enable_document_scene_sequence();
+                }
+                let script_warning = player.initial_script_warning();
+                self.stats = player
+                    .project_v2()
+                    .map(|project| FileStats::from_project(project, movie.len()));
+                self.reset_window_appearance(ctx);
+                self.transport_reveal = Default::default();
+                let scene_generation = player.scene_generation();
+                self.game = player.is_game();
+                self.script_ui = true;
+                self.script_hotkeys = manifest.behaviour.player_hotkeys;
+                self.scrub = None;
+                self.perf.reset();
+                // The splash shows first; the movie starts behind it.
+                if manifest.splash.enabled {
+                    player.set_playing(false);
+                    if let Some(qir) = self.qir.as_mut() {
+                        qir.splash_hold = true;
+                    }
+                }
+                self.player = Some(player);
+                self.observed_scene_generation = scene_generation;
+                self.last_pointer_stage = None;
+                let audio_warning = self.sync_timeline_audio().err();
+                self.file_path = None;
+                self.frame_tex = None;
+                self.v2_textures.invalidate();
+                self.last_tick = Instant::now();
+                self.attach_app(None);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title(manifest.title().to_string()));
+                for warning in script_warning.into_iter().chain(audio_warning) {
+                    self.app_log(&warning);
+                    if manifest.diagnostics.error_dialog {
+                        show_app_error(&manifest.app.name, &warning);
+                    }
+                }
+            }
+            Err(error) => {
+                self.status = format!("{} could not start: {error}", manifest.app.name);
+                let status = self.status.clone();
+                self.app_log(&status);
+            }
+        }
+    }
+
+    /// What the manifest asks of every frame: the splash, focus, cursor
+    /// and F11.
+    fn qir_frame(&mut self, ctx: &Context) {
+        let Some(qir) = self.qir.as_mut() else {
+            return;
+        };
+        qir.skip_splash_on_input(ctx);
+        qir.draw_splash(ctx);
+        if qir.splash_hold && qir.splash_revealing() {
+            qir.splash_hold = false;
+            if let Some(player) = self.player.as_mut() {
+                player.set_playing(true);
+            }
+            self.set_timeline_audio_playing(true);
+            self.last_tick = Instant::now();
+        }
+        let qir = self.qir.as_mut().expect("checked above");
+        qir.apply_cursor(ctx);
+        if qir.manifest.behaviour.fullscreen_key
+            && ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::F11))
+        {
+            let fullscreen = ctx.input(|input| input.viewport().fullscreen.unwrap_or(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
+        }
+        if qir.manifest.behaviour.unfocused == q0qir::Unfocused::Pause {
+            let focused = ctx.input(|input| input.focused);
+            match (focused, qir.paused_for_focus) {
+                (false, None) => {
+                    let was_playing = self.player.as_ref().is_some_and(Player::is_playing);
+                    qir.paused_for_focus = Some(was_playing);
+                    if let Some(player) = self.player.as_mut() {
+                        player.set_playing(false);
+                    }
+                    self.set_timeline_audio_playing(false);
+                }
+                (true, Some(was_playing)) => {
+                    qir.paused_for_focus = None;
+                    if was_playing {
+                        if let Some(player) = self.player.as_mut() {
+                            player.set_playing(true);
+                        }
+                        self.set_timeline_audio_playing(true);
+                        self.last_tick = Instant::now();
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     fn sync_timeline_audio(&mut self) -> Result<(), String> {
@@ -369,6 +540,7 @@ impl PlayerApp {
                 self.observed_scene_generation = scene_generation;
                 self.last_pointer_stage = None;
                 let audio_warning = self.sync_timeline_audio().err();
+                self.attach_app(Some(path));
                 self.file_path = Some(path.to_path_buf());
                 self.frame_tex = None;
                 self.v2_textures.invalidate();
@@ -839,6 +1011,34 @@ impl PlayerApp {
                 }
                 WindowCommand::PerformanceLog => self.copy_performance_log(ctx),
                 WindowCommand::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                WindowCommand::AppSave { key, value } => {
+                    let failed = self
+                        .saves
+                        .as_mut()
+                        .and_then(|saves| saves.set(key, value).err());
+                    if let Some(error) = failed {
+                        self.app_log(&format!("could not save: {error}"));
+                    }
+                }
+                WindowCommand::AppForget(key) => {
+                    let failed = self
+                        .saves
+                        .as_mut()
+                        .and_then(|saves| saves.forget(key.as_deref()).err());
+                    if let Some(error) = failed {
+                        self.app_log(&format!("could not forget a save: {error}"));
+                    }
+                }
+                WindowCommand::AppOpen(url) => ctx.open_url(egui::OpenUrl::new_tab(url)),
+                WindowCommand::AppLog(line) => self.app_log(&line),
+                // The movie handles these before they reach the window.
+                WindowCommand::RootTimeline { .. } => {}
+                WindowCommand::Background(choice) => {
+                    self.script_backdrop = match choice {
+                        q0s_format::q0lang::runtime::Backdrop::Default => None,
+                        chosen => Some(chosen),
+                    };
+                }
             }
         }
     }
@@ -871,10 +1071,19 @@ impl PlayerApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &Context, game_input_active: bool) {
+        let escape = self
+            .qir
+            .as_ref()
+            .map_or(q0qir::EscapeKey::Quit, |qir| qir.manifest.behaviour.escape);
         if self.preview.enabled
+            && escape != q0qir::EscapeKey::Movie
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            if escape == q0qir::EscapeKey::Quit {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else if ctx.input(|input| input.viewport().fullscreen.unwrap_or(false)) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            }
         }
         for shortcut in take_shortcuts(ctx, game_input_active, !self.game) {
             if self.preview.enabled && shortcut == PlayerShortcut::Open {
@@ -1017,6 +1226,14 @@ impl App for PlayerApp {
         if let Some(p) = self.pending_open.take() {
             self.open_path(ctx, &p);
         }
+        if let Some(movie) = self
+            .qir
+            .as_mut()
+            .and_then(super::qir::QirSession::take_movie)
+        {
+            self.open_qir_movie(ctx, &movie);
+        }
+        self.qir_frame(ctx);
         self.poll_platform(ctx);
 
         let game_input_active = self
@@ -1089,14 +1306,18 @@ impl App for PlayerApp {
         }
 
         if self.preview.enabled && self.player.is_none() {
-            egui::Window::new("Fast preview could not open")
-                .collapsible(false)
-                .show(ctx, |ui| {
-                    ui.label(&self.status);
-                    if ui.button("Close").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                });
+            egui::Window::new(if self.qir.is_some() {
+                "The app could not start"
+            } else {
+                "Fast preview could not open"
+            })
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.label(&self.status);
+                if ui.button("Close").clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
         }
 
         if self.show_settings && !self.cinema {
@@ -1533,9 +1754,13 @@ impl PlayerApp {
     fn reset_window_appearance(&mut self, ctx: &Context) {
         if self.script_window_customized {
             ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Icon(Some(std::sync::Arc::new(
-                super::launch::default_window_icon(),
-            ))));
+            // A QIR app goes back to its own icon, not q0player's.
+            let icon = self
+                .qir
+                .as_ref()
+                .and_then(super::qir::QirSession::window_icon)
+                .unwrap_or_else(super::launch::default_window_icon);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Icon(Some(std::sync::Arc::new(icon))));
             self.script_window_customized = false;
         }
     }
@@ -1660,12 +1885,42 @@ impl PlayerApp {
         self.last_pointer_stage = Some(now);
     }
 
+    /// What shows around the movie: the script's choice, else the app's,
+    /// else (plain q0player) the player's theme.
+    fn backdrop(&self) -> Color32 {
+        use q0s_format::q0lang::runtime::Backdrop as Chosen;
+        let stage = || {
+            self.player
+                .as_ref()
+                .and_then(Player::project_v2)
+                .map(|project| {
+                    let color = project.meta.background_color;
+                    Color32::from_rgb(color.r, color.g, color.b)
+                })
+        };
+        match self.script_backdrop {
+            Some(Chosen::Color([r, g, b])) => return Color32::from_rgb(r, g, b),
+            Some(Chosen::Stage) => {
+                if let Some(color) = stage() {
+                    return color;
+                }
+            }
+            Some(Chosen::Default) | None => {}
+        }
+        match self.qir.as_ref().map(|qir| qir.manifest.window.background) {
+            Some(q0qir::Backdrop::Black) => Color32::BLACK,
+            Some(q0qir::Backdrop::Custom([r, g, b])) => Color32::from_rgb(r, g, b),
+            Some(q0qir::Backdrop::Stage) => stage().unwrap_or(Color32::BLACK),
+            None => self.settings.theme.viewport_bg.to_color32(),
+        }
+    }
+
     fn viewport(&mut self, ctx: &Context) {
         // Cinema's bars are black, so only the movie is left to see.
         let backdrop = if self.cinema {
             Color32::BLACK
         } else {
-            self.settings.theme.viewport_bg.to_color32()
+            self.backdrop()
         };
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(backdrop))
@@ -2429,6 +2684,22 @@ fn movie_window_icon(player: &Player, source: &str) -> Result<egui::IconData, St
         width,
         height,
     })
+}
+
+/// A script error in a QIR app whose manifest asks for message boxes.
+fn show_app_error(app: &str, error: &str) {
+    #[cfg(not(target_os = "android"))]
+    {
+        rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title(app)
+            .set_description(error)
+            .show();
+    }
+    #[cfg(target_os = "android")]
+    {
+        let _ = (app, error);
+    }
 }
 
 #[cfg(test)]

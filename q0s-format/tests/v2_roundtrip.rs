@@ -624,7 +624,7 @@ fn v2_enforces_renderer_nesting_limit() {
     let over_limit = q0rg_chain(usize::from(MAX_Q0RG_NESTING_DEPTH) + 1);
     assert_eq!(
         validate(&over_limit).expect_err("deeper content would be dropped by renderers"),
-        Error::Validation("q0rg nesting depth exceeds 8")
+        Error::Validation("q0rg nesting depth exceeds 16")
     );
 }
 
@@ -633,7 +633,7 @@ fn v2_rejects_hostile_long_chain_without_recursive_dfs() {
     let project = q0rg_chain(4096);
     assert_eq!(
         validate(&project).expect_err("hostile chain must fail safely"),
-        Error::Validation("q0rg nesting depth exceeds 8")
+        Error::Validation("q0rg nesting depth exceeds 16")
     );
 }
 

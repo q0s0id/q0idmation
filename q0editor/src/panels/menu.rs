@@ -400,7 +400,9 @@ pub fn menus(app: &mut EditorApp, ui: &mut Ui) {
                 )
                 .clicked()
             {
-                app.queue(Action::ConvertSelectionToQ0rg);
+                app.queue(Action::PromptSymbol(
+                    crate::symbol_prompt::SymbolRequest::Convert,
+                ));
                 ui.close_menu();
             }
             if ui
@@ -615,7 +617,7 @@ pub fn menus(app: &mut EditorApp, ui: &mut Ui) {
         );
         ui.label(
             egui::RichText::new(
-                "V/A/P/B/N/R/O/K/I tools; arrows move selection (Shift: fine), or step frames without selection",
+                "V/A/P/B/N/R/O/K/I switch tools. Arrows nudge the selection. Frame keys are under Keyboard shortcuts.",
             )
             .color(app.settings.theme.text_dim.to_color32()),
         );
@@ -824,7 +826,7 @@ fn action_for_shortcut(command: ShortcutCommand) -> Option<Action> {
         C::PasteInPlace => Action::PasteInPlace,
         C::Duplicate => Action::DuplicateSelection,
         C::Delete => Action::DeleteSelection,
-        C::ConvertToSymbol => Action::ConvertSelectionToQ0rg,
+        C::ConvertToSymbol => Action::PromptSymbol(crate::symbol_prompt::SymbolRequest::Convert),
         C::BreakApart => Action::BreakApartSelection,
         C::FlipHorizontal => Action::FlipHorizontal,
         C::FlipVertical => Action::FlipVertical,
@@ -1083,6 +1085,51 @@ pub fn handle_global_shortcuts(app: &mut EditorApp, ctx: &egui::Context) {
 #[cfg(test)]
 mod shortcut_tests {
     use super::*;
+
+    #[test]
+    fn frame_keys_step_the_playhead_and_follow_overrides() {
+        let ctx = egui::Context::default();
+        let mut app = EditorApp::default();
+        app.session.current_frame = 2;
+        let press = |app: &mut EditorApp, key, modifiers| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    modifiers,
+                    events: [true, false]
+                        .map(|pressed| egui::Event::Key {
+                            key,
+                            physical_key: Some(key),
+                            pressed,
+                            repeat: false,
+                            modifiers,
+                        })
+                        .to_vec(),
+                    ..Default::default()
+                },
+                |ctx| handle_global_shortcuts(app, ctx),
+            );
+            app.flush_pending_actions();
+        };
+
+        for (key, mods, expected) in [
+            (Key::Comma, Modifiers::SHIFT, 1),
+            (Key::Comma, Modifiers::NONE, 0),
+            (Key::Period, Modifiers::NONE, 1),
+            (Key::Period, Modifiers::SHIFT, 2),
+            (Key::ArrowRight, Modifiers::NONE, 2),
+        ] {
+            press(&mut app, key, mods);
+            assert_eq!(app.session.current_frame, expected, "{key:?} {mods:?}");
+        }
+        app.settings.hotkeys.assign(
+            ShortcutCommand::NextFrame,
+            ShortcutChord::key(ShortcutKey::F2),
+        );
+        press(&mut app, Key::Period, Modifiers::NONE);
+        assert_eq!(app.session.current_frame, 2);
+        press(&mut app, Key::F2, Modifiers::NONE);
+        assert_eq!(app.session.current_frame, 3);
+    }
     use egui::Modifiers;
     use std::time::Duration;
 
@@ -1267,6 +1314,91 @@ mod shortcut_tests {
             (290.0, 190.0, 310.0, 210.0)
         );
         assert_eq!(app.session.status, "pasted at cursor");
+    }
+
+    #[test]
+    fn ctrl_v_in_the_free_3d_view_keeps_the_2d_camera_background_hidden() {
+        use crate::tools3d::{Orbit, Tool3d};
+        use q0s_format::three::{math::V3, Space3d};
+        use q0s_format::v2::{CameraState, Rgba};
+
+        let mut app = EditorApp::default();
+        seed_native_copy_square(&mut app);
+        let project = &mut app.state.project;
+        let q0rg_id = project.q0rgs[0].q0rg_id;
+        let layer = &mut project.q0rgs[0].layers[0];
+        layer.placements[0].fx.three = Some(Space3d::default());
+        app.session.selection = crate::state::Selection::Placement {
+            q0rg_id,
+            layer_id: layer.layer_id,
+            placement_idx: 0,
+        };
+        let w = f32::from(project.meta.stage_width);
+        let h = f32::from(project.meta.stage_height);
+        project.meta.background_color = Rgba {
+            r: 236,
+            g: 247,
+            b: 252,
+            a: 255,
+        };
+        let camera = CameraState {
+            center_x: w * 0.75,
+            center_y: h * 0.6,
+            zoom: 1.0,
+            rotation: 0.0,
+        };
+        project.runtime.camera.enabled = true;
+        project.runtime.camera.insert_key(0, camera);
+        let orbit = Orbit {
+            target: V3::new(w * 0.5, h * 0.5, 0.0),
+            yaw: 0.7,
+            pitch: 0.45,
+            distance: w,
+        };
+        app.session.tools3d.tool = Some(Tool3d::Move);
+        app.session.tools3d.orbit = Some(orbit);
+        app.session.clipboard = Some(crate::selection_edit::capture_clipboard(
+            project,
+            &app.session.selection,
+        ));
+        run_paste_shortcut(&mut app, Modifiers::COMMAND);
+        assert_eq!(app.state.project.q0rgs[0].layers[0].placements.len(), 2);
+        assert_eq!(app.state.project.camera_state_at(0), camera);
+        assert_eq!(app.session.tools3d.orbit, Some(orbit));
+
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        app.settings.theme.apply(&ctx);
+        let camera_fill = egui::Color32::from_rgb(236, 247, 252);
+        let paints_camera_fill = |app: &mut EditorApp| {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200.0, 700.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        crate::panels::stage::render(app, ui);
+                    });
+                },
+            );
+            output.shapes.iter().any(|clipped| {
+                matches!(&clipped.shape, egui::Shape::Path(path) if path.fill == camera_fill)
+            })
+        };
+
+        assert!(
+            !paints_camera_fill(&mut app),
+            "2D camera fill leaked into the free 3D view"
+        );
+        app.session.tools3d.orbit = None;
+        assert!(
+            paints_camera_fill(&mut app),
+            "the 2D camera still needs its background"
+        );
     }
 
     #[test]

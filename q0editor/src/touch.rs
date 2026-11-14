@@ -325,7 +325,10 @@ fn selection_bar(app: &mut EditorApp, ctx: &Context, free: Rect) {
                         ui.spacing_mut().button_padding = vec2(12.0, 9.0);
                         for (label, action) in [
                             ("Paste in place", Action::PasteInPlace),
-                            ("Convert to symbol", Action::ConvertSelectionToQ0rg),
+                            (
+                                "Convert to symbol",
+                                Action::PromptSymbol(crate::symbol_prompt::SymbolRequest::Convert),
+                            ),
                             ("Break apart", Action::BreakApartSelection),
                             ("Flip horizontal", Action::FlipHorizontal),
                             ("Flip vertical", Action::FlipVertical),

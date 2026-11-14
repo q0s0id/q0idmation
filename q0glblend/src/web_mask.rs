@@ -11,6 +11,10 @@ thread_local! {
 pub(super) fn take_error() -> Option<String> {
     ERROR.with(|error| error.borrow_mut().take())
 }
+
+pub(super) fn record_error(error: String) {
+    ERROR.with(|slot| *slot.borrow_mut() = Some(error));
+}
 pub(super) fn paint(
     painter: &Painter,
     rect: Rect,
@@ -93,11 +97,7 @@ fn with_resources(gl: &Arc<glow::Context>, draw: impl FnOnce(&mut Resources)) {
             .entry(Arc::as_ptr(gl) as usize)
             .or_insert_with(|| unsafe {
                 Resources::new(gl)
-                    .map_err(|error| {
-                        ERROR.with(|slot| {
-                            *slot.borrow_mut() = Some(format!("webgl compositor: {error}"))
-                        })
-                    })
+                    .map_err(|error| record_error(format!("webgl compositor: {error}")))
                     .ok()
             });
         if let Some(resources) = entry {

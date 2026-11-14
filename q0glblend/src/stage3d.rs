@@ -6,11 +6,11 @@
 use std::cell::Cell;
 use std::sync::Arc;
 
-use egui::Painter;
+use egui::{Color32, Painter};
 use q0s_format::runtime_scene::RuntimeSceneState;
 use q0s_format::three::draw::{DrawItem, Frame3d, Image, PlaneDraw, View3d};
 use q0s_format::three::frame::{self, FlatCut, SceneLook};
-use q0s_format::three::scene::{lift, CameraPose};
+use q0s_format::three::scene::{lift, CameraPose, LightRig};
 use q0s_format::three::Mat4;
 use q0s_format::transform::Affine;
 use q0s_format::v2::{Asset, Placement, PlacementFx, ProjectV2, Target};
@@ -67,6 +67,7 @@ pub struct Stage3d {
     /// The root's own transform undone: stage space from a parent.
     root_inverse: Affine,
     items: Vec<DrawItem>,
+    tint: Color32,
     flat: FlatCut,
     /// Inside a symbol on a layer whose flat art is lit.
     pub inside_lit: bool,
@@ -82,6 +83,7 @@ impl Stage3d {
         view: None,
         root_inverse: Affine::IDENTITY,
         items: Vec::new(),
+        tint: Color32::WHITE,
         flat: FlatCut::OFF,
         inside_lit: false,
         everything: false,
@@ -99,6 +101,32 @@ impl Stage3d {
         root: Affine,
         to_screen: Affine,
         scene: &RuntimeSceneState,
+    ) -> Self {
+        Self::new_tinted(
+            project,
+            q0rg_id,
+            frame,
+            root,
+            to_screen,
+            scene,
+            Color32::WHITE,
+            true,
+            true,
+        )
+    }
+
+    /// Paints a 3D pass with a tint applied after depth compositing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_tinted(
+        project: &ProjectV2,
+        q0rg_id: u16,
+        frame: u16,
+        root: Affine,
+        to_screen: Affine,
+        scene: &RuntimeSceneState,
+        tint: Color32,
+        draw_paper: bool,
+        timeline_camera_applied: bool,
     ) -> Self {
         let free = free_view();
         if free.is_none() && !frame::project_uses_3d(project) {
@@ -124,15 +152,23 @@ impl Stage3d {
                 scene,
             )
         });
+        let mut to_output = Affine::compose(to_screen, root);
         if let Some(free) = free {
             look.camera = free.camera;
             look.orthographic = free.orthographic;
+        } else if timeline_camera_applied {
+            let remove_affine = look.apply_timeline_camera(project, q0rg_id, frame);
+            to_output = Affine::compose(to_output, remove_affine);
         }
         // The GPU pass maps stage space onto its own target; the output
         // size here is only a placeholder.
-        let view = look.view(project, Affine::compose(to_screen, root), [1, 1]);
+        let view = look.view(project, to_output, [1, 1]);
         let mut items = Vec::new();
-        if free.is_some() && q0rg_id == project.meta.entry_q0rg_id {
+        if free.is_some()
+            && draw_paper
+            && tint == Color32::WHITE
+            && q0rg_id == project.meta.entry_q0rg_id
+        {
             items.push(paper(project));
         }
         Self {
@@ -141,10 +177,39 @@ impl Stage3d {
             view: Some(view),
             root_inverse: root.inverse().unwrap_or(Affine::IDENTITY),
             items,
+            tint,
             inside_lit: false,
             everything: free.is_some(),
             liquids: frame::liquid_items(project, q0rg_id, local_frame),
         }
+    }
+
+    /// Draw the paper once underneath a free-view preview with multiple passes.
+    pub fn paint_free_view_paper(
+        painter: &Painter,
+        project: &ProjectV2,
+        q0rg_id: u16,
+        frame: u16,
+        to_screen: Affine,
+    ) {
+        let Some(free) = free_view().filter(|_| q0rg_id == project.meta.entry_q0rg_id) else {
+            return;
+        };
+        let mut look = frame::scene_look(project, q0rg_id, frame, |_| None);
+        look.camera = free.camera;
+        look.orthographic = free.orthographic;
+        let view = look.view(project, to_screen, [1, 1]);
+        let frame = Frame3d {
+            view,
+            rig: LightRig {
+                fog: look.rig.fog,
+                ..LightRig::default_for(&view.camera)
+            },
+            items: vec![paper(project)],
+            overlay: None,
+            clear: None,
+        };
+        crate::paint_frame3d(painter, painter.clip_rect(), Arc::new(frame));
     }
 
     /// A pass that does nothing, for drawings that never hold 3D.
@@ -158,12 +223,19 @@ impl Stage3d {
 
     /// Is the next root layer's flat art lit by the 3D lights?
     pub fn next_layer(&mut self, layer_id: u16) -> bool {
+        self.next_layer_with_visibility(layer_id, true)
+    }
+
+    /// Advance the light boundary even when a layer is outside this pass.
+    pub fn next_layer_with_visibility(&mut self, layer_id: u16, visible: bool) -> bool {
         if !self.liquids.is_empty() {
             let (here, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.liquids)
                 .into_iter()
                 .partition(|(layer, _)| *layer == layer_id);
             self.liquids = later;
-            self.items.extend(here.into_iter().map(|(_, item)| item));
+            if visible {
+                self.items.extend(here.into_iter().map(|(_, item)| item));
+            }
         }
         self.flat.layer(layer_id)
     }
@@ -280,7 +352,12 @@ impl Stage3d {
             overlay: None,
             clear: None,
         };
-        crate::paint_frame3d(painter, painter.clip_rect(), Arc::new(frame));
+        crate::three::paint_tinted_frame3d(
+            painter,
+            painter.clip_rect(),
+            Arc::new(frame),
+            self.tint,
+        );
     }
 }
 

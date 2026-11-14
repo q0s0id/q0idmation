@@ -29,17 +29,34 @@ pub mod pairs {
 
 pub mod b64 {
     use base64::Engine;
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::de::{Error, Visitor};
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
 
     pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
-        let text = String::deserialize(deserializer)?;
-        base64::engine::general_purpose::STANDARD
-            .decode(text.as_bytes())
-            .map_err(serde::de::Error::custom)
+        struct Decode;
+
+        impl<'de> Visitor<'de> for Decode {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a base64 string")
+            }
+
+            fn visit_str<E: Error>(self, text: &str) -> Result<Self::Value, E> {
+                base64::engine::general_purpose::STANDARD
+                    .decode(text.as_bytes())
+                    .map_err(E::custom)
+            }
+        }
+
+        // Decode directly from the input slice or the parser's scratch
+        // space. An owned copy of a large encoded bitmap is unnecessary.
+        deserializer.deserialize_str(Decode)
     }
 }
 

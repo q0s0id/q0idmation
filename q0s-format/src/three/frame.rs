@@ -41,6 +41,57 @@ impl SceneLook {
         )
     }
 
+    /// Convert the playback camera's pan, zoom and rotation into a camera
+    /// move in 3D. Return the inverse of its 2D affine so callers can remove
+    /// it from the output transform they share with flat artwork.
+    pub fn apply_timeline_camera(
+        &mut self,
+        project: &ProjectV2,
+        q0rg_id: u16,
+        frame: u16,
+    ) -> Affine {
+        if self.orthographic
+            || q0rg_id != project.meta.entry_q0rg_id
+            || !project.runtime.camera.enabled
+        {
+            return Affine::IDENTITY;
+        }
+        let state = project.camera_world_state_at(frame);
+        if state == project.default_camera_state() {
+            return Affine::IDENTITY;
+        }
+        let Some(remove_affine) = project.camera_affine_at(frame).inverse() else {
+            return Affine::IDENTITY;
+        };
+        let offset = self.camera.target - self.camera.position;
+        let distance = offset.length();
+        if distance <= 1.0e-3 {
+            return Affine::IDENTITY;
+        }
+        let basis = self.camera.view_matrix();
+        let right = V3::new(basis.at(0, 0), basis.at(0, 1), basis.at(0, 2));
+        let down = V3::new(basis.at(1, 0), basis.at(1, 1), basis.at(1, 2));
+        let dx = state.center_x - f32::from(project.meta.stage_width) * 0.5;
+        let dy = state.center_y - f32::from(project.meta.stage_height) * 0.5;
+        let pan = (right * dx + down * dy) * (distance / self.camera.zoom);
+        let position = self.camera.position + pan + offset * (1.0 - state.zoom.recip());
+        let target = self.camera.target + pan;
+        let roll = self.camera.roll + state.rotation.to_degrees();
+        if !position.is_finite() || !target.is_finite() || !roll.is_finite() {
+            return Affine::IDENTITY;
+        }
+        self.camera.position = position;
+        self.camera.target = target;
+        self.camera.roll = roll;
+        if !self.rig.authored {
+            self.rig = LightRig {
+                fog: self.rig.fog,
+                ..LightRig::default_for(&self.camera)
+            };
+        }
+        remove_affine
+    }
+
     /// Walks a timeline's layers in drawing order, saying which have their
     /// flat art lit.
     pub fn flat_cut(&self) -> FlatCut {
@@ -511,6 +562,7 @@ pub fn symbol_plane(
                 &scene_state.rig_overrides,
                 scene_state,
                 None,
+                false,
             )
         });
         Some((

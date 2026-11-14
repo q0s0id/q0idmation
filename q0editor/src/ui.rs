@@ -1,5 +1,6 @@
 //! Small, font-independent controls shared by the editor's working panels.
-use egui::{pos2, vec2, Color32, Painter, Rect, Response, Sense, Shape, Stroke, Ui};
+use egui::epaint::CubicBezierShape;
+use egui::{pos2, vec2, Color32, Painter, Pos2, Rect, Response, Sense, Shape, Stroke, Ui};
 
 pub(crate) const ICON_CONTROL_SIZE: f32 = 26.0;
 
@@ -15,11 +16,13 @@ pub(crate) trait FitToScreen {
 
 impl FitToScreen for egui::Window<'_> {
     fn fit_to_screen(self, ctx: &egui::Context) -> Self {
-        let screen = ctx.screen_rect().size();
+        let screen_rect = ctx.screen_rect();
+        let screen = screen_rect.size();
+        let window = self.constrain_to(screen_rect);
         if screen.x >= MIN_SCREEN_SIZE.x && screen.y >= MIN_SCREEN_SIZE.y {
-            self
+            window
         } else {
-            self.scroll2([true, true])
+            window.scroll2([true, true])
         }
     }
 }
@@ -220,6 +223,8 @@ pub(crate) enum Icon {
     Timeline,
     /// Two chevrons pointing left: put everything back.
     Expand,
+    /// A parent square with two children hanging from it: layer parenting.
+    Parenting,
 }
 
 pub(crate) fn icon_button(ui: &mut Ui, icon: Icon, label: &str) -> Response {
@@ -247,6 +252,215 @@ pub(crate) fn blend(a: Color32, b: Color32, amount: f32) -> Color32 {
         channel(a.g(), b.g()),
         channel(a.b(), b.b()),
     )
+}
+
+/// The theme's chrome gradients as colours, handed from `Theme::apply` to
+/// every widget through the egui context.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Chrome {
+    pub enabled: bool,
+    pub bar: [Color32; 2],
+    pub panel: [Color32; 2],
+    pub hover: [Color32; 2],
+    pub selected: [Color32; 2],
+    pub accent: Color32,
+    pub text: Color32,
+}
+
+impl Chrome {
+    /// The stops when gradients are on, otherwise `flat` top to bottom.
+    pub(crate) fn pick(&self, stops: [Color32; 2], flat: Color32) -> [Color32; 2] {
+        if self.enabled {
+            stops
+        } else {
+            [flat, flat]
+        }
+    }
+}
+
+const CHROME_ID: &str = "q0editor_chrome_gradients";
+
+pub(crate) fn set_chrome(ctx: &egui::Context, chrome: Chrome) {
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new(CHROME_ID), chrome));
+}
+
+pub(crate) fn chrome(ctx: &egui::Context) -> Chrome {
+    ctx.data(|data| data.get_temp(egui::Id::new(CHROME_ID)))
+        .unwrap_or_default()
+}
+
+/// Blend of two premultiplied colours, alpha included.
+fn mix_premultiplied(a: Color32, b: Color32, t: f32) -> Color32 {
+    let channel = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
+    Color32::from_rgba_premultiplied(
+        channel(a.r(), b.r()),
+        channel(a.g(), b.g()),
+        channel(a.b(), b.b()),
+        channel(a.a(), b.a()),
+    )
+}
+
+/// A rounded rectangle fading from `top` to `bottom`, with egui's own soft
+/// edges: the outline is tessellated as usual and then recoloured by height.
+pub(crate) fn gradient_shape(
+    ctx: &egui::Context,
+    rect: Rect,
+    rounding: f32,
+    [top, bottom]: [Color32; 2],
+) -> Shape {
+    if top == bottom || rect.height() <= 0.0 || rect.width() <= 0.0 {
+        return Shape::rect_filled(rect, rounding, top);
+    }
+    let mut outline = Vec::new();
+    egui::epaint::tessellator::path::rounded_rectangle(
+        &mut outline,
+        rect,
+        egui::Rounding::same(rounding),
+    );
+    let mut tessellator = egui::epaint::Tessellator::new(
+        ctx.pixels_per_point(),
+        Default::default(),
+        [1, 1],
+        Vec::new(),
+    );
+    let mut mesh = egui::epaint::Mesh::default();
+    tessellator.tessellate_shape(
+        Shape::convex_polygon(outline, Color32::WHITE, Stroke::NONE),
+        &mut mesh,
+    );
+    for vertex in &mut mesh.vertices {
+        let t = ((vertex.pos.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
+        let coverage = f32::from(vertex.color.a()) / 255.0;
+        vertex.color = mix_premultiplied(top, bottom, t).gamma_multiply(coverage);
+    }
+    Shape::mesh(mesh)
+}
+
+pub(crate) fn paint_gradient(painter: &Painter, rect: Rect, rounding: f32, stops: [Color32; 2]) {
+    painter.add(gradient_shape(painter.ctx(), rect, rounding, stops));
+}
+
+/// Fills a bar (the menu bar, the document tabs) with the theme's bar
+/// gradient. Call it first thing inside a top or bottom panel with egui's
+/// default frame: the panel is its content plus that frame's margin (the
+/// clip rect is not the panel, it reaches over the panels above).
+pub(crate) fn paint_bar(ui: &Ui) {
+    let chrome = chrome(ui.ctx());
+    if chrome.enabled {
+        let margin = egui::Frame::side_top_panel(ui.style()).inner_margin;
+        let content = ui.max_rect();
+        let panel = Rect::from_min_max(
+            content.min - vec2(margin.left, margin.top),
+            content.max + vec2(margin.right, margin.bottom),
+        );
+        paint_gradient(ui.painter(), panel, 0.0, chrome.bar);
+    }
+}
+
+/// Height of the dock's tab strips; `workspace` sets the dock style from it.
+pub(crate) const TAB_BAR_HEIGHT: f32 = 26.0;
+
+const TAB_BARS_ID: &str = "q0editor_tab_bars";
+
+/// Called first thing inside a docked panel: paints the panel gradient
+/// behind its contents (unless `body` is false) and notes where its tab
+/// strip is, for `paint_tab_bars`.
+pub(crate) fn panel_backdrop(ui: &Ui, body: bool) {
+    let chrome = chrome(ui.ctx());
+    if !chrome.enabled {
+        return;
+    }
+    let rect = ui.clip_rect();
+    if body {
+        paint_gradient(ui.painter(), rect, 0.0, chrome.panel);
+    }
+    let bar = Rect::from_min_max(
+        pos2(rect.left(), rect.top() - TAB_BAR_HEIGHT),
+        pos2(rect.right(), rect.top()),
+    );
+    let layer = ui.layer_id();
+    ui.ctx().data_mut(|data| {
+        data.get_temp_mut_or_default::<Vec<(egui::LayerId, Rect)>>(egui::Id::new(TAB_BARS_ID))
+            .push((layer, bar));
+    });
+}
+
+/// Fills `slot`, reserved on `ui`'s layer before the dock drew, with this
+/// frame's tab strips, so they sit under the tabs.
+pub(crate) fn paint_tab_bars(ui: &Ui, slot: egui::layers::ShapeIdx) {
+    let bars: Vec<(egui::LayerId, Rect)> = ui
+        .ctx()
+        .data_mut(|data| data.remove_temp(egui::Id::new(TAB_BARS_ID)))
+        .unwrap_or_default();
+    let chrome = chrome(ui.ctx());
+    if !chrome.enabled {
+        return;
+    }
+    let shapes = bars
+        .into_iter()
+        .filter(|(layer, _)| *layer == ui.layer_id())
+        .map(|(_, rect)| gradient_shape(ui.ctx(), rect, 0.0, chrome.bar))
+        .collect();
+    ui.painter().set(slot, Shape::Vec(shapes));
+}
+
+/// The soft gradient a button wears: the selection, or the hover at
+/// `strength` (0…1, eased in and out by the caller).
+fn paint_button_surface(ui: &Ui, rect: Rect, rounding: f32, selected: bool, strength: f32) {
+    let chrome = chrome(ui.ctx());
+    if selected {
+        let stops = chrome.pick(chrome.selected, ui.visuals().selection.bg_fill);
+        paint_gradient(ui.painter(), rect, rounding, stops);
+        // A hairline of light along the top edge, and the accent around it.
+        let accent = if chrome.accent == Color32::TRANSPARENT {
+            ui.visuals().selection.bg_fill
+        } else {
+            chrome.accent
+        };
+        ui.painter().rect_stroke(
+            rect,
+            rounding,
+            Stroke::new(1.0_f32, accent.gamma_multiply(0.7)),
+        );
+        ui.painter().line_segment(
+            [
+                pos2(rect.left() + rounding, rect.top() + 1.0),
+                pos2(rect.right() - rounding, rect.top() + 1.0),
+            ],
+            Stroke::new(1.0_f32, Color32::from_white_alpha(28)),
+        );
+    } else if strength > 0.0 {
+        let [top, bottom] = chrome.pick(chrome.hover, ui.visuals().widgets.hovered.weak_bg_fill);
+        paint_gradient(
+            ui.painter(),
+            rect,
+            rounding,
+            [
+                top.gamma_multiply(strength),
+                bottom.gamma_multiply(strength),
+            ],
+        );
+    }
+}
+
+/// 0…1: how lit a control is, eased so the pointer passing over a row of
+/// buttons leaves a short glow instead of a blink.
+pub(crate) fn hover_strength(ui: &Ui, response: &Response) -> f32 {
+    let lit = response.hovered() || response.has_focus() || response.is_pointer_button_down_on();
+    ui.ctx()
+        .animate_bool_with_time(response.id.with("lit"), lit, 0.12)
+}
+
+/// A tool or icon button's surface: selection gradient, or the eased hover.
+pub(crate) fn paint_control(
+    ui: &Ui,
+    response: &Response,
+    rect: Rect,
+    rounding: f32,
+    selected: bool,
+) {
+    let strength = hover_strength(ui, response);
+    paint_button_surface(ui, rect, rounding, selected, strength);
 }
 
 pub(crate) fn icon_button_enabled(ui: &mut Ui, enabled: bool, icon: Icon, label: &str) -> Response {
@@ -294,29 +508,32 @@ fn icon_control_sized(ui: &mut Ui, icon: Icon, label: &str, selected: bool, size
     let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::click());
     response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, selected, label));
     if ui.is_rect_visible(rect) {
-        let visuals = ui.style().interact_selectable(&response, selected);
-        let fill = if selected {
-            ui.visuals().selection.bg_fill
-        } else {
-            visuals.weak_bg_fill
-        };
-        ui.painter()
-            .rect(rect.shrink(0.5), 4.0, fill, visuals.bg_stroke);
+        let rounding = (size * 0.24).round();
+        let body = rect.shrink(1.0);
+        paint_control(ui, &response, body, rounding, selected);
         let color = if selected {
             ui.visuals().selection.stroke.color
+        } else if response.hovered() {
+            ui.visuals().widgets.hovered.fg_stroke.color
         } else {
-            visuals.fg_stroke.color
+            ui.style().interact(&response).fg_stroke.color
         };
         let glyph = size * 16.0 / ICON_CONTROL_SIZE;
+        // A pressed button sinks by half a point.
+        let sink = if response.is_pointer_button_down_on() {
+            vec2(0.0, 0.5)
+        } else {
+            egui::Vec2::ZERO
+        };
         paint_icon(
             ui.painter(),
-            Rect::from_center_size(rect.center(), vec2(glyph, glyph)),
+            Rect::from_center_size(rect.center() + sink, vec2(glyph, glyph)),
             icon,
             color,
         );
         if response.has_focus() {
             ui.painter()
-                .rect_stroke(rect.shrink(0.5), 4.0, ui.visuals().selection.stroke);
+                .rect_stroke(body, rounding, ui.visuals().selection.stroke);
         }
     }
     response
@@ -523,6 +740,9 @@ pub(crate) fn clipped_label(
     );
 }
 
+/// The editor's icons: one colour in two strengths, an outline over a soft
+/// fill of the same colour, with round line ends. They are drawn on a unit
+/// square, so they stay sharp at any size.
 pub(crate) fn paint_icon(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
     let p = |x: f32, y: f32| {
         pos2(
@@ -530,266 +750,418 @@ pub(crate) fn paint_icon(painter: &Painter, rect: Rect, icon: Icon, color: Color
             rect.top() + y * rect.height(),
         )
     };
-    let r = |x0, y0, x1, y1| Rect::from_min_max(p(x0, y0), p(x1, y1));
-    let stroke = Stroke::new(1.45_f32, color);
-    let line = |a: (f32, f32), b: (f32, f32)| {
-        painter.line_segment([p(a.0, a.1), p(b.0, b.1)], stroke);
+    let r = |x0: f32, y0: f32, x1: f32, y1: f32| Rect::from_min_max(p(x0, y0), p(x1, y1));
+    let unit = rect.width().min(rect.height());
+    let width = (unit * 0.095).clamp(1.25, 2.6);
+    let stroke = Stroke::new(width, color);
+    let thin = Stroke::new(width * 0.75, color);
+    let tint = color.gamma_multiply(0.30);
+    let cap = |at: Pos2| {
+        painter.circle_filled(at, width * 0.5, color);
     };
+    // An open stroke with round ends.
     let path = |points: &[(f32, f32)]| {
-        painter.add(Shape::line(
-            points.iter().map(|(x, y)| p(*x, *y)).collect(),
+        let points: Vec<Pos2> = points.iter().map(|&(x, y)| p(x, y)).collect();
+        if let (Some(first), Some(last)) = (points.first(), points.last()) {
+            cap(*first);
+            cap(*last);
+        }
+        painter.add(Shape::line(points, stroke));
+    };
+    let line = |a: (f32, f32), b: (f32, f32)| path(&[a, b]);
+    // A closed outline over a soft fill: the body of most icons.
+    let body = |points: &[(f32, f32)]| {
+        painter.add(Shape::convex_polygon(
+            points.iter().map(|&(x, y)| p(x, y)).collect(),
+            tint,
             stroke,
         ));
     };
-    let polygon = |points: &[(f32, f32)]| {
+    let solid = |points: &[(f32, f32)]| {
         painter.add(Shape::convex_polygon(
-            points.iter().map(|(x, y)| p(*x, *y)).collect(),
+            points.iter().map(|&(x, y)| p(x, y)).collect(),
             color,
             Stroke::NONE,
         ));
     };
+    let dot = |x: f32, y: f32, radius: f32| painter.circle_filled(p(x, y), unit * radius, color);
+    let ring = |x: f32, y: f32, radius: f32| painter.circle(p(x, y), unit * radius, tint, stroke);
+    let card = |rect: Rect| painter.rect(rect, unit * 0.08, tint, stroke);
+    // The small "+" in the lower right of the "new ..." icons.
     let plus = || {
-        line((0.72, 0.60), (0.72, 0.96));
-        line((0.54, 0.78), (0.90, 0.78));
+        line((0.78, 0.63), (0.78, 0.93));
+        line((0.63, 0.78), (0.93, 0.78));
     };
     match icon {
         Icon::Add => {
-            line((0.5, 0.15), (0.5, 0.85));
-            line((0.15, 0.5), (0.85, 0.5));
+            line((0.5, 0.2), (0.5, 0.8));
+            line((0.2, 0.5), (0.8, 0.5));
         }
         Icon::Close => {
-            line((0.22, 0.22), (0.78, 0.78));
-            line((0.78, 0.22), (0.22, 0.78));
+            line((0.28, 0.28), (0.72, 0.72));
+            line((0.72, 0.28), (0.28, 0.72));
         }
-        Icon::Check => path(&[(0.13, 0.50), (0.39, 0.76), (0.88, 0.23)]),
+        Icon::Check => path(&[(0.18, 0.52), (0.41, 0.74), (0.82, 0.28)]),
         Icon::Rename => {
-            path(&[
-                (0.13, 0.68),
-                (0.66, 0.15),
-                (0.85, 0.34),
-                (0.32, 0.87),
-                (0.10, 0.90),
-                (0.13, 0.68),
-            ]);
-            line((0.55, 0.26), (0.74, 0.45));
+            body(&[(0.30, 0.56), (0.62, 0.24), (0.80, 0.42), (0.48, 0.74)]);
+            solid(&[(0.27, 0.59), (0.45, 0.77), (0.15, 0.87)]);
+            line((0.55, 0.31), (0.73, 0.49));
         }
         Icon::Delete => {
-            line((0.14, 0.25), (0.86, 0.25));
-            path(&[(0.27, 0.27), (0.31, 0.88), (0.69, 0.88), (0.73, 0.27)]);
-            path(&[(0.36, 0.24), (0.36, 0.10), (0.64, 0.10), (0.64, 0.24)]);
-            line((0.43, 0.40), (0.43, 0.73));
-            line((0.57, 0.40), (0.57, 0.73));
+            line((0.16, 0.27), (0.84, 0.27));
+            path(&[(0.39, 0.26), (0.42, 0.15), (0.58, 0.15), (0.61, 0.26)]);
+            body(&[(0.25, 0.35), (0.75, 0.35), (0.70, 0.86), (0.30, 0.86)]);
+            line((0.43, 0.48), (0.43, 0.73));
+            line((0.57, 0.48), (0.57, 0.73));
         }
         Icon::Import => {
-            path(&[(0.16, 0.60), (0.16, 0.87), (0.84, 0.87), (0.84, 0.60)]);
-            line((0.5, 0.10), (0.5, 0.65));
-            path(&[(0.29, 0.43), (0.5, 0.65), (0.71, 0.43)]);
+            painter.rect_filled(r(0.14, 0.66, 0.86, 0.84), 0.0, tint);
+            path(&[(0.14, 0.58), (0.14, 0.84), (0.86, 0.84), (0.86, 0.58)]);
+            line((0.5, 0.14), (0.5, 0.62));
+            path(&[(0.32, 0.45), (0.5, 0.63), (0.68, 0.45)]);
         }
         Icon::Home => {
-            path(&[(0.10, 0.43), (0.50, 0.12), (0.90, 0.43)]);
-            path(&[(0.23, 0.38), (0.23, 0.86), (0.77, 0.86), (0.77, 0.38)]);
-            path(&[(0.42, 0.85), (0.42, 0.58), (0.59, 0.58), (0.59, 0.85)]);
+            body(&[
+                (0.16, 0.46),
+                (0.5, 0.16),
+                (0.84, 0.46),
+                (0.84, 0.86),
+                (0.16, 0.86),
+            ]);
+            painter.rect_filled(r(0.42, 0.60, 0.58, 0.86), unit * 0.03, color);
         }
         Icon::Grip => {
-            for x in [0.35, 0.65] {
-                for y in [0.24, 0.5, 0.76] {
-                    painter.circle_filled(p(x, y), 1.2, color);
+            for x in [0.36, 0.64] {
+                for y in [0.26, 0.5, 0.74] {
+                    dot(x, y, 0.075);
                 }
             }
         }
         Icon::Search => {
-            painter.circle_stroke(p(0.40, 0.40), rect.width() * 0.27, stroke);
-            line((0.60, 0.60), (0.88, 0.88));
+            ring(0.43, 0.43, 0.25);
+            let heavy = Stroke::new(width * 1.5, color);
+            painter.line_segment([p(0.62, 0.62), p(0.84, 0.84)], heavy);
+            painter.circle_filled(p(0.84, 0.84), width * 0.75, color);
         }
         Icon::Camera => {
-            painter.rect_stroke(r(0.06, 0.24, 0.65, 0.76), 1.5, stroke);
-            polygon(&[(0.68, 0.36), (0.95, 0.22), (0.95, 0.78), (0.68, 0.64)]);
+            card(r(0.08, 0.28, 0.64, 0.74));
+            solid(&[(0.68, 0.44), (0.92, 0.30), (0.92, 0.72), (0.68, 0.58)]);
+            dot(0.22, 0.40, 0.05);
         }
-        Icon::Play => polygon(&[(0.26, 0.13), (0.85, 0.5), (0.26, 0.87)]),
+        Icon::Play => solid(&[(0.30, 0.17), (0.84, 0.5), (0.30, 0.83)]),
         Icon::Pause => {
-            painter.rect_filled(r(0.24, 0.16, 0.40, 0.84), 1.0, color);
-            painter.rect_filled(r(0.60, 0.16, 0.76, 0.84), 1.0, color);
+            painter.rect_filled(r(0.26, 0.18, 0.42, 0.82), unit * 0.05, color);
+            painter.rect_filled(r(0.58, 0.18, 0.74, 0.82), unit * 0.05, color);
         }
-        Icon::Previous | Icon::Back => path(&[(0.68, 0.18), (0.30, 0.50), (0.68, 0.82)]),
-        Icon::Next => path(&[(0.32, 0.18), (0.70, 0.50), (0.32, 0.82)]),
+        Icon::Previous | Icon::Back => path(&[(0.62, 0.20), (0.34, 0.5), (0.62, 0.80)]),
+        Icon::Next => path(&[(0.38, 0.20), (0.66, 0.5), (0.38, 0.80)]),
         Icon::First => {
-            line((0.20, 0.16), (0.20, 0.84));
-            path(&[(0.76, 0.19), (0.38, 0.50), (0.76, 0.81)]);
+            line((0.24, 0.20), (0.24, 0.80));
+            solid(&[(0.78, 0.20), (0.36, 0.5), (0.78, 0.80)]);
         }
         Icon::Last => {
-            line((0.80, 0.16), (0.80, 0.84));
-            path(&[(0.24, 0.19), (0.62, 0.50), (0.24, 0.81)]);
+            line((0.76, 0.20), (0.76, 0.80));
+            solid(&[(0.22, 0.20), (0.64, 0.5), (0.22, 0.80)]);
         }
         Icon::Onion => {
-            painter.circle_stroke(
-                p(0.35, 0.5),
-                rect.width() * 0.26,
-                Stroke::new(1.1_f32, color.gamma_multiply(0.5)),
+            painter.circle(
+                p(0.37, 0.5),
+                unit * 0.27,
+                tint,
+                Stroke::new(width * 0.8, color.gamma_multiply(0.5)),
             );
-            painter.circle_stroke(p(0.64, 0.5), rect.width() * 0.26, stroke);
+            painter.circle_stroke(p(0.63, 0.5), unit * 0.27, stroke);
         }
         Icon::Layer => {
-            path(&[
-                (0.14, 0.25),
-                (0.50, 0.10),
-                (0.86, 0.25),
-                (0.50, 0.42),
-                (0.14, 0.25),
-            ]);
-            path(&[(0.14, 0.42), (0.50, 0.59), (0.78, 0.47)]);
+            body(&[(0.10, 0.34), (0.46, 0.16), (0.82, 0.34), (0.46, 0.52)]);
+            path(&[(0.10, 0.50), (0.46, 0.68), (0.58, 0.62)]);
             plus();
         }
         Icon::Folder => {
+            painter.add(Shape::convex_polygon(
+                [
+                    (0.10, 0.34),
+                    (0.88, 0.34),
+                    (0.88, 0.56),
+                    (0.62, 0.80),
+                    (0.10, 0.80),
+                ]
+                .iter()
+                .map(|&(x, y)| p(x, y))
+                .collect(),
+                tint,
+                Stroke::NONE,
+            ));
             path(&[
-                (0.08, 0.75),
-                (0.08, 0.20),
-                (0.36, 0.20),
-                (0.47, 0.35),
-                (0.89, 0.35),
-                (0.89, 0.55),
+                (0.60, 0.80),
+                (0.10, 0.80),
+                (0.10, 0.22),
+                (0.36, 0.22),
+                (0.45, 0.34),
+                (0.88, 0.34),
+                (0.88, 0.58),
             ]);
-            line((0.08, 0.75), (0.41, 0.75));
             plus();
         }
         Icon::Mask => {
-            painter.circle_stroke(p(0.35, 0.39), rect.width() * 0.26, stroke);
-            painter.rect_stroke(r(0.32, 0.25, 0.77, 0.70), 1.0, stroke);
+            ring(0.36, 0.40, 0.24);
+            painter.rect_stroke(r(0.34, 0.24, 0.74, 0.62), unit * 0.06, stroke);
             plus();
         }
         Icon::Symbol => {
-            path(&[
-                (0.44, 0.09),
-                (0.79, 0.39),
-                (0.44, 0.69),
-                (0.09, 0.39),
-                (0.44, 0.09),
-            ]);
+            body(&[(0.42, 0.10), (0.74, 0.42), (0.42, 0.74), (0.10, 0.42)]);
             plus();
         }
         Icon::Frame | Icon::Keyframe | Icon::BlankKeyframe => {
-            painter.rect_stroke(r(0.12, 0.16, 0.77, 0.64), 1.0, stroke);
-            if icon == Icon::Keyframe {
-                painter.circle_filled(p(0.36, 0.40), 2.0, color);
-            } else if icon == Icon::BlankKeyframe {
-                painter.circle_stroke(p(0.36, 0.40), 2.0, stroke);
-            } else {
-                line((0.30, 0.46), (0.56, 0.46));
+            card(r(0.10, 0.18, 0.66, 0.66));
+            match icon {
+                Icon::Keyframe => {
+                    dot(0.38, 0.42, 0.10);
+                }
+                Icon::BlankKeyframe => {
+                    painter.circle_stroke(p(0.38, 0.42), unit * 0.10, stroke);
+                }
+                _ => line((0.27, 0.42), (0.49, 0.42)),
             }
             plus();
         }
         Icon::RemoveFrames | Icon::RemoveColumns => {
-            painter.rect_stroke(r(0.12, 0.15, 0.88, 0.65), 1.0, stroke);
+            card(r(0.10, 0.16, 0.90, 0.62));
             if icon == Icon::RemoveColumns {
-                line((0.38, 0.15), (0.38, 0.65));
-                line((0.63, 0.15), (0.63, 0.65));
+                painter.line_segment([p(0.37, 0.16), p(0.37, 0.62)], thin);
+                painter.line_segment([p(0.63, 0.16), p(0.63, 0.62)], thin);
             }
-            line((0.30, 0.86), (0.72, 0.86));
+            line((0.32, 0.83), (0.68, 0.83));
         }
         Icon::Tween => {
-            painter.circle_filled(p(0.13, 0.50), 1.9, color);
-            painter.circle_stroke(p(0.88, 0.50), 1.9, stroke);
-            line((0.28, 0.50), (0.70, 0.50));
-            path(&[(0.53, 0.30), (0.73, 0.50), (0.53, 0.70)]);
+            dot(0.15, 0.5, 0.10);
+            painter.circle_stroke(p(0.85, 0.5), unit * 0.10, stroke);
+            line((0.31, 0.5), (0.66, 0.5));
+            path(&[(0.54, 0.37), (0.67, 0.5), (0.54, 0.63)]);
         }
         Icon::ShapeTween => {
-            // A square becoming a circle.
-            painter.rect_filled(r(0.02, 0.36, 0.26, 0.64), 0.0, color);
-            painter.circle_stroke(p(0.86, 0.50), 2.4, stroke);
-            line((0.36, 0.50), (0.66, 0.50));
-            path(&[(0.52, 0.33), (0.69, 0.50), (0.52, 0.67)]);
+            painter.rect_filled(r(0.05, 0.38, 0.27, 0.62), unit * 0.03, color);
+            painter.circle(p(0.84, 0.5), unit * 0.12, tint, stroke);
+            line((0.36, 0.5), (0.61, 0.5));
+            path(&[(0.50, 0.38), (0.62, 0.5), (0.50, 0.62)]);
         }
         Icon::Up => {
-            line((0.50, 0.85), (0.50, 0.15));
-            path(&[(0.25, 0.40), (0.50, 0.15), (0.75, 0.40)]);
+            line((0.5, 0.82), (0.5, 0.20));
+            path(&[(0.27, 0.43), (0.5, 0.20), (0.73, 0.43)]);
         }
         Icon::Down => {
-            line((0.50, 0.15), (0.50, 0.85));
-            path(&[(0.25, 0.60), (0.50, 0.85), (0.75, 0.60)]);
+            line((0.5, 0.18), (0.5, 0.80));
+            path(&[(0.27, 0.57), (0.5, 0.80), (0.73, 0.57)]);
         }
         Icon::Indent => {
-            line((0.10, 0.16), (0.10, 0.84));
-            line((0.24, 0.50), (0.87, 0.50));
-            path(&[(0.63, 0.26), (0.87, 0.50), (0.63, 0.74)]);
+            line((0.14, 0.18), (0.14, 0.82));
+            line((0.30, 0.5), (0.84, 0.5));
+            path(&[(0.64, 0.30), (0.84, 0.5), (0.64, 0.70)]);
         }
         Icon::Outdent => {
-            line((0.90, 0.16), (0.90, 0.84));
-            line((0.13, 0.50), (0.76, 0.50));
-            path(&[(0.37, 0.26), (0.13, 0.50), (0.37, 0.74)]);
+            line((0.86, 0.18), (0.86, 0.82));
+            line((0.16, 0.5), (0.70, 0.5));
+            path(&[(0.36, 0.30), (0.16, 0.5), (0.36, 0.70)]);
         }
         Icon::Fit => {
-            path(&[(0.12, 0.36), (0.12, 0.12), (0.36, 0.12)]);
-            path(&[(0.64, 0.12), (0.88, 0.12), (0.88, 0.36)]);
-            path(&[(0.88, 0.64), (0.88, 0.88), (0.64, 0.88)]);
-            path(&[(0.36, 0.88), (0.12, 0.88), (0.12, 0.64)]);
+            painter.rect_filled(r(0.32, 0.32, 0.68, 0.68), unit * 0.06, tint);
+            path(&[(0.14, 0.36), (0.14, 0.14), (0.36, 0.14)]);
+            path(&[(0.64, 0.14), (0.86, 0.14), (0.86, 0.36)]);
+            path(&[(0.86, 0.64), (0.86, 0.86), (0.64, 0.86)]);
+            path(&[(0.36, 0.86), (0.14, 0.86), (0.14, 0.64)]);
         }
         Icon::Menu => {
-            for y in [0.26, 0.5, 0.74] {
-                line((0.16, y), (0.84, y));
+            for y in [0.28, 0.5, 0.72] {
+                line((0.2, y), (0.8, y));
             }
         }
         Icon::Record => {
-            painter.circle_filled(p(0.5, 0.5), rect.width() * 0.3, color);
+            painter.circle_filled(p(0.5, 0.5), unit * 0.36, tint);
+            dot(0.5, 0.5, 0.22);
         }
-        Icon::Undo => {
-            path(&[
-                (0.84, 0.82),
-                (0.84, 0.58),
-                (0.74, 0.43),
-                (0.58, 0.37),
-                (0.18, 0.37),
-            ]);
-            path(&[(0.36, 0.19), (0.18, 0.37), (0.36, 0.55)]);
-        }
-        Icon::Redo => {
-            path(&[
-                (0.16, 0.82),
-                (0.16, 0.58),
-                (0.26, 0.43),
-                (0.42, 0.37),
-                (0.82, 0.37),
-            ]);
-            path(&[(0.64, 0.19), (0.82, 0.37), (0.64, 0.55)]);
+        Icon::Undo | Icon::Redo => {
+            // A hook bending back to its arrowhead; redo is its mirror.
+            let x = |x: f32| if icon == Icon::Undo { x } else { 1.0 - x };
+            painter.add(CubicBezierShape::from_points_stroke(
+                [
+                    p(x(0.80), 0.82),
+                    p(x(0.82), 0.46),
+                    p(x(0.62), 0.38),
+                    p(x(0.26), 0.38),
+                ],
+                false,
+                Color32::TRANSPARENT,
+                stroke,
+            ));
+            cap(p(x(0.80), 0.82));
+            path(&[(x(0.40), 0.21), (x(0.23), 0.38), (x(0.40), 0.55)]);
         }
         Icon::Properties => {
-            for (y, knob) in [(0.24, 0.34), (0.5, 0.66), (0.76, 0.44)] {
-                line((0.12, y), (0.88, y));
-                painter.circle_filled(p(knob, y), rect.width() * 0.09, color);
+            for (y, knob) in [(0.26, 0.34), (0.5, 0.66), (0.74, 0.42)] {
+                line((0.14, y), (0.86, y));
+                painter.circle(p(knob, y), unit * 0.10, color, Stroke::NONE);
             }
         }
         Icon::Library => {
             // Three books, the last leaning on the others.
-            painter.rect_stroke(r(0.12, 0.2, 0.3, 0.86), 1.0, stroke);
-            painter.rect_stroke(r(0.36, 0.12, 0.54, 0.86), 1.0, stroke);
-            path(&[
-                (0.6, 0.3),
-                (0.76, 0.24),
-                (0.92, 0.82),
-                (0.76, 0.88),
-                (0.6, 0.3),
-            ]);
-            line((0.12, 0.34), (0.3, 0.34));
-            line((0.36, 0.26), (0.54, 0.26));
+            body(&[(0.12, 0.20), (0.30, 0.20), (0.30, 0.84), (0.12, 0.84)]);
+            body(&[(0.36, 0.14), (0.54, 0.14), (0.54, 0.84), (0.36, 0.84)]);
+            body(&[(0.60, 0.30), (0.76, 0.24), (0.92, 0.80), (0.76, 0.86)]);
+            painter.line_segment([p(0.12, 0.34), p(0.30, 0.34)], thin);
+            painter.line_segment([p(0.36, 0.28), p(0.54, 0.28)], thin);
         }
-        Icon::Tools => polygon(&[
-            (0.28, 0.1),
-            (0.28, 0.8),
-            (0.46, 0.62),
-            (0.6, 0.9),
-            (0.7, 0.85),
-            (0.56, 0.58),
-            (0.8, 0.56),
-        ]),
+        Icon::Tools => {
+            body(&[(0.26, 0.10), (0.26, 0.76), (0.74, 0.56)]);
+            let tail = Stroke::new(unit * 0.12, color);
+            painter.line_segment([p(0.46, 0.64), p(0.58, 0.88)], tail);
+            painter.circle_filled(p(0.58, 0.88), unit * 0.06, color);
+        }
         Icon::Timeline => {
-            painter.rect_stroke(r(0.08, 0.3, 0.92, 0.7), 1.0, stroke);
-            for x in [0.29, 0.5, 0.71] {
-                line((x, 0.3), (x, 0.7));
+            card(r(0.06, 0.30, 0.94, 0.70));
+            for x in [0.28, 0.5, 0.72] {
+                painter.line_segment([p(x, 0.30), p(x, 0.70)], thin);
             }
-            painter.circle_filled(p(0.185, 0.5), rect.width() * 0.07, color);
-            line((0.6, 0.1), (0.6, 0.9));
+            dot(0.17, 0.5, 0.07);
+            painter.line_segment([p(0.62, 0.16), p(0.62, 0.88)], stroke);
+            solid(&[(0.52, 0.08), (0.72, 0.08), (0.62, 0.20)]);
         }
         Icon::Expand => {
-            path(&[(0.5, 0.22), (0.22, 0.5), (0.5, 0.78)]);
-            path(&[(0.8, 0.22), (0.52, 0.5), (0.8, 0.78)]);
+            path(&[(0.48, 0.22), (0.22, 0.5), (0.48, 0.78)]);
+            path(&[(0.78, 0.22), (0.52, 0.5), (0.78, 0.78)]);
         }
+        Icon::Parenting => {
+            painter.rect(r(0.12, 0.10, 0.40, 0.34), unit * 0.05, tint, stroke);
+            painter.rect(r(0.60, 0.40, 0.88, 0.62), unit * 0.05, tint, stroke);
+            painter.rect(r(0.60, 0.70, 0.88, 0.92), unit * 0.05, tint, stroke);
+            path(&[(0.26, 0.36), (0.26, 0.81), (0.58, 0.81)]);
+            line((0.26, 0.51), (0.58, 0.51));
+        }
+    }
+}
+
+/// The theme editor's gradient section: every stop of every surface, a
+/// preview of each, and a way back to the theme's own.
+pub(crate) fn gradient_editor(ui: &mut Ui, theme: &mut crate::settings::Theme) {
+    use crate::settings::{ColorRgb, GradientStops};
+    let pinned = theme.gradients.is_some();
+    let mut gradients = theme.gradients();
+    let before = gradients;
+    let dim = theme.text_dim.to_color32();
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut gradients.enabled, "Paint gradients");
+        ui.label(
+            egui::RichText::new(if pinned {
+                "your own stops"
+            } else {
+                "following the colours above"
+            })
+            .small()
+            .color(dim),
+        );
+    });
+    let edit = |ui: &mut Ui, color: &mut ColorRgb| {
+        let mut c = [color.r, color.g, color.b];
+        if crate::color_picker::color_edit_button_srgb(ui, &mut c).changed() {
+            *color = ColorRgb::new(c[0], c[1], c[2]);
+        }
+    };
+    ui.add_enabled_ui(gradients.enabled, |ui| {
+        egui::Grid::new("editor_theme_gradients")
+            .num_columns(2)
+            .spacing([10.0, 6.0])
+            .show(ui, |ui| {
+                let rows: [(&str, &str, &mut GradientStops); 4] = [
+                    (
+                        "Bars",
+                        "The menu bar, the document tabs and every panel's tab strip.",
+                        &mut gradients.bar,
+                    ),
+                    (
+                        "Panels",
+                        "Behind each panel's contents. The stage keeps its canvas colour.",
+                        &mut gradients.panel,
+                    ),
+                    (
+                        "Hover",
+                        "A tool or icon button under the pointer.",
+                        &mut gradients.hover,
+                    ),
+                    (
+                        "Selected",
+                        "The chosen tool and the toggles that are on.",
+                        &mut gradients.selected,
+                    ),
+                ];
+                for (label, hint, stops) in rows {
+                    ui.label(label).on_hover_text(hint);
+                    ui.horizontal(|ui| {
+                        edit(ui, &mut stops.top);
+                        let (preview, _) = ui.allocate_exact_size(vec2(72.0, 20.0), Sense::hover());
+                        paint_gradient(ui.painter(), preview, 4.0, stops.to_color32());
+                        ui.painter().rect_stroke(
+                            preview,
+                            4.0,
+                            Stroke::new(
+                                1.0_f32,
+                                ui.visuals().widgets.noninteractive.bg_stroke.color,
+                            ),
+                        );
+                        edit(ui, &mut stops.bottom);
+                        if ui
+                            .small_button("⇅")
+                            .on_hover_text("Swap the top and bottom colours")
+                            .clicked()
+                        {
+                            std::mem::swap(&mut stops.top, &mut stops.bottom);
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+    });
+    let mut follow = false;
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .add_enabled(pinned, egui::Button::new("Follow the colours"))
+            .on_hover_text("Forget these stops: the gradients follow the base colours again")
+            .clicked()
+        {
+            follow = true;
+        }
+        fn surfaces(gradients: &mut crate::settings::ThemeGradients) -> [&mut GradientStops; 4] {
+            [
+                &mut gradients.bar,
+                &mut gradients.panel,
+                &mut gradients.hover,
+                &mut gradients.selected,
+            ]
+        }
+        if ui
+            .button("Softer")
+            .on_hover_text("Bring each pair of stops closer together")
+            .clicked()
+        {
+            for stops in surfaces(&mut gradients) {
+                let (top, bottom) = (stops.top, stops.bottom);
+                stops.top = crate::settings::blend(top, bottom, 0.25);
+                stops.bottom = crate::settings::blend(bottom, top, 0.25);
+            }
+        }
+        if ui
+            .button("Stronger")
+            .on_hover_text("Push each pair of stops further apart")
+            .clicked()
+        {
+            for stops in surfaces(&mut gradients) {
+                let middle = crate::settings::blend(stops.top, stops.bottom, 0.5);
+                stops.top = crate::settings::blend(middle, stops.top, 1.35);
+                stops.bottom = crate::settings::blend(middle, stops.bottom, 1.35);
+            }
+        }
+    });
+    if follow {
+        theme.gradients = None;
+    } else if gradients != before {
+        theme.gradients = Some(gradients);
     }
 }

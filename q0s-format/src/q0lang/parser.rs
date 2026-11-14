@@ -217,7 +217,18 @@ pub const BUILTIN_LIBRARIES: &[BuiltinLibrary] = &[
     },
     BuiltinLibrary {
         name: "q0.timeline",
-        symbols: &["gorun!", "gostop!", "frame", "label"],
+        symbols: &[
+            "gorun!",
+            "gostop!",
+            "stop!",
+            "play!",
+            "gonext!",
+            "goprev!",
+            "rootrun!",
+            "rootstop!",
+            "frame",
+            "label",
+        ],
     },
     BuiltinLibrary {
         name: "q0.input",
@@ -354,6 +365,7 @@ pub const BUILTIN_LIBRARIES: &[BuiltinLibrary] = &[
             "q0window.minimize!",
             "q0window.perf!",
             "q0window.quit!",
+            "q0window.background!",
             "window.x",
             "window.y",
             "window.width",
@@ -362,6 +374,26 @@ pub const BUILTIN_LIBRARIES: &[BuiltinLibrary] = &[
             "window.ui",
             "screen.width",
             "screen.height",
+        ],
+    },
+    BuiltinLibrary {
+        // The app around the movie: who it is, where it keeps its saves.
+        // Commands travel the window channel as `app.<name>`.
+        name: "q0.app",
+        symbols: &[
+            "q0app.save!",
+            "q0app.forget!",
+            "q0app.open!",
+            "q0app.log!",
+            "app.name",
+            "app.id",
+            "app.version",
+            "app.author",
+            "app.platform",
+            "app.packaged",
+            "app.debug",
+            "app.args",
+            "save",
         ],
     },
     BuiltinLibrary {
@@ -389,6 +421,13 @@ pub const HOST_FUNCTIONS: &[(&str, usize)] = &[
 pub fn is_host_function_name(name: &str) -> bool {
     name.starts_with("q0layer.")
 }
+
+/// `q0app.save!` and friends ride the window channel as `app.save`.
+/// `rootrun!` and `rootstop!` on the window channel.
+pub const ROOT_RUN: &str = "root.run";
+pub const ROOT_STOP: &str = "root.stop";
+
+pub const APP_COMMAND_PREFIX: &str = "app.";
 
 pub fn parse(src: &str) -> Program {
     Parser::new(src).parse_program()
@@ -424,6 +463,7 @@ enum HostCommandKind {
     Light,
     Layer,
     Window,
+    App,
 }
 
 struct Parser<'a> {
@@ -505,6 +545,53 @@ impl<'a> Parser<'a> {
             "import" => self.parse_import(line_no, &parts),
             "gorun!" => self.parse_timeline(line_no, TimelineSignal::GoRun, &line, &parts),
             "gostop!" => self.parse_timeline(line_no, TimelineSignal::GoStop, &line, &parts),
+            // Flash's stop(), play(), nextFrame() and prevFrame().
+            "stop!" | "play!" | "gonext!" | "goprev!" => {
+                if parts.len() > 1 {
+                    self.diagnostics.push(Diagnostic {
+                        line: line_no,
+                        message: format!("`{first}` takes no target"),
+                    });
+                }
+                let (kind, target) = match first {
+                    "stop!" => (
+                        TimelineSignal::GoStop,
+                        crate::q0lang::runtime::TIMELINE_HERE,
+                    ),
+                    "play!" => (TimelineSignal::GoRun, crate::q0lang::runtime::TIMELINE_HERE),
+                    "gonext!" => (
+                        TimelineSignal::GoStop,
+                        crate::q0lang::runtime::TIMELINE_NEXT,
+                    ),
+                    _ => (
+                        TimelineSignal::GoStop,
+                        crate::q0lang::runtime::TIMELINE_PREVIOUS,
+                    ),
+                };
+                Some(Statement::TimelineSignal {
+                    kind,
+                    target: Value::String(target.to_string()),
+                })
+            }
+            // The main timeline from any script, a clip's too: Flash's
+            // `_root.gotoAndPlay()`. Carried on the window channel, which
+            // clips already hand up to the main timeline.
+            "rootrun!" | "rootstop!" => {
+                let raw = line[first.len()..].trim();
+                let args = if raw.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![parse_value(raw, line_no, &mut self.diagnostics)]
+                };
+                Some(Statement::WindowCommand {
+                    command: if first == "rootrun!" {
+                        ROOT_RUN.to_string()
+                    } else {
+                        ROOT_STOP.to_string()
+                    },
+                    args,
+                })
+            }
             "gorun" | "gostop" => {
                 self.diagnostics.push(Diagnostic {
                     line: line_no,
@@ -575,6 +662,9 @@ impl<'a> Parser<'a> {
             }
             _ if first.starts_with("q0window.") && first.ends_with('!') => {
                 self.parse_host_command(line_no, &line, first, HostCommandKind::Window)
+            }
+            _ if first.starts_with("q0app.") && first.ends_with('!') => {
+                self.parse_host_command(line_no, &line, first, HostCommandKind::App)
             }
             _ if find_assignment_operator(&line).is_some() => self.parse_assignment(line_no, &line),
             _ if first.ends_with('!') => Some(Statement::Unknown { text: line }),
@@ -692,6 +782,7 @@ impl<'a> Parser<'a> {
             HostCommandKind::Light => "q0light.",
             HostCommandKind::Layer => "q0layer.",
             HostCommandKind::Window => "q0window.",
+            HostCommandKind::App => "q0app.",
         };
         let command = first
             .trim_start_matches(prefix)
@@ -715,6 +806,10 @@ impl<'a> Parser<'a> {
             HostCommandKind::Light => Statement::LightCommand { command, args },
             HostCommandKind::Layer => Statement::LayerCommand { command, args },
             HostCommandKind::Window => Statement::WindowCommand { command, args },
+            HostCommandKind::App => Statement::WindowCommand {
+                command: format!("{APP_COMMAND_PREFIX}{command}"),
+                args,
+            },
         })
     }
 

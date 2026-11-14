@@ -196,6 +196,27 @@ impl ObjectWorld {
                     format!("{name}.frame"),
                     RuntimeValue::Number(f64::from(frame)),
                 );
+                // Flash's names, for converted movies: 1-based.
+                runtime.vars.insert(
+                    format!("{name}._currentframe"),
+                    RuntimeValue::Number(f64::from(frame) + 1.0),
+                );
+                if let Some(count) = self
+                    .instances
+                    .get(key)
+                    .and_then(|object| {
+                        project
+                            .q0rgs
+                            .iter()
+                            .find(|q0rg| q0rg.q0rg_id == object.symbol)
+                    })
+                    .map(|q0rg| q0rg.frame_count)
+                {
+                    runtime.vars.insert(
+                        format!("{name}._totalframes"),
+                        RuntimeValue::Number(f64::from(count)),
+                    );
+                }
                 runtime
                     .vars
                     .insert(format!("{name}.playing"), RuntimeValue::Bool(playing));
@@ -288,6 +309,7 @@ impl ObjectPass<'_> {
                     .unwrap_or(&[]),
             )
         });
+        let rig_pose = q0s_format::parenting::merge_into(self.project, owner, frame, rig_pose);
         let mut active = Vec::new();
         for layer in q0rg.iter().flat_map(|q0rg| &q0rg.layers) {
             if !self.project.layer_is_visible(owner, layer.layer_id) {
@@ -516,6 +538,23 @@ impl ObjectPass<'_> {
                             "frame".into(),
                             RuntimeValue::Number(f64::from(object.frame)),
                         );
+                        // Flash's names, for converted movies: 1-based.
+                        runtime.vars.insert(
+                            "_currentframe".into(),
+                            RuntimeValue::Number(f64::from(object.frame) + 1.0),
+                        );
+                        if let Some(count) = self
+                            .project
+                            .q0rgs
+                            .iter()
+                            .find(|q0rg| q0rg.q0rg_id == object.symbol)
+                            .map(|q0rg| q0rg.frame_count)
+                        {
+                            runtime.vars.insert(
+                                "_totalframes".into(),
+                                RuntimeValue::Number(f64::from(count)),
+                            );
+                        }
                         let mut scripts: Vec<_> = self
                             .project
                             .runtime
@@ -605,8 +644,15 @@ impl ObjectPass<'_> {
                 ref timeline_action @ (RuntimeAction::GoRun(ref target)
                 | RuntimeAction::GoStop(ref target)) => {
                     let playing = matches!(timeline_action, RuntimeAction::GoRun(_));
+                    if *target == TimelineTarget::Here {
+                        object.playing = playing;
+                        continue;
+                    }
                     let frame = match &target {
                         TimelineTarget::Frame(frame) => Some(*frame),
+                        TimelineTarget::Here => Some(object.frame),
+                        TimelineTarget::Next => Some(object.frame.saturating_add(1)),
+                        TimelineTarget::Previous => Some(object.frame.saturating_sub(1)),
                         TimelineTarget::Label(label) => self
                             .project
                             .runtime
@@ -693,6 +739,7 @@ fn sync_globals(
         ("self.y", f64::from(local.ty)),
         ("self.frame", f64::from(object.frame)),
         ("frame", f64::from(object.frame)),
+        ("_currentframe", f64::from(object.frame) + 1.0),
         ("self.id", f64::from(key.instance_id)),
     ] {
         runtime

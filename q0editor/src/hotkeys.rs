@@ -244,8 +244,11 @@ impl ShortcutCommand {
             C::ToggleTimeline => vec![ShortcutChord::cmd_alt(K::T)],
             C::FirstFrame => vec![ShortcutChord::key(K::Home)],
             C::LastFrame => vec![ShortcutChord::key(K::End)],
-            C::PreviousFrame => vec![ShortcutChord::key(K::ArrowLeft)],
-            C::NextFrame => vec![ShortcutChord::key(K::ArrowRight)],
+            C::PreviousFrame => vec![ShortcutChord::shift(K::Comma), ShortcutChord::key(K::Comma)],
+            C::NextFrame => vec![
+                ShortcutChord::shift(K::Period),
+                ShortcutChord::key(K::Period),
+            ],
             C::InsertFrame => vec![ShortcutChord::key(K::F5)],
             C::RemoveFrame => vec![ShortcutChord::shift(K::F5)],
             C::InsertKeyframe => vec![ShortcutChord::key(K::F6)],
@@ -309,6 +312,8 @@ pub enum ShortcutKey {
     Plus,
     Equals,
     Slash,
+    Comma,
+    Period,
     Num0,
     Num1,
     Num2,
@@ -381,6 +386,8 @@ impl ShortcutKey {
             Key::Plus => Self::Plus,
             Key::Equals => Self::Equals,
             Key::Slash => Self::Slash,
+            Key::Comma => Self::Comma,
+            Key::Period => Self::Period,
             Key::Num0 => Self::Num0,
             Key::Num1 => Self::Num1,
             Key::Num2 => Self::Num2,
@@ -454,6 +461,8 @@ impl ShortcutKey {
             Self::Plus => Key::Plus,
             Self::Equals => Key::Equals,
             Self::Slash => Key::Slash,
+            Self::Comma => Key::Comma,
+            Self::Period => Key::Period,
             Self::Num0 => Key::Num0,
             Self::Num1 => Key::Num1,
             Self::Num2 => Key::Num2,
@@ -526,6 +535,8 @@ impl ShortcutKey {
             Self::Plus => "+",
             Self::Equals => "=",
             Self::Slash => "/",
+            Self::Comma => ",",
+            Self::Period => ".",
             Self::Num0 => "0",
             Self::Num1 => "1",
             Self::Num2 => "2",
@@ -676,12 +687,23 @@ impl ShortcutChord {
         if self.alt {
             parts.push("Alt".to_string());
         }
-        if self.shift {
+        let shifted_label = match (self.shift, self.key) {
+            (true, ShortcutKey::Comma) => Some("<"),
+            (true, ShortcutKey::Period) => Some(">"),
+            _ => None,
+        };
+        if self.shift && shifted_label.is_none() {
             parts.push("Shift".to_string());
         }
-        parts.push(self.key.label().to_string());
+        parts.push(shifted_label.unwrap_or(self.key.label()).to_string());
         parts.join("+")
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShortcutCapture {
+    pub command: ShortcutCommand,
+    pub replace: Option<ShortcutChord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

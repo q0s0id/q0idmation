@@ -54,7 +54,7 @@ impl From<q0theme::Rgb> for ColorRgb {
     }
 }
 
-fn blend(a: ColorRgb, b: ColorRgb, t: f32) -> ColorRgb {
+pub(crate) fn blend(a: ColorRgb, b: ColorRgb, t: f32) -> ColorRgb {
     let mix = |x: u8, y: u8| {
         (x as f32 + (y as f32 - x as f32) * t)
             .round()
@@ -194,6 +194,66 @@ pub struct Theme {
     /// Highlight tint for the line the cursor is on.
     #[serde(default = "default_syntax_current_line")]
     pub syntax_current_line: ColorRgb,
+
+    // ----- Chrome gradients -----
+    /// Gradients for bars, panels, hovered buttons and the selection. None
+    /// follows the base colours above; editing any stop pins them all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gradients: Option<ThemeGradients>,
+}
+
+/// Two colours a surface fades between, top to bottom.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GradientStops {
+    pub top: ColorRgb,
+    pub bottom: ColorRgb,
+}
+
+impl From<q0theme::Gradient> for GradientStops {
+    fn from(value: q0theme::Gradient) -> Self {
+        Self {
+            top: value.top.into(),
+            bottom: value.bottom.into(),
+        }
+    }
+}
+
+impl GradientStops {
+    pub fn to_color32(self) -> [Color32; 2] {
+        [self.top.to_color32(), self.bottom.to_color32()]
+    }
+}
+
+fn gradients_on() -> bool {
+    true
+}
+
+/// The chrome gradients of a theme, as the theme editor shows them.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThemeGradients {
+    /// Off paints every surface in its flat colour.
+    #[serde(default = "gradients_on")]
+    pub enabled: bool,
+    /// Menu bar, tab strips and the timeline's header.
+    pub bar: GradientStops,
+    /// Behind each panel's contents.
+    pub panel: GradientStops,
+    /// A button under the pointer.
+    pub hover: GradientStops,
+    /// The chosen tool and toggles that are on.
+    pub selected: GradientStops,
+}
+
+impl From<q0theme::ChromeGradients> for ThemeGradients {
+    fn from(value: q0theme::ChromeGradients) -> Self {
+        Self {
+            enabled: true,
+            bar: value.bar.into(),
+            panel: value.panel.into(),
+            hover: value.hover.into(),
+            selected: value.selected.into(),
+        }
+    }
 }
 
 // Default-fns for the new fields. Backwards-compat hook: `#[serde(default)]`
@@ -245,6 +305,22 @@ fn default_tween_arrow() -> ColorRgb {
 const SHAPE_TWEEN_GREEN: ColorRgb = ColorRgb::new(0x4C, 0xB0, 0x6A);
 
 impl Theme {
+    /// The chrome gradients: the pinned ones, or those that follow from the
+    /// base colours.
+    pub fn gradients(&self) -> ThemeGradients {
+        self.gradients.unwrap_or_else(|| {
+            let rgb = |c: ColorRgb| q0theme::Rgb::new(c.r, c.g, c.b);
+            q0theme::ChromeGradients::derive(
+                rgb(self.accent),
+                rgb(self.panel),
+                rgb(self.window),
+                rgb(self.deep_bg),
+                rgb(self.text),
+            )
+            .into()
+        })
+    }
+
     /// Shape-tween span fill: the chosen colour, or a green that sits at the
     /// same depth as this theme's motion-tween fill.
     pub fn shape_tween_fill(&self) -> ColorRgb {
@@ -364,6 +440,7 @@ impl Default for Theme {
             syntax_gutter_bg: default_syntax_gutter_bg(),
             syntax_gutter_fg: default_syntax_gutter_fg(),
             syntax_current_line: default_syntax_current_line(),
+            gradients: None,
         }
     }
 }
@@ -515,6 +592,7 @@ impl Theme {
             ..Theme::default()
         }
         .with_timeline_from_base();
+        theme.gradients = Some(preset.gradients().into());
 
         if preset.id == Q0S_SIGNATURE_ID {
             theme.canvas_bg = ColorRgb::new(0x09, 0x09, 0x09);
@@ -571,6 +649,10 @@ impl Theme {
         visuals.panel_fill = window;
         visuals.window_fill = window;
         let border = blend(self.window, self.text, 0.16).to_color32();
+        // Resting controls and separators get a quieter line than windows,
+        // and the hover outline leans towards the accent instead of being it.
+        let quiet = blend(self.window, self.text, 0.10).to_color32();
+        let hover_line = blend(blend(self.window, self.text, 0.16), self.accent, 0.6).to_color32();
         let hover = blend(self.panel, self.accent, 0.16).to_color32();
         visuals.window_stroke = Stroke::new(1.0_f32, border);
         visuals.menu_rounding = Rounding::same(8.0);
@@ -588,22 +670,22 @@ impl Theme {
         ] {
             w.bg_fill = panel;
             w.weak_bg_fill = panel;
-            w.bg_stroke = Stroke::new(1.0_f32, border);
+            w.bg_stroke = Stroke::new(1.0_f32, quiet);
             w.fg_stroke = Stroke::new(1.0_f32, text);
-            w.rounding = Rounding::same(5.0);
+            w.rounding = Rounding::same(6.0);
         }
         visuals.widgets.noninteractive.bg_fill = window;
         visuals.widgets.noninteractive.weak_bg_fill = window;
         visuals.widgets.hovered.bg_fill = hover;
         visuals.widgets.hovered.weak_bg_fill = hover;
         visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, text);
-        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, accent);
-        visuals.widgets.hovered.rounding = Rounding::same(5.0);
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, hover_line);
+        visuals.widgets.hovered.rounding = Rounding::same(6.0);
         visuals.widgets.active.bg_fill = hover;
         visuals.widgets.active.weak_bg_fill = hover;
         visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, text);
         visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, accent);
-        visuals.widgets.active.rounding = Rounding::same(5.0);
+        visuals.widgets.active.rounding = Rounding::same(6.0);
         visuals.widgets.open = visuals.widgets.active;
         // Soft shadows that fall straight down read as depth rather than as
         // a dark smear off to one side.
@@ -622,6 +704,19 @@ impl Theme {
         };
 
         style.visuals = visuals;
+        let gradients = self.gradients();
+        crate::ui::set_chrome(
+            ctx,
+            crate::ui::Chrome {
+                enabled: gradients.enabled,
+                bar: gradients.bar.to_color32(),
+                panel: gradients.panel.to_color32(),
+                hover: gradients.hover.to_color32(),
+                selected: gradients.selected.to_color32(),
+                accent,
+                text,
+            },
+        );
         // A touch longer than egui's default, so panels and headers open
         // with a visible ease instead of a jump.
         style.animation_time = 0.12;
@@ -1263,6 +1358,41 @@ fn sanitize_advanced_brush_presets(presets: &mut Vec<AdvancedBrushPreset>) {
     presets.truncate(64);
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct OnlineChatSettings {
+    pub width: u16,
+    pub history_height: u16,
+    pub room_sound: Option<std::path::PathBuf>,
+    pub dm_sound: Option<std::path::PathBuf>,
+}
+
+impl Default for OnlineChatSettings {
+    fn default() -> Self {
+        Self {
+            width: 460,
+            history_height: 280,
+            room_sound: None,
+            dm_sound: None,
+        }
+    }
+}
+
+impl OnlineChatSettings {
+    pub const WIDTH: std::ops::RangeInclusive<u16> = 180..=960;
+    pub const HISTORY_HEIGHT: std::ops::RangeInclusive<u16> = 96..=600;
+
+    pub fn canvas_size(&self, canvas: egui::Vec2) -> egui::Vec2 {
+        let clamp = |value: u16, range: std::ops::RangeInclusive<u16>| {
+            f32::from(value.clamp(*range.start(), *range.end()))
+        };
+        egui::vec2(
+            clamp(self.width, Self::WIDTH).min((canvas.x - 24.0).max(80.0)),
+            clamp(self.history_height, Self::HISTORY_HEIGHT).min((canvas.y - 114.0).max(48.0)),
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Settings {
@@ -1306,6 +1436,11 @@ pub struct Settings {
     /// Which buttons the timeline bar shows.
     #[serde(default)]
     pub timeline_bar: TimelineBar,
+    /// The timeline's layer parenting column.
+    #[serde(default)]
+    pub timeline_parenting_view: bool,
+    pub onion_skin_during_playback: bool,
+    pub online_chat: OnlineChatSettings,
     /// Show what is being worked on in Discord, while Discord is open.
     #[serde(default = "default_true")]
     pub discord_presence: bool,
@@ -1437,6 +1572,9 @@ impl Default for Settings {
             workspace_layout: serde_json::Value::Null,
             workspace_layout_presets: Vec::new(),
             timeline_bar: TimelineBar::default(),
+            timeline_parenting_view: false,
+            onion_skin_during_playback: false,
+            online_chat: OnlineChatSettings::default(),
             discord_presence: true,
             discord_show_project: true,
             discord_application_id: String::new(),
@@ -1553,6 +1691,11 @@ impl Settings {
     }
 
     pub fn path() -> Option<PathBuf> {
+        // Unit tests drive real editors that save their settings; they must
+        // never write over the settings of the person running them.
+        if cfg!(test) {
+            return None;
+        }
         Some(dirs::config_dir()?.join("q0editor").join("settings.json"))
     }
 
@@ -1608,6 +1751,35 @@ mod tests {
     fn missing_settings_fields_use_current_defaults() {
         let settings: Settings = serde_json::from_str("{}").expect("deserialize old settings");
         assert_eq!(settings, Settings::default());
+    }
+
+    #[test]
+    fn gradients_follow_the_palette_until_pinned_and_survive_q7s() {
+        let mut theme = Theme::default();
+        assert!(theme.gradients.is_none());
+        let before = theme.gradients();
+        theme.accent = ColorRgb::new(0x10, 0x80, 0xF0);
+        assert_ne!(
+            theme.gradients().selected,
+            before.selected,
+            "derived ones follow the accent"
+        );
+
+        let mut pinned = theme.gradients();
+        pinned.bar.top = ColorRgb::new(1, 2, 3);
+        pinned.enabled = false;
+        theme.gradients = Some(pinned);
+        let encoded = serde_json::to_string(&theme).expect("serialize theme");
+        let decoded: Theme = serde_json::from_str(&encoded).expect("deserialize theme");
+        assert_eq!(decoded.gradients(), pinned);
+
+        let preset = Theme::from_builtin(
+            Theme::PRESETS
+                .iter()
+                .find(|preset| preset.id == "dracula")
+                .expect("dracula"),
+        );
+        assert!(preset.gradients.is_some(), "presets bring their own");
     }
 
     #[test]

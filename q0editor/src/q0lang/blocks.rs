@@ -318,7 +318,13 @@ fn command_name(statement: &Statement) -> Option<(String, &[Value])> {
         Statement::ParticlesCommand { command, args } => ("q0particles", command, args),
         Statement::LightCommand { command, args } => ("q0light", command, args),
         Statement::LayerCommand { command, args } => ("q0layer", command, args),
-        Statement::WindowCommand { command, args } => ("q0window", command, args),
+        Statement::WindowCommand { command, args } => {
+            if let Some(app) = command.strip_prefix(q0s_format::q0lang::parser::APP_COMMAND_PREFIX)
+            {
+                return Some((format!("q0app.{app}!"), args.as_slice()));
+            }
+            ("q0window", command, args)
+        }
         _ => return None,
     };
     Some((format!("{library}.{command}!"), args.as_slice()))

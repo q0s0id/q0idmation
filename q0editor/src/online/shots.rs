@@ -613,6 +613,116 @@ fn find_text(shapes: &[egui::epaint::ClippedShape], wanted: &str) -> Option<egui
     shapes.iter().find_map(|s| walk(&s.shape, wanted))
 }
 
+#[test]
+fn timeline_controls_hold_their_position_when_room_avatars_appear() {
+    let mut app = EditorApp::default();
+    let mut online = signed_in(1);
+    room(&mut online, &mut app, 1);
+    app.online = online;
+    app.session.onion.enabled = true;
+    let presence = std::mem::take(&mut app.online.room.as_mut().unwrap().presence);
+    let ctx = Context::default();
+    crate::theme::install(&ctx);
+    app.settings.theme.apply(&ctx);
+    for width in [1000.0, 1850.0] {
+        let draw = |app: &mut EditorApp| {
+            let mut output = egui::FullOutput::default();
+            for _ in 0..5 {
+                output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 400.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default()
+                            .show(ctx, |ui| crate::panels::timeline::render(app, ui));
+                    },
+                );
+            }
+            output.shapes
+        };
+        app.online.room.as_mut().unwrap().presence.clear();
+        let alone = draw(&mut app);
+        app.online
+            .room
+            .as_mut()
+            .unwrap()
+            .presence
+            .clone_from(&presence);
+        let with_people = draw(&mut app);
+        for label in ["loop range", "Edit frames"] {
+            let location = find_text(&alone, label).unwrap_or_else(|| panic!("missing {label}"));
+            assert_eq!(
+                find_text(&with_people, label),
+                Some(location),
+                "{label} at {width}"
+            );
+        }
+        assert!(find_text(&with_people, "B").is_some(), "avatar at {width}");
+    }
+}
+
+#[test]
+fn room_search_and_owner_actions_work_without_joining() {
+    let mut app = EditorApp::default();
+    let mut online = signed_in(1);
+    online.rooms = rows(
+        &serde_json::json!({"rooms": [
+            {"id":"orchid", "name":"Night Orchid", "owner_id":1},
+            {"id":"clover", "name":"Night Clover", "owner_id":2},
+        ]}),
+        "rooms",
+    );
+    let ctx = Context::default();
+    crate::theme::install(&ctx);
+    app.settings.theme.apply(&ctx);
+    let mut draw = |events: Vec<egui::Event>| {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 1120.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| online.show_panel(&mut app, ctx),
+        )
+        .shapes
+    };
+    let mut shapes = Vec::new();
+    for _ in 0..6 {
+        shapes = draw(vec![]);
+    }
+    let search = find_text(&shapes, "Search rooms by name").expect("room search");
+    let press = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    draw(vec![egui::Event::PointerMoved(search), press(search, true)]);
+    draw(vec![press(search, false)]);
+    let shapes = draw(vec![egui::Event::Text("  ORCHID ".into())]);
+    assert!(find_text(&shapes, "Night Orchid").is_some());
+    assert!(find_text(&shapes, "Night Clover").is_none());
+    assert!(find_text(&shapes, "Close room").is_some());
+    let delete = find_text(&shapes, "Delete room").expect("owner's delete button");
+    draw(vec![egui::Event::PointerMoved(delete), press(delete, true)]);
+    draw(vec![press(delete, false)]);
+    let shapes = draw(vec![]);
+    assert!(find_text(&shapes, "Delete permanently?").is_some());
+    assert!(online.room.is_none());
+    assert_eq!(
+        online.rooms.len(),
+        2,
+        "the initial click only arms deletion"
+    );
+}
+
 /// Open each dropdown in the panel and keep it open: frames must stay short
 /// and the window must not grow.
 #[test]

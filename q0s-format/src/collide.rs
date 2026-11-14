@@ -647,6 +647,7 @@ pub fn instance_origin(
                 .unwrap_or(&[]),
         )
     });
+    let rig_pose = crate::parenting::merge_into(project, q0rg_id, local_frame, rig_pose);
     for layer in &q0rg.layers {
         if !layer
             .placements
@@ -833,6 +834,7 @@ impl Walk<'_, '_> {
                     .unwrap_or(&[]),
             )
         });
+        let rig_pose = crate::parenting::merge_into(project, q0rg_id, local_frame, rig_pose);
         let morph = crate::shape_tween::project_layer_morph(project, layer, local_frame);
         for active in active_placement_states_at(layer, local_frame) {
             let Some(placement) = layer.placements.get(active.index) else {

@@ -1186,7 +1186,7 @@ pub struct Session {
     pub credits_opened_at: Instant,
     pub show_settings: bool,
     pub show_shortcuts: bool,
-    pub shortcut_capture: Option<crate::hotkeys::ShortcutCommand>,
+    pub shortcut_capture: Option<crate::hotkeys::ShortcutCapture>,
     pub shortcut_feedback: Option<String>,
     pub easing_editor: Option<crate::easing::EasingEditorState>,
     pub tween_warning: Option<String>,

@@ -44,9 +44,158 @@ pub struct Gizmo {
     pub kind: Kind,
     pub centre: Pos2,
     pub tips: [Option<Pos2>; 3],
+    pub plane_centres: [Option<Pos2>; 3],
     /// Ring points and whether each faces the camera.
     pub rings: [Vec<(Pos2, bool)>; 3],
     pub normal_tip: Option<Pos2>,
+}
+
+impl Gizmo {
+    pub(crate) fn project(
+        view: &View3d,
+        kind: Kind,
+        pivot: V3,
+        axes: [V3; 3],
+        length: f32,
+    ) -> Option<Self> {
+        let centre = screen(view, pivot)?;
+        let toward = view.toward_eye(pivot);
+        let tips = axes.map(|axis| screen(view, pivot + axis * length));
+        let plane_centres = std::array::from_fn(|i| {
+            if plane_normal(axes, i).dot(toward).abs() < 0.05 {
+                return None;
+            }
+            let (a, b) = (axes[(i + 1) % 3], axes[(i + 2) % 3]);
+            screen(view, pivot + (a + b) * (length * 0.32))
+        });
+        let rings = axes.map(|axis| {
+            if kind != Kind::Rotate || axis == V3::ZERO {
+                return Vec::new();
+            }
+            let u = axis.any_perpendicular();
+            let v = axis.cross(u);
+            (0..=64)
+                .filter_map(|k| {
+                    let angle = k as f32 / 64.0 * std::f32::consts::TAU;
+                    let offset = (u * angle.cos() + v * angle.sin()) * (length * 0.82);
+                    let point = screen(view, pivot + offset)?;
+                    Some((point, offset.dot(toward) >= -length * 0.05))
+                })
+                .collect()
+        });
+        Some(Self {
+            kind,
+            centre,
+            tips,
+            plane_centres,
+            rings,
+            normal_tip: None,
+        })
+    }
+}
+
+fn screen(view: &View3d, point: V3) -> Option<Pos2> {
+    view.project(point).map(|[x, y, _]| Pos2::new(x, y))
+}
+
+/// Length in stage units for a screen distance at the pivot's depth.
+pub(crate) fn world_length(view: &View3d, pivot: V3, pixels: f32) -> f32 {
+    let depth = view.view.transform_point(pivot).z;
+    let a = view.to_output;
+    let output_scale = (a.a11 * a.a22 - a.a12 * a.a21).abs().sqrt();
+    pixels / (view.stage_scale_at(depth) * output_scale).max(1.0e-6)
+}
+
+pub(crate) fn plane_normal(axes: [V3; 3], i: usize) -> V3 {
+    axes[(i + 1) % 3].cross(axes[(i + 2) % 3]).normalized()
+}
+
+/// Where the pointer ray meets the plane through the pivot.
+pub(crate) fn plane_point(view: &View3d, pivot: V3, normal: V3, at: Pos2) -> Option<V3> {
+    let (origin, ray) = view.ray(at.x, at.y)?;
+    let along = ray.dot(normal);
+    if along.abs() < 1.0e-5 {
+        return None;
+    }
+    let t = (pivot - origin).dot(normal) / along;
+    (t > 0.0 || view.orthographic).then(|| origin + ray * t)
+}
+
+/// The signed position on an axis closest to the pointer ray.
+pub(crate) fn axis_parameter(origin: V3, ray: V3, pivot: V3, axis: V3) -> Option<f32> {
+    let w = origin - pivot;
+    let b = axis.dot(ray);
+    let denominator = 1.0 - b * b;
+    (denominator > 1.0e-4).then(|| (axis.dot(w) - b * ray.dot(w)) / denominator)
+}
+
+/// Signed turn in the ring's plane, in degrees.
+pub(crate) fn ring_turn(view: &View3d, pivot: V3, axis: V3, press: Pos2, at: Pos2) -> Option<f32> {
+    let toward = view.toward_eye(pivot);
+    let facing = axis.dot(toward);
+    if facing.abs() < 0.08 {
+        // Edge-on, the ring collapses to a line. Drag along the tangent on
+        // its near side so the axis still turns in a predictable direction.
+        let radius = world_length(view, pivot, 70.0);
+        let near = pivot + (toward - axis * facing).normalized() * radius;
+        let tangent = axis.cross(toward).normalized() * radius;
+        let direction = (screen(view, near + tangent * 0.1)? - screen(view, near)?) * 10.0;
+        return (direction.length_sq() > 1.0)
+            .then(|| ((at - press).dot(direction) / direction.length_sq()).to_degrees());
+    }
+    if screen(view, pivot)?.distance(at) < 2.0 {
+        return None;
+    }
+    let a = (plane_point(view, pivot, axis, press)? - pivot).normalized();
+    let b = (plane_point(view, pivot, axis, at)? - pivot).normalized();
+    Some(axis.dot(a.cross(b)).atan2(a.dot(b)).to_degrees())
+}
+
+/// The outer, view-aligned ring is a circle in screen space.
+pub(crate) fn screen_turn(pivot: Pos2, press: Pos2, at: Pos2) -> f32 {
+    let a = press - pivot;
+    let b = at - pivot;
+    if a.length_sq() < 4.0 || b.length_sq() < 4.0 {
+        return 0.0;
+    }
+    (a.x * b.y - a.y * b.x).atan2(a.dot(b)).to_degrees()
+}
+
+pub(crate) fn axis_scale(view: &View3d, pivot: V3, axis: V3, press: Pos2, at: Pos2) -> Option<f32> {
+    let centre = screen(view, pivot)?;
+    let tip = screen(view, pivot + axis * world_length(view, pivot, 80.0))?;
+    let direction = (tip - centre).normalized();
+    let along = |point: Pos2| {
+        let on_axis = centre + direction * (point - centre).dot(direction);
+        let (origin, ray) = view.ray(on_axis.x, on_axis.y)?;
+        let distance = axis_parameter(origin, ray, pivot, axis)?;
+        view.project(pivot + axis * distance)?;
+        Some(distance)
+    };
+    let start = along(press)?;
+    if start.abs() <= 1.0e-12 {
+        return None;
+    }
+    let factor = along(at)? / start;
+    factor.is_finite().then_some(factor)
+}
+
+pub(crate) fn plane_scale(
+    view: &View3d,
+    pivot: V3,
+    normal: V3,
+    press: Pos2,
+    at: Pos2,
+) -> Option<f32> {
+    let start = (plane_point(view, pivot, normal, press)? - pivot).length();
+    let end = (plane_point(view, pivot, normal, at)? - pivot).length();
+    (start > 1.0e-12).then_some(end / start)
+}
+
+/// A drag from the centre can grow or shrink the whole object.
+pub(crate) fn uniform_scale(press: Pos2, at: Pos2) -> f32 {
+    let delta = at - press;
+    1.0 + (delta.x - delta.y) / 120.0
 }
 
 /// Where the current tool's gizmo stands, if it has one and something is
@@ -62,48 +211,24 @@ pub fn layout(studio: &ModelStudio, view: &View3d) -> Option<Gizmo> {
     if !studio.has_selection() {
         return None;
     }
-    let pivot = studio.selection_centre()?;
-    let centre = studio.screen(view, pivot)?;
-    let depth = view.view.transform_point(flip(pivot)).z;
-    let per_unit = view.stage_scale_at(depth).max(1.0e-6);
-    let length = 92.0 / per_unit;
-    let axes = studio.axes();
-    let tips = axes.map(|a| studio.screen(view, pivot + a * length));
-    let toward = -studio.orbit.forward();
-    let rings = std::array::from_fn(|i| {
-        let (u, v) = (axes[(i + 1) % 3], axes[(i + 2) % 3]);
-        (0..=64)
-            .filter_map(|k| {
-                let a = k as f32 / 64.0 * std::f32::consts::TAU;
-                let offset = (u * a.cos() + v * a.sin()) * (length * 0.82);
-                let p = studio.screen(view, pivot + offset)?;
-                Some((p, offset.dot(toward) >= -length * 0.05))
-            })
-            .collect()
-    });
-    let normal = if kind == Kind::Extrude {
+    let pivot = flip(studio.selection_centre()?);
+    let length = world_length(view, pivot, 92.0);
+    let mut gizmo = Gizmo::project(view, kind, pivot, studio.axes().map(flip), length)?;
+    if kind == Kind::Extrude {
         let mesh = studio.model.meshes.get(studio.mesh)?;
         let m = mesh_matrix(mesh, &studio.world());
         let faces = studio.working_faces();
         if faces.is_empty() {
             return None;
         }
-        faces
+        let normal = faces
             .iter()
             .filter_map(|f| mesh.faces.get(*f))
             .fold(V3::ZERO, |s, f| s + m.transform_vector(mesh.face_normal(f)))
-            .normalized()
-    } else {
-        V3::Y
-    };
-    let normal_tip = studio.screen(view, pivot + normal * length * 1.1);
-    Some(Gizmo {
-        kind,
-        centre,
-        tips,
-        rings,
-        normal_tip,
-    })
+            .normalized();
+        gizmo.normal_tip = screen(view, pivot + flip(normal) * length * 1.1);
+    }
+    Some(gizmo)
 }
 
 fn segment_distance(p: Pos2, a: Pos2, b: Pos2) -> f32 {
@@ -114,35 +239,29 @@ fn segment_distance(p: Pos2, a: Pos2, b: Pos2) -> f32 {
 pub fn hit(gizmo: &Gizmo, pos: Pos2) -> Option<Handle> {
     let c = gizmo.centre;
     match gizmo.kind {
-        Kind::Move => {
-            if pos.distance(c) < 11.0 {
-                return Some(Handle::Free);
+        Kind::Move | Kind::Scale => {
+            let sizing = gizmo.kind == Kind::Scale;
+            if pos.distance(c) < if sizing { 12.0 } else { 11.0 } {
+                return Some(if sizing {
+                    Handle::ScaleAll
+                } else {
+                    Handle::Free
+                });
             }
-            for k in 0..3 {
-                let (a, b) = ((k + 1) % 3, (k + 2) % 3);
-                if let (Some(ta), Some(tb)) = (gizmo.tips[a], gizmo.tips[b]) {
-                    let square = c + (ta - c) * 0.32 + (tb - c) * 0.32;
-                    if pos.distance(square) < 10.0 {
-                        return Some(Handle::Plane(k));
-                    }
+            if let Some(i) = gizmo
+                .plane_centres
+                .iter()
+                .position(|square| square.is_some_and(|centre| centre.distance(pos) < 10.0))
+            {
+                return Some(Handle::Plane(i));
+            }
+            nearest_arrow(gizmo, pos).map(|i| {
+                if sizing {
+                    Handle::ScaleAxis(i)
+                } else {
+                    Handle::Axis(i)
                 }
-            }
-            nearest_arrow(gizmo, pos).map(Handle::Axis)
-        }
-        Kind::Scale => {
-            if pos.distance(c) < 12.0 {
-                return Some(Handle::ScaleAll);
-            }
-            for k in 0..3 {
-                let (a, b) = ((k + 1) % 3, (k + 2) % 3);
-                if let (Some(ta), Some(tb)) = (gizmo.tips[a], gizmo.tips[b]) {
-                    let square = c + (ta - c) * 0.32 + (tb - c) * 0.32;
-                    if pos.distance(square) < 10.0 {
-                        return Some(Handle::Plane(k));
-                    }
-                }
-            }
-            nearest_arrow(gizmo, pos).map(Handle::ScaleAxis)
+            })
         }
         Kind::Rotate => {
             let mut best: Option<(usize, f32)> = None;
@@ -232,9 +351,7 @@ pub fn paint(painter: &Painter, gizmo: &Gizmo, hover: Option<Handle>, active: Op
                 da.total_cmp(&db)
             });
             for (k, axis_colour) in AXIS_COLOURS.iter().enumerate() {
-                let (a, b) = ((k + 1) % 3, (k + 2) % 3);
-                if let (Some(ta), Some(tb)) = (gizmo.tips[a], gizmo.tips[b]) {
-                    let square = c + (ta - c) * 0.32 + (tb - c) * 0.32;
+                if let Some(square) = gizmo.plane_centres[k] {
                     let r = 7.0;
                     let fill = if lit(Handle::Plane(k)) {
                         HOT

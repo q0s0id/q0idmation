@@ -138,7 +138,9 @@ pub const Q1S_VERSION_SHADOW_QUALITY: u16 = 43;
 /// v44: 3D models, placements in 3D and timeline 3D setups (camera, 3D
 /// lights, bone poses), appended after the lighting block.
 pub const Q1S_VERSION_THREE_D: u16 = 44;
-pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_THREE_D;
+/// Layers can hang from other layers (Animate's layer parenting).
+pub const Q1S_VERSION_LAYER_PARENTS: u16 = 45;
+pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_LAYER_PARENTS;
 /// A packed `.q1s`: not a body version but a container around one, as
 /// `.q0s` v42 is. After it come the body's own version and length, then the
 /// body, with packed paths, deflated. A tenth of the size or less for most
@@ -154,7 +156,7 @@ pub const Q1S_V2_VERSION: u16 = Q1S_VERSION_CURRENT;
 /// A root q0rg is at depth 0, so a chain containing nine q0rgs (eight nested
 /// edges) is valid. Validation and every renderer must use this same limit so
 /// a project can never validate successfully and then lose deeper content.
-pub const MAX_Q0RG_NESTING_DEPTH: u8 = 8;
+pub const MAX_Q0RG_NESTING_DEPTH: u8 = 16;
 /// Maximum folder-parent edges in one timeline layer tree.
 pub const MAX_LAYER_FOLDER_NESTING_DEPTH: usize = 64;
 
@@ -1915,6 +1917,13 @@ pub struct ProjectRuntimeData {
     pub lighting: crate::lighting::LightingData,
     /// 3D cameras, 3D lights and bone poses per timeline.
     pub scene3d: crate::three::Scene3dData,
+    /// Layer parenting: each child layer and the layer it hangs from, on
+    /// the key's timeline. See `crate::parenting`.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, with = "crate::serde_support::pairs")
+    )]
+    pub layer_parents: HashMap<LayerKey, u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -2011,6 +2020,17 @@ pub struct ProjectV2 {
 }
 
 impl ProjectV2 {
+    pub fn is_scene_root(&self, q0rg_id: u16) -> bool {
+        if self.runtime.scenes.is_empty() {
+            q0rg_id == self.meta.entry_q0rg_id
+        } else {
+            self.runtime
+                .scenes
+                .iter()
+                .any(|scene| scene.q0rg_id == q0rg_id)
+        }
+    }
+
     /// Return the explicit ordered scene list, or infer the implicit scene used
     /// by project revisions that predate the scene table.
     pub fn scenes(&self) -> Vec<ProjectScene> {
@@ -2077,10 +2097,24 @@ impl ProjectV2 {
             .lerp(target.state, source.tween.easing().sample(raw_t))
     }
 
+    /// Where the camera is at `frame`: `camera_state_at` (its own keys), carried
+    /// along by the layer it follows, if any (see `parenting::CAMERA_LAYER`).
+    pub fn camera_world_state_at(&self, frame: u16) -> CameraState {
+        let mut state = self.camera_state_at(frame);
+        let track = &self.runtime.camera;
+        if track.enabled && !track.keys.is_empty() {
+            if let Some((x, y)) = crate::parenting::camera_offset(self, frame) {
+                state.center_x += x;
+                state.center_y += y;
+            }
+        }
+        state
+    }
+
     /// World/stage -> camera-stage affine. The identity camera produces the
     /// exact identity matrix, preserving legacy pixels and hit-test geometry.
     pub fn camera_affine_at(&self, frame: u16) -> Affine {
-        let state = self.camera_state_at(frame);
+        let state = self.camera_world_state_at(frame);
         let stage_cx = f32::from(self.meta.stage_width) * 0.5;
         let stage_cy = f32::from(self.meta.stage_height) * 0.5;
         let (sin, cos) = state.rotation.sin_cos();
@@ -3608,6 +3642,7 @@ fn validate_project_runtime(project: &ProjectV2) -> Result<(), Error> {
         }
     }
 
+    crate::parenting::validate(project)?;
     let mut library_folders = HashSet::with_capacity(project.runtime.library_folders.len());
     for path in &project.runtime.library_folders {
         if !valid_library_folder_path(path) {
@@ -4623,7 +4658,7 @@ fn validate_q0rg_graph(
         for &child in &children[node] {
             let child_depth = depth[node] + 1;
             if child_depth > usize::from(MAX_Q0RG_NESTING_DEPTH) {
-                return Err(Error::Validation("q0rg nesting depth exceeds 8"));
+                return Err(Error::Validation("q0rg nesting depth exceeds 16"));
             }
             depth[child] = depth[child].max(child_depth);
         }
@@ -4806,7 +4841,9 @@ pub(crate) const BODY_FLAG_PACKED_PATHS: u16 = 1;
 
 /// `write`, optionally packing vector paths. Packed bodies are for .q0s.
 pub(crate) fn write_with(project: &ProjectV2, packed: bool) -> Result<Vec<u8>, Error> {
-    let version = if uses_three_d(project) {
+    let version = if !project.runtime.layer_parents.is_empty() {
+        Q1S_VERSION_LAYER_PARENTS
+    } else if uses_three_d(project) {
         Q1S_VERSION_THREE_D
     } else if project
         .q0rgs
@@ -5046,6 +5083,7 @@ fn write_version_with(project: &ProjectV2, version: u16, packed: bool) -> Result
         && version != Q1S_VERSION_TRANSFORM_PIVOTS
         && version != Q1S_VERSION_SHADOW_QUALITY
         && version != Q1S_VERSION_THREE_D
+        && version != Q1S_VERSION_LAYER_PARENTS
     {
         return Err(Error::UnsupportedVersion(version));
     }
@@ -5209,6 +5247,11 @@ fn write_version_with(project: &ProjectV2, version: u16, packed: bool) -> Result
     {
         return Err(Error::Validation(
             "legacy q1s versions cannot store library folders",
+        ));
+    }
+    if version < Q1S_VERSION_LAYER_PARENTS && !project.runtime.layer_parents.is_empty() {
+        return Err(Error::Validation(
+            "legacy q1s versions cannot store layer parents",
         ));
     }
     if version < Q1S_VERSION_RIGGING
@@ -5742,6 +5785,9 @@ fn write_version_with(project: &ProjectV2, version: u16, packed: bool) -> Result
     }
     if version >= Q1S_VERSION_THREE_D {
         crate::three::wire::write_scene(&mut out, &project.runtime.scene3d)?;
+    }
+    if version >= Q1S_VERSION_LAYER_PARENTS {
+        crate::parenting::write(&mut out, project)?;
     }
     Ok(out)
 }
@@ -7170,7 +7216,8 @@ pub(crate) fn is_known_version(version: u16) -> bool {
         && version != Q1S_VERSION_PARTICLES
         && version != Q1S_VERSION_TRANSFORM_PIVOTS
         && version != Q1S_VERSION_SHADOW_QUALITY
-        && version != Q1S_VERSION_THREE_D)
+        && version != Q1S_VERSION_THREE_D
+        && version != Q1S_VERSION_LAYER_PARENTS)
 }
 
 /// Parse a project body after a six-byte wrapper header without copying the
@@ -7613,6 +7660,9 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
     }
     if version >= Q1S_VERSION_THREE_D {
         runtime.scene3d = crate::three::wire::read_scene(&mut c)?;
+    }
+    if version >= Q1S_VERSION_LAYER_PARENTS {
+        runtime.layer_parents = crate::parenting::read(&mut c)?;
     }
     c.finish()?;
 

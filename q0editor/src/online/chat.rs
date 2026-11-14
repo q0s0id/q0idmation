@@ -154,12 +154,16 @@ pub(super) struct Chat {
     pub(super) requested: bool,
     /// Small pictures of image attachments, by attachment id.
     pub(super) previews: HashMap<String, Preview>,
+    room_notification: bool,
+    dm_notification: bool,
+    last_inbox_message: Option<i64>,
 }
 
 impl Chat {
     pub(super) fn left_room(&mut self) {
         self.room.clear();
         self.room_primed = false;
+        self.room_notification = false;
         self.feed.retain(|line| line.kind != LineKind::Room);
     }
     fn push(&mut self, kind: LineKind, user_id: i64, body: impl Into<String>) {
@@ -249,6 +253,32 @@ pub(super) fn name_colour(user_id: i64, dark: bool) -> Color32 {
 }
 
 impl Online {
+    pub(crate) fn set_chat_sound(
+        &mut self,
+        settings: &mut crate::settings::Settings,
+        direct: bool,
+        path: std::path::PathBuf,
+    ) {
+        let preview = self.notification_audio.play(&path);
+        let sound = if direct {
+            &mut settings.online_chat.dm_sound
+        } else {
+            &mut settings.online_chat.room_sound
+        };
+        *sound = Some(path);
+        if let Err(error) = settings.try_save() {
+            self.say(
+                format!("could not save chat settings: {error}"),
+                Tone::Warning,
+            );
+        } else if let Err(error) = preview {
+            self.say(
+                format!("could not preview the sound: {error}"),
+                Tone::Warning,
+            );
+        }
+    }
+
     /// The chat key: the overlay input in a room or after a message, the
     /// panel's Messages tab otherwise. Signed out it does nothing, so the key
     /// never surprises someone who doesn't use online.
@@ -270,10 +300,13 @@ impl Online {
         }
         lines.retain(|line| !self.chat.room.iter().any(|known| known.id == line.id));
         lines.sort_by_key(|line| line.id);
+        lines.dedup_by_key(|line| line.id);
         let primed = self.chat.room_primed;
+        let me = self.actor();
         self.chat.room_primed = true;
         for line in &lines {
             if primed {
+                self.chat.room_notification |= Some(line.user_id) != me && !line.removed;
                 let text = line_text(&line.body, line.attachment.as_ref(), line.removed);
                 self.chat.push(LineKind::Room, line.user_id, text);
             }
@@ -331,6 +364,7 @@ impl Online {
             }
         }
         if announce {
+            self.chat.dm_notification |= incoming && !message.removed;
             let kind = if incoming {
                 LineKind::DmIn
             } else {
@@ -360,7 +394,17 @@ impl Online {
                         .flat_map(|people| people.values())
                         .filter_map(|p| serde_json::from_value::<Person>(p.clone()).ok()),
                 );
-                for message in rows::<DirectMessage>(&value, "messages") {
+                let mut messages = rows::<DirectMessage>(&value, "messages");
+                messages.sort_by_key(|message| message.id);
+                for message in messages {
+                    if self
+                        .chat
+                        .last_inbox_message
+                        .is_some_and(|id| message.id <= id)
+                    {
+                        continue;
+                    }
+                    self.chat.last_inbox_message = Some(message.id);
                     self.dm_arrived(message, true);
                 }
                 if let Some(unread) = value.get("unread").and_then(Value::as_i64) {
@@ -443,6 +487,32 @@ impl Online {
         };
         self.send(Command::Say { room, body });
         true
+    }
+
+    pub(super) fn play_chat_notifications(
+        &mut self,
+        settings: &crate::settings::OnlineChatSettings,
+    ) {
+        let dm = std::mem::take(&mut self.chat.dm_notification);
+        let room = std::mem::take(&mut self.chat.room_notification);
+        // One sound per batch. Give private replies priority when both arrive.
+        let path = settings
+            .dm_sound
+            .as_deref()
+            .filter(|_| dm)
+            .or_else(|| settings.room_sound.as_deref().filter(|_| room));
+        if let Some(path) = path {
+            if let Err(error) = self.notification_audio.play(path) {
+                let text = format!("could not play the notification sound: {error}");
+                if !self
+                    .notice
+                    .as_ref()
+                    .is_some_and(|notice| notice.text == text)
+                {
+                    self.say(text, Tone::Warning);
+                }
+            }
+        }
     }
     pub(super) fn send_dm(&mut self, user_id: i64, text: &str) -> bool {
         let Some(body) = dm_body(text) else {
@@ -529,9 +599,11 @@ impl Online {
         }
         let canvas = ctx
             .data(|d| d.get_temp::<egui::Rect>(egui::Id::new(CANVAS_RECT)))
+            .map(|rect| rect.intersect(ctx.screen_rect()))
             .filter(|rect| rect.is_positive())
             .unwrap_or_else(|| ctx.screen_rect().shrink(40.0));
-        let width = (canvas.width() - 24.0).clamp(160.0, 460.0);
+        let size = app.settings.online_chat.canvas_size(canvas.size());
+        let width = size.x;
         let anchor = canvas.left_bottom() + vec2(12.0, -12.0);
         let now = Instant::now();
         let typing = self.chat.input_open;
@@ -613,7 +685,10 @@ impl Online {
                                     None => ("MESSAGES", String::new()),
                                 };
                                 ui.label(RichText::new(title).small().strong().color(white));
-                                ui.label(RichText::new(place).small().color(dim));
+                                ui.add(
+                                    egui::Label::new(RichText::new(place).small().color(dim))
+                                        .truncate(true),
+                                );
                             });
                             ui.add_space(2.0);
                             if lines.is_empty() {
@@ -628,7 +703,7 @@ impl Online {
                                 );
                             }
                             egui::ScrollArea::vertical()
-                                .max_height(280.0)
+                                .max_height(size.y)
                                 .stick_to_bottom(true)
                                 .show(ui, |ui| {
                                     for (line, _) in &lines {
@@ -854,6 +929,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chat_preferences_preserve_a_silent_default_and_fit_small_canvases() {
+        let mut settings = crate::settings::Settings::default();
+        let chat = &mut settings.online_chat;
+        assert!(chat.room_sound.is_none() && chat.dm_sound.is_none());
+        chat.width = 720;
+        chat.history_height = 400;
+        chat.dm_sound = Some("inbox.ogg".into());
+        assert_eq!(chat.canvas_size(vec2(1200.0, 800.0)), vec2(720.0, 400.0));
+        assert_eq!(chat.canvas_size(vec2(300.0, 280.0)), vec2(276.0, 166.0));
+        let restored: crate::settings::Settings =
+            serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
+        assert_eq!(restored.online_chat, settings.online_chat);
+    }
+
+    #[test]
     fn typed_lines_follow_game_chat_conventions() {
         assert_eq!(parse_typed("  hi all "), Some(Typed::Room("hi all".into())));
         assert_eq!(
@@ -939,12 +1029,23 @@ mod tests {
             online.chat.feed.is_empty(),
             "history must not flood the overlay"
         );
+        assert!(!online.chat.room_notification);
         online.room_chat_arrived("room", vec![line(2), line(3)]);
         assert_eq!(online.chat.room.len(), 3, "duplicates are dropped");
         assert_eq!(online.chat.feed.len(), 1);
+        assert!(std::mem::take(&mut online.chat.room_notification));
+        let mut own = line(4);
+        own.user_id = 1;
+        let mut removed = line(5);
+        removed.removed = true;
+        online.room_chat_arrived("room", vec![line(3), own, removed]);
+        assert!(
+            !online.chat.room_notification,
+            "own messages, repeats and removed messages are silent"
+        );
         // another room's lines are ignored
         online.room_chat_arrived("elsewhere", vec![line(9)]);
-        assert_eq!(online.chat.room.len(), 3);
+        assert_eq!(online.chat.room.len(), 5);
         online.leave();
         assert!(online.chat.room.is_empty() && online.chat.feed.is_empty());
     }
@@ -962,7 +1063,9 @@ mod tests {
             removed: false,
         };
         online.dm_arrived(dm(1, 7, 1), true);
+        assert!(std::mem::take(&mut online.chat.dm_notification));
         online.dm_arrived(dm(2, 1, 8), true);
+        assert!(!online.chat.dm_notification);
         assert_eq!(online.chat.reply_to, Some(7));
         assert_eq!(online.chat.conversations[0].user_id, 8, "newest first");
         assert_eq!(online.chat.conversations[1].unread, 1);

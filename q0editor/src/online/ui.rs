@@ -54,6 +54,7 @@ pub(super) struct View {
     room_name: String,
     room_name_edited: bool,
     join_code: String,
+    room_search: String,
     pub(super) search: String,
     pub(super) expanded: Option<i64>,
     member_draft: Option<MemberDraft>,
@@ -74,6 +75,7 @@ impl Default for View {
             room_name: String::new(),
             room_name_edited: false,
             join_code: String::new(),
+            room_search: String::new(),
             search: String::new(),
             expanded: None,
             member_draft: None,
@@ -178,10 +180,62 @@ struct Out {
     history: Option<bool>,
     /// Open the conversation with this person in the Messages tab.
     message: Option<i64>,
+    chat_settings: Option<crate::settings::OnlineChatSettings>,
+    pick_chat_sound: Option<bool>,
 }
 impl Out {
     fn say(&mut self, text: impl Into<String>, tone: Tone) {
         self.say = Some((text.into(), tone));
+    }
+}
+
+fn chat_preferences(ui: &mut Ui, current: &crate::settings::OnlineChatSettings, out: &mut Out) {
+    use crate::settings::OnlineChatSettings;
+    let mut settings = current.clone();
+    ui.label(RichText::new("Canvas chat size").strong());
+    for (label, value, range) in [
+        ("Width", &mut settings.width, OnlineChatSettings::WIDTH),
+        (
+            "History height",
+            &mut settings.history_height,
+            OnlineChatSettings::HISTORY_HEIGHT,
+        ),
+    ] {
+        ui.horizontal(|ui| {
+            ui.label(label);
+            ui.add(egui::DragValue::new(value).clamp_range(range).suffix(" px"));
+        });
+    }
+    ui.separator();
+    ui.label(RichText::new("Notification sounds").strong());
+    for (label, sound, direct) in [
+        ("Room chat", &mut settings.room_sound, false),
+        ("Direct messages", &mut settings.dm_sound, true),
+    ] {
+        ui.push_id(label, |ui| {
+            ui.label(label);
+            ui.horizontal(|ui| {
+                let name = sound
+                    .as_deref()
+                    .and_then(|path| path.file_name())
+                    .map(|name| name.to_string_lossy())
+                    .unwrap_or_else(|| "Silent".into());
+                ui.add_sized([125.0, 18.0], egui::Label::new(name).truncate(true));
+                if ui.button("Choose…").clicked() {
+                    out.pick_chat_sound = Some(direct);
+                    ui.close_menu();
+                }
+                if ui
+                    .add_enabled(sound.is_some(), egui::Button::new("Clear"))
+                    .clicked()
+                {
+                    *sound = None;
+                }
+            });
+        });
+    }
+    if settings != *current {
+        out.chat_settings = Some(settings);
     }
 }
 
@@ -820,14 +874,14 @@ impl Online {
             .min_width(300.0)
             .resizable(true)
             .collapsible(true)
-            .constrain(true)
+            .constrain_to(screen)
             .show(ctx, |ui| {
                 let pal = Palette::new(app, ui);
                 if self.user.is_none() {
                     self.signed_out_view(ui, &pal, &mut out);
                     self.footer(ui, &pal);
                 } else {
-                    self.header(ui, &pal, &mut out);
+                    self.header(ui, &pal, &app.settings.online_chat, &mut out);
                     ui.separator();
                     self.tabs(ui);
                     ui.add_space(2.0);
@@ -864,6 +918,24 @@ impl Online {
     }
 
     fn apply(&mut self, app: &mut EditorApp, ctx: &Context, out: Out) {
+        if let Some(settings) = out.chat_settings {
+            app.settings.online_chat = settings;
+            if let Err(error) = app.settings.try_save() {
+                self.say(
+                    format!("could not save chat settings: {error}"),
+                    Tone::Warning,
+                );
+            }
+        }
+        if let Some(direct) = out.pick_chat_sound {
+            let dialog = crate::platform::FileDialog::new()
+                .add_filter("Audio", &["wav", "mp3", "ogg", "flac"]);
+            if let Some(action) = crate::platform::pick_file_then(dialog, move |path| {
+                Action::SetOnlineChatSound { direct, path }
+            }) {
+                app.queue(action);
+            }
+        }
         if out.cancel_sign_in {
             self.cancel_sign_in();
         }
@@ -1094,7 +1166,13 @@ impl Online {
 
     // --- signed in -----------------------------------------------------------
 
-    fn header(&mut self, ui: &mut Ui, pal: &Palette, out: &mut Out) {
+    fn header(
+        &mut self,
+        ui: &mut Ui,
+        pal: &Palette,
+        chat_settings: &crate::settings::OnlineChatSettings,
+        out: &mut Out,
+    ) {
         let user = self.user.clone().unwrap_or_default();
         if !self.rejected_drafts.is_empty()
             && ui
@@ -1124,6 +1202,9 @@ impl Online {
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.menu_button("⋯", |ui| {
+                    ui.menu_button("Chat settings", |ui| {
+                        chat_preferences(ui, chat_settings, out)
+                    });
                     if ui.button("Refresh lists").clicked() {
                         out.send.push(Command::Refresh);
                         ui.close_menu();
@@ -1392,6 +1473,18 @@ impl Online {
                 }
             });
         });
+        ui.add(
+            egui::TextEdit::singleline(&mut self.view.room_search)
+                .id_source("online_room_search")
+                .hint_text("Search rooms by name")
+                .desired_width(f32::INFINITY)
+                .char_limit(100),
+        );
+        let query = self.view.room_search.trim().to_lowercase();
+        let rooms = self
+            .rooms
+            .iter()
+            .filter(|room| query.is_empty() || room.name.to_lowercase().contains(&query));
         if self.lists_at.is_none() {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -1402,11 +1495,15 @@ impl Online {
                 RichText::new("No rooms yet. Start one above, or accept an invitation.")
                     .color(pal.dim),
             );
+        } else if rooms.clone().next().is_none() {
+            ui.label(RichText::new("No rooms match your search.").color(pal.dim));
         }
         let me = self.actor();
         let closing = self.busy("close");
-        for room in self.rooms.clone() {
+        let deleting = self.busy("delete-room");
+        for room in rooms {
             let current = self.room.as_ref().is_some_and(|r| r.id == room.id);
+            let owned = Some(room.owner_id) == me;
             card(ui, pal, |ui| {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
@@ -1442,36 +1539,21 @@ impl Online {
                         });
                     });
                 });
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if current {
                         if ui.button("Show room").clicked() {
                             self.view.tab = Tab::Room;
                         }
                     } else if room.closed {
-                        if Some(room.owner_id) == me {
+                        if owned {
                             if ui
-                                .add_enabled(!closing, egui::Button::new("Reopen"))
+                                .add_enabled(!closing && !deleting, egui::Button::new("Reopen"))
                                 .on_hover_text("Lets members open this room again")
                                 .clicked()
                             {
                                 out.send.push(Command::CloseRoom {
                                     room: room.id.clone(),
                                     closed: false,
-                                });
-                            }
-                            // open rooms are deleted from their settings, never
-                            // from a list where the button sat first in line
-                            if armed_button(
-                                ui,
-                                &mut self.view,
-                                pal,
-                                &format!("delete:{}", room.id),
-                                "Delete",
-                                "Delete this room permanently?",
-                                !self.busy.contains("delete-room"),
-                            ) {
-                                out.send.push(Command::DeleteRoom {
-                                    room: room.id.clone(),
                                 });
                             }
                         } else {
@@ -1500,6 +1582,37 @@ impl Online {
                             .clicked()
                     {
                         copy(ui, &room.id, out, "room code");
+                    }
+                    if owned {
+                        if !room.closed
+                            && armed_button(
+                                ui,
+                                &mut self.view,
+                                pal,
+                                &format!("close:{}", room.id),
+                                "Close room",
+                                "Close for everyone?",
+                                !closing && !deleting,
+                            )
+                        {
+                            out.send.push(Command::CloseRoom {
+                                room: room.id.clone(),
+                                closed: true,
+                            });
+                        }
+                        if armed_button(
+                            ui,
+                            &mut self.view,
+                            pal,
+                            &format!("delete:{}", room.id),
+                            "Delete room",
+                            "Delete permanently?",
+                            !closing && !deleting,
+                        ) {
+                            out.send.push(Command::DeleteRoom {
+                                room: room.id.clone(),
+                            });
+                        }
                     }
                 });
             });

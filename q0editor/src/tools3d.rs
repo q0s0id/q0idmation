@@ -157,8 +157,6 @@ struct Drag {
     /// Where the pointer first met the axis or plane, in stage space.
     grab: V3,
     press: Pos2,
-    /// The gizmo's middle on screen when it was taken.
-    centre_screen: Pos2,
 }
 
 /// One placement as the 3D tools see it.
@@ -209,14 +207,6 @@ pub(crate) fn stage_view3d(app: &EditorApp, view: &StageView) -> View3d {
         look.orthographic = free.orthographic;
     }
     look.view(project, view.screen_transform(), [1, 1])
-}
-
-/// Screen points per stage unit at a stage-space point.
-fn pixels_per_unit(view3d: &View3d, at: V3) -> f32 {
-    let depth = view3d.view.transform_point(at).z;
-    let a = &view3d.to_output;
-    let screen = (a.a11 * a.a22 - a.a12 * a.a21).abs().sqrt();
-    (view3d.stage_scale_at(depth) * screen).max(1.0e-6)
 }
 
 fn to_screen(view3d: &View3d, at: V3) -> Option<Pos2> {
@@ -347,34 +337,14 @@ fn kind_of(tool: Tool3d) -> Option<Kind> {
 
 /// The gizmo of the current tool around `object`.
 fn layout(view3d: &View3d, object: &Object, kind: Kind, axes: [V3; 3]) -> Option<Gizmo> {
-    let centre = to_screen(view3d, object.centre)?;
-    let length = ARROW / pixels_per_unit(view3d, object.centre);
-    let tips = std::array::from_fn(|i| {
-        // Sizing has no depth of its own: drawings are flat.
-        if kind == Kind::Scale && i == 2 {
-            return None;
-        }
-        to_screen(view3d, object.centre + axes[i] * length)
-    });
-    let toward = view3d.toward_eye(object.centre);
-    let rings = std::array::from_fn(|i| {
-        let (u, v) = (axes[(i + 1) % 3], axes[(i + 2) % 3]);
-        (0..=64)
-            .filter_map(|k| {
-                let a = k as f32 / 64.0 * std::f32::consts::TAU;
-                let offset = (u * a.cos() + v * a.sin()) * (length * 0.82);
-                let p = to_screen(view3d, object.centre + offset)?;
-                Some((p, offset.dot(toward) >= -length * 0.05))
-            })
-            .collect()
-    });
-    Some(Gizmo {
-        kind,
-        centre,
-        tips,
-        rings,
-        normal_tip: None,
-    })
+    let length = gizmo::world_length(view3d, object.centre, ARROW);
+    let mut gizmo = Gizmo::project(view3d, kind, object.centre, axes, length)?;
+    if kind == Kind::Scale {
+        // Stage placements store width and height; depth follows their size.
+        gizmo.tips[2] = None;
+        gizmo.plane_centres[..2].fill(None);
+    }
+    Some(gizmo)
 }
 
 /// The depth knob's place, when the z arrow is too short to hold.
@@ -507,13 +477,17 @@ pub(crate) fn handle(app: &mut EditorApp, response: &Response, view: &StageView)
     let pointer = response
         .interact_pointer_pos()
         .or_else(|| response.hover_pos());
+    let snapping = ctx.input(|i| i.modifiers.ctrl);
 
     // Holding a gizmo.
     if app.session.tools3d.drag.is_some() {
-        if response.dragged_by(PointerButton::Primary) {
+        let dragging = response.dragged_by(PointerButton::Primary);
+        if dragging || response.drag_stopped_by(PointerButton::Primary) {
             if let Some(at) = pointer {
-                drag_to(app, &view3d, at, ctx.input(|i| i.modifiers.ctrl));
+                drag_to(app, &view3d, at, snapping);
             }
+        }
+        if dragging {
             ctx.set_cursor_icon(CursorIcon::Grabbing);
             return;
         }
@@ -538,7 +512,10 @@ pub(crate) fn handle(app: &mut EditorApp, response: &Response, view: &StageView)
         let press = ctx.input(|i| i.pointer.press_origin()).or(pointer);
         if let (Some(press), Some((g, object, axes))) = (press, gizmo) {
             if let Some(grip) = grip_at(&g, press) {
-                begin(app, &view3d, object, axes, grip, press, g.centre);
+                begin(app, &view3d, object, axes, grip, press);
+                if let Some(at) = pointer {
+                    drag_to(app, &view3d, at, snapping);
+                }
                 return;
             }
         }
@@ -549,16 +526,10 @@ pub(crate) fn handle(app: &mut EditorApp, response: &Response, view: &StageView)
                     select(app, reference);
                     if let Some(object) = object(app, reference) {
                         let axes = axes_of(&object, app.session.tools3d.own_axes);
-                        let centre = to_screen(&view3d, object.centre).unwrap_or(press);
-                        begin(
-                            app,
-                            &view3d,
-                            object,
-                            axes,
-                            Grip::Gizmo(Handle::Free),
-                            press,
-                            centre,
-                        );
+                        begin(app, &view3d, object, axes, Grip::Gizmo(Handle::Free), press);
+                        if let Some(at) = pointer {
+                            drag_to(app, &view3d, at, snapping);
+                        }
                     }
                 }
             }
@@ -643,8 +614,29 @@ fn begin(
     axes: [V3; 3],
     grip: Grip,
     press: Pos2,
-    centre_screen: Pos2,
 ) {
+    let kind = app
+        .session
+        .tools3d
+        .tool
+        .and_then(kind_of)
+        .unwrap_or(Kind::Move);
+    let grab = match (kind, grip) {
+        (Kind::Move, Grip::Gizmo(Handle::Axis(k))) => {
+            axis_point(view3d, object.centre, axes[k], press)
+        }
+        (Kind::Move, Grip::Gizmo(Handle::Plane(k))) => {
+            gizmo::plane_point(view3d, object.centre, gizmo::plane_normal(axes, k), press)
+        }
+        (Kind::Move, Grip::Gizmo(Handle::Free)) => gizmo::plane_point(
+            view3d,
+            object.centre,
+            view3d.toward_eye(object.centre),
+            press,
+        ),
+        _ => Some(object.centre),
+    };
+    let Some(grab) = grab else { return };
     app.history
         .snapshot_with_session(&app.state.project, &app.session);
     let reference = object.reference;
@@ -657,23 +649,6 @@ fn begin(
             }
         }
     }
-    let grab = match grip {
-        Grip::Gizmo(Handle::Axis(k)) => axis_point(view3d, object.centre, axes[k], press),
-        Grip::Gizmo(Handle::Plane(k)) => plane_point(view3d, object.centre, axes[k], press),
-        Grip::Gizmo(Handle::Free) => plane_point(
-            view3d,
-            object.centre,
-            view3d.toward_eye(object.centre),
-            press,
-        ),
-        _ => None,
-    }
-    .unwrap_or(object.centre);
-    let kind = match app.session.tools3d.tool {
-        Some(Tool3d::Rotate) => Kind::Rotate,
-        Some(Tool3d::Scale) => Kind::Scale,
-        _ => Kind::Move,
-    };
     app.session.tools3d.drag = Some(Drag {
         kind,
         grip,
@@ -687,7 +662,6 @@ fn begin(
         axes,
         grab,
         press,
-        centre_screen,
     });
 }
 
@@ -695,25 +669,8 @@ fn begin(
 /// under `at`.
 fn axis_point(view3d: &View3d, centre: V3, axis: V3, at: Pos2) -> Option<V3> {
     let (origin, direction) = view3d.ray(at.x, at.y)?;
-    let w = origin - centre;
-    let b = axis.dot(direction);
-    let denominator = 1.0 - b * b;
-    if denominator.abs() < 1.0e-4 {
-        return None;
-    }
-    let t = (axis.dot(w) - b * direction.dot(w)) / denominator;
-    Some(centre + axis * t)
-}
-
-/// Where the ray under `at` meets the plane through `centre` facing `normal`.
-fn plane_point(view3d: &View3d, centre: V3, normal: V3, at: Pos2) -> Option<V3> {
-    let (origin, direction) = view3d.ray(at.x, at.y)?;
-    let along = direction.dot(normal);
-    if along.abs() < 1.0e-5 {
-        return None;
-    }
-    let t = (centre - origin).dot(normal) / along;
-    (t > 0.0 || view3d.orthographic).then(|| origin + direction * t)
+    let distance = gizmo::axis_parameter(origin, direction, centre, axis)?;
+    Some(centre + axis * distance)
 }
 
 fn snap(value: f32, step: f32, on: bool) -> f32 {
@@ -730,132 +687,110 @@ fn drag_to(app: &mut EditorApp, view3d: &View3d, at: Pos2, snapping: bool) {
         return;
     };
     let mut pose = drag.start;
-    let mut readout = String::new();
-    match drag.grip {
+    let readout = match drag.grip {
         Grip::Gizmo(Handle::Axis(k)) => {
-            if let Some(point) = axis_point(view3d, drag.centre, drag.axes[k], at) {
-                let amount = snap((point - drag.grab).dot(drag.axes[k]), 10.0, snapping);
-                move_by(&mut pose, drag.axes[k] * amount);
-                readout = format!("{} {amount:+.0}", ["x", "y", "z"][k]);
-            }
+            let Some(point) = axis_point(view3d, drag.centre, drag.axes[k], at) else {
+                return;
+            };
+            let amount = snap((point - drag.grab).dot(drag.axes[k]), 10.0, snapping);
+            move_by(&mut pose, drag.axes[k] * amount);
+            format!("{} {amount:+.0}", ["x", "y", "z"][k])
         }
         Grip::Gizmo(Handle::Plane(k)) if drag.kind == Kind::Move => {
-            if let Some(point) = plane_point(view3d, drag.centre, drag.axes[k], at) {
-                let delta = point - drag.grab;
-                let (a, b) = ((k + 1) % 3, (k + 2) % 3);
-                let da = snap(delta.dot(drag.axes[a]), 10.0, snapping);
-                let db = snap(delta.dot(drag.axes[b]), 10.0, snapping);
-                move_by(&mut pose, drag.axes[a] * da + drag.axes[b] * db);
-                readout = format!(
-                    "{} {da:+.0}  {} {db:+.0}",
-                    ["x", "y", "z"][a],
-                    ["x", "y", "z"][b]
-                );
-            }
+            let (a, b) = ((k + 1) % 3, (k + 2) % 3);
+            let (u, v) = (drag.axes[a], drag.axes[b]);
+            let normal = u.cross(v);
+            let Some(point) = gizmo::plane_point(view3d, drag.centre, normal.normalized(), at)
+            else {
+                return;
+            };
+            let delta = point - drag.grab;
+            let da = snap(
+                delta.cross(v).dot(normal) / normal.length_sq(),
+                10.0,
+                snapping,
+            );
+            let db = snap(
+                u.cross(delta).dot(normal) / normal.length_sq(),
+                10.0,
+                snapping,
+            );
+            move_by(&mut pose, u * da + v * db);
+            format!(
+                "{} {da:+.0}  {} {db:+.0}",
+                ["x", "y", "z"][a],
+                ["x", "y", "z"][b]
+            )
         }
         Grip::Gizmo(Handle::Free) => {
-            if let Some(point) =
-                plane_point(view3d, drag.centre, view3d.toward_eye(drag.centre), at)
-            {
-                let delta = point - drag.grab;
-                move_by(&mut pose, delta);
-                readout = format!("x {:+.0}  y {:+.0}  z {:+.0}", delta.x, -delta.y, delta.z);
-            }
+            let Some(point) =
+                gizmo::plane_point(view3d, drag.centre, view3d.toward_eye(drag.centre), at)
+            else {
+                return;
+            };
+            let delta = point - drag.grab;
+            move_by(&mut pose, delta);
+            format!("x {:+.0}  y {:+.0}  z {:+.0}", delta.x, -delta.y, delta.z)
         }
         Grip::Depth => {
             let amount = snap(
-                -(at.y - drag.press.y) / pixels_per_unit(view3d, drag.centre) * 2.0,
+                gizmo::world_length(view3d, drag.centre, (drag.press.y - at.y) * 2.0),
                 10.0,
                 snapping,
             );
             move_by(&mut pose, V3::Z * amount);
-            readout = format!("depth {:+.0}", amount);
+            format!("depth {amount:+.0}")
         }
         Grip::Gizmo(Handle::Ring(k)) => {
-            let degrees = snap(
-                screen_turn(&drag, at) * axis_sign(view3d, &drag, drag.axes[k]),
-                15.0,
-                snapping,
-            );
+            let Some(degrees) = gizmo::ring_turn(view3d, drag.centre, drag.axes[k], drag.press, at)
+            else {
+                return;
+            };
+            let degrees = snap(degrees, 15.0, snapping);
             turn(&mut pose, drag.pivot, drag.axes[k], degrees);
-            readout = format!("turn {degrees:+.0}°");
+            format!("turn {degrees:+.0}°")
         }
         Grip::Gizmo(Handle::ViewRing) => {
+            let Some(centre) = to_screen(view3d, drag.centre) else {
+                return;
+            };
             let forward = -view3d.toward_eye(drag.centre);
-            let degrees = snap(screen_turn(&drag, at), 15.0, snapping);
+            let degrees = snap(gizmo::screen_turn(centre, drag.press, at), 15.0, snapping);
             turn(&mut pose, drag.pivot, forward, degrees);
-            readout = format!("turn {degrees:+.0}°");
+            format!("turn {degrees:+.0}°")
         }
         Grip::Gizmo(Handle::ScaleAxis(k)) => {
-            let factor = stretch(&drag, at, Some(drag_tip_direction(view3d, &drag, k)));
+            let Some(factor) = gizmo::axis_scale(view3d, drag.centre, drag.axes[k], drag.press, at)
+            else {
+                return;
+            };
             let factor = snap(factor, 0.1, snapping).max(0.01);
             size_by(
                 &mut pose,
                 drag.pivot,
                 if k == 0 { [factor, 1.0] } else { [1.0, factor] },
             );
-            readout = format!("{} {:.0}%", ["width", "height"][k.min(1)], factor * 100.0);
+            format!("{} {:.0}%", ["width", "height"][k.min(1)], factor * 100.0)
         }
-        Grip::Gizmo(Handle::ScaleAll | Handle::Plane(_)) => {
-            let factor = snap(stretch(&drag, at, None), 0.1, snapping).max(0.01);
+        Grip::Gizmo(handle @ (Handle::ScaleAll | Handle::Plane(_))) => {
+            let factor = if let Handle::Plane(k) = handle {
+                let normal = gizmo::plane_normal(drag.axes, k);
+                let Some(factor) = gizmo::plane_scale(view3d, drag.centre, normal, drag.press, at)
+                else {
+                    return;
+                };
+                factor
+            } else {
+                gizmo::uniform_scale(drag.press, at)
+            };
+            let factor = snap(factor, 0.1, snapping).max(0.01);
             size_by(&mut pose, drag.pivot, [factor, factor]);
-            readout = format!("size {:.0}%", factor * 100.0);
+            format!("size {:.0}%", factor * 100.0)
         }
-        Grip::Gizmo(Handle::Extrude) => {}
-    }
+        Grip::Gizmo(Handle::Extrude) => return,
+    };
     write(app, drag.reference, pose);
     app.session.status = readout;
-}
-
-/// Which way an axis's screen tip points from the gizmo's middle.
-fn drag_tip_direction(view3d: &View3d, drag: &Drag, k: usize) -> Vec2 {
-    let length = ARROW / pixels_per_unit(view3d, drag.centre);
-    to_screen(view3d, drag.centre + drag.axes[k] * length)
-        .map(|tip| tip - drag.centre_screen)
-        .filter(|d| d.length() > 4.0)
-        .map_or(vec2(1.0, 0.0), Vec2::normalized)
-}
-
-/// Degrees the pointer has gone round the gizmo's middle since the press,
-/// clockwise on screen.
-fn screen_turn(drag: &Drag, at: Pos2) -> f32 {
-    let a = drag.press - drag.centre_screen;
-    let b = at - drag.centre_screen;
-    if a.length() < 2.0 || b.length() < 2.0 {
-        return 0.0;
-    }
-    let mut angle = (b.y.atan2(b.x) - a.y.atan2(a.x)).to_degrees();
-    while angle > 180.0 {
-        angle -= 360.0;
-    }
-    while angle < -180.0 {
-        angle += 360.0;
-    }
-    angle
-}
-
-/// Clockwise on screen is a positive turn about an axis pointing away from
-/// the eye, and a negative one about an axis pointing at it.
-fn axis_sign(view3d: &View3d, drag: &Drag, axis: V3) -> f32 {
-    if axis.dot(view3d.toward_eye(drag.centre)) > 0.0 {
-        -1.0
-    } else {
-        1.0
-    }
-}
-
-/// How much farther from the middle the pointer is than at the press,
-/// along `direction` when given.
-fn stretch(drag: &Drag, at: Pos2, direction: Option<Vec2>) -> f32 {
-    let measure = |p: Pos2| {
-        let d = p - drag.centre_screen;
-        direction.map_or(d.length(), |dir| d.dot(dir))
-    };
-    let start = measure(drag.press);
-    if start.abs() < 4.0 {
-        return 1.0;
-    }
-    measure(at) / start
 }
 
 fn move_by(pose: &mut Pose, delta: V3) {
@@ -1545,5 +1480,144 @@ mod tests {
             (point - (centre + V3::X * 50.0)).length() < 1.0e-2,
             "{point:?}"
         );
+    }
+
+    #[test]
+    fn stage_gizmos_follow_an_oblique_perspective_camera() {
+        use crate::app::Action;
+
+        let ctx = egui::Context::default();
+        let mut app = EditorApp::default();
+        app.handle(&ctx, Action::CreateProject(Default::default()));
+        app.handle(&ctx, Action::NewModel);
+        let reference = selected(&app).expect("new model is selected on stage");
+        app.session.tools3d.orbit = Some(Orbit {
+            target: object(&app, reference).unwrap().centre + V3::new(-150.0, 50.0, 0.0),
+            yaw: 0.8,
+            pitch: 0.35,
+            distance: lens(&app.state.project) * 0.7,
+        });
+        let screen = Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 740.0));
+        let size = vec2(
+            f32::from(app.state.project.meta.stage_width),
+            f32::from(app.state.project.meta.stage_height),
+        );
+        let scale = (screen.width() / size.x).min(screen.height() / size.y) * 0.8;
+        let stage_rect = Rect::from_center_size(screen.center(), size * scale);
+        let view = StageView {
+            origin: stage_rect.min,
+            scale,
+            stage_rect,
+            edit_transform: Affine::IDENTITY,
+        };
+        let view3d = stage_view3d(&app, &view);
+        let render = |app: &mut EditorApp, events| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let response = ui
+                            .allocate_response(ui.available_size(), egui::Sense::click_and_drag());
+                        handle(app, &response, &view);
+                    });
+                },
+            );
+        };
+        let drag = |app: &mut EditorApp, press, at| {
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            render(
+                app,
+                vec![egui::Event::PointerMoved(press), button(press, true)],
+            );
+            render(app, vec![egui::Event::PointerMoved(at)]);
+            render(app, vec![button(at, false)]);
+        };
+
+        app.session.tools3d.tool = Some(Tool3d::Rotate);
+        let model = object(&app, reference).unwrap();
+        let axes = axes_of(&model, false);
+        let g = layout(&view3d, &model, Kind::Rotate, axes).unwrap();
+        let press = g.rings[0]
+            .iter()
+            .map(|(p, _)| *p)
+            .find(|p| grip_at(&g, *p) == Some(Grip::Gizmo(Handle::Ring(0))))
+            .unwrap();
+        let start =
+            gizmo::plane_point(&view3d, model.centre, axes[0], press).unwrap() - model.centre;
+        let turn = Quat::from_axis_angle(axes[0], 60.0f32.to_radians());
+        let at = to_screen(&view3d, model.centre + turn.rotate(start)).unwrap();
+        render(&mut app, vec![]);
+        drag(&mut app, press, at);
+        let rotated = object(&app, reference).unwrap();
+        assert!(
+            close(rotated.space.tilt_x, 60.0),
+            "{}",
+            rotated.space.tilt_x
+        );
+        assert!((rotated.centre - model.centre).length() < 1.0e-3);
+
+        app.handle(&ctx, Action::Undo);
+        app.session.tools3d.tool = Some(Tool3d::Scale);
+        let model = object(&app, reference).unwrap();
+        let axes = axes_of(&model, true);
+        let g = layout(&view3d, &model, Kind::Scale, axes).unwrap();
+        let press = g.tips[0].unwrap();
+        assert_eq!(grip_at(&g, press), Some(Grip::Gizmo(Handle::ScaleAxis(0))));
+        let length = gizmo::world_length(&view3d, model.centre, ARROW);
+        let at = to_screen(&view3d, model.centre + axes[0] * (2.0 * length)).unwrap();
+        drag(&mut app, press, at);
+        let scaled = object(&app, reference).unwrap();
+        assert!(
+            close(scaled.transform.sx, 2.0 * model.transform.sx),
+            "{}",
+            scaled.transform.sx
+        );
+        assert!(close(scaled.transform.sy, model.transform.sy));
+
+        let g = layout(&view3d, &scaled, Kind::Scale, axes).unwrap();
+        let press = g.plane_centres[2].unwrap();
+        assert_eq!(grip_at(&g, press), Some(Grip::Gizmo(Handle::Plane(2))));
+        let offset = (axes[0] + axes[1]) * (length * 0.32);
+        assert_eq!(Some(press), to_screen(&view3d, scaled.centre + offset));
+        let at = to_screen(&view3d, scaled.centre + offset * 1.5).unwrap();
+        drag(&mut app, press, at);
+        let plane_scaled = object(&app, reference).unwrap();
+        assert!(close(plane_scaled.transform.sx, scaled.transform.sx * 1.5));
+        assert!(close(plane_scaled.transform.sy, scaled.transform.sy * 1.5));
+
+        let centre = to_screen(&view3d, scaled.centre).unwrap();
+        drag(&mut app, centre, centre - vec2(60.0, 0.0));
+        let uniformly_scaled = object(&app, reference).unwrap().transform;
+        assert!(close(uniformly_scaled.sx, plane_scaled.transform.sx * 0.5));
+        assert!(close(uniformly_scaled.sy, plane_scaled.transform.sy * 0.5));
+    }
+
+    #[test]
+    fn edge_on_ring_turns_along_its_projected_tangent() {
+        let camera = CameraPose::stage(640, 480);
+        for orthographic in [false, true] {
+            let view = View3d::new(
+                camera,
+                orthographic,
+                [640.0, 480.0],
+                Affine::IDENTITY,
+                [640, 480],
+            );
+            let pivot = V3::new(320.0, 240.0, 0.0);
+            let press = pos2(320.0, 280.0);
+            let angle =
+                |dy| gizmo::ring_turn(&view, pivot, V3::X, press, press + vec2(0.0, dy)).unwrap();
+            assert!(angle(35.0) > 20.0 && angle(35.0) < 40.0);
+            assert!(close(angle(-35.0), -angle(35.0)));
+        }
     }
 }

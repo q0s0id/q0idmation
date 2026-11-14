@@ -359,15 +359,20 @@ pub(crate) fn open_dialog() -> crate::platform::FileDialog {
             &["q1s", "fla", "xfl", "q0l", "q0lang", "qx", "q0ex"],
         )
         .add_filter("q0s project (.q1s)", &[Q1S_EXTENSION])
-        .add_filter("Adobe Animate (.fla, .xfl)", q0fla::IMPORT_EXTENSIONS)
+        .add_filter(
+            "Adobe Animate or Flash (.fla, .xfl, .swf)",
+            q0fla::IMPORT_EXTENSIONS,
+        )
         .add_filter("q0lang source (.q0l, .q0lang)", Q0LANG_EXTENSIONS)
         .add_filter("q0ex plugin (.qx, .q0ex)", &q0ex::EXTENSIONS)
         .add_filter("any", &["*"])
 }
 
 pub(crate) fn fla_import_dialog() -> crate::platform::FileDialog {
-    crate::platform::FileDialog::new()
-        .add_filter("Adobe Animate (.fla, .xfl)", q0fla::IMPORT_EXTENSIONS)
+    crate::platform::FileDialog::new().add_filter(
+        "Adobe Animate or Flash (.fla, .xfl, .swf)",
+        q0fla::IMPORT_EXTENSIONS,
+    )
 }
 
 pub fn pick_q0fla_save_path(source: &Path) -> Option<PathBuf> {

@@ -573,6 +573,41 @@ fn timeline_ruler(
             });
         }
     }
+    // The parenting view's switch, above the column it opens.
+    let parenting = Rect::from_center_size(
+        pos2(label_edge_x - 72.0, rect.center().y),
+        vec2(18.0, RULER_H),
+    );
+    let shown = crate::layer_parenting_ui::shown(app);
+    let parenting_response = ui
+        .interact(
+            parenting,
+            egui::Id::new(("timeline_parenting_toggle", q0rg_id)),
+            Sense::click(),
+        )
+        .on_hover_text(
+            "Parenting view: hang layers from other layers, so they move, turn and scale with them",
+        );
+    if parenting_response.hovered() {
+        painter.rect_filled(
+            parenting.shrink(1.0),
+            2.0,
+            theme.accent.to_color32().gamma_multiply(0.15),
+        );
+    }
+    crate::ui::paint_icon(
+        &painter,
+        Rect::from_center_size(parenting.center(), vec2(12.0, 12.0)),
+        Icon::Parenting,
+        if shown {
+            theme.accent.to_color32()
+        } else {
+            theme.text.to_color32()
+        },
+    );
+    if parenting_response.clicked() {
+        crate::layer_parenting_ui::toggle(app);
+    }
     let frame_painter = ui.painter_at(Rect::from_min_max(pos2(label_edge_x, rect.top()), rect.max));
     let mut adjusting_range = false;
     if app.session.onion.enabled || app.session.onion.edit_frames {
@@ -980,17 +1015,39 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             }
 
             if camera_row_enabled {
+                let row_y = rect.min.y + rows_h();
                 draw_camera_layer_row(
                     app,
                     &label_painter,
                     &theme,
                     rect,
-                    rect.min.y + rows_h(),
+                    row_y,
                     frame_count,
                     visible_frames,
                     label_width,
                     frame_base_x,
                     &painter,
+                );
+                // The camera's parenting square, where a layer's would be.
+                let label_rect =
+                    Rect::from_min_size(pos2(rect.min.x, row_y), vec2(label_width, row_h()));
+                let controls_left = label_rect.right() - 58.0;
+                let column = Rect::from_min_max(
+                    pos2(
+                        controls_left - 2.0 - crate::layer_parenting_ui::column_width(app),
+                        label_rect.top(),
+                    ),
+                    pos2(controls_left - 2.0, label_rect.bottom()),
+                );
+                crate::layer_parenting_ui::row(
+                    app,
+                    ui,
+                    &label_painter,
+                    q0rg_id,
+                    q0s_format::parenting::CAMERA_LAYER,
+                    column,
+                    Rect::from_min_size(pos2(rect.min.x, row_y), vec2(rect.width(), row_h())),
+                    false,
                 );
             }
 
@@ -1137,7 +1194,8 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                             mask_art_rect.left()
                         } else {
                             outline_rect.left()
-                        } - 3.0,
+                        } - 3.0
+                            - crate::layer_parenting_ui::column_width(app),
                         label_rect.bottom(),
                     ),
                 );
@@ -1228,6 +1286,30 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         effective_locked,
                     ),
                 );
+                {
+                    let controls_left = if is_mask {
+                        mask_art_rect.left()
+                    } else {
+                        outline_rect.left()
+                    };
+                    let column = Rect::from_min_max(
+                        pos2(
+                            controls_left - 2.0 - crate::layer_parenting_ui::column_width(app),
+                            label_rect.top(),
+                        ),
+                        pos2(controls_left - 2.0, label_rect.bottom()),
+                    );
+                    crate::layer_parenting_ui::row(
+                        app,
+                        ui,
+                        &label_painter,
+                        q0rg_id,
+                        row_layer_id,
+                        column,
+                        row_rect,
+                        is_folder,
+                    );
+                }
                 label_painter.line_segment(
                     [pos2(label_edge_x, row_y), pos2(label_edge_x, row_y + row_h())],
                     Stroke::new(1.0_f32, theme.stroke_dark.to_color32()),
@@ -1463,6 +1545,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             }
 
             ROW_NOW.with(|now| now.set(None));
+            crate::layer_parenting_ui::finish(app, ui, q0rg_id);
             row_edges(
                 app,
                 ui,
@@ -3442,6 +3525,7 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
     let height = crate::ui::ICON_CONTROL_SIZE + 2.0;
     let known = widths.iter().all(|width| *width > 0.0);
     let one_row = known && widths.iter().sum::<f32>() + GAP * 2.0 <= full.width();
+    let mut people_space = None;
     let measured = if one_row {
         let row = Rect::from_min_size(full.min, vec2(full.width(), height));
         let group = |ui: &mut Ui, rect: Rect| {
@@ -3471,6 +3555,10 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
         );
         bar_playback(app, &mut center);
         let center_width = center.min_rect().width();
+        people_space = Some(Rect::from_min_max(
+            egui::pos2(center.min_rect().right() + GAP * 0.5, row.top()),
+            egui::pos2(right_x - GAP * 0.5, row.bottom()),
+        ));
         ui.allocate_rect(row, egui::Sense::hover());
         [left_width, center_width, right_width]
     } else {
@@ -3490,6 +3578,7 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
             ui.ctx().request_repaint();
         }
     }
+    crate::online::timeline_people(app, ui, people_space);
 }
 
 fn shows(app: &EditorApp, button: TimelineButton) -> bool {
@@ -3636,7 +3725,9 @@ fn bar_layers_and_frames(app: &mut EditorApp, ui: &mut Ui) {
     if shows(app, TimelineButton::NewSymbol)
         && icon_button(ui, Icon::Symbol, "Create q0rg symbol").clicked()
     {
-        app.queue(Action::AddQ0rg);
+        app.queue(Action::PromptSymbol(
+            crate::symbol_prompt::SymbolRequest::New,
+        ));
     }
     let frame_buttons = [
         TimelineButton::InsertFrame,
@@ -4039,7 +4130,6 @@ fn bar_view(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
                 .color(theme.text_dim.to_color32()),
         );
     }
-    crate::online::timeline_people(app, ui);
     bar_chooser(app, ui);
 }
 
@@ -4122,6 +4212,16 @@ fn bar_chooser(app: &mut EditorApp, ui: &mut Ui) {
                         if !hidden.remove(&button) {
                             hidden.insert(button);
                         }
+                        app.settings.save();
+                    }
+                    ui.separator();
+                    if ui
+                        .checkbox(
+                            &mut app.settings.onion_skin_during_playback,
+                            "Show onion skin during playback",
+                        )
+                        .changed()
+                    {
                         app.settings.save();
                     }
                 });

@@ -10,7 +10,7 @@
 | --- | --- |
 | `q0.core` | `do!`, `listen`, `xlisten`, `pb`, `pr`, `func`, `if`, `else`, `while`, `for`, `in`, `range`, `break`, `continue`, `return`, `true`, `false`, `null`, `and`, `or`, `not` |
 | `q0.math` | `pi`, `tau`, `sin`, `cos`, `tan`, `sqrt`, `abs`, `min`, `max`, `clamp`, `lerp`, `floor`, `ceil`, `round` |
-| `q0.timeline` | `gorun!`, `gostop!`, `frame`, `label` |
+| `q0.timeline` | `gorun!`, `gostop!`, `stop!`, `play!`, `gonext!`, `goprev!`, `rootrun!`, `rootstop!`, `frame`, `label` |
 | `q0.object` | `self.x`, `self.y`, `self.frame`, `self.playing`, `self.name`, `self.id`, `self.width`, `self.height`, `self.left`, `self.right`, `self.top`, `self.bottom`, `self.hovered`, `self.mouse_x`, `self.mouse_y` |
 | `q0.mouse` | `mouse.down`, `mouse.up`, `mouse.move`, `mouse.click`, `mouse.double`, `mouse.wheel`, `mouse.over`, `mouse.out` |
 | `q0.input` | `input.left`, `input.right`, `input.jump`, `input.jump_pressed`, `input.up`, `input.down`, `input.action`, `input.action_pressed` |
@@ -21,7 +21,8 @@
 | `q0.particles` | `q0particles.start!`, `q0particles.stop!`, `q0particles.burst!`, `q0particles.move!`, `q0particles.clear!` |
 | `q0.light` | `q0light.on!`, `q0light.off!`, `q0light.move!`, `q0light.color!`, `q0light.brightness!`, `q0light.size!`, `q0light.darkness!` |
 | `q0.layer` | `q0layer.hide!`, `q0layer.show!`, `q0layer.move!`, `q0layer.alpha!`, `q0layer.reset!`, `q0layer.solid!`, `q0layer.unsolid!`, `q0layer.touches`, `q0layer.which`, `q0layer.hit`, `q0layer.circle`, `q0layer.box`, `q0layer.visible`, `q0layer.count` |
-| `q0.window` | `q0window.fullscreen!`, `q0window.ui!`, `q0window.hotkeys!`, `q0window.move!`, `q0window.size!`, `q0window.center!`, `q0window.title!`, `q0window.top!`, `q0window.minimize!`, `q0window.perf!`, `q0window.quit!`, `window.x`, `window.y`, `window.width`, `window.height`, `window.fullscreen`, `window.ui`, `screen.width`, `screen.height` |
+| `q0.window` | `q0window.fullscreen!`, `q0window.ui!`, `q0window.hotkeys!`, `q0window.move!`, `q0window.size!`, `q0window.center!`, `q0window.title!`, `q0window.background!`, `q0window.top!`, `q0window.minimize!`, `q0window.perf!`, `q0window.quit!`, `window.x`, `window.y`, `window.width`, `window.height`, `window.fullscreen`, `window.ui`, `screen.width`, `screen.height` |
+| `q0.app` | `q0app.save!`, `q0app.forget!`, `q0app.open!`, `q0app.log!`, `app.name`, `app.id`, `app.version`, `app.author`, `app.platform`, `app.packaged`, `app.debug`, `app.args`, `save.<name>` |
 | `q0shell` | `q0shell.print!`, `q0shell.read!`, `q0shell.write!`, `q0shell.append!`, `q0shell.mkdir!`, `q0shell.list!`, `q0shell.move!`, `q0shell.delete!` |
 
 This is the list of libraries the parser recognises, not a promise that every host implements every symbol. `frame` holds the current frame only inside object scripts; `label` has no value yet. `player` stands for an instance name you give in the project. The [availability table](hosts.md) explains which program supports what.
@@ -83,6 +84,9 @@ Commands are statements; they never return a value into an expression. Put a spa
 | --- | --- | --- |
 | `gorun! target` | frame index or target string | editor preview, player |
 | `gostop! target` | frame index or target string | editor preview, player |
+| `stop!`, `play!` | none; stop or play where the timeline is | editor preview, player |
+| `gonext!`, `goprev!` | none; one frame on or back, then stop | editor preview, player |
+| `rootrun! target`, `rootstop! target` | like `gorun!`/`gostop!`, always on the main timeline; the target may be left out | editor preview, player |
 | `q0scene.switch! alias` | the alias of a bundled scene, as a string | player |
 | `q0rig.position! control, x, y` | name, two numbers | player |
 | `q0rig.value! control, value` | name, number | player |
@@ -115,7 +119,12 @@ Commands are statements; they never return a value into an expression. Put a spa
 | `q0window.title! text` | any value | player |
 | `q0window.decorations! on`, `q0window.titlebar! on` | boolean, system window frame | desktop player |
 | `q0window.icon! asset` | bundled bitmap name/id; null restores the default | desktop player |
+| `q0window.background! color` | the space around the movie: `"#rrggbb"`, `"#rgb"`, `"stage"`, `"black"`, `"white"`, or `r, g, b` (0-255); null returns to the app's choice | player |
 | `q0window.center!`, `q0window.minimize!`, `q0window.perf!`, `q0window.quit!` | none | player |
+| `q0app.save! name, value` | a name and a number, text, boolean or null; read back as `save.name` in this run and the next | player |
+| `q0app.forget! name`, `q0app.forget!` | one saved name, or nothing to forget every save | player |
+| `q0app.open! url` | a web address starting with `https://` or `http://` | player |
+| `q0app.log! values...` | written to the app's log and console (see [QIR](../qir.md)) | player |
 | `q0shell.print! value, ...` | zero to 255 values | shell |
 | `q0shell.read! path` | path | shell |
 | `q0shell.write! path, text` | path, value to write | shell |
@@ -128,3 +137,36 @@ Commands are statements; they never return a value into an expression. Put a spa
 The detailed behaviour of frames, names, rigs, physics, particles and lights is in the [host api](hosts.md); file operations, value conversion and path rules are in [q0shell](q0shell.md). Keywords are covered in [syntax](syntax.md), events in [events](events.md).
 
 Sources: [parser catalogue](../../q0s-format/src/q0lang/parser.rs), [qvm evaluation](../../q0vm/src/lib.rs), [command translation](../../q0s-format/src/q0lang/runtime.rs).
+
+## q0.app
+
+The app around the movie: who it is and where it keeps saves. In q0player a
+movie's saves live under the player's data folder, named after the file; in an
+app built with [Q0Build](../qir.md) they live in the app's own save folder.
+
+```q0lang
+import q0.app
+import q0.window
+
+best = save.best
+if best == null {
+    best = 0
+}
+if score > best {
+    q0app.save! "best", score
+}
+q0app.log! "finished with", score
+if app.packaged {
+    q0window.title! app.name + " " + app.version
+}
+```
+
+| value | what it reads |
+| --- | --- |
+| `app.name`, `app.id`, `app.version`, `app.author` | from the app's manifest; a movie in q0player has only `app.name`, its file name |
+| `app.platform` | `windows`, `linux`, `android`, `macos` or `web` |
+| `app.packaged` | true in an app built with Q0Build |
+| `app.debug` | true when the app was built with Debug build ticked |
+| `app.args` | the command line after the program, separated by spaces |
+| `save.<name>` | what `q0app.save!` kept under that name |
+

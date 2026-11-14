@@ -340,6 +340,7 @@ pub struct Online {
     counter: u64,
     view: ui::View,
     chat: chat::Chat,
+    notification_audio: crate::audio::NotificationAudio,
     /// What other people changed lately, outlined on the stage.
     edits: Vec<presence::RemoteEdit>,
     /// Loads attachment previews into textures as they arrive.
@@ -387,6 +388,7 @@ impl Default for Online {
             counter: 0,
             view: ui::View::default(),
             chat: chat::Chat::default(),
+            notification_audio: Default::default(),
             edits: Vec::new(),
             preview_ctx: Context::default(),
         }
@@ -627,6 +629,7 @@ impl Online {
         self.busy.clear();
         self.view = ui::View::default();
         self.chat = chat::Chat::default();
+        self.notification_audio = Default::default();
         self.say(message, tone);
     }
     fn refresh(&mut self) {
@@ -863,6 +866,9 @@ impl Online {
                 self.refresh();
             }
             Reply::RoomClosed { room, closed } => {
+                if let Some(row) = self.rooms.iter_mut().find(|row| row.id == room) {
+                    row.closed = closed;
+                }
                 if closed && self.room.as_ref().is_some_and(|r| r.id == room) {
                     self.leave();
                     self.say(
@@ -1080,6 +1086,7 @@ pub fn tick(app: &mut EditorApp, ctx: &Context) {
     for reply in replies {
         online.handle(app, ctx, reply);
     }
+    online.play_chat_notifications(&app.settings.online_chat);
     if online.user.is_some()
         && online.open
         && online

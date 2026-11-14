@@ -1000,6 +1000,7 @@ fn paint_q0rg(
             .unwrap_or(&[]);
         q0s_format::rig::evaluate_rig(rig, f32::from(local_frame), overrides)
     });
+    let rig_pose = q0s_format::parenting::merge_into(project, q0rg_id, local_frame, rig_pose);
     // Lights shine on the root timeline, after its light layer.
     let stage_rect = Rect::from_min_size(
         view.origin,

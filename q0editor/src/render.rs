@@ -924,12 +924,16 @@ impl<'a> RenderLookup<'a> {
         if let Some(pose) = self.rig_poses.borrow().get(&key).cloned() {
             return Some(pose);
         }
-        let rig = self.rig(q0rg_id)?;
-        let pose = Rc::new(q0s_format::rig::evaluate_rig(
+        // The rig's pose with parented layers bound too (see q0s_format::parenting).
+        let rig = self
+            .rig(q0rg_id)
+            .map(|rig| q0s_format::rig::evaluate_rig(rig, f32::from(local_frame), &[]));
+        let pose = Rc::new(q0s_format::parenting::merge_into(
+            self.project,
+            q0rg_id,
+            local_frame,
             rig,
-            f32::from(local_frame),
-            &[],
-        ));
+        )?);
         self.rig_poses.borrow_mut().insert(key, Rc::clone(&pose));
         Some(pose)
     }
@@ -998,6 +1002,7 @@ struct MaskRasterArgs {
     height: u32,
     background: [u8; 4],
     root: Affine,
+    timeline_camera_applied: bool,
     lighting: bool,
     hidden_artwork: Option<HashSet<(u16, u16)>>,
     excluded_layers: Option<HashSet<u16>>,
@@ -1047,6 +1052,7 @@ impl MaskRasterArgs {
                 excluded_layers: self.excluded_layers.as_ref(),
                 background_regions: self.lighting.then_some(regions.as_slice()),
             }),
+            self.timeline_camera_applied,
         );
         (rgba, width, height)
     }
@@ -1578,9 +1584,15 @@ impl TextureCache {
         // A bound placement move edits its rig asset, not placement.transform.
         // Refresh every pose of the touched rig, including its descendants.
         let index = self.render_index(project, Some(revision));
+        // Layer parents ride the same pose: moving a parent (or a child,
+        // stored relative to it) changes the bindings the boxes are read from.
         let rig_owners: HashSet<u16> = locators
             .iter()
-            .filter_map(|(q0rg_id, _, _)| index.rigs.contains_key(q0rg_id).then_some(*q0rg_id))
+            .filter_map(|(q0rg_id, _, _)| {
+                (index.rigs.contains_key(q0rg_id)
+                    || q0s_format::parenting::has_parents(project, *q0rg_id))
+                .then_some(*q0rg_id)
+            })
             .collect();
         if !rig_owners.is_empty() {
             self.rig_pose_cache
@@ -5067,6 +5079,8 @@ pub(crate) struct StageRenderPass<'a> {
     project: &'a ProjectV2,
     lookup: RenderLookup<'a>,
     revision: Option<(u64, u64)>,
+    draw_free_view_paper: bool,
+    timeline_camera_applied: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -5130,7 +5144,31 @@ impl<'a> StageRenderPass<'a> {
             project,
             lookup: RenderLookup::new(project, render_index, revision.is_none()),
             revision,
+            draw_free_view_paper: true,
+            timeline_camera_applied: false,
         }
+    }
+
+    pub(crate) fn through_timeline_camera(mut self, applied: bool) -> Self {
+        self.timeline_camera_applied = applied;
+        self
+    }
+
+    pub(crate) fn draw_free_view_paper_separately(
+        &mut self,
+        painter: &Painter,
+        q0rg_id: u16,
+        frame: u16,
+        view: &StageView,
+    ) {
+        q0glblend::Stage3d::paint_free_view_paper(
+            painter,
+            self.project,
+            q0rg_id,
+            frame,
+            view.screen_transform(),
+        );
+        self.draw_free_view_paper = false;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5344,6 +5382,7 @@ impl<'a> StageRenderPass<'a> {
                             [0, 0, 0, 0]
                         },
                         root,
+                        timeline_camera_applied: self.timeline_camera_applied,
                         lighting,
                         hidden_artwork: (textures.editing_mask_q0rg_id == Some(q0rg_id))
                             .then(|| textures.hidden_mask_art_layers.clone()),
@@ -5506,6 +5545,8 @@ impl<'a> StageRenderPass<'a> {
                 0,
                 tint,
                 excluded_layers.map(RootLayerFilter::Excluding),
+                self.draw_free_view_paper,
+                self.timeline_camera_applied,
             );
         }
         if std::env::var_os("Q0_RENDER_PROFILE").is_some() {
@@ -5601,6 +5642,8 @@ impl<'a> StageRenderPass<'a> {
             0,
             tint,
             Some(RootLayerFilter::ExcludingPlacement(layer_id, placement_idx)),
+            false,
+            self.timeline_camera_applied,
         );
     }
 }
@@ -5794,7 +5837,9 @@ fn q0rg_group_supported_for_gpu_masks(
             break;
         }
         for state in active {
-            if !placement_fx_is_visual_identity(placement_fx_without_tint(state.fx)) {
+            if state.fx.three.is_some()
+                || !placement_fx_is_visual_identity(placement_fx_without_tint(state.fx))
+            {
                 supported = false;
                 break;
             }
@@ -5971,7 +6016,8 @@ fn q0rg_masks_supported_by_gpu(
                     .active_placement_states_at(q0rg_id, mask_layer, local_frame)
                     .iter()
                     .all(|state| {
-                        placement_fx_is_visual_identity(placement_fx_without_tint(state.fx))
+                        state.fx.three.is_none()
+                            && placement_fx_is_visual_identity(placement_fx_without_tint(state.fx))
                             && mask_layer
                                 .placements
                                 .get(state.index)
@@ -6005,10 +6051,11 @@ fn q0rg_masks_supported_by_gpu(
                 let Some(placement) = layer.placements.get(state.index) else {
                     return true;
                 };
-                let fx_supported =
-                    placement_fx_is_visual_identity(placement_fx_without_tint(state.fx))
-                        || placement_fx_is_pure_opacity(placement_fx_without_tint(state.fx))
-                        || placement_fx_is_pure_blend(placement_fx_without_tint(state.fx));
+                let fx = placement_fx_without_tint(state.fx);
+                let fx_supported = fx.three.is_none()
+                    && (placement_fx_is_visual_identity(fx)
+                        || placement_fx_is_pure_opacity(fx)
+                        || placement_fx_is_pure_blend(fx));
                 fx_supported
                     && match placement.target {
                         Target::Asset(asset_id) => group_asset_supported(project, lookup, asset_id),
@@ -6472,7 +6519,7 @@ fn render_q0rg_outline(
     }
 }
 
-fn outline_color_for_layer(layer_id: u16) -> Color32 {
+pub(crate) fn outline_color_for_layer(layer_id: u16) -> Color32 {
     const COLORS: [Color32; 8] = [
         Color32::from_rgb(255, 86, 102),
         Color32::from_rgb(51, 211, 182),
@@ -6549,21 +6596,21 @@ fn render_q0rg(
     depth: u8,
     tint: Color32,
     root_layer_filter: Option<RootLayerFilter<'_>>,
+    draw_free_view_paper: bool,
+    timeline_camera_applied: bool,
 ) {
     let mut vector_batch = VectorMeshBatch::default();
-    // Onion skins stay flat: their tint would not reach the 3D pass.
-    let mut three = if tint == Color32::WHITE {
-        q0glblend::Stage3d::new(
-            project,
-            q0rg_id,
-            frame,
-            Affine::IDENTITY,
-            view.screen_transform(),
-            &q0s_format::runtime_scene::RuntimeSceneState::new(),
-        )
-    } else {
-        q0glblend::Stage3d::OFF
-    };
+    let mut three = q0glblend::Stage3d::new_tinted(
+        project,
+        q0rg_id,
+        frame,
+        Affine::IDENTITY,
+        view.screen_transform(),
+        &q0s_format::runtime_scene::RuntimeSceneState::new(),
+        tint,
+        draw_free_view_paper,
+        timeline_camera_applied,
+    );
     render_q0rg_with_vector_batch(
         painter,
         project,
@@ -6648,17 +6695,17 @@ fn render_q0rg_with_vector_batch(
             }
         }
         previous_layer = Some(layer.layer_id);
+        let visible = (depth != 0
+            || root_layer_filter.is_none_or(|filter| filter.includes(layer.layer_id)))
+            && project.layer_is_visible(q0rg_id, layer.layer_id);
         // Flat art the 3D lights reach, on this layer of the root or inside
         // a symbol placed on such a layer.
         let layer_lit_flat = if depth == 0 {
-            three.next_layer(layer.layer_id)
+            three.next_layer_with_visibility(layer.layer_id, visible)
         } else {
             three.inside_lit
         };
-        if depth == 0 && root_layer_filter.is_some_and(|filter| !filter.includes(layer.layer_id)) {
-            continue;
-        }
-        if !project.layer_is_visible(q0rg_id, layer.layer_id) {
+        if !visible {
             continue;
         }
         let is_mask =
@@ -6757,7 +6804,7 @@ fn render_q0rg_with_vector_batch(
                 };
                 if three.takes(target_asset, &resolved.fx, layer_lit_flat) {
                     vector_batch.flush(painter);
-                    let opacity = resolved.fx.opacity.clamp(0.0, 1.0) * f32::from(tint.a()) / 255.0;
+                    let opacity = resolved.fx.opacity.clamp(0.0, 1.0);
                     three.push(
                         project,
                         q0rg_id,
@@ -9079,6 +9126,7 @@ pub(crate) fn render_target_preview_with_revision(
         }
         Target::Q0rg(q0rg_id) => render_q0rg(
             painter, project, &lookup, q0rg_id, frame, affine, view, textures, ctx, 0, tint, None,
+            false, false,
         ),
     }
 }
@@ -9247,6 +9295,13 @@ fn placement_bbox_at_depth(
         return None;
     }
     let aff = Affine::from_transform(placement.transform);
+    if depth == Q0RG_RECURSION_LIMIT {
+        if let Some(bounds) =
+            standalone_placement_3d_stage_bounds(project, placement, &pts_local, stroke_pad)
+        {
+            return Some(bounds);
+        }
+    }
     let mut min_x = f32::INFINITY;
     let mut min_y = f32::INFINITY;
     let mut max_x = f32::NEG_INFINITY;
@@ -9399,7 +9454,376 @@ fn placement_frame_bbox_at_depth(
         return None;
     }
     let local = q0rg_shown_bbox(project, child_id, shown_frame, depth - 1)?;
+    if depth == Q0RG_RECURSION_LIMIT {
+        let corners = [
+            Vec2::new(local.0, local.1),
+            Vec2::new(local.2, local.1),
+            Vec2::new(local.2, local.3),
+            Vec2::new(local.0, local.3),
+        ];
+        if let Some(bounds) =
+            standalone_placement_3d_stage_bounds(project, placement, &corners, 0.0)
+        {
+            return Some(bounds);
+        }
+    }
     transformed_rect_bounds(local, Affine::from_transform(placement.transform))
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Placement3dStageProjection {
+    pub stage_bounds: Option<(f32, f32, f32, f32)>,
+    pub effective_local_bbox: Option<(f32, f32, f32, f32)>,
+    pub effective_visual_affine: Affine,
+    pub plane_to_stage_affine: Affine,
+    pub view3d: q0s_format::three::draw::View3d,
+    pub matrix: q0s_format::three::Mat4,
+    pub z: f32,
+}
+
+impl Placement3dStageProjection {
+    /// Maps a 2D stage point onto the placement's `Z = self.z` plane.
+    pub(crate) fn stage_to_plane(&self, stage_point: Vec2) -> Vec2 {
+        if let Some((origin, dir)) = self.view3d.ray(stage_point.x, stage_point.y) {
+            if dir.z.abs() > 1.0e-6 {
+                let t = (self.z - origin.z) / dir.z;
+                if t > 0.0 {
+                    let hit = origin + dir * t;
+                    if hit.x.is_finite() && hit.y.is_finite() {
+                        return Vec2::new(hit.x, hit.y);
+                    }
+                }
+            }
+        }
+        self.plane_to_stage_affine
+            .inverse()
+            .map(|inv| inv.apply(stage_point))
+            .unwrap_or(stage_point)
+    }
+
+    /// Maps a point on the placement's `Z = self.z` plane into 2D stage coordinates.
+    pub(crate) fn plane_to_stage(&self, plane_point: Vec2) -> Vec2 {
+        if let Some([sx, sy, _]) = self.view3d.project(q0s_format::three::V3::new(
+            plane_point.x,
+            plane_point.y,
+            self.z,
+        )) {
+            if sx.is_finite() && sy.is_finite() {
+                return Vec2::new(sx, sy);
+            }
+        }
+        self.plane_to_stage_affine.apply(plane_point)
+    }
+
+    /// Intersects the camera ray through `stage_point` with the placement's
+    /// 3D card plane (`self.matrix`), returning local `(lx, ly)` coordinates.
+    pub(crate) fn stage_to_local_card(&self, stage_point: Vec2) -> Option<Vec2> {
+        use q0s_format::three::V3;
+        let (ray_o, ray_d) = self.view3d.ray(stage_point.x, stage_point.y)?;
+        let card_o = self.matrix.transform_point(V3::ZERO);
+        let ux = self.matrix.transform_point(V3::X) - card_o;
+        let uy = self.matrix.transform_point(V3::Y) - card_o;
+        let normal = ux.cross(uy);
+        let n_len_sq = normal.dot(normal);
+        if n_len_sq <= 1.0e-10 {
+            return None;
+        }
+        let denom = ray_d.dot(normal);
+        if denom.abs() <= 1.0e-6 {
+            return None;
+        }
+        let t = (card_o - ray_o).dot(normal) / denom;
+        if t <= 0.0 {
+            return None;
+        }
+        let v = (ray_o + ray_d * t) - card_o;
+        let lx = v.cross(uy).dot(normal) / n_len_sq;
+        let ly = ux.cross(v).dot(normal) / n_len_sq;
+        (lx.is_finite() && ly.is_finite()).then_some(Vec2::new(lx, ly))
+    }
+}
+
+fn plane_z_to_stage_affine(
+    view3d: &q0s_format::three::draw::View3d,
+    center_plane: Vec2,
+    z: f32,
+) -> Option<Affine> {
+    use q0s_format::three::V3;
+    let p0 = view3d.project(V3::new(center_plane.x, center_plane.y, z))?;
+    let px = view3d.project(V3::new(center_plane.x + 1.0, center_plane.y, z))?;
+    let py = view3d.project(V3::new(center_plane.x, center_plane.y + 1.0, z))?;
+    let dx = Vec2::new(px[0] - p0[0], px[1] - p0[1]);
+    let dy = Vec2::new(py[0] - p0[0], py[1] - p0[1]);
+    if !dx.x.is_finite() || !dx.y.is_finite() || !dy.x.is_finite() || !dy.y.is_finite() {
+        return None;
+    }
+    Some(Affine {
+        a11: dx.x,
+        a12: dy.x,
+        a21: dx.y,
+        a22: dy.y,
+        tx: p0[0] - dx.x * center_plane.x - dy.x * center_plane.y,
+        ty: p0[1] - dx.y * center_plane.x - dy.y * center_plane.y,
+    })
+}
+
+fn project_outline_3d_bounds(
+    outline: &[Vec2],
+    matrix: &q0s_format::three::Mat4,
+    view3d: &q0s_format::three::draw::View3d,
+    stroke_pad_stage: f32,
+) -> Option<(f32, f32, f32, f32)> {
+    use q0s_format::three::V3;
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for p in outline {
+        let Some([sx, sy, _]) = view3d.project(matrix.transform_point(V3::new(p.x, p.y, 0.0)))
+        else {
+            continue;
+        };
+        if !sx.is_finite() || !sy.is_finite() {
+            continue;
+        }
+        min_x = min_x.min(sx);
+        min_y = min_y.min(sy);
+        max_x = max_x.max(sx);
+        max_y = max_y.max(sy);
+    }
+    if !min_x.is_finite() {
+        return None;
+    }
+    let pad = stroke_pad_stage.max(0.0);
+    Some((min_x - pad, min_y - pad, max_x + pad, max_y + pad))
+}
+
+fn standalone_placement_3d_stage_bounds(
+    project: &ProjectV2,
+    placement: &Placement,
+    local_outline: &[Vec2],
+    stroke_pad: f32,
+) -> Option<(f32, f32, f32, f32)> {
+    let asset = match placement.target {
+        Target::Asset(id) => project.assets.iter().find(|a| a.id() == id),
+        Target::Q0rg(_) => None,
+    };
+    let free = q0glblend::free_view();
+    let is_placed_model = matches!(asset, Some(Asset::Model(_)))
+        && (placement.instance_id != 0
+            || placement.transform != Transform2D::IDENTITY
+            || placement.fx.three.is_some());
+    if free.is_none() && placement.fx.three.is_none() && !is_placed_model {
+        return None;
+    }
+    let q0rg_id = project.meta.entry_q0rg_id;
+    let local_frame = placement.frame;
+    let scene_state = q0s_format::runtime_scene::RuntimeSceneState::new();
+    let mut look =
+        q0s_format::three::frame::scene_look(project, q0rg_id, local_frame, |instance| {
+            q0s_format::raster::runtime_instance_matrix(
+                project,
+                q0rg_id,
+                local_frame,
+                instance,
+                &scene_state,
+            )
+        });
+    if let Some(free) = free {
+        look.camera = free.camera;
+        look.orthographic = free.orthographic;
+    }
+    let view3d = look.view(project, Affine::IDENTITY, [1, 1]);
+    let local_affine = Affine::from_transform(placement.transform);
+    let matrix = q0s_format::three::frame::placement_space_matrix(
+        &q0s_format::three::Mat4::IDENTITY,
+        local_affine,
+        &placement.fx,
+        placement.pivot,
+    );
+    let space = placement.fx.three.unwrap_or_default();
+    if let Some(Asset::Model(model)) = asset {
+        let track = project
+            .runtime
+            .scene3d
+            .pose(q0rg_id, placement.instance_id)
+            .map(|track| (track, local_frame));
+        let world =
+            q0s_format::three::draw::pose_model(&model.data, &space, 0.0, project.meta.fps, track);
+        if let Some([x0, y0, x1, y1]) =
+            q0s_format::three::frame::model_output_bounds(&model.data, &matrix, &world, &view3d)
+        {
+            return Some((x0, y0, x1, y1));
+        }
+    }
+    let scale =
+        q0s_format::three::frame::screen_scale(&view3d, &matrix, q0s_format::three::V3::ZERO);
+    project_outline_3d_bounds(local_outline, &matrix, &view3d, stroke_pad * scale)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn placement_3d_stage_projection(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    layer: &q0s_format::v2::Layer,
+    placement_idx: usize,
+    frame: u16,
+    override_local_affine: Option<Affine>,
+    local_2d_bounds: Option<(f32, f32, f32, f32)>,
+) -> Option<Placement3dStageProjection> {
+    let placement = layer.placements.get(placement_idx)?;
+    let q0rg = project.q0rgs.iter().find(|q| q.q0rg_id == q0rg_id)?;
+    let local_frame = if q0rg.frame_count > 0 {
+        frame % q0rg.frame_count
+    } else {
+        0
+    };
+    let active = q0s_format::raster::active_placement_states_at(layer, local_frame)
+        .into_iter()
+        .find(|a| a.index == placement_idx);
+    let fx = active.as_ref().map(|a| a.fx).unwrap_or(placement.fx);
+    let playback_start_frame = active
+        .as_ref()
+        .map(|a| a.playback_start_frame)
+        .unwrap_or(placement.frame);
+    let local_affine = override_local_affine.unwrap_or_else(|| {
+        active
+            .as_ref()
+            .map(|a| Affine::from_transform(a.transform))
+            .unwrap_or_else(|| Affine::from_transform(placement.transform))
+    });
+    let asset = match placement.target {
+        Target::Asset(id) => project.assets.iter().find(|a| a.id() == id),
+        Target::Q0rg(_) => None,
+    };
+    let free = q0glblend::free_view();
+    if free.is_none()
+        && !q0s_format::three::frame::project_uses_3d(project)
+        && !q0s_format::three::frame::is_3d(asset, &fx)
+    {
+        return None;
+    }
+    let scene_state = q0s_format::runtime_scene::RuntimeSceneState::new();
+    let mut look =
+        q0s_format::three::frame::scene_look(project, q0rg_id, local_frame, |instance| {
+            q0s_format::raster::runtime_instance_matrix(
+                project,
+                q0rg_id,
+                local_frame,
+                instance,
+                &scene_state,
+            )
+        });
+    if let Some(free) = free {
+        look.camera = free.camera;
+        look.orthographic = free.orthographic;
+    }
+    let lit_flat = look.flat_cut().layer(layer.layer_id)
+        && matches!(
+            asset,
+            Some(Asset::Vector(_) | Asset::Bitmap(_) | Asset::Q0v(_))
+        );
+    if free.is_none() && !q0s_format::three::frame::is_3d(asset, &fx) && !lit_flat {
+        return None;
+    }
+    let view3d = look.view(project, Affine::IDENTITY, [1, 1]);
+    let matrix = q0s_format::three::frame::placement_space_matrix(
+        &q0s_format::three::Mat4::IDENTITY,
+        local_affine,
+        &fx,
+        placement.pivot,
+    );
+    let space = fx.three.unwrap_or_default();
+    let elapsed = local_frame.saturating_sub(playback_start_frame);
+    let local_2d_bounds = local_2d_bounds
+        .or_else(|| placement_shown_local_bbox(project, q0rg_id, layer, placement_idx, frame));
+    let center_local = placement
+        .pivot
+        .or_else(|| {
+            local_2d_bounds.map(|(x0, y0, x1, y1)| Vec2::new((x0 + x1) * 0.5, (y0 + y1) * 0.5))
+        })
+        .unwrap_or(Vec2::new(0.0, 0.0));
+    let center_plane = local_affine.apply(center_local);
+    let plane_to_stage_affine = plane_z_to_stage_affine(&view3d, center_plane, space.z)?;
+    let effective_visual_affine = Affine::compose(plane_to_stage_affine, local_affine);
+    let inv_effective = effective_visual_affine.inverse()?;
+
+    let (stage_bounds, effective_local_bbox) = if let Some(Asset::Model(model)) = asset {
+        let track = project
+            .runtime
+            .scene3d
+            .pose(q0rg_id, placement.instance_id)
+            .map(|track| (track, local_frame));
+        let world = q0s_format::three::draw::pose_model(
+            &model.data,
+            &space,
+            f32::from(elapsed),
+            project.meta.fps,
+            track,
+        );
+        let stage_b =
+            q0s_format::three::frame::model_output_bounds(&model.data, &matrix, &world, &view3d)
+                .map(|[x0, y0, x1, y1]| (x0, y0, x1, y1))
+                .or_else(|| {
+                    local_2d_bounds.and_then(|(x0, y0, x1, y1)| {
+                        project_outline_3d_bounds(
+                            &[
+                                Vec2::new(x0, y0),
+                                Vec2::new(x1, y0),
+                                Vec2::new(x1, y1),
+                                Vec2::new(x0, y1),
+                            ],
+                            &matrix,
+                            &view3d,
+                            0.0,
+                        )
+                    })
+                });
+        let local_b = if inv_effective.a12.abs() <= 1.0e-5 && inv_effective.a21.abs() <= 1.0e-5 {
+            stage_b.and_then(|b| transformed_rect_bounds(b, inv_effective))
+        } else {
+            let view_local = look.view(project, inv_effective, [1, 1]);
+            q0s_format::three::frame::model_output_bounds(&model.data, &matrix, &world, &view_local)
+                .map(|[x0, y0, x1, y1]| (x0, y0, x1, y1))
+                .or_else(|| stage_b.and_then(|b| transformed_rect_bounds(b, inv_effective)))
+        };
+        (stage_b, local_b)
+    } else if let Some((lx0, ly0, lx1, ly1)) = local_2d_bounds {
+        let corners = [
+            Vec2::new(lx0, ly0),
+            Vec2::new(lx1, ly0),
+            Vec2::new(lx1, ly1),
+            Vec2::new(lx0, ly1),
+        ];
+        let view_local = look.view(project, inv_effective, [1, 1]);
+        let local_b = project_outline_3d_bounds(&corners, &matrix, &view_local, 0.0);
+        let stroke_pad = asset.map(asset_stroke_padding).unwrap_or(0.0);
+        let scale = q0s_format::three::frame::screen_scale(
+            &view3d,
+            &matrix,
+            q0s_format::three::V3::new(center_local.x, center_local.y, 0.0),
+        );
+        let stage_b = match (placement.target, asset) {
+            (Target::Asset(asset_id), Some(asset)) => {
+                let outline = asset_local_visual_outline(project, asset_id, asset);
+                project_outline_3d_bounds(&outline, &matrix, &view3d, stroke_pad * scale)
+            }
+            _ => project_outline_3d_bounds(&corners, &matrix, &view3d, 0.0),
+        };
+        (stage_b, local_b)
+    } else {
+        (None, None)
+    };
+
+    Some(Placement3dStageProjection {
+        stage_bounds,
+        effective_local_bbox,
+        effective_visual_affine,
+        plane_to_stage_affine,
+        view3d,
+        matrix,
+        z: space.z,
+    })
 }
 
 /// What a symbol shows at `frame`, in its own coordinates, down through
@@ -9551,6 +9975,19 @@ impl PlacementBoundsCache {
             return None;
         }
         let local = self.q0rg_frame_bbox(project, child_id, shown_frame, depth - 1)?;
+        if depth == Q0RG_RECURSION_LIMIT {
+            let corners = [
+                Vec2::new(local.0, local.1),
+                Vec2::new(local.2, local.1),
+                Vec2::new(local.2, local.3),
+                Vec2::new(local.0, local.3),
+            ];
+            if let Some(bounds) =
+                standalone_placement_3d_stage_bounds(project, placement, &corners, 0.0)
+            {
+                return Some(bounds);
+            }
+        }
         transformed_rect_bounds(local, Affine::from_transform(placement.transform))
     }
 
@@ -9584,6 +10021,7 @@ impl PlacementBoundsCache {
                 };
                 let mut shown = placement.clone();
                 shown.transform = active.transform;
+                shown.fx = active.fx;
                 let placed = match shown.target {
                     Target::Asset(_) => self.placement_bbox_at_depth(project, &shown, depth),
                     Target::Q0rg(child_id) => {
@@ -9698,10 +10136,31 @@ impl PlacementBoundsCache {
                         asset_local_visual_outline(project, asset_id, asset),
                     );
                 }
-                transformed_outline_bounds(self.asset_outlines.get(&asset_id)?, affine)?
+                let outline = self.asset_outlines.get(&asset_id)?;
+                if depth == Q0RG_RECURSION_LIMIT {
+                    if let Some(bounds) = standalone_placement_3d_stage_bounds(
+                        project, placement, outline, stroke_pad,
+                    ) {
+                        return Some(bounds);
+                    }
+                }
+                transformed_outline_bounds(outline, affine)?
             }
             Target::Q0rg(child_id) => {
                 let local_bounds = self.q0rg_local_bbox(project, child_id, depth - 1)?;
+                if depth == Q0RG_RECURSION_LIMIT {
+                    let corners = [
+                        Vec2::new(local_bounds.0, local_bounds.1),
+                        Vec2::new(local_bounds.2, local_bounds.1),
+                        Vec2::new(local_bounds.2, local_bounds.3),
+                        Vec2::new(local_bounds.0, local_bounds.3),
+                    ];
+                    if let Some(bounds) =
+                        standalone_placement_3d_stage_bounds(project, placement, &corners, 0.0)
+                    {
+                        return Some(bounds);
+                    }
+                }
                 transformed_rect_bounds(local_bounds, affine)?
             }
         };
@@ -14192,6 +14651,45 @@ mod tests {
                 .tx,
             12.0
         );
+    }
+
+    #[test]
+    fn moving_a_layer_parent_refreshes_its_childs_cached_pose() {
+        let mut project = crate::state::default_project();
+        let placement = |instance_id: u32, tx: f32| Placement {
+            pivot: None,
+            instance_id,
+            frame: 0,
+            target: Target::Asset(99),
+            transform: Transform2D {
+                tx,
+                ..Transform2D::IDENTITY
+            },
+            tween: Tween::None,
+            fx: PlacementFx::default(),
+        };
+        let mut child = project.q0rgs[0].layers[0].clone();
+        child.layer_id = 2;
+        child.placements.clear();
+        child.push_placement(placement(6, 10.0));
+        project.q0rgs[0].layers[0].push_placement(placement(5, 0.0));
+        project.q0rgs[0].layers.push(child);
+        q0s_format::parenting::set_parent(&mut project, 1, 2, Some(1)).unwrap();
+
+        let mut textures = TextureCache::default();
+        let revision = (8, 3);
+        let child_x = |textures: &mut TextureCache, project: &ProjectV2| {
+            textures
+                .scoped_rig_pose(project, revision, 1, 0)
+                .and_then(|pose| pose.binding_transform(6))
+                .map(|affine| affine.tx)
+        };
+        assert_eq!(child_x(&mut textures, &project), Some(10.0));
+
+        // A live drag keeps the revision; the child must still follow.
+        project.q0rgs[0].layers[0].placements[0].transform.tx = 100.0;
+        textures.placement_transforms_changed(&project, revision, &[(1, 1, 0)]);
+        assert_eq!(child_x(&mut textures, &project), Some(110.0));
     }
 
     #[test]

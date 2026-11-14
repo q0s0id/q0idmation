@@ -1459,6 +1459,19 @@ fn runtime_action_label(action: &super::runtime::RuntimeAction) -> String {
                 WindowCommand::Minimize => "q0window.minimize!".to_string(),
                 WindowCommand::PerformanceLog => "q0window.perf!".to_string(),
                 WindowCommand::Quit => "q0window.quit!".to_string(),
+                WindowCommand::AppSave { key, value } => {
+                    format!("q0app.save! {key:?}, {}", value.display_lossy())
+                }
+                WindowCommand::AppForget(Some(key)) => format!("q0app.forget! {key:?}"),
+                WindowCommand::AppForget(None) => "q0app.forget!".to_string(),
+                WindowCommand::AppOpen(url) => format!("q0app.open! {url:?}"),
+                WindowCommand::AppLog(text) => format!("q0app.log! {text:?}"),
+                WindowCommand::RootTimeline { play, target } => format!(
+                    "{} {}",
+                    if *play { "rootrun!" } else { "rootstop!" },
+                    timeline_target_label(target)
+                ),
+                WindowCommand::Background(choice) => format!("q0window.background! {choice:?}"),
             }
         }
     }
@@ -1470,6 +1483,9 @@ fn timeline_target_label(target: &super::runtime::TimelineTarget) -> String {
     match target {
         TimelineTarget::Frame(frame) => frame.to_string(),
         TimelineTarget::Label(label) => label.clone(),
+        TimelineTarget::Here => "this frame".to_string(),
+        TimelineTarget::Next => "the next frame".to_string(),
+        TimelineTarget::Previous => "the previous frame".to_string(),
     }
 }
 

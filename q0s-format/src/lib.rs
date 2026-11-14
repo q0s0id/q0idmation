@@ -5,6 +5,7 @@ mod io;
 pub mod lighting;
 pub mod migrate;
 pub mod model;
+pub mod parenting;
 pub mod parser;
 pub mod particles;
 pub mod physics;

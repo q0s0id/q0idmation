@@ -5,10 +5,11 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
 use std::num::NonZeroU32;
 use std::sync::{Arc, Weak};
 
-use egui::{PaintCallback, Painter, Rect, Shape};
+use egui::{Color32, PaintCallback, Painter, Rect, Shape};
 use glow::HasContext as _;
 use q0s_format::three::draw::{draw_passes, DrawItem, Frame3d, View3d};
 use q0s_format::three::math::{Mat4, V3};
@@ -24,6 +25,15 @@ thread_local! {
 /// Draws `frame` over everything painted so far inside `rect`. The frame's
 /// view maps stage space to screen points.
 pub fn paint_frame3d(painter: &Painter, rect: Rect, frame: Arc<Frame3d>) {
+    paint_tinted_frame3d(painter, rect, frame, Color32::WHITE);
+}
+
+pub(crate) fn paint_tinted_frame3d(
+    painter: &Painter,
+    rect: Rect,
+    frame: Arc<Frame3d>,
+    tint: Color32,
+) {
     let rect = rect.intersect(painter.clip_rect());
     if !rect.is_positive() || frame.items.is_empty() {
         return;
@@ -44,9 +54,7 @@ pub fn paint_frame3d(painter: &Painter, rect: Rect, frame: Arc<Frame3d>) {
             let renderer = renderers.entry(key).or_insert_with(|| {
                 // SAFETY: called on the GL thread inside egui's paint
                 // callback, with its context current.
-                unsafe { Renderer::new(gl) }
-                    .map_err(|error| eprintln!("3D shader: {error}"))
-                    .ok()
+                unsafe { Renderer::new(gl) }.map_err(report_error).ok()
             });
             if let Some(renderer) = renderer {
                 // SAFETY: as above.
@@ -57,6 +65,7 @@ pub fn paint_frame3d(painter: &Painter, rect: Rect, frame: Arc<Frame3d>) {
                         region,
                         info.pixels_per_point,
                         info.screen_size_px,
+                        tint,
                     )
                 };
             }
@@ -140,23 +149,35 @@ uniform float u_shadow_texel0;
 uniform float u_shadow_texel1;
 out vec4 out_color;
 
-// How much of a light reaches past its shadow map, with a 3x3 filter.
+// Quadratic weights for the nearest three texels along an axis.
+vec3 shadow_weights(float f) {
+    float inv = 1.0 - f;
+    return vec3(0.5 * inv * inv, 0.5 + f * inv, 0.5 * f * f);
+}
+
+// Filter depth comparisons with weights that vary within each texel.
 float shadow_seen(sampler2D map, mat4 m, vec3 world, vec3 n, float texel) {
     vec4 c = m * vec4(world + n * texel * 1.5, 1.0);
     if (c.w <= 1e-6) return 1.0;
     vec3 p = c.xyz / c.w;
-    if (abs(p.x) > 1.0 || abs(p.y) > 1.0 || p.z > 1.0) return 1.0;
-    vec2 uv = p.xy * 0.5 + 0.5;
-    float z = p.z * 0.5 + 0.5;
-    float size = float(textureSize(map, 0).x);
+    if (abs(p.x) > 1.0 || abs(p.y) > 1.0) return 1.0;
+    // Receivers behind the map can still be shadowed by its casters.
+    // At the far depth, untouched texels (cleared to 1) still pass.
+    float z = min(p.z * 0.5 + 0.5 - 0.0005, 1.0);
+    ivec2 size = textureSize(map, 0);
+    vec2 uv = (p.xy * 0.5 + 0.5) * vec2(size);
+    ivec2 center = ivec2(uv);
+    vec3 wx = shadow_weights(fract(uv.x));
+    vec3 wy = shadow_weights(fract(uv.y));
     float lit = 0.0;
-    for (int y = -1; y <= 1; ++y) {
-        for (int x = -1; x <= 1; ++x) {
-            float d = texture(map, uv + vec2(float(x), float(y)) / size).r;
-            lit += (z - 0.0005 <= d) ? 1.0 : 0.0;
+    for (int y = 0; y < 3; ++y) {
+        for (int x = 0; x < 3; ++x) {
+            ivec2 tap = clamp(center + ivec2(x - 1, y - 1), ivec2(0), size - 1);
+            float d = texelFetch(map, tap, 0).r;
+            lit += wx[x] * wy[y] * step(z, d);
         }
     }
-    return lit / 9.0;
+    return min(lit, 1.0);
 }
 
 float step_light(float l, float bands) {
@@ -358,9 +379,10 @@ void main() {
 const COMPOSITE_FRAGMENT: &str = r#"#version 140
 in vec2 v_uv;
 uniform sampler2D u_tex;
+uniform vec4 u_tint;
 out vec4 out_color;
 void main() {
-    out_color = texture(u_tex, v_uv);
+    out_color = texture(u_tex, v_uv) * u_tint;
 }
 "#;
 
@@ -448,6 +470,7 @@ struct Renderer {
     program: glow::Program,
     composite: glow::Program,
     composite_tex: Option<glow::UniformLocation>,
+    composite_tint: Option<glow::UniformLocation>,
     overlay: glow::Program,
     overlay_view: Option<glow::UniformLocation>,
     overlay_clip: Option<glow::UniformLocation>,
@@ -525,6 +548,14 @@ fn u32_bytes(values: &[u32]) -> &[u8] {
     }
 }
 
+fn report_error(error: String) {
+    #[cfg(not(target_arch = "wasm32"))]
+    eprintln!("3D renderer: {error}");
+    #[cfg(target_arch = "wasm32")]
+    crate::web_mask::record_error(format!("webgl 3d renderer: {error}"));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn native_framebuffer(raw: i32) -> Option<glow::Framebuffer> {
     NonZeroU32::new(raw as u32).map(glow::NativeFramebuffer)
 }
@@ -666,6 +697,7 @@ impl Renderer {
         Ok(Self {
             program,
             composite_tex: gl.get_uniform_location(composite, "u_tex"),
+            composite_tint: gl.get_uniform_location(composite, "u_tint"),
             overlay_view: gl.get_uniform_location(overlay, "u_view"),
             overlay_clip: gl.get_uniform_location(overlay, "u_clip"),
             overlay_point: gl.get_uniform_location(overlay, "u_point_size"),
@@ -1020,14 +1052,24 @@ impl Renderer {
         region: crate::CallbackRegion,
         pixels_per_point: f32,
         screen_size_px: [u32; 2],
+        tint: Color32,
     ) {
         let (width, height) = (region.width, region.height);
+        #[cfg(not(target_arch = "wasm32"))]
         let read_framebuffer =
             native_framebuffer(gl.get_parameter_i32(glow::READ_FRAMEBUFFER_BINDING));
+        #[cfg(not(target_arch = "wasm32"))]
         let draw_framebuffer =
             native_framebuffer(gl.get_parameter_i32(glow::DRAW_FRAMEBUFFER_BINDING));
+        // Browser paint callbacks draw directly to the canvas, whose
+        // framebuffer is represented by None in WebGL.
+        #[cfg(target_arch = "wasm32")]
+        let (read_framebuffer, draw_framebuffer) = (None, None);
         self.sweep(gl);
         if self.ensure_target(gl, width, height).is_none() {
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, read_framebuffer);
+            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, draw_framebuffer);
+            report_error("could not allocate a 3d render target".into());
             return;
         }
         let target = self.target.as_ref().expect("target");
@@ -1419,6 +1461,10 @@ impl Renderer {
         gl.use_program(Some(self.composite));
         gl.bind_texture(glow::TEXTURE_2D, Some(resolve_texture));
         gl.uniform_1_i32(self.composite_tex.as_ref(), 0);
+        gl.uniform_4_f32_slice(
+            self.composite_tint.as_ref(),
+            &tint.to_array().map(|channel| f32::from(channel) / 255.0),
+        );
         gl.enable(glow::BLEND);
         gl.blend_func_separate(
             glow::ONE,
@@ -1511,21 +1557,13 @@ impl Renderer {
                 pass.maps.push((fb, texture));
             }
         }
-        let Some(pass) = self.shadow.as_ref() else {
+        // The pass owns the uniform locations, which are JS objects on WebGL.
+        // Hold it apart from the mesh and texture caches while drawing.
+        let Some(pass) = self.shadow.take() else {
             return Vec::new();
         };
-        let (program, light_u, model_u, cut_u, tex_u, pos, uv) = (
-            pass.program,
-            pass.light,
-            pass.model,
-            pass.cut,
-            pass.tex,
-            pass.pos,
-            pass.uv,
-        );
-        let maps: Vec<(glow::Framebuffer, glow::Texture)> =
-            pass.maps.iter().take(views.len()).copied().collect();
-        gl.use_program(Some(program));
+        let (pos, uv) = (pass.pos, pass.uv);
+        gl.use_program(Some(pass.program));
         gl.bind_vertex_array(Some(self.vao));
         gl.disable(glow::BLEND);
         gl.disable(glow::CULL_FACE);
@@ -1535,7 +1573,7 @@ impl Renderer {
         gl.color_mask(false, false, false, false);
         gl.viewport(0, 0, size, size);
         gl.active_texture(glow::TEXTURE0);
-        gl.uniform_1_i32(tex_u.as_ref(), 0);
+        gl.uniform_1_i32(pass.tex.as_ref(), 0);
         let attrib = |location: u32, buffer: glow::Buffer, size: i32, stride: i32, offset: i32| {
             if location != u32::MAX {
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(buffer));
@@ -1544,14 +1582,17 @@ impl Renderer {
             }
         };
         let stride = (STATIC_FLOATS * 4) as i32;
-        for (view, (fb, _)) in views.iter().zip(&maps) {
+        for (view, (fb, _)) in views.iter().zip(&pass.maps) {
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(*fb));
             gl.clear_depth_f32(1.0);
             gl.clear(glow::DEPTH_BUFFER_BIT);
-            Self::set_matrix(gl, light_u.as_ref(), &view.matrix);
+            Self::set_matrix(gl, pass.light.as_ref(), &view.matrix);
             for item in &frame.items {
+                if !item.casts_shadow() {
+                    continue;
+                }
                 match item {
-                    DrawItem::Mesh(mesh) if mesh.opacity >= 0.5 => {
+                    DrawItem::Mesh(mesh) => {
                         let Some((vertices, indices)) = self.mesh_buffers(gl, &mesh.render) else {
                             continue;
                         };
@@ -1574,8 +1615,8 @@ impl Renderer {
                         }
                         attrib(uv, vertices, 2, stride, 6 * 4);
                         gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(indices));
-                        Self::set_matrix(gl, model_u.as_ref(), &mesh.matrix);
-                        gl.uniform_1_i32(cut_u.as_ref(), 0);
+                        Self::set_matrix(gl, pass.model.as_ref(), &mesh.matrix);
+                        gl.uniform_1_i32(pass.cut.as_ref(), 0);
                         gl.draw_elements(
                             glow::TRIANGLES,
                             mesh.render.indices.len() as i32,
@@ -1583,7 +1624,7 @@ impl Renderer {
                             0,
                         );
                     }
-                    DrawItem::Plane(plane) if !plane.layered && plane.opacity >= 0.5 => {
+                    DrawItem::Plane(plane) => {
                         let Some(texture) = self.texture(
                             gl,
                             &plane.image.rgba,
@@ -1601,12 +1642,11 @@ impl Renderer {
                         let model = plane.matrix
                             * Mat4::translation(V3::new(x0, y0, 0.0))
                             * Mat4::scale(V3::new(x1 - x0, y1 - y0, 1.0));
-                        Self::set_matrix(gl, model_u.as_ref(), &model);
+                        Self::set_matrix(gl, pass.model.as_ref(), &model);
                         gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-                        gl.uniform_1_i32(cut_u.as_ref(), 1);
+                        gl.uniform_1_i32(pass.cut.as_ref(), 1);
                         gl.draw_elements(glow::TRIANGLES, 6, glow::UNSIGNED_INT, 0);
                     }
-                    _ => {}
                 }
             }
         }
@@ -1616,7 +1656,14 @@ impl Renderer {
             }
         }
         gl.color_mask(true, true, true, true);
-        maps.iter().map(|(_, texture)| *texture).collect()
+        let textures = pass
+            .maps
+            .iter()
+            .take(views.len())
+            .map(|(_, texture)| *texture)
+            .collect();
+        self.shadow = Some(pass);
+        textures
     }
 
     unsafe fn draw_overlay(

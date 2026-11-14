@@ -1,8 +1,10 @@
 use egui::{Color32, ScrollArea, Ui};
+use q0s_format::raster::ActivePlacementState;
 use q0s_format::transform::Affine;
 use q0s_format::v2::{
-    Asset, BlendMode, BlurFx, DropShadowFx, GlowFx, GradientFill, PlacementFx, Q0rgPlayback,
-    Q0rgPlaybackMode, Rgba, Stroke as VStroke, Target, VectorAppearance, VectorMaterial,
+    Asset, BlendMode, BlurFx, DropShadowFx, GlowFx, GradientFill, Placement, PlacementFx,
+    ProjectV2, Q0rgPlayback, Q0rgPlaybackMode, Rgba, Stroke as VStroke, Target, VectorAppearance,
+    VectorMaterial,
 };
 
 use crate::app::{Action, EditorApp};
@@ -896,7 +898,7 @@ fn scene_properties(app: &mut EditorApp, ui: &mut Ui) {
                                 ui,
                                 &scene.name,
                                 active,
-                                (ui.available_width() - 32.0).max(30.0),
+                                (ui.available_width() - 58.0).max(30.0),
                             )
                             .on_hover_text("Switch to this scene")
                             .clicked()
@@ -909,6 +911,20 @@ fn scene_properties(app: &mut EditorApp, ui: &mut Ui) {
                                     draft: scene.name.clone(),
                                     focus_requested: true,
                                 });
+                            }
+                            if icon_button_enabled(
+                                ui,
+                                scenes.len() > 1,
+                                Icon::Delete,
+                                if scenes.len() > 1 {
+                                    "Delete scene"
+                                } else {
+                                    "The project needs at least one scene"
+                                },
+                            )
+                            .clicked()
+                            {
+                                app.queue(Action::DeleteScene(scene.scene_id));
                             }
                         });
                     }
@@ -2342,6 +2358,168 @@ fn q0rg_playback_mode_name(mode: Q0rgPlaybackMode) -> &'static str {
     }
 }
 
+fn set_q0rg_first_frame(playback: &mut Q0rgPlayback, first: u16, frame_count: u16) {
+    let last = playback
+        .last_frame
+        .unwrap_or(frame_count.saturating_sub(1))
+        .max(first);
+    playback.set_range(first, last, frame_count);
+}
+
+fn active_placement_at_frame(
+    project: &ProjectV2,
+    reference: PlacementRef,
+    frame: u16,
+) -> Option<(&Placement, ActivePlacementState)> {
+    let layer = project
+        .q0rgs
+        .iter()
+        .find(|q| q.q0rg_id == reference.q0rg_id)?
+        .layers
+        .iter()
+        .find(|layer| layer.layer_id == reference.layer_id)?;
+    let source = layer.placements.get(reference.placement_idx)?;
+    let active = q0s_format::raster::active_placement_states_at(layer, frame)
+        .into_iter()
+        .find(|active| active.index == reference.placement_idx)?;
+    Some((source, active))
+}
+
+fn q0rg_frame_grid(
+    app: &mut EditorApp,
+    ui: &mut Ui,
+    child_id: u16,
+    child_frames: u16,
+    selected_frame: u16,
+) -> Option<u16> {
+    let render_revision = (
+        app.active_project_tab_id().unwrap_or(0),
+        app.state.render_revision(),
+    );
+    let light = app.settings.theme.library_preview_light.to_color32();
+    let dark = app.settings.theme.library_preview_dark.to_color32();
+    let mut picked = None;
+    crate::ui::preview_card_grid(ui, usize::from(child_frames), None, |ui, index, rect| {
+        let frame = index as u16;
+        let (response, preview_rect) =
+            crate::ui::preview_card_at(ui, &(frame + 1).to_string(), frame == selected_frame, rect);
+        crate::panels::library::draw_cached_q0rg_frame_preview(
+            &ui.painter_at(preview_rect),
+            &app.state.project,
+            child_id,
+            frame,
+            preview_rect,
+            &mut app.textures,
+            ui.ctx(),
+            render_revision,
+            light,
+            dark,
+        );
+        if response.clicked() {
+            picked = Some(frame);
+        }
+    });
+    picked
+}
+
+pub(crate) fn render_frame_picker(app: &mut EditorApp, ui: &mut Ui) {
+    let Selection::Placement {
+        q0rg_id,
+        layer_id,
+        placement_idx,
+    } = app.session.selection
+    else {
+        ui.weak("Select a symbol instance on the stage");
+        return;
+    };
+    let reference = PlacementRef {
+        q0rg_id,
+        layer_id,
+        placement_idx,
+    };
+    let frame = crate::frame_edit::frame_for(app, reference);
+    let project = &app.state.project;
+    let symbol =
+        active_placement_at_frame(project, reference, frame).and_then(|(source, active)| {
+            let Target::Q0rg(child_id) = source.target else {
+                return None;
+            };
+            project
+                .q0rgs
+                .iter()
+                .find(|q| q.q0rg_id == child_id)
+                .map(|symbol| (symbol, active))
+        });
+    let Some((symbol, active)) = symbol else {
+        ui.weak("Select a symbol instance on the stage");
+        return;
+    };
+
+    let child_id = symbol.q0rg_id;
+    let child_frames = symbol.frame_count.max(1);
+    let locked = project.layer_is_locked(q0rg_id, layer_id);
+    let mut fx = active.fx;
+    let mode = fx.q0rg_playback.mode;
+    let single = matches!(
+        mode,
+        Q0rgPlaybackMode::SingleFrame | Q0rgPlaybackMode::Manual
+    );
+    let (caption, selected_frame) = if single {
+        ("Frame", fx.q0rg_playback.single_frame)
+    } else {
+        ("First frame", fx.q0rg_playback.first_frame)
+    };
+    let selected_frame = selected_frame.min(child_frames - 1);
+    ui.label(egui::RichText::new(&symbol.name).strong());
+    ui.weak(format!(
+        "{} · {caption} {} / {child_frames}",
+        q0rg_playback_mode_name(mode),
+        selected_frame + 1
+    ));
+    if locked {
+        ui.weak("Unlock this layer to pick a frame");
+    }
+
+    let project_tab = app.active_project_tab_id();
+    let picked = ScrollArea::vertical()
+        .id_source(("frame_picker", project_tab, child_id))
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.add_enabled_ui(!locked, |ui| {
+                ui.push_id((q0rg_id, layer_id, placement_idx, frame), |ui| {
+                    q0rg_frame_grid(app, ui, child_id, child_frames, selected_frame)
+                })
+                .inner
+            })
+            .inner
+        })
+        .inner;
+    let Some(picked) = picked.filter(|picked| *picked != selected_frame) else {
+        return;
+    };
+    if single {
+        fx.q0rg_playback.single_frame = picked;
+    } else {
+        set_q0rg_first_frame(&mut fx.q0rg_playback, picked, child_frames);
+    }
+
+    app.history
+        .snapshot_with_session(&app.state.project, &app.session);
+    if let Some(new_idx) = apply_placement_edit_at_frame(
+        app,
+        q0rg_id,
+        layer_id,
+        placement_idx,
+        frame,
+        active.transform,
+        fx,
+    ) {
+        let manual = (mode == Q0rgPlaybackMode::Manual).then_some(fx.q0rg_playback);
+        finish_placement_edit(app, reference, new_idx, frame, manual);
+        ui.ctx().request_repaint();
+    }
+}
+
 fn blend_mode_name(mode: BlendMode) -> &'static str {
     match mode {
         BlendMode::Normal => "Normal",
@@ -2374,33 +2552,19 @@ fn placement_properties(
         placement_idx,
     };
     let current_frame = crate::frame_edit::frame_for(app, reference);
-    let Some((source_frame, playback_start_frame, target, transform, source_pivot, tween, mut fx)) =
-        app.state
-            .project
-            .q0rgs
-            .iter()
-            .find(|q| q.q0rg_id == q0rg_id)
-            .and_then(|q| q.layers.iter().find(|layer| layer.layer_id == layer_id))
-            .and_then(|layer| {
-                let source = layer.placements.get(placement_idx)?;
-                let active = q0s_format::raster::active_placement_states_at(layer, current_frame)
-                    .into_iter()
-                    .find(|active| active.index == placement_idx)?;
-                Some((
-                    source.frame,
-                    active.playback_start_frame,
-                    source.target,
-                    active.transform,
-                    source.pivot,
-                    source.tween,
-                    active.fx,
-                ))
-            })
+    let Some((source, active)) =
+        active_placement_at_frame(&app.state.project, reference, current_frame)
     else {
         ui.label("Selection is no longer available");
         return;
     };
-    let authored_transform = transform;
+    let source_frame = source.frame;
+    let target = source.target;
+    let source_pivot = source.pivot;
+    let tween = source.tween;
+    let playback_start_frame = active.playback_start_frame;
+    let mut fx = active.fx;
+    let authored_transform = active.transform;
     let (mut transform, rig_bound) = crate::tools::placement_transform_for_edit(
         &app.state.project,
         q0rg_id,
@@ -2408,7 +2572,7 @@ fn placement_properties(
         placement_idx,
         current_frame,
     )
-    .unwrap_or((transform, false));
+    .unwrap_or((authored_transform, false));
 
     let mut wants_snapshot = false;
     let mut transform_dirty = false;
@@ -2502,9 +2666,17 @@ fn placement_properties(
                             .as_ref()
                             .filter(|pivot| pivot.selection == app.session.selection)
                             .and_then(|pivot| {
+                                let plane_point = crate::tools::stage_point_to_placement_plane(
+                                    &app.state.project,
+                                    q0rg_id,
+                                    layer_id,
+                                    placement_idx,
+                                    app.session.current_frame,
+                                    pivot.point,
+                                );
                                 Affine::from_transform(transform)
                                     .inverse()
-                                    .map(|inverse| inverse.apply(pivot.point))
+                                    .map(|inverse| inverse.apply(plane_point))
                             })
                     })
                     .or_else(|| {
@@ -2565,7 +2737,11 @@ fn placement_properties(
                 unlocked,
                 egui::Button::new("Duplicate Symbol"),
             ).on_hover_text("Create an independent copy, including nested symbols, without changing the original").clicked() {
-                app.queue(crate::app::Action::DuplicateSymbol(q0rg_id, layer_id, placement_idx));
+                app.queue(crate::app::Action::PromptSymbol(crate::symbol_prompt::SymbolRequest::Duplicate(
+                    q0rg_id,
+                    layer_id,
+                    placement_idx,
+                )));
             }
             if ui
                 .add_enabled(unlocked, egui::Button::new("Make Variant"))
@@ -2608,7 +2784,12 @@ fn placement_properties(
             });
         }
         ui.separator();
-        ui.label(egui::RichText::new("Playback").strong());
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("Playback").strong());
+            if !crate::touch::ENABLED && ui.small_button("Frame Picker…").clicked() {
+                app.queue(Action::OpenFramePicker);
+            }
+        });
         egui::Grid::new("placement_q0rg_playback")
             .num_columns(2)
             .show(ui, |ui| {
@@ -2719,9 +2900,11 @@ fn placement_properties(
                     if response.changed() || (response.lost_focus()
                         && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
                         let before = fx.q0rg_playback;
-                        let first = first.saturating_sub(1);
-                        let last = fx.q0rg_playback.last_frame.unwrap_or(max_frame).max(first);
-                        fx.q0rg_playback.set_range(first, last, child_frames);
+                        set_q0rg_first_frame(
+                            &mut fx.q0rg_playback,
+                            first.saturating_sub(1),
+                            child_frames,
+                        );
                         if fx.q0rg_playback != before { fx_dirty = true; wants_snapshot = true; }
                     }
                     ui.end_row();
@@ -2752,10 +2935,6 @@ fn placement_properties(
                         if fx.q0rg_playback != before { fx_dirty = true; wants_snapshot = true; }
                     }
                     ui.end_row();
-                } else {
-                    ui.label("frame picker");
-                    ui.label("choose a frame below");
-                    ui.end_row();
                 }
 
                 let preview_frame = q0s_format::v2::resolve_q0rg_playback_frame(
@@ -2772,9 +2951,7 @@ fn placement_properties(
 
         if fx.q0rg_playback.mode == Q0rgPlaybackMode::Manual {
             let selected_frame = fx.q0rg_playback.single_frame.min(max_frame);
-            let preview_light = app.settings.theme.library_preview_light.to_color32();
-            let preview_dark = app.settings.theme.library_preview_dark.to_color32();
-            egui::ScrollArea::vertical()
+            let picked = ScrollArea::vertical()
                 .id_source((
                     "placement_q0rg_manual_frames",
                     q0rg_id,
@@ -2784,53 +2961,15 @@ fn placement_properties(
                 .max_height(190.0)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let render_revision = (
-                        app.active_project_tab_id().unwrap_or(0),
-                        app.state.render_revision(),
-                    );
-                    ui.push_id(
-                        (
-                            "placement_q0rg_manual_frame_grid",
-                            q0rg_id,
-                            layer_id,
-                            placement_idx,
-                        ),
-                        |ui| {
-                            crate::ui::preview_card_grid(
-                                ui,
-                                usize::from(child_frames),
-                                None,
-                                |ui, index, rect| {
-                                    let frame = index as u16;
-                                    let (response, preview_rect) = crate::ui::preview_card_at(
-                                        ui,
-                                        &format!("{}", frame + 1),
-                                        frame == selected_frame,
-                                        rect,
-                                    );
-                                    crate::panels::library::draw_cached_q0rg_frame_preview(
-                                        &ui.painter_at(preview_rect),
-                                        &app.state.project,
-                                        child_id,
-                                        frame,
-                                        preview_rect,
-                                        &mut app.textures,
-                                        ui.ctx(),
-                                        render_revision,
-                                        preview_light,
-                                        preview_dark,
-                                    );
-                                    if response.clicked() {
-                                        fx.q0rg_playback.single_frame = frame;
-                                        manual_playback_edit = Some(fx.q0rg_playback);
-                                        fx_dirty = true;
-                                        wants_snapshot = true;
-                                    }
-                                },
-                            );
-                        },
-                    );
-                });
+                    q0rg_frame_grid(app, ui, child_id, child_frames, selected_frame)
+                })
+                .inner;
+            if let Some(frame) = picked {
+                fx.q0rg_playback.single_frame = frame;
+                manual_playback_edit = Some(fx.q0rg_playback);
+                fx_dirty = true;
+                wants_snapshot = true;
+            }
         }
     }
 
@@ -2931,34 +3070,47 @@ fn placement_properties(
                 app.session.status = "could not update the rig-bound transform".to_string();
             }
         }
-        if let Some(playback) = manual_playback_edit {
-            propagate_manual_q0rg_playback(
-                &mut app.state.project,
-                q0rg_id,
-                layer_id,
-                new_idx,
-                current_frame,
-                playback,
-            );
-        }
-        app.session.selection = Selection::Placement {
+        finish_placement_edit(app, reference, new_idx, current_frame, manual_playback_edit);
+    }
+}
+
+fn finish_placement_edit(
+    app: &mut EditorApp,
+    reference: PlacementRef,
+    new_idx: usize,
+    frame: u16,
+    manual_playback_edit: Option<Q0rgPlayback>,
+) {
+    let PlacementRef {
+        q0rg_id, layer_id, ..
+    } = reference;
+    if let Some(playback) = manual_playback_edit {
+        propagate_manual_q0rg_playback(
+            &mut app.state.project,
             q0rg_id,
             layer_id,
-            placement_idx: new_idx,
-        };
-        if app.session.onion.edit_frames {
-            crate::frame_edit::remap(
-                app,
-                &[reference],
-                &[PlacementRef {
-                    placement_idx: new_idx,
-                    ..reference
-                }],
-            );
-        }
-        app.state.mark_dirty();
-        app.textures.invalidate();
+            new_idx,
+            frame,
+            playback,
+        );
     }
+    app.session.selection = Selection::Placement {
+        q0rg_id,
+        layer_id,
+        placement_idx: new_idx,
+    };
+    if app.session.onion.edit_frames {
+        crate::frame_edit::remap(
+            app,
+            &[reference],
+            &[PlacementRef {
+                placement_idx: new_idx,
+                ..reference
+            }],
+        );
+    }
+    app.state.mark_dirty();
+    app.textures.invalidate();
 }
 
 #[derive(Clone, Copy)]
@@ -3574,29 +3726,36 @@ fn propagate_manual_q0rg_playback(
     if !matches!(target, Target::Q0rg(_)) {
         return;
     }
+    let instance_id = selected.instance_id;
+    if instance_id != 0 {
+        for placement in &mut layer.placements {
+            if placement.frame >= frame
+                && placement.instance_id == instance_id
+                && placement.target == target
+            {
+                placement.fx.q0rg_playback = playback;
+            }
+        }
+        return;
+    }
+
+    // Older placements without persistent IDs follow their order at each key.
     let occurrence = layer
         .placements
         .iter()
         .take(selected_placement_idx)
         .filter(|placement| placement.frame == frame && placement.target == target)
         .count();
-    let future_frames: std::collections::BTreeSet<u16> = layer
-        .placements
-        .iter()
-        .map(|placement| placement.frame)
-        .filter(|keyframe| *keyframe >= frame)
-        .collect();
-    for keyframe in future_frames {
-        if let Some(index) = layer
-            .placements
-            .iter()
-            .enumerate()
-            .filter(|(_, placement)| placement.frame == keyframe && placement.target == target)
-            .nth(occurrence)
-            .map(|(index, _)| index)
-        {
-            layer.placements[index].fx.q0rg_playback = playback;
+    let mut positions = std::collections::BTreeMap::<u16, usize>::new();
+    for placement in &mut layer.placements {
+        if placement.frame < frame || placement.target != target {
+            continue;
         }
+        let position = positions.entry(placement.frame).or_default();
+        if *position == occurrence && placement.instance_id == 0 {
+            placement.fx.q0rg_playback = playback;
+        }
+        *position += 1;
     }
 }
 

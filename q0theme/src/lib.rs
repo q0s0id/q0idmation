@@ -12,6 +12,77 @@ impl Rgb {
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
     }
+
+    /// `self` moved `amount` (0…1) of the way to `other`.
+    pub fn mix(self, other: Rgb, amount: f32) -> Rgb {
+        let channel = |a: u8, b: u8| {
+            (f32::from(a) + (f32::from(b) - f32::from(a)) * amount.clamp(0.0, 1.0)).round() as u8
+        };
+        Rgb::new(
+            channel(self.r, other.r),
+            channel(self.g, other.g),
+            channel(self.b, other.b),
+        )
+    }
+
+    /// Perceived brightness, 0…255.
+    pub fn luma(self) -> f32 {
+        0.299 * f32::from(self.r) + 0.587 * f32::from(self.g) + 0.114 * f32::from(self.b)
+    }
+}
+
+const WHITE: Rgb = Rgb::new(0xFF, 0xFF, 0xFF);
+const BLACK: Rgb = Rgb::new(0x00, 0x00, 0x00);
+
+/// Two colours a surface fades between, top to bottom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gradient {
+    pub top: Rgb,
+    pub bottom: Rgb,
+}
+
+impl Gradient {
+    pub const fn new(top: Rgb, bottom: Rgb) -> Self {
+        Self { top, bottom }
+    }
+}
+
+/// The gradients a theme paints its chrome with. Frontends paint them where
+/// they have the surface; a gradient whose two stops match reads as flat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChromeGradients {
+    /// The menu bar, tab strips and other bars.
+    pub bar: Gradient,
+    /// Behind each panel's contents.
+    pub panel: Gradient,
+    /// A button under the pointer.
+    pub hover: Gradient,
+    /// The chosen tool, a toggle that is on.
+    pub selected: Gradient,
+}
+
+impl ChromeGradients {
+    /// Gentle defaults for any palette: bars catch a little light at the top,
+    /// panels sink slightly towards the bottom, and the selection glows in the
+    /// accent.
+    pub fn derive(accent: Rgb, panel: Rgb, window: Rgb, deep_bg: Rgb, text: Rgb) -> Self {
+        let dark = text.luma() > 127.0;
+        if dark {
+            Self {
+                bar: Gradient::new(panel.mix(text, 0.07), window.mix(BLACK, 0.18)),
+                panel: Gradient::new(window, window.mix(deep_bg, 0.55)),
+                hover: Gradient::new(panel.mix(text, 0.16), panel.mix(text, 0.06)),
+                selected: Gradient::new(panel.mix(accent, 0.62), panel.mix(accent, 0.30)),
+            }
+        } else {
+            Self {
+                bar: Gradient::new(panel.mix(WHITE, 0.65), panel.mix(BLACK, 0.05)),
+                panel: Gradient::new(window.mix(WHITE, 0.5), window),
+                hover: Gradient::new(panel.mix(WHITE, 0.7), panel.mix(text, 0.06)),
+                selected: Gradient::new(panel.mix(accent, 0.22), panel.mix(accent, 0.40)),
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +277,57 @@ pub fn default_theme() -> &'static BuiltinTheme {
     &BUILTIN_THEMES[0]
 }
 
+impl BuiltinTheme {
+    /// The theme's chrome gradients: drawn by hand for themes with a strong
+    /// character, derived from the palette for the rest.
+    pub fn gradients(&self) -> ChromeGradients {
+        let derived = ChromeGradients::derive(
+            self.accent,
+            self.panel,
+            self.window,
+            self.deep_bg,
+            self.text,
+        );
+        let g = |top: u32, bottom: u32| {
+            let rgb = |v: u32| Rgb::new((v >> 16) as u8, (v >> 8) as u8, v as u8);
+            Gradient::new(rgb(top), rgb(bottom))
+        };
+        match self.id {
+            Q0S_SIGNATURE_ID => ChromeGradients {
+                bar: g(0x1C1C1C, 0x070707),
+                panel: g(0x101010, 0x060606),
+                hover: g(0x2C2C2C, 0x161616),
+                selected: g(0xE02240, 0x76081A),
+            },
+            "dracula" => ChromeGradients {
+                selected: g(0xBD93F9, 0x8C5BD6),
+                ..derived
+            },
+            "sunset" => ChromeGradients {
+                bar: g(0x4A3045, 0x231424),
+                selected: g(0xFF8A6B, 0xC2407A),
+                ..derived
+            },
+            "cobalt" => ChromeGradients {
+                bar: g(0x1D4C70, 0x082238),
+                selected: g(0xFFB23D, 0xD07400),
+                ..derived
+            },
+            "forest" => ChromeGradients {
+                selected: g(0x7FA94A, 0x3E6A2A),
+                ..derived
+            },
+            "high-contrast" => ChromeGradients {
+                bar: g(0x1A1A1A, 0x1A1A1A),
+                panel: g(0x0E0E0E, 0x0E0E0E),
+                hover: g(0x3A3A3A, 0x3A3A3A),
+                selected: g(0x6A5500, 0x6A5500),
+            },
+            _ => derived,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +339,24 @@ mod tests {
         let names: BTreeSet<_> = BUILTIN_THEMES.iter().map(|theme| theme.name).collect();
         assert_eq!(ids.len(), BUILTIN_THEMES.len());
         assert_eq!(names.len(), BUILTIN_THEMES.len());
+    }
+
+    #[test]
+    fn every_theme_has_gradients_its_text_reads_on() {
+        for theme in BUILTIN_THEMES {
+            let selected = theme.gradients().selected;
+            let middle = selected.top.mix(selected.bottom, 0.5);
+            assert!(
+                (middle.luma() - theme.text.luma()).abs() > 60.0
+                    || (middle.luma() - theme.panel.luma()).abs() > 20.0,
+                "{}: the selection should stand out from the panel or carry its text",
+                theme.id
+            );
+        }
+        assert_eq!(
+            Rgb::new(0, 0, 0).mix(Rgb::new(200, 100, 50), 0.5),
+            Rgb::new(100, 50, 25)
+        );
     }
 
     #[test]

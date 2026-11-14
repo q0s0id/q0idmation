@@ -652,6 +652,35 @@ fn mix_timeline_audio_chunk_inner(
     Some(output)
 }
 
+/// Plays UI sounds on their own sink so timeline playback and scrubbing
+/// do not start, pause or replace them.
+#[derive(Default)]
+pub(crate) struct NotificationAudio {
+    output: Option<(OutputStream, OutputStreamHandle)>,
+    sink: Option<Sink>,
+}
+
+impl NotificationAudio {
+    pub(crate) fn play(&mut self, path: &Path) -> Result<(), String> {
+        use std::io::BufReader;
+
+        let file = std::fs::File::open(path).map_err(|error| format!("open sound: {error}"))?;
+        let source = rodio::Decoder::new(BufReader::new(file))
+            .map_err(|error| format!("decode sound: {error}"))?;
+        if self.output.is_none() {
+            self.output = Some(
+                OutputStream::try_default()
+                    .map_err(|error| format!("open default audio output: {error}"))?,
+            );
+        }
+        let (_, handle) = self.output.as_ref().expect("audio output was opened");
+        let sink = Sink::try_new(handle).map_err(|error| format!("play sound: {error}"))?;
+        sink.append(source);
+        self.sink = Some(sink);
+        Ok(())
+    }
+}
+
 pub struct EditorAudioPlayback {
     _stream: OutputStream,
     handle: OutputStreamHandle,

@@ -240,6 +240,10 @@ impl DrawItem {
         matches!(self, Self::Plane(plane) if plane.layered)
     }
 
+    pub fn casts_shadow(&self) -> bool {
+        self.opacity() >= 0.5 && !self.layered()
+    }
+
     /// Does any of it let what is behind show through?
     pub fn blends(&self) -> bool {
         self.opacity() < 0.999
@@ -567,16 +571,20 @@ pub struct ShadowView {
     pub texel: f32,
 }
 
-/// Where the frame's shadow casters and receivers are: min and max corners.
-fn frame_bounds(items: &[DrawItem]) -> Option<(V3, V3)> {
-    let mut out: Option<(V3, V3)> = None;
-    let mut take = |p: V3| {
-        out = Some(match out {
-            Some((lo, hi)) => (lo.min(p), hi.max(p)),
-            None => (p, p),
-        });
-    };
+/// Caster corners for fitting the map, plus the scene extent for spot lights.
+fn shadow_bounds(items: &[DrawItem]) -> (Vec<V3>, V3, V3) {
+    let mut casters = Vec::new();
+    let mut lo = V3::splat(f32::INFINITY);
+    let mut hi = V3::splat(f32::NEG_INFINITY);
     for item in items {
+        let casts = item.casts_shadow();
+        let mut take = |p: V3| {
+            lo = lo.min(p);
+            hi = hi.max(p);
+            if casts {
+                casters.push(p);
+            }
+        };
         match item {
             DrawItem::Mesh(mesh) => {
                 for corner in mesh_bounds(mesh) {
@@ -591,23 +599,64 @@ fn frame_bounds(items: &[DrawItem]) -> Option<(V3, V3)> {
             }
         }
     }
-    out
+    (casters, lo, hi)
+}
+
+/// Maps an axis-aligned window to clip space.
+fn shadow_window(centre: V3, size: V3) -> Mat4 {
+    Mat4::scale(V3::new(2.0 / size.x, 2.0 / size.y, 2.0 / size.z)) * Mat4::translation(-centre)
+}
+
+fn fit_spot_shadow(clip: Mat4, casters: &[V3]) -> (Mat4, f32) {
+    let mut min = V3::splat(f32::INFINITY);
+    let mut max = V3::splat(f32::NEG_INFINITY);
+    for p in casters {
+        let [x, y, z, w] = clip.transform4(*p);
+        // A bounding box crossing the near plane needs clipping before its
+        // projected corners can bound it. Keep the full cone in that case.
+        if w <= 1.0e-6 || z < -w {
+            return (clip, 2.0);
+        }
+        let p = V3::new(x / w, y / w, 0.0);
+        min = min.min(p);
+        max = max.max(p);
+    }
+    let min = min.max(V3::splat(-1.0));
+    let max = max.min(V3::splat(1.0));
+    let pad = (max.x - min.x).max(max.y - min.y).max(1.0e-3) * 0.01;
+    let min = V3::new((min.x - pad).max(-1.0), (min.y - pad).max(-1.0), -1.0);
+    let max = V3::new((max.x + pad).min(1.0), (max.y + pad).min(1.0), 1.0);
+    if min.x >= max.x || min.y >= max.y {
+        return (clip, 2.0);
+    }
+    let size = max - min;
+    let window = shadow_window(min + size * 0.5, size);
+    (window * clip, size.x.max(size.y))
 }
 
 /// The shadow views of a frame's shadow-casting suns and spots.
 pub fn shadow_views(frame: &Frame3d) -> Vec<ShadowView> {
-    if !frame.rig.shadows {
+    use super::scene::Light3dKind;
+
+    let lights = frame
+        .rig
+        .lights
+        .iter()
+        .enumerate()
+        .filter(|(_, light)| light.shadows && light.kind != Light3dKind::Point);
+    if !frame.rig.shadows || lights.clone().next().is_none() {
         return Vec::new();
     }
-    let Some((lo, hi)) = frame_bounds(&frame.items) else {
+    let (casters, lo, hi) = shadow_bounds(&frame.items);
+    if casters.is_empty() {
         return Vec::new();
-    };
+    }
     let centre = (lo + hi) * 0.5;
     let radius = ((hi - lo).length() * 0.5).max(1.0);
     let mut out = Vec::new();
-    for (index, light) in frame.rig.lights.iter().enumerate() {
-        if !light.shadows || out.len() >= MAX_SHADOWS {
-            continue;
+    for (index, light) in lights {
+        if out.len() >= MAX_SHADOWS {
+            break;
         }
         let forward = light.direction.normalized();
         if forward == V3::ZERO {
@@ -615,39 +664,39 @@ pub fn shadow_views(frame: &Frame3d) -> Vec<ShadowView> {
         }
         let right = forward.any_perpendicular();
         let up = forward.cross(right).normalized();
+        let eye = if light.kind == Light3dKind::Sun {
+            V3::ZERO
+        } else {
+            light.position
+        };
+        let view = Mat4::from_rows([
+            [right.x, right.y, right.z, -right.dot(eye)],
+            [up.x, up.y, up.z, -up.dot(eye)],
+            [forward.x, forward.y, forward.z, -forward.dot(eye)],
+            [0.0, 0.0, 0.0, 1.0],
+        ]);
         match light.kind {
-            super::scene::Light3dKind::Sun => {
-                let eye = centre - forward * (radius * 2.0);
-                let depth = radius * 4.0;
-                let view = Mat4::from_rows([
-                    [
-                        right.x / radius,
-                        right.y / radius,
-                        right.z / radius,
-                        -right.dot(eye) / radius,
-                    ],
-                    [
-                        up.x / radius,
-                        up.y / radius,
-                        up.z / radius,
-                        -up.dot(eye) / radius,
-                    ],
-                    [
-                        2.0 * forward.x / depth,
-                        2.0 * forward.y / depth,
-                        2.0 * forward.z / depth,
-                        -2.0 * forward.dot(eye) / depth - 1.0,
-                    ],
-                    [0.0, 0.0, 0.0, 1.0],
-                ]);
+            Light3dKind::Sun => {
+                // A sun ray keeps the same light-space XY from caster to receiver.
+                // Fit the map to the casters, with a guard band for filtering and bias.
+                let mut min = V3::splat(f32::INFINITY);
+                let mut max = V3::splat(f32::NEG_INFINITY);
+                for p in &casters {
+                    let p = view.transform_point(*p);
+                    min = min.min(p);
+                    max = max.max(p);
+                }
+                let extent = max - min;
+                let pad = extent.x.max(extent.y).max(1.0e-3) * 0.01;
+                let size = extent + V3::splat(2.0 * pad);
+                let window = shadow_window(min + extent * 0.5, size);
                 out.push(ShadowView {
                     light: index,
-                    matrix: view,
-                    texel: 2.0 * radius / SHADOW_SIZE as f32,
+                    matrix: window * view,
+                    texel: size.x.max(size.y) / SHADOW_SIZE as f32,
                 });
             }
-            super::scene::Light3dKind::Spot => {
-                let eye = light.position;
+            Light3dKind::Spot => {
                 let reach = (centre - eye).length() + radius;
                 let far = if light.range > 0.0 {
                     light.range.min(reach)
@@ -660,25 +709,20 @@ pub fn shadow_views(frame: &Frame3d) -> Vec<ShadowView> {
                 let t = half.min(1.5).tan();
                 let a = (far + near) / (far - near);
                 let b = -2.0 * far * near / (far - near);
-                let view = Mat4::from_rows([
-                    [right.x, right.y, right.z, -right.dot(eye)],
-                    [up.x, up.y, up.z, -up.dot(eye)],
-                    [forward.x, forward.y, forward.z, -forward.dot(eye)],
-                    [0.0, 0.0, 0.0, 1.0],
-                ]);
                 let projection = Mat4::from_rows([
                     [1.0 / t, 0.0, 0.0, 0.0],
                     [0.0, 1.0 / t, 0.0, 0.0],
                     [0.0, 0.0, a, b],
                     [0.0, 0.0, 1.0, 0.0],
                 ]);
+                let (matrix, width) = fit_spot_shadow(projection * view, &casters);
                 out.push(ShadowView {
                     light: index,
-                    matrix: projection * view,
-                    texel: 2.0 * t * (centre - eye).length() / SHADOW_SIZE as f32,
+                    matrix,
+                    texel: width * t * (centre - eye).length() / SHADOW_SIZE as f32,
                 });
             }
-            super::scene::Light3dKind::Point => {}
+            Light3dKind::Point => {}
         }
     }
     out
@@ -808,6 +852,84 @@ pub fn shade_glass(rig: &LightRig, rgba: [f32; 4], point: V3, n: V3, to_eye: V3)
 mod tests {
     use super::*;
     use crate::three::scene::{Light3dKind, LitLight3d};
+
+    #[test]
+    fn a_large_receiver_does_not_widen_the_sun_shadow_map() {
+        let camera = CameraPose::stage(200, 200);
+        let direction = V3::new(0.8, 0.32, 1.0).normalized();
+        let image = Arc::new(Image {
+            width: 1,
+            height: 1,
+            rgba: Arc::new(vec![255; 4]),
+        });
+        let mut frame = Frame3d {
+            view: View3d::new(camera, false, [200.0; 2], Affine::IDENTITY, [200; 2]),
+            rig: LightRig {
+                ambient: [0.1; 3],
+                lights: vec![LitLight3d {
+                    kind: Light3dKind::Sun,
+                    position: V3::ZERO,
+                    direction,
+                    color: [1.0; 3],
+                    range: 0.0,
+                    cos_inner: 1.0,
+                    cos_outer: 1.0,
+                    shadows: true,
+                }],
+                authored: true,
+                shadows: true,
+                fog: None,
+            },
+            items: vec![DrawItem::Plane(PlaneDraw {
+                image: image.clone(),
+                rect: [-5.0, -6.0, 5.0, 6.0],
+                matrix: Mat4::translation(V3::new(0.0, 0.0, -20.0)),
+                opacity: 1.0,
+                lit: false,
+                layered: false,
+            })],
+            overlay: None,
+            clear: None,
+        };
+        let caster = shadow_views(&frame)[0];
+        frame.items.push(DrawItem::Plane(PlaneDraw {
+            image,
+            rect: [-650.0, -650.0, 650.0, 650.0],
+            matrix: Mat4::IDENTITY,
+            opacity: 1.0,
+            lit: true,
+            layered: true,
+        }));
+        let view = shadow_views(&frame)[0];
+        assert_eq!(caster.texel, view.texel);
+        let on_art = V3::new(16.0, 6.4, 0.0);
+        let clip = view.matrix.transform4(on_art);
+        assert!(clip[0].abs() < 1.0 && clip[1].abs() < 1.0);
+        assert!(
+            clip[2] > 1.0,
+            "the receiver can be behind the fitted depth range"
+        );
+    }
+
+    #[test]
+    fn a_spot_fits_its_casters_without_changing_depth_clipping() {
+        let cone = Mat4::from_rows([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 2.0, -3.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ]);
+        let mut corners = [V3::new(0.25, -0.2, 2.0), V3::new(0.5, 0.2, 2.0)];
+        let (fitted, width) = fit_spot_shadow(cone, &corners);
+        assert!(width < 0.3, "map width {width}");
+        for p in corners {
+            let [x, y, z, w] = fitted.transform4(p);
+            assert!(x.abs() < w && y.abs() < w);
+            assert_eq!([z, w], cone.transform4(p)[2..]);
+        }
+        corners[0].z = 0.5;
+        assert_eq!(fit_spot_shadow(cone, &corners), (cone, 2.0));
+    }
 
     #[test]
     fn glass_is_clearer_face_on_than_edge_on() {

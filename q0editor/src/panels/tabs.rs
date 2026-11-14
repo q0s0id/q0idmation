@@ -8,6 +8,7 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
         .resizable(false)
         .exact_height(42.0)
         .show(ctx, |ui| {
+            crate::ui::paint_bar(ui);
             ui.add_space(3.0);
             strip(app, ui);
         });

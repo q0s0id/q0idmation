@@ -58,11 +58,27 @@ impl Printer {
             }
             Statement::Expression { value } => self.line(depth, print_value(value)),
             Statement::TimelineSignal { kind, target } => {
-                let word = match kind {
-                    TimelineSignal::GoRun => "gorun!",
-                    TimelineSignal::GoStop => "gostop!",
+                use crate::q0lang::runtime::{TIMELINE_HERE, TIMELINE_NEXT, TIMELINE_PREVIOUS};
+                let reserved = match (kind, target) {
+                    (TimelineSignal::GoStop, Value::String(t)) if t == TIMELINE_HERE => {
+                        Some("stop!")
+                    }
+                    (TimelineSignal::GoRun, Value::String(t)) if t == TIMELINE_HERE => {
+                        Some("play!")
+                    }
+                    (_, Value::String(t)) if t == TIMELINE_NEXT => Some("gonext!"),
+                    (_, Value::String(t)) if t == TIMELINE_PREVIOUS => Some("goprev!"),
+                    _ => None,
                 };
-                self.line(depth, format!("{word} {}", print_value(target)));
+                if let Some(word) = reserved {
+                    self.line(depth, word.to_string());
+                } else {
+                    let word = match kind {
+                        TimelineSignal::GoRun => "gorun!",
+                        TimelineSignal::GoStop => "gostop!",
+                    };
+                    self.line(depth, format!("{word} {}", print_value(target)));
+                }
             }
             Statement::ShellCommand { command, args } => {
                 self.line(depth, command_text("q0shell", command, args))
@@ -85,9 +101,26 @@ impl Printer {
             Statement::LayerCommand { command, args } => {
                 self.line(depth, command_text("q0layer", command, args))
             }
-            Statement::WindowCommand { command, args } => {
-                self.line(depth, command_text("q0window", command, args))
-            }
+            Statement::WindowCommand { command, args } => self.line(
+                depth,
+                match command.strip_prefix(super::parser::APP_COMMAND_PREFIX) {
+                    Some(app) => command_text("q0app", app, args),
+                    None if command == super::parser::ROOT_RUN
+                        || command == super::parser::ROOT_STOP =>
+                    {
+                        let word = if command == super::parser::ROOT_RUN {
+                            "rootrun!"
+                        } else {
+                            "rootstop!"
+                        };
+                        match args.first() {
+                            Some(target) => format!("{word} {}", print_value(target)),
+                            None => word.to_string(),
+                        }
+                    }
+                    None => command_text("q0window", command, args),
+                },
+            ),
             Statement::Listen { event, handler } => {
                 self.line(depth, format!("listen {event} {handler}"))
             }

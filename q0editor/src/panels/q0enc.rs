@@ -7,6 +7,8 @@ use crate::app::EditorApp;
 use crate::q0enc::{ExportFormat, ImageCodec, JobState, Q0EncState};
 use crate::ui::FitToScreen;
 
+const WINDOW_ID: &str = "q0enc";
+
 pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
     if !app.q0enc.open {
         return;
@@ -23,7 +25,7 @@ pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
     let mut cancel_ids = Vec::new();
     let previous_sequence_create_subfolder = app.q0enc.sequence_create_subfolder;
 
-    egui::Window::new("q0enc")
+    egui::Window::new(WINDOW_ID)
         .open(&mut open)
         .default_size([780.0, 610.0])
         .default_pos(ctx.screen_rect().center() - egui::vec2(410.0, 340.0))
@@ -31,7 +33,7 @@ pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
         .max_height((ctx.screen_rect().height() - 110.0).max(400.0))
         .vscroll(true)
         .max_width(860.0)
-        .collapsible(false)
+        .collapsible(true)
         .resizable(true)
         .fit_to_screen(ctx)
         .show(ctx, |ui| {
@@ -49,7 +51,14 @@ pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
                         project.meta.stage_width,
                         project.meta.stage_height,
                         project.meta.fps,
-                        entry_frame_count(project)
+                        crate::q0enc::source_last_frame(
+                            project,
+                            if state.selected_format == ExportFormat::Q0s {
+                                state.starting_scene_q0rg_id
+                            } else {
+                                state.source_q0rg_id
+                            },
+                        ) + 1
                     ))
                     .color(theme.text_dim.to_color32()),
                 );
@@ -345,19 +354,32 @@ fn render_format_settings(
         ExportFormat::Q0s => {
             ui.label("runtime build for q0player and q0lang games.");
             ui.label(
-                RichText::new(
-                    "exports the complete vector project, preserves q0rgs and scripts, then verifies the written file by parsing it back.",
-                )
-                .color(dim),
+                RichText::new("keeps all scenes, symbols and scripts in the exported movie.")
+                    .color(dim),
             );
             ui.add_space(8.0);
+            let scenes = project.scenes();
+            let selected = scenes
+                .iter()
+                .find(|scene| scene.q0rg_id == state.starting_scene_q0rg_id)
+                .map_or("Choose a scene", |scene| scene.name.as_str());
             egui::Grid::new("q0enc_q0s_summary")
                 .min_col_width(96.0)
                 .num_columns(2)
                 .spacing([16.0, 5.0])
                 .show(ui, |ui| {
-                    ui.label("entry q0rg");
-                    ui.label(entry_q0rg_name(project));
+                    ui.label("starting scene");
+                    egui::ComboBox::from_id_source("q0enc_starting_scene")
+                        .selected_text(selected)
+                        .show_ui(ui, |ui| {
+                            for scene in &scenes {
+                                ui.selectable_value(
+                                    &mut state.starting_scene_q0rg_id,
+                                    scene.q0rg_id,
+                                    &scene.name,
+                                );
+                            }
+                        });
                     ui.end_row();
                     ui.label("assets");
                     ui.label(project.assets.len().to_string());
@@ -369,6 +391,23 @@ fn render_format_settings(
                     ui.label("Serialize / validate / write / verify");
                     ui.end_row();
                 });
+            if state.starting_scene_q0rg_id != project.meta.entry_q0rg_id
+                && !project.runtime.camera.keys.is_empty()
+            {
+                if let Some(owner) = scenes
+                    .iter()
+                    .find(|scene| scene.q0rg_id == project.meta.entry_q0rg_id)
+                {
+                    ui.label(
+                        RichText::new(format!(
+                            "Start with {} to include its 2D camera track.",
+                            owner.name
+                        ))
+                        .small()
+                        .color(dim),
+                    );
+                }
+            }
         }
         ExportFormat::Q0v => {
             ui.label("embedded media container for q0player content.");
@@ -719,22 +758,53 @@ fn q0rg_label(project: &ProjectV2, id: u16) -> String {
         .unwrap_or_else(|| format!("missing q0rg {id}"))
 }
 
-fn entry_q0rg_name(project: &ProjectV2) -> String {
-    q0rg_label(project, project.meta.entry_q0rg_id)
-}
-
-fn entry_frame_count(project: &ProjectV2) -> u16 {
-    project
-        .q0rgs
-        .iter()
-        .find(|q0rg| q0rg.q0rg_id == project.meta.entry_q0rg_id)
-        .map(|q0rg| q0rg.frame_count.max(1))
-        .unwrap_or(1)
-}
-
 #[allow(dead_code)]
 fn path_has_extension(path: &Path, extension: &str) -> bool {
     path.extension()
         .and_then(|value| value.to_str())
         .is_some_and(|value| value.eq_ignore_ascii_case(extension))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn q0enc_can_collapse_to_a_title_bar_and_expand_again() {
+        let ctx = egui::Context::default();
+        let mut app = EditorApp::default();
+        crate::theme::install(&ctx);
+        app.settings.theme.apply(&ctx);
+        ctx.style_mut(|style| style.animation_time = 0.0);
+        app.q0enc.open = true;
+        let id = egui::Id::new(WINDOW_ID);
+        let draw = |app: &mut EditorApp| {
+            for _ in 0..3 {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1280.0, 900.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| render(app, ctx),
+                );
+            }
+            ctx.memory(|memory| memory.area_rect(id)).unwrap()
+        };
+        let expanded = draw(&mut app);
+        let mut collapse = egui::collapsing_header::CollapsingState::load_with_default_open(
+            &ctx,
+            id.with("collapsing"),
+            true,
+        );
+        collapse.set_open(false);
+        collapse.store(&ctx);
+        assert!(draw(&mut app).height() < expanded.height() * 0.3);
+        assert!(app.q0enc.open);
+        collapse.set_open(true);
+        collapse.store(&ctx);
+        assert!(draw(&mut app).height() > expanded.height() * 0.8);
+    }
 }

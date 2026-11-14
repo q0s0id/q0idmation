@@ -22,7 +22,7 @@ use q0s_format::raster::RuntimeBoundsCache;
 use q0s_format::runtime_scene::RuntimeSceneState;
 use q0s_format::transform::{Affine, Follow};
 use q0s_format::v2::{
-    Anchor, BlendMode, GradientFill, GradientKind, GradientStop, LibraryItemReference, Path,
+    Anchor, Asset, BlendMode, GradientFill, GradientKind, GradientStop, LibraryItemReference, Path,
     Placement, PlacementFx, ProjectV2, Rgba, Target, TintFx, Transform2D, Tween, Vec2,
     VectorAppearance, VectorMaterial,
 };
@@ -1473,9 +1473,109 @@ fn render_where(
         });
 }
 
+/// Library items a particle can be: symbols (not scenes, and not the
+/// timeline the emitter sits on, which would emit itself), then drawings.
+/// Name and target, each list sorted by name.
+/// Library items by name: what the picker lists.
+type LibraryChoices = Vec<(String, Target)>;
+
+fn particle_items(app: &EditorApp, emitter_q0rg: u16) -> (LibraryChoices, LibraryChoices) {
+    let project = &app.state.project;
+    let mut symbols: Vec<(String, Target)> = project
+        .q0rgs
+        .iter()
+        .filter(|q0rg| q0rg.q0rg_id != emitter_q0rg && !project.is_scene_root(q0rg.q0rg_id))
+        .map(|q0rg| (q0rg.name.clone(), Target::Q0rg(q0rg.q0rg_id)))
+        .collect();
+    let mut drawings: Vec<(String, Target)> = project
+        .assets
+        .iter()
+        .filter(|asset| matches!(asset, Asset::Vector(_) | Asset::Bitmap(_)))
+        .map(|asset| {
+            let id = asset.id();
+            let kind = if matches!(asset, Asset::Vector(_)) {
+                "Vector"
+            } else {
+                "Bitmap"
+            };
+            let name = project
+                .asset_names
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| format!("{kind} {id}"));
+            (name, Target::Asset(id))
+        })
+        .collect();
+    symbols.sort_by_key(|(name, _)| name.to_lowercase());
+    drawings.sort_by_key(|(name, _)| name.to_lowercase());
+    (symbols, drawings)
+}
+
+/// The name a particle's library item goes by in the library.
+fn item_name(app: &EditorApp, target: Target) -> String {
+    let project = &app.state.project;
+    match target {
+        Target::Q0rg(id) => project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == id)
+            .map_or_else(|| format!("missing symbol {id}"), |q0rg| q0rg.name.clone()),
+        Target::Asset(id) => project
+            .asset_names
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| format!("drawing {id}")),
+    }
+}
+
+/// Makes every particle a copy of `target`, sized as a scale.
+fn use_item(emitter: &mut ParticleEmitter, target: Target) {
+    if !matches!(emitter.look, ParticleLook::Item(_)) {
+        // Items are sized as a scale, not in pixels.
+        emitter.size_start = v(0.5, 0.1);
+        emitter.size_end = v(0.2, 0.05);
+    }
+    emitter.look = ParticleLook::Item(target);
+}
+
 /// The look buttons, with library items.
 fn render_look(app: &EditorApp, ui: &mut Ui, edit: &mut Edit, emitter: &mut ParticleEmitter) {
     let selected_target = selected_instance(app, emitter.q0rg_id).map(|(_, target)| target);
+    let (symbols, drawings) = particle_items(app, emitter.q0rg_id);
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Symbol or drawing");
+        let chosen = match emitter.look {
+            ParticleLook::Item(target) => Some(target),
+            _ => None,
+        };
+        let shown = chosen.map_or_else(|| "choose from the library…".to_string(), |target| item_name(app, target));
+        let mut pick = None;
+        egui::ComboBox::from_id_source(("particle_item", emitter.q0rg_id, emitter.emitter_id))
+            .selected_text(shown)
+            .width(200.0)
+            .show_ui(ui, |ui| {
+                if symbols.is_empty() && drawings.is_empty() {
+                    ui.label("The library has no symbols or drawings yet.");
+                }
+                for (caption, items) in [("Symbols", &symbols), ("Drawings", &drawings)] {
+                    if items.is_empty() {
+                        continue;
+                    }
+                    ui.label(RichText::new(caption).small().weak());
+                    for (name, target) in items {
+                        if ui.selectable_label(chosen == Some(*target), name).clicked() {
+                            pick = Some(*target);
+                        }
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Every particle becomes a copy of this symbol or drawing: it moves, turns, scales and fades like the built-in shapes, and a symbol keeps playing its own timeline");
+        if let Some(target) = pick.filter(|target| Some(*target) != chosen) {
+            use_item(emitter, target);
+            mark(edit);
+        }
+    });
     ui.horizontal_wrapped(|ui| {
         for look in ParticleLook::BUILT_IN {
             if ui
@@ -1492,29 +1592,16 @@ fn render_look(app: &EditorApp, ui: &mut Ui, edit: &mut Edit, emitter: &mut Part
                 mark(edit);
             }
         }
-        let is_item = matches!(emitter.look, ParticleLook::Item(_));
         let response = ui
             .add_enabled(
-                selected_target.is_some() || is_item,
-                egui::SelectableLabel::new(
-                    is_item,
-                    if is_item {
-                        "Library item ✓"
-                    } else {
-                        "Selected object"
-                    },
-                ),
+                selected_target.is_some(),
+                egui::Button::new("Selected object"),
             )
             .on_hover_text("Emit copies of the object selected on the stage")
             .on_disabled_hover_text("Select an object on the stage to emit copies of it");
         if response.clicked() {
             if let Some(target) = selected_target {
-                if !is_item {
-                    // Items are sized as a scale, not in pixels.
-                    emitter.size_start = v(0.5, 0.1);
-                    emitter.size_end = v(0.2, 0.05);
-                }
-                emitter.look = ParticleLook::Item(target);
+                use_item(emitter, target);
                 mark(edit);
             }
         }
@@ -2448,5 +2535,43 @@ mod tests {
         assert!(first.fx.tint.is_none());
         assert!((first.transform.sy - 0.5).abs() < 1.0e-6);
         assert!(project.assets.is_empty());
+    }
+    #[test]
+    fn the_library_picker_offers_symbols_and_drawings_but_not_scenes_or_itself() {
+        let mut app = EditorApp::default();
+        app.handle(&egui::Context::default(), crate::app::Action::AddQ0rg);
+        app.handle(&egui::Context::default(), crate::app::Action::AddQ0rg);
+        let ids: Vec<u16> = app
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .map(|q0rg| q0rg.q0rg_id)
+            .collect();
+        let (emitting, other) = (ids[ids.len() - 2], ids[ids.len() - 1]);
+        app.state.project.assets.push(Asset::Vector(VectorAsset {
+            asset_id: 40,
+            paths: Vec::new(),
+            fill: None,
+            stroke: None,
+        }));
+        app.state.project.asset_names.insert(40, "Leaf".into());
+        let (symbols, drawings) = particle_items(&app, emitting);
+        assert!(symbols
+            .iter()
+            .any(|(_, target)| *target == Target::Q0rg(other)));
+        assert!(!symbols
+            .iter()
+            .any(|(_, target)| *target == Target::Q0rg(emitting)));
+        assert!(symbols
+            .iter()
+            .all(|(_, target)| !matches!(target, Target::Q0rg(id) if app.state.project.is_scene_root(*id))));
+        assert_eq!(drawings, vec![("Leaf".to_string(), Target::Asset(40))]);
+
+        let mut emitter = ParticleEmitter::new(emitting, 1, [0.0, 0.0]);
+        use_item(&mut emitter, Target::Asset(40));
+        assert_eq!(emitter.look, ParticleLook::Item(Target::Asset(40)));
+        assert!(emitter.size_start.value < 1.0, "items are sized as a scale");
+        assert_eq!(item_name(&app, Target::Asset(40)), "Leaf");
     }
 }

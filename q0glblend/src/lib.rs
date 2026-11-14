@@ -1,19 +1,17 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Weak;
 
 use egui::{pos2, Color32, Mesh, PaintCallback, Painter, Pos2, Rect, Shape, TextureId};
 use glow::HasContext as _;
 use q0s_format::v2::{BlendMode, GradientKind, GradientStop};
 
 mod lighting;
-#[cfg(not(target_arch = "wasm32"))]
 mod three;
-#[cfg(not(target_arch = "wasm32"))]
 pub use three::paint_frame3d;
-#[cfg(not(target_arch = "wasm32"))]
 mod stage3d;
-#[cfg(not(target_arch = "wasm32"))]
 pub use stage3d::{free_view, with_revision, FreeView, FreeViewGuard, Stage3d};
 #[cfg(target_arch = "wasm32")]
 mod web_mask;
@@ -3655,6 +3653,9 @@ impl GlResources {
         gl.clear_color(0.0, 0.0, 0.0, 0.0);
         gl.clear(glow::COLOR_BUFFER_BIT);
         gl.disable(glow::SCISSOR_TEST);
+        // The group's MSAA pass restores its configured destination before
+        // compositing. Masks need that destination to be this scratch slot.
+        let previous_target = self.target_framebuffer.replace(framebuffer);
         self.paint_vector_group(
             glow_painter,
             gl,
@@ -3668,6 +3669,7 @@ impl GlResources {
             screen_size_px,
             false,
         );
+        self.target_framebuffer = previous_target;
     }
 
     unsafe fn multiply_mask_textures(

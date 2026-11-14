@@ -39,7 +39,8 @@ The rules for operators, truthiness and conversion are in [syntax](syntax.md).
 
 | action | made by | host |
 | --- | --- | --- |
-| `GoRun(target)`, `GoStop(target)` | `gorun!`, `gostop!` | editor preview, player |
+| `GoRun(target)`, `GoStop(target)` | `gorun!`, `gostop!`, `stop!`, `play!`, `gonext!`, `goprev!` | editor preview, player |
+| `Window(RootTimeline { play, target })` | `rootrun!`, `rootstop!` | editor preview, player |
 | `ShellCommand` | `q0shell.*!` | shell |
 | `SceneSwitch` | `q0scene.switch!` | player |
 | `RigSetPosition`, `RigSetValue`, `RigReset`, `RigSetPose`, `RigResetPose` | `q0rig.*!` | player |

@@ -406,6 +406,7 @@ fn placement_target_stage_bounds(
                 .unwrap_or(&[]),
         )
     });
+    let rig_pose = crate::parenting::merge_into(project, host_q0rg_id, local_frame, rig_pose);
     let target = match (rig, rig_pose.as_ref()) {
         (Some(rig), Some(pose)) => {
             crate::rig::resolved_variant_target(rig, pose, placement.instance_id, placement.target)
@@ -489,6 +490,7 @@ fn q0rg_stage_bounds(
                 .unwrap_or(&[]),
         )
     });
+    let rig_pose = crate::parenting::merge_into(project, q0rg_id, local_frame, rig_pose);
     for layer in &q0rg.layers {
         if !project.layer_is_visible(q0rg_id, layer.layer_id) {
             continue;
@@ -699,6 +701,7 @@ fn find_runtime_instance<'p>(
                 .unwrap_or(&[]),
         )
     });
+    let rig_pose = crate::parenting::merge_into(project, host_q0rg_id, local_frame, rig_pose);
     for layer in &q0rg.layers {
         // Working out what a layer shows costs far more than asking whether
         // the instance is ever on it.
@@ -974,6 +977,7 @@ fn rasterize_placement_fx_tile_with_runtime_state(
             .unwrap_or(&[]);
         crate::rig::evaluate_rig(rig, f32::from(local_frame), overrides)
     });
+    let rig_pose = crate::parenting::merge_into(project, host_q0rg_id, local_frame, rig_pose);
     render_placement_target(
         project,
         host_q0rg_id,
@@ -1123,6 +1127,7 @@ fn rasterize_placement_outer_fx_tile(
     let mut source = vec![0u8; len];
     let rig = crate::rig::rig_for_q0rg(project, host_q0rg_id);
     let rig_pose = rig.map(|rig| crate::rig::evaluate_rig(rig, f32::from(local_frame), &[]));
+    let rig_pose = crate::parenting::merge_into(project, host_q0rg_id, local_frame, rig_pose);
     render_placement_target(
         project,
         host_q0rg_id,
@@ -1324,6 +1329,7 @@ pub fn rasterize_q0rg_frame_with_root_transform(
         rig_overrides,
         scene_state,
         None,
+        true,
     )
 }
 
@@ -1352,8 +1358,8 @@ impl MaskEditingPreview<'_> {
 }
 
 /// Rasterize the editor's authoring view with exactly the supplied local-to-pixel
-/// transform. The editor applies its edit-in-place or preview camera itself;
-/// applying the project camera again here would move and crop masked artwork.
+/// transform. `timeline_camera_applied` means `root` already includes the
+/// timeline camera's affine, so the 3D pass can replace it with perspective.
 #[allow(clippy::too_many_arguments)]
 pub fn rasterize_q0rg_frame_with_mask_preview(
     project: &ProjectV2,
@@ -1367,6 +1373,7 @@ pub fn rasterize_q0rg_frame_with_mask_preview(
     rig_overrides: &crate::rig::RigRuntimeOverrides,
     scene_state: &RuntimeSceneState,
     mask_preview: Option<MaskEditingPreview<'_>>,
+    timeline_camera_applied: bool,
 ) -> Vec<u8> {
     let ss = ss.max(1);
     let sw = w.saturating_mul(ss);
@@ -1414,6 +1421,7 @@ pub fn rasterize_q0rg_frame_with_mask_preview(
         rig_overrides,
         scene_state,
         mask_preview,
+        timeline_camera_applied,
     );
     if ss == 1 {
         return hi;
@@ -1579,6 +1587,7 @@ fn render_to_buffer(
     rig_overrides: &crate::rig::RigRuntimeOverrides,
     scene_state: &RuntimeSceneState,
     mask_preview: Option<MaskEditingPreview<'_>>,
+    timeline_camera_applied: bool,
 ) {
     if depth > MAX_Q0RG_NESTING_DEPTH {
         return;
@@ -1602,6 +1611,7 @@ fn render_to_buffer(
             w,
             h,
             scene_state,
+            timeline_camera_applied.then_some(frame),
         );
     let rig_pose = crate::rig::rig_for_q0rg(project, q0rg_id).map(|rig| {
         let overrides = rig_overrides
@@ -1610,6 +1620,7 @@ fn render_to_buffer(
             .unwrap_or(&[]);
         crate::rig::evaluate_rig(rig, f32::from(local_frame), overrides)
     });
+    let rig_pose = crate::parenting::merge_into(project, q0rg_id, local_frame, rig_pose);
     // only rasterize mask layers that are referenced by a visible layer and
     // have active artwork on this frame. blank mask frames disable clipping,
     // including holds of a blank keyframe and cells beyond the mask's duration.
@@ -1638,6 +1649,7 @@ fn render_to_buffer(
         .filter(|layer| !blank_mask_ids.contains(&layer.layer_id))
         .map(|layer| {
             let mut mask = vec![0u8; buffer.len()];
+            let scoped = three_pass::begin_scope(&mask, w, h, 0.0, 0.0);
             render_layer_contents(
                 project,
                 q0rg_id,
@@ -1652,6 +1664,9 @@ fn render_to_buffer(
                 scene_state,
                 rig_pose.as_ref(),
             );
+            if scoped {
+                three_pass::end(project, &mut mask);
+            }
             (layer.layer_id, mask)
         })
         .collect::<HashMap<_, _>>();
@@ -1671,18 +1686,17 @@ fn render_to_buffer(
             }
         }
         previous_layer = Some(layer.layer_id);
-        if three {
-            three_pass::next_layer(layer.layer_id);
-        }
-        if mask_preview.is_some_and(|preview| {
+        let excluded = mask_preview.is_some_and(|preview| {
             preview
                 .excluded_layers
                 .is_some_and(|excluded| excluded.contains(&layer.layer_id))
-        }) {
-            continue;
-        }
+        });
         let look = scene_state.layer_look(project, q0rg_id, layer.layer_id);
-        if !look.visible || look.alpha <= 0.0 {
+        let visible = !excluded && look.visible && look.alpha > 0.0;
+        if three {
+            three_pass::next_layer(layer.layer_id, visible);
+        }
+        if !visible {
             continue;
         }
         let metadata = project.layer_metadata(q0rg_id, layer.layer_id);
@@ -2153,6 +2167,18 @@ fn tile_shift(x: u32, y: u32, composed: Affine) -> Affine {
     }
 }
 
+fn mask_alpha_bounds(masks: &[&[u8]], w: u32, h: u32) -> Option<(u32, u32, u32, u32)> {
+    let (mut left, mut top, mut right, mut bottom) = (0, 0, w, h);
+    for mask in masks {
+        let (x0, y0, x1, y1) = rgba_alpha_bounds(mask, w, h)?;
+        left = left.max(x0);
+        top = top.max(y0);
+        right = right.min(x1);
+        bottom = bottom.min(y1);
+    }
+    (left < right && top < bottom).then_some((left, top, right, bottom))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_masked_layer_contents(
     project: &ProjectV2,
@@ -2170,6 +2196,7 @@ fn render_masked_layer_contents(
     masks: &[&[u8]],
 ) {
     let shape_morph = crate::shape_tween::project_layer_morph(project, layer, local_frame);
+    let mut projected_mask_bounds = None;
     for active in active_placement_states_at(layer, local_frame) {
         let Some(placement) = layer.placements.get(active.index) else {
             continue;
@@ -2183,24 +2210,46 @@ fn render_masked_layer_contents(
         let key = InstanceKey::new(q0rg_id, placement.instance_id);
         let local_affine = scene_state.effective_affine(key, authored_affine);
         let composed = Affine::compose(parent, local_affine);
-        let (min_x, min_y, max_x, max_y) = match fx_tile(
-            project,
-            q0rg_id,
-            placement,
-            &active,
-            local_frame,
-            composed,
-            depth,
-            rig_overrides,
-            scene_state,
-            morphed,
-            w,
-            h,
-        ) {
-            FxTile::Offscreen => continue,
-            FxTile::Region(region) => region,
-            FxTile::Unknown => (0, 0, w, h),
-        };
+        let (min_x, min_y, max_x, max_y) =
+            if three_pass::needs_projected_bounds(project, placement, &active.fx, buffer) {
+                // Crop to where the screen-space stencil can show this placement.
+                // Its unprojected bounds may be somewhere else entirely.
+                let Some((x0, y0, x1, y1)) =
+                    *projected_mask_bounds.get_or_insert_with(|| mask_alpha_bounds(masks, w, h))
+                else {
+                    continue;
+                };
+                let padding = placement_fx_padding(placement_fx_in_pixels(
+                    active.fx,
+                    composed.uniform_scale(),
+                ))
+                .saturating_add(2);
+                (
+                    x0.saturating_sub(padding),
+                    y0.saturating_sub(padding),
+                    x1.saturating_add(padding).min(w),
+                    y1.saturating_add(padding).min(h),
+                )
+            } else {
+                match fx_tile(
+                    project,
+                    q0rg_id,
+                    placement,
+                    &active,
+                    local_frame,
+                    composed,
+                    depth,
+                    rig_overrides,
+                    scene_state,
+                    morphed,
+                    w,
+                    h,
+                ) {
+                    FxTile::Offscreen => continue,
+                    FxTile::Region(region) => region,
+                    FxTile::Unknown => (0, 0, w, h),
+                }
+            };
         let (tile_w, tile_h) = (max_x - min_x, max_y - min_y);
         let mut source = vec![0u8; tile_w as usize * tile_h as usize * 4];
         // A masked tile has a 3D pass of its own.
@@ -2211,7 +2260,10 @@ fn render_masked_layer_contents(
                 project,
                 q0rg_id,
                 placement,
-                &active.fx,
+                &PlacementFx {
+                    opacity: 1.0,
+                    ..active.fx
+                },
                 tile_parent,
                 local_affine,
                 local_frame,
@@ -2363,6 +2415,7 @@ fn render_placement_target(
                 rig_overrides,
                 scene_state,
                 None,
+                false,
             );
         }
         _ => {}

@@ -4,6 +4,7 @@ pub mod menu;
 pub mod properties;
 pub mod q0enc;
 pub mod q0fla;
+pub mod shortcuts;
 pub mod stage;
 pub mod tabs;
 pub mod timeline;

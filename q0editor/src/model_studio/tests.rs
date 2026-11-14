@@ -162,6 +162,58 @@ fn bones_bind_and_key_a_clip() {
 }
 
 #[test]
+fn model_studio_turns_and_scales_in_the_picked_axes_under_perspective() {
+    use q0s_format::three::{Quat, V3};
+
+    let (mut app, ctx) = project_app();
+    app.handle(&ctx, Action::NewModel);
+    let studio = app.model_studio.as_mut().unwrap();
+    studio.objects.insert(0);
+    studio.orbit.target += V3::new(-0.6, 0.35, 0.4);
+    let view = studio.view(egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(900.0, 600.0),
+    ));
+    let pivot = studio.selection_centre().unwrap();
+    let press = studio.screen(&view, pivot + V3::X * 0.55).unwrap();
+    let turn = Quat::from_axis_angle(V3::Y, 60.0f32.to_radians());
+    let at = studio
+        .screen(&view, pivot + turn.rotate(V3::X * 0.55))
+        .unwrap();
+    assert!(super::view::begin(
+        studio,
+        OpKind::Rotate,
+        press,
+        Constraint::Axis(V3::Y),
+        "y"
+    ));
+    super::view::update(studio, &view, at, false);
+    let node = usize::from(studio.model.meshes[0].node.unwrap());
+    let turned = studio.model.nodes[node].rotation.rotate(V3::X);
+    assert!(
+        (turned - turn.rotate(V3::X)).length() < 1.0e-3,
+        "{turned:?}"
+    );
+    super::view::cancel(studio);
+
+    let at = studio.screen(&view, pivot + V3::X * 1.1).unwrap();
+    assert!(super::view::begin(
+        studio,
+        OpKind::Scale,
+        press,
+        Constraint::Axis(V3::X),
+        "x"
+    ));
+    super::view::update(studio, &view, at, false);
+    let node = usize::from(studio.model.meshes[0].node.unwrap());
+    let scale = studio.model.nodes[node].scale;
+    assert!(
+        (scale - V3::new(2.0, 1.0, 1.0)).length() < 1.0e-3,
+        "{scale:?}"
+    );
+}
+
+#[test]
 fn a_drawing_goes_into_3d_and_tweens_its_depth() {
     let fx = q0s_format::v2::PlacementFx {
         three: Some(Space3d {

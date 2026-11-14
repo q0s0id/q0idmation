@@ -380,7 +380,9 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     ui.horizontal(|ui| {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if icon_button(ui, Icon::Symbol, "Create q0rg symbol").clicked() {
-                app.queue(Action::AddQ0rg);
+                app.queue(Action::PromptSymbol(
+                    crate::symbol_prompt::SymbolRequest::New,
+                ));
             }
             if icon_button(
                 ui,
@@ -2148,7 +2150,7 @@ fn collect_q0rg_color_stats(
     depth: u8,
     stats: &mut PreviewColorStats,
 ) {
-    if depth > 8 {
+    if depth > q0s_format::MAX_Q0RG_NESTING_DEPTH {
         return;
     }
     let Some(q0rg) = project.q0rgs.iter().find(|q0rg| q0rg.q0rg_id == q0rg_id) else {

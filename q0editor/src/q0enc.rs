@@ -180,6 +180,9 @@ pub struct ExportOptions {
 
 impl ExportOptions {
     pub fn validate(&self, project: &ProjectV2) -> Result<(), String> {
+        if self.format == ExportFormat::Q0s && !project.is_scene_root(self.source_q0rg_id) {
+            return Err("choose a starting scene from this project".to_string());
+        }
         if !project
             .q0rgs
             .iter()
@@ -187,24 +190,25 @@ impl ExportOptions {
         {
             return Err("export source q0rg is missing".to_string());
         }
-        if self.format != ExportFormat::Q0s {
-            if self.width == 0 || self.height == 0 {
-                return Err("export size must be greater than zero".to_string());
-            }
-            if !matches!(self.supersampling, 1 | 2 | 4) {
-                return Err("supersampling must be 1x, 2x, or 4x".to_string());
-            }
-            let render_bytes = u64::from(self.width)
-                .checked_mul(u64::from(self.height))
-                .and_then(|pixels| pixels.checked_mul(u64::from(self.supersampling).pow(2)))
-                .and_then(|pixels| pixels.checked_mul(4))
-                .ok_or_else(|| "render size overflows the allocation limit".to_string())?;
-            if render_bytes > MAX_RENDER_ALLOCATION_BYTES {
-                return Err(format!(
-                    "render buffer would use more than {} mb",
-                    MAX_RENDER_ALLOCATION_BYTES / (1024 * 1024)
-                ));
-            }
+        if self.format == ExportFormat::Q0s {
+            return Ok(());
+        }
+        if self.width == 0 || self.height == 0 {
+            return Err("export size must be greater than zero".to_string());
+        }
+        if !matches!(self.supersampling, 1 | 2 | 4) {
+            return Err("supersampling must be 1x, 2x, or 4x".to_string());
+        }
+        let render_bytes = u64::from(self.width)
+            .checked_mul(u64::from(self.height))
+            .and_then(|pixels| pixels.checked_mul(u64::from(self.supersampling).pow(2)))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| "render size overflows the allocation limit".to_string())?;
+        if render_bytes > MAX_RENDER_ALLOCATION_BYTES {
+            return Err(format!(
+                "render buffer would use more than {} mb",
+                MAX_RENDER_ALLOCATION_BYTES / (1024 * 1024)
+            ));
         }
         if self.first_frame > self.last_frame {
             return Err("first frame must not be after last frame".to_string());
@@ -340,6 +344,7 @@ pub struct Q0EncState {
     pub open: bool,
     pub selected_format: ExportFormat,
     pub source_q0rg_id: u16,
+    pub starting_scene_q0rg_id: u16,
     pub entire_timeline: bool,
     pub first_frame: u16,
     pub last_frame: u16,
@@ -376,6 +381,7 @@ impl Default for Q0EncState {
             open: false,
             selected_format: ExportFormat::Q0s,
             source_q0rg_id: 1,
+            starting_scene_q0rg_id: 1,
             entire_timeline: true,
             first_frame: 0,
             last_frame: 0,
@@ -445,20 +451,13 @@ impl Q0EncState {
         self.open = true;
         self.source_project_path = file_path.map(Path::to_path_buf);
         self.source_q0rg_id = project.meta.entry_q0rg_id;
+        self.starting_scene_q0rg_id = project.meta.entry_q0rg_id;
         self.render_scale = MIN_RENDER_SCALE;
         self.sync_render_dimensions(project);
         self.first_frame = 0;
         self.last_frame = source_last_frame(project, self.source_q0rg_id);
         self.sequence_subfolder = format!("{}-frames", project_stem(file_path));
         self.refresh_output_for_format(file_path);
-    }
-
-    pub fn toggle_for_project(&mut self, project: &ProjectV2, file_path: Option<&Path>) {
-        if self.open {
-            self.open = false;
-        } else {
-            self.open_for_project(project, file_path);
-        }
     }
 
     pub fn select_format(&mut self, format: ExportFormat, file_path: Option<&Path>) {
@@ -514,6 +513,9 @@ impl Q0EncState {
     }
 
     pub fn reconcile_with_project(&mut self, project: &ProjectV2) {
+        if !project.is_scene_root(self.starting_scene_q0rg_id) {
+            self.starting_scene_q0rg_id = project.meta.entry_q0rg_id;
+        }
         if !project
             .q0rgs
             .iter()
@@ -541,7 +543,11 @@ impl Q0EncState {
     pub fn current_options(&self) -> ExportOptions {
         ExportOptions {
             format: self.selected_format,
-            source_q0rg_id: self.source_q0rg_id,
+            source_q0rg_id: if self.selected_format == ExportFormat::Q0s {
+                self.starting_scene_q0rg_id
+            } else {
+                self.source_q0rg_id
+            },
             entire_timeline: self.entire_timeline,
             first_frame: self.first_frame,
             last_frame: self.last_frame,
@@ -608,6 +614,15 @@ impl Q0EncState {
         };
         let id = self.next_job_id;
         self.next_job_id = self.next_job_id.saturating_add(1);
+        let mut snapshot = project.clone();
+        if options.format == ExportFormat::Q0s
+            && options.source_q0rg_id != snapshot.meta.entry_q0rg_id
+        {
+            // The legacy 2D camera belongs to the original startup timeline.
+            // 3D camera setups already carry their own timeline ids.
+            snapshot.runtime.camera = Default::default();
+            snapshot.meta.entry_q0rg_id = options.source_q0rg_id;
+        }
         self.queue.push(ExportJob {
             id,
             output_path,
@@ -616,7 +631,7 @@ impl Q0EncState {
             completed_units: 0,
             total_units,
             phase: "waiting".to_string(),
-            snapshot: project.clone(),
+            snapshot,
             source_project_path: self.source_project_path.clone(),
         });
         Ok(id)
@@ -1990,6 +2005,50 @@ mod tests {
             .expect("parse q0s");
         assert_eq!(parsed.meta.name, "snapshot before edits");
         assert!(matches!(state.queue[0].state, JobState::Completed));
+        std::fs::remove_file(output).expect("cleanup q0s");
+    }
+
+    #[test]
+    fn q0s_starts_at_the_selected_scene_from_the_queued_snapshot() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::EditorApp::default();
+        app.handle(&ctx, crate::app::Action::AddScene);
+        let source = app.session.current_q0rg_id;
+        let project = &mut app.state.project;
+        project.q0rgs[0].frame_count = 8;
+        project.q0rgs[1].frame_count = 1;
+        project.runtime.camera.enabled = true;
+        let old_camera = project.default_camera_state();
+        project.runtime.camera.insert_key(6, old_camera);
+        project
+            .runtime
+            .scene3d
+            .setup_mut(source, project.meta.stage_width, project.meta.stage_height)
+            .camera
+            .enabled = true;
+        let output = unique_output("starting-scene").with_extension("q0s");
+
+        app.handle(&ctx, crate::app::Action::OpenQ0Enc);
+        assert_eq!(app.q0enc.starting_scene_q0rg_id, source);
+        let project = &app.state.project;
+        let state = &mut app.q0enc;
+        state.output_text = output.display().to_string();
+        state.enqueue(project).expect("queue the second scene");
+        state.starting_scene_q0rg_id = project.meta.entry_q0rg_id;
+        state.start_queue();
+        let statuses = wait_for_queue(state);
+        assert!(
+            matches!(state.queue[0].state, JobState::Completed),
+            "{statuses:?}"
+        );
+        let parsed = q0s_format::parse_q0s_v2(&std::fs::read(&output).expect("read exported q0s"))
+            .expect("parse exported q0s");
+        assert_eq!(parsed.meta.entry_q0rg_id, source);
+        assert_eq!(parsed.scenes(), project.scenes());
+        assert_eq!(parsed.runtime.scene3d, project.runtime.scene3d);
+        assert_eq!(parsed.runtime.camera, Default::default());
+        assert_eq!(project.meta.entry_q0rg_id, 1);
+        assert!(project.runtime.camera.has_keyframe(6));
         std::fs::remove_file(output).expect("cleanup q0s");
     }
 

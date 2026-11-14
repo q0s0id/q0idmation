@@ -723,7 +723,7 @@ fn project_library_title(project_name: &str, path: Option<&std::path::Path>) -> 
     }
 }
 
-fn unique_symbol_name(
+pub(crate) fn unique_symbol_name(
     project: &ProjectV2,
     requested: &str,
     exclude_q0rg_id: Option<u16>,
@@ -776,6 +776,10 @@ pub enum Action {
     ImportBitmapFromPath(PathBuf),
     ImportMedia,
     ImportMediaFromPath(PathBuf),
+    SetOnlineChatSound {
+        direct: bool,
+        path: PathBuf,
+    },
     SaveProject,
     SaveProjectAs,
     OpenQ0Enc,
@@ -793,6 +797,7 @@ pub enum Action {
     SelectTool(Tool),
     TogglePlay,
     ToggleTimeline,
+    OpenFramePicker,
     /// Hide every panel but the stage (F9), and back.
     ToggleStageOnly,
     /// Borderless full screen (F11), and back.
@@ -843,10 +848,13 @@ pub enum Action {
     /// switch, on, and whether it is the row the drag started on.
     PaintLayerFlag(u16, u16, crate::layer_flags::LayerFlag, bool, bool),
     DeleteLayer(u16, u16),
+    /// Hang a layer from another of its timeline (or free it with None).
+    SetLayerParent(u16, u16, Option<u16>),
     AddQ0rg,
     AddScene,
     SwitchScene(u16),
     RenameScene(u16, String),
+    DeleteScene(u16),
     RenameLibraryItem(LibraryItem, String),
     DeleteLibraryItem(LibraryItem),
     DeleteLibraryItems(Vec<LibraryItem>),
@@ -911,6 +919,8 @@ pub enum Action {
     PasteInPlace,
     DuplicateSelection,
     DuplicateSymbol(u16, u16, usize),
+    /// Ask for a name and a folder, then make the symbol.
+    PromptSymbol(crate::symbol_prompt::SymbolRequest),
     /// Copy an instance's symbol as a variant of it, put the copy in its
     /// place and start editing it there.
     MakeVariant(u16, u16, usize),
@@ -1117,6 +1127,7 @@ impl Action {
             Self::ImportBitmapFromPath(_) => "import-bitmap-path",
             Self::ImportMedia => "import-media-dialog",
             Self::ImportMediaFromPath(_) => "import-media-path",
+            Self::SetOnlineChatSound { .. } => "set-online-chat-sound",
             Self::SaveProject => "save-project",
             Self::SaveProjectAs => "save-project-as-dialog",
             Self::OpenQ0Enc => "open-q0enc",
@@ -1134,6 +1145,7 @@ impl Action {
             Self::SelectTool(_) => "select-tool",
             Self::TogglePlay => "toggle-play",
             Self::ToggleTimeline => "toggle-timeline",
+            Self::OpenFramePicker => "open-frame-picker",
             Self::ToggleStageOnly => "toggle-stage-only",
             Self::ToggleFullscreen => "toggle-fullscreen",
             Self::ToggleOutlineMode => "toggle-outline-mode",
@@ -1177,6 +1189,7 @@ impl Action {
             Self::AddScene => "add-scene",
             Self::SwitchScene(_) => "switch-scene",
             Self::RenameScene(..) => "rename-scene",
+            Self::DeleteScene(_) => "delete-scene",
             Self::RenameLibraryItem(..) => "rename-library-item",
             Self::DeleteLibraryItem(_) => "delete-library-item",
             Self::DeleteLibraryItems(_) => "delete-library-items",
@@ -1228,6 +1241,8 @@ impl Action {
             Self::PasteInPlace => "paste-in-place",
             Self::DuplicateSelection => "duplicate-selection",
             Self::DuplicateSymbol(..) => "duplicate-symbol",
+            Self::PromptSymbol(_) => "prompt-symbol",
+            Self::SetLayerParent(..) => "set-layer-parent",
             Self::MakeVariant(..) => "make-variant",
             Self::SwapVariant(..) => "swap-variant",
             Self::AltDragDuplicateSelection(_) => "alt-drag-duplicate-selection",
@@ -3408,6 +3423,9 @@ impl EditorApp {
             Action::ImportMediaFromPath(path) => {
                 self.import_media_from_path(ctx, &path);
             }
+            Action::SetOnlineChatSound { direct, path } => {
+                self.online.set_chat_sound(&mut self.settings, direct, path);
+            }
             Action::SaveProject => {
                 if !crate::text_tool::finish_edit(self) {
                     return;
@@ -3446,20 +3464,25 @@ impl EditorApp {
                     }
                 }
             }
-            Action::OpenQ0Enc => {
-                self.q0enc
-                    .open_for_project(&self.state.project, self.state.file_path.as_deref());
-                self.session.status = "q0enc opened".to_string();
-            }
-            Action::ToggleQ0Enc => {
-                self.q0enc
-                    .toggle_for_project(&self.state.project, self.state.file_path.as_deref());
-                self.session.status = if self.q0enc.open {
-                    "q0enc opened"
+            Action::OpenQ0Enc | Action::ToggleQ0Enc => {
+                if matches!(action, Action::ToggleQ0Enc) && self.q0enc.open {
+                    self.q0enc.open = false;
+                    self.session.status = "q0enc closed".to_string();
                 } else {
-                    "q0enc closed"
+                    let project = &self.state.project;
+                    self.q0enc
+                        .open_for_project(project, self.state.file_path.as_deref());
+                    let scene = self
+                        .session
+                        .breadcrumb
+                        .first()
+                        .copied()
+                        .unwrap_or(self.session.current_q0rg_id);
+                    if project.is_scene_root(scene) {
+                        self.q0enc.starting_scene_q0rg_id = scene;
+                    }
+                    self.session.status = "q0enc opened".to_string();
                 }
-                .to_string();
             }
             Action::OpenQ0Fla => {
                 self.q0fla_open = true;
@@ -3681,6 +3704,7 @@ impl EditorApp {
                 self.workspace_layout
                     .toggle(crate::workspace::Panel::Timeline);
             }
+            Action::OpenFramePicker => self.workspace_layout.open_frame_picker(ctx),
             Action::StrokesToOwnLayer => {
                 let q0rg_id = self.session.current_q0rg_id;
                 let layer_id = self.session.current_layer_id;
@@ -4455,6 +4479,46 @@ impl EditorApp {
             Action::DeleteLayer(q0rg_id, layer_id) => {
                 self.request_layer_delete(q0rg_id, layer_id);
             }
+            Action::SetLayerParent(q0rg_id, layer_id, parent) => {
+                let before = self.state.project.clone();
+                match q0s_format::parenting::set_parent(
+                    &mut self.state.project,
+                    q0rg_id,
+                    layer_id,
+                    parent,
+                ) {
+                    Ok(()) if self.state.project != before => {
+                        self.history.snapshot_with_session(&before, &self.session);
+                        self.state.mark_dirty();
+                        self.textures.invalidate();
+                        let name = |id: u16| {
+                            if id == q0s_format::parenting::CAMERA_LAYER {
+                                return "Camera".to_string();
+                            }
+                            self.state
+                                .project
+                                .q0rgs
+                                .iter()
+                                .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+                                .and_then(|q0rg| {
+                                    q0rg.layers.iter().find(|layer| layer.layer_id == id)
+                                })
+                                .map_or_else(|| format!("layer {id}"), |layer| layer.name.clone())
+                        };
+                        self.session.status = match parent {
+                            Some(parent) => {
+                                format!("{} now follows {}", name(layer_id), name(parent))
+                            }
+                            None => format!("{} has no parent", name(layer_id)),
+                        };
+                    }
+                    Ok(()) => {}
+                    Err(error) => {
+                        self.state.project = before;
+                        self.session.status = format!("layer parent: {error}");
+                    }
+                }
+            }
             Action::AddQ0rg => {
                 self.history
                     .snapshot_with_session(&self.state.project, &self.session);
@@ -4689,6 +4753,19 @@ impl EditorApp {
                 self.session.scene_rename = None;
                 self.state.mark_dirty();
                 self.session.status = format!("renamed scene to {name}");
+            }
+            Action::DeleteScene(scene_id) => {
+                let scenes = self.state.project.scenes();
+                let Some(scene) = scenes.iter().find(|scene| scene.scene_id == scene_id) else {
+                    self.session.status = "scene no longer exists".to_string();
+                    return;
+                };
+                if scenes.len() == 1 {
+                    self.session.status = "the project needs at least one scene".to_string();
+                    return;
+                }
+                self.pending_q0rg_delete =
+                    Some((scene.q0rg_id, self.q0rg_reference_count(scene.q0rg_id)));
             }
             Action::RenameLibraryItem(item, requested_name) => {
                 let name = requested_name.trim().to_string();
@@ -5776,6 +5853,9 @@ impl EditorApp {
             }
             Action::DuplicateSymbol(q0rg_id, layer_id, placement_idx) => {
                 self.duplicate_symbol_instance(q0rg_id, layer_id, placement_idx);
+            }
+            Action::PromptSymbol(request) => {
+                crate::symbol_prompt::open(self, ctx, request);
             }
             Action::MakeVariant(q0rg_id, layer_id, placement_idx) => {
                 self.make_variant(q0rg_id, layer_id, placement_idx);
@@ -6908,56 +6988,171 @@ impl EditorApp {
     }
 
     fn apply_q0rg_delete(&mut self, q0rg_id: u16) {
-        if q0rg_id == self.state.project.meta.entry_q0rg_id {
+        let project = &self.state.project;
+        if !project.q0rgs.iter().any(|q0rg| q0rg.q0rg_id == q0rg_id) {
             return;
         }
-        self.history
-            .snapshot_with_session(&self.state.project, &self.session);
-        self.state.project.q0rgs.retain(|q| q.q0rg_id != q0rg_id);
-        self.state
-            .project
-            .runtime
+        let scenes = project.scenes();
+        let scene_name = scenes
+            .iter()
+            .find(|scene| scene.q0rg_id == q0rg_id)
+            .map(|scene| scene.name.clone());
+        let replacement = if q0rg_id == project.meta.entry_q0rg_id {
+            let Some(scene) = scenes.iter().find(|scene| scene.q0rg_id != q0rg_id) else {
+                self.session.status = "the project needs at least one scene".to_string();
+                return;
+            };
+            Some(scene.q0rg_id)
+        } else {
+            None
+        };
+        self.history.snapshot_with_session(project, &self.session);
+        let project = &mut self.state.project;
+        if let Some(replacement) = replacement {
+            project.meta.entry_q0rg_id = replacement;
+            project.runtime.camera = Default::default();
+        }
+        project.q0rgs.retain(|q| q.q0rg_id != q0rg_id);
+        let runtime = &mut project.runtime;
+        runtime
             .library_item_folders
             .remove(&q0s_format::v2::LibraryItemReference::Q0rg(q0rg_id));
-        self.state
-            .project
-            .runtime
-            .scenes
-            .retain(|scene| scene.q0rg_id != q0rg_id);
-        self.state
-            .project
-            .runtime
-            .frame_labels
-            .retain(|key, _| key.q0rg_id != q0rg_id);
-        self.state
-            .project
-            .audio_clips
-            .retain(|clip| clip.q0rg_id != q0rg_id);
-        self.state
-            .project
-            .runtime
+        runtime.scenes.retain(|scene| scene.q0rg_id != q0rg_id);
+        runtime.frame_labels.retain(|key, _| key.q0rg_id != q0rg_id);
+        runtime
             .frame_scripts
             .retain(|script| script.q0rg_id != q0rg_id);
-        self.state
-            .project
-            .runtime
-            .instance_names
-            .retain(|key, _| key.q0rg_id != q0rg_id);
-        for q0rg in &mut self.state.project.q0rgs {
-            for layer in &mut q0rg.layers {
-                layer.placements.retain(
-                    |placement| !matches!(placement.target, Target::Q0rg(id) if id == q0rg_id),
-                );
-            }
-        }
-        self.state
-            .project
+        project.audio_clips.retain(|clip| clip.q0rg_id != q0rg_id);
+        project
             .layer_metadata
             .retain(|key, _| key.q0rg_id != q0rg_id);
+        let mut removed_instances = std::collections::HashSet::new();
+        let mut affected_timelines = std::collections::HashSet::new();
+        for q0rg in &mut project.q0rgs {
+            for layer in &mut q0rg.layers {
+                layer.placements.retain(|placement| {
+                    let removed = placement.target == Target::Q0rg(q0rg_id);
+                    if removed {
+                        affected_timelines.insert(q0rg.q0rg_id);
+                        if placement.instance_id != 0 {
+                            removed_instances.insert((q0rg.q0rg_id, placement.instance_id));
+                        }
+                    }
+                    !removed
+                });
+            }
+        }
+        for q0rg in project
+            .q0rgs
+            .iter()
+            .filter(|q| affected_timelines.contains(&q.q0rg_id))
+        {
+            for placement in q0rg.layers.iter().flat_map(|layer| &layer.placements) {
+                removed_instances.remove(&(q0rg.q0rg_id, placement.instance_id));
+            }
+        }
+        let instance_lost = |owner, instance| removed_instances.contains(&(owner, instance));
+        runtime.instance_names.retain(|key, _| {
+            key.q0rg_id != q0rg_id && !instance_lost(key.q0rg_id, key.instance_id)
+        });
+        runtime
+            .physics
+            .scenes
+            .retain(|scene| scene.q0rg_id != q0rg_id);
+        runtime
+            .physics
+            .liquids
+            .retain(|liquid| liquid.q0rg_id != q0rg_id);
+        runtime.physics.bodies.retain(|body| {
+            body.q0rg_id != q0rg_id && !instance_lost(body.q0rg_id, body.instance_id)
+        });
+        runtime.physics.links.retain(|link| {
+            link.q0rg_id != q0rg_id
+                && !instance_lost(link.q0rg_id, link.from)
+                && !instance_lost(link.q0rg_id, link.to)
+        });
+        runtime
+            .particles
+            .emitters
+            .retain(|emitter| emitter.q0rg_id != q0rg_id);
+        for emitter in &mut runtime.particles.emitters {
+            if emitter
+                .follow
+                .is_some_and(|id| instance_lost(emitter.q0rg_id, id))
+            {
+                emitter.follow = None;
+            }
+        }
+        runtime
+            .lighting
+            .setups
+            .retain(|setup| setup.q0rg_id != q0rg_id);
+        for setup in &mut runtime.lighting.setups {
+            for light in &mut setup.lights {
+                if light
+                    .follow
+                    .is_some_and(|id| instance_lost(setup.q0rg_id, id))
+                {
+                    light.follow = None;
+                }
+            }
+        }
+        runtime
+            .scene3d
+            .setups
+            .retain(|setup| setup.q0rg_id != q0rg_id);
+        for setup in &mut runtime.scene3d.setups {
+            setup
+                .physics
+                .bodies
+                .retain(|body| !instance_lost(setup.q0rg_id, body.instance_id));
+            for light in &mut setup.lights {
+                if light
+                    .follow
+                    .is_some_and(|id| instance_lost(setup.q0rg_id, id))
+                {
+                    light.follow = None;
+                }
+            }
+        }
+        runtime.scene3d.poses.retain(|pose| {
+            pose.q0rg_id != q0rg_id && !instance_lost(pose.q0rg_id, pose.instance_id)
+        });
+
+        if self.session.current_q0rg_id == q0rg_id || self.session.breadcrumb.contains(&q0rg_id) {
+            self.session.current_q0rg_id = q0rg_id;
+            self.session.current_frame = 0;
+            self.session.animation_preview_frame = 0;
+            self.session.edit_in_place.clear();
+            self.session.playing = false;
+        }
+        if affected_timelines.contains(&self.session.current_q0rg_id) {
+            self.session.selection = Selection::None;
+        }
+        if self
+            .session
+            .frame_script_editor
+            .as_ref()
+            .is_some_and(|editor| editor.q0rg_id == q0rg_id)
+        {
+            self.session.frame_script_editor = None;
+        }
+        self.session.preview_loop_ranges.remove(&q0rg_id);
+        self.session.outline_layers.retain(|(id, _)| *id != q0rg_id);
+        self.session
+            .timeline_row_heights
+            .retain(|(id, _), _| *id != q0rg_id);
+        self.session
+            .hidden_mask_art_layers
+            .retain(|(_, id, _)| *id != q0rg_id);
         self.session.reconcile_with(&self.state.project);
+        self.q0enc.reconcile_with_project(&self.state.project);
         self.state.mark_dirty();
         self.textures.invalidate();
-        self.session.status = format!("deleted symbol {q0rg_id}");
+        self.session.status = scene_name.map_or_else(
+            || format!("deleted symbol {q0rg_id}"),
+            |name| format!("deleted scene {name}"),
+        );
     }
 
     fn request_layer_delete(&mut self, q0rg_id: u16, layer_id: u16) {
@@ -7025,6 +7220,12 @@ impl EditorApp {
         let metadata = self.state.project.layer_metadata(q0rg_id, layer_id);
         self.history
             .snapshot_with_session(&self.state.project, &self.session);
+        // Layers hanging from the ones going away keep their place on the stage.
+        let leaving: Vec<u16> = self.state.project.q0rgs[q0rg_index].layers[start..end]
+            .iter()
+            .map(|layer| layer.layer_id)
+            .collect();
+        q0s_format::parenting::release_children(&mut self.state.project, q0rg_id, &leaving);
         let removed_ids: Vec<u16> = self.state.project.q0rgs[q0rg_index].layers[start..end]
             .iter()
             .map(|layer| layer.layer_id)
@@ -12423,6 +12624,9 @@ impl EditorApp {
                                 color_row(ui, "Window stroke", &mut t.stroke_dark);
                             });
                     });
+                egui::CollapsingHeader::new("Gradients")
+                    .default_open(true)
+                    .show(ui, |ui| crate::ui::gradient_editor(ui, &mut t));
                 egui::CollapsingHeader::new("Stage & canvas")
                     .default_open(true)
                     .show(ui, |ui| {
@@ -12677,189 +12881,8 @@ impl EditorApp {
     }
 
     fn render_shortcuts_dialog(&mut self, ctx: &Context) {
-        use crate::hotkeys::{ShortcutChord, ShortcutCommand};
-
-        let mut open = true;
-        let mut close_requested = false;
-        egui::Window::new("Keyboard shortcuts")
-            .open(&mut open)
-            .default_size([560.0, 540.0])
-            .default_pos(ctx.screen_rect().center() - egui::vec2(280.0, 270.0))
-            .collapsible(false)
-            .resizable(true)
-            .fit_to_screen(ctx)
-            .show(ctx, |ui| {
-                ui.label(
-                    "A command can have several shortcuts. Add one, then press the keys; \
-                     click a shortcut to remove it.",
-                );
-                ui.label(
-                    egui::RichText::new(
-                        "Keys follow their position, so Ctrl+Z also works as Ctrl+\u{44f} on a \
-                         Russian layout. Adding a shortcut takes it from the command that had it.",
-                    )
-                    .small()
-                    .color(self.settings.theme.text_dim.to_color32()),
-                );
-                ui.horizontal(|ui| {
-                    if ui.button("Reset to factory defaults").clicked() {
-                        self.settings.hotkeys.reset();
-                        self.settings.save();
-                        self.session.shortcut_capture = None;
-                        self.session.shortcut_feedback = Some("Factory shortcuts restored".into());
-                    }
-                    if ui.button("Close").clicked() {
-                        close_requested = true;
-                    }
-                });
-                if let Some(feedback) = &self.session.shortcut_feedback {
-                    ui.label(
-                        egui::RichText::new(feedback)
-                            .small()
-                            .color(self.settings.theme.accent.to_color32()),
-                    );
-                }
-                ui.separator();
-
-                egui::ScrollArea::vertical()
-                    .id_source("keyboard_shortcuts_list")
-                    .max_height(430.0)
-                    .show(ui, |ui| {
-                        egui::Grid::new("keyboard_shortcuts_grid")
-                            .num_columns(3)
-                            .spacing([12.0, 7.0])
-                            .striped(true)
-                            .show(ui, |ui| {
-                                let accent = self.settings.theme.accent.to_color32();
-                                let dim = self.settings.theme.text_dim.to_color32();
-                                for command in ShortcutCommand::ALL.iter().copied() {
-                                    ui.label(command.label());
-                                    let capturing = self.session.shortcut_capture == Some(command);
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 4.0;
-                                        let shortcuts = self.settings.hotkeys.shortcuts(command);
-                                        for chord in shortcuts {
-                                            let chip = egui::Button::new(
-                                                egui::RichText::new(chord.display()).monospace(),
-                                            )
-                                            .small()
-                                            .rounding(4.0);
-                                            if ui
-                                                .add(chip)
-                                                .on_hover_text(format!(
-                                                    "Remove {}",
-                                                    chord.display()
-                                                ))
-                                                .clicked()
-                                            {
-                                                self.settings.hotkeys.remove(command, chord);
-                                                self.settings.save();
-                                                self.session.shortcut_feedback = Some(format!(
-                                                    "{} no longer uses {}",
-                                                    command.label(),
-                                                    chord.display()
-                                                ));
-                                            }
-                                        }
-                                        if capturing {
-                                            ui.colored_label(accent, "Press keys... (Esc cancels)");
-                                        } else if self
-                                            .settings
-                                            .hotkeys
-                                            .shortcuts(command)
-                                            .is_empty()
-                                        {
-                                            ui.colored_label(dim, "Unassigned");
-                                        }
-                                    });
-                                    ui.horizontal(|ui| {
-                                        if capturing {
-                                            if ui.small_button("Cancel").clicked() {
-                                                self.session.shortcut_capture = None;
-                                            }
-                                        } else if ui
-                                            .small_button("Add")
-                                            .on_hover_text("Add another shortcut")
-                                            .clicked()
-                                        {
-                                            self.session.shortcut_capture = Some(command);
-                                            self.session.shortcut_feedback = None;
-                                        }
-                                        if !self.settings.hotkeys.is_default(command)
-                                            && ui
-                                                .small_button("Reset")
-                                                .on_hover_text("Back to the factory shortcuts")
-                                                .clicked()
-                                        {
-                                            self.settings.hotkeys.reset_command(command);
-                                            self.settings.save();
-                                            self.session.shortcut_feedback = Some(format!(
-                                                "{} is back to {}",
-                                                command.label(),
-                                                self.settings.hotkeys.display(command)
-                                            ));
-                                        }
-                                    });
-                                    ui.end_row();
-                                }
-                            });
-                    });
-            });
-
-        if !open || close_requested {
-            self.session.show_shortcuts = false;
-            self.session.shortcut_capture = None;
-            return;
-        }
-
-        let capture = if self.session.show_shortcuts {
-            ctx.input(|input| {
-                input.events.iter().find_map(|event| match event {
-                    egui::Event::Key {
-                        key,
-                        pressed: true,
-                        repeat: false,
-                        modifiers,
-                        ..
-                    } => Some((*key, *modifiers)),
-                    // egui-winit reports these native clipboard combinations
-                    // instead of Key(X/C/V), including while a shortcut is captured.
-                    egui::Event::Cut => Some((egui::Key::X, input.modifiers)),
-                    egui::Event::Copy => Some((egui::Key::C, input.modifiers)),
-                    egui::Event::Paste(_) => Some((egui::Key::V, input.modifiers)),
-                    _ => None,
-                })
-            })
-        } else {
-            None
-        };
-        if let (Some(command), Some((key, modifiers))) = (self.session.shortcut_capture, capture) {
-            if key == egui::Key::Escape && !modifiers.command && !modifiers.shift && !modifiers.alt
-            {
-                self.session.shortcut_capture = None;
-                self.session.shortcut_feedback = Some("Shortcut assignment cancelled".into());
-            } else if let Some(chord) = ShortcutChord::from_modifiers(key, modifiers) {
-                let moved = self.settings.hotkeys.add(command, chord);
-                self.settings.save();
-                self.session.shortcut_capture = None;
-                self.session.shortcut_feedback = Some(if moved.is_empty() {
-                    format!("{} now also uses {}", command.label(), chord.display())
-                } else {
-                    format!(
-                        "{} now also uses {}; taken from {}",
-                        command.label(),
-                        chord.display(),
-                        moved
-                            .iter()
-                            .map(|item| item.label())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                });
-            } else {
-                self.session.shortcut_feedback =
-                    Some("That key cannot be used for a shortcut".into());
-            }
+        if panels::shortcuts::render(self, ctx) {
+            self.settings.save();
         }
     }
 
@@ -14098,34 +14121,59 @@ impl EditorApp {
         }
 
         if let Some((q0rg_id, references)) = self.pending_q0rg_delete {
+            let scene = self
+                .state
+                .project
+                .scenes()
+                .into_iter()
+                .find(|scene| scene.q0rg_id == q0rg_id);
             let mut confirm = false;
             let mut cancel = false;
-            egui::Window::new("Delete used symbol?")
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .collapsible(false)
-                .resizable(false)
-                .fit_to_screen(ctx)
-                .show(ctx, |ui| {
+            egui::Window::new(if scene.is_some() {
+                "Delete scene?"
+            } else {
+                "Delete used symbol?"
+            })
+            .id(egui::Id::new("delete_timeline_confirmation"))
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .fit_to_screen(ctx)
+            .show(ctx, |ui| {
+                if let Some(scene) = &scene {
+                    ui.label(format!("Delete {} and its timeline?", scene.name));
+                }
+                if references > 0 {
                     ui.label(format!(
-                        "Symbol {q0rg_id} is used by {references} placement(s)."
+                        "This also removes {references} placement(s) that use it."
                     ));
-                    ui.label("Deleting it also removes every one of those placements.");
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Delete symbol and placements").clicked() {
-                            confirm = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
-                        }
-                    });
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let label = if scene.is_some() {
+                        "Delete scene"
+                    } else {
+                        "Delete symbol and placements"
+                    };
+                    if ui.button(label).clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
                 });
+            });
             if confirm {
                 self.pending_q0rg_delete = None;
                 self.apply_q0rg_delete(q0rg_id);
             } else if cancel {
                 self.pending_q0rg_delete = None;
-                self.session.status = "symbol deletion cancelled".to_string();
+                self.session.status = if scene.is_some() {
+                    "scene deletion cancelled"
+                } else {
+                    "symbol deletion cancelled"
+                }
+                .to_string();
             }
         }
 
@@ -14290,6 +14338,9 @@ impl EditorApp {
     fn resolve_preview_timeline_target(&self, target: &TimelineTarget) -> Option<u16> {
         match target {
             TimelineTarget::Frame(frame) => Some(*frame),
+            TimelineTarget::Here => Some(self.session.current_frame),
+            TimelineTarget::Next => Some(self.session.current_frame.saturating_add(1)),
+            TimelineTarget::Previous => Some(self.session.current_frame.saturating_sub(1)),
             TimelineTarget::Label(label) => self
                 .state
                 .project
@@ -14335,6 +14386,8 @@ impl EditorApp {
     ) {
         for action in actions {
             match action {
+                RuntimeAction::GoRun(TimelineTarget::Here) => self.session.playing = true,
+                RuntimeAction::GoStop(TimelineTarget::Here) => self.session.playing = false,
                 RuntimeAction::GoRun(target) => {
                     if let Some(frame) = self.resolve_preview_timeline_target(target) {
                         self.session.playing = true;
@@ -14350,6 +14403,20 @@ impl EditorApp {
                     } else {
                         self.report_missing_preview_frame_label(target);
                     }
+                }
+                // In the preview every script runs on the main timeline.
+                RuntimeAction::Window(
+                    q0s_format::q0lang::runtime::WindowCommand::RootTimeline { play, target },
+                ) => {
+                    let step = if *play {
+                        RuntimeAction::GoRun(target.clone())
+                    } else {
+                        RuntimeAction::GoStop(target.clone())
+                    };
+                    self.apply_preview_q0lang_actions(
+                        std::slice::from_ref(&step),
+                        transition_budget,
+                    );
                 }
                 RuntimeAction::ShellCommand { .. }
                 | RuntimeAction::SceneSwitch { .. }
@@ -14642,7 +14709,11 @@ impl EditorApp {
             self.session.selection_history_gesture = Some((selection_before_frame.clone(), true));
         }
         self.handle_dropped_files(ctx);
-        if self.show_home {
+        if self.session.show_shortcuts && self.session.shortcut_capture.is_some() {
+            if panels::shortcuts::capture_key(self, ctx) {
+                self.settings.save();
+            }
+        } else if self.show_home {
             panels::menu::handle_home_shortcuts(self, ctx);
         } else if self.model_studio.is_none() {
             panels::menu::handle_global_shortcuts(self, ctx);
@@ -14657,6 +14728,11 @@ impl EditorApp {
 
         let menu_started = Instant::now();
         // F9 leaves the stage alone on screen, menus and tabs too.
+        // New drawings on parented layers need ids to follow their parent,
+        // and links to layers that are gone are dropped.
+        if q0s_format::parenting::tidy(&mut self.state.project) {
+            self.state.mark_dirty();
+        }
         let stage_only = self.stage_only && !self.show_home && self.project_active;
         if crate::touch::ENABLED {
             crate::touch::top_bar(self, ctx);
@@ -14664,6 +14740,7 @@ impl EditorApp {
             egui::TopBottomPanel::top("menu_bar")
                 .resizable(false)
                 .show(ctx, |ui| {
+                    crate::ui::paint_bar(ui);
                     panels::menu::render(self, ui);
                 });
             panels::tabs::render(self, ctx);
@@ -14740,6 +14817,7 @@ impl EditorApp {
         }
         self.render_new_project_dialog(ctx);
         self.render_replace_q0rg_dialog(ctx);
+        crate::symbol_prompt::render(self, ctx);
         self.render_destructive_change_dialogs(ctx);
         self.render_unsaved_changes_dialog(ctx);
         if !self.render_fla_font_dialog(ctx) {
@@ -17837,6 +17915,80 @@ mod tests {
         );
         assert!(app.state.project.q0rgs.iter().any(|q0rg| q0rg.q0rg_id == 1));
         assert_eq!(app.session.status, "the stage symbol cannot be deleted");
+    }
+
+    #[test]
+    fn deleting_the_starting_scene_keeps_a_valid_project_and_is_undoable() {
+        let ctx = Context::default();
+        let mut app = EditorApp::default();
+        app.handle(&ctx, Action::AddScene);
+        let scenes = app.state.project.scenes();
+        let (first, next) = (&scenes[0], &scenes[1]);
+        let project = &mut app.state.project;
+        let camera = project.default_camera_state();
+        project.runtime.camera.enabled = true;
+        project.runtime.camera.insert_key(0, camera);
+        for scene in &scenes {
+            project
+                .runtime
+                .scene3d
+                .setup_mut(
+                    scene.q0rg_id,
+                    project.meta.stage_width,
+                    project.meta.stage_height,
+                )
+                .camera
+                .enabled = true;
+        }
+        project.q0rgs[1].layers[0].push_placement(Placement {
+            pivot: None,
+            instance_id: 42,
+            frame: 0,
+            target: Target::Q0rg(first.q0rg_id),
+            transform: Transform2D::IDENTITY,
+            tween: Tween::None,
+            fx: Default::default(),
+        });
+        let instance = q0s_format::v2::InstanceKey::new(next.q0rg_id, 42);
+        project
+            .runtime
+            .instance_names
+            .insert(instance, "former_scene".into());
+        app.handle(&ctx, Action::SwitchScene(first.scene_id));
+        app.handle(&ctx, Action::OpenQ0Enc);
+        app.handle(&ctx, Action::DeleteScene(first.scene_id));
+        assert_eq!(app.pending_q0rg_delete.take(), Some((first.q0rg_id, 1)));
+        app.apply_q0rg_delete(first.q0rg_id);
+        let project = &app.state.project;
+        assert_eq!(project.scenes(), vec![next.clone()]);
+        assert_eq!(project.meta.entry_q0rg_id, next.q0rg_id);
+        assert_eq!(app.session.current_q0rg_id, next.q0rg_id);
+        assert_eq!(app.q0enc.starting_scene_q0rg_id, next.q0rg_id);
+        assert!(project.q0rgs[0].layers[0].placements.is_empty());
+        assert!(!project.runtime.instance_names.contains_key(&instance));
+        assert!(project.runtime.scene3d.setup(first.q0rg_id).is_none());
+        assert!(
+            project
+                .runtime
+                .scene3d
+                .setup(next.q0rg_id)
+                .unwrap()
+                .camera
+                .enabled
+        );
+        assert_eq!(project.runtime.camera, Default::default());
+        q0s_format::v2::validate(project).expect("valid project after deleting the starting scene");
+
+        app.handle(&ctx, Action::DeleteScene(next.scene_id));
+        assert!(app.pending_q0rg_delete.is_none());
+        app.handle(&ctx, Action::Undo);
+        assert_eq!(app.state.project.scenes(), scenes);
+        assert_eq!(app.state.project.meta.entry_q0rg_id, first.q0rg_id);
+        assert!(app.state.project.runtime.camera.has_keyframe(0));
+        assert_eq!(
+            app.state.project.runtime.instance_names[&instance],
+            "former_scene"
+        );
     }
 
     #[test]

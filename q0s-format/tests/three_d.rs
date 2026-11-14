@@ -145,6 +145,161 @@ fn pixel(pixels: &[u8], x: usize, y: usize) -> [u8; 4] {
 }
 
 #[test]
+fn the_timeline_camera_pans_and_dollies_3d_objects_by_depth() {
+    let green = Rgba {
+        r: 20,
+        g: 210,
+        b: 40,
+        a: 255,
+    };
+    let blue = Rgba {
+        r: 25,
+        g: 40,
+        b: 220,
+        a: 255,
+    };
+    let mut scene = project(
+        vec![
+            square(1, 10.0, RED),
+            square(2, 10.0, blue),
+            square(3, 10.0, green),
+        ],
+        vec![
+            placed(1, 100.0, 65.0, Some(Space3d::default())),
+            placed(
+                2,
+                100.0,
+                135.0,
+                Some(Space3d {
+                    z: 100.0,
+                    ..Space3d::default()
+                }),
+            ),
+            placed(3, 100.0, 100.0, None),
+        ],
+    );
+    let render = |project: &ProjectV2| rasterize_q0rg_frame(project, 1, 0, 200, 200, 1, [255; 4]);
+    let span = |pixels: &[u8], channel: usize| {
+        let mut xs = pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .enumerate()
+            .filter(|(_, px)| {
+                px[channel] > 160 && px[(channel + 1) % 3] < 80 && px[(channel + 2) % 3] < 80
+            })
+            .map(|(index, _)| index % 200);
+        let first = xs.next().expect("the object is visible");
+        let (min, max) = xs.fold((first, first), |(min, max), x| (min.min(x), max.max(x)));
+        ((min + max + 1) as f32 * 0.5, max + 1 - min)
+    };
+    let before = render(&scene);
+    let near_before = span(&before, 0);
+    let far_before = span(&before, 2);
+    let mut camera = scene.default_camera_state();
+    camera.center_x += 20.0;
+    camera.zoom = 1.5;
+    scene.runtime.camera.enabled = true;
+    scene.runtime.camera.insert_key(0, camera);
+    let after = render(&scene);
+    let near = span(&after, 0);
+    let far = span(&after, 2);
+    let flat = span(&after, 1);
+    assert!(
+        (near.0 - flat.0).abs() <= 0.5 && near.1.abs_diff(flat.1) <= 1,
+        "2D and 3D art at depth zero should line up: {near:?}, {flat:?}"
+    );
+    assert_eq!(near, (70.0, 30));
+    assert!(
+        near_before.0 - near.0 > far_before.0 - far.0 + 8.0,
+        "near {near:?}, far {far:?}"
+    );
+    assert!(
+        near.1 - near_before.1 > far.1 - far_before.1 + 2,
+        "near {near:?}, far {far:?}"
+    );
+}
+
+fn attach_mask(project: &mut ProjectV2, mask: Placement) {
+    use q0s_format::v2::{LayerKey, LayerKind, LayerMetadata};
+    project.q0rgs[0].layers.push(Layer {
+        layer_id: 2,
+        timeline_frame_count: None,
+        name: "mask".into(),
+        explicit_keyframes: Vec::new(),
+        placements: vec![mask],
+    });
+    project.layer_metadata.insert(
+        LayerKey::new(1, 1),
+        LayerMetadata {
+            mask_layer_id: Some(2),
+            ..Default::default()
+        },
+    );
+    project.layer_metadata.insert(
+        LayerKey::new(1, 2),
+        LayerMetadata {
+            kind: LayerKind::Mask,
+            ..Default::default()
+        },
+    );
+}
+
+#[test]
+fn a_masked_3d_card_uses_its_projected_position_and_opacity() {
+    let mut card = placed(
+        1,
+        160.0,
+        100.0,
+        Some(Space3d {
+            z: 320.0,
+            lit: false,
+            ..Default::default()
+        }),
+    );
+    card.fx.opacity = 0.5;
+    let mut project = project(vec![square(1, 12.0, RED), square(2, 3.0, RED)], vec![card]);
+    let draw = |project: &ProjectV2| rasterize_q0rg_frame(project, 1, 0, 200, 200, 1, [0; 4]);
+    let unmasked = draw(&project);
+    let expected = pixel(&unmasked, 127, 100);
+    assert!(expected[3].abs_diff(128) <= 1, "{expected:?}");
+    assert!(pixel(&unmasked, 132, 100)[3] > 100);
+
+    attach_mask(&mut project, placed(2, 127.0, 100.0, None));
+    let masked = draw(&project);
+    let inside = pixel(&masked, 127, 100);
+    assert_eq!(inside[3], expected[3]);
+    assert!(inside
+        .into_iter()
+        .zip(expected)
+        .all(|(a, b)| a.abs_diff(b) <= 1));
+    assert_eq!(pixel(&masked, 132, 100)[3], 0);
+}
+
+#[test]
+fn a_model_can_supply_the_mask_alpha() {
+    let mut project = project(
+        vec![square(1, 80.0, RED), cube_model(2)],
+        vec![placed(1, 100.0, 100.0, None)],
+    );
+    attach_mask(
+        &mut project,
+        placed(
+            2,
+            160.0,
+            100.0,
+            Some(Space3d {
+                z: 320.0,
+                ..Default::default()
+            }),
+        ),
+    );
+    let masked = rasterize_q0rg_frame(&project, 1, 0, 200, 200, 1, [0; 4]);
+    assert_eq!(pixel(&masked, 127, 100), [RED.r, RED.g, RED.b, 255]);
+    assert_eq!(pixel(&masked, 160, 100)[3], 0);
+}
+
+#[test]
 fn a_placed_model_draws_in_software() {
     let project = project(vec![cube_model(1)], vec![placed(1, 100.0, 100.0, None)]);
     let pixels = rasterize_q0rg_frame(&project, 1, 0, 200, 200, 1, [255, 255, 255, 255]);

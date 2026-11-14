@@ -753,41 +753,28 @@ fn on_plane(origin: V3, dir: V3, point: V3, n: V3) -> Option<V3> {
     Some(origin + dir * t)
 }
 
-/// The distance along `axis` (through `point`) closest to the mouse ray.
-fn along_axis(origin: V3, dir: V3, point: V3, axis: V3) -> Option<f32> {
-    let w0 = point - origin;
-    let b = axis.dot(dir);
-    let denom = 1.0 - b * b;
-    if denom.abs() < 1.0e-5 {
-        return None;
-    }
-    Some((b * dir.dot(w0) - axis.dot(w0)) / denom)
-}
-
 fn snap(value: f32, step: f32) -> f32 {
     (value / step).round() * step
 }
 
 /// The model-space change the mouse asks for now.
-fn op_matrix(studio: &mut ModelStudio, view: &View3d, mouse: Pos2, snapping: bool) -> Mat4 {
-    let Some(op) = studio.op.clone() else {
-        return Mat4::IDENTITY;
-    };
+fn op_matrix(studio: &mut ModelStudio, view: &View3d, mouse: Pos2, snapping: bool) -> Option<Mat4> {
+    use super::gizmo;
+
+    let op = studio.op.clone()?;
     let step = studio.grid_step();
     let angle_step = studio.settings.angle_step.max(1.0);
-    let Some(pivot_screen) = studio.screen(view, op.pivot) else {
-        return Mat4::IDENTITY;
-    };
-    let rays = (studio.ray(view, op.start_mouse), studio.ray(view, mouse));
+    let pivot = super::flip(op.pivot);
     let mut value = String::new();
     let m = match op.kind {
         OpKind::Grab | OpKind::Inset | OpKind::LoopCut => {
             let forward = studio.orbit.forward();
+            let rays = (studio.ray(view, op.start_mouse), studio.ray(view, mouse));
             let delta = match (op.constraint, rays) {
                 (Constraint::Axis(axis), (Some((o0, d0)), Some((o1, d1)))) => {
                     match (
-                        along_axis(o0, d0, op.pivot, axis),
-                        along_axis(o1, d1, op.pivot, axis),
+                        gizmo::axis_parameter(o0, d0, op.pivot, axis),
+                        gizmo::axis_parameter(o1, d1, op.pivot, axis),
                     ) {
                         (Some(s0), Some(s1)) => {
                             let mut s = s1 - s0;
@@ -822,22 +809,15 @@ fn op_matrix(studio: &mut ModelStudio, view: &View3d, mouse: Pos2, snapping: boo
             Mat4::translation(delta)
         }
         OpKind::Rotate => {
-            let a = op.start_mouse - pivot_screen;
-            let b = mouse - pivot_screen;
-            if a.length() < 2.0 || b.length() < 2.0 {
-                return Mat4::IDENTITY;
-            }
-            let mut degrees = -(b.y.atan2(b.x) - a.y.atan2(a.x)).to_degrees();
-            degrees = (degrees + 540.0).rem_euclid(360.0) - 180.0;
-            let toward_viewer = -studio.orbit.forward();
-            let axis = match op.constraint {
-                Constraint::Axis(axis) | Constraint::Plane(axis) => {
-                    if axis.dot(toward_viewer) < 0.0 {
-                        degrees = -degrees;
-                    }
-                    axis
-                }
-                Constraint::Free => toward_viewer,
+            let (axis, mut degrees) = match op.constraint {
+                Constraint::Axis(axis) | Constraint::Plane(axis) => (
+                    axis,
+                    gizmo::ring_turn(view, pivot, super::flip(axis), op.start_mouse, mouse)?,
+                ),
+                Constraint::Free => (
+                    -studio.orbit.forward(),
+                    -gizmo::screen_turn(studio.screen(view, op.pivot)?, op.start_mouse, mouse),
+                ),
             };
             if snapping {
                 degrees = snap(degrees, angle_step);
@@ -846,11 +826,20 @@ fn op_matrix(studio: &mut ModelStudio, view: &View3d, mouse: Pos2, snapping: boo
             about(op.pivot, rotation_about(axis, degrees))
         }
         OpKind::Scale => {
-            let a = (op.start_mouse - pivot_screen).length().max(4.0);
-            let mut k = (mouse - pivot_screen).length() / a;
-            if snapping {
-                k = snap(k, 0.1).max(0.1);
-            }
+            let k = match op.constraint {
+                Constraint::Axis(axis) => {
+                    gizmo::axis_scale(view, pivot, super::flip(axis), op.start_mouse, mouse)?
+                }
+                Constraint::Plane(normal) => {
+                    gizmo::plane_scale(view, pivot, super::flip(normal), op.start_mouse, mouse)?
+                }
+                Constraint::Free => gizmo::uniform_scale(op.start_mouse, mouse),
+            };
+            let k = if snapping {
+                snap(k, 0.1).max(0.1)
+            } else {
+                k.max(0.01)
+            };
             value = format!("×{k:.2}");
             let m = match op.constraint {
                 Constraint::Axis(axis) => {
@@ -883,7 +872,7 @@ fn op_matrix(studio: &mut ModelStudio, view: &View3d, mouse: Pos2, snapping: boo
     if let Some(op) = &mut studio.op {
         op.value = value;
     }
-    m
+    Some(m)
 }
 
 /// Follows the mouse with the running change.
@@ -928,7 +917,9 @@ pub fn update(studio: &mut ModelStudio, view: &View3d, mouse: Pos2, snapping: bo
         studio.touch();
         return;
     }
-    let t = op_matrix(studio, view, mouse, snapping);
+    let Some(t) = op_matrix(studio, view, mouse, snapping) else {
+        return;
+    };
     match &op.start {
         Start::Verts { mesh, list } => {
             let world = studio.model.rest_world();

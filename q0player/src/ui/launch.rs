@@ -27,6 +27,10 @@ pub struct Launch {
     /// on [`PREFERRED_MULTISAMPLING`] has to probe before launching.
     pub multisampling: u16,
     pub event_loop_builder: Option<eframe::EventLoopBuilderHook>,
+    /// A QIR app: the movie, its manifest and icon, which decide the window.
+    pub qir: Option<q0qir::Bundle>,
+    /// What a QIR app reads as `app.args`.
+    pub args: Vec<String>,
 }
 
 impl Default for Launch {
@@ -36,7 +40,50 @@ impl Default for Launch {
             preview: PreviewOptions::default(),
             multisampling: PREFERRED_MULTISAMPLING,
             event_loop_builder: None,
+            qir: None,
+            args: Vec::new(),
         }
+    }
+}
+
+/// The window a QIR app's manifest asks for. `most_samples` caps the
+/// anti-aliasing where the platform was probed for what it offers.
+pub fn qir_options(
+    manifest: &q0qir::Manifest,
+    icon_png: Option<&[u8]>,
+    most_samples: u16,
+) -> eframe::NativeOptions {
+    let window = &manifest.window;
+    let icon = icon_png
+        .and_then(|png| eframe::icon_data::from_png_bytes(png).ok())
+        .unwrap_or_else(q0_window_icon);
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([window.width as f32, window.height as f32])
+        .with_min_inner_size([
+            window.min_width.max(64) as f32,
+            window.min_height.max(64) as f32,
+        ])
+        .with_title(manifest.title())
+        .with_resizable(window.resizable)
+        .with_decorations(window.decorations)
+        .with_app_id(manifest.app.id.clone())
+        .with_icon(icon);
+    viewport = match window.start {
+        q0qir::StartMode::Windowed => viewport,
+        q0qir::StartMode::Maximized => viewport.with_maximized(true),
+        q0qir::StartMode::Fullscreen => viewport.with_fullscreen(true),
+    };
+    if window.always_on_top {
+        viewport = viewport.with_always_on_top();
+    }
+    let samples = manifest.render.msaa.min(most_samples);
+    eframe::NativeOptions {
+        viewport,
+        multisampling: if samples <= 1 { 0 } else { samples },
+        vsync: manifest.render.vsync,
+        centered: window.centered,
+        persist_window: false,
+        ..Default::default()
     }
 }
 
@@ -59,7 +106,30 @@ pub fn run(launch: Launch) -> eframe::Result<()> {
         preview,
         multisampling,
         event_loop_builder,
+        qir,
+        args,
     } = launch;
+    if let Some(bundle) = qir {
+        // Desktops offer 8 samples; a phone says what it offers.
+        let most = if super::platform::TOUCH {
+            multisampling
+        } else {
+            8
+        };
+        let mut options = qir_options(&bundle.manifest, bundle.icon_png.as_deref(), most);
+        options.event_loop_builder = event_loop_builder;
+        let app_id = bundle.manifest.app.id.clone();
+        let mut session = super::qir::QirSession::new(bundle, args);
+        if !session.claim_single_instance() {
+            session.log("already running; this copy closes");
+            return Ok(());
+        }
+        return eframe::run_native(
+            &app_id,
+            options,
+            Box::new(move |cc| Box::new(PlayerApp::new(None, &cc.egui_ctx).with_qir(session))),
+        );
+    }
     let mut options = native_options(multisampling);
     options.event_loop_builder = event_loop_builder;
     eframe::run_native(
