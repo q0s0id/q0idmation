@@ -25,7 +25,7 @@ pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
     let mut cancel_ids = Vec::new();
     let previous_sequence_create_subfolder = app.q0enc.sequence_create_subfolder;
 
-    egui::Window::new(WINDOW_ID)
+    crate::dialog::Dialog::new(WINDOW_ID)
         .open(&mut open)
         .default_size([780.0, 610.0])
         .default_pos(ctx.screen_rect().center() - egui::vec2(410.0, 340.0))
@@ -391,23 +391,6 @@ fn render_format_settings(
                     ui.label("Serialize / validate / write / verify");
                     ui.end_row();
                 });
-            if state.starting_scene_q0rg_id != project.meta.entry_q0rg_id
-                && !project.runtime.camera.keys.is_empty()
-            {
-                if let Some(owner) = scenes
-                    .iter()
-                    .find(|scene| scene.q0rg_id == project.meta.entry_q0rg_id)
-                {
-                    ui.label(
-                        RichText::new(format!(
-                            "Start with {} to include its 2D camera track.",
-                            owner.name
-                        ))
-                        .small()
-                        .color(dim),
-                    );
-                }
-            }
         }
         ExportFormat::Q0v => {
             ui.label("embedded media container for q0player content.");
@@ -420,11 +403,11 @@ fn render_format_settings(
             ui.add_space(8.0);
             render_frame_source(ui, state, project, false);
             ui.add_space(8.0);
-            ui.label(RichText::new("streams").strong());
-            ui.checkbox(&mut state.q0v_streams.video, "video stream");
-            ui.checkbox(&mut state.q0v_streams.audio, "audio stream");
+            crate::ui::section_header(ui, "streams");
+            crate::ui::switch(ui, &mut state.q0v_streams.video, "video stream");
+            crate::ui::switch(ui, &mut state.q0v_streams.audio, "audio stream");
             if state.q0v_streams.video {
-                ui.checkbox(&mut state.transparent, "transparent video background");
+                crate::ui::switch(ui, &mut state.transparent, "transparent video background");
             }
             if !state.q0v_streams.video && !state.q0v_streams.audio {
                 ui.label(
@@ -495,7 +478,7 @@ fn render_format_settings(
                 ui.text_edit_singleline(&mut state.sequence_prefix);
                 ui.label("_0001.png");
             });
-            ui.checkbox(&mut state.transparent, "transparent background");
+            crate::ui::switch(ui, &mut state.transparent, "transparent background");
             // Frames copied out of the app always go as one folder.
             if !crate::platform::EXPORTS_IN_APP {
                 ui.checkbox(
@@ -521,8 +504,8 @@ fn render_format_settings(
             ui.label("small palette-based animated previews.");
             render_frame_source(ui, state, project, false);
             ui.add_space(8.0);
-            ui.checkbox(&mut state.gif_loop, "loop forever");
-            ui.checkbox(&mut state.transparent, "transparent background");
+            crate::ui::switch(ui, &mut state.gif_loop, "loop forever");
+            crate::ui::switch(ui, &mut state.transparent, "transparent background");
             ui.horizontal(|ui| {
                 ui.label("quantizer speed");
                 ui.add(egui::Slider::new(&mut state.gif_speed, 1..=30));
@@ -565,7 +548,7 @@ fn render_format_settings(
                         .color(dim),
                 );
             } else {
-                ui.checkbox(&mut state.transparent, "transparent background");
+                crate::ui::switch(ui, &mut state.transparent, "transparent background");
             }
             ui.label(
                 RichText::new(
@@ -585,7 +568,7 @@ fn render_frame_source(
     single_frame: bool,
 ) {
     ui.add_space(6.0);
-    ui.label(RichText::new("source").strong());
+    crate::ui::section_header(ui, "source");
     egui::ComboBox::from_id_source("q0enc_source_q0rg")
         .selected_text(q0rg_label(project, state.source_q0rg_id))
         .show_ui(ui, |ui| {
@@ -620,7 +603,7 @@ fn render_frame_source(
             }
         });
     } else {
-        ui.checkbox(&mut state.entire_timeline, "entire timeline");
+        crate::ui::switch(ui, &mut state.entire_timeline, "entire timeline");
         ui.add_enabled_ui(!state.entire_timeline, |ui| {
             ui.horizontal(|ui| {
                 let mut first = u32::from(state.first_frame) + 1;
@@ -646,7 +629,7 @@ fn render_frame_source(
     }
 
     ui.add_space(6.0);
-    ui.label(RichText::new("render").strong());
+    crate::ui::section_header(ui, "render");
     ui.horizontal(|ui| {
         ui.label("upscale");
         let mut scale = state.render_scale;

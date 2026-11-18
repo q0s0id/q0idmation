@@ -396,7 +396,7 @@ pub fn render_window(app: &mut EditorApp, ctx: &Context) {
         return;
     }
     let mut open = true;
-    egui::Window::new("Light")
+    crate::dialog::Dialog::new("Light")
         .open(&mut open)
         .default_size([380.0, 600.0])
         .default_pos(ctx.screen_rect().right_top() + egui::vec2(-860.0, 90.0))
@@ -491,7 +491,7 @@ fn render_scene(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16, mode: RigMode, d
         .unwrap_or_else(|| LightSetup::new(q0rg_id));
     let mut edit = Edit::default();
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Scene").strong());
+        crate::ui::section_title(ui, "Scene");
         edit.checkbox(ui, &mut setup.enabled, "Lights on");
     });
     ui.horizontal_wrapped(|ui| {
@@ -724,7 +724,7 @@ fn render_light(
 ) {
     let q0rg_id = app.session.current_q0rg_id;
     let frame = app.session.current_frame;
-    ui.label(RichText::new("Looks like").strong());
+    crate::ui::section_header(ui, "Looks like");
     ui.horizontal_wrapped(|ui| {
         for preset in &LIGHT_PRESETS {
             if ui
@@ -865,7 +865,7 @@ fn render_keys(
     dim: Color32,
 ) {
     ui.add_space(6.0);
-    ui.label(RichText::new("Animation").strong());
+    crate::ui::section_header(ui, "Animation");
     let keyed_here = light.key_at(frame).is_some();
     ui.horizontal_wrapped(|ui| {
         let mut changed = None;
@@ -1194,6 +1194,41 @@ pub fn handle_stage(
 mod tests {
     use super::*;
     use q0s_format::v2::{Layer, ProjectMeta, Q0rg};
+
+    /// A header with its rule to the edge, in a row before a switch, once
+    /// made the window wider every frame.
+    #[test]
+    fn light_window_settles_at_one_width() {
+        let ctx = Context::default();
+        let mut app = EditorApp::default();
+        crate::theme::install(&ctx);
+        app.settings.theme.apply(&ctx);
+        app.settings.light_enabled = true;
+        app.session.lights.open = true;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0));
+        let mut widths = Vec::new();
+        for _ in 0..10 {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| render_window(&mut app, ctx),
+            );
+            widths.push(
+                ctx.memory(|memory| memory.area_rect(egui::Id::new("Light")))
+                    .expect("the Light window")
+                    .width(),
+            );
+        }
+        let settled = &widths[3..];
+        assert!(
+            settled
+                .windows(2)
+                .all(|pair| (pair[0] - pair[1]).abs() < 0.5),
+            "the window kept widening: {widths:?}"
+        );
+    }
 
     fn project() -> ProjectV2 {
         ProjectV2 {

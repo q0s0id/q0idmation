@@ -154,13 +154,16 @@ impl EditorApp {
                     self.online.set_local_lock(tab, q0rg_id, layer_id, false);
                     metadata.locked = false;
                 }
-                self.follow_mask_lock(q0rg_id, layer_id, on);
             }
         }
         self.state
             .project
             .layer_metadata
             .insert(LayerKey::new(q0rg_id, layer_id), metadata);
+        // After the insert: following the lock writes the same metadata.
+        if flag == LayerFlag::Locked {
+            self.follow_mask_lock(q0rg_id, layer_id, on);
+        }
         self.state.mark_dirty();
     }
 

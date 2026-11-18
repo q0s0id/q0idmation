@@ -352,6 +352,7 @@ fn layer_folders_and_depth_order_survive_q1s_roundtrip() {
             collapsed: false,
             hidden: false,
             locked: false,
+            mask_preview: false,
         },
     );
     project.layer_metadata.insert(
@@ -363,6 +364,7 @@ fn layer_folders_and_depth_order_survive_q1s_roundtrip() {
             collapsed: false,
             hidden: false,
             locked: false,
+            mask_preview: false,
         },
     );
     project.layer_metadata.insert(
@@ -374,6 +376,7 @@ fn layer_folders_and_depth_order_survive_q1s_roundtrip() {
             collapsed: true,
             hidden: false,
             locked: false,
+            mask_preview: false,
         },
     );
 
@@ -403,6 +406,7 @@ fn layer_folder_cannot_hold_keyframes_or_have_noncontiguous_children() {
             collapsed: false,
             hidden: false,
             locked: false,
+            mask_preview: false,
         },
     );
     assert_eq!(
@@ -427,6 +431,7 @@ fn layer_folder_cannot_hold_keyframes_or_have_noncontiguous_children() {
             collapsed: false,
             hidden: false,
             locked: false,
+            mask_preview: false,
         },
     );
     project.layer_metadata.insert(
@@ -438,6 +443,7 @@ fn layer_folder_cannot_hold_keyframes_or_have_noncontiguous_children() {
             collapsed: false,
             hidden: false,
             locked: false,
+            mask_preview: false,
         },
     );
     project.q0rgs[0].layers.insert(
@@ -754,4 +760,176 @@ fn a_packed_q1s_reads_back_exactly_and_is_smaller() {
     assert!(wire_equivalent(&project, &back));
     // The plain layout older editors wrote still opens.
     assert!(wire_equivalent(&project, &parse(&plain).unwrap()));
+}
+
+/// A filled square, the kind of drawing the editor makes for every shape.
+fn drawing(asset_id: u16) -> Asset {
+    let corner = |x: f32, y: f32| Anchor {
+        point: Vec2::new(x, y),
+        in_handle: None,
+        out_handle: None,
+    };
+    Asset::Vector(VectorAsset {
+        asset_id,
+        paths: vec![Path {
+            closed: true,
+            anchors: vec![
+                corner(0.0, 0.0),
+                corner(40.0, 0.0),
+                corner(40.0, 40.0),
+                corner(0.0, 40.0),
+            ],
+        }],
+        fill: Some(Rgba {
+            r: 30,
+            g: 120,
+            b: 220,
+            a: 255,
+        }),
+        stroke: None,
+    })
+}
+
+fn place_on(project: &mut ProjectV2, q0rg_index: usize, layer_index: usize, target: Target) {
+    project.q0rgs[q0rg_index].layers[layer_index].push_placement(Placement {
+        pivot: None,
+        instance_id: 0,
+        frame: 0,
+        target,
+        transform: Transform2D::IDENTITY,
+        tween: Tween::None,
+        fx: Default::default(),
+    });
+}
+
+fn plain(name: Option<&str>) -> bool {
+    name.is_none()
+}
+
+#[test]
+fn unused_graphics_leave_with_their_metadata_and_everything_used_stays() {
+    use q0s_format::graphics::{drop_unused_graphics, unused_graphics};
+    use q0s_format::v2::LibraryItemReference;
+
+    let mut project = sample_v2_project();
+    // 3: drawn, then deleted, with a soft look of its own.
+    project.assets.push(drawing(3));
+    project.asset_appearances.insert(
+        3,
+        q0s_format::v2::VectorAppearance {
+            material: q0s_format::v2::VectorMaterial::SoftHalo {
+                radius: 4.0,
+                opacity: 0.5,
+            },
+            erase_mask: Vec::new(),
+            material_source: Vec::new(),
+            clip_mask: Vec::new(),
+            field_transform: q0s_format::transform::Affine::IDENTITY,
+            fill_gradient: None,
+        },
+    );
+    // 4: unused, but the user named it.
+    project.assets.push(drawing(4));
+    project.asset_names.insert(4, "Leaf".to_string());
+    // 5: unused, but the user filed it.
+    project.assets.push(drawing(5));
+    project.runtime.library_folders.push("Props".to_string());
+    project
+        .runtime
+        .library_item_folders
+        .insert(LibraryItemReference::Asset(5), "Props".to_string());
+    // 6: drawn only on a mask layer.
+    project.assets.push(drawing(6));
+    project.q0rgs[0].layers.push(Layer {
+        layer_id: 2,
+        timeline_frame_count: None,
+        name: "Mask".to_string(),
+        explicit_keyframes: Vec::new(),
+        placements: Vec::new(),
+    });
+    project.layer_metadata.insert(
+        q0s_format::v2::LayerKey::new(1, 2),
+        q0s_format::v2::LayerMetadata {
+            kind: q0s_format::v2::LayerKind::Mask,
+            ..Default::default()
+        },
+    );
+    place_on(&mut project, 0, 1, Target::Asset(6));
+    // 7: only a particle emitter draws it.
+    project.assets.push(drawing(7));
+    let mut emitter = q0s_format::particles::ParticleEmitter::new(1, 1, [10.0, 20.0]);
+    emitter.end_frame = 9;
+    emitter.look = q0s_format::particles::ParticleLook::Item(Target::Asset(7));
+    project.runtime.particles.emitters.push(emitter);
+    validate(&project).expect("sample with graphics is valid");
+
+    assert_eq!(unused_graphics(&project, plain), vec![3]);
+    let before = write(&project).unwrap();
+    let mut lean = project.clone();
+    assert_eq!(drop_unused_graphics(&mut lean, plain), vec![3]);
+    validate(&lean).expect("the lean project is valid");
+    assert!(!lean.asset_appearances.contains_key(&3));
+    let ids: Vec<u16> = lean.assets.iter().map(Asset::id).collect();
+    assert_eq!(ids, vec![1, 2, 4, 5, 6, 7]);
+    let after = write(&lean).unwrap();
+    assert!(
+        after.len() < before.len(),
+        "{} vs {}",
+        after.len(),
+        before.len()
+    );
+    assert_eq!(parse(&after).unwrap(), with_scene_table(&lean));
+    // Nothing more to drop the second time.
+    assert!(drop_unused_graphics(&mut lean, plain).is_empty());
+}
+
+#[test]
+fn rig_variants_keep_their_drawings() {
+    use q0s_format::graphics::{referenced_asset_ids, vector_owners};
+
+    let mut project = sample_v2_project();
+    project.assets.push(drawing(3));
+    project.assets.push(Asset::Rig(q0s_format::v2::RigAsset {
+        asset_id: 9,
+        owner_q0rg_id: 2,
+        nodes: Vec::new(),
+        controls: Vec::new(),
+        constraints: Vec::new(),
+        channels: Vec::new(),
+        drivers: Vec::new(),
+        poses: Vec::new(),
+        deformers: Vec::new(),
+        pose_drivers: Vec::new(),
+        mirror_pairs: Vec::new(),
+        variants: vec![q0s_format::v2::RigVariantSet {
+            variant_id: 1,
+            name: "hand".to_string(),
+            instance_id: 0,
+            source_control: 0,
+            choices: vec![q0s_format::v2::RigVariantChoice {
+                name: "open".to_string(),
+                target: Target::Asset(3),
+            }],
+        }],
+    }));
+    assert!(referenced_asset_ids(&project).contains(&3));
+    assert_eq!(vector_owners(&project).get(&3), Some(&2));
+    assert!(q0s_format::graphics::unused_graphics(&project, plain).is_empty());
+}
+
+#[test]
+fn a_drawing_in_a_symbol_belongs_to_the_symbol() {
+    use q0s_format::graphics::vector_owners;
+
+    let mut project = sample_v2_project();
+    // Vector 2 is drawn in Spinner; placing it on the Stage too keeps it
+    // Spinner's.
+    place_on(&mut project, 0, 0, Target::Asset(2));
+    project.assets.push(drawing(3));
+    place_on(&mut project, 0, 0, Target::Asset(3));
+    let owners = vector_owners(&project);
+    assert_eq!(owners.get(&2), Some(&2));
+    assert_eq!(owners.get(&3), Some(&1));
+    // Bitmaps are not drawings.
+    assert_eq!(owners.get(&1), None);
 }

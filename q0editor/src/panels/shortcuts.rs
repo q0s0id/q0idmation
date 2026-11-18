@@ -107,124 +107,138 @@ struct Filter {
     category: Option<Category>,
 }
 
+const FILTER_ID: &str = "shortcut_filter";
+
 pub(crate) fn render(app: &mut EditorApp, ctx: &Context) -> bool {
     let mut changed = false;
-    let filter_id = egui::Id::new("shortcut_filter");
-    let mut filter = ctx
-        .data(|d| d.get_temp::<Filter>(filter_id))
-        .unwrap_or_default();
     let mut open = true;
-    egui::Window::new("Keyboard shortcuts")
+    crate::dialog::Dialog::new("Keyboard shortcuts")
         .open(&mut open)
         .default_size([640.0, 510.0])
         .default_pos(ctx.screen_rect().center() - egui::vec2(320.0, 255.0))
         .collapsible(false)
         .fit_to_screen(ctx)
-        .show(ctx, |ui| {
-            ui.add_enabled_ui(app.session.shortcut_capture.is_none(), |ui| {
-                crate::ui::search_field(ui, &mut filter.search, "Search commands or keys");
-            });
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .selectable_label(filter.category.is_none(), "All")
-                    .clicked()
-                {
-                    filter.category = None;
-                }
-                for category in Category::ALL {
-                    if ui
-                        .selectable_label(filter.category == Some(category), category.label())
-                        .clicked()
-                    {
-                        filter.category = Some(category);
-                    }
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add_enabled(
-                            !app.settings.hotkeys.overrides.is_empty(),
-                            egui::Button::new("Reset all"),
-                        )
-                        .on_hover_text("Restore every default shortcut")
-                        .clicked()
-                    {
-                        app.settings.hotkeys.reset();
-                        app.session.shortcut_capture = None;
-                        app.session.shortcut_feedback = Some("Default shortcuts restored".into());
-                        changed = true;
-                    }
-                });
-            });
-            if let Some(capture) = app.session.shortcut_capture {
-                ui.horizontal_wrapped(|ui| {
-                    let prompt =
-                        app.session.shortcut_feedback.clone().unwrap_or_else(|| {
-                            format!("Press keys for {}", capture.command.label())
-                        });
-                    ui.colored_label(app.settings.theme.accent.to_color32(), prompt);
-                    if ui.small_button("Cancel").on_hover_text("Esc").clicked() {
-                        app.session.shortcut_capture = None;
-                        app.session.shortcut_feedback = None;
-                    }
-                });
-            } else if let Some(feedback) = &app.session.shortcut_feedback {
-                ui.weak(feedback);
-            }
-            ui.separator();
-            let query = filter.search.trim().to_lowercase();
-            egui::ScrollArea::vertical()
-                .id_source((
-                    "shortcut_commands",
-                    filter.category.map(|category| category as u8),
-                    &query,
-                ))
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    let mut any = false;
-                    for category in Category::ALL {
-                        if filter.category.is_some_and(|selected| selected != category) {
-                            continue;
-                        }
-                        let mut first = true;
-                        for &command in ShortcutCommand::ALL {
-                            if Category::of(command) != category {
-                                continue;
-                            }
-                            let chords = app.settings.hotkeys.shortcuts(command);
-                            if !query.is_empty()
-                                && !command.label().to_lowercase().contains(&query)
-                                && !chords
-                                    .iter()
-                                    .any(|chord| chord.display().to_lowercase().contains(&query))
-                            {
-                                continue;
-                            }
-                            if first && filter.category.is_none() {
-                                if any {
-                                    ui.add_space(10.0);
-                                }
-                                ui.weak(RichText::new(category.label()).strong());
-                            }
-                            first = false;
-                            any = true;
-                            changed |= ui
-                                .push_id(command as u8, |ui| command_row(app, ui, command, &chords))
-                                .inner;
-                        }
-                    }
-                    if !any {
-                        ui.weak("No matching shortcuts");
-                    }
-                });
-        });
+        .show(ctx, |ui| changed = editor(app, ui));
     app.session.show_shortcuts = open;
-    if open {
-        ctx.data_mut(|d| d.insert_temp(filter_id, filter));
-    } else {
-        app.session.shortcut_capture = None;
-        app.session.shortcut_feedback = None;
-        ctx.data_mut(|d| d.remove::<Filter>(filter_id));
+    if !open {
+        end_editing(app, ctx);
     }
+    changed
+}
+
+/// Forgets a half-made shortcut and the search once no editor shows them.
+pub(crate) fn end_editing(app: &mut EditorApp, ctx: &Context) {
+    app.session.shortcut_capture = None;
+    app.session.shortcut_feedback = None;
+    ctx.data_mut(|d| d.remove::<Filter>(egui::Id::new(FILTER_ID)));
+}
+
+/// The shortcut editor: a search, the categories and a row per command. Its
+/// own window shows it, and so does the Settings window's Shortcuts page.
+pub(crate) fn editor(app: &mut EditorApp, ui: &mut Ui) -> bool {
+    let mut changed = false;
+    let filter_id = egui::Id::new(FILTER_ID);
+    let mut filter = ui
+        .ctx()
+        .data(|d| d.get_temp::<Filter>(filter_id))
+        .unwrap_or_default();
+    ui.add_enabled_ui(app.session.shortcut_capture.is_none(), |ui| {
+        crate::ui::search_field(ui, &mut filter.search, "Search commands or keys");
+    });
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .selectable_label(filter.category.is_none(), "All")
+            .clicked()
+        {
+            filter.category = None;
+        }
+        for category in Category::ALL {
+            if ui
+                .selectable_label(filter.category == Some(category), category.label())
+                .clicked()
+            {
+                filter.category = Some(category);
+            }
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add_enabled(
+                    !app.settings.hotkeys.overrides.is_empty(),
+                    egui::Button::new("Reset all"),
+                )
+                .on_hover_text("Restore every default shortcut")
+                .clicked()
+            {
+                app.settings.hotkeys.reset();
+                app.session.shortcut_capture = None;
+                app.session.shortcut_feedback = Some("Default shortcuts restored".into());
+                changed = true;
+            }
+        });
+    });
+    if let Some(capture) = app.session.shortcut_capture {
+        ui.horizontal_wrapped(|ui| {
+            let prompt = app
+                .session
+                .shortcut_feedback
+                .clone()
+                .unwrap_or_else(|| format!("Press keys for {}", capture.command.label()));
+            ui.colored_label(app.settings.theme.accent.to_color32(), prompt);
+            if ui.small_button("Cancel").on_hover_text("Esc").clicked() {
+                app.session.shortcut_capture = None;
+                app.session.shortcut_feedback = None;
+            }
+        });
+    } else if let Some(feedback) = &app.session.shortcut_feedback {
+        ui.weak(feedback);
+    }
+    ui.separator();
+    let query = filter.search.trim().to_lowercase();
+    egui::ScrollArea::vertical()
+        .id_source((
+            "shortcut_commands",
+            filter.category.map(|category| category as u8),
+            &query,
+        ))
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let mut any = false;
+            for category in Category::ALL {
+                if filter.category.is_some_and(|selected| selected != category) {
+                    continue;
+                }
+                let mut first = true;
+                for &command in ShortcutCommand::ALL {
+                    if Category::of(command) != category {
+                        continue;
+                    }
+                    let chords = app.settings.hotkeys.shortcuts(command);
+                    if !query.is_empty()
+                        && !command.label().to_lowercase().contains(&query)
+                        && !chords
+                            .iter()
+                            .any(|chord| chord.display().to_lowercase().contains(&query))
+                    {
+                        continue;
+                    }
+                    if first && filter.category.is_none() {
+                        if any {
+                            ui.add_space(10.0);
+                        }
+                        ui.weak(RichText::new(category.label()).strong());
+                    }
+                    first = false;
+                    any = true;
+                    changed |= ui
+                        .push_id(command as u8, |ui| command_row(app, ui, command, &chords))
+                        .inner;
+                }
+            }
+            if !any {
+                ui.weak("No matching shortcuts");
+            }
+        });
+    ui.ctx().data_mut(|d| d.insert_temp(filter_id, filter));
     changed
 }
 
@@ -307,6 +321,74 @@ fn command_row(
     });
     ui.separator();
     changed
+}
+
+/// A small keycap with a command's shortcut, shown where the command lives
+/// (a tool's properties, say), so it can be changed right there: click it,
+/// then press the new keys. Click it again to leave it as it was.
+pub(crate) fn chip(app: &mut EditorApp, ui: &mut Ui, command: ShortcutCommand) -> egui::Response {
+    let first = app.settings.hotkeys.shortcuts(command).first().copied();
+    let capturing = app
+        .session
+        .shortcut_capture
+        .is_some_and(|capture| capture.command == command);
+    let accent = app.settings.theme.accent.to_color32();
+    let (text, color) = if capturing {
+        ("press keys…".to_string(), accent)
+    } else if let Some(chord) = first {
+        (chord.display(), ui.visuals().text_color())
+    } else {
+        ("set key".to_string(), ui.visuals().weak_text_color())
+    };
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text, egui::FontId::monospace(11.0), color);
+    let size = egui::vec2(galley.size().x + 12.0, 18.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            format!("{} shortcut", command.label()),
+        )
+    });
+    if ui.is_rect_visible(rect) {
+        let lit = crate::ui::hover_strength(ui, &response);
+        let fill = crate::ui::blend(
+            ui.visuals().extreme_bg_color,
+            ui.visuals().widgets.hovered.weak_bg_fill,
+            lit,
+        );
+        let edge = if capturing {
+            egui::Stroke::new(1.0_f32, accent)
+        } else {
+            ui.visuals().widgets.inactive.bg_stroke
+        };
+        ui.painter().rect(rect, 4.0, fill, edge);
+        // The keycap's lip along its bottom edge.
+        ui.painter().hline(
+            (rect.left() + 3.0)..=(rect.right() - 3.0),
+            rect.bottom() - 1.0,
+            egui::Stroke::new(1.0_f32, ui.visuals().widgets.inactive.bg_stroke.color),
+        );
+        ui.painter()
+            .galley(rect.center() - galley.size() * 0.5, galley, color);
+    }
+    let response = response
+        .on_hover_text(if capturing {
+            "Press the new shortcut. Esc or a click here keeps the old one."
+        } else {
+            "Click, then press a new shortcut for this"
+        })
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if response.clicked() {
+        if capturing {
+            app.session.shortcut_capture = None;
+            app.session.shortcut_feedback = None;
+        } else {
+            start_capture(app, ui, command, first);
+        }
+    }
+    response
 }
 
 fn start_capture(
@@ -476,7 +558,7 @@ mod tests {
 
         ctx.data_mut(|d| {
             d.insert_temp(
-                egui::Id::new("shortcut_filter"),
+                egui::Id::new(FILTER_ID),
                 Filter {
                     search: "next frame".into(),
                     category: None,

@@ -1362,6 +1362,8 @@ fn build_q0rg(
             collapsed: false,
             hidden: raw_layer.hidden,
             locked: raw_layer.locked,
+            // Animate shows a locked mask's clipping; open it the same way.
+            mask_preview: raw_layer.kind == LayerKind::Mask && raw_layer.locked,
         };
         if layer_metadata != LayerMetadata::default() {
             metadata.insert(LayerKey::new(q0rg_id, layer_id), layer_metadata);

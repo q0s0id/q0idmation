@@ -86,7 +86,7 @@ pub fn render_window(app: &mut EditorApp, ctx: &Context) {
         return;
     }
     let mut open = true;
-    egui::Window::new("3D")
+    crate::dialog::Dialog::new("3D")
         .open(&mut open)
         .default_size([380.0, 620.0])
         .default_pos(ctx.screen_rect().right_top() + egui::vec2(-820.0, 100.0))
@@ -138,7 +138,7 @@ fn render_contents(app: &mut EditorApp, ui: &mut Ui) {
     );
 
     // Camera.
-    ui.label(RichText::new("Camera").strong());
+    crate::ui::section_header(ui, "Camera");
     ui.horizontal(|ui| {
         edit.checkbox(ui, &mut setup.camera.enabled, "Own camera");
         if setup.camera.enabled {
@@ -229,7 +229,7 @@ fn render_contents(app: &mut EditorApp, ui: &mut Ui) {
     ui.separator();
 
     // Light.
-    ui.label(RichText::new("Light").strong());
+    crate::ui::section_header(ui, "Light");
     egui::Grid::new("scene3d_light")
         .num_columns(2)
         .spacing([8.0, 4.0])
@@ -663,7 +663,7 @@ pub(crate) fn placement_3d_properties(
     };
     ui.separator();
     ui.horizontal(|ui| {
-        ui.label(RichText::new("3D").strong());
+        crate::ui::section_title(ui, "3D");
         if let Some((asset_id, _)) = &model {
             if ui.button("Edit model…").clicked() {
                 app.queue(crate::app::Action::EditModel(*asset_id));
@@ -690,7 +690,7 @@ pub(crate) fn placement_3d_properties(
     };
     if model.is_none() {
         let mut placed = fx.three.is_some();
-        let response = ui.checkbox(&mut placed, "Place in 3D").on_hover_text(
+        let response = crate::ui::switch(ui, &mut placed, "Place in 3D").on_hover_text(
             "Stand this drawing in 3D as a flat card: push it back, turn it, light it",
         );
         if response.changed() {
@@ -728,12 +728,12 @@ pub(crate) fn placement_3d_properties(
             note(&response, fx_dirty, wants_snapshot);
             ui.end_row();
             ui.label("Lit");
-            let response = ui.checkbox(&mut space.lit, "by the 3D lights");
+            let response = crate::ui::switch(ui, &mut space.lit, "by the 3D lights");
             note(&response, fx_dirty, wants_snapshot);
             ui.end_row();
         });
     if let Some((_, data)) = &model {
-        ui.label(RichText::new("Animation").strong());
+        crate::ui::section_header(ui, "Animation");
         egui::Grid::new("placement_3d_clip")
             .num_columns(2)
             .spacing([8.0, 4.0])
@@ -781,7 +781,7 @@ pub(crate) fn placement_3d_properties(
                     note(&response, fx_dirty, wants_snapshot);
                     ui.end_row();
                     ui.label("Loop");
-                    let response = ui.checkbox(&mut space.clip_loop, "");
+                    let response = crate::ui::switch(ui, &mut space.clip_loop, "");
                     note(&response, fx_dirty, wants_snapshot);
                     ui.end_row();
                 }

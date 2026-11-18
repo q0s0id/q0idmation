@@ -26,12 +26,7 @@ fn color32(c: Rgba) -> Color32 {
 
 fn edit_color(ui: &mut Ui, value: &mut Rgba) -> bool {
     let mut color = color32(*value);
-    let changed = egui::color_picker::color_edit_button_srgba(
-        ui,
-        &mut color,
-        egui::color_picker::Alpha::OnlyBlend,
-    )
-    .changed();
+    let changed = crate::color_picker::color_edit_button_srgba(ui, &mut color).changed();
     if changed {
         let [r, g, b, a] = color.to_srgba_unmultiplied();
         *value = Rgba { r, g, b, a };
@@ -774,26 +769,26 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
         help(&mut studio, ctx);
     }
     if studio.confirm_close {
-        egui::Window::new("Save the model?")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(ctx, |ui| {
-                ui.label("This model has changes that are not in the library yet.");
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if primary_button(ui, "Save and close").clicked() {
-                        save = true;
-                        close = true;
-                    }
-                    if ghost_button(ui, "Close without saving").clicked() {
-                        close = true;
-                    }
-                    if ghost_button(ui, "Keep editing").clicked() {
-                        studio.confirm_close = false;
-                    }
-                });
-            });
+        use crate::dialog::{Confirm, Kind, Tone};
+        match Confirm::new(
+            "Save the model?",
+            Tone::Warning,
+            "This model has changes that are not in the library yet.",
+        )
+        .action("Save and close", Kind::Primary)
+        .default_action()
+        .cancel("Keep editing")
+        .action("Close without saving", Kind::Secondary)
+        .show(ctx)
+        {
+            Some(0) => {
+                save = true;
+                close = true;
+            }
+            Some(1) => studio.confirm_close = false,
+            Some(2) => close = true,
+            _ => {}
+        }
     }
 
     let wants_texture = std::mem::take(&mut studio.wants_texture);
@@ -850,7 +845,7 @@ fn tool_settings(studio: &mut ModelStudio, ui: &mut Ui) {
                 }
             });
             ui.add_space(6.0);
-            ui.checkbox(&mut studio.settings.snap, "Snap")
+            crate::ui::switch(ui, &mut studio.settings.snap, "Snap")
                 .on_hover_text("Hold Ctrl to switch snapping for one drag");
             if studio.tool == Tool::Rotate {
                 egui::ComboBox::from_id_source("studio_angle_step")
@@ -906,7 +901,7 @@ fn tool_settings(studio: &mut ModelStudio, ui: &mut Ui) {
             }
         }
         Tool::Inset | Tool::LoopCut => {
-            ui.checkbox(&mut studio.settings.snap, "Snap");
+            crate::ui::switch(ui, &mut studio.settings.snap, "Snap");
         }
         Tool::Paint => {
             ui.label("Colour with");
@@ -926,8 +921,7 @@ fn tool_settings(studio: &mut ModelStudio, ui: &mut Ui) {
     }
     if studio.mode == Mode::Pose {
         ui.separator();
-        ui.checkbox(&mut studio.rest_edit, "Edit skeleton")
-            .on_hover_text(
+        crate::ui::switch(ui, &mut studio.rest_edit, "Edit skeleton").on_hover_text(
             "On: move bones in the rest pose. Off: turning bones keys the clip at the playhead.",
         );
     }
@@ -1676,7 +1670,7 @@ fn material(studio: &mut ModelStudio, ui: &mut Ui) {
                 changed |= edit_color(ui, &mut material.emissive);
                 ui.end_row();
                 ui.label("Both sides");
-                changed |= ui.checkbox(&mut material.double_sided, "").changed();
+                changed |= crate::ui::switch(ui, &mut material.double_sided, "").changed();
                 ui.end_row();
                 ui.label("Picture");
                 ui.horizontal(|ui| {
@@ -1704,6 +1698,62 @@ fn material(studio: &mut ModelStudio, ui: &mut Ui) {
     if changed {
         studio.touch();
     }
+    // How the texture sits on the faces the material is used on.
+    ui.horizontal_wrapped(|ui| {
+        use q0model::ops::FaceFit;
+        ui.label("Texture");
+        let across = match studio.face_fit {
+            Some(FaceFit::Tile(across)) => across,
+            _ => (studio.size() * 0.25).max(0.01),
+        };
+        segmented(ui, |ui| {
+            for (fit, label, hint) in [
+                (None, "As is", "Leave the faces' texture positions alone"),
+                (
+                    Some(FaceFit::Stretch),
+                    "Stretch",
+                    "The whole picture corner to corner on each face",
+                ),
+                (
+                    Some(FaceFit::Fit),
+                    "Fit",
+                    "The whole picture on each face, in proportion",
+                ),
+                (
+                    Some(FaceFit::Fill),
+                    "Fill",
+                    "Each face covered, in proportion; the sides may be cut",
+                ),
+                (
+                    Some(FaceFit::Tile(across)),
+                    "Tile",
+                    "The picture repeated like tiles, lined up across faces",
+                ),
+            ] {
+                let on = match (studio.face_fit, fit) {
+                    (Some(FaceFit::Tile(_)), Some(FaceFit::Tile(_))) => true,
+                    (now, fit) => now == fit,
+                };
+                if pill(ui, on, label).on_hover_text(hint).clicked() {
+                    studio.face_fit = fit;
+                }
+            }
+        });
+        if let Some(FaceFit::Tile(mut across)) = studio.face_fit {
+            if ui
+                .add(
+                    egui::DragValue::new(&mut across)
+                        .speed(studio.size() * 0.005)
+                        .clamp_range(0.001..=100_000.0)
+                        .prefix("every "),
+                )
+                .on_hover_text("How wide one tile is, in model units")
+                .changed()
+            {
+                studio.face_fit = Some(FaceFit::Tile(across));
+            }
+        }
+    });
     ui.horizontal(|ui| {
         if ui
             .button("Use on picked")
@@ -1718,12 +1768,15 @@ fn material(studio: &mut ModelStudio, ui: &mut Ui) {
                     if let Some(mesh) = studio.model.meshes.get_mut(studio.mesh) {
                         q0model::ops::set_material(mesh, &faces, material);
                     }
+                    super::commands::lay_texture(studio, studio.mesh, &faces);
                 }
                 _ => {
                     for m in studio.objects.clone() {
                         if let Some(mesh) = studio.model.meshes.get_mut(m) {
-                            let all = (0..mesh.faces.len()).collect();
+                            let all: std::collections::BTreeSet<usize> =
+                                (0..mesh.faces.len()).collect();
                             q0model::ops::set_material(mesh, &all, material);
+                            super::commands::lay_texture(studio, m, &all);
                         }
                     }
                 }
@@ -1763,7 +1816,7 @@ fn stage_settings(studio: &mut ModelStudio, ui: &mut Ui) {
             .weak(),
     );
     let mut outline = studio.model.outline.is_some();
-    if ui.checkbox(&mut outline, "Cartoon outline").changed() {
+    if crate::ui::switch(ui, &mut outline, "Cartoon outline").changed() {
         studio.model.outline = outline.then_some(Outline {
             width: 2.5,
             color: Rgba {
@@ -2313,7 +2366,7 @@ fn context_menu(studio: &mut ModelStudio, ui: &mut Ui) {
 
 fn help(studio: &mut ModelStudio, ctx: &Context) {
     let mut open = true;
-    egui::Window::new("Model studio")
+    crate::dialog::Dialog::new("Model studio")
         .open(&mut open)
         .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
         .collapsible(false)

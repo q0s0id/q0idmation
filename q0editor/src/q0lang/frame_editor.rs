@@ -68,7 +68,7 @@ pub fn render(app: &mut EditorApp, ctx: &egui::Context) {
     let mut save = false;
     let mut remove = false;
     let mut close = false;
-    egui::Window::new(format!(
+    crate::dialog::Dialog::new(format!(
         "frame code - {} / {} / {}",
         q0rg_name,
         layer_name,

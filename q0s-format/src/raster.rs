@@ -1312,8 +1312,8 @@ pub fn rasterize_q0rg_frame_with_root_transform(
     rig_overrides: &crate::rig::RigRuntimeOverrides,
     scene_state: &RuntimeSceneState,
 ) -> Vec<u8> {
-    let root = if q0rg_id == project.meta.entry_q0rg_id && project.runtime.camera.enabled {
-        Affine::compose(root, project.camera_affine_at(frame))
+    let root = if project.camera_on(q0rg_id) {
+        Affine::compose(root, project.camera_affine_in(q0rg_id, frame))
     } else {
         root
     };

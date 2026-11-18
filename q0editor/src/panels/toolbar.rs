@@ -62,6 +62,12 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 render_tool_button(app, ui, tool);
             }
         });
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing = vec2(6.0, 4.0);
+            render_paint_well(app, ui);
+            ui.vertical(|ui| render_paint_buttons(app, ui));
+        });
         if three {
             ui.add_space(4.0);
             ui.separator();
@@ -83,6 +89,12 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 }
                 render_tool_button(app, ui, tool);
             }
+            ui.add_space(3.0);
+            ui.separator();
+            ui.add_space(2.0);
+            render_paint_well(app, ui);
+            ui.add_space(2.0);
+            render_paint_buttons(app, ui);
             if three {
                 ui.add_space(3.0);
                 ui.separator();
@@ -97,6 +109,142 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             }
             ui.add_space(8.0);
         });
+    }
+}
+
+/// Fill and stroke, Animate style: the fill a solid square, the stroke a
+/// hollow frame lower and to the right over it, the one being edited in
+/// front. Click either to pick its colour; a change paints the selection
+/// too.
+fn render_paint_well(app: &mut EditorApp, ui: &mut Ui) {
+    use crate::color_panel::{self as colors, Slot};
+    let ctx = ui.ctx().clone();
+    let size = tool_button_size() + 4.0;
+    let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::click());
+    let swatch = (size * 0.64).round();
+    let fill_rect = Rect::from_min_size(rect.min + vec2(1.0, 1.0), vec2(swatch, swatch));
+    let stroke_rect = Rect::from_min_size(
+        rect.max - vec2(swatch + 1.0, swatch + 1.0),
+        vec2(swatch, swatch),
+    );
+    let band = (swatch * 0.24).round().max(3.0);
+    let hole = stroke_rect.shrink(band);
+    let active = colors::active_slot(&ctx);
+    // What is under a point: the stroke's frame, else the fill, else the
+    // hole in the frame.
+    let slot_at = |point: Pos2| {
+        let on_frame = stroke_rect.contains(point) && !hole.contains(point);
+        let on_fill = fill_rect.contains(point);
+        match (on_frame, on_fill) {
+            (true, true) => active,
+            (true, false) => Slot::Stroke,
+            (false, true) => Slot::Fill,
+            (false, false) => Slot::Stroke,
+        }
+    };
+    let fill = colors::look_now(app, &ctx, Slot::Fill);
+    let stroke = colors::look_now(app, &ctx, Slot::Stroke);
+    let hovered = response.hover_pos().map(slot_at);
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let accent = app.settings.theme.accent.to_color32();
+        let order = match active {
+            Slot::Fill => [Slot::Stroke, Slot::Fill],
+            Slot::Stroke => [Slot::Fill, Slot::Stroke],
+        };
+        for slot in order {
+            let area = match slot {
+                Slot::Fill => fill_rect,
+                Slot::Stroke => stroke_rect,
+            };
+            match slot {
+                Slot::Fill => colors::paint_fill_swatch(painter, area, &fill),
+                Slot::Stroke => colors::paint_stroke_swatch(painter, area, &stroke, band),
+            }
+            if slot == active {
+                painter.rect_stroke(area.expand(1.5), 2.0, Stroke::new(1.25_f32, accent));
+            } else if hovered == Some(slot) {
+                painter.rect_stroke(
+                    area.expand(1.5),
+                    2.0,
+                    Stroke::new(1.0_f32, ui.visuals().strong_text_color()),
+                );
+            }
+        }
+    }
+    let response = response.on_hover_text(match hovered {
+        Some(Slot::Stroke) => "Stroke colour: click to pick it, or none",
+        _ => "Fill colour: click to pick it, a gradient, or none",
+    });
+    let clicked = response
+        .clicked()
+        .then(|| response.interact_pointer_pos().map(slot_at))
+        .flatten();
+    if let Some(slot) = clicked {
+        colors::set_active_slot(&ctx, slot);
+    }
+    for slot in [Slot::Fill, Slot::Stroke] {
+        let owner = ui.id().with(("toolbar_paint_popup", slot));
+        let toggle = clicked == Some(slot);
+        if toggle && !ctx.memory(|memory| memory.is_popup_open(owner)) {
+            colors::arm(&ctx);
+        }
+        let look = if slot == Slot::Fill { &fill } else { &stroke };
+        let mut color =
+            Color32::from_rgba_unmultiplied(look.color.r, look.color.g, look.color.b, look.color.a);
+        let mut gradient = look.gradient.clone();
+        let mut none = look.none;
+        let allowed = colors::none_allowed(&app.session, slot);
+        let anchor = if slot == Slot::Fill {
+            fill_rect
+        } else {
+            stroke_rect
+        };
+        let (changed, change) = crate::color_picker::paint_popup(
+            ui,
+            owner,
+            toggle,
+            anchor,
+            egui::color_picker::Alpha::BlendOrAdditive,
+            crate::color_picker::PaintTarget {
+                color: &mut color,
+                gradient: (slot == Slot::Fill).then_some(&mut gradient),
+                none: Some(crate::color_picker::NoneSlot {
+                    none: &mut none,
+                    allowed,
+                }),
+            },
+        );
+        if changed {
+            let [r, g, b, a] = color.to_srgba_unmultiplied();
+            let paint = colors::Look {
+                color: q0s_format::v2::Rgba { r, g, b, a },
+                gradient,
+                none,
+            }
+            .paint(change == crate::color_picker::PaintChange::Shape);
+            colors::apply(app, &ctx, slot, &paint, false);
+        }
+    }
+}
+
+/// Default colours, swap, and none, in a row under the swatches.
+fn render_paint_buttons(app: &mut EditorApp, ui: &mut Ui) {
+    use crate::color_panel::{self as colors, Mini};
+    let ctx = ui.ctx().clone();
+    let side = if crate::touch::ENABLED { 18.0 } else { 13.0 };
+    let gap = 1.0;
+    let (row, _) = ui.allocate_exact_size(vec2(side * 3.0 + gap * 2.0, side), Sense::hover());
+    for (index, mini) in Mini::ALL.into_iter().enumerate() {
+        let rect = Rect::from_min_size(
+            pos2(row.left() + index as f32 * (side + gap), row.top()),
+            vec2(side, side),
+        );
+        let enabled =
+            mini != Mini::None || colors::none_allowed(&app.session, colors::active_slot(&ctx));
+        if colors::mini_button(ui, rect, mini, enabled).clicked() {
+            colors::press_mini(app, &ctx, mini);
+        }
     }
 }
 

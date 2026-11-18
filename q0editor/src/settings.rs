@@ -687,6 +687,8 @@ impl Theme {
         visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, accent);
         visuals.widgets.active.rounding = Rounding::same(6.0);
         visuals.widgets.open = visuals.widgets.active;
+        // Sliders fill up to their knob, like the switches fill with the accent.
+        visuals.slider_trailing_fill = true;
         // Soft shadows that fall straight down read as depth rather than as
         // a dark smear off to one side.
         let shadow = if dark { 90 } else { 45 };
@@ -1196,6 +1198,10 @@ impl Default for BrushPreferences {
     }
 }
 
+fn default_eraser() -> BrushPreferences {
+    BrushPreferences::from_runtime(crate::brush::BrushSettings::eraser_default())
+}
+
 impl BrushPreferences {
     pub fn from_runtime(settings: BrushSettings) -> Self {
         Self {
@@ -1413,6 +1419,10 @@ pub struct Settings {
     pub brush_join: BrushJoin,
     #[serde(default)]
     pub brush: BrushPreferences,
+    /// The eraser's own nib, size, smoothing and dynamics, used while it is
+    /// not synced with the brush.
+    #[serde(default = "default_eraser")]
+    pub eraser: BrushPreferences,
     /// Freehand pencil smoothing, independent of brush settings.
     pub pencil_smoothing: u8,
     /// Snapping and the drawing tools' own switches.
@@ -1440,6 +1450,10 @@ pub struct Settings {
     #[serde(default)]
     pub timeline_parenting_view: bool,
     pub onion_skin_during_playback: bool,
+    /// Turns the scene's lights off while onion skin shows, so ghosts stay
+    /// easy to see in a dark scene. 3D stays on either way.
+    #[serde(default)]
+    pub onion_unlit: bool,
     pub online_chat: OnlineChatSettings,
     /// Show what is being worked on in Discord, while Discord is open.
     #[serde(default = "default_true")]
@@ -1563,6 +1577,7 @@ impl Default for Settings {
             brush_cap: BrushCap::Round,
             brush_join: BrushJoin::Round,
             brush: BrushPreferences::default(),
+            eraser: default_eraser(),
             pencil_smoothing: 50,
             aids: DrawingAids::default(),
             brush_mode: PersistBrushMode::Classic,
@@ -1574,6 +1589,7 @@ impl Default for Settings {
             timeline_bar: TimelineBar::default(),
             timeline_parenting_view: false,
             onion_skin_during_playback: false,
+            onion_unlit: false,
             online_chat: OnlineChatSettings::default(),
             discord_presence: true,
             discord_show_project: true,

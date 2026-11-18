@@ -169,79 +169,139 @@ pub(crate) fn timeline_people(app: &mut EditorApp, ui: &mut egui::Ui, beside: Op
     if everyone.is_empty() {
         return;
     }
-    let width = everyone.len() as f32 * (SIZE + GAP) - GAP;
-    let layout = Layout::right_to_left(Align::Center).with_main_wrap(true);
-    let draw = |ui: &mut egui::Ui| {
+    // Faces only use the spare room beside the controls and never take a
+    // row of their own: on a short timeline that row came out of the layers.
+    // Whoever does not fit folds into a "+N" chip. When the bar wraps there
+    // is no spare room (`beside` is None): a few faces go in line.
+    let room = beside.map_or(3, |rect| {
+        ((rect.width() + GAP) / (SIZE + GAP)).floor().max(0.0) as usize
+    });
+    if room == 0 {
+        return;
+    }
+    let faces = if everyone.len() <= room {
+        everyone.len()
+    } else {
+        room - 1
+    };
+    let (shown, folded) = everyone.split_at(faces);
+    let mut draw = |ui: &mut egui::Ui| {
         ui.spacing_mut().item_spacing.x = GAP;
-        for (user_id, place) in everyone {
-            let person = online.person(user_id);
-            let colour = person_colour(user_id);
-            let (rect, response) = ui.allocate_exact_size(vec2(SIZE, SIZE), egui::Sense::click());
-            let painter = ui.painter();
-            match online.avatars.get(&user_id) {
-                Some(Avatar::Ready(texture)) => {
-                    egui::Image::new(egui::load::SizedTexture::new(texture.id(), rect.size()))
-                        .rounding(SIZE * 0.5)
-                        .paint_at(ui, rect.shrink(1.5));
-                }
-                found => {
-                    painter.circle_filled(
-                        rect.center(),
-                        SIZE * 0.5 - 1.5,
-                        colour.gamma_multiply(0.55),
-                    );
-                    let initial = person
-                        .username
-                        .chars()
-                        .find(|c| c.is_alphanumeric())
-                        .map(|c| c.to_uppercase().to_string())
-                        .unwrap_or_else(|| "?".into());
-                    painter.text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        initial,
-                        egui::FontId::proportional(11.0),
-                        Color32::WHITE,
-                    );
-                    if found.is_none() {
-                        online.request_avatar(user_id);
-                    }
-                }
-            }
-            ui.painter().circle_stroke(
-                rect.center(),
-                SIZE * 0.5 - 0.5,
-                Stroke::new(2.0_f32, colour),
-            );
-            let here = markers.iter().find(|m| m.user_id == user_id);
-            let detail = match (here, place) {
-                (Some(marker), _) => format!("frame {} · click to go there", marker.frame + 1),
-                (None, Some(_)) => "on another timeline · click to go there".to_owned(),
-                (None, None) => "in the room".to_owned(),
-            };
-            let response = response.on_hover_ui(|ui| {
-                ui.label(RichText::new(&person.username).strong().color(colour));
-                ui.label(RichText::new(&detail).small());
+        for &(user_id, place) in shown {
+            face(ui, online, &markers, user_id, place, SIZE);
+        }
+        if folded.is_empty() {
+            return;
+        }
+        let label = if shown.is_empty() {
+            format!("{}", folded.len())
+        } else {
+            format!("+{}", folded.len())
+        };
+        let response = ui
+            .add(
+                egui::Button::new(RichText::new(label).small())
+                    .min_size(vec2(SIZE, SIZE))
+                    .rounding(SIZE * 0.5),
+            )
+            .on_hover_text(if shown.is_empty() {
+                "Who is in the room"
+            } else {
+                "More people in the room"
             });
-            if response.clicked() {
-                if let Some((q0rg_id, frame)) = place {
-                    online.follow = Some(Follow {
-                        q0rg_id,
-                        frame,
-                        navigated: false,
-                    });
-                }
+        let popup = ui.id().with("room_people_folded");
+        if response.clicked() {
+            ui.memory_mut(|memory| memory.toggle_popup(popup));
+        }
+        egui::popup::popup_below_widget(ui, popup, &response, |ui| {
+            ui.set_min_width(140.0);
+            for &(user_id, place) in folded {
+                ui.horizontal(|ui| {
+                    face(ui, online, &markers, user_id, place, SIZE);
+                    ui.label(
+                        RichText::new(online.person(user_id).username)
+                            .color(person_colour(user_id)),
+                    );
+                });
+            }
+        });
+    };
+    let layout = Layout::right_to_left(Align::Center);
+    match beside {
+        Some(rect) => {
+            let mut child = ui.child_ui(rect, layout);
+            child.set_clip_rect(ui.clip_rect().intersect(rect));
+            draw(&mut child);
+        }
+        None => {
+            ui.horizontal(draw);
+        }
+    }
+}
+
+/// One person's face: their avatar or initial in a ring of their colour.
+/// Hover says where they are; a click goes there.
+fn face(
+    ui: &mut egui::Ui,
+    online: &mut Online,
+    markers: &[Marker],
+    user_id: i64,
+    place: Option<(u16, u16)>,
+    size: f32,
+) {
+    let person = online.person(user_id);
+    let colour = person_colour(user_id);
+    let (rect, response) = ui.allocate_exact_size(vec2(size, size), egui::Sense::click());
+    match online.avatars.get(&user_id) {
+        Some(Avatar::Ready(texture)) => {
+            egui::Image::new(egui::load::SizedTexture::new(texture.id(), rect.size()))
+                .rounding(size * 0.5)
+                .paint_at(ui, rect.shrink(1.5));
+        }
+        found => {
+            let painter = ui.painter();
+            painter.circle_filled(rect.center(), size * 0.5 - 1.5, colour.gamma_multiply(0.55));
+            let initial = person
+                .username
+                .chars()
+                .find(|c| c.is_alphanumeric())
+                .map(|c| c.to_uppercase().to_string())
+                .unwrap_or_else(|| "?".into());
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                initial,
+                egui::FontId::proportional(11.0),
+                Color32::WHITE,
+            );
+            if found.is_none() {
+                online.request_avatar(user_id);
             }
         }
+    }
+    ui.painter().circle_stroke(
+        rect.center(),
+        size * 0.5 - 0.5,
+        Stroke::new(2.0_f32, colour),
+    );
+    let here = markers.iter().find(|m| m.user_id == user_id);
+    let detail = match (here, place) {
+        (Some(marker), _) => format!("frame {} · click to go there", marker.frame + 1),
+        (None, Some(_)) => "on another timeline · click to go there".to_owned(),
+        (None, None) => "in the room".to_owned(),
     };
-    // Avatars use spare room beside the controls. On a narrow timeline they
-    // wrap below the bar, outside the width measurements for its buttons.
-    if let Some(rect) = beside.filter(|rect| rect.width() >= width) {
-        let mut child = ui.child_ui(rect, layout);
-        child.set_clip_rect(ui.clip_rect().intersect(rect));
-        draw(&mut child);
-    } else {
-        ui.with_layout(layout, draw);
+    let response = response.on_hover_ui(|ui| {
+        ui.label(RichText::new(&person.username).strong().color(colour));
+        ui.label(RichText::new(&detail).small());
+    });
+    if response.clicked() {
+        if let Some((q0rg_id, frame)) = place {
+            online.follow = Some(Follow {
+                q0rg_id,
+                frame,
+                navigated: false,
+            });
+        }
     }
 }
 

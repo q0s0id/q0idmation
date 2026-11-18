@@ -161,6 +161,85 @@ pub(crate) fn update(ctx: &Context, scope: PickerScope) {
     }
 }
 
+/// The colour shown under the mouse pointer, read straight off the screen, so
+/// it works over anything: the stage, the panels, other windows. Windows
+/// only; elsewhere [`request_pixel`] takes a screenshot of the editor.
+#[cfg(windows)]
+pub(crate) fn pixel_under_pointer() -> Option<Color32> {
+    desktop::pixel_under_pointer()
+}
+
+#[derive(Clone, Copy)]
+struct PixelRequest {
+    viewport: egui::ViewportId,
+    /// The point as a fraction of the screenshot's size.
+    at: Pos2,
+}
+
+fn pixel_request_id(owner: Id) -> Id {
+    owner.with("pixel_request")
+}
+
+fn pixel_result_id(owner: Id) -> Id {
+    owner.with("pixel_result")
+}
+
+/// Asks for the colour shown at `point`, in this window. [`take_pixel`] hands
+/// it to `owner` once known: at once where the screen can be read directly,
+/// otherwise a frame or two later from a screenshot.
+pub(crate) fn request_pixel(ctx: &Context, owner: Id, point: Pos2) {
+    #[cfg(windows)]
+    if let Some(color) = pixel_under_pointer() {
+        ctx.data_mut(|data| data.insert_temp(pixel_result_id(owner), color));
+        return;
+    }
+    let screen = ctx.screen_rect();
+    let request = PixelRequest {
+        viewport: ctx.viewport_id(),
+        at: Pos2::new(
+            (point.x - screen.left()) / screen.width().max(1.0),
+            (point.y - screen.top()) / screen.height().max(1.0),
+        ),
+    };
+    ctx.data_mut(|data| data.insert_temp(pixel_request_id(owner), request));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
+    ctx.request_repaint();
+}
+
+/// The colour [`request_pixel`] asked for, once it is known.
+pub(crate) fn take_pixel(ctx: &Context, owner: Id) -> Option<Color32> {
+    if let Some(color) = ctx.data_mut(|data| data.remove_temp::<Color32>(pixel_result_id(owner))) {
+        return Some(color);
+    }
+    let request = ctx.data(|data| data.get_temp::<PixelRequest>(pixel_request_id(owner)))?;
+    let color = ctx.input(|input| {
+        input.events.iter().find_map(|event| {
+            let egui::Event::Screenshot { viewport_id, image } = event else {
+                return None;
+            };
+            if *viewport_id != request.viewport || image.size[0] == 0 || image.size[1] == 0 {
+                return None;
+            }
+            let x = ((request.at.x * image.size[0] as f32).floor().max(0.0) as usize)
+                .min(image.size[0] - 1);
+            let y = ((request.at.y * image.size[1] as f32).floor().max(0.0) as usize)
+                .min(image.size[1] - 1);
+            image
+                .pixels
+                .get(y * image.size[0] + x)
+                .map(|color| color.to_opaque())
+        })
+    })?;
+    ctx.data_mut(|data| data.remove::<PixelRequest>(pixel_request_id(owner)));
+    Some(color)
+}
+
+/// Whether a colour popup is open.
+pub(crate) fn is_open(ctx: &Context) -> bool {
+    ctx.data(|data| data.get_temp::<PickerState>(state_id()))
+        .is_some_and(|state| state.request.is_some())
+}
+
 fn clear_request(ctx: &Context) {
     ctx.data_mut(|data| {
         data.get_temp_mut_or_default::<PickerState>(state_id())
@@ -204,33 +283,62 @@ pub(crate) fn finish_frame(ctx: &Context) {
     }
 }
 
-pub(crate) fn color_edit_button_srgba(ui: &mut Ui, color: &mut Color32) -> Response {
-    color_edit_button(ui, color, egui::color_picker::Alpha::BlendOrAdditive, None).0
+pub fn color_edit_button_srgba(ui: &mut Ui, color: &mut Color32) -> Response {
+    color_edit_button(
+        ui,
+        color,
+        egui::color_picker::Alpha::BlendOrAdditive,
+        None,
+        None,
+    )
+    .0
 }
 
-pub(crate) fn color_edit_button_srgb(ui: &mut Ui, color: &mut [u8; 3]) -> Response {
+pub fn color_edit_button_srgb(ui: &mut Ui, color: &mut [u8; 3]) -> Response {
     let mut rgba = Color32::from_rgb(color[0], color[1], color[2]);
-    let response = color_edit_button(ui, &mut rgba, egui::color_picker::Alpha::Opaque, None).0;
+    let response =
+        color_edit_button(ui, &mut rgba, egui::color_picker::Alpha::Opaque, None, None).0;
     *color = [rgba.r(), rgba.g(), rgba.b()];
     response
 }
 
 /// What a paint box changed this frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum PaintChange {
+pub enum PaintChange {
     #[default]
     None,
     /// the solid colour (`Response::changed` says so too)
     Color,
     /// a gradient's colours or their places
     Stops,
-    /// gradient on or off, its kind, angle or size: it has to be fitted again
+    /// gradient on or off, its kind, angle or size, or none turned on or
+    /// off: it has to be fitted again
     Shape,
 }
 
+/// What a fill's popup paints with.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaintKind {
+    Solid,
+    Linear,
+    Radial,
+    Nothing,
+}
+
+/// A paint box's "none": whether the paint is none now, and whether it may
+/// be made none (a shape keeps at least its fill or its stroke).
+pub(crate) struct NoneSlot<'a> {
+    pub(crate) none: &'a mut bool,
+    pub(crate) allowed: bool,
+}
+
+/// Why none cannot be chosen when it is not allowed.
+pub(crate) const NONE_REFUSED: &str =
+    "The other paint is none already: a shape keeps its fill or its stroke";
+
 /// A fill's colour box: a colour, or a linear or radial gradient, picked in
 /// the same popup.
-pub(crate) fn paint_edit_button(
+pub fn paint_edit_button(
     ui: &mut Ui,
     color: &mut Color32,
     gradient: &mut Option<PaintGradient>,
@@ -240,7 +348,75 @@ pub(crate) fn paint_edit_button(
         color,
         egui::color_picker::Alpha::BlendOrAdditive,
         Some(gradient),
+        None,
     )
+}
+
+/// `paint_edit_button` whose paint can also be none: the box shows white
+/// with a red line, and the popup's None segment turns it on. `none_allowed`
+/// false greys that segment out. Picking a colour turns none off.
+pub fn optional_paint_edit_button(
+    ui: &mut Ui,
+    color: &mut Color32,
+    gradient: &mut Option<PaintGradient>,
+    none: &mut bool,
+    none_allowed: bool,
+) -> (Response, PaintChange) {
+    color_edit_button(
+        ui,
+        color,
+        egui::color_picker::Alpha::BlendOrAdditive,
+        Some(gradient),
+        Some(NoneSlot {
+            none,
+            allowed: none_allowed,
+        }),
+    )
+}
+
+/// A plain colour box (a stroke's, say) that can also be none.
+/// `Response::changed` covers none turning on or off.
+pub fn optional_color_edit_button(
+    ui: &mut Ui,
+    color: &mut Color32,
+    none: &mut bool,
+    none_allowed: bool,
+) -> Response {
+    color_edit_button(
+        ui,
+        color,
+        egui::color_picker::Alpha::BlendOrAdditive,
+        None,
+        Some(NoneSlot {
+            none,
+            allowed: none_allowed,
+        }),
+    )
+    .0
+}
+
+/// What a popup edits: a colour, maybe a gradient, maybe none.
+pub(crate) struct PaintTarget<'a> {
+    pub(crate) color: &'a mut Color32,
+    pub(crate) gradient: Option<&'a mut Option<PaintGradient>>,
+    pub(crate) none: Option<NoneSlot<'a>>,
+}
+
+/// A paint box drawn in `rect`: none, a gradient, or the colour.
+pub(crate) fn paint_box_face(
+    painter: &egui::Painter,
+    rect: Rect,
+    color: Color32,
+    gradient: Option<&PaintGradient>,
+    none: bool,
+) {
+    if none {
+        crate::color_picker_ui::paint_none(painter, rect, 0.0);
+    } else if let Some(gradient) = gradient {
+        paint_gradient(painter, rect, gradient, true);
+    } else {
+        egui::color_picker::show_color_at(painter, color, rect);
+    }
 }
 
 fn to_color32(c: Rgba) -> Color32 {
@@ -328,37 +504,91 @@ pub(crate) fn paint_gradient(
     painter.add(egui::Shape::mesh(mesh));
 }
 
-/// The stop bar, its controls, presets and the selected stop's colour.
+fn selected_stop_id(owner: Id) -> Id {
+    owner.with("gradient_stop")
+}
+
+/// Which stop of `owner`'s gradient is selected, for an editor that shows
+/// the stop bar without its own picker.
+pub(crate) fn selected_stop(ctx: &Context, owner: Id, stops: usize) -> usize {
+    ctx.data(|data| data.get_temp::<usize>(selected_stop_id(owner)))
+        .unwrap_or(0)
+        .min(stops.saturating_sub(1))
+}
+
+/// The stop bar, its controls and presets, `width` wide, without a picker
+/// for the selected stop's colour: the caller edits it, see
+/// [`selected_stop`].
+pub(crate) fn gradient_stops_editor(
+    ui: &mut Ui,
+    owner: Id,
+    gradient: &mut PaintGradient,
+    width: f32,
+) -> PaintChange {
+    gradient_editor(
+        ui,
+        owner,
+        gradient,
+        egui::color_picker::Alpha::BlendOrAdditive,
+        None,
+        width,
+        false,
+    )
+}
+
+/// The stop bar, its controls, presets and, with `picker`, the selected
+/// stop's colour, in a column exactly `width` wide. Bounded so its
+/// right-aligned buttons stay beside the bar: in a popup that sizes itself,
+/// an unbounded row would reach the edge of the screen.
 fn gradient_editor(
     ui: &mut Ui,
     owner: Id,
     gradient: &mut PaintGradient,
     alpha: egui::color_picker::Alpha,
+    armed: Option<&mut bool>,
+    width: f32,
+    picker: bool,
 ) -> PaintChange {
+    ui.vertical(|ui| {
+        ui.set_width(width);
+        gradient_editor_rows(ui, owner, gradient, alpha, armed, width, picker)
+    })
+    .inner
+}
+
+fn gradient_editor_rows(
+    ui: &mut Ui,
+    owner: Id,
+    gradient: &mut PaintGradient,
+    alpha: egui::color_picker::Alpha,
+    armed: Option<&mut bool>,
+    width: f32,
+    picker: bool,
+) -> PaintChange {
+    use crate::color_picker_ui as face;
     let mut change = PaintChange::None;
-    let selected_id = owner.with("gradient_stop");
-    let mut selected = ui
-        .data(|data| data.get_temp::<usize>(selected_id))
-        .unwrap_or(0)
-        .min(gradient.stops.len().saturating_sub(1));
-    let width = ui.spacing().slider_width.max(200.0);
-    let (bar, bar_response) = ui.allocate_exact_size(egui::vec2(width, 26.0), Sense::click());
-    paint_gradient(ui.painter(), bar, gradient, false);
-    ui.painter()
-        .rect_stroke(bar, 2.0, ui.visuals().widgets.noninteractive.bg_stroke);
-    let handle = if crate::touch::ENABLED {
-        egui::vec2(18.0, 22.0)
-    } else {
-        egui::vec2(11.0, 15.0)
-    };
-    let (row, _) = ui.allocate_exact_size(egui::vec2(width, handle.y + 2.0), Sense::hover());
+    let selected_id = selected_stop_id(owner);
+    let mut selected = selected_stop(ui.ctx(), owner, gradient.stops.len());
+    let touch = crate::touch::ENABLED;
+    let bar_height = if touch { 30.0 } else { 24.0 };
+    let (bar, bar_response) = ui.allocate_exact_size(egui::vec2(width, bar_height), Sense::click());
+    let ramp = gradient.clone();
+    face::ramp(ui, bar, 8.0, owner.with("gradient_bar"), |t| {
+        to_color32(ramp.sample(t))
+    });
+
+    // Round stop pins under the bar, pointing up at their place.
+    let pin = if touch { 10.0 } else { 7.5 };
+    let (row, _) = ui.allocate_exact_size(egui::vec2(width, pin * 2.0 + 8.0), Sense::hover());
     let mut remove = None;
     for (index, stop) in gradient.stops.iter_mut().enumerate() {
         let x = bar.left() + bar.width() * stop.position;
-        let rect = Rect::from_center_size(egui::pos2(x, row.center().y), handle);
+        let center = egui::pos2(x, row.top() + 5.0 + pin);
+        let rect =
+            egui::Rect::from_center_size(center, egui::vec2(pin * 2.0 + 4.0, pin * 2.0 + 10.0));
         let response = ui
             .interact(rect, selected_id.with(index), Sense::click_and_drag())
-            .on_hover_text("drag to move · drag down or double-click to remove");
+            .on_hover_text("Drag to move \u{b7} drag down or double-click to remove");
         if response.clicked() || response.drag_started() {
             selected = index;
         }
@@ -375,26 +605,17 @@ fn gradient_editor(
         if pulled_off || response.double_clicked() || response.secondary_clicked() {
             remove = Some(index);
         }
-        let stroke = if index == selected {
-            egui::Stroke::new(2.0_f32, ui.visuals().strong_text_color())
-        } else {
-            ui.visuals().widgets.inactive.fg_stroke
-        };
-        let tip = egui::pos2(x, rect.top() - 3.0);
-        ui.painter().add(egui::Shape::convex_polygon(
-            vec![
-                tip,
-                egui::pos2(x + 4.0, rect.top() + 1.0),
-                egui::pos2(x - 4.0, rect.top() + 1.0),
-            ],
-            stroke.color,
-            egui::Stroke::NONE,
-        ));
-        let body = Rect::from_min_max(egui::pos2(rect.left(), rect.top() + 1.0), rect.max);
-        checker(ui.painter(), body);
-        ui.painter().rect_filled(body, 2.0, to_color32(stop.color));
-        ui.painter().rect_stroke(body, 2.0, stroke);
+        face::stop_pin(
+            ui.painter(),
+            center,
+            pin,
+            to_color32(stop.color),
+            index == selected,
+            response.hovered(),
+            ui.visuals().selection.stroke.color,
+        );
     }
+    let bar_response = bar_response.on_hover_text("Click to add a colour here");
     if bar_response.clicked() {
         if let Some(pointer) = bar_response.interact_pointer_pos() {
             let position = ((pointer.x - bar.left()) / bar.width()).clamp(0.0, 1.0);
@@ -420,9 +641,36 @@ fn gradient_editor(
             .unwrap_or(0);
     }
 
-    ui.horizontal(|ui| {
+    // Rows that wrap where they would not fit, as in a narrow Color panel;
+    // in the popup they keep their buttons at the right.
+    let narrow = width < 250.0;
+    let row = |ui: &mut Ui, contents: &mut dyn FnMut(&mut Ui)| {
+        if narrow {
+            ui.horizontal_wrapped(|ui| contents(ui));
+        } else {
+            ui.horizontal(|ui| contents(ui));
+        }
+    };
+    let at_right = |ui: &mut Ui, contents: &mut dyn FnMut(&mut Ui)| {
+        if narrow {
+            contents(ui);
+        } else {
+            // Right-aligned within the editor's own width. In a popup the
+            // room to the right runs to the edge of the screen, and a
+            // right-to-left row given all of it stretched the popup there.
+            let used = ui.cursor().min.x - ui.min_rect().min.x;
+            let room = egui::vec2((width - used).max(0.0), ui.spacing().interact_size.y);
+            ui.allocate_ui_with_layout(
+                room,
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| contents(ui),
+            );
+        }
+    };
+    row(ui, &mut |ui| {
+        ui.spacing_mut().item_spacing.x = 5.0;
         let mut percent = gradient.stops[selected].position * 100.0;
-        ui.label("Stop at");
+        ui.label(egui::RichText::new("Stop").color(ui.visuals().weak_text_color()));
         if ui
             .add(
                 egui::DragValue::new(&mut percent)
@@ -442,52 +690,61 @@ fn gradient_editor(
                 .unwrap_or(0);
             change = PaintChange::Stops;
         }
-        if ui
-            .add_enabled(
-                gradient.stops.len() > 2,
-                egui::Button::new("Remove").small(),
-            )
-            .clicked()
-        {
-            gradient.stops.remove(selected);
-            selected = selected.min(gradient.stops.len() - 1);
-            change = PaintChange::Stops;
-        }
-        if ui.small_button("⇄ Reverse").clicked() {
-            gradient.reverse();
-            selected = gradient.stops.len() - 1 - selected;
-            change = PaintChange::Stops;
-        }
-        if ui
-            .small_button("Even")
-            .on_hover_text("Space the stops evenly")
-            .clicked()
-        {
-            let last = (gradient.stops.len() - 1).max(1) as f32;
-            for (index, stop) in gradient.stops.iter_mut().enumerate() {
-                stop.position = index as f32 / last;
+        at_right(ui, &mut |ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            if ui
+                .add_enabled(
+                    gradient.stops.len() > 2,
+                    egui::Button::new("Remove").small(),
+                )
+                .on_hover_text("Remove this stop")
+                .clicked()
+            {
+                gradient.stops.remove(selected);
+                selected = selected.min(gradient.stops.len() - 1);
+                change = PaintChange::Stops;
             }
-            change = PaintChange::Stops;
-        }
+            if ui
+                .small_button("Even")
+                .on_hover_text("Space the stops evenly")
+                .clicked()
+            {
+                let last = (gradient.stops.len() - 1).max(1) as f32;
+                for (index, stop) in gradient.stops.iter_mut().enumerate() {
+                    stop.position = index as f32 / last;
+                }
+                change = PaintChange::Stops;
+            }
+            if ui
+                .small_button("Reverse")
+                .on_hover_text("Turn the colours round")
+                .clicked()
+            {
+                gradient.reverse();
+                selected = gradient.stops.len() - 1 - selected;
+                change = PaintChange::Stops;
+            }
+        });
     });
-    ui.horizontal(|ui| {
+    row(ui, &mut |ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
         if gradient.kind == GradientKind::Linear {
-            ui.label("Angle");
+            ui.label(egui::RichText::new("Angle").color(ui.visuals().weak_text_color()));
             if ui
                 .add(
                     egui::DragValue::new(&mut gradient.angle)
                         .clamp_range(-180.0..=180.0)
                         .speed(1.0)
-                        .suffix("°")
+                        .suffix("\u{b0}")
                         .fixed_decimals(0),
                 )
                 .changed()
             {
                 change = PaintChange::Shape;
             }
-            for (arrow, angle) in [("→", 0.0), ("↘", 45.0), ("↓", 90.0), ("↙", 135.0)] {
-                if ui
-                    .selectable_label((gradient.angle - angle).abs() < 0.5, arrow)
+            for angle in [0.0, 45.0, 90.0, 135.0] {
+                if face::arrow_button(ui, angle, (gradient.angle - angle).abs() < 0.5)
+                    .on_hover_text(format!("{angle:.0}\u{b0}"))
                     .clicked()
                 {
                     gradient.angle = angle;
@@ -495,30 +752,45 @@ fn gradient_editor(
                 }
             }
         }
-        ui.label("Size");
-        let mut size = gradient.size * 100.0;
-        if ui
-            .add(
-                egui::DragValue::new(&mut size)
-                    .clamp_range(10.0..=400.0)
-                    .suffix("%")
-                    .fixed_decimals(0),
-            )
-            .on_hover_text("100% spans the shape; less packs the colours tighter")
-            .changed()
-        {
-            gradient.size = size / 100.0;
-            change = PaintChange::Shape;
-        }
+        at_right(ui, &mut |ui| {
+            if narrow {
+                ui.label(egui::RichText::new("Size").color(ui.visuals().weak_text_color()));
+            }
+            let mut size = gradient.size * 100.0;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut size)
+                        .clamp_range(10.0..=400.0)
+                        .suffix("%")
+                        .fixed_decimals(0),
+                )
+                .on_hover_text("100% spans the shape; less packs the colours tighter")
+                .changed()
+            {
+                gradient.size = size / 100.0;
+                change = PaintChange::Shape;
+            }
+            if !narrow {
+                ui.label(egui::RichText::new("Size").color(ui.visuals().weak_text_color()));
+            }
+        });
     });
+    // Ready-made ramps, and a fade of the first colour.
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+        let count = crate::paint::PRESETS.len() + 1;
+        let tile_width = ((width - 4.0 * (count as f32 - 1.0)) / count as f32).floor();
+        let tile = egui::vec2(tile_width, if touch { 22.0 } else { 16.0 });
         for (index, (name, _)) in crate::paint::PRESETS.iter().enumerate() {
             let preset = PaintGradient::preset(index, gradient.kind, gradient.angle);
-            let (rect, response) = ui.allocate_exact_size(egui::vec2(30.0, 16.0), Sense::click());
-            paint_gradient(ui.painter(), rect, &preset, false);
-            let response = response.on_hover_text(*name);
-            if response.clicked() {
+            let (rect, response) = ui.allocate_exact_size(tile, Sense::click());
+            face::ramp(ui, rect, 4.0, owner.with(("gradient_preset", index)), |t| {
+                to_color32(preset.sample(t))
+            });
+            if response.hovered() {
+                face::hover_ring(ui, rect, 4.0);
+            }
+            if response.on_hover_text(*name).clicked() {
                 gradient.stops = preset.stops;
                 selected = 0;
                 change = PaintChange::Stops;
@@ -533,18 +805,37 @@ fn gradient_editor(
             ];
             fade
         };
-        let (rect, response) = ui.allocate_exact_size(egui::vec2(30.0, 16.0), Sense::click());
-        paint_gradient(ui.painter(), rect, &fade, false);
+        let (rect, response) = ui.allocate_exact_size(tile, Sense::click());
+        face::ramp(ui, rect, 4.0, owner.with("gradient_fade"), |t| {
+            to_color32(fade.sample(t))
+        });
+        if response.hovered() {
+            face::hover_ring(ui, rect, 4.0);
+        }
         if response.on_hover_text("Fade out").clicked() {
             gradient.stops = fade.stops;
             selected = 0;
             change = PaintChange::Stops;
         }
     });
-    let mut stop_color = to_color32(gradient.stops[selected].color);
-    if egui::color_picker::color_picker_color32(ui, &mut stop_color, alpha) {
-        gradient.stops[selected].color = to_rgba(stop_color);
-        change = PaintChange::Stops;
+    if picker {
+        ui.add_space(4.0);
+        let mut stop_color = to_color32(gradient.stops[selected].color);
+        let outcome = crate::color_picker_ui::picker(
+            ui,
+            &mut stop_color,
+            crate::color_picker_ui::Frame {
+                owner,
+                key: owner.with(("gradient_stop_picker", selected)),
+                alpha: alpha != egui::color_picker::Alpha::Opaque,
+                closable: false,
+                armed,
+            },
+        );
+        if outcome.changed {
+            gradient.stops[selected].color = to_rgba(stop_color);
+            change = PaintChange::Stops;
+        }
     }
     ui.data_mut(|data| data.insert_temp(selected_id, selected));
     change
@@ -554,10 +845,83 @@ fn color_edit_button(
     ui: &mut Ui,
     color: &mut Color32,
     alpha: egui::color_picker::Alpha,
-    mut gradient: Option<&mut Option<PaintGradient>>,
+    gradient: Option<&mut Option<PaintGradient>>,
+    none: Option<NoneSlot<'_>>,
 ) -> (Response, PaintChange) {
-    let mut change = PaintChange::None;
     let owner = ui.auto_id_with("screen_color_popup");
+    let (rect, mut response) = ui.allocate_exact_size(ui.spacing().interact_size, Sense::click());
+    response.widget_info(|| egui::WidgetInfo::new(egui::WidgetType::ColorButton));
+    response = response.on_hover_text(match (gradient.is_some(), none.is_some()) {
+        (true, true) => "Click to edit the colour or gradient, or make it none",
+        (true, false) => "Click to edit the colour or gradient",
+        (false, true) => "Click to edit the colour, or make it none",
+        (false, false) => "Click to edit color",
+    });
+    let mut gradient = gradient;
+    let mut none = none;
+    let (changed, change) = paint_popup(
+        ui,
+        owner,
+        response.clicked(),
+        rect,
+        alpha,
+        PaintTarget {
+            color,
+            gradient: gradient.as_deref_mut(),
+            none: none.as_mut().map(|slot| NoneSlot {
+                none: &mut *slot.none,
+                allowed: slot.allowed,
+            }),
+        },
+    );
+    if changed {
+        response.mark_changed();
+    }
+    if ui.is_rect_visible(rect) {
+        let open = ui.memory(|memory| memory.is_popup_open(owner));
+        let visuals = if open {
+            &ui.visuals().widgets.open
+        } else {
+            ui.style().interact(&response)
+        };
+        let paint_rect = rect.expand(visuals.expansion);
+        paint_box_face(
+            ui.painter(),
+            paint_rect,
+            *color,
+            gradient.as_deref().and_then(|g| g.as_ref()),
+            none.as_ref().is_some_and(|slot| *slot.none),
+        );
+        ui.painter()
+            .rect_stroke(paint_rect, visuals.rounding.at_most(2.0), visuals.bg_stroke);
+    }
+    (response, change)
+}
+
+/// Whether a "none" slot is switched on.
+fn is_none(none: &Option<NoneSlot<'_>>) -> bool {
+    none.as_ref().is_some_and(|slot| *slot.none)
+}
+
+/// The paint popup of a box at `anchor`, owned by `owner`: `toggle` opens
+/// or closes it. It takes a pixel picked off the screen, shows the kind
+/// (solid, linear, radial, none) when there is a choice, and the picker or
+/// gradient editor. Returns whether the paint changed this frame, and how.
+pub(crate) fn paint_popup(
+    ui: &mut Ui,
+    owner: Id,
+    toggle: bool,
+    anchor: Rect,
+    alpha: egui::color_picker::Alpha,
+    target: PaintTarget<'_>,
+) -> (bool, PaintChange) {
+    let PaintTarget {
+        color,
+        mut gradient,
+        mut none,
+    } = target;
+    let mut change = PaintChange::None;
+    let mut changed = false;
     let result = ui.ctx().data_mut(|data| {
         let state = data.get_temp_mut_or_default::<PickerState>(state_id());
         if state
@@ -570,14 +934,15 @@ fn color_edit_button(
             None
         }
     });
-    let mut sampled_change = false;
     if let Some(sample) = result {
-        if let Some(active) = gradient.as_mut().and_then(|g| g.as_mut()) {
+        let painting_none = is_none(&none);
+        let active = gradient
+            .as_mut()
+            .and_then(|g| g.as_mut())
+            .filter(|_| !painting_none);
+        if let Some(active) = active {
             // a picked pixel paints the selected stop
-            let selected = ui
-                .data(|data| data.get_temp::<usize>(owner.with("gradient_stop")))
-                .unwrap_or(0)
-                .min(active.stops.len().saturating_sub(1));
+            let selected = selected_stop(ui.ctx(), owner, active.stops.len());
             if let Some(stop) = active.stops.get_mut(selected) {
                 stop.color = Rgba {
                     a: stop.color.a,
@@ -590,128 +955,184 @@ fn color_edit_button(
             let rgba = color.to_srgba_unmultiplied();
             let sample =
                 Color32::from_rgba_unmultiplied(sample.r(), sample.g(), sample.b(), rgba[3]);
-            sampled_change = *color != sample;
+            changed = *color != sample;
             *color = sample;
+            if let Some(slot) = none.as_mut().filter(|slot| *slot.none) {
+                // a colour picked is a colour wanted: none is over
+                *slot.none = false;
+                if let Some(gradient) = gradient.as_mut() {
+                    **gradient = None;
+                }
+                changed = true;
+                change = PaintChange::Shape;
+            }
         }
     }
     let open = ui.memory(|memory| memory.is_popup_open(owner));
-    let (rect, mut response) = ui.allocate_exact_size(ui.spacing().interact_size, Sense::click());
-    response.widget_info(|| egui::WidgetInfo::new(egui::WidgetType::ColorButton));
-    if ui.is_rect_visible(rect) {
-        let visuals = if open {
-            &ui.visuals().widgets.open
-        } else {
-            ui.style().interact(&response)
-        };
-        let paint_rect = rect.expand(visuals.expansion);
-        match gradient.as_deref().and_then(|g| g.as_ref()) {
-            Some(active) => paint_gradient(ui.painter(), paint_rect, active, true),
-            None => egui::color_picker::show_color_at(ui.painter(), *color, paint_rect),
-        }
-        ui.painter()
-            .rect_stroke(paint_rect, visuals.rounding.at_most(2.0), visuals.bg_stroke);
+    if !open && crate::color_picker_ui::has_open(ui.ctx(), owner) {
+        // Closed: a colour that changed joins the recent ones.
+        crate::color_picker_ui::finish(ui.ctx(), owner);
     }
-    response = response.on_hover_text(if gradient.is_some() {
-        "Click to edit the colour or gradient"
-    } else {
-        "Click to edit color"
-    });
-    if sampled_change {
-        response.mark_changed();
-    }
-    if response.clicked() {
+    if toggle {
         ui.memory_mut(|memory| memory.toggle_popup(owner));
     }
     if ui.memory(|memory| memory.is_popup_open(owner)) {
         let area = egui::Area::new(owner)
             .order(egui::Order::Foreground)
-            .fixed_pos(response.rect.max)
+            .fixed_pos(anchor.max)
             .constrain(true)
             .show(ui.ctx(), |ui| {
-                ui.spacing_mut().slider_width = 275.0;
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        if crate::touch::ENABLED {
-                            let armed_key = armed_id(owner);
-                            let mut armed =
-                                ui.data(|data| data.get_temp::<bool>(armed_key).unwrap_or(false));
-                            if ui
-                                .selectable_label(armed, "Pick from screen")
-                                .on_hover_text("Then tap anywhere to take its colour")
-                                .clicked()
-                            {
-                                armed = !armed;
-                                ui.data_mut(|data| data.insert_temp(armed_key, armed));
+                ui.spacing_mut().slider_width = crate::color_picker_ui::width();
+                let touch = crate::touch::ENABLED;
+                egui::Frame::popup(ui.style())
+                    .inner_margin(egui::Margin::same(if touch { 14.0 } else { 10.0 }))
+                    .rounding(12.0)
+                    .show(ui, |ui| {
+                        // The popup is as wide as its picker, whatever the
+                        // mode: nothing in it may push it wider.
+                        ui.set_max_width(crate::color_picker_ui::width());
+                        let armed_key = armed_id(owner);
+                        let mut armed =
+                            ui.data(|data| data.get_temp::<bool>(armed_key).unwrap_or(false));
+                        let mut close = false;
+                        let chooses_kind = gradient.is_some() || none.is_some();
+                        if chooses_kind {
+                            // Solid, linear, radial or none, and the close button.
+                            let before = if is_none(&none) {
+                                PaintKind::Nothing
+                            } else {
+                                match gradient.as_deref().and_then(|g| g.as_ref()).map(|g| g.kind) {
+                                    None => PaintKind::Solid,
+                                    Some(GradientKind::Linear) => PaintKind::Linear,
+                                    Some(GradientKind::Radial) => PaintKind::Radial,
+                                }
+                            };
+                            let mut options = vec![(PaintKind::Solid, "Solid")];
+                            if gradient.is_some() {
+                                options.push((PaintKind::Linear, "Linear"));
+                                options.push((PaintKind::Radial, "Radial"));
                             }
-                        } else {
-                            ui.small("Click outside to pick a screen color · Esc to close");
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("✕").on_hover_text("Close").clicked() {
-                                ui.memory_mut(|memory| memory.close_popup());
-                                ui.data_mut(|data| data.remove::<bool>(armed_id(owner)));
+                            if none.is_some() {
+                                options.push((PaintKind::Nothing, "None"));
                             }
-                        });
-                    });
-                    if let Some(gradient) = gradient.as_deref_mut() {
-                        ui.horizontal(|ui| {
-                            let kind = gradient.as_ref().map(|g| g.kind);
-                            if ui.selectable_label(kind.is_none(), "Solid").clicked()
-                                && kind.is_some()
-                            {
-                                *gradient = None;
-                                change = PaintChange::Shape;
-                            }
-                            for (choice, label) in [
-                                (GradientKind::Linear, "Linear"),
-                                (GradientKind::Radial, "Radial"),
-                            ] {
-                                if ui
-                                    .selectable_label(
-                                        kind == Some(choice),
-                                        format!("{label} gradient"),
-                                    )
-                                    .clicked()
-                                    && kind != Some(choice)
-                                {
-                                    match gradient {
-                                        Some(active) => active.kind = choice,
-                                        None => {
-                                            *gradient = Some(PaintGradient::starting_from(
-                                                to_rgba(*color),
-                                                choice,
-                                            ))
+                            let none_allowed = none.as_ref().is_some_and(|slot| slot.allowed);
+                            let mut kind = before;
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                let side = if touch { 32.0 } else { 24.0 };
+                                crate::color_picker_ui::segmented_enabled(
+                                    ui,
+                                    crate::color_picker_ui::width() - side - 4.0,
+                                    &mut kind,
+                                    &options,
+                                    |option| {
+                                        (option == PaintKind::Nothing
+                                            && !none_allowed
+                                            && before != PaintKind::Nothing)
+                                            .then_some(NONE_REFUSED)
+                                    },
+                                );
+                                if crate::color_picker_ui::close_button(ui).clicked() {
+                                    close = true;
+                                }
+                            });
+                            if kind != before {
+                                if let Some(slot) = none.as_mut() {
+                                    *slot.none = kind == PaintKind::Nothing;
+                                }
+                                if let Some(gradient) = gradient.as_deref_mut() {
+                                    let start = |kind| {
+                                        Some(PaintGradient::starting_from(to_rgba(*color), kind))
+                                    };
+                                    match (kind, gradient.as_mut()) {
+                                        (PaintKind::Nothing, _) => {}
+                                        (PaintKind::Solid, _) => *gradient = None,
+                                        (PaintKind::Linear, Some(active)) => {
+                                            active.kind = GradientKind::Linear
+                                        }
+                                        (PaintKind::Radial, Some(active)) => {
+                                            active.kind = GradientKind::Radial
+                                        }
+                                        (PaintKind::Linear, None) => {
+                                            *gradient = start(GradientKind::Linear)
+                                        }
+                                        (PaintKind::Radial, None) => {
+                                            *gradient = start(GradientKind::Radial)
                                         }
                                     }
-                                    change = PaintChange::Shape;
+                                }
+                                change = PaintChange::Shape;
+                                changed = true;
+                            }
+                            ui.add_space(4.0);
+                        }
+                        let armed_slot = touch.then_some(&mut armed);
+                        let painting_none = is_none(&none);
+                        let active = gradient
+                            .as_mut()
+                            .and_then(|g| g.as_mut())
+                            .filter(|_| !painting_none);
+                        match active {
+                            Some(active) => {
+                                let edited = gradient_editor(
+                                    ui,
+                                    owner,
+                                    active,
+                                    alpha,
+                                    armed_slot,
+                                    crate::color_picker_ui::width(),
+                                    true,
+                                );
+                                if edited != PaintChange::None && change != PaintChange::Shape {
+                                    change = edited;
                                 }
                             }
-                        });
-                        ui.separator();
-                    }
-                    match gradient.as_mut().and_then(|g| g.as_mut()) {
-                        Some(active) => {
-                            let edited = gradient_editor(ui, owner, active, alpha);
-                            if edited != PaintChange::None && change != PaintChange::Shape {
-                                change = edited;
+                            None => {
+                                let outcome = crate::color_picker_ui::picker(
+                                    ui,
+                                    color,
+                                    crate::color_picker_ui::Frame {
+                                        owner,
+                                        key: owner,
+                                        alpha: alpha != egui::color_picker::Alpha::Opaque,
+                                        closable: !chooses_kind,
+                                        armed: armed_slot,
+                                    },
+                                );
+                                if outcome.changed {
+                                    changed = true;
+                                    if let Some(slot) = none.as_mut().filter(|slot| *slot.none) {
+                                        // a colour picked is a colour wanted
+                                        *slot.none = false;
+                                        if let Some(gradient) = gradient.as_mut() {
+                                            **gradient = None;
+                                        }
+                                        change = PaintChange::Shape;
+                                    }
+                                }
+                                close |= outcome.close;
                             }
                         }
-                        None => {
-                            if egui::color_picker::color_picker_color32(ui, color, alpha) {
-                                response.mark_changed();
-                            }
+                        ui.add_space(2.0);
+                        ui.label(
+                            egui::RichText::new(if !touch {
+                                "Click outside to pick a colour off the screen \u{b7} Esc closes"
+                            } else if armed {
+                                "Tap anywhere to take its colour"
+                            } else {
+                                "Tap outside to close"
+                            })
+                            .small()
+                            .color(ui.visuals().weak_text_color()),
+                        );
+                        if touch {
+                            ui.data_mut(|data| data.insert_temp(armed_key, armed));
                         }
-                    }
-                    if crate::touch::ENABLED {
-                        let armed =
-                            ui.data(|data| data.get_temp::<bool>(armed_id(owner)).unwrap_or(false));
-                        ui.small(if armed {
-                            "Tap anywhere to take its colour"
-                        } else {
-                            "Tap outside to close"
-                        });
-                    }
-                });
+                        if close {
+                            ui.memory_mut(|memory| memory.close_popup());
+                            ui.data_mut(|data| data.remove::<bool>(armed_key));
+                        }
+                    });
             })
             .response;
         let ctx = ui.ctx();
@@ -762,10 +1183,111 @@ fn color_edit_button(
             }
         });
     }
-    if change == PaintChange::None && response.changed() {
+    if change == PaintChange::None && changed {
         change = PaintChange::Color;
     }
-    (response, change)
+    (change != PaintChange::None, change)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The popup's width over a few frames on a wide screen, painting
+    /// `color` with `gradient` (a fill) and `none`, as given.
+    fn popup_widths(gradient: Option<Option<PaintGradient>>, none: Option<bool>) -> Vec<f32> {
+        let ctx = Context::default();
+        let owner = Id::new("paint_popup_width_test");
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1920.0, 1080.0),
+            )),
+            ..Default::default()
+        };
+        let mut gradient = gradient;
+        let mut none = none;
+        let mut widths = Vec::new();
+        for frame in 0..6 {
+            let _ = ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut color = Color32::from_rgb(200, 40, 40);
+                    paint_popup(
+                        ui,
+                        owner,
+                        frame == 0,
+                        Rect::from_min_size(egui::pos2(40.0, 40.0), egui::vec2(20.0, 20.0)),
+                        egui::color_picker::Alpha::BlendOrAdditive,
+                        PaintTarget {
+                            color: &mut color,
+                            gradient: gradient.as_mut(),
+                            none: none.as_mut().map(|none| NoneSlot {
+                                none,
+                                allowed: true,
+                            }),
+                        },
+                    );
+                });
+            });
+            if let Some(rect) = ctx.memory(|memory| memory.area_rect(owner)) {
+                widths.push(rect.width());
+            }
+        }
+        widths
+    }
+
+    #[test]
+    fn the_paint_popup_keeps_its_width_in_every_mode() {
+        let red = Rgba {
+            r: 200,
+            g: 40,
+            b: 40,
+            a: 255,
+        };
+        let modes = [
+            ("a plain colour", None, None),
+            ("a solid fill", Some(None), Some(false)),
+            (
+                "a linear gradient",
+                Some(Some(PaintGradient::starting_from(
+                    red,
+                    GradientKind::Linear,
+                ))),
+                Some(false),
+            ),
+            (
+                "a radial gradient",
+                Some(Some(PaintGradient::starting_from(
+                    red,
+                    GradientKind::Radial,
+                ))),
+                Some(false),
+            ),
+            ("no fill", Some(None), Some(true)),
+            ("no stroke", None, Some(true)),
+        ];
+        // the picker's width and the popup's margins, and a little for its edge
+        let most = crate::color_picker_ui::width() + 2.0 * 10.0 + 4.0;
+        for wheel in [false, true] {
+            crate::color_picker_ui::set_prefers_wheel(wheel);
+            for (name, gradient, none) in modes.clone() {
+                let widths = popup_widths(gradient, none);
+                assert!(widths.len() >= 4, "{name}: the popup opened");
+                let settled = &widths[2..];
+                assert!(
+                    settled.iter().all(|width| *width <= most),
+                    "{name} (wheel {wheel}) grew past {most}: {widths:?}"
+                );
+                assert!(
+                    settled
+                        .windows(2)
+                        .all(|pair| (pair[0] - pair[1]).abs() < 0.5),
+                    "{name} (wheel {wheel}) kept changing width: {widths:?}"
+                );
+            }
+        }
+        crate::color_picker_ui::set_prefers_wheel(false);
+    }
 }
 
 #[cfg(windows)]
@@ -777,10 +1299,33 @@ mod desktop {
         Graphics::Gdi::{GetDC, GetPixel, ReleaseDC, CLR_INVALID},
         System::LibraryLoader::GetModuleHandleW,
         UI::WindowsAndMessaging::{
-            CallNextHookEx, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, MSLLHOOKSTRUCT,
-            WH_MOUSE_LL, WM_LBUTTONDOWN, WM_LBUTTONUP,
+            CallNextHookEx, GetCursorPos, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK,
+            MSLLHOOKSTRUCT, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_LBUTTONUP,
         },
     };
+
+    /// One desktop pixel, in physical screen coordinates.
+    fn pixel(x: i32, y: i32) -> Option<Color32> {
+        // Read exactly one desktop pixel; do not copy/encode a screenshot.
+        unsafe {
+            let dc = GetDC(std::ptr::null_mut());
+            if dc.is_null() {
+                return None;
+            }
+            let pixel = GetPixel(dc, x, y);
+            ReleaseDC(std::ptr::null_mut(), dc);
+            (pixel != CLR_INVALID)
+                .then(|| Color32::from_rgb(pixel as u8, (pixel >> 8) as u8, (pixel >> 16) as u8))
+        }
+    }
+
+    pub(super) fn pixel_under_pointer() -> Option<Color32> {
+        let mut point = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+        if unsafe { GetCursorPos(&mut point) } == 0 {
+            return None;
+        }
+        pixel(point.x, point.y)
+    }
 
     struct Capture {
         rect: Rect,
@@ -870,20 +1415,10 @@ mod desktop {
                         return 1;
                     }
                     if message as u32 == WM_LBUTTONDOWN && !capture.rect.contains(point) {
-                        // Read exactly one desktop pixel; do not copy/encode a screenshot.
-                        let dc = GetDC(std::ptr::null_mut());
-                        if !dc.is_null() {
-                            let pixel = GetPixel(dc, event.pt.x, event.pt.y);
-                            ReleaseDC(std::ptr::null_mut(), dc);
-                            if pixel != CLR_INVALID {
-                                capture.pressed = Some(Color32::from_rgb(
-                                    pixel as u8,
-                                    (pixel >> 8) as u8,
-                                    (pixel >> 16) as u8,
-                                ));
-                                capture.swallow_release = true;
-                                return 1;
-                            }
+                        if let Some(color) = pixel(event.pt.x, event.pt.y) {
+                            capture.pressed = Some(color);
+                            capture.swallow_release = true;
+                            return 1;
                         }
                     }
                 }

@@ -710,6 +710,90 @@ pub enum Projection {
     Cylinder,
 }
 
+/// How [`fit_face_uvs`] lays a texture on each face.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FaceFit {
+    /// Corner to corner over each face, whatever its shape.
+    Stretch,
+    /// All of the picture on each face, in proportion and in the middle.
+    Fit,
+    /// Each face covered, in proportion; the picture's sides may be cut.
+    Fill,
+    /// The picture repeated every this many model units across, lined up
+    /// from face to face like tiles.
+    Tile(f32),
+}
+
+/// Where `point` lies on a face facing `normal`, in model units, seen from
+/// the side the face faces most, with up kept up.
+fn face_plane(point: V3, normal: V3) -> [f32; 2] {
+    let (ax, ay, az) = (normal.x.abs(), normal.y.abs(), normal.z.abs());
+    if ax >= ay && ax >= az {
+        [if normal.x > 0.0 { -point.z } else { point.z }, -point.y]
+    } else if ay >= az {
+        [point.x, if normal.y > 0.0 { point.z } else { -point.z }]
+    } else {
+        [if normal.z > 0.0 { point.x } else { -point.x }, -point.y]
+    }
+}
+
+/// New texture positions for each of `faces` on its own. `aspect` is the
+/// texture's width over its height, so Fit, Fill and Tile keep the
+/// picture in proportion.
+pub fn fit_face_uvs(mesh: &mut Mesh, faces: &BTreeSet<usize>, fit: FaceFit, aspect: f32) {
+    let aspect = if aspect.is_finite() && aspect > 0.0 {
+        aspect
+    } else {
+        1.0
+    };
+    let mut list = polys(mesh);
+    for f in faces {
+        let Some(p) = list.get_mut(*f) else { continue };
+        let normal = newell_normal(p.verts.iter().map(|v| mesh.positions[*v as usize]));
+        let flat: Vec<[f32; 2]> = p
+            .verts
+            .iter()
+            .map(|v| face_plane(mesh.positions[*v as usize], normal))
+            .collect();
+        let (lo, hi) = flat.iter().fold(
+            ([f32::MAX, f32::MAX], [f32::MIN, f32::MIN]),
+            |(lo, hi), [s, t]| {
+                (
+                    [lo[0].min(*s), lo[1].min(*t)],
+                    [hi[0].max(*s), hi[1].max(*t)],
+                )
+            },
+        );
+        let size = [(hi[0] - lo[0]).max(1.0e-6), (hi[1] - lo[1]).max(1.0e-6)];
+        let middle = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5];
+        // The picture's place on the face: its corner and size.
+        let (corner, picture) = match fit {
+            FaceFit::Stretch => (lo, size),
+            FaceFit::Fit | FaceFit::Fill => {
+                let height = if fit == FaceFit::Fit {
+                    (size[0] / aspect).min(size[1])
+                } else {
+                    (size[0] / aspect).max(size[1])
+                };
+                let picture = [height * aspect, height];
+                (
+                    [middle[0] - picture[0] * 0.5, middle[1] - picture[1] * 0.5],
+                    picture,
+                )
+            }
+            FaceFit::Tile(across) => {
+                let across = across.max(1.0e-4);
+                ([0.0, 0.0], [across, across / aspect])
+            }
+        };
+        p.uvs = flat
+            .iter()
+            .map(|[s, t]| [(s - corner[0]) / picture[0], (t - corner[1]) / picture[1]])
+            .collect();
+    }
+    set_polys(mesh, list);
+}
+
 /// New texture positions for faces, fitted to 0..1 over the selection.
 pub fn project_uvs(mesh: &mut Mesh, faces: &BTreeSet<usize>, projection: Projection) {
     let Some((lo, hi)) = mesh.bounds() else {
@@ -1144,6 +1228,57 @@ mod tests {
             }
         }
         edges.values().all(|n| *n == 2)
+    }
+
+    /// The texture positions of face `f`, least and most of each.
+    fn uv_span(mesh: &Mesh, f: usize) -> ([f32; 2], [f32; 2]) {
+        polys(mesh)[f]
+            .uvs
+            .iter()
+            .fold(([f32::MAX; 2], [f32::MIN; 2]), |(lo, hi), uv| {
+                (
+                    [lo[0].min(uv[0]), lo[1].min(uv[1])],
+                    [hi[0].max(uv[0]), hi[1].max(uv[1])],
+                )
+            })
+    }
+
+    #[test]
+    fn textures_laid_on_faces_stretch_fit_fill_and_tile() {
+        let all: BTreeSet<usize> = (0..6).collect();
+        let near = |a: f32, b: f32| (a - b).abs() < 1.0e-4;
+        let mut cube = Primitive::Cube.build(2.0, 4);
+        fit_face_uvs(&mut cube, &all, FaceFit::Stretch, 2.0);
+        for f in 0..6 {
+            let (lo, hi) = uv_span(&cube, f);
+            assert!(near(lo[0], 0.0) && near(lo[1], 0.0) && near(hi[0], 1.0) && near(hi[1], 1.0));
+        }
+        // A picture twice as wide as high on a square face: Fit shows it
+        // all with room above and below, Fill covers the face and cuts
+        // its sides.
+        fit_face_uvs(&mut cube, &all, FaceFit::Fit, 2.0);
+        let (lo, hi) = uv_span(&cube, 0);
+        assert!(near(lo[0], 0.0) && near(hi[0], 1.0) && near(lo[1], -0.5) && near(hi[1], 1.5));
+        fit_face_uvs(&mut cube, &all, FaceFit::Fill, 2.0);
+        let (lo, hi) = uv_span(&cube, 0);
+        assert!(near(lo[0], 0.25) && near(hi[0], 0.75) && near(lo[1], 0.0) && near(hi[1], 1.0));
+        // Tiles half a unit across: four across the cube's two units.
+        fit_face_uvs(&mut cube, &all, FaceFit::Tile(0.5), 1.0);
+        let (lo, hi) = uv_span(&cube, 0);
+        assert!(near(hi[0] - lo[0], 4.0) && near(hi[1] - lo[1], 4.0));
+        // Upright on the side faces: the top edge reads as the picture's top.
+        let side = (0..6)
+            .find(|f| cube.face_normal(&cube.faces[*f]).z > 0.9)
+            .unwrap();
+        let top_v = polys(&cube)[side]
+            .verts
+            .iter()
+            .zip(&polys(&cube)[side].uvs)
+            .filter(|(v, _)| cube.positions[**v as usize].y > 0.0)
+            .map(|(_, uv)| uv[1])
+            .fold(f32::MIN, f32::max);
+        let (lo, _) = uv_span(&cube, side);
+        assert!(near(top_v, lo[1]), "{top_v} vs {}", lo[1]);
     }
 
     #[test]

@@ -1172,6 +1172,7 @@ mod tests {
                 collapsed: false,
                 hidden: false,
                 locked: false,
+                mask_preview: false,
             },
         );
         project.layer_metadata.insert(
@@ -1183,6 +1184,7 @@ mod tests {
                 collapsed: true,
                 hidden: false,
                 locked: false,
+                mask_preview: false,
             },
         );
 

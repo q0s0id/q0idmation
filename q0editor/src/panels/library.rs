@@ -22,6 +22,8 @@ enum LibraryKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LibraryIcon {
     Folder(bool),
+    /// A graphics folder; lit while open.
+    Graphics(bool),
     Stage,
     Symbol,
     Vector,
@@ -68,9 +70,23 @@ struct LibraryRow {
     uses: usize,
     detail: String,
     folder: Option<String>,
+    /// The graphics folder this drawing shows in, when it is a graphic.
+    graphics: Option<GraphicsHome>,
+}
+
+/// A timeline's graphics folder, as a graphic's row knows it.
+#[derive(Debug, Clone)]
+struct GraphicsHome {
+    q0rg_id: u16,
+    /// Where the folder sits among the project's graphics folders.
+    rank: usize,
+    name: Arc<str>,
 }
 
 const LIBRARY_ROOT_FILTER: &str = "\0root";
+/// `library_folder_filter` while a graphics folder is selected; the q0rg id
+/// follows for a timeline's folder.
+const GRAPHICS_FILTER: &str = "\0graphics";
 
 #[derive(Clone)]
 struct FolderDrag {
@@ -88,6 +104,79 @@ enum TreeRow {
         index: usize,
         depth: usize,
     },
+    Graphics(GraphicsFolderRow),
+}
+
+/// The Graphics folder of one library (`owner` None) or a timeline's
+/// graphics folder inside it.
+struct GraphicsFolderRow {
+    tab_id: u64,
+    owner: Option<u16>,
+    depth: usize,
+    /// Drawings in it, counting every timeline's for the Graphics folder.
+    count: usize,
+    name: Arc<str>,
+}
+
+impl GraphicsFolderRow {
+    fn filter(&self) -> String {
+        match self.owner {
+            Some(id) => format!("{GRAPHICS_FILTER}/{id}"),
+            None => GRAPHICS_FILTER.to_string(),
+        }
+    }
+}
+
+/// Appends the Graphics folder of library `tab_id` and, when it is open,
+/// one folder per timeline with drawings in it.
+fn graphics_tree(
+    app: &EditorApp,
+    result: &mut Vec<TreeRow>,
+    rows: &[LibraryRow],
+    tab_id: u64,
+    searching: bool,
+) {
+    use std::collections::BTreeMap;
+    let mut folders: BTreeMap<(usize, u16), (Arc<str>, Vec<usize>)> = BTreeMap::new();
+    for (index, row) in rows.iter().enumerate() {
+        if let Some(home) = row.graphics.as_ref().filter(|_| row.tab_id == tab_id) {
+            folders
+                .entry((home.rank, home.q0rg_id))
+                .or_insert_with(|| (Arc::clone(&home.name), Vec::new()))
+                .1
+                .push(index);
+        }
+    }
+    if folders.is_empty() {
+        return;
+    }
+    result.push(TreeRow::Graphics(GraphicsFolderRow {
+        tab_id,
+        owner: None,
+        depth: 0,
+        count: folders.values().map(|(_, items)| items.len()).sum(),
+        name: Arc::from("Graphics"),
+    }));
+    // Searching opens every folder with a match, as it does for folders.
+    if !searching && !app.library_open_graphics.contains(&(tab_id, None)) {
+        return;
+    }
+    for ((_, q0rg_id), (name, items)) in folders {
+        result.push(TreeRow::Graphics(GraphicsFolderRow {
+            tab_id,
+            owner: Some(q0rg_id),
+            depth: 1,
+            count: items.len(),
+            name,
+        }));
+        if searching || app.library_open_graphics.contains(&(tab_id, Some(q0rg_id))) {
+            result.extend(
+                items
+                    .into_iter()
+                    .map(|index| TreeRow::Item { index, depth: 2 }),
+            );
+        }
+    }
 }
 
 fn library_tree(app: &EditorApp, rows: &[LibraryRow], source: LibrarySource) -> Vec<TreeRow> {
@@ -145,7 +234,7 @@ fn library_tree(app: &EditorApp, rows: &[LibraryRow], source: LibrarySource) -> 
         for (index, row) in rows
             .iter()
             .enumerate()
-            .filter(|(_, row)| row.tab_id == library.tab_id)
+            .filter(|(_, row)| row.tab_id == library.tab_id && row.graphics.is_none())
         {
             items.entry(row.folder.clone()).or_default().push(index);
         }
@@ -205,8 +294,138 @@ fn library_tree(app: &EditorApp, rows: &[LibraryRow], source: LibrarySource) -> 
             &items,
             searching,
         );
+        graphics_tree(app, &mut result, rows, library.tab_id, searching);
     }
     result
+}
+
+/// Whether a graphics folder of library `tab_id` takes `item` back: a plain
+/// drawing the user had filed in a folder of the open project.
+fn graphics_can_take(app: &EditorApp, tab_id: u64, item: LibraryItem) -> bool {
+    let LibraryItem::Asset(id) = item else {
+        return false;
+    };
+    app.active_project_tab_id() == Some(tab_id)
+        && app
+            .state
+            .project
+            .runtime
+            .library_item_folders
+            .contains_key(&q0s_format::v2::LibraryItemReference::Asset(id))
+        && crate::graphics::is_plain_drawing(&app.state.project, id)
+}
+
+/// A graphics folder row: quiet until pointed at, opened like a folder, and
+/// it takes back drawings dragged out of other folders. The caller ends the
+/// grid row.
+fn graphics_folder_row(
+    app: &mut EditorApp,
+    ui: &mut Ui,
+    folder: &GraphicsFolderRow,
+    searching: bool,
+    library_label: Option<&str>,
+) {
+    let key = (folder.tab_id, folder.owner);
+    let open = searching || app.library_open_graphics.contains(&key);
+    let filter = folder.filter();
+    let accent = app.settings.theme.accent.to_color32();
+    let dim = app.settings.theme.text_dim.to_color32();
+    let response = ui
+        .horizontal(|ui| {
+            ui.add_space(folder.depth as f32 * 14.0);
+            ui.visuals_mut().widgets.inactive.fg_stroke.color = dim;
+            library_name_cell(
+                ui,
+                app.library_folder_filter == filter,
+                LibraryIcon::Graphics(open),
+                &folder.name,
+                accent,
+                Sense::click(),
+            )
+        })
+        .inner
+        .on_hover_text(match folder.owner {
+            None => {
+                "Drawings, in a folder for each timeline that uses them.\n\
+                 Drawings nothing uses are left out when you save;\n\
+                 name one or move it to a folder to keep it."
+            }
+            Some(_) => "Drawings this timeline uses",
+        });
+    if response.clicked() {
+        app.library_folder_filter = filter;
+        app.library_selection = None;
+        app.library_multi_selection.clear();
+        app.session.selection = Selection::None;
+    }
+    let clicked_icon = response.clicked()
+        && response.interact_pointer_pos().is_some_and(|p| {
+            p.x < response.rect.left()
+                + ui.spacing().button_padding.x
+                + LIBRARY_ICON_SIZE
+                + LIBRARY_ICON_GAP
+        });
+    if !searching
+        && (response.double_clicked() || clicked_icon)
+        && !app.library_open_graphics.remove(&key)
+    {
+        app.library_open_graphics.insert(key);
+    }
+    if response
+        .dnd_hover_payload::<LibraryDragPayload>()
+        .is_some_and(|payload| {
+            payload.source_tab_id == folder.tab_id
+                && graphics_can_take(app, folder.tab_id, payload.item)
+        })
+    {
+        ui.painter()
+            .rect_stroke(response.rect.expand(2.0), 2.0, Stroke::new(1.5_f32, accent));
+    }
+    if let Some(payload) = response.dnd_release_payload::<LibraryDragPayload>() {
+        if payload.source_tab_id == folder.tab_id {
+            let dragged = LibrarySelection {
+                tab_id: folder.tab_id,
+                item: payload.item,
+            };
+            let items = if app.library_multi_selection.contains(&dragged) {
+                app.library_multi_selection.clone()
+            } else {
+                vec![dragged]
+            };
+            // Graphics folders hold only drawings in use; an unused one
+            // would vanish from the library the moment it landed.
+            let used = q0s_format::graphics::referenced_asset_ids(&app.state.project);
+            let drawings: Vec<LibraryItem> = items
+                .into_iter()
+                .filter(|selected| selected.tab_id == folder.tab_id)
+                .map(|selected| selected.item)
+                .filter(|item| graphics_can_take(app, folder.tab_id, *item))
+                .collect();
+            let mut unused = 0;
+            for item in drawings {
+                if matches!(item, LibraryItem::Asset(id) if used.contains(&id)) {
+                    app.queue(Action::MoveLibraryItemToFolder(item, None));
+                } else {
+                    unused += 1;
+                }
+            }
+            if unused > 0 {
+                app.session.status =
+                    "a drawing nothing uses stays in its folder: graphics folders hold drawings in use"
+                        .to_string();
+            }
+        }
+    }
+    let count = folder.count;
+    cell(
+        ui,
+        &format!("{count} drawing{}", if count == 1 { "" } else { "s" }),
+    );
+    ui.label("");
+    ui.label("");
+    if let Some(label) = library_label {
+        cell(ui, label);
+    }
 }
 
 fn folder_drop(app: &mut EditorApp, response: &Response, tab_id: u64, destination: Option<String>) {
@@ -377,28 +596,9 @@ fn library_rows_cache_key(
 
 pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     use crate::ui::{icon_button, icon_button_enabled, Icon};
-    ui.horizontal(|ui| {
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if icon_button(ui, Icon::Symbol, "Create q0rg symbol").clicked() {
-                app.queue(Action::PromptSymbol(
-                    crate::symbol_prompt::SymbolRequest::New,
-                ));
-            }
-            if icon_button(
-                ui,
-                Icon::Import,
-                "Import images, audio or video into the library",
-            )
-            .clicked()
-            {
-                app.queue(Action::ImportMedia);
-            }
-        });
-    });
-    ui.separator();
-
     let libraries = app.project_library_summaries();
     let active_tab = app.active_project_tab_id();
+    remember_view_per_tab(app, ui.ctx(), active_tab, &libraries);
     let source_is_valid = match app.library_source {
         Some(LibrarySource::All) => !libraries.is_empty(),
         Some(LibrarySource::Project(tab_id)) => libraries.iter().any(|lib| lib.tab_id == tab_id),
@@ -418,15 +618,6 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         app.library_selection_anchor = None;
     }
 
-    if libraries.is_empty() {
-        ui.label(
-            egui::RichText::new("No open q1s libraries")
-                .small()
-                .color(app.settings.theme.text_dim.to_color32()),
-        );
-        return;
-    }
-
     let source = app.library_source.unwrap_or(LibrarySource::All);
     let selected_source_text = match source {
         LibrarySource::All => "All libraries".to_string(),
@@ -437,21 +628,54 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             .unwrap_or_else(|| "All libraries".to_string()),
     };
     let mut requested_source = source;
-    egui::ComboBox::from_id_source("library_project_picker")
-        .width(ui.available_width())
-        .wrap(true)
-        .selected_text(selected_source_text)
-        .show_ui(ui, |ui| {
-            ui.selectable_value(&mut requested_source, LibrarySource::All, "All libraries");
-            ui.separator();
-            for library in &libraries {
-                ui.selectable_value(
-                    &mut requested_source,
-                    LibrarySource::Project(library.tab_id),
-                    &library.label,
-                );
+    // One toolbar: which library, then making and bringing in things.
+    ui.horizontal(|ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if icon_button(ui, Icon::Symbol, "Create q0rg symbol").clicked() {
+                app.queue(Action::PromptSymbol(
+                    crate::symbol_prompt::SymbolRequest::New,
+                ));
+            }
+            if icon_button(
+                ui,
+                Icon::Import,
+                "Import images, audio or video into the library",
+            )
+            .clicked()
+            {
+                app.queue(Action::ImportMedia);
+            }
+            if !libraries.is_empty() {
+                egui::ComboBox::from_id_source("library_project_picker")
+                    .width(ui.available_width().max(60.0))
+                    .wrap(true)
+                    .selected_text(selected_source_text)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut requested_source,
+                            LibrarySource::All,
+                            "All libraries",
+                        );
+                        ui.separator();
+                        for library in &libraries {
+                            ui.selectable_value(
+                                &mut requested_source,
+                                LibrarySource::Project(library.tab_id),
+                                &library.label,
+                            );
+                        }
+                    });
             }
         });
+    });
+    if libraries.is_empty() {
+        ui.label(
+            egui::RichText::new("No open q1s libraries")
+                .small()
+                .color(app.settings.theme.text_dim.to_color32()),
+        );
+        return;
+    }
     if requested_source != source {
         app.library_source = Some(requested_source);
         app.library_selection = None;
@@ -469,6 +693,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     };
     if !app.library_folder_filter.is_empty()
         && app.library_folder_filter != LIBRARY_ROOT_FILTER
+        && !app.library_folder_filter.starts_with(GRAPHICS_FILTER)
         && !folder_paths.contains(&app.library_folder_filter)
     {
         app.library_folder_filter.clear();
@@ -486,7 +711,9 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             )
             .clicked()
             {
-                let parent = if selected_folder.is_empty() || selected_folder == LIBRARY_ROOT_FILTER
+                let parent = if selected_folder.is_empty()
+                    || selected_folder == LIBRARY_ROOT_FILTER
+                    || selected_folder.starts_with(GRAPHICS_FILTER)
                 {
                     None
                 } else {
@@ -500,7 +727,8 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             }
             let rename_selected = can_manage_folders
                 && !selected_folder.is_empty()
-                && selected_folder != LIBRARY_ROOT_FILTER;
+                && selected_folder != LIBRARY_ROOT_FILTER
+                && !selected_folder.starts_with(GRAPHICS_FILTER);
             if icon_button_enabled(ui, rename_selected, Icon::Rename, "Rename selected folder")
                 .clicked()
             {
@@ -591,6 +819,10 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         .folder
                         .as_deref()
                         .is_some_and(|folder| folder.to_lowercase().contains(&needle))
+                    || row
+                        .graphics
+                        .as_ref()
+                        .is_some_and(|home| home.name.to_lowercase().contains(&needle))
                     || row.library_label.to_lowercase().contains(&needle)
             });
         }
@@ -724,6 +956,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     });
 
     crate::ui::search_field(ui, &mut app.library_search, "Search library...");
+    let scroll_to = step_with_arrows(app, ui, &rows, &tree_rows, active_tab);
 
     let mut selected: Option<(LibrarySelection, usize, bool, bool, bool)> = None;
     let mut enter: Option<(u64, u16)> = None;
@@ -746,22 +979,23 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 .min_col_width(28.0)
                 .spacing([8.0, 3.0])
                 .show(ui, |ui| {
-                    if ui
-                        .selectable_label(
-                            false,
-                            if app.library_sort_by_uses {
-                                if app.library_sort_ascending {
-                                    "Uses ↑"
-                                } else {
-                                    "Uses ↓"
-                                }
-                            } else if app.library_sort_ascending {
-                                "Name A-Z"
+                    if header_cell(
+                        ui,
+                        !app.library_sort_by_uses,
+                        if app.library_sort_by_uses {
+                            if app.library_sort_ascending {
+                                "Uses ↑"
                             } else {
-                                "Name Z-A"
-                            },
-                        )
-                        .clicked()
+                                "Uses ↓"
+                            }
+                        } else if app.library_sort_ascending {
+                            "Name A-Z"
+                        } else {
+                            "Name Z-A"
+                        },
+                    )
+                    .on_hover_text("Sort by name; click again to reverse")
+                    .clicked()
                     {
                         if app.library_sort_by_uses {
                             app.library_sort_by_uses = false;
@@ -770,9 +1004,8 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                             app.library_sort_ascending = !app.library_sort_ascending;
                         }
                     }
-                    ui.label("Type");
-                    if ui
-                        .selectable_label(app.library_sort_by_uses, "Uses")
+                    header_label(ui, "Type");
+                    if header_cell(ui, app.library_sort_by_uses, "Uses")
                         .on_hover_text("Sort by use count, then by name")
                         .clicked()
                     {
@@ -783,13 +1016,19 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                             app.library_sort_ascending = false;
                         }
                     }
-                    ui.label("ID");
+                    header_label(ui, "ID");
                     if showing_all {
-                        ui.label("Library");
+                        header_label(ui, "Library");
                     }
                     ui.end_row();
                 });
-            ui.separator();
+            let line = ui.available_rect_before_wrap();
+            ui.painter().hline(
+                line.x_range(),
+                line.top() + 1.5,
+                ui.visuals().widgets.noninteractive.bg_stroke,
+            );
+            ui.add_space(4.0);
 
             if rows.is_empty() {
                 ui.label(
@@ -811,6 +1050,22 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 .id_source(LIBRARY_ITEMS_SCROLL_ID)
                 .auto_shrink([false, true])
                 .show_rows(ui, row_height, tree_rows.len(), |ui, visible_rows| {
+                    if let Some(index) = scroll_to {
+                        // `show_rows` places row i at i times this below the top.
+                        let pitch = row_height + ui.spacing().item_spacing.y;
+                        let top = ui.max_rect().top()
+                            + (index as f32 - visible_rows.start as f32) * pitch;
+                        ui.scroll_to_rect(
+                            Rect::from_min_size(pos2(ui.max_rect().left(), top), vec2(1.0, pitch)),
+                            None,
+                        );
+                    }
+                    // Stripes just strong enough to follow a row across.
+                    ui.visuals_mut().faint_bg_color = crate::ui::blend(
+                        ui.visuals().window_fill,
+                        ui.visuals().text_color(),
+                        0.035,
+                    );
                     egui::Grid::new("library_items")
                         .striped(true)
                         .num_columns(columns)
@@ -820,6 +1075,23 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                             for tree_index in visible_rows.clone() {
                                 let (row_index, depth) = match &tree_rows[tree_index] {
                                     TreeRow::Item { index, depth } => (*index, *depth),
+                                    TreeRow::Graphics(folder) => {
+                                        graphics_folder_row(
+                                            app,
+                                            ui,
+                                            folder,
+                                            !needle.is_empty(),
+                                            showing_all.then(|| {
+                                                libraries
+                                                    .iter()
+                                                    .find(|lib| lib.tab_id == folder.tab_id)
+                                                    .map(|lib| lib.label.as_str())
+                                                    .unwrap_or_default()
+                                            }),
+                                        );
+                                        ui.end_row();
+                                        continue;
+                                    }
                                     TreeRow::Folder {
                                         tab_id,
                                         path,
@@ -932,15 +1204,16 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                                                 }
                                             });
                                         }
-                                        ui.label("folder");
+                                        cell(ui, "folder");
                                         ui.label("");
                                         ui.label("");
                                         if showing_all {
-                                            ui.label(
+                                            cell(
+                                                ui,
                                                 libraries
                                                     .iter()
                                                     .find(|lib| lib.tab_id == tab_id)
-                                                    .map(|lib| lib.label.clone())
+                                                    .map(|lib| lib.label.as_str())
                                                     .unwrap_or_default(),
                                             );
                                         }
@@ -1003,7 +1276,11 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                                     row.name,
                                     row.detail,
                                     row.library_label,
-                                    row.folder.as_deref().unwrap_or("Unfoldered")
+                                    match (&row.folder, &row.graphics) {
+                                        (Some(folder), _) => folder.clone(),
+                                        (None, Some(home)) => format!("Graphics / {}", home.name),
+                                        (None, None) => "Unfoldered".to_string(),
+                                    }
                                 ));
                                 if row_is_active {
                                     response.clone().context_menu(|ui| {
@@ -1068,13 +1345,18 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                                         LibraryKey::Asset(_) => {}
                                     }
                                 }
-                                ui.label(row.kind);
-                                ui.label(row.uses.to_string());
-                                ui.label(match row.key {
-                                    LibraryKey::Q0rg(id) | LibraryKey::Asset(id) => id.to_string(),
-                                });
+                                cell(ui, row.kind);
+                                cell(ui, &row.uses.to_string());
+                                cell(
+                                    ui,
+                                    &match row.key {
+                                        LibraryKey::Q0rg(id) | LibraryKey::Asset(id) => {
+                                            id.to_string()
+                                        }
+                                    },
+                                );
                                 if showing_all {
-                                    ui.label(&row.library_label);
+                                    cell(ui, &row.library_label);
                                 }
                                 ui.end_row();
                             }
@@ -1214,6 +1496,112 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     render_rename_dialog(app, ui.ctx());
 }
 
+/// Each open project tab keeps the library it last showed, here in the
+/// editor only (never in the .q1s), and a tab not seen yet shows its own
+/// library. Closing a tab forgets it.
+fn remember_view_per_tab(
+    app: &mut EditorApp,
+    ctx: &egui::Context,
+    active_tab: Option<u64>,
+    libraries: &[crate::app::ProjectLibrarySummary],
+) {
+    #[derive(Clone, Default)]
+    struct Views {
+        shown_for: Option<u64>,
+        by_tab: HashMap<u64, (Option<LibrarySource>, String)>,
+    }
+    let id = egui::Id::new("library_view_per_tab");
+    let mut views = ctx.data(|d| d.get_temp::<Views>(id)).unwrap_or_default();
+    views
+        .by_tab
+        .retain(|tab, _| libraries.iter().any(|library| library.tab_id == *tab));
+    if views.shown_for != active_tab {
+        if let Some(previous) = views.shown_for {
+            views.by_tab.insert(
+                previous,
+                (app.library_source, app.library_folder_filter.clone()),
+            );
+        }
+        if let Some(tab) = active_tab {
+            let (source, folder) = views
+                .by_tab
+                .get(&tab)
+                .cloned()
+                .unwrap_or((Some(LibrarySource::Project(tab)), String::new()));
+            app.library_source = source;
+            app.library_folder_filter = folder;
+            app.library_selection = None;
+            app.library_multi_selection.clear();
+            app.library_selection_anchor = None;
+        }
+        views.shown_for = active_tab;
+    }
+    ctx.data_mut(|d| d.insert_temp(id, views));
+}
+
+/// Up and Down move the selection through the list's items while the
+/// pointer is over the library, and nothing is being typed. Returns the
+/// tree row to bring into view.
+fn step_with_arrows(
+    app: &mut EditorApp,
+    ui: &mut Ui,
+    rows: &[LibraryRow],
+    tree_rows: &[TreeRow],
+    active_tab: Option<u64>,
+) -> Option<usize> {
+    if !ui.rect_contains_pointer(ui.max_rect()) || ui.ctx().wants_keyboard_input() {
+        return None;
+    }
+    let step: isize = ui.input_mut(|input| {
+        if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+            1
+        } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+            -1
+        } else {
+            0
+        }
+    });
+    if step == 0 {
+        return None;
+    }
+    let items: Vec<(usize, usize)> = tree_rows
+        .iter()
+        .enumerate()
+        .filter_map(|(tree_index, row)| match row {
+            TreeRow::Item { index, .. } => Some((tree_index, *index)),
+            _ => None,
+        })
+        .collect();
+    let last = items.len().checked_sub(1)?;
+    let current = app.library_selection.and_then(|selection| {
+        items.iter().position(|(_, index)| {
+            let row = &rows[*index];
+            row.tab_id == selection.tab_id && row.key == key_for_item(selection.item)
+        })
+    });
+    let next = match current {
+        Some(position) => position.saturating_add_signed(step).min(last),
+        None if step > 0 => 0,
+        None => last,
+    };
+    let (tree_index, row_index) = items[next];
+    let row = &rows[row_index];
+    let selection = LibrarySelection {
+        tab_id: row.tab_id,
+        item: item_for_key(row.key),
+    };
+    app.library_multi_selection = vec![selection];
+    app.library_selection = Some(selection);
+    app.library_selection_anchor = Some(selection);
+    if Some(row.tab_id) == active_tab {
+        app.session.selection = match selection.item {
+            LibraryItem::Q0rg(id) => Selection::Q0rg(id),
+            LibraryItem::Asset(id) => Selection::Asset(id),
+        };
+    }
+    Some(tree_index)
+}
+
 fn selected_library_item(app: &EditorApp) -> Option<LibraryItem> {
     let selection = app.library_selection?;
     (Some(selection.tab_id) == app.active_project_tab_id()).then_some(selection.item)
@@ -1322,7 +1710,7 @@ fn render_rename_dialog(app: &mut EditorApp, ctx: &egui::Context) {
     let mut open = true;
     let mut submit = false;
     let mut cancel = false;
-    egui::Window::new(title)
+    crate::dialog::Dialog::new(title)
         .id(egui::Id::new("library_rename_dialog"))
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .collapsible(false)
@@ -1427,6 +1815,39 @@ fn draw_library_drag_preview(ctx: &egui::Context, icon: LibraryIcon, name: &str,
     );
 }
 
+/// A sortable column heading: small and quiet, brighter while it sorts.
+fn header_cell(ui: &mut Ui, active: bool, text: &str) -> Response {
+    let color = if active {
+        ui.visuals().strong_text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    ui.add(
+        egui::Label::new(egui::RichText::new(text).small().strong().color(color))
+            .sense(Sense::click()),
+    )
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A column heading that does not sort.
+fn header_label(ui: &mut Ui, text: &str) {
+    ui.label(
+        egui::RichText::new(text)
+            .small()
+            .strong()
+            .color(ui.visuals().weak_text_color()),
+    );
+}
+
+/// A detail cell beside an item's name: smaller and dimmer than the name.
+fn cell(ui: &mut Ui, text: &str) {
+    ui.label(
+        egui::RichText::new(text)
+            .small()
+            .color(ui.visuals().weak_text_color()),
+    );
+}
+
 fn library_name_cell(
     ui: &mut Ui,
     selected: bool,
@@ -1453,15 +1874,10 @@ fn library_name_cell(
     });
 
     if ui.is_rect_visible(response.rect) {
+        // The same surface as the tool buttons: an eased hover glow, and
+        // the selection gradient with the accent around it.
+        crate::ui::paint_control(ui, &response, rect, 5.0, selected);
         let visuals = ui.style().interact_selectable(&response, selected);
-        if selected || response.hovered() || response.highlighted() || response.has_focus() {
-            ui.painter().rect(
-                rect.expand(visuals.expansion),
-                visuals.rounding,
-                visuals.weak_bg_fill,
-                visuals.bg_stroke,
-            );
-        }
 
         let content = rect.shrink2(button_padding);
         let icon_rect = Rect::from_center_size(
@@ -1499,6 +1915,14 @@ fn draw_library_icon(
                 closed,
                 foreground,
                 accent,
+            );
+        }
+        LibraryIcon::Graphics(open) => {
+            crate::ui::paint_icon(
+                painter,
+                rect,
+                crate::ui::Icon::Graphics,
+                if open { accent } else { foreground },
             );
         }
         LibraryIcon::Stage => {
@@ -1679,6 +2103,21 @@ fn collect_rows_for_project(
     // FLA projects with thousands of symbols/assets that made Library O(items *
     // placements) every UI frame. Count all targets once instead.
     let (q0rg_uses, asset_uses) = library_use_counts(project);
+    let owners = q0s_format::graphics::vector_owners(project);
+    let homes: HashMap<u16, GraphicsHome> = crate::graphics::folders(project, owners.values())
+        .into_iter()
+        .enumerate()
+        .map(|(rank, (q0rg_id, name))| {
+            (
+                q0rg_id,
+                GraphicsHome {
+                    q0rg_id,
+                    rank,
+                    name: Arc::from(name),
+                },
+            )
+        })
+        .collect();
     let mut rows = Vec::with_capacity(project.q0rgs.len() + project.assets.len());
     for q0rg in &project.q0rgs {
         if q0rg.q0rg_id == project.meta.entry_q0rg_id {
@@ -1699,6 +2138,7 @@ fn collect_rows_for_project(
                 .library_item_folders
                 .get(&q0s_format::v2::LibraryItemReference::Q0rg(q0rg.q0rg_id))
                 .cloned(),
+            graphics: None,
         });
     }
     for asset in &project.assets {
@@ -1706,6 +2146,27 @@ fn collect_rows_for_project(
             continue;
         }
         let id = asset.id();
+        let folder = project
+            .runtime
+            .library_item_folders
+            .get(&q0s_format::v2::LibraryItemReference::Asset(id))
+            .cloned();
+        // A plain drawing shows in the graphics folder of the timeline that
+        // uses it; one nothing uses is left out of the library and the file.
+        let graphics = match asset {
+            Asset::Vector(_)
+                if folder.is_none()
+                    && crate::graphics::plain_name(
+                        project.asset_names.get(&id).map(String::as_str),
+                    ) =>
+            {
+                let Some(owner) = owners.get(&id) else {
+                    continue;
+                };
+                homes.get(owner).cloned()
+            }
+            _ => None,
+        };
         let uses = asset_uses.get(&id).copied().unwrap_or(0);
         let (name, kind, detail) = match asset {
             Asset::Bitmap(bitmap) => (
@@ -1814,11 +2275,8 @@ fn collect_rows_for_project(
             kind,
             uses,
             detail,
-            folder: project
-                .runtime
-                .library_item_folders
-                .get(&q0s_format::v2::LibraryItemReference::Asset(id))
-                .cloned(),
+            folder,
+            graphics,
         });
     }
     rows
@@ -1826,7 +2284,8 @@ fn collect_rows_for_project(
 
 fn draw_preview(app: &mut EditorApp, ui: &mut Ui, selection: Option<LibrarySelection>) {
     let height = (ui.clip_rect().bottom() - ui.cursor().top() - 145.0).clamp(64.0, 142.0);
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::drag());
     let border = app.settings.theme.stroke_dark.to_color32();
     let text_dim = app.settings.theme.text_dim.to_color32();
     let deep_bg = app.settings.theme.deep_bg.to_color32();
@@ -1848,6 +2307,27 @@ fn draw_preview(app: &mut EditorApp, ui: &mut Ui, selection: Option<LibrarySelec
         return;
     };
     let key = key_for_item(selection.item);
+    // The picture drags onto the stage or timeline just like the item's name.
+    let response = response.on_hover_cursor(egui::CursorIcon::Grab);
+    response.dnd_set_drag_payload(LibraryDragPayload {
+        source_tab_id: selection.tab_id,
+        item: selection.item,
+    });
+    if response.dragged() {
+        if let Some(row) = app
+            .library_cache
+            .rows
+            .iter()
+            .find(|row| row.tab_id == selection.tab_id && row.key == key)
+        {
+            draw_library_drag_preview(
+                ui.ctx(),
+                row.icon,
+                &row.name,
+                app.settings.theme.accent.to_color32(),
+            );
+        }
+    }
     let frame = match key {
         LibraryKey::Q0rg(id) => app.project_library_preview_frame(selection.tab_id, id),
         LibraryKey::Asset(_) => 0,
@@ -2654,5 +3134,90 @@ mod tests {
         );
         assert!((center.x - rect.center().x).abs() < 0.01);
         assert!((center.y - rect.center().y).abs() < 0.01);
+    }
+
+    #[test]
+    fn drawings_sit_in_closed_graphics_folders_of_the_timeline_that_uses_them() {
+        let mut app = EditorApp::default();
+        app.handle(
+            &egui::Context::default(),
+            Action::CreateProject(crate::app::NewProjectSpec::default()),
+        );
+        let tab = app.active_project_tab_id().expect("a project tab");
+        let project = &mut app.state.project;
+        let mut hero = project.q0rgs[0].clone();
+        hero.q0rg_id = 2;
+        hero.name = "Hero".to_string();
+        hero.layers
+            .iter_mut()
+            .for_each(|layer| layer.placements.clear());
+        project.q0rgs.push(hero);
+        for id in 1..=4 {
+            project
+                .assets
+                .push(Asset::Vector(q0s_format::v2::VectorAsset {
+                    asset_id: id,
+                    paths: Vec::new(),
+                    fill: None,
+                    stroke: None,
+                }));
+        }
+        // 3 was deleted from the stage; 4 too, but the user named it.
+        project.asset_names.insert(4, "Keep me".to_string());
+        let mut place = |q0rg: usize, target: Target| {
+            project.q0rgs[q0rg].layers[0].push_placement(Placement {
+                instance_id: 0,
+                frame: 0,
+                target,
+                transform: Transform2D::IDENTITY,
+                pivot: None,
+                tween: Tween::None,
+                fx: Default::default(),
+            });
+        };
+        place(0, Target::Asset(1));
+        place(0, Target::Q0rg(2));
+        place(1, Target::Asset(2));
+
+        let source = LibrarySource::Project(tab);
+        let rows = collect_rows(&app, source, &app.project_library_summaries());
+        let home = |id: u16| {
+            rows.iter()
+                .find(|row| row.key == LibraryKey::Asset(id))
+                .map(|row| row.graphics.as_ref().map(|home| home.q0rg_id))
+        };
+        assert_eq!(home(1), Some(Some(1)));
+        assert_eq!(home(2), Some(Some(2)));
+        assert_eq!(home(3), None, "an unused drawing leaves the library");
+        assert_eq!(home(4), Some(None), "a named drawing stays a library item");
+
+        let shown = |app: &EditorApp| {
+            library_tree(app, &rows, source)
+                .iter()
+                .map(|row| match row {
+                    TreeRow::Folder { .. } => "folder".to_string(),
+                    TreeRow::Graphics(folder) => format!("graphics {:?}", folder.owner),
+                    TreeRow::Item { index, depth } => {
+                        format!("{:?} at {depth}", rows[*index].key)
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            shown(&app),
+            ["folder", "Q0rg(2) at 0", "Asset(4) at 0", "graphics None"],
+            "graphics start closed, below everything else"
+        );
+        app.library_open_graphics.insert((tab, None));
+        app.library_open_graphics.insert((tab, Some(2)));
+        assert_eq!(
+            shown(&app)[3..],
+            [
+                "graphics None",
+                "graphics Some(1)",
+                "graphics Some(2)",
+                "Asset(2) at 2"
+            ]
+        );
     }
 }

@@ -1171,6 +1171,13 @@ pub struct TextureCache {
     // changed selection clips cannot accumulate large meshes indefinitely.
     #[cfg(feature = "appearance-mask-eraser")]
     raw_area_selection: Option<(RawAreaSelectionKey, CachedRawAreaSelection)>,
+    /// The selected lines' unioned body as stage geometry, with its GPU
+    /// selection paint, for the surface it was built from.
+    #[cfg(feature = "appearance-mask-eraser")]
+    pub(crate) selected_stroke_area: Option<(
+        std::sync::Weak<geo::MultiPolygon<f64>>,
+        CachedRawAreaSelection,
+    )>,
     #[cfg(all(test, feature = "appearance-mask-eraser"))]
     appearance_signature_build_count: usize,
     #[cfg(all(test, feature = "appearance-mask-eraser"))]
@@ -4480,6 +4487,7 @@ fn collect_vector_q0rg_group_primitives(
     } else {
         0
     };
+    let rig_pose = lookup.rig_pose(q0rg_id, local_frame);
     for layer in &q0rg.layers {
         if !project.layer_is_visible(q0rg_id, layer.layer_id) {
             continue;
@@ -4498,7 +4506,11 @@ fn collect_vector_q0rg_group_primitives(
             }
             let primitive_start = primitives.len();
             let placement = resolved.placement;
-            let composed = Affine::compose(parent, Affine::from_transform(resolved.interp));
+            let local = rig_pose
+                .as_ref()
+                .and_then(|pose| pose.binding_transform(placement.instance_id))
+                .unwrap_or_else(|| Affine::from_transform(resolved.interp));
+            let composed = Affine::compose(parent, local);
             match placement.target {
                 Target::Asset(asset_id) => {
                     if !collect_vector_asset_group_primitives(
@@ -5087,6 +5099,8 @@ pub(crate) struct StageRenderPass<'a> {
 enum RootLayerFilter<'a> {
     Excluding(&'a HashSet<u16>),
     ExcludingPlacement(u16, usize),
+    /// One layer alone, as an onion ghost draws it.
+    Only(u16),
 }
 
 impl RootLayerFilter<'_> {
@@ -5094,6 +5108,7 @@ impl RootLayerFilter<'_> {
         match self {
             Self::Excluding(excluded) => !excluded.contains(&layer_id),
             Self::ExcludingPlacement(_, _) => true,
+            Self::Only(only) => layer_id == only,
         }
     }
 
@@ -5102,8 +5117,44 @@ impl RootLayerFilter<'_> {
             Self::ExcludingPlacement(excluded_layer, excluded_idx) => {
                 layer_id != excluded_layer || placement_idx != excluded_idx
             }
-            Self::Excluding(_) => true,
+            Self::Excluding(_) | Self::Only(_) => true,
         }
+    }
+}
+
+/// Onion-skin ghosts drawn inside the live frame. Each listed root layer's
+/// ghosts go right under that layer's own art: the layers below stay under
+/// them, the layer covers them, and the frame stays one pass, so its lights
+/// and 3D work as they do without onion skin.
+#[derive(Clone, Copy)]
+pub(crate) struct OnionGhosts<'a> {
+    /// Drawn in this order under each layer.
+    frames: &'a [OnionFrame],
+    /// Turns the scene's lights off while the ghosts show.
+    unlit: bool,
+    timeline_camera_applied: bool,
+}
+
+/// One ghosted frame: which root layers it shows, and in what tint.
+pub(crate) struct OnionFrame {
+    pub(crate) frame: u16,
+    pub(crate) tint: Color32,
+    pub(crate) layers: HashSet<u16>,
+}
+
+impl<'a> OnionGhosts<'a> {
+    pub(crate) fn new(frames: &'a [OnionFrame], unlit: bool) -> Self {
+        Self {
+            frames,
+            unlit,
+            timeline_camera_applied: false,
+        }
+    }
+
+    fn ghosts(&self, layer_id: u16) -> bool {
+        self.frames
+            .iter()
+            .any(|frame| frame.layers.contains(&layer_id))
     }
 }
 
@@ -5182,7 +5233,39 @@ impl<'a> StageRenderPass<'a> {
         ctx: &Context,
         tint: Color32,
     ) {
-        self.render_tinted_filtered(painter, q0rg_id, frame, view, textures, ctx, tint, None);
+        self.render_tinted_filtered(
+            painter, q0rg_id, frame, view, textures, ctx, tint, None, None,
+        );
+    }
+
+    /// The live frame with onion-skin ghosts slipped under their layers.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_with_onion(
+        &self,
+        painter: &Painter,
+        q0rg_id: u16,
+        frame: u16,
+        view: &StageView,
+        textures: &mut TextureCache,
+        ctx: &Context,
+        excluded_layers: Option<&HashSet<u16>>,
+        onion: OnionGhosts<'_>,
+    ) {
+        let onion = OnionGhosts {
+            timeline_camera_applied: self.timeline_camera_applied,
+            ..onion
+        };
+        self.render_tinted_filtered(
+            painter,
+            q0rg_id,
+            frame,
+            view,
+            textures,
+            ctx,
+            Color32::WHITE,
+            excluded_layers,
+            Some(onion),
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5196,6 +5279,7 @@ impl<'a> StageRenderPass<'a> {
         ctx: &Context,
         tint: Color32,
         excluded_layers: Option<&HashSet<u16>>,
+        onion: Option<OnionGhosts<'_>>,
     ) {
         let revision = self
             .revision
@@ -5210,6 +5294,7 @@ impl<'a> StageRenderPass<'a> {
                 ctx,
                 tint,
                 excluded_layers,
+                onion,
             )
         });
     }
@@ -5225,6 +5310,7 @@ impl<'a> StageRenderPass<'a> {
         ctx: &Context,
         tint: Color32,
         excluded_layers: Option<&HashSet<u16>>,
+        onion: Option<OnionGhosts<'_>>,
     ) {
         let layer_filter_hash = excluded_layers.map_or(0, |excluded| {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -5257,6 +5343,70 @@ impl<'a> StageRenderPass<'a> {
                 textures,
             )
         {
+            if let Some(onion) = onion {
+                // The CPU picture comes in one piece, so ghosts cannot slip
+                // between its layers: the layers under the lowest ghosting
+                // layer, then the ghosts, then the rest.
+                let layer_ids: Vec<u16> = self
+                    .lookup
+                    .q0rg(q0rg_id)
+                    .map(|q0rg| q0rg.layers.iter().map(|layer| layer.layer_id).collect())
+                    .unwrap_or_default();
+                let split = layer_ids
+                    .iter()
+                    .position(|layer_id| onion.ghosts(*layer_id))
+                    .unwrap_or(layer_ids.len());
+                let (lower, upper) = layer_ids.split_at(split);
+                let leaving = |part: &[u16]| -> HashSet<u16> {
+                    excluded_layers
+                        .into_iter()
+                        .flatten()
+                        .chain(part)
+                        .copied()
+                        .collect()
+                };
+                self.render_tinted_filtered_now(
+                    painter,
+                    q0rg_id,
+                    frame,
+                    view,
+                    textures,
+                    ctx,
+                    tint,
+                    Some(&leaving(upper)),
+                    None,
+                );
+                for ghost in onion.frames {
+                    let elsewhere: HashSet<u16> = layer_ids
+                        .iter()
+                        .copied()
+                        .filter(|layer_id| !ghost.layers.contains(layer_id))
+                        .collect();
+                    self.render_tinted_filtered_now(
+                        painter,
+                        q0rg_id,
+                        ghost.frame,
+                        view,
+                        textures,
+                        ctx,
+                        ghost.tint,
+                        Some(&elsewhere),
+                        None,
+                    );
+                }
+                self.render_tinted_filtered_now(
+                    painter,
+                    q0rg_id,
+                    frame,
+                    view,
+                    textures,
+                    ctx,
+                    tint,
+                    Some(&leaving(lower)),
+                    None,
+                );
+                return;
+            }
             let canvas_rect = painter.clip_rect();
             let visible_rect = canvas_rect;
             if visible_rect.width() > 0.0 && visible_rect.height() > 0.0 {
@@ -5348,11 +5498,9 @@ impl<'a> StageRenderPass<'a> {
                             paper.max,
                             pos2(paper.min.x, paper.max.y),
                         ]);
-                        if q0rg_id == self.project.meta.entry_q0rg_id
-                            && self.project.runtime.camera.enabled
-                        {
+                        if self.project.camera_on(q0rg_id) {
                             if let Some(camera_to_world) =
-                                self.project.camera_affine_at(frame).inverse()
+                                self.project.camera_affine_in(q0rg_id, frame).inverse()
                             {
                                 let w = f32::from(self.project.meta.stage_width);
                                 let h = f32::from(self.project.meta.stage_height);
@@ -5547,6 +5695,7 @@ impl<'a> StageRenderPass<'a> {
                 excluded_layers.map(RootLayerFilter::Excluding),
                 self.draw_free_view_paper,
                 self.timeline_camera_applied,
+                onion,
             );
         }
         if std::env::var_os("Q0_RENDER_PROFILE").is_some() {
@@ -5591,6 +5740,7 @@ impl<'a> StageRenderPass<'a> {
             ctx,
             tint,
             Some(excluded_layers),
+            None,
         );
     }
 
@@ -5644,6 +5794,7 @@ impl<'a> StageRenderPass<'a> {
             Some(RootLayerFilter::ExcludingPlacement(layer_id, placement_idx)),
             false,
             self.timeline_camera_applied,
+            None,
         );
     }
 }
@@ -6150,7 +6301,13 @@ fn collect_gpu_mask_placement_primitives(
     if depth > Q0RG_RECURSION_LIMIT || lookup.rig(q0rg_id).is_some() {
         return false;
     }
-    let composed = Affine::compose(parent, Affine::from_transform(active.transform));
+    // Rigs never reach here, but parented layers do: their objects sit
+    // where the parent binding puts them, not at their own (relative) keys.
+    let local = lookup
+        .rig_pose(q0rg_id, frame)
+        .and_then(|pose| pose.binding_transform(placement.instance_id))
+        .unwrap_or_else(|| Affine::from_transform(active.transform));
+    let composed = Affine::compose(parent, local);
     let start = primitives.len();
     let supported = match placement.target {
         Target::Asset(asset_id) => collect_vector_asset_group_primitives(
@@ -6598,6 +6755,7 @@ fn render_q0rg(
     root_layer_filter: Option<RootLayerFilter<'_>>,
     draw_free_view_paper: bool,
     timeline_camera_applied: bool,
+    onion: Option<OnionGhosts<'_>>,
 ) {
     let mut vector_batch = VectorMeshBatch::default();
     let mut three = q0glblend::Stage3d::new_tinted(
@@ -6627,6 +6785,7 @@ fn render_q0rg(
         &mut vector_batch,
         q0glblend::ColorTransform::default(),
         &mut three,
+        onion,
     );
     vector_batch.flush(painter);
     three.flush(painter);
@@ -6650,6 +6809,7 @@ fn render_q0rg_with_vector_batch(
     vector_batch: &mut VectorMeshBatch,
     inherited_color: q0glblend::ColorTransform,
     three: &mut q0glblend::Stage3d,
+    onion: Option<OnionGhosts<'_>>,
 ) {
     if depth > Q0RG_RECURSION_LIMIT {
         return;
@@ -6670,19 +6830,22 @@ fn render_q0rg_with_vector_batch(
     let rig = lookup.rig(q0rg_id);
     let rig_pose = lookup.rig_pose(q0rg_id, local_frame);
 
-    // Lights shine on the root timeline after its light layer; onion skins
-    // and partial renders stay unlit.
-    let lighting = (depth == 0 && tint == Color32::WHITE && root_layer_filter.is_none())
-        .then(|| {
-            q0s_format::raster::frame_lighting(
-                project,
-                q0rg_id,
-                local_frame,
-                &q0s_format::runtime_scene::RuntimeSceneState::new(),
-            )
-        })
-        .flatten()
-        .and_then(|lighting| lighting_paint(view, parent, lighting));
+    // Lights shine on the root timeline after its light layer; ghosts and
+    // partial renders stay unlit, and onion skin may turn the lights off.
+    let lighting = (depth == 0
+        && tint == Color32::WHITE
+        && root_layer_filter.is_none()
+        && !onion.is_some_and(|onion| onion.unlit))
+    .then(|| {
+        q0s_format::raster::frame_lighting(
+            project,
+            q0rg_id,
+            local_frame,
+            &q0s_format::runtime_scene::RuntimeSceneState::new(),
+        )
+    })
+    .flatten()
+    .and_then(|lighting| lighting_paint(view, parent, lighting));
     let mut lit = lighting.is_none();
     let mut previous_layer = None;
     for layer in &q0rg.layers {
@@ -6705,6 +6868,40 @@ fn render_q0rg_with_vector_batch(
         } else {
             three.inside_lit
         };
+        // Onion skin: this layer's ghosts go right under its own art, over
+        // everything drawn so far, even when the live art is left out here
+        // (an outlined layer is drawn as outlines afterwards).
+        if let Some(onion) = onion.filter(|onion| {
+            depth == 0
+                && onion.ghosts(layer.layer_id)
+                && project.layer_is_visible(q0rg_id, layer.layer_id)
+        }) {
+            vector_batch.flush(painter);
+            three.flush(painter);
+            for ghost in onion
+                .frames
+                .iter()
+                .filter(|ghost| ghost.layers.contains(&layer.layer_id))
+            {
+                render_q0rg(
+                    painter,
+                    project,
+                    lookup,
+                    q0rg_id,
+                    ghost.frame,
+                    parent,
+                    view,
+                    textures,
+                    ctx,
+                    0,
+                    ghost.tint,
+                    Some(RootLayerFilter::Only(layer.layer_id)),
+                    false,
+                    onion.timeline_camera_applied,
+                    None,
+                );
+            }
+        }
         if !visible {
             continue;
         }
@@ -7078,6 +7275,7 @@ fn render_q0rg_with_vector_batch(
                             vector_batch,
                             color_transform,
                             three,
+                            None,
                         );
                         three.inside_lit = was_lit;
                     }
@@ -9126,7 +9324,7 @@ pub(crate) fn render_target_preview_with_revision(
         }
         Target::Q0rg(q0rg_id) => render_q0rg(
             painter, project, &lookup, q0rg_id, frame, affine, view, textures, ctx, 0, tint, None,
-            false, false,
+            false, false, None,
         ),
     }
 }
@@ -11138,6 +11336,43 @@ mod tests {
         .unwrap();
         assert!(mesh.vertices.len() > 32);
         assert!(mesh.vertices.iter().any(|v| v.pos.x < -31.9));
+    }
+
+    #[test]
+    fn stroke_corners_follow_the_join_the_stroke_asks_for() {
+        // An L turning a right angle at (100, 0), 20 wide: a sharp corner
+        // reaches (110, -10), a round one only as far as its arc.
+        let corner = |join| {
+            let vector = VectorAsset {
+                asset_id: 1,
+                paths: Vec::new(),
+                fill: None,
+                stroke: Some(q0s_format::v2::Stroke {
+                    width: 20.0,
+                    color: Rgba {
+                        r: 0,
+                        g: 0,
+                        b: 0,
+                        a: 255,
+                    },
+                    cap: q0s_format::geom::CapShape::Butt,
+                    join,
+                }),
+            };
+            let points = vec![
+                Vec2::new(0.0, 0.0),
+                Vec2::new(100.0, 0.0),
+                Vec2::new(100.0, 100.0),
+            ];
+            let (vertices, _) = tessellate_cached_asset_strokes(&vector, &[(points, false)]);
+            vertices
+                .iter()
+                .map(|p| (p.x - 110.0).hypot(p.y + 10.0))
+                .fold(f32::MAX, f32::min)
+        };
+        assert!(corner(q0s_format::geom::JoinShape::Miter) < 0.01, "sharp");
+        assert!(corner(q0s_format::geom::JoinShape::Round) > 2.0, "round");
+        assert!(corner(q0s_format::geom::JoinShape::Bevel) > 2.0, "cut");
     }
 
     #[test]
@@ -14690,6 +14925,280 @@ mod tests {
         project.q0rgs[0].layers[0].placements[0].transform.tx = 100.0;
         textures.placement_transforms_changed(&project, revision, &[(1, 1, 0)]);
         assert_eq!(child_x(&mut textures, &project), Some(110.0));
+    }
+
+    #[test]
+    fn onion_ghosts_sit_over_lower_layers_under_their_own_and_keep_the_lights() {
+        let square = |asset_id: u16, size: f32| {
+            Asset::Vector(VectorAsset {
+                asset_id,
+                paths: vec![VPath {
+                    anchors: [
+                        Vec2::new(0.0, 0.0),
+                        Vec2::new(size, 0.0),
+                        Vec2::new(size, size),
+                        Vec2::new(0.0, size),
+                    ]
+                    .into_iter()
+                    .map(|point| Anchor {
+                        point,
+                        in_handle: None,
+                        out_handle: None,
+                    })
+                    .collect(),
+                    closed: true,
+                }],
+                fill: Some(Rgba {
+                    r: 90,
+                    g: 90,
+                    b: 90,
+                    a: 255,
+                }),
+                stroke: None,
+            })
+        };
+        let placement = |frame: u16, asset_id: u16, tx: f32| Placement {
+            pivot: None,
+            instance_id: 0,
+            frame,
+            target: Target::Asset(asset_id),
+            transform: Transform2D {
+                tx,
+                ty: 100.0,
+                ..Transform2D::IDENTITY
+            },
+            tween: Tween::None,
+            fx: PlacementFx::default(),
+        };
+        let mut project = crate::state::default_project();
+        project.assets.push(square(64_080, 300.0));
+        project.assets.push(square(64_081, 10.0));
+        project.q0rgs[0].frame_count = 2;
+        // A background under a sprite that moves from x 0 to x 150.
+        let mut background = project.q0rgs[0].layers[0].clone();
+        background.placements.clear();
+        background.push_placement(Placement {
+            transform: Transform2D::IDENTITY,
+            ..placement(0, 64_080, 0.0)
+        });
+        let mut sprite = background.clone();
+        sprite.layer_id = 2;
+        sprite.placements.clear();
+        sprite.push_placement(placement(0, 64_081, 0.0));
+        sprite.push_placement(placement(1, 64_081, 150.0));
+        project.q0rgs[0].layers = vec![background, sprite];
+        project.runtime.lighting.setup_mut(1);
+
+        let ghosts = [OnionFrame {
+            frame: 0,
+            tint: Color32::from_rgba_unmultiplied(80, 120, 255, 120),
+            layers: HashSet::from([2]),
+        }];
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 400.0));
+        let view = StageView {
+            origin: Pos2::ZERO,
+            scale: 1.0,
+            stage_rect: rect,
+            edit_transform: Affine::IDENTITY,
+        };
+        let ctx = Context::default();
+        let draw = |unlit: bool, excluded: Option<&HashSet<u16>>| {
+            let mut textures = TextureCache::default();
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let painter = ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Middle,
+                        egui::Id::new("onion-order"),
+                    ));
+                    StageRenderPass::new(&project, &mut textures).render_with_onion(
+                        &painter,
+                        1,
+                        1,
+                        &view,
+                        &mut textures,
+                        ctx,
+                        excluded,
+                        OnionGhosts::new(&ghosts, unlit),
+                    );
+                },
+            )
+            .shapes
+        };
+        take_flushed_run_bounds();
+        let lit = draw(false, None);
+        // Each fill in the order it was painted.
+        let found = take_flushed_run_bounds();
+        let at = |what: &str, test: &dyn Fn(&Rect) -> bool| {
+            found
+                .iter()
+                .position(test)
+                .unwrap_or_else(|| panic!("no {what} in {found:?}"))
+        };
+        let background = at("background", &|b| b.width() > 250.0);
+        let ghost = at("ghost", &|b| b.width() < 20.0 && b.min.x < 5.0);
+        let live = at("live sprite", &|b| b.width() < 20.0 && b.min.x > 145.0);
+        assert!(background < ghost, "the ghost is over the layer below");
+        assert!(ghost < live, "the sprite covers its own ghost");
+
+        let callbacks = |shapes: &[egui::epaint::ClippedShape]| {
+            shapes
+                .iter()
+                .filter(|clipped| matches!(clipped.shape, Shape::Callback(_)))
+                .count()
+        };
+        assert_eq!(
+            callbacks(&lit),
+            callbacks(&draw(true, None)) + 1,
+            "the lights stay on under onion skin unless it turns them off"
+        );
+
+        // An outlined layer leaves its fills out but keeps its ghosts.
+        take_flushed_run_bounds();
+        draw(false, Some(&HashSet::from([2])));
+        let found = take_flushed_run_bounds();
+        assert!(found.iter().any(|b| b.width() < 20.0 && b.min.x < 5.0));
+        assert!(!found.iter().any(|b| b.width() < 20.0 && b.min.x > 145.0));
+    }
+
+    #[test]
+    fn a_masked_layer_hanging_from_a_parent_is_cut_where_the_parent_carries_it() {
+        use q0s_format::v2::{LayerKey, LayerKind, LayerMetadata};
+        let square = |asset_id: u16, size: f32| {
+            Asset::Vector(VectorAsset {
+                asset_id,
+                paths: vec![VPath {
+                    anchors: [
+                        Vec2::new(0.0, 0.0),
+                        Vec2::new(size, 0.0),
+                        Vec2::new(size, size),
+                        Vec2::new(0.0, size),
+                    ]
+                    .into_iter()
+                    .map(|point| Anchor {
+                        point,
+                        in_handle: None,
+                        out_handle: None,
+                    })
+                    .collect(),
+                    closed: true,
+                }],
+                fill: Some(Rgba {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                }),
+                stroke: None,
+            })
+        };
+        let placement = |instance_id: u32, asset_id: u16| Placement {
+            pivot: None,
+            instance_id,
+            frame: 0,
+            target: Target::Asset(asset_id),
+            transform: Transform2D::IDENTITY,
+            tween: Tween::None,
+            fx: PlacementFx::default(),
+        };
+        let mut project = crate::state::default_project();
+        project.assets.push(square(64_070, 400.0));
+        project.assets.push(square(64_071, 10.0));
+        // Layer 1 masks layer 3; layer 3 hangs from layer 2.
+        let base = project.q0rgs[0].layers[0].clone();
+        let mut mask = base.clone();
+        mask.placements.clear();
+        mask.push_placement(placement(4, 64_070));
+        let mut parent = base.clone();
+        parent.layer_id = 2;
+        parent.placements.clear();
+        parent.push_placement(placement(5, 64_071));
+        let mut child = base;
+        child.layer_id = 3;
+        child.placements.clear();
+        child.push_placement(placement(6, 64_071));
+        project.q0rgs[0].layers = vec![mask, parent, child];
+        for (layer_id, metadata) in [
+            (
+                1,
+                LayerMetadata {
+                    kind: LayerKind::Mask,
+                    ..LayerMetadata::default()
+                },
+            ),
+            (
+                3,
+                LayerMetadata {
+                    mask_layer_id: Some(1),
+                    ..LayerMetadata::default()
+                },
+            ),
+        ] {
+            project.layer_metadata.insert(
+                LayerKey {
+                    q0rg_id: 1,
+                    layer_id,
+                },
+                metadata,
+            );
+        }
+        q0s_format::parenting::set_parent(&mut project, 1, 3, Some(2)).unwrap();
+        // The parent walks away; its child's own key stays at the origin.
+        project.q0rgs[0].layers[1].placements[0].transform.tx = 200.0;
+
+        // Mask 1 previews its clipping, as when it is locked.
+        let mut textures = TextureCache {
+            editing_mask_q0rg_id: Some(1),
+            hidden_mask_art_layers: HashSet::from([(1, 1)]),
+            ..TextureCache::default()
+        };
+        let index = Arc::new(RenderIndex::new(&project));
+        let lookup = RenderLookup::new(&project, index, true);
+        let view = StageView {
+            origin: Pos2::ZERO,
+            scale: 1.0,
+            stage_rect: Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 400.0)),
+            edit_transform: Affine::IDENTITY,
+        };
+        let ctx = Context::default();
+        let (_, placements) = collect_gpu_masked_layer(
+            &project,
+            &lookup,
+            &project.q0rgs[0],
+            &project.q0rgs[0].layers[2],
+            0,
+            Affine::IDENTITY,
+            &view,
+            &mut textures,
+            &ctx,
+            0,
+            Color32::WHITE,
+            q0glblend::ColorTransform::default(),
+        )
+        .expect("plain vectors take the GPU mask path");
+        // Fills are cached in the shape's own space; the paint places them.
+        let xs: Vec<f32> = placements
+            .iter()
+            .flat_map(|placement| &placement.primitives)
+            .map(|primitive| match primitive {
+                q0glblend::VectorGroupPrimitive::Gradient { paint, .. } => {
+                    let place = &paint.transform;
+                    let corner = paint.source_bounds.min - place.source_origin;
+                    place.target_origin.x + place.linear[0] * corner.x + place.linear[1] * corner.y
+                }
+                q0glblend::VectorGroupPrimitive::Solid(mesh) => mesh.calc_bounds().min.x,
+                q0glblend::VectorGroupPrimitive::Textured { mesh, .. } => mesh.calc_bounds().min.x,
+            })
+            .collect();
+        assert!(!xs.is_empty());
+        let min_x = xs.iter().copied().fold(f32::MAX, f32::min);
+        assert!(
+            (199.0..=201.0).contains(&min_x),
+            "the masked child should ride its parent to x 200, not sit at {min_x}"
+        );
     }
 
     #[test]

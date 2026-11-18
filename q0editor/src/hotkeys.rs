@@ -73,6 +73,29 @@ pub enum ShortcutCommand {
 }
 
 impl ShortcutCommand {
+    /// The command that picks `tool`.
+    pub fn for_tool(tool: crate::state::Tool) -> Self {
+        use crate::state::Tool as T;
+        match tool {
+            T::Select => Self::ToolSelect,
+            T::Lasso => Self::ToolLasso,
+            T::Subselect => Self::ToolSubselect,
+            T::Hand => Self::ToolHand,
+            T::Pen => Self::ToolPen,
+            T::Pencil => Self::ToolPencil,
+            T::Brush => Self::ToolBrush,
+            T::Eraser => Self::ToolEraser,
+            T::Knife => Self::ToolKnife,
+            T::Line => Self::ToolLine,
+            T::Rectangle => Self::ToolRectangle,
+            T::Oval => Self::ToolOval,
+            T::Bucket => Self::ToolBucket,
+            T::Eyedropper => Self::ToolEyedropper,
+            T::Text => Self::ToolText,
+            T::Rig => Self::ToolRig,
+        }
+    }
+
     pub const ALL: &'static [Self] = &[
         Self::PerformanceSnapshot,
         Self::NextTab,

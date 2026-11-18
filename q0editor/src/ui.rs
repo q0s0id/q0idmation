@@ -89,7 +89,7 @@ pub(crate) fn hidden_palette_note(ctx: &egui::Context, settings_open: bool, acce
     if !open {
         return;
     }
-    egui::Window::new(" ")
+    crate::dialog::Dialog::new(" ")
         .id(egui::Id::new("palette_border_note_inline_window"))
         .open(&mut open)
         .collapsible(false)
@@ -225,6 +225,10 @@ pub(crate) enum Icon {
     Expand,
     /// A parent square with two children hanging from it: layer parenting.
     Parenting,
+    /// A folder with a bezier stroke across it: a timeline's graphics.
+    Graphics,
+    /// A filled square with a hollow one over its corner: fill and stroke.
+    Color,
 }
 
 pub(crate) fn icon_button(ui: &mut Ui, icon: Icon, label: &str) -> Response {
@@ -305,18 +309,15 @@ fn mix_premultiplied(a: Color32, b: Color32, t: f32) -> Color32 {
 pub(crate) fn gradient_shape(
     ctx: &egui::Context,
     rect: Rect,
-    rounding: f32,
+    rounding: impl Into<egui::Rounding>,
     [top, bottom]: [Color32; 2],
 ) -> Shape {
+    let rounding = rounding.into();
     if top == bottom || rect.height() <= 0.0 || rect.width() <= 0.0 {
         return Shape::rect_filled(rect, rounding, top);
     }
     let mut outline = Vec::new();
-    egui::epaint::tessellator::path::rounded_rectangle(
-        &mut outline,
-        rect,
-        egui::Rounding::same(rounding),
-    );
+    egui::epaint::tessellator::path::rounded_rectangle(&mut outline, rect, rounding);
     let mut tessellator = egui::epaint::Tessellator::new(
         ctx.pixels_per_point(),
         Default::default(),
@@ -617,6 +618,144 @@ pub(crate) fn name_button(ui: &mut Ui, text: &str, selected: bool, width: f32) -
     response
         .on_hover_text(text)
         .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// An on/off switch for a settings row: the track fills with the accent as
+/// it turns on, and the knob slides across with the theme's easing.
+pub(crate) fn toggle_switch(ui: &mut Ui, on: &mut bool) -> Response {
+    let (rect, mut response) = ui.allocate_exact_size(vec2(34.0, 18.0), Sense::click());
+    if response.clicked() {
+        *on = !*on;
+        response.mark_changed();
+    }
+    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, *on, ""));
+    if ui.is_rect_visible(rect) {
+        paint_switch(ui, &response, rect, *on, false);
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A compact switch with its label to the right, the inspector panels'
+/// stand-in for egui's checkbox. Clicking the label flips it too.
+pub(crate) fn switch(ui: &mut Ui, on: &mut bool, text: &str) -> Response {
+    switch_mixed(ui, on, false, text)
+}
+
+/// `switch`, with the knob parked in the middle while `mixed`: the selected
+/// things disagree.
+pub(crate) fn switch_mixed(ui: &mut Ui, on: &mut bool, mixed: bool, text: &str) -> Response {
+    let track = vec2(28.0, 16.0);
+    const GAP: f32 = 6.0;
+    let galley = (!text.is_empty()).then(|| {
+        ui.painter().layout_no_wrap(
+            text.to_owned(),
+            egui::TextStyle::Body.resolve(ui.style()),
+            ui.visuals().text_color(),
+        )
+    });
+    let width = track.x + galley.as_ref().map_or(0.0, |galley| GAP + galley.size().x);
+    let height = ui.spacing().interact_size.y.clamp(track.y, 22.0);
+    let (rect, mut response) = ui.allocate_exact_size(vec2(width, height), Sense::click());
+    if response.clicked() {
+        *on = !*on;
+        response.mark_changed();
+    }
+    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, *on, text));
+    if ui.is_rect_visible(rect) {
+        let track = Rect::from_min_size(pos2(rect.left(), rect.center().y - track.y * 0.5), track);
+        paint_switch(ui, &response, track, *on, mixed);
+        if let Some(galley) = galley {
+            let color = if response.hovered() {
+                ui.visuals().strong_text_color()
+            } else {
+                ui.visuals().text_color()
+            };
+            let at = pos2(track.right() + GAP, rect.center().y - galley.size().y * 0.5);
+            ui.painter().galley(at, galley, color);
+        }
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// The theme's accent, or egui's selection colour before a theme is applied.
+fn accent(ui: &Ui) -> Color32 {
+    match chrome(ui.ctx()).accent {
+        Color32::TRANSPARENT => ui.visuals().selection.bg_fill,
+        accent => accent,
+    }
+}
+
+fn paint_switch(ui: &Ui, response: &Response, rect: Rect, on: bool, mixed: bool) {
+    let how_on = ui.ctx().animate_bool(response.id, on);
+    let how_on = if mixed { 0.5 } else { how_on };
+    let accent = accent(ui);
+    let radius = rect.height() * 0.5;
+    let track = blend(ui.visuals().extreme_bg_color, accent, how_on);
+    let edge = if response.hovered() || response.has_focus() {
+        ui.visuals().widgets.hovered.bg_stroke
+    } else {
+        ui.visuals().widgets.inactive.bg_stroke
+    };
+    ui.painter().rect(rect, radius, track, edge);
+    let knob = blend(
+        ui.visuals().widgets.inactive.fg_stroke.color,
+        crate::theme::on_accent(accent),
+        how_on,
+    );
+    let x = egui::lerp(rect.left() + radius..=rect.right() - radius, how_on);
+    ui.painter()
+        .circle_filled(pos2(x, rect.center().y), radius - 3.0, knob);
+}
+
+/// A section title in an inspector panel: an accent tick and the title.
+/// Put buttons after it in the same row when the section has actions.
+pub(crate) fn section_title(ui: &mut Ui, title: &str) -> Response {
+    let color = ui.visuals().strong_text_color();
+    let galley =
+        ui.painter()
+            .layout_no_wrap(title.to_owned(), egui::FontId::proportional(13.5), color);
+    let size = vec2(galley.size().x + 10.0, galley.size().y.max(18.0));
+    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let tick =
+            Rect::from_center_size(pos2(rect.left() + 1.5, rect.center().y), vec2(3.0, 12.0));
+        ui.painter().rect_filled(tick, 1.5, accent(ui));
+        let at = pos2(rect.left() + 10.0, rect.center().y - galley.size().y * 0.5);
+        ui.painter().galley(at, galley, color);
+    }
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, title));
+    response
+}
+
+/// Opens a section of an inspector panel: the title, then a hairline to
+/// the panel's edge. It stands in for a bold label after a separator.
+pub(crate) fn section_header(ui: &mut Ui, title: &str) {
+    // In a row, a rule to the edge would push what follows past it, and a
+    // window sized to its contents would widen every frame to fit.
+    if ui.layout().is_horizontal() {
+        section_title(ui, title);
+        return;
+    }
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        section_title(ui, title);
+        let width = ui.available_width().max(0.0);
+        let (rect, _) = ui.allocate_exact_size(vec2(width, 18.0), Sense::hover());
+        ui.painter().hline(
+            rect.x_range(),
+            rect.center().y.round() + 0.5,
+            ui.visuals().widgets.noninteractive.bg_stroke,
+        );
+    });
+    ui.add_space(2.0);
+}
+
+/// Spacing for the inspector panels (Properties, Library): a little more
+/// air between rows than egui's default.
+pub(crate) fn inspector_style(ui: &mut Ui) {
+    let spacing = ui.spacing_mut();
+    spacing.item_spacing = vec2(6.0, 6.0);
+    spacing.interact_size.y = spacing.interact_size.y.min(24.0);
 }
 
 /// Allocate the entire grid, but interact with and paint only visible rows.
@@ -1035,6 +1174,34 @@ pub(crate) fn paint_icon(painter: &Painter, rect: Rect, icon: Icon, color: Color
             painter.rect(r(0.60, 0.70, 0.88, 0.92), unit * 0.05, tint, stroke);
             path(&[(0.26, 0.36), (0.26, 0.81), (0.58, 0.81)]);
             line((0.26, 0.51), (0.58, 0.51));
+        }
+        Icon::Color => {
+            painter.rect(r(0.10, 0.10, 0.62, 0.62), unit * 0.06, tint, stroke);
+            painter.rect_stroke(r(0.40, 0.40, 0.90, 0.90), unit * 0.06, stroke);
+            painter.rect_stroke(r(0.53, 0.53, 0.77, 0.77), unit * 0.03, thin);
+        }
+        Icon::Graphics => {
+            painter.rect_filled(r(0.08, 0.30, 0.92, 0.84), unit * 0.04, tint);
+            path(&[
+                (0.08, 0.84),
+                (0.08, 0.18),
+                (0.36, 0.18),
+                (0.45, 0.30),
+                (0.92, 0.30),
+                (0.92, 0.84),
+                (0.08, 0.84),
+            ]);
+            // A pen stroke between two anchors, one handle pulled out.
+            painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
+                [p(0.25, 0.70), p(0.36, 0.42), p(0.56, 0.80), p(0.72, 0.50)],
+                false,
+                Color32::TRANSPARENT,
+                stroke,
+            ));
+            painter.line_segment([p(0.72, 0.50), p(0.82, 0.40)], thin);
+            dot(0.25, 0.70, 0.075);
+            dot(0.72, 0.50, 0.075);
+            dot(0.82, 0.40, 0.045);
         }
     }
 }

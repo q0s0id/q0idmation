@@ -900,6 +900,8 @@ fn import_dom_document(
             collapsed: false,
             hidden: imported.hidden,
             locked: imported.locked,
+            // Animate shows a locked mask's clipping; open it the same way.
+            mask_preview: imported.kind == LayerKind::Mask && imported.locked,
         };
         if metadata != LayerMetadata::default() {
             layer_metadata.insert(LayerKey::new(1, layer_id), metadata);

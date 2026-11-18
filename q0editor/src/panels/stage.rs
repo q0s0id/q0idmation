@@ -34,8 +34,7 @@ pub(crate) fn render_animation_preview(app: &mut EditorApp, ctx: &egui::Context)
     } else {
         project.meta.entry_q0rg_id
     };
-    let timeline_camera_applied =
-        root == project.meta.entry_q0rg_id && project.runtime.camera.enabled;
+    let timeline_camera_applied = project.camera_on(root);
     let frame_count = app
         .state
         .project
@@ -78,7 +77,7 @@ pub(crate) fn render_animation_preview(app: &mut EditorApp, ctx: &egui::Context)
         ctx.request_repaint_after(interval);
     }
     let mut open = true;
-    egui::Window::new("Animation Preview")
+    crate::dialog::Dialog::new("Animation Preview")
         .id(egui::Id::new("animation_camera_preview"))
         .open(&mut open)
         .default_size(vec2(560.0, 390.0))
@@ -133,7 +132,7 @@ pub(crate) fn render_animation_preview(app: &mut EditorApp, ctx: &egui::Context)
                 scale,
                 stage_rect: rect,
                 edit_transform: if timeline_camera_applied {
-                    app.state.project.camera_affine_at(frame)
+                    app.state.project.camera_affine_in(root, frame)
                 } else {
                     q0s_format::transform::Affine::IDENTITY
                 },
@@ -341,10 +340,7 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
     if interactive && camera_editing && !library_drag_active && !editing_text {
         handle_camera_stage_input(app, &response, &view, &ctx);
     }
-    if free_view.is_none()
-        && app.session.current_q0rg_id == app.state.project.meta.entry_q0rg_id
-        && app.state.project.runtime.camera.enabled
-    {
+    if free_view.is_none() && app.state.project.camera_on(app.session.current_q0rg_id) {
         draw_camera_background_outside_stage(
             app,
             &painter,
@@ -442,12 +438,14 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
             .unwrap_or(app.state.render_revision()),
     );
     let hidden_mask_art_layers = app
-        .session
-        .hidden_mask_art_layers
+        .state
+        .project
+        .layer_metadata
         .iter()
-        .filter_map(|(project_id, hidden_q0rg_id, layer_id)| {
-            (*project_id == render_revision.0).then_some((*hidden_q0rg_id, *layer_id))
+        .filter(|(_, metadata)| {
+            metadata.kind == q0s_format::v2::LayerKind::Mask && metadata.mask_preview
         })
+        .map(|(key, _)| (key.q0rg_id, key.layer_id))
         .collect::<std::collections::HashSet<_>>();
     if app.textures.hidden_mask_art_layers != hidden_mask_art_layers {
         app.textures.mask_visibility_revision =
@@ -508,124 +506,56 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
             &app.textures.hidden_mask_art_layers,
         );
     } else {
-        // Onion skin: render `before` past frames + `after` upcoming frames with
-        // a colour-tinted alpha behind the live frame. Past frames get a cool
-        // (blueish) tint, upcoming a warm (orange) tint — Flash convention.
-        let onion_split = if onion_enabled && !app.session.onion.all_unlocked_layers {
-            timeline.and_then(|q| {
-                q.layers
-                    .iter()
-                    .position(|layer| {
-                        layer.layer_id == app.session.current_layer_id
-                            && app.state.project.layer_is_visible(q0rg_id, layer.layer_id)
-                            && !app.state.project.layer_is_locked(q0rg_id, layer.layer_id)
-                            && !app.state.project.layer_is_folder(q0rg_id, layer.layer_id)
-                    })
-                    .map(|index| {
-                        let below: std::collections::HashSet<_> = q.layers[..index]
-                            .iter()
-                            .map(|layer| layer.layer_id)
-                            .collect();
-                        let above: std::collections::HashSet<_> = q.layers[index..]
-                            .iter()
-                            .map(|layer| layer.layer_id)
-                            .collect();
-                        (below, above)
-                    })
-            })
-        } else {
-            None
-        };
-        if let Some((_, above)) = &onion_split {
-            let excluded: std::collections::HashSet<_> =
-                above.union(&outlined_layers).copied().collect();
-            render_pass.render_tinted_excluding_layers(
-                &painter,
-                q0rg_id,
-                frame,
-                &view,
-                &mut app.textures,
-                ui.ctx(),
-                Color32::WHITE,
-                &excluded,
-            );
-        }
+        // Ghosts (onion skin's `before` past and `after` upcoming frames, and
+        // Edit frames' other frames) are drawn inside the live frame, each
+        // right under its own layer: the layers below stay under it, the
+        // layer's own art covers it, and lights and 3D still see one frame.
+        // Past frames get a cool (blueish) tint, upcoming a warm (orange) one.
+        let mut ghosts: Vec<crate::render::OnionFrame> = Vec::new();
         if app.session.onion.edit_frames {
             for (sample, layers) in crate::frame_edit::preview_layers(app) {
-                let excluded = app
-                    .state
-                    .project
-                    .q0rgs
-                    .iter()
-                    .find(|q| q.q0rg_id == q0rg_id)
-                    .into_iter()
-                    .flat_map(|q| &q.layers)
-                    .filter(|l| !layers.contains(&l.layer_id))
-                    .map(|l| l.layer_id)
-                    .collect();
-                render_pass.render_tinted_excluding_layers(
-                    &painter,
-                    q0rg_id,
-                    sample,
-                    &view,
-                    &mut app.textures,
-                    ui.ctx(),
-                    Color32::WHITE,
-                    &excluded,
-                );
+                ghosts.push(crate::render::OnionFrame {
+                    frame: sample,
+                    tint: Color32::WHITE,
+                    layers: layers.into_iter().collect(),
+                });
             }
         }
-        if onion_enabled {
-            let excluded_layers: std::collections::HashSet<_> = timeline
-                .into_iter()
-                .flat_map(|q| &q.layers)
-                .filter(|layer| {
-                    app.state.project.layer_is_locked(q0rg_id, layer.layer_id)
-                        || (!app.session.onion.all_unlocked_layers
-                            && layer.layer_id != app.session.current_layer_id)
-                })
-                .map(|layer| layer.layer_id)
-                .collect();
-            let has_onion_layers = timeline.is_some_and(|q| {
-                q.layers.iter().any(|layer| {
-                    !excluded_layers.contains(&layer.layer_id)
-                        && !app.state.project.layer_is_folder(q0rg_id, layer.layer_id)
-                        && app.state.project.layer_is_visible(q0rg_id, layer.layer_id)
-                })
-            });
-            if frame_count > 0 && has_onion_layers {
-                for offset in (-(app.session.onion.before as i32)
-                    ..=(app.session.onion.after as i32))
-                    .filter(|o| *o != 0)
-                {
-                    let target = frame as i32 + offset;
-                    if target < 0 || target >= frame_count as i32 {
-                        continue;
-                    }
-                    let tint = onion_tint_for(
+        if onion_enabled && frame_count > 0 {
+            let layers = onion_layers(app, q0rg_id);
+            for offset in (-(app.session.onion.before as i32)..=(app.session.onion.after as i32))
+                .filter(|offset| *offset != 0)
+            {
+                let target = frame as i32 + offset;
+                if layers.is_empty() || target < 0 || target >= frame_count as i32 {
+                    continue;
+                }
+                ghosts.push(crate::render::OnionFrame {
+                    frame: target as u16,
+                    tint: onion_tint_for(
                         offset,
                         app.session.onion.before,
                         app.session.onion.after,
                         app.settings.theme.onion_past.to_color32(),
                         app.settings.theme.onion_future.to_color32(),
-                    );
-                    render_pass.render_tinted_excluding_layers(
-                        &painter,
-                        q0rg_id,
-                        target as u16,
-                        &view,
-                        &mut app.textures,
-                        ui.ctx(),
-                        tint,
-                        &excluded_layers,
-                    );
-                }
+                    ),
+                    layers: layers.clone(),
+                });
             }
         }
-
-        if let Some((below, _)) = &onion_split {
-            let excluded: std::collections::HashSet<_> =
-                below.union(&outlined_layers).copied().collect();
+        let excluded = (!outlined_layers.is_empty()).then_some(&outlined_layers);
+        if !ghosts.is_empty() {
+            render_pass.render_with_onion(
+                &painter,
+                q0rg_id,
+                frame,
+                &view,
+                &mut app.textures,
+                ui.ctx(),
+                excluded,
+                crate::render::OnionGhosts::new(&ghosts, onion_enabled && app.settings.onion_unlit),
+            );
+        } else if let Some(excluded) = excluded {
             render_pass.render_tinted_excluding_layers(
                 &painter,
                 q0rg_id,
@@ -634,32 +564,12 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
                 &mut app.textures,
                 ui.ctx(),
                 Color32::WHITE,
-                &excluded,
+                excluded,
             );
-            if !outlined_layers.is_empty() {
-                crate::render::render_stage_outline_layers(
-                    &painter,
-                    &render_pass,
-                    q0rg_id,
-                    frame,
-                    &view,
-                    &outlined_layers,
-                    &app.textures.hidden_mask_art_layers,
-                );
-            }
-        } else if outlined_layers.is_empty() {
-            render_pass.render(&painter, q0rg_id, frame, &view, &mut app.textures, ui.ctx());
         } else {
-            render_pass.render_tinted_excluding_layers(
-                &painter,
-                q0rg_id,
-                frame,
-                &view,
-                &mut app.textures,
-                ui.ctx(),
-                Color32::WHITE,
-                &outlined_layers,
-            );
+            render_pass.render(&painter, q0rg_id, frame, &view, &mut app.textures, ui.ctx());
+        }
+        if !outlined_layers.is_empty() {
             crate::render::render_stage_outline_layers(
                 &painter,
                 &render_pass,
@@ -734,10 +644,7 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
     app.perf
         .record(crate::perf::PerfSpan::SceneRender, scene_elapsed);
 
-    if q0rg_id == app.state.project.meta.entry_q0rg_id
-        && app.state.project.runtime.camera.enabled
-        && free_view.is_none()
-    {
+    if app.state.project.camera_on(q0rg_id) && free_view.is_none() {
         draw_camera_overlay(app, &painter, &view, frame);
     }
 
@@ -994,14 +901,15 @@ fn handle_camera_stage_input(
             .input(|input| input.pointer.press_origin())
             .or_else(|| response.interact_pointer_pos());
         if let Some(press) = press {
-            let state = app.state.project.camera_state_at(frame);
+            let scene = app.session.current_q0rg_id;
+            let state = app.state.project.camera_state_in(scene, frame);
             // Zoom and turn round where the camera is shown, parent and all.
-            let shown = app.state.project.camera_world_state_at(frame);
+            let shown = app.state.project.camera_world_state_in(scene, frame);
             let center =
                 view.stage_to_screen(q0s_format::v2::Vec2::new(shown.center_x, shown.center_y));
             app.history
                 .snapshot_with_session(&app.state.project, &app.session);
-            app.state.project.runtime.camera.insert_key(frame, state);
+            app.camera_mut().insert_key(frame, state);
             app.state.mark_dirty();
             app.session.camera_stage_drag = Some(crate::state::CameraStageDrag {
                 mode: camera_drag_mode(&corners, press),
@@ -1086,7 +994,10 @@ fn handle_camera_stage_input(
 }
 
 fn draw_camera_overlay(app: &EditorApp, painter: &egui::Painter, view: &StageView, frame: u16) {
-    let state = app.state.project.camera_world_state_at(frame);
+    let state = app
+        .state
+        .project
+        .camera_world_state_in(app.session.current_q0rg_id, frame);
     let corners = camera_viewport_corners(app, view, frame);
     let selected = app.session.camera_track_selected;
     let color = if selected {
@@ -1172,7 +1083,10 @@ fn draw_camera_background_outside_stage(
 }
 
 fn camera_viewport_corners(app: &EditorApp, view: &StageView, frame: u16) -> [egui::Pos2; 4] {
-    let state = app.state.project.camera_world_state_at(frame);
+    let state = app
+        .state
+        .project
+        .camera_world_state_in(app.session.current_q0rg_id, frame);
     let half_w = f32::from(app.state.project.meta.stage_width) * 0.5 / state.zoom.max(0.01);
     let half_h = f32::from(app.state.project.meta.stage_height) * 0.5 / state.zoom.max(0.01);
     let (sin, cos) = state.rotation.sin_cos();
@@ -1727,6 +1641,10 @@ fn stage_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
             app.queue(Action::BreakApartSelection);
             ui.close_menu();
         }
+        if app.can_trace_bitmap_selection() && ui.button("Trace Bitmap…").clicked() {
+            app.queue(Action::PromptTraceBitmap);
+            ui.close_menu();
+        }
         let spread_objects =
             crate::selection_edit::selected_object_refs(&app.state.project, &app.session.selection);
         let spread_between_keyframes_enabled = spread_objects.first().is_some_and(|first| {
@@ -1939,6 +1857,41 @@ fn selected_has_stroke(app: &EditorApp) -> bool {
             .unwrap_or(false),
         _ => false,
     }
+}
+
+/// The root layers onion skin ghosts: every unlocked layer with "all
+/// unlocked", else the active layer, or the unlocked layers inside it when it
+/// is a folder. Folders draw nothing themselves; hidden layers are skipped
+/// when drawn.
+fn onion_layers(app: &EditorApp, q0rg_id: u16) -> std::collections::HashSet<u16> {
+    let project = &app.state.project;
+    let Some(timeline) = project.q0rgs.iter().find(|q| q.q0rg_id == q0rg_id) else {
+        return Default::default();
+    };
+    let active = app.session.current_layer_id;
+    let inside_active = |layer_id: u16| {
+        let mut folder = project.layer_parent_folder(q0rg_id, layer_id);
+        for _ in 0..timeline.layers.len() {
+            match folder {
+                Some(id) if id == active => return true,
+                Some(id) => folder = project.layer_parent_folder(q0rg_id, id),
+                None => return false,
+            }
+        }
+        false
+    };
+    timeline
+        .layers
+        .iter()
+        .map(|layer| layer.layer_id)
+        .filter(|&layer_id| {
+            !project.layer_is_locked(q0rg_id, layer_id)
+                && !project.layer_is_folder(q0rg_id, layer_id)
+                && (app.session.onion.all_unlocked_layers
+                    || layer_id == active
+                    || inside_active(layer_id))
+        })
+        .collect()
 }
 
 /// Pick the onion-skin tint for a frame `offset` away from the current

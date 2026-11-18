@@ -506,16 +506,19 @@ pub fn handle_stage(app: &mut EditorApp, response: &Response, cursor: Option<Vec
         }
     }
     let mut draft = app.session.text_defaults.clone();
-    let inset = cached_font(&draft.font)
+    let (inset, line) = cached_font(&draft.font)
         .and_then(|(bytes, index)| {
             let face = Face::parse(&bytes, index).ok()?;
-            Some(draft.size - blank_line_height(&face, draft.size))
+            let line = blank_line_height(&face, draft.size);
+            Some((draft.size - line, line))
         })
-        .unwrap_or(0.0);
-    // Keep the baseline stable as the user types characters of different heights.
+        .unwrap_or((0.0, draft.size));
+    // Keep the baseline stable as the user types characters of different
+    // heights. The first line sits centred on the click, where the I-beam's
+    // middle is, not hanging below it.
     draft.transform = Affine {
         tx: point.x,
-        ty: point.y - inset,
+        ty: point.y - inset - line * 0.5,
         ..Affine::IDENTITY
     };
     draft.q0rg_id = app.session.current_q0rg_id;
@@ -939,6 +942,28 @@ pub(crate) fn render_canvas(
     true
 }
 
+/// Whether text is being edited or a text object is selected: what the
+/// Properties panel shows as the selection's page.
+pub(crate) fn has_text_selection(app: &EditorApp) -> bool {
+    app.session.text_editor.is_some()
+        || selected_asset_id(app, &app.session.selection).is_some()
+        || matches!(app.session.selection, Selection::Asset(id)
+            if app
+                .state
+                .project
+                .asset_names
+                .get(&id)
+                .and_then(|n| decode_source(n))
+                .is_some())
+}
+
+/// The text tool's own settings, for new text: the tool's page.
+pub(crate) fn render_tool_defaults(app: &mut EditorApp, ui: &mut egui::Ui) {
+    let mut defaults = std::mem::take(&mut app.session.text_defaults);
+    text_controls(ui, &mut defaults);
+    app.session.text_defaults = defaults;
+}
+
 pub(crate) fn render_properties(app: &mut EditorApp, ui: &mut egui::Ui) -> bool {
     if let Some(mut draft) = app.session.text_editor.take() {
         text_controls(ui, &mut draft);
@@ -1005,7 +1030,7 @@ fn text_controls(ui: &mut egui::Ui, draft: &mut TextDraft) {
     // Keep editing while the user adjusts the text's own inspector controls.
     ui.ctx()
         .data_mut(|d| d.insert_temp(egui::Id::new("text_properties_rect"), ui.clip_rect()));
-    ui.label(egui::RichText::new("Text").strong());
+    crate::ui::section_header(ui, "Text");
     font_picker(ui, draft);
     ui.horizontal(|ui| {
         ui.label("Size");
@@ -1777,7 +1802,7 @@ mod tests {
     }
 
     #[test]
-    fn new_text_frame_starts_at_the_clicked_point() {
+    fn new_text_frame_starts_at_the_click_with_its_line_centred_on_it() {
         let mut app = EditorApp::default();
         let ctx = Context::default();
         let click = egui::pos2(165.0, 128.0);
@@ -1799,7 +1824,20 @@ mod tests {
         frame(vec![pointer_button(click, false)]);
         let output = frame(vec![]);
         let projected = text_frame_corners(&app, &output);
-        assert!((projected[0] - click).length() < 0.1, "{projected:?}");
+        let (top, bottom) = projected
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(top, bottom), corner| {
+                (top.min(corner.y), bottom.max(corner.y))
+            });
+        let left = projected
+            .iter()
+            .map(|corner| corner.x)
+            .fold(f32::MAX, f32::min);
+        assert!((left - click.x).abs() < 0.1, "{projected:?}");
+        assert!(
+            ((top + bottom) * 0.5 - click.y).abs() < 0.5,
+            "the empty line is centred on the click: {projected:?}"
+        );
     }
 
     #[test]

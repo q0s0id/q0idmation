@@ -13,8 +13,10 @@ visible. the camera can frame artwork on either side of the original paper.
   edit-in-place transform and animation preview camera.
 - a lit software mask tile includes the union of the paper and the camera
   background polygons, so darkness affects the background outside the original
-  stage too. overlapping polygons are filled once; onion skins and partial
-  renders remain transparent and unlit, as in the gpu path.
+  stage too. overlapping polygons are filled once; partial renders remain
+  transparent and unlit, as in the gpu path. the gpu path draws onion ghosts
+  inside the lit frame, right under their layers; a frame that needs this
+  software tile draws the layers under the ghosts, the ghosts, then the rest.
 - lines, rectangles, ovals, lasso starts and text accept finite coordinates
   outside the paper. primitive endpoints are no longer clamped to document
   dimensions, so shift constraints work across the boundary.

@@ -10,16 +10,23 @@ The magnet next to the zoom at the top of the stage, **View > Snapping** or
 stage's corners and middle within 10 screen pixels, or failing that onto the
 nearest line. It applies to the line, rectangle, oval and pen tools, to things
 dragged with the Select tool (the dragged thing's point nearest the grab is what
-snaps), to Subselect's points and to a line's dragged end. A ring marks a snap
+snaps), to Subselect's points (also when points on several lines move
+together) and to a line's dragged end. A ring marks a snap
 to a point and a square a snap onto a line. Hold Shift to drag without snapping.
 
 ## Lines
 
-- New lines are cut where they cross or meet other lines on the layer, so each
+- Lines are cut where they cross or meet other lines on the layer, so each
   piece between crossings can be picked, moved, recoloured or deleted on its
-  own. Turn this off with **Cut lines where they cross** in the Line or Pen
-  tool options. A filled shape's outline is not cut; its sides are picked one
-  by one as before.
+  own. This happens when a line is drawn, and again when one is moved,
+  turned, stretched, or reshaped by its points, handles or a bend. Turn this
+  off with **Cut lines where they cross** in the Line or Pen tool options. A
+  filled shape's outline is not cut; its sides are picked one by one as
+  before.
+- A line that runs right across paint parts it too, so each side can be
+  picked on its own. A hairline is taken out of the paint under the line,
+  where the line hides it. A line that only pokes into paint leaves it
+  whole.
 - Click a line to pick that piece. Double-click it to pick every line joined
   to it.
 - A picked line shows dotted over its whole painted width, like a picked

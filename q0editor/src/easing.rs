@@ -798,7 +798,7 @@ pub fn render_editor(app: &mut EditorApp, ctx: &egui::Context) {
     } else {
         format!("Easing Curve Editor — {} tweens", state.targets.len())
     };
-    egui::Window::new(title)
+    crate::dialog::Dialog::new(title)
         .open(&mut open)
         .default_width(430.0)
         .resizable(true)
@@ -1085,22 +1085,17 @@ pub fn render_warning(app: &mut EditorApp, ctx: &egui::Context) {
     let Some(message) = app.session.tween_warning.clone() else {
         return;
     };
-    let mut open = true;
-    let mut dismiss = false;
-    egui::Window::new("Tween not created")
-        .open(&mut open)
-        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-        .collapsible(false)
-        .resizable(false)
-        .fit_to_screen(ctx)
-        .show(ctx, |ui| {
-            ui.label(message);
-            ui.add_space(8.0);
-            if ui.button("OK").clicked() {
-                dismiss = true;
-            }
-        });
-    if dismiss || !open {
+    let answer = crate::dialog::Confirm::new(
+        "Tween not created",
+        crate::dialog::Tone::Info,
+        "This tween could not be made",
+    )
+    .badge(crate::dialog::Badge::Icon(crate::ui::Icon::Tween))
+    .detail(message)
+    .action("OK", crate::dialog::Kind::Primary)
+    .default_action()
+    .show(ctx);
+    if answer.is_some() {
         app.session.tween_warning = None;
     }
 }

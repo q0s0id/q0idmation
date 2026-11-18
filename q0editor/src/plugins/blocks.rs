@@ -2557,7 +2557,7 @@ impl BlockEditor {
 
     fn variable_prompt(&mut self, ui: &mut Ui, program: &mut Program, near: Rect) -> bool {
         let mut done = None;
-        egui::Window::new("New variable")
+        crate::dialog::Dialog::new("New variable")
             .collapsible(false)
             .resizable(false)
             .fixed_pos(near.left_top() + vec2(20.0, 60.0))

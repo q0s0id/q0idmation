@@ -1072,8 +1072,8 @@ impl Player {
         *frame_index = 0;
         *entry_q0rg_id = root;
         // This is the player's private parsed snapshot. The editor's authored
-        // project is never changed. Keep all existing camera/render entry rules.
-        Arc::make_mut(project).meta.entry_q0rg_id = root;
+        // project is never changed. Each scene plays with its own camera.
+        Arc::make_mut(project).set_entry_scene(root);
         self.audio_timeline = build_project_audio_timeline(project);
         self.scene_runtime = RuntimeSceneState::new();
         self.objects = objects::ObjectWorld::default();

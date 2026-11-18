@@ -451,7 +451,7 @@ pub fn render_window(app: &mut EditorApp, ctx: &Context) {
         return;
     }
     let mut open = true;
-    egui::Window::new("Particles")
+    crate::dialog::Dialog::new("Particles")
         .open(&mut open)
         .default_size([400.0, 640.0])
         .default_pos(ctx.screen_rect().right_top() + egui::vec2(-850.0, 80.0))
@@ -1643,7 +1643,7 @@ fn render_emitter_simple(
         f32::from(app.state.project.meta.stage_width.max(1)),
         f32::from(app.state.project.meta.stage_height.max(1)),
     ];
-    ui.label(RichText::new("Start from").strong());
+    crate::ui::section_header(ui, "Start from");
     ui.horizontal_wrapped(|ui| {
         for preset in &PRESETS {
             if ui
@@ -1657,7 +1657,7 @@ fn render_emitter_simple(
         }
     });
     ui.add_space(6.0);
-    ui.label(RichText::new("Looks like").strong());
+    crate::ui::section_header(ui, "Looks like");
     render_look(app, ui, edit, emitter);
     ui.horizontal(|ui| {
         edit.checkbox(ui, &mut emitter.additive, "Glows");
@@ -1999,7 +1999,7 @@ fn render_pro_looks(
     emitter: &mut ParticleEmitter,
     dim: Color32,
 ) {
-    ui.label(RichText::new("Texture").strong());
+    crate::ui::section_header(ui, "Texture");
     render_look(app, ui, edit, emitter);
     ui.add_space(4.0);
     let (size_speed, size_range, size_suffix) = size_unit(emitter);

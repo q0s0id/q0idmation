@@ -863,7 +863,7 @@ impl Online {
         let mut open = self.open;
         let screen = ctx.screen_rect();
         let mut out = Out::default();
-        egui::Window::new("Online")
+        crate::dialog::Dialog::new("Online")
             .id(egui::Id::new("q0editor_online"))
             .open(&mut open)
             .default_pos(egui::pos2(screen.right() - 410.0, screen.top() + 70.0))
@@ -1232,6 +1232,7 @@ impl Online {
                 .response
                 .on_hover_text("Account");
                 let (text, color, filled) = match &self.room {
+                    Some(_) if self.unreadable.is_some() => ("out of sync", pal.warn, false),
                     Some(_) if self.connection.is_some() => ("reconnecting", pal.warn, false),
                     Some(room) if room.pending.is_some() || room.changed_at.is_some() => {
                         ("syncing", pal.link, false)
@@ -1241,7 +1242,7 @@ impl Online {
                 };
                 let response = ui.label(RichText::new(text).small().color(color));
                 dot(ui, color, filled);
-                if let Some(message) = &self.connection {
+                if let Some(message) = self.unreadable.as_ref().or(self.connection.as_ref()) {
                     response.on_hover_text(message);
                 }
             });
@@ -1631,10 +1632,9 @@ impl Online {
                 );
                 // button first from the right, field fills the rest: subtracting a
                 // guessed button width made the window grow a little every frame
+                let parsed = room_code(&self.view.join_code);
                 one_line(ui, |ui| {
-                    let code = self.view.join_code.trim().to_owned();
-                    let valid = code.len() == 32 && code.bytes().all(|b| b.is_ascii_hexdigit());
-                    let enabled = valid && !joining && self.room.is_none();
+                    let enabled = parsed.is_ok() && !joining && self.room.is_none();
                     let clicked = ui
                         .add_enabled(enabled, egui::Button::new("Join"))
                         .on_disabled_hover_text(if self.room.is_some() {
@@ -1649,14 +1649,34 @@ impl Online {
                             .font(egui::TextStyle::Monospace)
                             .desired_width(f32::INFINITY),
                     );
+                    // The button above was drawn from the code as it was
+                    // before this frame's typing or paste: draw again now,
+                    // or it waits for the pointer to move to light up.
+                    if response.changed() {
+                        ui.ctx().request_repaint();
+                    }
                     let submit =
                         response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if (clicked || (submit && enabled)) && valid {
-                        out.send.push(Command::Join {
-                            id: code.to_ascii_lowercase(),
-                        });
+                    if let Ok(code) = &parsed {
+                        if clicked || (submit && enabled) {
+                            out.send.push(Command::Join { id: code.clone() });
+                        }
                     }
                 });
+                // Say why Join is off, not only on hover.
+                let why = match (&parsed, self.room.as_ref()) {
+                    (Err(Some(problem)), _) => Some((problem.as_str(), pal.warn)),
+                    (Ok(code), Some(room)) if room.id == *code => {
+                        Some(("You are already in this room.", pal.dim))
+                    }
+                    (Ok(_), Some(_)) => {
+                        Some(("Leave the room you are in to join another.", pal.dim))
+                    }
+                    _ => None,
+                };
+                if let Some((text, color)) = why {
+                    ui.label(RichText::new(text).small().color(color));
+                }
             });
     }
 
@@ -3212,4 +3232,123 @@ fn room_settings(
                 out.send.push(Command::DeleteRoom {room:room.id.clone()});
             }
         });
+}
+
+/// The room code in what was pasted: 32 hex digits, lowercased. Copies from
+/// web pages and chats can carry invisible line-break hints, and a code
+/// typed on a Cyrillic layout gets а, с and е that only look Latin; both are
+/// read through, and so is a link with the code in it. `Err(None)` for an
+/// empty field, `Err(Some(why))` for anything else that is not a code.
+fn room_code(text: &str) -> Result<String, Option<String>> {
+    let cleaned: String = text
+        .chars()
+        .filter(|&c| !invisible(c))
+        .map(latin_look_alike)
+        .collect();
+    if cleaned.trim().is_empty() {
+        return Err(None);
+    }
+    let found = |text: &str| {
+        let mut runs = text
+            .split(|c: char| !c.is_ascii_hexdigit())
+            .filter(|run| run.len() == 32);
+        match (runs.next(), runs.next()) {
+            (Some(code), None) => Some(code.to_ascii_lowercase()),
+            _ => None,
+        }
+    };
+    // A code split into groups by spaces or line breaks reads as one.
+    let joined: String = cleaned.chars().filter(|c| !c.is_whitespace()).collect();
+    if let Some(code) = found(&cleaned).or_else(|| found(&joined)) {
+        return Ok(code);
+    }
+    let digits = joined.chars().filter(char::is_ascii_hexdigit).count();
+    let others = joined.chars().count() - digits;
+    Err(Some(if others == 0 {
+        format!("A room code has 32 characters; this has {digits}.")
+    } else {
+        format!(
+            "A room code is 32 characters of 0–9 and a–f. This has {digits} of those and \
+             {others} other character{}.",
+            if others == 1 { "" } else { "s" }
+        )
+    }))
+}
+
+/// Characters that take no room on screen: break hints, joiners, direction
+/// marks, the byte-order mark.
+fn invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
+/// Letters and digits that look like a room code's but are not ASCII.
+fn latin_look_alike(c: char) -> char {
+    match c {
+        'а' => 'a',
+        'с' => 'c',
+        'е' => 'e',
+        'А' => 'A',
+        'В' => 'B',
+        'С' => 'C',
+        'Е' => 'E',
+        '０'..='９' | 'ａ'..='ｆ' | 'Ａ'..='Ｆ' => {
+            char::from_u32(c as u32 - 0xFEE0).unwrap_or(c)
+        }
+        _ => c,
+    }
+}
+
+#[cfg(test)]
+mod room_code_tests {
+    use super::room_code;
+
+    const CODE: &str = "f0d63f40a3e849375ddb94fb025b5e61";
+
+    #[test]
+    fn reads_a_plain_code_in_any_case_with_space_around() {
+        assert_eq!(room_code(CODE).as_deref(), Ok(CODE));
+        let shouted = format!("  {}\n", CODE.to_uppercase());
+        assert_eq!(room_code(&shouted).as_deref(), Ok(CODE));
+    }
+
+    #[test]
+    fn reads_through_invisible_characters_and_look_alikes() {
+        let hidden = format!(
+            "{}\u{200B}{}\u{00AD}{}",
+            &CODE[..8],
+            &CODE[8..20],
+            &CODE[20..]
+        );
+        assert_eq!(room_code(&hidden).as_deref(), Ok(CODE));
+        // Cyrillic а and е in place of the Latin ones.
+        let cyrillic = CODE.replace('a', "а").replace('e', "е");
+        assert_ne!(cyrillic, CODE);
+        assert_eq!(room_code(&cyrillic).as_deref(), Ok(CODE));
+        assert_eq!(room_code(&format!("\u{FEFF}{CODE}")).as_deref(), Ok(CODE));
+    }
+
+    #[test]
+    fn reads_a_link_or_a_code_in_groups() {
+        let link = format!("https://q0id.com/rooms/{CODE}?from=chat");
+        assert_eq!(room_code(&link).as_deref(), Ok(CODE));
+        let grouped = format!(
+            "{} {} {} {}",
+            &CODE[..8],
+            &CODE[8..16],
+            &CODE[16..24],
+            &CODE[24..]
+        );
+        assert_eq!(room_code(&grouped).as_deref(), Ok(CODE));
+    }
+
+    #[test]
+    fn says_what_is_wrong_with_anything_else() {
+        assert_eq!(room_code("   "), Err(None));
+        assert!(matches!(room_code(&CODE[..31]), Err(Some(why)) if why.contains("31")));
+        assert!(matches!(room_code("not a code at all"), Err(Some(_))));
+    }
 }

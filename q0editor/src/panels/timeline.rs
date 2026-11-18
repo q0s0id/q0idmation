@@ -821,8 +821,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     // sees the q0rg's edge and has somewhere to drop "+ Frame" hits visually.
     let visible_frames = frame_count.saturating_add(VIRTUAL_FRAMES_BUFFER);
 
-    let camera_row_enabled =
-        q0rg_id == app.state.project.meta.entry_q0rg_id && app.state.project.runtime.camera.enabled;
+    let camera_row_enabled = app.state.project.camera_on(q0rg_id);
     let camera_row_count = usize::from(camera_row_enabled);
 
     let available_frames_width = (ui.available_width() - label_width - 12.0).max(frame_w());
@@ -832,9 +831,21 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         .session
         .timeline_horizontal_scroll
         .clamp(0.0, max_scroll);
+    // The frames follow the playhead when it moves on its own (F6 on a
+    // keyframe, the frame keys, playback), so a new frame never lands out
+    // of sight past the edge.
+    let follow_id = egui::Id::new(("timeline_followed_frame", q0rg_id));
+    let playhead = app.session.timeline_frame();
+    let followed = ui.data(|data| data.get_temp::<u16>(follow_id));
+    if followed.is_some_and(|frame| frame != playhead)
+        && app.session.timeline_scroll_to_frame.is_none()
+    {
+        app.session.timeline_scroll_to_frame = Some((q0rg_id, playhead));
+    }
+    ui.data_mut(|data| data.insert_temp(follow_id, playhead));
     if let Some((target_q0rg, target)) = app.session.timeline_scroll_to_frame.take() {
         if target_q0rg == q0rg_id {
-            let x = f32::from(target.min(frame_count.saturating_sub(1))) * frame_w();
+            let x = f32::from(target.min(visible_frames.saturating_sub(1))) * frame_w();
             let scroll = &mut app.session.timeline_horizontal_scroll;
             if x < *scroll {
                 *scroll = x;
@@ -1165,11 +1176,11 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     label_rect.right_center() - vec2(72.0, 0.0),
                     vec2(18.0, row_h()),
                 );
-                let mask_art_hidden = app.session.hidden_mask_art_layers.contains(&(
-                    app.active_project_tab_id().unwrap_or(0),
-                    q0rg_id,
-                    layer.layer_id,
-                ));
+                let mask_art_hidden = app
+                    .state
+                    .project
+                    .layer_metadata(q0rg_id, layer.layer_id)
+                    .mask_preview;
                 let mask_art_response = is_mask.then(|| {
                     ui.interact(
                         mask_art_rect,
@@ -2023,7 +2034,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                             (selection.first_frame()..=selection.last_frame()).contains(&frame)
                         });
                         let existing_has_key = existing.is_some_and(|selection| {
-                            app.state.project.runtime.camera.keys.iter().any(|key| {
+                            app.camera().keys.iter().any(|key| {
                                 (selection.first_frame()..=selection.last_frame())
                                     .contains(&key.frame)
                             })
@@ -2658,8 +2669,7 @@ fn layer_drop_target_at(
     if row_count == 0 {
         return None;
     }
-    let camera_rows =
-        usize::from(q0rg_id == project.meta.entry_q0rg_id && project.runtime.camera.enabled);
+    let camera_rows = usize::from(project.camera_on(q0rg_id));
     let first_row_y = rect.min.y + rows_h() * (camera_rows as f32 + 1.0);
     let raw_row = layer_row_at(pos.y - first_row_y);
     if raw_row >= row_count as isize {
@@ -2749,8 +2759,7 @@ fn draw_layer_drop_preview(
     label_width: f32,
 ) {
     let accent = theme.accent.to_color32();
-    let camera_rows =
-        usize::from(q0rg_id == project.meta.entry_q0rg_id && project.runtime.camera.enabled);
+    let camera_rows = usize::from(project.camera_on(q0rg_id));
     match target {
         LayerDropTarget::IntoFolder(folder_id) | LayerDropTarget::IntoMask(folder_id) => {
             let Some(index) = visible_layer_ids
@@ -3366,7 +3375,7 @@ fn draw_camera_layer_row(
     draw_camera_spans(
         frame_painter,
         theme,
-        &app.state.project.runtime.camera,
+        app.camera(),
         frame_base_x,
         row_y,
         frame_count,
@@ -3568,6 +3577,7 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
             let left = ui.horizontal(|ui| bar_layers_and_frames(app, ui)).response;
             let center = ui.horizontal(|ui| bar_playback(app, ui)).response;
             let right = ui.horizontal(|ui| bar_view(app, theme, ui)).response;
+            crate::online::timeline_people(app, ui, None);
             [left.rect.width(), center.rect.width(), right.rect.width()]
         })
         .inner
@@ -3578,7 +3588,9 @@ fn transport_bar(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
             ui.ctx().request_repaint();
         }
     }
-    crate::online::timeline_people(app, ui, people_space);
+    if people_space.is_some() {
+        crate::online::timeline_people(app, ui, people_space);
+    }
 }
 
 fn shows(app: &EditorApp, button: TimelineButton) -> bool {
@@ -3587,8 +3599,9 @@ fn shows(app: &EditorApp, button: TimelineButton) -> bool {
 
 fn bar_layers_and_frames(app: &mut EditorApp, ui: &mut Ui) {
     if shows(app, TimelineButton::Camera) {
-        let camera_available = app.session.current_q0rg_id == app.state.project.meta.entry_q0rg_id;
-        let camera_enabled = app.state.project.runtime.camera.enabled;
+        // Every scene has its own camera; a symbol's timeline has none.
+        let camera_available = app.state.project.is_scene_root(app.session.current_q0rg_id);
+        let camera_enabled = app.camera().enabled;
         let camera_response = ui
             .add_enabled_ui(camera_available, |ui| {
                 icon_toggle(
@@ -3601,14 +3614,14 @@ fn bar_layers_and_frames(app: &mut EditorApp, ui: &mut Ui) {
             .inner;
         if camera_response.clicked() {
             let before = app.state.project.clone();
-            app.state.project.runtime.camera.enabled = !camera_enabled;
+            app.camera_mut().enabled = !camera_enabled;
             app.history.snapshot_with_session(&before, &app.session);
             app.state.mark_dirty();
-            app.session.camera_track_selected = app.state.project.runtime.camera.enabled;
+            app.session.camera_track_selected = app.camera().enabled;
             app.session.timeline_selection = None;
             app.session.timeline_layer_selection = None;
             app.session.selection = Selection::None;
-            app.session.status = if app.state.project.runtime.camera.enabled {
+            app.session.status = if app.camera().enabled {
                 "camera track enabled".to_string()
             } else {
                 "camera track disabled".to_string()
@@ -4101,6 +4114,16 @@ fn bar_view(app: &mut EditorApp, theme: &Theme, ui: &mut Ui) {
             .on_hover_text(
                 "Off: onion skin only on the active layer. On: all visible, unlocked layers.",
             );
+        if app.session.onion.enabled
+            && ui
+                .checkbox(&mut app.settings.onion_unlit, "no lights")
+                .on_hover_text(
+                    "Turns the scene's lights off while onion skin shows, so ghosts are easy to see in a dark scene. Off: everything stays lit, ghosts included.",
+                )
+                .changed()
+        {
+            app.settings.save();
+        }
         ui.label(
             egui::RichText::new("Before")
                 .color(theme.text_dim.to_color32())
@@ -4300,7 +4323,7 @@ fn render_layer_rename_dialog(app: &mut EditorApp, ctx: &egui::Context) {
     let mut open = true;
     let mut submit = false;
     let mut cancel = false;
-    egui::Window::new("Rename layer")
+    crate::dialog::Dialog::new("Rename layer")
         .id(egui::Id::new("timeline_layer_rename_dialog"))
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .collapsible(false)
@@ -4405,7 +4428,7 @@ fn render_frame_label_dialog(app: &mut EditorApp, ctx: &egui::Context) {
     let mut open = true;
     let mut submit = false;
     let mut cancel = false;
-    egui::Window::new(format!("frame {} label", u32::from(edit.frame) + 1))
+    crate::dialog::Dialog::new(format!("frame {} label", u32::from(edit.frame) + 1))
         .id(egui::Id::new("timeline_frame_label_dialog"))
         .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .collapsible(false)
@@ -5601,6 +5624,7 @@ mod tests {
                     collapsed: false,
                     hidden: false,
                     locked: false,
+                    mask_preview: false,
                 },
             );
         }
@@ -5613,6 +5637,7 @@ mod tests {
                 collapsed: false,
                 hidden: false,
                 locked: false,
+                mask_preview: false,
             },
         );
         assert_eq!(visible_layer_indices(&project, 0), vec![3, 2, 1, 0]);
@@ -5793,6 +5818,7 @@ mod tests {
                 collapsed: false,
                 hidden: false,
                 locked: false,
+                mask_preview: false,
             },
         );
         project.layer_metadata.insert(
@@ -5804,6 +5830,7 @@ mod tests {
                 collapsed: false,
                 hidden: false,
                 locked: false,
+                mask_preview: false,
             },
         );
         let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 120.0));

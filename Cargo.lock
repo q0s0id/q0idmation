@@ -778,7 +778,7 @@ dependencies = [
 
 [[package]]
 name = "canripper"
-version = "0.1.0-beta.6.2"
+version = "0.1.0-beta.6.3"
 dependencies = [
  "dirs",
  "eframe",
@@ -3464,7 +3464,7 @@ dependencies = [
 
 [[package]]
 name = "q0android"
-version = "0.1.0-beta.6.2"
+version = "0.1.0-beta.6.3"
 dependencies = [
  "egui",
  "glutin",
@@ -3476,7 +3476,7 @@ dependencies = [
 
 [[package]]
 name = "q0build"
-version = "0.1.0-beta.6.2"
+version = "0.1.0-beta.6.3"
 dependencies = [
  "dirs",
  "eframe",
@@ -3498,14 +3498,14 @@ dependencies = [
 
 [[package]]
 name = "q0credits"
-version = "0.1.0-beta.6.2"
+version = "0.1.0-beta.6.3"
 dependencies = [
  "egui",
 ]
 
 [[package]]
 name = "q0editor"
-version = "0.1.0-beta.6.2"
+version = "0.1.0-beta.6.3"
 dependencies = [
  "base64",
  "clipboard-win",
@@ -3546,7 +3546,7 @@ dependencies = [
 
 [[package]]
 name = "q0editor-android"
-version = "0.1.0-beta.6.2"
+version = "0.1.0-beta.6.3"
 dependencies = [
  "android_logger",
  "egui",
@@ -3559,7 +3559,7 @@ dependencies = [
 
 [[package]]
 name = "q0ex"
-version = "0.1.0-beta.6.2"
+version = "0.1.0-beta.6.3"
 dependencies = [
  "base64",
  "serde_json",
@@ -3567,7 +3567,7 @@ dependencies = [
 
 [[package]]
 name = "q0fla"
-version = "0.1.0-beta.6.2"
+version = "0.1.0-beta.6.3"
 dependencies = [
  "cfb",
  "flate2",
@@ -3583,7 +3583,7 @@ dependencies = [
 
 [[package]]
 name = "q0glblend"
-version = "0.1.0-beta.6.2"
+version = "0.1.0-beta.6.3"
 dependencies = [
  "egui",
  "egui_glow",
@@ -3593,11 +3593,11 @@ dependencies = [
 
 [[package]]
 name = "q0icon"
-version = "0.1.0-beta.6.2"
+version = "0.1.0-beta.6.3"
 
 [[package]]
 name = "q0model"
-version = "0.1.0-beta.6.2"
+version = "0.1.0-beta.6.3"
 dependencies = [
  "image",
  "miniz_oxide",
@@ -3619,7 +3619,7 @@ dependencies = [
 
 [[package]]
 name = "q0physics"
-version = "0.1.0-beta.6.2"
+version = "0.1.0-beta.6.3"
 dependencies = [
  "q0s-format",
  "rapier2d",
@@ -3628,7 +3628,7 @@ dependencies = [
 
 [[package]]
 name = "q0player"
-version = "0.1.0-beta.6.2"
+version = "0.1.0-beta.6.3"
 dependencies = [
  "dirs",
  "eframe",
@@ -3662,7 +3662,7 @@ dependencies = [
 
 [[package]]
 name = "q0player-android"
-version = "0.1.0-beta.6.2"
+version = "0.1.0-beta.6.3"
 dependencies = [
  "android_logger",
  "log",
@@ -3674,7 +3674,7 @@ dependencies = [
 
 [[package]]
 name = "q0qir"
-version = "0.1.0-beta.6.2"
+version = "0.1.0-beta.6.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -3682,7 +3682,7 @@ dependencies = [
 
 [[package]]
 name = "q0s-format"
-version = "0.1.0-beta.6.2"
+version = "0.1.0-beta.6.3"
 dependencies = [
  "base64",
  "miniz_oxide",
@@ -3693,14 +3693,14 @@ dependencies = [
 
 [[package]]
 name = "q0shell"
-version = "0.1.0-beta.6.2"
+version = "0.1.0-beta.6.3"
 dependencies = [
  "q0s-format",
 ]
 
 [[package]]
 name = "q0term"
-version = "0.1.0-beta.6.2"
+version = "0.1.0-beta.6.3"
 dependencies = [
  "eframe",
  "egui",
@@ -3709,11 +3709,11 @@ dependencies = [
 
 [[package]]
 name = "q0theme"
-version = "0.1.0-beta.6.2"
+version = "0.1.0-beta.6.3"
 
 [[package]]
 name = "q0video"
-version = "0.1.0-beta.6.2"
+version = "0.1.0-beta.6.3"
 dependencies = [
  "flate2",
  "image",
@@ -3723,7 +3723,7 @@ dependencies = [
 
 [[package]]
 name = "q0vm"
-version = "0.1.0-beta.6.2"
+version = "0.1.0-beta.6.3"
 
 [[package]]
 name = "quick-xml"

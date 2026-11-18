@@ -245,6 +245,10 @@ pub enum Reply {
         ok: bool,
         message: String,
     },
+    /// An edit in the room this editor cannot read, most likely made by a
+    /// newer or older q0editor. The room's chat and people still arrive; the
+    /// drawing waits before that edit.
+    Unreadable(String),
     Notice(String),
     RoomClosed {
         room: String,
@@ -505,6 +509,30 @@ fn event(value: Value) -> Result<RoomEvent, Failure> {
     let value = value.get("event").cloned().unwrap_or(value);
     decode(value)
 }
+/// A poll's answer, read part by part, so that one edit this editor cannot
+/// read does not also hide the room's chat, people and the edits before it.
+/// The edits stop just before the first unreadable one, which comes back as
+/// the reason: the room's revision cannot move past an edit not applied.
+fn read_batch(mut value: Value) -> Result<(EventBatch, Option<Failure>), Failure> {
+    let events = value
+        .as_object_mut()
+        .and_then(|batch| batch.remove("events"))
+        .unwrap_or(Value::Null);
+    let mut batch: EventBatch = decode(value)?;
+    let mut unreadable = None;
+    if let Value::Array(events) = events {
+        for event in events {
+            match decode::<RoomEvent>(event) {
+                Ok(event) => batch.events.push(event),
+                Err(e) => {
+                    unreadable = Some(e);
+                    break;
+                }
+            }
+        }
+    }
+    Ok((batch, unreadable))
+}
 fn snapshot(value: Value) -> Result<RoomSnapshot, Failure> {
     let value = value.get("room").cloned().unwrap_or(value);
     decode(value)
@@ -560,17 +588,15 @@ fn start_poll(
                 Ok(p) => p,
                 Err(_) => break,
             };
-            match request(&agent, &base, &creds, "GET", &path, None, true)
-                .and_then(decode::<EventBatch>)
-            {
-                Ok(batch) => {
+            match request(&agent, &base, &creds, "GET", &path, None, true).and_then(read_batch) {
+                Ok((batch, unreadable)) => {
                     if thread_stop.load(Ordering::Acquire) {
                         break;
                     }
                     if let Some(last) = batch.chat.iter().map(|line| line.id).max() {
                         chat_since = chat_since.max(last);
                     }
-                    if !healthy {
+                    if !healthy && unreadable.is_none() {
                         healthy = true;
                         failures = 0;
                         send(
@@ -590,6 +616,27 @@ fn start_poll(
                             batch,
                         },
                     );
+                    if let Some(e) = unreadable {
+                        // The server answers at once while that edit waits,
+                        // so ask again only every few seconds.
+                        healthy = false;
+                        failures = failures.saturating_add(1);
+                        send(
+                            &tx,
+                            &ctx,
+                            Reply::Unreadable(format!(
+                                "an edit in this room came from another q0editor version and \
+                                 can’t be read here ({}). chat and people still work; the \
+                                 drawing catches up once q0editor is updated",
+                                e.message
+                            )),
+                        );
+                        let wait = 2u64.saturating_mul(u64::from(failures.min(5)));
+                        let until = Instant::now() + Duration::from_secs(wait);
+                        while Instant::now() < until && !thread_stop.load(Ordering::Acquire) {
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                    }
                 }
                 Err(e) if e.status == 409 => {
                     if let Ok(path) = room_path(&id, "") {
@@ -1840,6 +1887,49 @@ fn verification_url(base: &str, uri: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One edit from another editor version once failed the whole poll: no
+    /// chat, no people, no edits, quietly retried forever.
+    #[test]
+    fn an_unreadable_edit_does_not_hide_the_rest_of_a_poll() {
+        let readable = |revision: u64| {
+            serde_json::to_value(RoomEvent {
+                revision,
+                actor: 1,
+                operation_id: format!("op-{revision}"),
+                kind: q0online::EventKind::Edit,
+                target_operation_id: None,
+                patch: Default::default(),
+                generations: Vec::new(),
+            })
+            .unwrap()
+        };
+        let mut unknown = readable(6);
+        unknown["patch"]["from_the_future"] = json!(true);
+        let (batch, unreadable) = read_batch(json!({
+            "revision": 7,
+            "events": [readable(5), unknown, readable(7)],
+            "members": [],
+            "presence": [{"user_id": 2}],
+        }))
+        .unwrap();
+        assert_eq!(batch.revision, 7);
+        // Edits stop before the unreadable one, so none is skipped.
+        assert_eq!(
+            batch.events.iter().map(|e| e.revision).collect::<Vec<_>>(),
+            [5]
+        );
+        assert_eq!(batch.presence.len(), 1);
+        assert_eq!(unreadable.expect("the reason").code, "protocol");
+
+        let (batch, unreadable) =
+            read_batch(json!({"revision": 7, "events": [readable(6), readable(7)]})).unwrap();
+        assert!(unreadable.is_none());
+        assert_eq!(batch.events.len(), 2);
+        // A batch with no edits at all still reads.
+        assert!(read_batch(json!({"revision": 2})).unwrap().1.is_none());
+    }
+
     #[test]
     fn device_pending_and_room_conflict_codes_are_preserved() {
         let pending = decode_failure(

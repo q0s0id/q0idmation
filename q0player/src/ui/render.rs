@@ -490,8 +490,8 @@ fn q0rg_contains_mask_inner(
 }
 
 fn authored_root_affine(project: &ProjectV2, q0rg_id: u16, frame: u16) -> Affine {
-    if q0rg_id == project.meta.entry_q0rg_id && project.runtime.camera.enabled {
-        project.camera_affine_at(frame)
+    if project.camera_on(q0rg_id) {
+        project.camera_affine_in(q0rg_id, frame)
     } else {
         Affine::IDENTITY
     }
@@ -774,6 +774,7 @@ fn collect_solid_q0rg(
         return false;
     }
     let frame = frame % q.frame_count.max(1);
+    let pose = q0s_format::parenting::merge_into(project, owner, frame, None);
     for layer in &q.layers {
         let look = scene.layer_look(project, owner, layer.layer_id);
         if !look.visible || look.alpha <= 0.0 {
@@ -802,10 +803,11 @@ fn collect_solid_q0rg(
                 return false;
             }
             let key = InstanceKey::new(owner, placement.instance_id);
-            let transform = Affine::compose(
-                parent,
-                scene.effective_affine(key, Affine::from_transform(active.transform)),
-            );
+            let authored = pose
+                .as_ref()
+                .and_then(|pose| pose.binding_transform(placement.instance_id))
+                .unwrap_or_else(|| Affine::from_transform(active.transform));
+            let transform = Affine::compose(parent, scene.effective_affine(key, authored));
             let color = active
                 .fx
                 .tint
@@ -1000,6 +1002,8 @@ fn paint_q0rg(
             .unwrap_or(&[]);
         q0s_format::rig::evaluate_rig(rig, f32::from(local_frame), overrides)
     });
+    // Parent links alone still leave the GPU masks usable; a rig does not.
+    let rigged = rig_pose.is_some();
     let rig_pose = q0s_format::parenting::merge_into(project, q0rg_id, local_frame, rig_pose);
     // Lights shine on the root timeline, after its light layer.
     let stage_rect = Rect::from_min_size(
@@ -1058,7 +1062,7 @@ fn paint_q0rg(
         // Scripts move and fade whole layers (q0.layer).
         let parent = look.shift(parent);
         let fade_from = (look.alpha < 1.0).then(|| painter.add(Shape::Noop));
-        if rig_pose.is_none()
+        if !rigged
             && !active_clipping_masks(project, q, layer.layer_id, local_frame, cache).is_empty()
         {
             three.flush(painter);
@@ -1068,6 +1072,7 @@ fn paint_q0rg(
                 q,
                 layer,
                 local_frame,
+                rig_pose.as_ref(),
                 parent,
                 view,
                 depth,
@@ -1623,6 +1628,7 @@ fn collect_masked_layer(
     q: &q0s_format::v2::Q0rg,
     layer: &q0s_format::v2::Layer,
     local_frame: u16,
+    pose: Option<&q0s_format::rig::RigPose>,
     parent: Affine,
     view: &StageView,
     depth: u8,
@@ -1632,12 +1638,13 @@ fn collect_masked_layer(
     inherited_color: q0glblend::ColorTransform,
 ) -> Option<MaskedLayer> {
     let q0rg_id = q.q0rg_id;
+    // Objects on parented layers sit where their parent binding puts them.
     let placed = |placement: &Placement, active: &q0s_format::raster::ActivePlacementState| {
         let key = InstanceKey::new(q0rg_id, placement.instance_id);
-        Affine::compose(
-            parent,
-            scene_state.effective_affine(key, Affine::from_transform(active.transform)),
-        )
+        let authored = pose
+            .and_then(|pose| pose.binding_transform(placement.instance_id))
+            .unwrap_or_else(|| Affine::from_transform(active.transform));
+        Affine::compose(parent, scene_state.effective_affine(key, authored))
     };
 
     let mut masks = Vec::new();

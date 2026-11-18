@@ -328,6 +328,9 @@ pub struct ModelStudio {
     pub show_bones: bool,
     pub show_grid: bool,
     pub material: usize,
+    /// How a material's texture is laid on the faces it is used on; `None`
+    /// leaves their texture positions as they are.
+    pub face_fit: Option<q0model::ops::FaceFit>,
     pub status: String,
     pub(crate) box_select: Option<(Pos2, Pos2)>,
     pub viewport: Rect,
@@ -385,6 +388,7 @@ impl ModelStudio {
             show_bones: has_bones,
             show_grid: true,
             material: 0,
+            face_fit: None,
             status: String::new(),
             box_select: None,
             viewport: Rect::NOTHING,

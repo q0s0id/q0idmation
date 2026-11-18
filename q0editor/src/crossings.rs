@@ -619,6 +619,24 @@ fn split_path_at(path: &VPath, cuts: &[(f32, Vec2)], affine: Affine) -> Vec<VPat
     finish_pieces(pieces, affine)
 }
 
+/// A box around `path` placed by `affine`: its points and handles, which
+/// hold its curves inside them.
+fn control_box(path: &VPath, affine: Affine) -> (f32, f32, f32, f32) {
+    path.anchors
+        .iter()
+        .flat_map(|anchor| [Some(anchor.point), anchor.in_handle, anchor.out_handle])
+        .flatten()
+        .map(|point| affine.apply(point))
+        .fold((f32::MAX, f32::MAX, f32::MIN, f32::MIN), |b, point| {
+            (
+                b.0.min(point.x),
+                b.1.min(point.y),
+                b.2.max(point.x),
+                b.3.max(point.y),
+            )
+        })
+}
+
 /// How long `path` is at most, in stage pixels: its control polygon.
 fn rough_length(path: &VPath, affine: Affine) -> f32 {
     (0..segment_count(path))
@@ -692,17 +710,27 @@ pub fn cut_at_crossings(
     asset_id: u16,
     new_path: usize,
 ) -> bool {
+    cut_line_at_crossings(project, q0rg_id, layer_id, frame, asset_id, new_path).is_some()
+}
+
+/// [`cut_at_crossings`], telling where the line `new_path` ended up when
+/// anything was cut: the indices of its pieces in its drawing, which may
+/// have been copied to a new asset on the same placement.
+pub fn cut_line_at_crossings(
+    project: &mut ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    frame: u16,
+    asset_id: u16,
+    new_path: usize,
+) -> Option<Vec<usize>> {
     let placed = drawings(project, q0rg_id, layer_id, frame);
-    let Some(&(_, _, new_affine)) = placed.iter().find(|(_, id, _)| *id == asset_id) else {
-        return false;
-    };
-    let Some(line) = vector(project, asset_id).and_then(|vector| {
+    let &(_, _, new_affine) = placed.iter().find(|(_, id, _)| *id == asset_id)?;
+    let line = vector(project, asset_id).and_then(|vector| {
         let path = vector.paths.get(new_path)?;
         (cuttable(vector, path) && rough_length(path, new_affine) >= MIN_LENGTH)
             .then(|| path.clone())
-    }) else {
-        return false;
-    };
+    })?;
     let affine_of = |asset: u16| {
         placed
             .iter()
@@ -713,6 +741,7 @@ pub fn cut_at_crossings(
     let mut cuts: std::collections::BTreeMap<(u16, usize), Cuts> = Default::default();
     // Lines too short to see, to sweep away.
     let mut crumbs: std::collections::BTreeMap<u16, Vec<usize>> = Default::default();
+    let line_box = control_box(&line, new_affine);
     for &(_, other_asset, affine) in &placed {
         let Some(other) = vector(project, other_asset) else {
             continue;
@@ -723,6 +752,9 @@ pub fn cut_at_crossings(
             }
             if !path.closed && rough_length(path, affine) < MIN_LENGTH {
                 crumbs.entry(other_asset).or_default().push(path_idx);
+                continue;
+            }
+            if !overlap(line_box, control_box(path, affine), JOINED) {
                 continue;
             }
             let (on_new, on_other) = crossings(&line, new_affine, path, affine);
@@ -758,13 +790,15 @@ pub fn cut_at_crossings(
         }
     }
     if pieces_made > MAX_PIECES || (by_asset.is_empty() && crumbs.is_empty()) {
-        return false;
+        return None;
     }
     let touched: std::collections::BTreeSet<u16> =
         by_asset.keys().chain(crumbs.keys()).copied().collect();
     let writable =
         crate::brush::prepare_writable_raw_assets(project, q0rg_id, layer_id, frame, &touched);
     let mut cut_any = false;
+    // Where the line itself lands: unmoved unless its drawing changes.
+    let mut line_pieces = vec![new_path];
     for original in touched {
         let asset = *writable.get(&original).unwrap_or(&original);
         let affine = affine_of(original).unwrap_or(Affine::IDENTITY);
@@ -787,23 +821,290 @@ pub fn cut_at_crossings(
         // pieces go on the end.
         let mut tail = Vec::new();
         let mut paths = Vec::with_capacity(vector.paths.len());
-        for (path, replacement) in vector.paths.drain(..).zip(replaced) {
+        // The line's places among `paths` and, from the second piece on,
+        // among `tail`.
+        let mut line_head = None;
+        let mut line_tail = Vec::new();
+        for (path_idx, (path, replacement)) in vector.paths.drain(..).zip(replaced).enumerate() {
+            let is_line = original == asset_id && path_idx == new_path;
             match replacement {
-                None => paths.push(path),
+                None => {
+                    if is_line {
+                        line_head = Some(paths.len());
+                    }
+                    paths.push(path);
+                }
                 Some(pieces) => {
                     let mut pieces = pieces.into_iter();
                     if let Some(first) = pieces.next() {
+                        if is_line {
+                            line_head = Some(paths.len());
+                        }
                         paths.push(first);
                     }
-                    tail.extend(pieces);
+                    for piece in pieces {
+                        if is_line {
+                            line_tail.push(tail.len());
+                        }
+                        tail.push(piece);
+                    }
                     cut_any = true;
                 }
             }
         }
+        if original == asset_id {
+            let head_count = paths.len();
+            line_pieces = line_head
+                .into_iter()
+                .chain(line_tail.into_iter().map(|offset| head_count + offset))
+                .collect();
+        }
         paths.extend(tail);
         vector.paths = paths;
     }
-    cut_any
+    cut_any.then_some(line_pieces)
+}
+
+/// The most lines one edit cuts and parts paint along.
+const MAX_SETTLED: usize = 256;
+
+/// A line's stage points and stroke width.
+type StageLine = (Vec<Vec2>, f32);
+
+/// A line that was just drawn, moved or reshaped, as it is now.
+struct Edited {
+    reference: PathRef,
+    path: VPath,
+    /// Its stage points and stroke width, to part fills along.
+    stage: StageLine,
+}
+
+fn edited_line(project: &ProjectV2, reference: PathRef) -> Option<Edited> {
+    let placement = project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == reference.q0rg_id)?
+        .layers
+        .iter()
+        .find(|layer| layer.layer_id == reference.layer_id)?
+        .placements
+        .get(reference.placement_idx)?;
+    let Target::Asset(asset_id) = placement.target else {
+        return None;
+    };
+    let vector = vector(project, asset_id)?;
+    let path = vector.paths.get(reference.path_idx)?;
+    let stroke = vector.stroke?;
+    if path.anchors.len() < 2 || (path.closed && vector.fill.is_some()) {
+        return None;
+    }
+    let affine = Affine::from_transform(placement.transform);
+    let mut points: Vec<Vec2> = crate::render::flatten_path(path)
+        .into_iter()
+        .map(|point| affine.apply(point))
+        .collect();
+    if path.closed && points.len() > 2 && points.first() != points.last() {
+        points.push(points[0]);
+    }
+    Some(Edited {
+        reference,
+        path: path.clone(),
+        stage: (points, stroke.width),
+    })
+}
+
+/// The asset placed at `reference`'s placement now, and where its path
+/// equal to `path` is: an earlier cut may have moved it.
+fn find_again(project: &ProjectV2, reference: PathRef, path: &VPath) -> Option<(u16, usize)> {
+    let placement = project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == reference.q0rg_id)?
+        .layers
+        .iter()
+        .find(|layer| layer.layer_id == reference.layer_id)?
+        .placements
+        .get(reference.placement_idx)?;
+    let Target::Asset(asset_id) = placement.target else {
+        return None;
+    };
+    let paths = &vector(project, asset_id)?.paths;
+    let index = if paths.get(reference.path_idx) == Some(path) {
+        reference.path_idx
+    } else {
+        paths.iter().position(|candidate| candidate == path)?
+    };
+    Some((asset_id, index))
+}
+
+/// What settling edited lines changed.
+#[derive(Debug, Default)]
+pub(crate) struct Settled {
+    /// Each edited line that was cut, and its pieces.
+    pub pieces: Vec<(PathRef, Vec<PathRef>)>,
+    /// Drawings that changed and need painting again.
+    pub assets: std::collections::BTreeSet<u16>,
+}
+
+impl Settled {
+    pub fn changed(&self) -> bool {
+        !self.pieces.is_empty() || !self.assets.is_empty()
+    }
+}
+
+/// After lines were drawn, moved or reshaped on `frame`: each is cut where
+/// it crosses other lines, and the fills it now runs right across are
+/// parted along it, so every region between lines can be picked on its
+/// own. Lines of filled shapes are left as they are. The caller has made
+/// the keyframe and taken the undo step.
+pub(crate) fn settle_edited_lines(
+    project: &mut ProjectV2,
+    frame: u16,
+    lines: &[PathRef],
+) -> Settled {
+    let mut settled = Settled::default();
+    // A whole drawing dropped somewhere is left as it is rather than
+    // holding up the drop.
+    if lines.len() > MAX_SETTLED {
+        return settled;
+    }
+    let edited: Vec<Edited> = lines
+        .iter()
+        .filter_map(|reference| edited_line(project, *reference))
+        .collect();
+    if edited.is_empty() {
+        return settled;
+    }
+    for line in &edited {
+        let reference = line.reference;
+        let Some((asset_id, path_idx)) = find_again(project, reference, &line.path) else {
+            continue;
+        };
+        let Some(pieces) = cut_line_at_crossings(
+            project,
+            reference.q0rg_id,
+            reference.layer_id,
+            frame,
+            asset_id,
+            path_idx,
+        ) else {
+            continue;
+        };
+        if let Some(Target::Asset(now)) = project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == reference.q0rg_id)
+            .and_then(|q0rg| {
+                q0rg.layers
+                    .iter()
+                    .find(|layer| layer.layer_id == reference.layer_id)
+            })
+            .and_then(|layer| layer.placements.get(reference.placement_idx))
+            .map(|placement| placement.target)
+        {
+            settled.assets.insert(now);
+        }
+        // Other drawings on the layer may have been cut too.
+        settled.assets.extend(
+            drawings(project, reference.q0rg_id, reference.layer_id, frame)
+                .into_iter()
+                .map(|(_, asset, _)| asset),
+        );
+        if pieces != [reference.path_idx] {
+            settled.pieces.push((
+                reference,
+                pieces
+                    .into_iter()
+                    .map(|path_idx| PathRef {
+                        path_idx,
+                        ..reference
+                    })
+                    .collect(),
+            ));
+        }
+    }
+    let mut by_layer: std::collections::BTreeMap<(u16, u16), Vec<StageLine>> = Default::default();
+    for line in edited {
+        by_layer
+            .entry((line.reference.q0rg_id, line.reference.layer_id))
+            .or_default()
+            .push(line.stage);
+    }
+    for ((q0rg_id, layer_id), lines) in by_layer {
+        settled
+            .assets
+            .extend(crate::brush::part_raw_fills_along_lines(
+                project, q0rg_id, layer_id, frame, &lines,
+            ));
+    }
+    settled
+}
+
+/// `selection` with each cut line swapped for its pieces. Points picked on
+/// a line that was cut no longer name the same places, so they are let go.
+pub(crate) fn follow_cut_lines(
+    selection: &Selection,
+    pieces: &[(PathRef, Vec<PathRef>)],
+) -> Selection {
+    if pieces.is_empty() {
+        return selection.clone();
+    }
+    let swap = |refs: &[PathRef]| -> Vec<PathRef> {
+        let mut out = Vec::new();
+        for reference in refs {
+            match pieces.iter().find(|(cut, _)| cut == reference) {
+                Some((_, parts)) => out.extend(parts.iter().copied()),
+                None => out.push(*reference),
+            }
+            out.dedup();
+        }
+        out
+    };
+    match selection {
+        Selection::Path {
+            q0rg_id,
+            layer_id,
+            placement_idx,
+            path_idx,
+        } => {
+            let reference = PathRef {
+                q0rg_id: *q0rg_id,
+                layer_id: *layer_id,
+                placement_idx: *placement_idx,
+                path_idx: *path_idx,
+            };
+            let swapped = swap(&[reference]);
+            if swapped.len() == 1 {
+                let only = swapped[0];
+                Selection::Path {
+                    q0rg_id: only.q0rg_id,
+                    layer_id: only.layer_id,
+                    placement_idx: only.placement_idx,
+                    path_idx: only.path_idx,
+                }
+            } else {
+                Selection::Paths(swapped)
+            }
+        }
+        Selection::Paths(refs) => Selection::Paths(swap(refs)),
+        Selection::RawParts {
+            fills,
+            strokes,
+            stroke_segments,
+            objects,
+        } => Selection::RawParts {
+            fills: fills.clone(),
+            strokes: swap(strokes),
+            stroke_segments: stroke_segments.clone(),
+            objects: objects.clone(),
+        },
+        Selection::PathPoints { path, .. } | Selection::SubselectPoints { path, .. }
+            if pieces.iter().any(|(cut, _)| cut == path) =>
+        {
+            Selection::None
+        }
+        other => other.clone(),
+    }
 }
 
 /// One line on the frame: where it is, how it is placed and its points.

@@ -1905,7 +1905,7 @@ pub fn render_properties(app: &mut EditorApp, ui: &mut Ui) {
             ui.selectable_value(&mut app.session.rig_edit_mode, mode, mode.label());
         }
     });
-    ui.checkbox(&mut app.session.rig_auto_key, "Auto-key controls");
+    crate::ui::switch(ui, &mut app.session.rig_auto_key, "Auto-key controls");
     render_pose_tween_options(app, ui, q0rg_id);
     if !app.session.rig_auto_key {
         ui.label(
@@ -1980,7 +1980,7 @@ fn render_bone_selection(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    ui.label(egui::RichText::new("Bones").strong());
+    crate::ui::section_header(ui, "Bones");
     if nodes.is_empty() {
         ui.label("draw the first bone on the stage with Add bone");
         return;
@@ -2196,7 +2196,7 @@ fn render_selected_node_numeric(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16, 
 }
 
 fn render_pro_controls(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
-    ui.label(egui::RichText::new("Control builder").strong());
+    crate::ui::section_header(ui, "Control builder");
     ui.horizontal_wrapped(|ui| {
         let selected_node = app.session.rig_selected_node;
         for (label, kind, target) in [
@@ -2230,7 +2230,7 @@ fn render_pro_controls(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
         );
     }
     ui.add_space(4.0);
-    ui.label(egui::RichText::new("Controls").strong());
+    crate::ui::section_header(ui, "Controls");
     let controls = rig_for_q0rg(&app.state.project, q0rg_id)
         .map(|rig| {
             rig.controls
@@ -2429,7 +2429,7 @@ fn render_simple_public_controls(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16)
     if controls.is_empty() {
         return;
     }
-    ui.label(egui::RichText::new("Animator controls").strong());
+    crate::ui::section_header(ui, "Animator controls");
     for (control_id, name, kind, min_value, max_value, mut value) in controls {
         let before = app.state.project.clone();
         let response = match kind {
@@ -2446,7 +2446,7 @@ fn render_simple_public_controls(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16)
             }
             RigControlKind::Toggle => {
                 let mut enabled = value >= 0.5;
-                let response = ui.checkbox(&mut enabled, name);
+                let response = crate::ui::switch(ui, &mut enabled, &name);
                 value = if enabled { 1.0 } else { 0.0 };
                 response
             }
@@ -2527,7 +2527,7 @@ fn render_master_driver_editor(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16, c
     let before_value = app.state.project.clone();
     let response = if control.kind == RigControlKind::Toggle {
         let mut enabled = value >= 0.5;
-        let response = ui.checkbox(&mut enabled, "Enabled");
+        let response = crate::ui::switch(ui, &mut enabled, "Enabled");
         value = if enabled { 1.0 } else { 0.0 };
         response
     } else {
@@ -2762,7 +2762,7 @@ fn render_pose_library(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
         });
     }
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Poses").strong());
+        crate::ui::section_title(ui, "Poses");
         if ui.small_button("Save current").clicked() {
             let before = app.state.project.clone();
             if let Some(pose_id) =
@@ -3059,7 +3059,7 @@ pub(crate) fn render_pose_tween_options(app: &mut EditorApp, ui: &mut Ui, q0rg_i
         .unwrap_or(Easing::Linear);
     let mut requested = None;
     ui.add_enabled_ui(!spans.is_empty(), |ui| {
-        if ui.checkbox(&mut tween, "Tween between poses").on_hover_text(
+        if crate::ui::switch(ui, &mut tween, "Tween between poses").on_hover_text(
             "Applies to the selected bone/control's surrounding pose keys. New poses hold by default."
         ).changed() {
             requested = Some(if tween { easing } else { Easing::Hold });
@@ -3385,7 +3385,7 @@ fn bake_ik_pose_to_fk(
 }
 
 fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
-    ui.label(egui::RichText::new("Constraints").strong());
+    crate::ui::section_header(ui, "Constraints");
     let constraints = rig_for_q0rg(&app.state.project, q0rg_id)
         .map(|rig| rig.constraints.clone())
         .unwrap_or_default();
@@ -3965,7 +3965,7 @@ fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                         ui.label("IK");
                         ui.label(format!("{:.0}%", current_weight * 100.0));
                     });
-                    let response = ui.checkbox(&mut stretch, "Allow stretch");
+                    let response = crate::ui::switch(ui, &mut stretch, "Allow stretch");
                     settings_changed |= response.changed();
                     if stretch {
                         ui.horizontal(|ui| {
@@ -4236,7 +4236,7 @@ fn render_pro_constraints(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
 }
 
 fn render_pro_pose_metadata(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
-    ui.label(egui::RichText::new("Pose drivers + mirror metadata").strong());
+    crate::ui::section_header(ui, "Pose drivers + mirror metadata");
     let snapshot = rig_for_q0rg(&app.state.project, q0rg_id).cloned();
     let Some(snapshot) = snapshot else {
         return;
@@ -4478,7 +4478,7 @@ fn render_pro_pose_metadata(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
 }
 
 fn render_pro_variants(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
-    ui.label(egui::RichText::new("Drawing substitutions").strong());
+    crate::ui::section_header(ui, "Drawing substitutions");
     let selected_scalar = app.session.rig_selected_control.and_then(|id| {
         rig_for_q0rg(&app.state.project, q0rg_id).and_then(|rig| {
             rig.controls
@@ -4661,7 +4661,7 @@ fn render_pro_variants(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
 }
 
 fn render_pro_deformers(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
-    ui.label(egui::RichText::new("Vector deformers").strong());
+    crate::ui::section_header(ui, "Vector deformers");
     ui.horizontal_wrapped(|ui| {
         for (label, kind) in [("Auto skin", 0_u8), ("Bend", 1_u8), ("Cage", 2_u8)] {
             if ui.button(label).clicked() {

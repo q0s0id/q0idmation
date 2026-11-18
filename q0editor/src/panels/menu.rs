@@ -419,6 +419,18 @@ pub fn menus(app: &mut EditorApp, ui: &mut Ui) {
                 ui.close_menu();
             }
             if ui
+                .add_enabled(
+                    app.can_trace_bitmap_selection(),
+                    egui::Button::new("Trace Bitmap…"),
+                )
+                .on_hover_text("Turn the selected bitmap into vector shapes")
+                .on_disabled_hover_text("Select a bitmap on the stage first")
+                .clicked()
+            {
+                app.queue(Action::PromptTraceBitmap);
+                ui.close_menu();
+            }
+            if ui
                 .button("Strokes to Own Layer")
                 .on_hover_text("Move this layer's outlines to a new layer above it; the fills stay")
                 .clicked()

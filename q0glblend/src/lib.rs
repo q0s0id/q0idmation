@@ -316,7 +316,17 @@ struct CachedSolidMeshBuffers {
     vbo: glow::Buffer,
     ebo: glow::Buffer,
     index_count: i32,
+    /// GPU memory the two buffers take.
+    bytes: usize,
+    /// `cached_solid_clock` when last drawn, for least-recently-used eviction.
+    last_used: u64,
 }
+
+/// GPU memory cached meshes may keep before the least recently drawn go.
+/// A frame draws the scene's batches plus every selected object's stipple
+/// and outline; all of them must fit, or each frame uploads them again.
+#[cfg(not(target_arch = "wasm32"))]
+const CACHED_SOLID_BUDGET_BYTES: usize = 384 * 1024 * 1024;
 
 #[cfg(not(target_arch = "wasm32"))]
 struct CachedFilteredGroup {
@@ -502,6 +512,8 @@ struct GlResources {
     cached_solid_color_scale_uniform: Option<glow::UniformLocation>,
     cached_solid_color_offset_uniform: Option<glow::UniformLocation>,
     cached_solid_buffers: HashMap<usize, CachedSolidMeshBuffers>,
+    cached_solid_bytes: usize,
+    cached_solid_clock: u64,
     gradient_program: glow::Program,
     gradient_vao: glow::VertexArray,
     gradient_stop_texture: glow::Texture,
@@ -2181,6 +2193,8 @@ impl GlResources {
             cached_solid_color_scale_uniform,
             cached_solid_color_offset_uniform,
             cached_solid_buffers: HashMap::new(),
+            cached_solid_bytes: 0,
+            cached_solid_clock: 0,
             gradient_program,
             gradient_vao,
             gradient_stop_texture,
@@ -2367,6 +2381,8 @@ impl GlResources {
         color_transform: ColorTransform,
     ) {
         let key = Arc::as_ptr(mesh) as usize;
+        self.cached_solid_clock = self.cached_solid_clock.wrapping_add(1);
+        let clock = self.cached_solid_clock;
         let reusable = self
             .cached_solid_buffers
             .get(&key)
@@ -2374,9 +2390,12 @@ impl GlResources {
             .is_some_and(|cached| Arc::ptr_eq(&cached, mesh));
         if !reusable {
             if let Some(stale) = self.cached_solid_buffers.remove(&key) {
+                self.cached_solid_bytes = self.cached_solid_bytes.saturating_sub(stale.bytes);
                 gl.delete_buffer(stale.vbo);
                 gl.delete_buffer(stale.ebo);
             }
+            // Meshes nobody holds any more (an old pose, zoom or selection)
+            // give their buffers back at once.
             let dead: Vec<usize> = self
                 .cached_solid_buffers
                 .iter()
@@ -2384,19 +2403,28 @@ impl GlResources {
                 .collect();
             for dead_key in dead {
                 if let Some(stale) = self.cached_solid_buffers.remove(&dead_key) {
+                    self.cached_solid_bytes = self.cached_solid_bytes.saturating_sub(stale.bytes);
                     gl.delete_buffer(stale.vbo);
                     gl.delete_buffer(stale.ebo);
                 }
             }
-            // Selection paint cache itself keeps only the current pose. Bound the
-            // backend too so old zoom/theme poses cannot retain giant GL buffers.
-            if self.cached_solid_buffers.len() >= 4 {
-                let stale: Vec<_> = self
+            // Live ones are kept up to a memory budget, least recently drawn
+            // first out. A count cap (it was 4) is far below what one frame
+            // draws, so every frame emptied the cache and uploaded the scene
+            // and the selection again.
+            let incoming = mesh.vertices.len() * 8 * std::mem::size_of::<f32>()
+                + mesh.indices.len() * std::mem::size_of::<u32>();
+            while self.cached_solid_bytes + incoming > CACHED_SOLID_BUDGET_BYTES {
+                let Some(oldest) = self
                     .cached_solid_buffers
-                    .drain()
-                    .map(|(_, value)| value)
-                    .collect();
-                for stale in stale {
+                    .iter()
+                    .min_by_key(|(_, cached)| cached.last_used)
+                    .map(|(key, _)| *key)
+                else {
+                    break;
+                };
+                if let Some(stale) = self.cached_solid_buffers.remove(&oldest) {
+                    self.cached_solid_bytes = self.cached_solid_bytes.saturating_sub(stale.bytes);
                     gl.delete_buffer(stale.vbo);
                     gl.delete_buffer(stale.ebo);
                 }
@@ -2437,14 +2465,18 @@ impl GlResources {
                     vbo,
                     ebo,
                     index_count: mesh.indices.len() as i32,
+                    bytes: vertex_bytes.len() + index_bytes.len(),
+                    last_used: clock,
                 },
             );
+            self.cached_solid_bytes += vertex_bytes.len() + index_bytes.len();
         }
 
         let cached = self
             .cached_solid_buffers
-            .get(&key)
+            .get_mut(&key)
             .expect("cached mesh inserted above");
+        cached.last_used = clock;
         let vbo = cached.vbo;
         let ebo = cached.ebo;
         let index_count = cached.index_count;
@@ -2605,6 +2637,8 @@ impl GlResources {
                 vbo,
                 ebo,
                 index_count,
+                bytes: vertex_bytes.len() + index_bytes.len(),
+                last_used: 0,
             },
         );
         (vbo, ebo, index_count)

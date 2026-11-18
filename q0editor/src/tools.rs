@@ -29,7 +29,6 @@ use crate::state::{
     TransformPivot,
 };
 
-const HIT_RADIUS: f32 = 6.0;
 // Keep freehand sampling density stable in screen space. A stage-space threshold
 // makes Pencil/Lasso turn into long sticks when zoomed out; raw pointer events
 // are instead accepted at sub-pixel screen spacing and later simplified/fitted.
@@ -1017,8 +1016,59 @@ fn handle_curve_drag(app: &mut EditorApp, response: &Response, cursor: Option<Ve
     if response.drag_stopped_by(PointerButton::Primary) {
         app.session.tool_state = ToolState::Idle;
         app.session.status = "Curve edited".to_string();
+        settle_edited_lines(app, &[path]);
     }
     true
+}
+
+/// Lines a drag or a drawing just changed, cut where they now cross other
+/// lines and parting the fills they run across (see
+/// [`crate::crossings::settle_edited_lines`]), while lines are cut where
+/// they cross. The selection follows the pieces.
+pub(crate) fn settle_edited_lines(app: &mut EditorApp, lines: &[PathRef]) {
+    if !app.settings.aids.split_crossings || lines.is_empty() {
+        return;
+    }
+    let settled = crate::crossings::settle_edited_lines(
+        &mut app.state.project,
+        app.session.current_frame,
+        lines,
+    );
+    if !settled.changed() {
+        return;
+    }
+    app.textures
+        .invalidate_assets(settled.assets.iter().copied());
+    app.session.selection =
+        crate::crossings::follow_cut_lines(&app.session.selection, &settled.pieces);
+    app.state.mark_dirty();
+}
+
+/// The lines a finished select-tool drag moved or reshaped.
+fn dragged_lines(state: &ToolState) -> Vec<PathRef> {
+    match state {
+        ToolState::DraggingPath {
+            q0rg_id,
+            layer_id,
+            placement_idx,
+            path_idx,
+            ..
+        } => vec![PathRef {
+            q0rg_id: *q0rg_id,
+            layer_id: *layer_id,
+            placement_idx: *placement_idx,
+            path_idx: *path_idx,
+        }],
+        ToolState::DraggingPaths { refs, .. }
+        | ToolState::DraggingRawHandle { refs, .. }
+        | ToolState::DraggingRawRotate { refs, .. }
+        | ToolState::DraggingRawSkew { refs, .. }
+        | ToolState::DraggingGroup { refs, .. } => refs.clone(),
+        ToolState::DraggingPathPoints { path, .. } | ToolState::DraggingLineEnd { path, .. } => {
+            vec![*path]
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn subselect(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: &StageView) {
@@ -1177,6 +1227,19 @@ fn subselect(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, vie
                 start_cursor,
             } => {
                 if let Some(point) = cursor {
+                    // The picked point nearest the press lands on whatever
+                    // is in reach, as with the points of one line.
+                    let point = if shift_down {
+                        point
+                    } else {
+                        crate::snap::move_cursor(
+                            app,
+                            start_cursor,
+                            point,
+                            view,
+                            response.ctx.frame_nr(),
+                        )
+                    };
                     let delta = constrain_move_delta(
                         Vec2::new(point.x - start_cursor.x, point.y - start_cursor.y),
                         shift_down,
@@ -1283,6 +1346,8 @@ fn subselect(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, vie
             }
             ToolState::DraggingManyPoints { parts, .. } => {
                 app.session.tool_state = ToolState::Idle;
+                let lines: Vec<PathRef> = parts.iter().map(|(path, _, _)| *path).collect();
+                settle_edited_lines(app, &lines);
                 app.session.status = format!(
                     "Moved {} point(s) on {} path(s)",
                     parts
@@ -1340,11 +1405,13 @@ fn subselect(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, vie
                 }
                 app.session.tool_state = ToolState::Idle;
                 app.session.status = "Vector point edit finished".to_string();
+                settle_edited_lines(app, &[path]);
                 return;
             }
-            ToolState::DraggingSubselectHandle { .. } => {
+            ToolState::DraggingSubselectHandle { path, .. } => {
                 app.session.tool_state = ToolState::Idle;
                 app.session.status = "Bezier handle moved".to_string();
+                settle_edited_lines(app, &[path]);
                 return;
             }
             _ => {}
@@ -2633,6 +2700,16 @@ fn selected_pivot_hit(app: &mut EditorApp, view: &StageView, cursor_screen: Pos2
 
 // ---------------- Pen tool ----------------
 
+/// How near the first point, in screen pixels, a press closes the path.
+const PEN_CLOSE_RADIUS: f32 = 8.0;
+const PEN_HINT: &str =
+    "Pen: click for a corner, drag for a curve (Alt: one handle, Shift: 45°) \u{b7} click the first point to close \u{b7} Enter or double-click ends \u{b7} Backspace undoes a point \u{b7} Esc cancels";
+
+/// Click for a corner point; press and drag for a smooth one whose handles
+/// follow the pointer (Alt moves only the outgoing handle, for a cusp;
+/// Shift keeps angles to 45°). Click or drag on the first point to close.
+/// Enter or a double-click ends an open path, Backspace takes the last
+/// point back, Esc drops the path.
 fn pen(
     app: &mut EditorApp,
     response: &Response,
@@ -2641,7 +2718,15 @@ fn pen(
     view: &StageView,
     ctx: &Context,
 ) {
-    let cursor = cursor.map(|point| {
+    if !matches!(
+        app.session.tool_state,
+        ToolState::PenDrawing { .. } | ToolState::Idle
+    ) {
+        // Other tool was active; reset.
+        app.session.tool_state = ToolState::Idle;
+    }
+    let (alt, shift) = ctx.input(|input| (input.modifiers.alt, input.modifiers.shift));
+    let snap = |app: &mut EditorApp, point: Vec2| {
         crate::snap::point(
             app,
             point,
@@ -2649,65 +2734,190 @@ fn pen(
             &crate::snap::Leave::default(),
             ctx.frame_nr(),
         )
-    });
-    let in_progress = matches!(app.session.tool_state, ToolState::PenDrawing { .. });
-    if !in_progress && !matches!(app.session.tool_state, ToolState::Idle) {
-        // Other tool was active; reset.
-        app.session.tool_state = ToolState::Idle;
-    }
+    };
+    let on_first = |anchors: &[Anchor], screen: Pos2| {
+        anchors.len() >= 2
+            && stage_to_screen(anchors[0].point, view).distance(screen) <= PEN_CLOSE_RADIUS
+    };
+    let place = |app: &mut EditorApp, anchors: &mut Vec<Anchor>, at: Vec2| {
+        let point = snap(app, at);
+        let point = match anchors.last() {
+            Some(previous) if shift => pen_angle_step(previous.point, point),
+            _ => point,
+        };
+        anchors.push(Anchor {
+            point,
+            in_handle: None,
+            out_handle: None,
+        });
+    };
 
-    let commit_close = response.double_clicked_by(PointerButton::Primary);
-    let escape = ctx.input(|i| i.key_pressed(Key::Escape));
-    let enter = ctx.input(|i| i.key_pressed(Key::Enter));
+    // A press that turned into a drag: the point goes where the press was,
+    // and the drag pulls out its handles.
+    if response.drag_started_by(PointerButton::Primary) {
+        if let Some(press) = ctx.input(|input| input.pointer.press_origin()) {
+            let (mut anchors, _) = take_pen(app);
+            let closing = on_first(&anchors, press);
+            if !closing {
+                place(app, &mut anchors, screen_to_stage(press, view));
+            }
+            app.session.tool_state = ToolState::PenDrawing { anchors, closing };
+        }
+    }
+    if response.dragged_by(PointerButton::Primary) {
+        if let (Some(pointer), ToolState::PenDrawing { anchors, closing }) =
+            (ctx.pointer_interact_pos(), &mut app.session.tool_state)
+        {
+            let index = if *closing {
+                0
+            } else {
+                anchors.len().saturating_sub(1)
+            };
+            if let Some(anchor) = anchors.get_mut(index) {
+                let mut handle = screen_to_stage(pointer, view);
+                if shift {
+                    handle = pen_angle_step(anchor.point, handle);
+                }
+                let pulled = stage_to_screen(anchor.point, view).distance(pointer) >= 2.0;
+                let handle = pulled.then_some(handle);
+                let mirrored = handle.map(|handle| {
+                    Vec2::new(
+                        2.0 * anchor.point.x - handle.x,
+                        2.0 * anchor.point.y - handle.y,
+                    )
+                });
+                if *closing {
+                    // The closing curve arrives through the first point's
+                    // incoming handle.
+                    anchor.in_handle = mirrored;
+                    if !alt {
+                        anchor.out_handle = handle;
+                    }
+                } else {
+                    anchor.out_handle = handle;
+                    if !alt {
+                        anchor.in_handle = mirrored;
+                    }
+                }
+            }
+        }
+        ctx.request_repaint();
+    }
+    if response.drag_stopped()
+        && matches!(
+            app.session.tool_state,
+            ToolState::PenDrawing { closing: true, .. }
+        )
+    {
+        let (anchors, _) = take_pen(app);
+        finish_pen(app, anchors, true);
+        return;
+    }
 
     if response.clicked_by(PointerButton::Primary)
         && !response.double_clicked_by(PointerButton::Primary)
     {
-        if let Some(p) = cursor {
-            let mut anchors = match std::mem::replace(&mut app.session.tool_state, ToolState::Idle)
-            {
-                ToolState::PenDrawing { anchors } => anchors,
-                _ => Vec::new(),
-            };
-            // Clicking very close to the first anchor closes the path.
-            if anchors.len() >= 2 {
-                let first = anchors[0].point;
-                let dx = (first.x - p.x) * 1.0;
-                let dy = (first.y - p.y) * 1.0;
-                if (dx * dx + dy * dy).sqrt() < HIT_RADIUS {
-                    commit_path(app, anchors, true, DrawingMode::Merge);
-                    return;
-                }
+        if let (Some(at), Some(screen)) = (cursor, ctx.pointer_interact_pos()) {
+            let (mut anchors, _) = take_pen(app);
+            if on_first(&anchors, screen) {
+                finish_pen(app, anchors, true);
+                return;
             }
-            anchors.push(Anchor {
-                point: p,
-                in_handle: None,
-                out_handle: None,
-            });
-            app.session.tool_state = ToolState::PenDrawing { anchors };
-            app.session.status = "Pen: anchor added (Enter closes, Esc cancels)".to_string();
+            place(app, &mut anchors, at);
+            app.session.tool_state = ToolState::PenDrawing {
+                anchors,
+                closing: false,
+            };
+            app.session.status = PEN_HINT.to_string();
         }
     }
 
-    if commit_close {
-        if let ToolState::PenDrawing { anchors } =
-            std::mem::replace(&mut app.session.tool_state, ToolState::Idle)
-        {
-            if anchors.len() >= 2 {
-                commit_path(app, anchors, true, DrawingMode::Merge);
-            }
-        }
-    } else if enter {
-        if let ToolState::PenDrawing { anchors } =
-            std::mem::replace(&mut app.session.tool_state, ToolState::Idle)
-        {
-            if anchors.len() >= 2 {
-                commit_path(app, anchors, false, DrawingMode::Merge);
-            }
-        }
-    } else if escape {
+    let drawing = matches!(app.session.tool_state, ToolState::PenDrawing { .. });
+    let (enter, escape, backspace) = ctx.input(|input| {
+        (
+            input.key_pressed(Key::Enter),
+            input.key_pressed(Key::Escape),
+            input.key_pressed(Key::Backspace),
+        )
+    });
+    if drawing && (enter || response.double_clicked_by(PointerButton::Primary)) {
+        let (anchors, _) = take_pen(app);
+        finish_pen(app, anchors, false);
+    } else if drawing && escape {
         app.session.tool_state = ToolState::Idle;
-        app.session.status = "Pen: cancelled".to_string();
+        app.session.status = "Pen: path dropped".to_string();
+    } else if drawing && backspace {
+        let (mut anchors, _) = take_pen(app);
+        anchors.pop();
+        if anchors.is_empty() {
+            app.session.status = "Pen: path dropped".to_string();
+        } else {
+            app.session.tool_state = ToolState::PenDrawing {
+                anchors,
+                closing: false,
+            };
+        }
+    }
+}
+
+fn take_pen(app: &mut EditorApp) -> (Vec<Anchor>, bool) {
+    match std::mem::replace(&mut app.session.tool_state, ToolState::Idle) {
+        ToolState::PenDrawing { anchors, closing } => (anchors, closing),
+        _ => (Vec::new(), false),
+    }
+}
+
+fn finish_pen(app: &mut EditorApp, anchors: Vec<Anchor>, closed: bool) {
+    app.session.tool_state = ToolState::Idle;
+    if anchors.len() < 2 {
+        app.session.status = "Pen: a path needs two points".to_string();
+        return;
+    }
+    commit_path(app, anchors, closed, DrawingMode::Merge);
+    app.session.status = if closed {
+        "Pen: closed path drawn"
+    } else {
+        "Pen: open path drawn"
+    }
+    .to_string();
+}
+
+/// `point` turned about `origin` to the nearest 45°, at the same distance.
+fn pen_angle_step(origin: Vec2, point: Vec2) -> Vec2 {
+    let (dx, dy) = (point.x - origin.x, point.y - origin.y);
+    let length = dx.hypot(dy);
+    if length <= f32::EPSILON {
+        return point;
+    }
+    let step = std::f32::consts::FRAC_PI_4;
+    let angle = (dy.atan2(dx) / step).round() * step;
+    Vec2::new(
+        origin.x + angle.cos() * length,
+        origin.y + angle.sin() * length,
+    )
+}
+
+/// One pen segment as screen points, curved as it will be drawn.
+fn pen_segment_screen(a: &Anchor, b: &Anchor, view: &StageView, out: &mut Vec<Pos2>) {
+    let (p0, p3) = (a.point, b.point);
+    let p1 = a.out_handle.unwrap_or(p0);
+    let p2 = b.in_handle.unwrap_or(p3);
+    if a.out_handle.is_none() && b.in_handle.is_none() {
+        out.push(stage_to_screen(p3, view));
+        return;
+    }
+    const STEPS: usize = 24;
+    for step in 1..=STEPS {
+        let t = step as f32 / STEPS as f32;
+        let mt = 1.0 - t;
+        let (a, b, c, d) = (mt * mt * mt, 3.0 * mt * mt * t, 3.0 * mt * t * t, t * t * t);
+        out.push(stage_to_screen(
+            Vec2::new(
+                a * p0.x + b * p1.x + c * p2.x + d * p3.x,
+                a * p0.y + b * p1.y + c * p2.y + d * p3.y,
+            ),
+            view,
+        ));
     }
 }
 
@@ -3976,6 +4186,97 @@ fn marquee_selection(
 
     let raw_hits = collect_raw_paths_in_rect(project, q0rg_id, frame, rect);
     selection_from_group_parts(raw_hits, objects)
+}
+
+/// The marquee as a click on everything it touches: whole fills (with their
+/// holes) and whole lines, plus the objects, the same parts Shift-clicking
+/// each would pick, so Properties edits them the same way. A filled shape
+/// with an outline gives both its paint and its outline.
+fn marquee_whole_selection(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    frame: u16,
+    rect: (f32, f32, f32, f32),
+) -> Selection {
+    let objects = collect_placements_in_rect(project, q0rg_id, frame, rect);
+    // Lines, and the outlines of shapes without paint.
+    let mut strokes = collect_raw_paths_in_rect(project, q0rg_id, frame, rect);
+    let mut fills = Vec::new();
+    let mut outlined_fill = false;
+    if let Some(q0rg) = project.q0rgs.iter().find(|q| q.q0rg_id == q0rg_id) {
+        for layer in q0rg.layers.iter().rev() {
+            if !project.layer_is_visible(q0rg_id, layer.layer_id)
+                || project.layer_is_locked(q0rg_id, layer.layer_id)
+            {
+                continue;
+            }
+            for placement_idx in active_raw_placement_indices(project, layer, frame) {
+                let Target::Asset(asset_id) = layer.placements[placement_idx].target else {
+                    continue;
+                };
+                let Some(Asset::Vector(vector)) =
+                    project.assets.iter().find(|a| a.id() == asset_id)
+                else {
+                    continue;
+                };
+                if vector.fill.is_none() {
+                    continue;
+                }
+                let rings: Vec<(usize, Vec<Vec2>)> = vector
+                    .paths
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, path)| path.closed)
+                    .map(|(index, path)| (index, flatten_path(path)))
+                    .collect();
+                let mut chosen = std::collections::BTreeSet::new();
+                for (index, points) in &rings {
+                    if path_intersects_rect(points, true, rect) {
+                        chosen.insert(*index);
+                    }
+                }
+                // A touched shape comes whole: the rings inside it are its
+                // holes and the islands in them.
+                let touched: Vec<usize> = chosen.iter().copied().collect();
+                for outer in touched {
+                    let Some((_, outline)) = rings.iter().find(|(index, _)| *index == outer) else {
+                        continue;
+                    };
+                    for (index, points) in &rings {
+                        if points
+                            .first()
+                            .is_some_and(|point| point_in_polygon(outline, *point))
+                        {
+                            chosen.insert(*index);
+                        }
+                    }
+                }
+                for path_idx in chosen {
+                    let reference = PathRef {
+                        q0rg_id,
+                        layer_id: layer.layer_id,
+                        placement_idx,
+                        path_idx,
+                    };
+                    fills.push(reference);
+                    if vector.stroke.is_some() {
+                        strokes.push(reference);
+                        outlined_fill = true;
+                    }
+                }
+            }
+        }
+    }
+    if outlined_fill {
+        return Selection::RawParts {
+            fills,
+            strokes,
+            stroke_segments: Vec::new(),
+            objects,
+        };
+    }
+    fills.extend(strokes);
+    selection_from_group_parts(fills, objects)
 }
 
 /// Select clipped raw artwork and whole display objects touched by the
@@ -6282,20 +6583,18 @@ fn catmull_rom_anchors(points: &[Vec2]) -> Vec<Anchor> {
 
 // ---------------- Eraser tool ----------------
 
+/// The eraser is a brush that takes away: synced, it is the brush exactly;
+/// otherwise it has its own nib, size, smoothing and dynamics.
 fn eraser_settings(app: &EditorApp, view_scale: f32) -> crate::brush::BrushSettings {
-    let mut settings = app.session.brush;
-    if settings.sync_with_eraser {
-        if !settings.scale_with_stage {
-            settings.size /= view_scale.max(1.0e-4);
-        }
+    let mut settings = if app.session.brush.sync_with_eraser {
+        app.session.brush
     } else {
-        settings.size = app.session.eraser_size.max(0.1);
-        if !settings.scale_with_stage {
-            settings.size /= view_scale.max(1.0e-4);
-        }
-        settings.nib = crate::brush::BrushNib::Circle;
+        app.session.eraser
+    };
+    settings.size = settings.size.max(0.1);
+    if !settings.scale_with_stage {
+        settings.size /= view_scale.max(1.0e-4);
     }
-    settings.smoothing = 0;
     settings
 }
 
@@ -6312,7 +6611,11 @@ fn eraser(app: &mut EditorApp, response: &Response, view: &StageView, ctx: &Cont
 
     if drag_started {
         if let Some(screen) = response.interact_pointer_pos() {
-            let sample = crate::brush::BrushSample::mouse(screen_to_stage(screen, view));
+            let sample = crate::brush::BrushSample::pointer(
+                screen_to_stage(screen, view),
+                pointer_pressure_at(ctx, screen),
+                ctx.input(|input| input.time),
+            );
             app.session.tool_state = ToolState::EraserDrawing {
                 stroke: crate::brush::brush_begin(settings, sample),
             };
@@ -6351,44 +6654,20 @@ fn eraser(app: &mut EditorApp, response: &Response, view: &StageView, ctx: &Cont
     sync_classic_brush_preview_for_view(app, response, view, ctx);
 
     if drag_started || dragged || drag_stopped {
-        let event_positions: Vec<Pos2> = ctx.input(|input| {
-            input
-                .events
-                .iter()
-                .filter_map(|event| match event {
-                    egui::Event::PointerMoved(position) => Some(*position),
-                    _ => None,
-                })
-                .collect()
-        });
+        // The brush's own input: pen pressure and timing reach the eraser's
+        // size dynamics as they do the brush's.
+        let samples = classic_input_samples(ctx, response, view);
         let mut body_tail = Vec::new();
         let mut outline_tail = Vec::new();
 
         if let ToolState::EraserDrawing { stroke } = &mut app.session.tool_state {
             let old_len = stroke.samples.len();
-            for screen in event_positions {
-                if response.rect.contains(screen) {
-                    crate::brush::brush_add_sample(
-                        stroke,
-                        settings,
-                        crate::brush::BrushSample::mouse(screen_to_stage(screen, view)),
-                    );
-                }
-            }
-            if let Some(screen) = response.interact_pointer_pos() {
-                if response.rect.contains(screen) {
-                    let point = screen_to_stage(screen, view);
-                    if stroke
-                        .samples
-                        .last()
-                        .is_none_or(|sample| sample.position != point)
-                    {
-                        crate::brush::brush_add_sample(
-                            stroke,
-                            settings,
-                            crate::brush::BrushSample::mouse(point),
-                        );
-                    }
+            for sample in samples {
+                if response
+                    .rect
+                    .contains(stage_to_screen(sample.position, view))
+                {
+                    crate::brush::brush_add_sample(stroke, settings, sample);
                 }
             }
 
@@ -8622,13 +8901,31 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
             if let Some(end) = cursor {
                 let min = Vec2::new(start.x.min(end.x), start.y.min(end.y));
                 let max = Vec2::new(start.x.max(end.x), start.y.max(end.y));
-                let selection = marquee_selection(
+                // Whole shapes, as Shift-clicking each would; Alt cuts out
+                // only the part inside, as Animate does.
+                let pick = if response.ctx.input(|input| input.modifiers.alt) {
+                    marquee_selection
+                } else {
+                    marquee_whole_selection
+                };
+                let selection = pick(
                     &app.state.project,
                     app.session.current_q0rg_id,
                     app.session.current_frame,
                     (min.x, min.y, max.x, max.y),
                 );
                 app.session.status = match &selection {
+                    Selection::RawParts {
+                        fills,
+                        strokes,
+                        objects,
+                        ..
+                    } => format!(
+                        "Selected {} shape(s), {} line(s) and {} object(s)",
+                        fills.len(),
+                        strokes.len(),
+                        objects.len()
+                    ),
                     Selection::RawArea {
                         placements,
                         objects,
@@ -8661,6 +8958,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 app.state.mark_dirty();
             }
         }
+        settle_edited_lines(app, &dragged_lines(&finished_state));
         let finished_drag = matches!(
             finished_state,
             ToolState::DraggingPlacement { .. }
@@ -13003,6 +13301,48 @@ pub(crate) fn set_selected_stroke_width(app: &mut EditorApp, width: f32) -> bool
 /// Changes the outline of the selected raw parts with `restyle`: colour,
 /// width, ends or corners. Lines sharing a drawing with others are lifted
 /// into their own first, so only what is selected changes.
+/// Corners are where a line's segments meet, so a corner style goes to the
+/// whole lines the selection touches. Restyling cuts a selected segment out
+/// first, as other stroke edits do, and a line cut out has no corners left
+/// to shape: that is why Corners seemed to do nothing.
+pub(crate) fn set_selected_stroke_join(
+    app: &mut EditorApp,
+    join: q0s_format::geom::JoinShape,
+) -> bool {
+    let whole = match &app.session.selection {
+        Selection::StrokeSegment(segment) => Some(Selection::RawParts {
+            fills: Vec::new(),
+            strokes: vec![segment.path],
+            stroke_segments: Vec::new(),
+            objects: Vec::new(),
+        }),
+        Selection::RawParts {
+            fills,
+            strokes,
+            stroke_segments,
+            objects,
+        } if !stroke_segments.is_empty() => {
+            let mut strokes = strokes.clone();
+            for segment in stroke_segments {
+                if !strokes.contains(&segment.path) {
+                    strokes.push(segment.path);
+                }
+            }
+            Some(Selection::RawParts {
+                fills: fills.clone(),
+                strokes,
+                stroke_segments: Vec::new(),
+                objects: objects.clone(),
+            })
+        }
+        _ => None,
+    };
+    if let Some(whole) = whole {
+        app.session.selection = whole;
+    }
+    restyle_selected_strokes(app, move |stroke| stroke.join = join)
+}
+
 pub(crate) fn restyle_selected_strokes(
     app: &mut EditorApp,
     restyle: impl Fn(&mut VStroke),
@@ -14462,20 +14802,30 @@ fn commit_path(app: &mut EditorApp, anchors: Vec<Anchor>, closed: bool, mode: Dr
 }
 
 fn commit_vector_path(app: &mut EditorApp, new_path: VPath, mode: DrawingMode) {
-    app.history
-        .snapshot_with_session(&app.state.project, &app.session);
-
     let mut fill = if new_path.closed {
         app.session.fill_color
     } else {
         None
     };
-    let stroke = Some(VStroke {
+    // A stroke of none leaves a closed shape its fill alone. A line is
+    // nothing but its stroke, so without one there is nothing to draw.
+    let stroke = (!app.session.stroke_none).then_some(VStroke {
         color: app.session.stroke_color,
         width: app.session.stroke_width.max(0.1),
         cap: app.session.brush_cap,
         join: app.session.brush_join,
     });
+    if fill.is_none() && stroke.is_none() {
+        app.session.status = if new_path.closed {
+            "Nothing drawn: the fill and the stroke are both none".to_string()
+        } else {
+            "Nothing drawn: a line needs a stroke colour, and the stroke is none".to_string()
+        };
+        return;
+    }
+    app.history
+        .snapshot_with_session(&app.state.project, &app.session);
+
     let new_bbox = match path_bbox(&new_path) {
         Some(b) => b,
         None => return, // degenerate path with no geometry
@@ -14504,6 +14854,12 @@ fn commit_vector_path(app: &mut EditorApp, new_path: VPath, mode: DrawingMode) {
             app.session.selection = Selection::None;
         }
         fill = None;
+        if stroke.is_none() {
+            // the fill is all there is, and it is painted
+            app.state.mark_dirty();
+            app.session.status = "New fill".to_string();
+            return;
+        }
     }
 
     let merge_asset_id = match mode {
@@ -14596,16 +14952,44 @@ fn cut_new_line_at_crossings(
     if !app.settings.aids.split_crossings {
         return;
     }
-    if crate::crossings::cut_at_crossings(
-        &mut app.state.project,
-        q0rg_id,
-        layer_id,
-        frame,
-        asset_id,
-        path_idx,
-    ) {
-        app.textures.invalidate();
-        app.state.mark_dirty();
+    let placement_idx = app
+        .state
+        .project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+        .and_then(|q0rg| q0rg.layers.iter().find(|layer| layer.layer_id == layer_id))
+        .and_then(|layer| {
+            layer.placements.iter().position(|placement| {
+                placement.frame == frame && placement.target == Target::Asset(asset_id)
+            })
+        });
+    match placement_idx {
+        // Cut where it crosses, and part the fills it runs across.
+        Some(placement_idx) if frame == app.session.current_frame => {
+            settle_edited_lines(
+                app,
+                &[PathRef {
+                    q0rg_id,
+                    layer_id,
+                    placement_idx,
+                    path_idx,
+                }],
+            );
+        }
+        _ => {
+            if crate::crossings::cut_at_crossings(
+                &mut app.state.project,
+                q0rg_id,
+                layer_id,
+                frame,
+                asset_id,
+                path_idx,
+            ) {
+                app.textures.invalidate();
+                app.state.mark_dirty();
+            }
+        }
     }
 }
 
@@ -16018,7 +16402,6 @@ fn paint_advanced_gpu_preview(
 }
 
 fn draw_in_progress_overlay(app: &EditorApp, painter: &Painter, view: &StageView) {
-    let red = Color32::from_rgb(0xCC, 0x33, 0x33);
     let cursor = painter.ctx().pointer_hover_pos();
 
     match &app.session.tool_state {
@@ -16032,32 +16415,72 @@ fn draw_in_progress_overlay(app: &EditorApp, painter: &Painter, view: &StageView
                 painter.circle_filled(stage_to_screen(points[0], view), 3.0, selection_color(app));
             }
         }
-        ToolState::PenDrawing { anchors } => {
-            if anchors.len() >= 2 {
-                let pts: Vec<Pos2> = anchors
-                    .iter()
-                    .map(|a| stage_to_screen(a.point, view))
-                    .collect();
-                painter.add(Shape::Path(PathShape {
-                    points: pts,
-                    closed: false,
-                    fill: Color32::TRANSPARENT,
-                    stroke: Stroke::new(1.0_f32, red),
-                }));
+        ToolState::PenDrawing { anchors, closing } => {
+            let accent = selection_color(app);
+            let line = Stroke::new(1.5_f32, accent);
+            // The path so far, curved as it will be drawn.
+            if let Some(first) = anchors.first() {
+                let mut points = vec![stage_to_screen(first.point, view)];
+                for pair in anchors.windows(2) {
+                    pen_segment_screen(&pair[0], &pair[1], view, &mut points);
+                }
+                if *closing {
+                    if let Some(last) = anchors.last() {
+                        pen_segment_screen(last, first, view, &mut points);
+                    }
+                }
+                if points.len() >= 2 {
+                    painter.add(Shape::line(points, line));
+                }
             }
-            if let (Some(last), Some(c)) = (anchors.last(), cursor) {
-                let from = stage_to_screen(last.point, view);
-                painter.add(Shape::Path(PathShape {
-                    points: vec![from, c],
-                    closed: false,
-                    fill: Color32::TRANSPARENT,
-                    stroke: Stroke::new(1.0_f32, Color32::from_rgb(0xCC, 0x66, 0x66)),
-                }));
+            let pressed = painter.ctx().input(|input| input.pointer.primary_down());
+            let closes_here = cursor.is_some_and(|c| {
+                anchors.len() >= 2
+                    && stage_to_screen(anchors[0].point, view).distance(c) <= PEN_CLOSE_RADIUS
+            });
+            // The next segment, from the last point to the pointer (or to
+            // the first point when a click there would close the path).
+            if let (Some(last), Some(c), false) = (anchors.last(), cursor, pressed || *closing) {
+                let target = if closes_here {
+                    anchors[0].clone()
+                } else {
+                    let at = screen_to_stage(c, view);
+                    Anchor {
+                        point: at,
+                        in_handle: None,
+                        out_handle: None,
+                    }
+                };
+                let mut band = vec![stage_to_screen(last.point, view)];
+                pen_segment_screen(last, &target, view, &mut band);
+                painter.add(Shape::line(
+                    band,
+                    Stroke::new(1.0_f32, accent.gamma_multiply(0.6)),
+                ));
             }
-            for a in anchors {
-                let s = stage_to_screen(a.point, view);
-                painter.circle_filled(s, 3.5, red);
-                painter.circle_stroke(s, 3.5, Stroke::new(1.0_f32, Color32::WHITE));
+            // Handles of the point being shaped: the last one, or the first
+            // while closing.
+            let shaped = if *closing {
+                anchors.first()
+            } else {
+                anchors.last()
+            };
+            if let Some(anchor) = shaped {
+                let at = stage_to_screen(anchor.point, view);
+                for handle in [anchor.in_handle, anchor.out_handle].into_iter().flatten() {
+                    let end = stage_to_screen(handle, view);
+                    painter.line_segment([at, end], Stroke::new(1.0_f32, accent));
+                    painter.circle_filled(end, 3.0, accent);
+                }
+            }
+            for (index, anchor) in anchors.iter().enumerate() {
+                let at = stage_to_screen(anchor.point, view);
+                let square = egui::Rect::from_center_size(at, egui::vec2(6.0, 6.0));
+                painter.rect_filled(square, 0.0, Color32::WHITE);
+                painter.rect_stroke(square, 0.0, Stroke::new(1.0_f32, accent));
+                if index == 0 && closes_here {
+                    painter.circle_stroke(at, PEN_CLOSE_RADIUS, Stroke::new(1.5_f32, accent));
+                }
             }
         }
         ToolState::FreehandDrawing { points } => {
@@ -16126,7 +16549,13 @@ fn draw_in_progress_overlay(app: &EditorApp, painter: &Painter, view: &StageView
                             stroke: Stroke::NONE,
                         }));
                     }
-                    if let Some(mesh) = crate::render::styled_stroke_mesh(
+                    if app.session.stroke_none {
+                        // no stroke: a hairline shows where the fill will go
+                        painter.add(Shape::closed_line(
+                            points,
+                            Stroke::new(1.0_f32, selection_color(app)),
+                        ));
+                    } else if let Some(mesh) = crate::render::styled_stroke_mesh(
                         &points,
                         app.session.stroke_width.max(0.5) * view.effective_scale(),
                         path.closed,
@@ -16174,6 +16603,48 @@ fn draw_in_progress_overlay(app: &EditorApp, painter: &Painter, view: &StageView
         | ToolState::Idle => {}
         ToolState::KnifeDrawing { .. } => crate::knife::paint_preview(app, painter, view),
     }
+}
+
+/// The selected lines' body: stage geometry and its stipple and outline
+/// meshes are built once for the surface, then drawn from the GPU each frame.
+fn paint_selected_stroke_surface(
+    app: &mut EditorApp,
+    painter: &Painter,
+    view: &StageView,
+    surface: &std::sync::Arc<MultiPolygon<f64>>,
+) {
+    if surface.0.is_empty() {
+        return;
+    }
+    let accent = selection_color(app);
+    #[cfg(feature = "appearance-mask-eraser")]
+    {
+        let fresh = app
+            .textures
+            .selected_stroke_area
+            .as_ref()
+            .and_then(|(held, _)| held.upgrade())
+            .is_some_and(|held| std::sync::Arc::ptr_eq(&held, surface));
+        if !fresh {
+            let stage_view = StageView {
+                origin: Pos2::ZERO,
+                scale: 1.0,
+                stage_rect: painter.clip_rect(),
+                edit_transform: Affine::IDENTITY,
+            };
+            let geometry = CachedRawAreaSelection::new(
+                &surface_to_screen_contours(surface, &stage_view),
+                Vec::new(),
+            );
+            app.textures.selected_stroke_area =
+                Some((std::sync::Arc::downgrade(surface), geometry));
+        }
+        if let Some((_, source)) = app.textures.selected_stroke_area.as_mut() {
+            paint_cached_selection_surface(&mut app.perf, painter, view, source, accent);
+        }
+    }
+    #[cfg(not(feature = "appearance-mask-eraser"))]
+    paint_selection_surface(painter, &surface_to_screen_contours(surface, view), accent);
 }
 
 /// The painted bodies of the selected line channels, unioned before stippling.
@@ -16303,6 +16774,7 @@ fn build_selected_stroke_surface(app: &EditorApp) -> std::sync::Arc<MultiPolygon
     whole.sort_by_key(|r| (r.q0rg_id, r.layer_id, r.placement_idx, r.path_idx));
     whole.dedup();
     let mut polygons = Vec::new();
+    let mut thinnest = f64::INFINITY;
     let mut append = |reference: PathRef, segment: Option<usize>| {
         let Some(placement) = project
             .q0rgs
@@ -16340,6 +16812,7 @@ fn build_selected_stroke_surface(app: &EditorApp) -> std::sync::Arc<MultiPolygon
         .map(|(transform, _)| transform)
         .unwrap_or(placement.transform);
         let affine = Affine::from_transform(transform);
+        thinnest = thinnest.min(f64::from(stroke.width * affine.uniform_scale()));
         for contour in q0s_format::geom::stroke_polygons(
             &flatten_path_for_stroke(path),
             path.closed,
@@ -16372,11 +16845,36 @@ fn build_selected_stroke_surface(app: &EditorApp) -> std::sync::Arc<MultiPolygon
             append(segment.path, Some(segment.segment_idx));
         }
     }
-    let surface = geo::unary_union(polygons.iter());
+    let thinnest = if thinnest.is_finite() { thinnest } else { 1.0 };
+    let surface = without_slits(geo::unary_union(polygons.iter()), thinnest);
     std::sync::Arc::new(match clip {
         Some(clip) => surface.intersection(&clip),
         None => surface,
     })
+}
+
+/// `surface` without the hairline holes and specks a union of pieces that
+/// meet edge to edge leaves behind: anything with less area than a square a
+/// fifth of the thinnest line wide. A real hole in a stroke is never that
+/// small; a slit drawn with an outline is a line across the stroke.
+fn without_slits(surface: MultiPolygon<f64>, thinnest: f64) -> MultiPolygon<f64> {
+    use geo::Area;
+    let least = (thinnest * 0.2).powi(2).max(1.0e-6);
+    MultiPolygon(
+        surface
+            .0
+            .into_iter()
+            .filter(|polygon| polygon.unsigned_area() > least)
+            .map(|polygon| {
+                let (exterior, interiors) = polygon.into_inner();
+                let interiors = interiors
+                    .into_iter()
+                    .filter(|ring| Polygon::new(ring.clone(), Vec::new()).unsigned_area() > least)
+                    .collect();
+                Polygon::new(exterior, interiors)
+            })
+            .collect(),
+    )
 }
 
 /// Draw selection bounds using the current theme accent.
@@ -16431,11 +16929,7 @@ pub fn draw_selection_overlay(app: &mut EditorApp, painter: &Painter, view: &Sta
     let boxed = transform_box_shown(app);
     if app.session.current_tool != Tool::Subselect {
         let surface = selected_stroke_surface(app, painter.ctx());
-        paint_selection_surface(
-            painter,
-            &surface_to_screen_contours(&surface, view),
-            selection_color(app),
-        );
+        paint_selected_stroke_surface(app, painter, view, &surface);
     }
     painter
         .ctx()
@@ -17449,10 +17943,23 @@ fn draw_clipped_raw_area_selection(
         stage_started.elapsed(),
     );
 
-    let texture = selection_stipple_texture(painter, accent);
     let Some(source) = app.textures.raw_area_selection(&key) else {
         return;
     };
+    paint_cached_selection_surface(&mut app.perf, painter, view, source, accent);
+}
+
+/// Paints a cached selection surface, stipple and outline, on the GPU. Its
+/// meshes are built once per surface and pose; pan and zoom only reproject.
+#[cfg(feature = "appearance-mask-eraser")]
+fn paint_cached_selection_surface(
+    perf: &mut crate::perf::PerfLog,
+    painter: &Painter,
+    view: &StageView,
+    source: &mut CachedRawAreaSelection,
+    accent: Color32,
+) {
+    let texture = selection_stipple_texture(painter, accent);
     let reference_key = (accent, texture.id(), [0; 7]);
     let edit = view.edit_transform;
     let fallback_key = (
@@ -17474,13 +17981,8 @@ fn draw_clipped_raw_area_selection(
         reference_key
     };
     if source.paint_key != Some(paint_key) {
-        app.perf
-            .add_counter(crate::perf::PerfCounter::SelectionPaintCacheMisses, 1);
+        perf.add_counter(crate::perf::PerfCounter::SelectionPaintCacheMisses, 1);
         let paint_started = std::time::Instant::now();
-        let source = app
-            .textures
-            .raw_area_selection(&key)
-            .expect("cached marquee geometry");
         let reference_meshes = (source.fill.affine_reprojection_supported != Some(false))
             .then(|| {
                 crate::render::raw_area_selection_reference_meshes(
@@ -17502,11 +18004,11 @@ fn draw_clipped_raw_area_selection(
                 accent,
             )
         });
-        app.perf.set_counter_max(
+        perf.set_counter_max(
             crate::perf::PerfCounter::SelectionMeshVertices,
             meshes.iter().map(|mesh| mesh.vertices.len() as u64).sum(),
         );
-        app.perf.set_counter_max(
+        perf.set_counter_max(
             crate::perf::PerfCounter::SelectionMeshIndices,
             meshes.iter().map(|mesh| mesh.indices.len() as u64).sum(),
         );
@@ -17531,19 +18033,15 @@ fn draw_clipped_raw_area_selection(
         } else {
             fallback_key
         });
-        app.perf.record(
+        perf.record(
             crate::perf::PerfSpan::SelectionScreenMeshBuild,
             paint_started.elapsed(),
         );
     }
-    let Some(cached) = app
-        .textures
-        .raw_area_selection(&key)
-        .and_then(|source| source.paint.as_ref())
-    else {
+    let Some(cached) = source.paint.as_ref() else {
         return;
     };
-    app.perf.add_counter(
+    perf.add_counter(
         crate::perf::PerfCounter::SelectionGpuCallbacks,
         cached.meshes.len() as u64 + u64::from(cached.solid_overlay.is_some()),
     );
@@ -18320,7 +18818,45 @@ enum SampledPaint {
     Stroke(VStroke),
 }
 
+/// Click vector paint to copy its exact fill or stroke. Click anything else
+/// (a bitmap, a gradient, the background) to take the colour shown there, and
+/// press on the stage and drag to take it from anywhere on screen: the
+/// panels too, and on Windows other windows. Shift sends a picked colour to
+/// the stroke instead of the fill.
 fn eyedropper(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: &StageView) {
+    let ctx = response.ctx.clone();
+    let owner = egui::Id::new("eyedropper_tool");
+    let to_stroke_id = owner.with("to_stroke");
+    // A colour asked for from a screenshot (where the screen cannot be
+    // read directly) lands a frame or two later.
+    if let Some(color) = crate::color_picker::take_pixel(&ctx, owner) {
+        let to_stroke = ctx.data(|data| data.get_temp::<bool>(to_stroke_id).unwrap_or(false));
+        take_shown_colour(app, color, to_stroke);
+    }
+    let pointer = ctx.input(|input| input.pointer.latest_pos());
+    let shift = ctx.input(|input| input.modifiers.shift);
+    if response.dragged_by(PointerButton::Primary) {
+        ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+        #[cfg(windows)]
+        if let (Some(point), Some(color)) = (pointer, crate::color_picker::pixel_under_pointer()) {
+            // A live swatch beside the pointer, never under it: the screen
+            // is read where the pointer is.
+            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, owner));
+            let at = point + egui::vec2(18.0, -18.0);
+            painter.circle_filled(at, 10.0, color);
+            painter.circle_stroke(at, 10.0, Stroke::new(2.0_f32, Color32::WHITE));
+            painter.circle_stroke(at, 11.5, Stroke::new(1.0_f32, Color32::BLACK));
+        }
+        ctx.request_repaint();
+        return;
+    }
+    if response.drag_stopped() {
+        if let Some(point) = pointer {
+            ctx.data_mut(|data| data.insert_temp(to_stroke_id, shift));
+            crate::color_picker::request_pixel(&ctx, owner, point);
+        }
+        return;
+    }
     if !response.clicked_by(PointerButton::Primary) {
         return;
     }
@@ -18337,20 +18873,47 @@ fn eyedropper(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, vi
         tolerance,
         0,
     );
-    match sampled {
+    match sampled.filter(|_| !shift) {
         Some(SampledPaint::Fill(color)) => {
             app.session.fill_color = Some(color);
+            app.session.fill_kept = color;
             app.session.status = "Fill sampled".to_string();
         }
         Some(SampledPaint::Stroke(stroke)) => {
             app.session.stroke_color = stroke.color;
+            app.session.stroke_none = false;
             app.session.stroke_width = stroke.width.max(0.1);
             app.session.brush_cap = stroke.cap;
             app.session.status = "Stroke sampled".to_string();
         }
+        // No vector paint here (or Shift): the colour as it shows.
         None => {
-            app.session.status = "No vector paint under pointer".to_string();
+            if let Some(point) = pointer {
+                ctx.data_mut(|data| data.insert_temp(to_stroke_id, shift));
+                crate::color_picker::request_pixel(&ctx, owner, point);
+            }
         }
+    }
+}
+
+/// A colour picked off the screen: it has no opacity of its own, so the
+/// paint keeps the opacity it had.
+fn take_shown_colour(app: &mut EditorApp, color: Color32, to_stroke: bool) {
+    let with_alpha = |alpha: u8| Rgba {
+        r: color.r(),
+        g: color.g(),
+        b: color.b(),
+        a: alpha,
+    };
+    if to_stroke {
+        app.session.stroke_color = with_alpha(app.session.stroke_color.a);
+        app.session.stroke_none = false;
+        app.session.status = "Stroke colour picked".to_string();
+    } else {
+        let alpha = app.session.fill_color.map_or(255, |fill| fill.a);
+        app.session.fill_color = Some(with_alpha(alpha));
+        app.session.fill_kept = with_alpha(alpha);
+        app.session.status = "Fill colour picked".to_string();
     }
 }
 
@@ -18592,12 +19155,8 @@ fn bucket_fill_at(app: &mut EditorApp, point: Vec2) -> bool {
     let q0rg_id = app.session.current_q0rg_id;
     let layer_id = app.session.current_layer_id;
     let frame = app.session.current_frame;
-    let color = app.session.fill_color.unwrap_or(Rgba {
-        r: 0,
-        g: 0,
-        b: 0,
-        a: 255,
-    });
+    // The bucket always pours paint: with the fill none, the colour it had.
+    let color = app.session.fill_color.unwrap_or(app.session.fill_kept);
 
     // Stroke intersections partition existing paint as well as empty space.
     // Resolve the planar face before choosing the fill underneath the cursor;
@@ -29102,13 +29661,24 @@ mod tests {
     }
 
     #[test]
-    fn independent_eraser_remains_circle_without_destroying_brush_nib() {
+    fn independent_eraser_keeps_its_own_nib_and_smoothing() {
         let mut app = EditorApp::default();
         app.session.brush.nib = crate::brush::BrushNib::Slash;
+        app.session.brush.smoothing = 10;
         app.session.brush.sync_with_eraser = false;
+        app.session.eraser.nib = crate::brush::BrushNib::Square;
+        app.session.eraser.smoothing = 70;
+        app.session.eraser.pressure_size = true;
         let settings = eraser_settings(&app, 1.0);
-        assert_eq!(settings.nib, crate::brush::BrushNib::Circle);
+        assert_eq!(settings.nib, crate::brush::BrushNib::Square);
+        assert_eq!(settings.smoothing, 70, "the eraser smooths too");
+        assert!(settings.pressure_size);
         assert_eq!(app.session.brush.nib, crate::brush::BrushNib::Slash);
+
+        app.session.brush.sync_with_eraser = true;
+        let synced = eraser_settings(&app, 1.0);
+        assert_eq!(synced.nib, crate::brush::BrushNib::Slash);
+        assert_eq!(synced.smoothing, 10, "synced, it is the brush exactly");
     }
 
     #[test]
@@ -29345,6 +29915,15 @@ mod tests {
     fn keying_while_holding_an_object_records_each_pose() {
         let mut app = EditorApp::default();
         app.state.project = project_with_held_display_object();
+        // The scene ends on the first frame, with a background layer that
+        // must carry on when the hold keys past the end.
+        let scene = &mut app.state.project.q0rgs[0];
+        scene.frame_count = 1;
+        let mut background = scene.layers[0].clone();
+        background.layer_id = 2;
+        background.name = "Background".into();
+        background.placements.clear();
+        scene.layers.push(background);
         app.session.current_q0rg_id = 1;
         app.session.current_layer_id = 1;
         app.session.current_frame = 0;
@@ -29423,6 +30002,12 @@ mod tests {
             app.session.tool_state,
             ToolState::DraggingPlacement { .. }
         ));
+        let scene = &app.state.project.q0rgs[0];
+        assert_eq!(scene.frame_count, 2, "the timeline goes on");
+        assert_eq!(
+            scene.layers[1].timeline_frame_count, None,
+            "the background carries on to the new frame"
+        );
         frame(&mut app, vec![egui::Event::PointerMoved(pos2(50.0, 10.0))]);
         frame(&mut app, pointer(50.0, false));
 
@@ -29437,6 +30022,113 @@ mod tests {
             Selection::Placement { placement_idx, .. }
                 if app.state.project.q0rgs[0].layers[0].placements[placement_idx].frame == 1
         ));
+    }
+
+    #[test]
+    fn pen_clicks_corners_drags_curves_and_closes_on_the_first_point() {
+        let mut app = EditorApp::default();
+        app.settings.aids.snap = false;
+        let ctx = Context::default();
+        let mut time = 0.0;
+        let mut frame = |app: &mut EditorApp, events: Vec<egui::Event>| {
+            // Short enough for a click, and each click is followed by an
+            // idle frame so no two make a double-click.
+            time += 0.2;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        Pos2::ZERO,
+                        egui::vec2(200.0, 200.0),
+                    )),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::none())
+                        .show(ctx, |ui| {
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(200.0, 200.0),
+                                egui::Sense::click_and_drag(),
+                            );
+                            let view = StageView {
+                                origin: Pos2::ZERO,
+                                scale: 1.0,
+                                stage_rect: rect,
+                                edit_transform: q0s_format::transform::Affine::IDENTITY,
+                            };
+                            let cursor = response
+                                .interact_pointer_pos()
+                                .or_else(|| response.hover_pos())
+                                .map(|p| Vec2::new(p.x, p.y));
+                            let painter = ui.painter().clone();
+                            pen(app, &response, cursor, &painter, &view, ctx);
+                        });
+                },
+            );
+        };
+        let button = |at: Pos2, pressed| egui::Event::PointerButton {
+            pos: at,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        let click = |app: &mut EditorApp,
+                     frame: &mut dyn FnMut(&mut EditorApp, Vec<egui::Event>),
+                     at: Pos2| {
+            frame(app, vec![egui::Event::PointerMoved(at), button(at, true)]);
+            frame(app, vec![button(at, false)]);
+            frame(app, vec![]);
+            frame(app, vec![]);
+        };
+        frame(&mut app, vec![]);
+        click(&mut app, &mut frame, pos2(40.0, 40.0));
+        // Press at (120, 40) and drag down: a smooth point, handles mirrored.
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos2(120.0, 40.0)),
+                button(pos2(120.0, 40.0), true),
+            ],
+        );
+        for y in [50.0, 60.0, 70.0] {
+            frame(&mut app, vec![egui::Event::PointerMoved(pos2(120.0, y))]);
+        }
+        frame(&mut app, vec![button(pos2(120.0, 70.0), false)]);
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![]);
+        let ToolState::PenDrawing { anchors, .. } = &app.session.tool_state else {
+            panic!("still drawing");
+        };
+        assert_eq!(anchors.len(), 2, "the drag made one point, not two");
+        assert_eq!(
+            anchors[1].point,
+            Vec2::new(120.0, 40.0),
+            "where the press was"
+        );
+        assert_eq!(anchors[1].out_handle, Some(Vec2::new(120.0, 70.0)));
+        assert_eq!(anchors[1].in_handle, Some(Vec2::new(120.0, 10.0)));
+        assert_eq!(anchors[0].out_handle, None, "a click makes a corner");
+
+        frame(&mut app, vec![egui::Event::PointerMoved(pos2(60.0, 140.0))]);
+        click(&mut app, &mut frame, pos2(60.0, 140.0));
+        // A click within a few pixels of the first point closes the path.
+        click(&mut app, &mut frame, pos2(43.0, 38.0));
+        assert!(matches!(app.session.tool_state, ToolState::Idle));
+        let drawn = app
+            .state
+            .project
+            .assets
+            .iter()
+            .rev()
+            .find_map(|asset| match asset {
+                Asset::Vector(vector) => vector.paths.last().cloned(),
+                _ => None,
+            })
+            .expect("the path was committed");
+        assert!(drawn.closed);
+        assert_eq!(drawn.anchors.len(), 3);
     }
 
     #[test]
@@ -30547,14 +31239,162 @@ mod sprite_tests {
                 draw_selection_overlay(&mut app, &painter, &view);
             },
         );
+        // The stipple is a cached mesh drawn from the GPU (a paint callback),
+        // or a textured mesh where there is no GL.
         assert!(
             output.shapes.iter().any(|shape| match &shape.shape {
                 Shape::Mesh(mesh) =>
                     mesh.texture_id != egui::TextureId::default() && !mesh.indices.is_empty(),
+                Shape::Callback(_) => true,
                 _ => false,
             }),
             "marquee lines produced only the old centerline outline"
         );
+        let before = app
+            .textures
+            .selected_stroke_area
+            .as_ref()
+            .map(|(held, _)| held.clone());
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Middle,
+                    egui::Id::new("marquee-line-body"),
+                ));
+                draw_selection_overlay(&mut app, &painter, &view);
+            },
+        );
+        let after = app
+            .textures
+            .selected_stroke_area
+            .as_ref()
+            .map(|(held, _)| held.clone());
+        assert!(
+            before.zip(after).is_some_and(|(a, b)| a.ptr_eq(&b)),
+            "an idle repaint rebuilt the selected lines' meshes"
+        );
+    }
+
+    #[test]
+    fn a_union_of_stroke_pieces_keeps_no_hairline_slits() {
+        use geo::{Coord, LineString};
+        let square = |x0: f64, x1: f64| {
+            Polygon::new(
+                LineString(vec![
+                    Coord { x: x0, y: 0.0 },
+                    Coord { x: x1, y: 0.0 },
+                    Coord { x: x1, y: 10.0 },
+                    Coord { x: x0, y: 10.0 },
+                    Coord { x: x0, y: 0.0 },
+                ]),
+                Vec::new(),
+            )
+        };
+        // A body with a hairline hole, as touching pieces can leave, and a
+        // real hole.
+        let slit = LineString(vec![
+            Coord { x: 5.0, y: 2.0 },
+            Coord { x: 5.001, y: 2.0 },
+            Coord { x: 5.001, y: 8.0 },
+            Coord { x: 5.0, y: 8.0 },
+            Coord { x: 5.0, y: 2.0 },
+        ]);
+        let hole = LineString(vec![
+            Coord { x: 20.0, y: 2.0 },
+            Coord { x: 28.0, y: 2.0 },
+            Coord { x: 28.0, y: 8.0 },
+            Coord { x: 20.0, y: 8.0 },
+            Coord { x: 20.0, y: 2.0 },
+        ]);
+        let body = Polygon::new(square(0.0, 40.0).exterior().clone(), vec![slit, hole]);
+        let speck = square(100.0, 100.001);
+        let cleaned = without_slits(MultiPolygon(vec![body, speck]), 10.0);
+        assert_eq!(cleaned.0.len(), 1, "the speck is gone");
+        assert_eq!(
+            cleaned.0[0].interiors().len(),
+            1,
+            "only the real hole is left"
+        );
+    }
+
+    #[test]
+    fn corners_reshape_a_clicked_side_without_cutting_the_outline_up() {
+        let mut app = blank_app();
+        app.session.fill_color = None;
+        commit_vector_path(
+            &mut app,
+            straight(&[(0.0, 0.0), (40.0, 0.0), (40.0, 40.0), (0.0, 40.0)], true),
+            DrawingMode::Object,
+        );
+        let (layer, placement_idx) = (1, 0);
+        let path = PathRef {
+            q0rg_id: 1,
+            layer_id: layer,
+            placement_idx,
+            path_idx: 0,
+        };
+        // Clicking one side of the outline selects that side.
+        app.session.selection = Selection::StrokeSegment(StrokeSegmentRef {
+            path,
+            segment_idx: 0,
+        });
+        assert!(set_selected_stroke_join(
+            &mut app,
+            q0s_format::geom::JoinShape::Bevel
+        ));
+        let outlines: Vec<_> = app
+            .state
+            .project
+            .assets
+            .iter()
+            .filter_map(|asset| match asset {
+                Asset::Vector(vector) => vector.stroke.map(|stroke| (stroke, vector.paths.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outlines.len(), 1, "one outline, not cut into sides");
+        let (stroke, paths) = &outlines[0];
+        assert_eq!(stroke.join, q0s_format::geom::JoinShape::Bevel);
+        assert!(
+            paths.len() == 1 && paths[0].closed,
+            "still one closed outline"
+        );
+    }
+
+    #[test]
+    fn the_marquee_picks_whole_shapes_like_shift_clicking() {
+        let mut app = blank_app();
+        app.session.fill_color = Some(Rgba {
+            r: 200,
+            g: 30,
+            b: 40,
+            a: 255,
+        });
+        let square = |x: f32, y: f32, size: f32| {
+            straight(
+                &[(x, y), (x + size, y), (x + size, y + size), (x, y + size)],
+                true,
+            )
+        };
+        commit_vector_path(&mut app, square(0.0, 0.0, 40.0), DrawingMode::Object);
+        commit_vector_path(&mut app, square(100.0, 100.0, 3.0), DrawingMode::Object);
+        // Half over the big square, all round the tiny one.
+        let selection =
+            marquee_whole_selection(&app.state.project, 1, 0, (30.0, 30.0, 110.0, 110.0));
+        let Selection::RawParts { fills, strokes, .. } = &selection else {
+            panic!("fill and outline, as Shift-clicking both: {selection:?}");
+        };
+        assert_eq!(fills.len(), 2, "both shapes, whole: {fills:?}");
+        assert_eq!(strokes.len(), 2, "and their outlines");
+        // The Alt marquee still cuts out only the part inside.
+        assert!(matches!(
+            marquee_selection(&app.state.project, 1, 0, (30.0, 30.0, 110.0, 110.0)),
+            Selection::RawArea { .. }
+        ));
     }
 
     #[test]
@@ -31296,6 +32136,133 @@ mod drawing_rework_tests {
             meeting.iter().all(|point| *point == meeting[0]),
             "{meeting:?}"
         );
+    }
+
+    /// A square of lines painted inside, on a blank frame.
+    fn painted_square(app: &mut EditorApp) {
+        draw_line(app, (100.0, 100.0), (300.0, 100.0));
+        draw_line(app, (300.0, 100.0), (300.0, 300.0));
+        draw_line(app, (300.0, 300.0), (100.0, 300.0));
+        draw_line(app, (100.0, 300.0), (100.0, 100.0));
+        assert!(bucket_fill_at(app, Vec2::new(200.0, 200.0)));
+    }
+
+    /// The separate pieces of the frame's paint.
+    fn paint_pieces(app: &EditorApp) -> Vec<Polygon<f64>> {
+        app.state
+            .project
+            .assets
+            .iter()
+            .filter_map(|asset| match asset {
+                Asset::Vector(vector) if vector.fill.is_some() => Some(vector),
+                _ => None,
+            })
+            .flat_map(|vector| crate::brush::vector_fill_geometry(vector).0)
+            .collect()
+    }
+
+    fn piece_holding(pieces: &[Polygon<f64>], x: f64, y: f64) -> Option<usize> {
+        pieces
+            .iter()
+            .position(|piece| piece.contains(&geo::Point::new(x, y)))
+    }
+
+    #[test]
+    fn a_line_drawn_across_paint_parts_it() {
+        let mut app = blank_app();
+        painted_square(&mut app);
+        assert_eq!(paint_pieces(&app).len(), 1);
+        let painted: f64 = paint_pieces(&app)[0].unsigned_area();
+        draw_line(&mut app, (150.0, 60.0), (150.0, 340.0));
+        let pieces = paint_pieces(&app);
+        assert_eq!(pieces.len(), 2, "the line parts the paint in two");
+        let left = piece_holding(&pieces, 125.0, 200.0).expect("left side painted");
+        let right = piece_holding(&pieces, 250.0, 200.0).expect("right side painted");
+        assert_ne!(left, right);
+        let area: f64 = pieces.iter().map(|piece| piece.unsigned_area()).sum();
+        assert!(
+            area > painted - 60.0,
+            "only a hairline is taken: {area} of {painted}"
+        );
+    }
+
+    #[test]
+    fn a_line_poking_into_paint_leaves_it_whole() {
+        let mut app = blank_app();
+        painted_square(&mut app);
+        draw_line(&mut app, (150.0, 60.0), (150.0, 200.0));
+        assert_eq!(paint_pieces(&app).len(), 1);
+    }
+
+    #[test]
+    fn a_line_moved_across_paint_and_lines_cuts_and_parts_them() {
+        let mut app = blank_app();
+        painted_square(&mut app);
+        // A line off to the side, then moved over the square by hand.
+        draw_line(&mut app, (500.0, 60.0), (500.0, 340.0));
+        let layer = &app.state.project.q0rgs[0].layers[0];
+        let line = layer
+            .placements
+            .iter()
+            .enumerate()
+            .find_map(|(placement_idx, placement)| {
+                let Target::Asset(asset_id) = placement.target else {
+                    return None;
+                };
+                let Some(Asset::Vector(vector)) = app
+                    .state
+                    .project
+                    .assets
+                    .iter()
+                    .find(|asset| asset.id() == asset_id)
+                else {
+                    return None;
+                };
+                vector
+                    .paths
+                    .iter()
+                    .position(|path| path.anchors[0].point.x == 500.0)
+                    .map(|path_idx| PathRef {
+                        q0rg_id: app.session.current_q0rg_id,
+                        layer_id: layer.layer_id,
+                        placement_idx,
+                        path_idx,
+                    })
+            })
+            .expect("the line");
+        let lines_before = path_count(&app);
+        let start = raw_path_clone(
+            &app.state.project,
+            line.q0rg_id,
+            line.layer_id,
+            line.placement_idx,
+            line.path_idx,
+        )
+        .unwrap();
+        assert!(replace_raw_path_translated(
+            &mut app.state.project,
+            line.q0rg_id,
+            line.layer_id,
+            line.placement_idx,
+            line.path_idx,
+            &start,
+            Vec2::new(-350.0, 0.0),
+        ));
+        app.session.selection = Selection::Path {
+            q0rg_id: line.q0rg_id,
+            layer_id: line.layer_id,
+            placement_idx: line.placement_idx,
+            path_idx: line.path_idx,
+        };
+        settle_edited_lines(&mut app, &[line]);
+        assert_eq!(paint_pieces(&app).len(), 2, "the paint is parted");
+        // The moved line falls in three, the top and bottom sides in two,
+        // and the paint is drawn as two shapes.
+        assert_eq!(path_count(&app), lines_before + 2 + 2 + 1);
+        match &app.session.selection {
+            Selection::Paths(pieces) => assert_eq!(pieces.len(), 3, "{pieces:?}"),
+            other => panic!("the moved line's pieces stay picked, not {other:?}"),
+        }
     }
 
     #[test]

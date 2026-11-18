@@ -418,7 +418,14 @@ pub fn move_cursor(
             .as_ref()
             .is_none_or(|moving| moving.start_cursor != start_cursor)
         {
-            let grips = selection_grips(&app.state.project, &app.session.selection);
+            // Points picked on more lines than one move together.
+            let mut leave = Leave::selection(&app.session.selection);
+            if matches!(app.session.selection, Selection::SubselectPoints { .. }) {
+                leave
+                    .anchors
+                    .extend(app.session.subselect_more.iter().cloned());
+            }
+            let grips = leave_grips(&app.state.project, &leave);
             let grip = grips
                 .iter()
                 .copied()
@@ -430,7 +437,7 @@ pub fn move_cursor(
                 &app.state.project,
                 app.session.current_q0rg_id,
                 app.session.current_frame,
-                &Leave::selection(&app.session.selection),
+                &leave,
                 stage_size(app),
             );
             state.moving = Some(Moving {
@@ -458,10 +465,9 @@ pub fn end_move() {
     STATE.with(|state| state.borrow_mut().moving = None);
 }
 
-/// The points of `selection` that snap when it is dragged: its anchors and
-/// the corners and middle of objects.
-fn selection_grips(project: &ProjectV2, selection: &Selection) -> Vec<Vec2> {
-    let leave = Leave::selection(selection);
+/// The points of what `leave` names that snap when it is dragged: its
+/// anchors and the corners and middle of objects.
+fn leave_grips(project: &ProjectV2, leave: &Leave) -> Vec<Vec2> {
     let mut grips = Vec::new();
     let placement = |q0rg_id: u16, layer_id: u16, placement_idx: usize| {
         project

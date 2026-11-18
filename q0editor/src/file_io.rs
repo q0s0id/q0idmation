@@ -153,6 +153,10 @@ pub fn load_project(path: &Path) -> Result<ProjectV2, FileError> {
 }
 
 pub fn save_project(path: &Path, project: &ProjectV2) -> Result<(), FileError> {
+    // Graphics nothing uses stay in the open project, where undo and the
+    // clipboard may still want them, but are not written.
+    let lean = crate::graphics::lean_for_save(project);
+    let project = lean.as_ref().unwrap_or(project);
     let bytes = write_v2(project)?;
     // Do not put bytes on disk unless the writer's result can be parsed back
     // as a complete project. The staged file is also read back byte-for-byte

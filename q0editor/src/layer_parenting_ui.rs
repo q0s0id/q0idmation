@@ -203,7 +203,7 @@ pub(crate) fn row(
 
 /// Whether the timeline shows a camera row (the main one, camera on).
 fn camera_row_shown(app: &EditorApp, q0rg_id: u16) -> bool {
-    q0rg_id == app.state.project.meta.entry_q0rg_id && app.state.project.runtime.camera.enabled
+    app.state.project.camera_on(q0rg_id)
 }
 
 /// A layer's outline colour; the camera's is the theme's accent, like its

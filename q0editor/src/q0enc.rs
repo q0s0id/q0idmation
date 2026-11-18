@@ -618,10 +618,9 @@ impl Q0EncState {
         if options.format == ExportFormat::Q0s
             && options.source_q0rg_id != snapshot.meta.entry_q0rg_id
         {
-            // The legacy 2D camera belongs to the original startup timeline.
-            // 3D camera setups already carry their own timeline ids.
-            snapshot.runtime.camera = Default::default();
-            snapshot.meta.entry_q0rg_id = options.source_q0rg_id;
+            // Each scene keeps its own 2D camera when another one starts the
+            // movie. 3D camera setups already carry their own timeline ids.
+            snapshot.set_entry_scene(options.source_q0rg_id);
         }
         self.queue.push(ExportJob {
             id,

@@ -1,6 +1,7 @@
 pub mod collide;
 pub mod error;
 pub mod geom;
+pub mod graphics;
 mod io;
 pub mod lighting;
 pub mod migrate;

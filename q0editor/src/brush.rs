@@ -87,6 +87,16 @@ impl Default for BrushSettings {
     }
 }
 
+impl BrushSettings {
+    /// What the eraser starts with while it is not synced with the brush.
+    pub fn eraser_default() -> Self {
+        Self {
+            size: 18.0,
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BrushSample {
     pub position: Vec2,
@@ -1781,7 +1791,7 @@ fn fitted_segments_to_closed_path(segments: &[FittedCubic]) -> Option<VPath> {
     })
 }
 
-fn fit_closed_ring_path(points: &[Vec2], tolerance: f32) -> Option<VPath> {
+pub(crate) fn fit_closed_ring_path(points: &[Vec2], tolerance: f32) -> Option<VPath> {
     if points.len() < 4 {
         return None;
     }
@@ -1887,7 +1897,7 @@ fn fitted_ring_path_is_safe(original: &LineString<f64>, candidate: &VPath, toler
     (candidate_area.abs() - original_area.abs()).abs() <= allowed_area_delta
 }
 
-fn linear_ring_path(points: &[Vec2]) -> VPath {
+pub(crate) fn linear_ring_path(points: &[Vec2]) -> VPath {
     VPath {
         anchors: points
             .iter()
@@ -2926,6 +2936,133 @@ fn erase_brush_region_impl(
     app.session.status = "Raw fill erased".to_string();
     app.state.mark_dirty();
     true
+}
+
+/// Half the width of the hairline a line takes out of the fill it parts:
+/// thin enough to stay hidden under the line, wide enough that the pieces
+/// on either side stay apart.
+const PARTING_HALF: f64 = 0.05;
+
+/// Whether a piece left after parting a fill is a real region rather than
+/// a sliver shaved off along the line: big enough, and not a thin strip.
+fn real_piece(polygon: &Polygon<f64>) -> bool {
+    use geo::{Euclidean, Length};
+    let area = polygon.unsigned_area();
+    let perimeter = Euclidean.length(polygon.exterior()).max(1.0e-9);
+    area >= 2.0 && 2.0 * area / perimeter >= 0.5
+}
+
+/// Parts the raw fills on the frame that `lines` run right across, the way
+/// a line drawn over paint splits it in Animate, so each side can be picked
+/// on its own. Each line is its stage points and stroke width. A hairline
+/// is taken out of the fill under the line, where the line hides it; a fill
+/// a line only reaches into keeps its shape. The caller has made the
+/// keyframe. Returns the fills that changed.
+pub(crate) fn part_raw_fills_along_lines(
+    project: &mut ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    frame: u16,
+    lines: &[(Vec<Vec2>, f32)],
+) -> BTreeSet<u16> {
+    let mut zone = MultiPolygon::<f64>(Vec::new());
+    for (points, width) in lines {
+        if points.len() < 2 {
+            continue;
+        }
+        // A line that stops on the edge of a fill parts it too: its ends
+        // reach on under its own cap.
+        let reach = (width * 0.5).max(0.5);
+        let extend = |end: Vec2, before: Vec2| {
+            let (dx, dy) = (end.x - before.x, end.y - before.y);
+            let length = dx.hypot(dy);
+            if length <= 1.0e-6 {
+                end
+            } else {
+                Vec2::new(end.x + dx / length * reach, end.y + dy / length * reach)
+            }
+        };
+        let mut coords: Vec<Vec2> = points.clone();
+        let closed = points.len() > 2 && points.first() == points.last();
+        if !closed {
+            let last = coords.len() - 1;
+            coords[0] = extend(points[0], points[1]);
+            coords[last] = extend(points[last], points[last - 1]);
+        }
+        let line = LineString::new(
+            coords
+                .iter()
+                .map(|point| Coord {
+                    x: f64::from(point.x),
+                    y: f64::from(point.y),
+                })
+                .collect(),
+        );
+        let band = line.buffer(PARTING_HALF);
+        zone = if zone.0.is_empty() {
+            band
+        } else {
+            zone.union(&band)
+        };
+    }
+    if zone.0.is_empty() {
+        return BTreeSet::new();
+    }
+    let mut updates = Vec::new();
+    for candidate in collect_raw_fill_candidates(project, q0rg_id, layer_id, frame, false) {
+        #[cfg(feature = "appearance-mask-eraser")]
+        if project.asset_appearances.contains_key(&candidate.asset_id) {
+            continue;
+        }
+        if !candidate.geometry.intersects(&zone) {
+            continue;
+        }
+        let mut parted = false;
+        let mut kept = Vec::new();
+        for polygon in &candidate.geometry.0 {
+            if !polygon.intersects(&zone) {
+                kept.push(polygon.clone());
+                continue;
+            }
+            let pieces: Vec<Polygon<f64>> = MultiPolygon(vec![polygon.clone()])
+                .difference(&zone)
+                .0
+                .into_iter()
+                .filter(real_piece)
+                .collect();
+            if pieces.len() >= 2 {
+                parted = true;
+                kept.extend(pieces);
+            } else {
+                kept.push(polygon.clone());
+            }
+        }
+        if parted {
+            updates.push((candidate.asset_id, MultiPolygon(kept)));
+        }
+    }
+    if updates.is_empty() {
+        return BTreeSet::new();
+    }
+    let originals: BTreeSet<u16> = updates.iter().map(|(asset_id, _)| *asset_id).collect();
+    let writable = prepare_writable_raw_assets(project, q0rg_id, layer_id, frame, &originals);
+    let mut changed = BTreeSet::new();
+    for (original, geometry) in updates {
+        let asset_id = *writable.get(&original).unwrap_or(&original);
+        let paths = coverage_to_separate_paths(&geometry);
+        if paths.is_empty() {
+            continue;
+        }
+        if let Some(Asset::Vector(vector)) = project
+            .assets
+            .iter_mut()
+            .find(|asset| asset.id() == asset_id)
+        {
+            vector.paths = paths;
+            changed.insert(asset_id);
+        }
+    }
+    changed
 }
 
 fn collect_raw_fill_candidates(

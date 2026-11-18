@@ -140,7 +140,11 @@ pub const Q1S_VERSION_SHADOW_QUALITY: u16 = 43;
 pub const Q1S_VERSION_THREE_D: u16 = 44;
 /// Layers can hang from other layers (Animate's layer parenting).
 pub const Q1S_VERSION_LAYER_PARENTS: u16 = 45;
-pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_LAYER_PARENTS;
+/// Mask layers remember whether the editor previews their clipping.
+pub const Q1S_VERSION_MASK_PREVIEW: u16 = 46;
+/// Every scene has its own camera, not only the starting one.
+pub const Q1S_VERSION_SCENE_CAMERAS: u16 = 47;
+pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_SCENE_CAMERAS;
 /// A packed `.q1s`: not a body version but a container around one, as
 /// `.q0s` v42 is. After it come the body's own version and length, then the
 /// body, with packed paths, deflated. A tenth of the size or less for most
@@ -1695,6 +1699,9 @@ pub enum LayerKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+// Rooms and the server keep projects as JSON written by every editor version:
+// a field an older editor never wrote must read as its default, not fail.
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct LayerMetadata {
     pub kind: LayerKind,
     pub parent_folder_id: Option<u16>,
@@ -1709,6 +1716,10 @@ pub struct LayerMetadata {
     /// Locked layers remain visible but are excluded from artwork editing and
     /// selection. Folder locks apply effectively to their child layers.
     pub locked: bool,
+    /// A mask layer previews its clipping in the editor instead of showing
+    /// its own artwork. Locking a mask turns it on, as in Animate. Exported
+    /// playback always masks; this is only what the editor shows.
+    pub mask_preview: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -1924,6 +1935,11 @@ pub struct ProjectRuntimeData {
         serde(default, with = "crate::serde_support::pairs")
     )]
     pub layer_parents: HashMap<LayerKey, u16>,
+    /// The cameras of the scenes after the starting one, by each scene's
+    /// root timeline. The starting scene's camera stays in `camera`, so
+    /// files and players that know a single camera keep working.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub scene_cameras: std::collections::BTreeMap<u16, CameraTrack>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -2060,10 +2076,73 @@ impl ProjectV2 {
         CameraState::identity_for_stage(self.meta.stage_width, self.meta.stage_height)
     }
 
+    /// The camera of the scene whose root timeline is `q0rg_id`, and a
+    /// switched-off one for any other timeline. The starting scene's camera
+    /// is `runtime.camera`; every other scene's is in
+    /// `runtime.scene_cameras`.
+    pub fn scene_camera(&self, q0rg_id: u16) -> &CameraTrack {
+        static NO_CAMERA: CameraTrack = CameraTrack {
+            enabled: false,
+            keys: Vec::new(),
+        };
+        if q0rg_id == self.meta.entry_q0rg_id {
+            &self.runtime.camera
+        } else if self.is_scene_root(q0rg_id) {
+            self.runtime
+                .scene_cameras
+                .get(&q0rg_id)
+                .unwrap_or(&NO_CAMERA)
+        } else {
+            &NO_CAMERA
+        }
+    }
+
+    /// The camera of the scene whose root timeline is `q0rg_id`, to change;
+    /// None for a timeline that is not a scene.
+    pub fn scene_camera_mut(&mut self, q0rg_id: u16) -> Option<&mut CameraTrack> {
+        if q0rg_id == self.meta.entry_q0rg_id {
+            Some(&mut self.runtime.camera)
+        } else if self.is_scene_root(q0rg_id) {
+            Some(self.runtime.scene_cameras.entry(q0rg_id).or_default())
+        } else {
+            None
+        }
+    }
+
+    /// Whether `q0rg_id` is a scene whose camera is switched on.
+    pub fn camera_on(&self, q0rg_id: u16) -> bool {
+        self.scene_camera(q0rg_id).enabled
+    }
+
+    /// Makes the scene rooted at `q0rg_id` the one the movie starts with.
+    /// Each scene keeps its own camera.
+    pub fn set_entry_scene(&mut self, q0rg_id: u16) {
+        let old = self.meta.entry_q0rg_id;
+        if old == q0rg_id {
+            return;
+        }
+        let incoming = self
+            .runtime
+            .scene_cameras
+            .remove(&q0rg_id)
+            .unwrap_or_default();
+        let outgoing = std::mem::replace(&mut self.runtime.camera, incoming);
+        let old_still_a_scene = self.runtime.scenes.iter().any(|scene| scene.q0rg_id == old);
+        if old_still_a_scene && outgoing != CameraTrack::default() {
+            self.runtime.scene_cameras.insert(old, outgoing);
+        }
+        self.meta.entry_q0rg_id = q0rg_id;
+    }
+
     /// Evaluate authored camera animation without mutating any scene object.
     /// Disabled/empty camera tracks are exactly the legacy identity view.
     pub fn camera_state_at(&self, frame: u16) -> CameraState {
-        let track = &self.runtime.camera;
+        self.camera_state_in(self.meta.entry_q0rg_id, frame)
+    }
+
+    /// `camera_state_at` for the camera of the scene rooted at `q0rg_id`.
+    pub fn camera_state_in(&self, q0rg_id: u16, frame: u16) -> CameraState {
+        let track = self.scene_camera(q0rg_id);
         let fallback = self.default_camera_state();
         if !track.enabled || track.keys.is_empty() {
             return fallback;
@@ -2100,10 +2179,15 @@ impl ProjectV2 {
     /// Where the camera is at `frame`: `camera_state_at` (its own keys), carried
     /// along by the layer it follows, if any (see `parenting::CAMERA_LAYER`).
     pub fn camera_world_state_at(&self, frame: u16) -> CameraState {
-        let mut state = self.camera_state_at(frame);
-        let track = &self.runtime.camera;
+        self.camera_world_state_in(self.meta.entry_q0rg_id, frame)
+    }
+
+    /// `camera_world_state_at` for the scene rooted at `q0rg_id`.
+    pub fn camera_world_state_in(&self, q0rg_id: u16, frame: u16) -> CameraState {
+        let mut state = self.camera_state_in(q0rg_id, frame);
+        let track = self.scene_camera(q0rg_id);
         if track.enabled && !track.keys.is_empty() {
-            if let Some((x, y)) = crate::parenting::camera_offset(self, frame) {
+            if let Some((x, y)) = crate::parenting::camera_offset_in(self, q0rg_id, frame) {
                 state.center_x += x;
                 state.center_y += y;
             }
@@ -2114,7 +2198,12 @@ impl ProjectV2 {
     /// World/stage -> camera-stage affine. The identity camera produces the
     /// exact identity matrix, preserving legacy pixels and hit-test geometry.
     pub fn camera_affine_at(&self, frame: u16) -> Affine {
-        let state = self.camera_world_state_at(frame);
+        self.camera_affine_in(self.meta.entry_q0rg_id, frame)
+    }
+
+    /// `camera_affine_at` for the scene rooted at `q0rg_id`.
+    pub fn camera_affine_in(&self, q0rg_id: u16, frame: u16) -> Affine {
+        let state = self.camera_world_state_in(q0rg_id, frame);
         let stage_cx = f32::from(self.meta.stage_width) * 0.5;
         let stage_cy = f32::from(self.meta.stage_height) * 0.5;
         let (sin, cos) = state.rotation.sin_cos();
@@ -3687,55 +3776,69 @@ fn validate_project_runtime(project: &ProjectV2) -> Result<(), Error> {
         }
     }
 
-    let entry = project
-        .q0rgs
-        .iter()
-        .find(|q0rg| q0rg.q0rg_id == project.meta.entry_q0rg_id)
-        .ok_or(Error::Validation("entry q0rg is missing"))?;
-    let camera_frames = project
-        .runtime
-        .camera
-        .keys
-        .iter()
-        .map(|key| key.frame)
-        .collect::<HashSet<_>>();
-    if camera_frames.len() != project.runtime.camera.keys.len() {
-        return Err(Error::Validation("camera keyframes must be unique"));
+    for &q0rg_id in project.runtime.scene_cameras.keys() {
+        if q0rg_id == project.meta.entry_q0rg_id || !project.is_scene_root(q0rg_id) {
+            return Err(Error::Validation(
+                "a scene camera belongs to a scene after the first",
+            ));
+        }
     }
-    for key in &project.runtime.camera.keys {
-        if key.frame >= entry.frame_count {
-            return Err(Error::Validation(
-                "camera key is outside the entry timeline",
-            ));
+    let cameras = std::iter::once((project.meta.entry_q0rg_id, &project.runtime.camera)).chain(
+        project
+            .runtime
+            .scene_cameras
+            .iter()
+            .map(|(q0rg_id, track)| (*q0rg_id, track)),
+    );
+    for (scene_q0rg_id, track) in cameras {
+        let entry = project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == scene_q0rg_id)
+            .ok_or(Error::Validation("entry q0rg is missing"))?;
+        let camera_frames = track
+            .keys
+            .iter()
+            .map(|key| key.frame)
+            .collect::<HashSet<_>>();
+        if camera_frames.len() != track.keys.len() {
+            return Err(Error::Validation("camera keyframes must be unique"));
         }
-        if ![
-            key.state.center_x,
-            key.state.center_y,
-            key.state.zoom,
-            key.state.rotation,
-        ]
-        .into_iter()
-        .all(f32::is_finite)
-            || key.state.zoom <= 0.0
-        {
-            return Err(Error::Validation(
-                "camera state must be finite with zoom > 0",
-            ));
-        }
-        if !key.tween.easing().is_valid() {
-            return Err(Error::Validation("camera tween easing is invalid"));
-        }
-        if key.tween.is_shape() {
-            return Err(Error::Validation("camera keys cannot use shape tweens"));
-        }
-        if let Some(to_frame) = key.tween.to_frame() {
-            if to_frame <= key.frame
-                || to_frame >= entry.frame_count
-                || !camera_frames.contains(&to_frame)
+        for key in &track.keys {
+            if key.frame >= entry.frame_count {
+                return Err(Error::Validation(
+                    "camera key is outside the entry timeline",
+                ));
+            }
+            if ![
+                key.state.center_x,
+                key.state.center_y,
+                key.state.zoom,
+                key.state.rotation,
+            ]
+            .into_iter()
+            .all(f32::is_finite)
+                || key.state.zoom <= 0.0
             {
                 return Err(Error::Validation(
-                    "camera tween must target a later camera keyframe",
+                    "camera state must be finite with zoom > 0",
                 ));
+            }
+            if !key.tween.easing().is_valid() {
+                return Err(Error::Validation("camera tween easing is invalid"));
+            }
+            if key.tween.is_shape() {
+                return Err(Error::Validation("camera keys cannot use shape tweens"));
+            }
+            if let Some(to_frame) = key.tween.to_frame() {
+                if to_frame <= key.frame
+                    || to_frame >= entry.frame_count
+                    || !camera_frames.contains(&to_frame)
+                {
+                    return Err(Error::Validation(
+                        "camera tween must target a later camera keyframe",
+                    ));
+                }
             }
         }
     }
@@ -4841,7 +4944,15 @@ pub(crate) const BODY_FLAG_PACKED_PATHS: u16 = 1;
 
 /// `write`, optionally packing vector paths. Packed bodies are for .q0s.
 pub(crate) fn write_with(project: &ProjectV2, packed: bool) -> Result<Vec<u8>, Error> {
-    let version = if !project.runtime.layer_parents.is_empty() {
+    let version = if has_scene_cameras(project) {
+        Q1S_VERSION_SCENE_CAMERAS
+    } else if project
+        .layer_metadata
+        .values()
+        .any(|metadata| metadata.mask_preview)
+    {
+        Q1S_VERSION_MASK_PREVIEW
+    } else if !project.runtime.layer_parents.is_empty() {
         Q1S_VERSION_LAYER_PARENTS
     } else if uses_three_d(project) {
         Q1S_VERSION_THREE_D
@@ -5084,6 +5195,8 @@ fn write_version_with(project: &ProjectV2, version: u16, packed: bool) -> Result
         && version != Q1S_VERSION_SHADOW_QUALITY
         && version != Q1S_VERSION_THREE_D
         && version != Q1S_VERSION_LAYER_PARENTS
+        && version != Q1S_VERSION_MASK_PREVIEW
+        && version != Q1S_VERSION_SCENE_CAMERAS
     {
         return Err(Error::UnsupportedVersion(version));
     }
@@ -5133,6 +5246,16 @@ fn write_version_with(project: &ProjectV2, version: u16, packed: bool) -> Result
     {
         return Err(Error::Validation(
             "legacy q1s versions cannot store timeline masks",
+        ));
+    }
+    if version < Q1S_VERSION_MASK_PREVIEW
+        && project
+            .layer_metadata
+            .values()
+            .any(|metadata| metadata.mask_preview)
+    {
+        return Err(Error::Validation(
+            "legacy q1s versions cannot store mask previews",
         ));
     }
     if version < Q1S_VERSION_LAYER_FRAME_COUNTS
@@ -5247,6 +5370,11 @@ fn write_version_with(project: &ProjectV2, version: u16, packed: bool) -> Result
     {
         return Err(Error::Validation(
             "legacy q1s versions cannot store library folders",
+        ));
+    }
+    if version < Q1S_VERSION_SCENE_CAMERAS && has_scene_cameras(project) {
+        return Err(Error::Validation(
+            "legacy q1s versions cannot store scene cameras",
         ));
     }
     if version < Q1S_VERSION_LAYER_PARENTS && !project.runtime.layer_parents.is_empty() {
@@ -5514,6 +5642,9 @@ fn write_version_with(project: &ProjectV2, version: u16, packed: bool) -> Result
                     None => out.push(0),
                 }
             }
+            if version >= Q1S_VERSION_MASK_PREVIEW {
+                out.push(u8::from(value.mask_preview));
+            }
         }
     }
 
@@ -5703,31 +5834,7 @@ fn write_version_with(project: &ProjectV2, version: u16, packed: bool) -> Result
         }
     }
     if version >= Q1S_VERSION_CAMERA_TRACK {
-        out.push(u8::from(project.runtime.camera.enabled));
-        let count = u16::try_from(project.runtime.camera.keys.len())
-            .map_err(|_| Error::Overflow("camera key count exceeds u16"))?;
-        out.extend_from_slice(&count.to_le_bytes());
-        let mut keys = project.runtime.camera.keys.clone();
-        keys.sort_by_key(|key| key.frame);
-        for key in keys {
-            out.extend_from_slice(&key.frame.to_le_bytes());
-            out.extend_from_slice(&key.state.center_x.to_le_bytes());
-            out.extend_from_slice(&key.state.center_y.to_le_bytes());
-            out.extend_from_slice(&key.state.zoom.to_le_bytes());
-            out.extend_from_slice(&key.state.rotation.to_le_bytes());
-            match key.tween {
-                Tween::None => out.push(TWEEN_KIND_NONE),
-                Tween::Linear { to_frame } => {
-                    out.push(TWEEN_KIND_LINEAR);
-                    out.extend_from_slice(&to_frame.to_le_bytes());
-                }
-                Tween::Eased { to_frame, easing } | Tween::Shape { to_frame, easing } => {
-                    out.push(TWEEN_KIND_EASED);
-                    out.extend_from_slice(&to_frame.to_le_bytes());
-                    write_easing(&mut out, easing);
-                }
-            }
-        }
+        write_camera_track(&mut out, &project.runtime.camera)?;
     }
     if version >= Q1S_VERSION_SCENES {
         let scenes = project.scenes();
@@ -5789,7 +5896,99 @@ fn write_version_with(project: &ProjectV2, version: u16, packed: bool) -> Result
     if version >= Q1S_VERSION_LAYER_PARENTS {
         crate::parenting::write(&mut out, project)?;
     }
+    if version >= Q1S_VERSION_SCENE_CAMERAS {
+        let cameras = project
+            .runtime
+            .scene_cameras
+            .iter()
+            .filter(|(_, track)| **track != CameraTrack::default())
+            .collect::<Vec<_>>();
+        let count = u16::try_from(cameras.len())
+            .map_err(|_| Error::Overflow("scene camera count exceeds u16"))?;
+        out.extend_from_slice(&count.to_le_bytes());
+        for (q0rg_id, track) in cameras {
+            out.extend_from_slice(&q0rg_id.to_le_bytes());
+            write_camera_track(&mut out, track)?;
+        }
+    }
     Ok(out)
+}
+
+/// Whether any scene besides the starting one has a camera worth saving.
+fn has_scene_cameras(project: &ProjectV2) -> bool {
+    project
+        .runtime
+        .scene_cameras
+        .values()
+        .any(|track| *track != CameraTrack::default())
+}
+
+fn write_camera_track(out: &mut Vec<u8>, track: &CameraTrack) -> Result<(), Error> {
+    out.push(u8::from(track.enabled));
+    let count = u16::try_from(track.keys.len())
+        .map_err(|_| Error::Overflow("camera key count exceeds u16"))?;
+    out.extend_from_slice(&count.to_le_bytes());
+    let mut keys = track.keys.clone();
+    keys.sort_by_key(|key| key.frame);
+    for key in keys {
+        out.extend_from_slice(&key.frame.to_le_bytes());
+        out.extend_from_slice(&key.state.center_x.to_le_bytes());
+        out.extend_from_slice(&key.state.center_y.to_le_bytes());
+        out.extend_from_slice(&key.state.zoom.to_le_bytes());
+        out.extend_from_slice(&key.state.rotation.to_le_bytes());
+        match key.tween {
+            Tween::None => out.push(TWEEN_KIND_NONE),
+            Tween::Linear { to_frame } => {
+                out.push(TWEEN_KIND_LINEAR);
+                out.extend_from_slice(&to_frame.to_le_bytes());
+            }
+            Tween::Eased { to_frame, easing } | Tween::Shape { to_frame, easing } => {
+                out.push(TWEEN_KIND_EASED);
+                out.extend_from_slice(&to_frame.to_le_bytes());
+                write_easing(out, easing);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_camera_track(c: &mut Cursor) -> Result<CameraTrack, Error> {
+    let mut track = CameraTrack {
+        enabled: match c.read_u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(Error::Validation("invalid camera enabled flag")),
+        },
+        keys: Vec::new(),
+    };
+    let count = c.read_u16()?;
+    track.keys.reserve(usize::from(count));
+    for _ in 0..count {
+        let frame = c.read_u16()?;
+        let state = CameraState {
+            center_x: c.read_f32()?,
+            center_y: c.read_f32()?,
+            zoom: c.read_f32()?,
+            rotation: c.read_f32()?,
+        };
+        let tween = match c.read_u8()? {
+            TWEEN_KIND_NONE => Tween::None,
+            TWEEN_KIND_LINEAR => Tween::Linear {
+                to_frame: c.read_u16()?,
+            },
+            TWEEN_KIND_EASED => Tween::Eased {
+                to_frame: c.read_u16()?,
+                easing: read_easing(c)?,
+            },
+            _ => return Err(Error::Validation("invalid camera tween kind")),
+        };
+        track.keys.push(CameraKey {
+            frame,
+            state,
+            tween,
+        });
+    }
+    Ok(track)
 }
 
 fn write_asset<'a>(
@@ -7217,7 +7416,9 @@ pub(crate) fn is_known_version(version: u16) -> bool {
         && version != Q1S_VERSION_TRANSFORM_PIVOTS
         && version != Q1S_VERSION_SHADOW_QUALITY
         && version != Q1S_VERSION_THREE_D
-        && version != Q1S_VERSION_LAYER_PARENTS)
+        && version != Q1S_VERSION_LAYER_PARENTS
+        && version != Q1S_VERSION_MASK_PREVIEW
+        && version != Q1S_VERSION_SCENE_CAMERAS)
 }
 
 /// Parse a project body after a six-byte wrapper header without copying the
@@ -7328,6 +7529,12 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
             } else {
                 None
             };
+            let mask_preview = version >= Q1S_VERSION_MASK_PREVIEW
+                && match c.read_u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(Error::Validation("invalid layer mask preview flag")),
+                };
             if layer_metadata
                 .insert(
                     key,
@@ -7338,6 +7545,7 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
                         collapsed,
                         hidden,
                         locked,
+                        mask_preview,
                     },
                 )
                 .is_some()
@@ -7579,38 +7787,7 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
         }
     }
     if version >= Q1S_VERSION_CAMERA_TRACK {
-        runtime.camera.enabled = match c.read_u8()? {
-            0 => false,
-            1 => true,
-            _ => return Err(Error::Validation("invalid camera enabled flag")),
-        };
-        let count = c.read_u16()?;
-        runtime.camera.keys.reserve(usize::from(count));
-        for _ in 0..count {
-            let frame = c.read_u16()?;
-            let state = CameraState {
-                center_x: c.read_f32()?,
-                center_y: c.read_f32()?,
-                zoom: c.read_f32()?,
-                rotation: c.read_f32()?,
-            };
-            let tween = match c.read_u8()? {
-                TWEEN_KIND_NONE => Tween::None,
-                TWEEN_KIND_LINEAR => Tween::Linear {
-                    to_frame: c.read_u16()?,
-                },
-                TWEEN_KIND_EASED => Tween::Eased {
-                    to_frame: c.read_u16()?,
-                    easing: read_easing(&mut c)?,
-                },
-                _ => return Err(Error::Validation("invalid camera tween kind")),
-            };
-            runtime.camera.keys.push(CameraKey {
-                frame,
-                state,
-                tween,
-            });
-        }
+        runtime.camera = read_camera_track(&mut c)?;
     }
     if version >= Q1S_VERSION_SCENES {
         let count = c.read_u16()?;
@@ -7663,6 +7840,16 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
     }
     if version >= Q1S_VERSION_LAYER_PARENTS {
         runtime.layer_parents = crate::parenting::read(&mut c)?;
+    }
+    if version >= Q1S_VERSION_SCENE_CAMERAS {
+        let count = c.read_u16()?;
+        for _ in 0..count {
+            let q0rg_id = c.read_u16()?;
+            let track = read_camera_track(&mut c)?;
+            if runtime.scene_cameras.insert(q0rg_id, track).is_some() {
+                return Err(Error::Validation("duplicate scene camera"));
+            }
+        }
     }
     c.finish()?;
 
@@ -9102,12 +9289,92 @@ mod compatibility_tests {
                 collapsed: true,
                 hidden: false,
                 locked: false,
+                mask_preview: false,
             },
         );
         assert_eq!(
             write_version(&project, Q1S_VERSION_ASSET_NAMES)
                 .expect_err("v5 cannot store layer folders"),
             Error::Validation("legacy q1s versions cannot store layer folders")
+        );
+    }
+
+    #[test]
+    fn scene_cameras_save_and_follow_the_starting_scene() {
+        let version = |bytes: &[u8]| u16::from_le_bytes([bytes[4], bytes[5]]);
+        let mut project = legacy_project();
+        let mut second = project.q0rgs[0].clone();
+        second.q0rg_id = 2;
+        second.name = "Second".into();
+        project.q0rgs.push(second);
+        project.runtime.scenes = vec![
+            ProjectScene {
+                scene_id: 1,
+                q0rg_id: 1,
+                name: "One".into(),
+            },
+            ProjectScene {
+                scene_id: 2,
+                q0rg_id: 2,
+                name: "Two".into(),
+            },
+        ];
+        let rest = project.default_camera_state();
+        let track = project.scene_camera_mut(2).expect("a scene has a camera");
+        track.enabled = true;
+        track.insert_key(0, rest);
+        assert!(project.scene_camera(1).keys.is_empty());
+        assert!(project.camera_on(2) && !project.camera_on(1));
+
+        let bytes = write(&project).unwrap();
+        assert_eq!(version(&bytes), Q1S_VERSION_SCENE_CAMERAS);
+        assert_eq!(
+            parse(&bytes).unwrap().runtime.scene_cameras,
+            project.runtime.scene_cameras
+        );
+        assert_eq!(
+            write_version(&project, Q1S_VERSION_MASK_PREVIEW).expect_err("v46 has one camera"),
+            Error::Validation("legacy q1s versions cannot store scene cameras")
+        );
+
+        project.set_entry_scene(2);
+        assert!(
+            project.runtime.camera.has_keyframe(0),
+            "the second scene's camera now starts the movie"
+        );
+        assert!(
+            project.runtime.scene_cameras.is_empty(),
+            "the first scene had no camera to keep"
+        );
+    }
+
+    #[test]
+    fn a_mask_preview_is_saved_and_only_raises_the_version_when_on() {
+        let version = |bytes: &[u8]| u16::from_le_bytes([bytes[4], bytes[5]]);
+        let mut project = legacy_project();
+        let mut mask = LayerMetadata {
+            kind: LayerKind::Mask,
+            ..LayerMetadata::default()
+        };
+        project.layer_metadata.insert(LayerKey::new(1, 1), mask);
+        let bytes = write(&project).unwrap();
+        assert!(
+            version(&bytes) < Q1S_VERSION_MASK_PREVIEW,
+            "without a preview, older builds still open it"
+        );
+
+        mask.mask_preview = true;
+        project.layer_metadata.insert(LayerKey::new(1, 1), mask);
+        let bytes = write(&project).unwrap();
+        assert_eq!(version(&bytes), Q1S_VERSION_MASK_PREVIEW);
+        assert_eq!(
+            parse(&bytes).unwrap().layer_metadata,
+            project.layer_metadata
+        );
+        assert_eq!(
+            write_version(&project, Q1S_VERSION_LAYER_PARENTS)
+                .expect_err("v45 cannot store a mask preview"),
+            Error::Validation("legacy q1s versions cannot store mask previews")
         );
     }
 

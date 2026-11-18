@@ -427,6 +427,10 @@ pub struct EditorApp {
     pub(crate) library_sort_by_uses: bool,
     pub(crate) library_folder_filter: String,
     pub(crate) library_collapsed_folders: std::collections::HashSet<(u64, String)>,
+    /// Graphics folders the user opened, by library tab: `None` is the
+    /// Graphics folder itself, `Some(id)` the folder of q0rg `id`. They
+    /// start closed.
+    pub(crate) library_open_graphics: std::collections::HashSet<(u64, Option<u16>)>,
     pub(crate) library_folder_draft: Option<LibraryFolderDraft>,
     pub(crate) library_cache: crate::panels::library::LibraryCache,
     document_tabs: Vec<DocumentTab>,
@@ -867,6 +871,10 @@ pub enum Action {
     RemoveSelectedTimelineFrames,
     ConvertSelectionToQ0rg,
     BreakApartSelection,
+    /// Open the Trace Bitmap dialog for the selected bitmap.
+    PromptTraceBitmap,
+    /// Swap the selected bitmap for vector shapes traced from its pixels.
+    TraceBitmap(crate::bitmap_trace::TraceSettings),
     ConvertStrokeToFill,
     /// Move the current layer's outlines to a new layer above it.
     StrokesToOwnLayer,
@@ -1073,6 +1081,8 @@ impl Action {
             "remove-selected-timeline-frames" => Self::RemoveSelectedTimelineFrames,
             "convert-selection-to-q0rg" => Self::ConvertSelectionToQ0rg,
             "break-apart-selection" => Self::BreakApartSelection,
+            "prompt-trace-bitmap" => Self::PromptTraceBitmap,
+            "trace-bitmap" => Self::TraceBitmap(Default::default()),
             "convert-stroke-to-fill" => Self::ConvertStrokeToFill,
             "strokes-to-own-layer" => Self::StrokesToOwnLayer,
             "exit-q0rg" => Self::ExitQ0rg,
@@ -1202,6 +1212,8 @@ impl Action {
             Self::RemoveSelectedTimelineFrames => "remove-selected-timeline-frames",
             Self::ConvertSelectionToQ0rg => "convert-selection-to-q0rg",
             Self::BreakApartSelection => "break-apart-selection",
+            Self::PromptTraceBitmap => "prompt-trace-bitmap",
+            Self::TraceBitmap(_) => "trace-bitmap",
             Self::ConvertStrokeToFill => "convert-stroke-to-fill",
             Self::PlaceQ0rgInstance(_) => "place-q0rg-instance",
             Self::PlaceLibraryItemAt(..) => "place-library-item-at",
@@ -1452,6 +1464,7 @@ impl Default for EditorApp {
         session.brush_cap = settings.brush_cap.into();
         session.brush_join = settings.brush_join.into();
         session.brush = settings.brush.to_runtime();
+        session.eraser = settings.eraser.to_runtime();
         session.brush_mode = settings.brush_mode.into();
         session.advanced_brush = settings.advanced_brush.to_runtime();
         Self {
@@ -1513,6 +1526,7 @@ impl Default for EditorApp {
             library_sort_by_uses: false,
             library_folder_filter: String::new(),
             library_collapsed_folders: Default::default(),
+            library_open_graphics: Default::default(),
             library_folder_draft: None,
             library_cache: crate::panels::library::LibraryCache::default(),
             document_tabs: Vec::new(),
@@ -1803,13 +1817,23 @@ impl EditorApp {
         if self.state.project.layer_metadata(q0rg_id, layer_id).kind != LayerKind::Mask {
             return false;
         }
-        let key = (self.active_project_tab_id().unwrap_or(0), q0rg_id, layer_id);
-        if locked {
-            self.session.hidden_mask_art_layers.insert(key);
-        } else {
-            self.session.hidden_mask_art_layers.remove(&key);
-        }
+        self.set_mask_preview(q0rg_id, layer_id, locked);
         true
+    }
+
+    /// Turns a mask layer's clipping preview on or off. It is saved with the
+    /// project, as the layer's lock is.
+    pub(crate) fn set_mask_preview(&mut self, q0rg_id: u16, layer_id: u16, on: bool) {
+        let mut metadata = self.state.project.layer_metadata(q0rg_id, layer_id);
+        if metadata.kind != LayerKind::Mask || metadata.mask_preview == on {
+            return;
+        }
+        metadata.mask_preview = on;
+        self.state
+            .project
+            .layer_metadata
+            .insert(LayerKey::new(q0rg_id, layer_id), metadata);
+        self.state.mark_dirty();
     }
 
     /// Shows the Plugin Studio's tab, opening it the first time.
@@ -2083,6 +2107,7 @@ impl EditorApp {
         session.brush_cap = self.settings.brush_cap.into();
         session.brush_join = self.settings.brush_join.into();
         session.brush = self.settings.brush.to_runtime();
+        session.eraser = self.settings.eraser.to_runtime();
         session.brush_mode = self.settings.brush_mode.into();
         session.advanced_brush = self.settings.advanced_brush.to_runtime();
         let mut q0enc = crate::q0enc::Q0EncState::default();
@@ -3309,6 +3334,7 @@ impl EditorApp {
                     | Action::AltDragDuplicateSelection(_)
                     | Action::ConvertSelectionToQ0rg
                     | Action::BreakApartSelection
+                    | Action::TraceBitmap(_)
                     | Action::ConvertStrokeToFill
                     | Action::BringToFront
                     | Action::SendToBack
@@ -3902,6 +3928,7 @@ impl EditorApp {
                             collapsed: false,
                             hidden: false,
                             locked: false,
+                            mask_preview: false,
                         },
                     );
                 }
@@ -3983,6 +4010,7 @@ impl EditorApp {
                         collapsed: false,
                         hidden: false,
                         locked: false,
+                        mask_preview: false,
                     },
                 );
                 self.session.current_layer_id = next_id;
@@ -4052,6 +4080,7 @@ impl EditorApp {
                         collapsed: false,
                         hidden: false,
                         locked: false,
+                        mask_preview: false,
                     },
                 );
                 self.state.project.layer_metadata.insert(
@@ -4391,13 +4420,12 @@ impl EditorApp {
                 if !is_mask {
                     return;
                 }
-                let key = (self.active_project_tab_id().unwrap_or(0), q0rg_id, layer_id);
-                let hidden = if self.session.hidden_mask_art_layers.remove(&key) {
-                    false
-                } else {
-                    self.session.hidden_mask_art_layers.insert(key);
-                    true
-                };
+                let hidden = !self
+                    .state
+                    .project
+                    .layer_metadata(q0rg_id, layer_id)
+                    .mask_preview;
+                self.set_mask_preview(q0rg_id, layer_id, hidden);
                 self.session.status = if hidden {
                     "mask preview enabled; source artwork hidden"
                 } else {
@@ -5148,6 +5176,12 @@ impl EditorApp {
             }
             Action::BreakApartSelection => {
                 self.break_apart_selection();
+            }
+            Action::PromptTraceBitmap => {
+                crate::bitmap_trace_ui::open(self, ctx);
+            }
+            Action::TraceBitmap(settings) => {
+                self.trace_bitmap_selection(&settings);
             }
             Action::ConvertStrokeToFill => {
                 self.convert_stroke_to_fill();
@@ -7009,9 +7043,9 @@ impl EditorApp {
         self.history.snapshot_with_session(project, &self.session);
         let project = &mut self.state.project;
         if let Some(replacement) = replacement {
-            project.meta.entry_q0rg_id = replacement;
-            project.runtime.camera = Default::default();
+            project.set_entry_scene(replacement);
         }
+        project.runtime.scene_cameras.remove(&q0rg_id);
         project.q0rgs.retain(|q| q.q0rg_id != q0rg_id);
         let runtime = &mut project.runtime;
         runtime
@@ -7142,9 +7176,6 @@ impl EditorApp {
         self.session
             .timeline_row_heights
             .retain(|(id, _), _| *id != q0rg_id);
-        self.session
-            .hidden_mask_art_layers
-            .retain(|(_, id, _)| *id != q0rg_id);
         self.session.reconcile_with(&self.state.project);
         self.q0enc.reconcile_with_project(&self.state.project);
         self.state.mark_dirty();
@@ -7851,20 +7882,18 @@ impl EditorApp {
             .filter(|key| key.q0rg_id == q0rg_id && key.frame >= requested)
             .count();
         let (removed_camera_keys, removed_camera_tweens) =
-            if q0rg_id == self.state.project.meta.entry_q0rg_id {
+            if self.state.project.is_scene_root(q0rg_id) {
                 (
                     self.state
                         .project
-                        .runtime
-                        .camera
+                        .scene_camera(q0rg_id)
                         .keys
                         .iter()
                         .filter(|key| key.frame >= requested)
                         .count(),
                     self.state
                         .project
-                        .runtime
-                        .camera
+                        .scene_camera(q0rg_id)
                         .keys
                         .iter()
                         .filter(|key| {
@@ -7936,14 +7965,15 @@ impl EditorApp {
             .runtime
             .frame_scripts
             .retain(|script| script.q0rg_id != q0rg_id || script.frame < frame_count);
-        if q0rg_id == self.state.project.meta.entry_q0rg_id {
-            self.state
-                .project
-                .runtime
-                .camera
-                .keys
-                .retain(|key| key.frame < frame_count);
-            for key in &mut self.state.project.runtime.camera.keys {
+        if let Some(camera) = self
+            .state
+            .project
+            .is_scene_root(q0rg_id)
+            .then_some(())
+            .and_then(|()| self.state.project.scene_camera_mut(q0rg_id))
+        {
+            camera.keys.retain(|key| key.frame < frame_count);
+            for key in &mut camera.keys {
                 if key
                     .tween
                     .to_frame()
@@ -8954,6 +8984,175 @@ impl EditorApp {
         }
     }
 
+    /// The selected stage object, when it shows a bitmap: its timeline,
+    /// layer, placement and bitmap asset.
+    pub(crate) fn selected_bitmap_placement(&self) -> Option<(u16, u16, usize, u16)> {
+        let Selection::Placement {
+            q0rg_id,
+            layer_id,
+            placement_idx,
+        } = self.session.selection
+        else {
+            return None;
+        };
+        let placement = self
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == q0rg_id)?
+            .layers
+            .iter()
+            .find(|layer| layer.layer_id == layer_id)?
+            .placements
+            .get(placement_idx)?;
+        let Target::Asset(asset_id) = placement.target else {
+            return None;
+        };
+        self.state
+            .project
+            .assets
+            .iter()
+            .any(|asset| matches!(asset, Asset::Bitmap(bitmap) if bitmap.asset_id == asset_id))
+            .then_some((q0rg_id, layer_id, placement_idx, asset_id))
+    }
+
+    pub fn can_trace_bitmap_selection(&self) -> bool {
+        self.selected_bitmap_placement().is_some()
+    }
+
+    /// Swaps the selected bitmap for vector shapes traced from its pixels,
+    /// placed where the bitmap stood. The bitmap stays in the library.
+    fn trace_bitmap_selection(&mut self, settings: &crate::bitmap_trace::TraceSettings) {
+        if self.selection_touches_locked_layer() {
+            self.session.status = "layer is locked".to_string();
+            return;
+        }
+        let Some((q0rg_id, layer_id, placement_idx, asset_id)) = self.selected_bitmap_placement()
+        else {
+            self.session.status = "Trace Bitmap: select a bitmap on the stage first".to_string();
+            return;
+        };
+        if self.break_apart_fx_block_reason().is_some() {
+            self.session.status =
+                "Reset instance FX before Trace Bitmap: the shapes cannot carry them".to_string();
+            return;
+        }
+        let frame = self.session.current_frame;
+        let Some(active_transform) = self
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+            .and_then(|q0rg| q0rg.layers.iter().find(|layer| layer.layer_id == layer_id))
+            .and_then(|layer| {
+                crate::render::active_transform_for_placement(layer, placement_idx, frame)
+            })
+        else {
+            self.session.status = "Selected bitmap is not on this frame".to_string();
+            return;
+        };
+        let Some(Asset::Bitmap(bitmap)) = self
+            .state
+            .project
+            .assets
+            .iter()
+            .find(|asset| asset.id() == asset_id)
+            .cloned()
+        else {
+            return;
+        };
+        let shapes =
+            crate::bitmap_trace::trace(bitmap.width, bitmap.height, &bitmap.rgba, settings);
+        if shapes.is_empty() {
+            self.session.status =
+                "Trace Bitmap: nothing opaque enough to trace (lower the opacity cutoff)"
+                    .to_string();
+            return;
+        }
+
+        // Bake the bitmap's placement into the paths, as Break Apart does, so
+        // the shapes are raw graphics sitting exactly where the bitmap was.
+        let bake = Affine::from_transform(active_transform);
+        let mut next_asset_id = crate::tools::next_asset_id_pub(&self.state.project);
+        let mut assets = Vec::new();
+        let mut pieces = Vec::new();
+        for shape in shapes {
+            let traced = VectorAsset {
+                asset_id: next_asset_id,
+                paths: shape.paths,
+                fill: Some(shape.color),
+                stroke: None,
+            };
+            pieces.push(BreakApartPiece {
+                placement: Placement {
+                    pivot: None,
+                    instance_id: 0,
+                    frame,
+                    target: Target::Asset(next_asset_id),
+                    transform: Transform2D::IDENTITY,
+                    tween: Tween::None,
+                    fx: Default::default(),
+                },
+                raw_path_count: traced.paths.len(),
+            });
+            assets.push(Asset::Vector(bake_vector_asset(
+                &traced,
+                next_asset_id,
+                bake,
+            )));
+            let Some(next) = next_asset_id.checked_add(1) else {
+                self.session.status = "Trace Bitmap ran out of asset ids".to_string();
+                return;
+            };
+            next_asset_id = next;
+        }
+
+        self.history
+            .snapshot_with_session(&self.state.project, &self.session);
+        let Some(mapped_idx) = crate::tools::materialize_placement_keyframe_for_edit(
+            &mut self.state.project,
+            q0rg_id,
+            layer_id,
+            placement_idx,
+            frame,
+        ) else {
+            return;
+        };
+        let shape_count = assets.len();
+        self.state.project.assets.extend(assets);
+        let Some(layer) = self
+            .state
+            .project
+            .q0rgs
+            .iter_mut()
+            .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+            .and_then(|q0rg| {
+                q0rg.layers
+                    .iter_mut()
+                    .find(|layer| layer.layer_id == layer_id)
+            })
+        else {
+            return;
+        };
+        layer.placements.remove(mapped_idx);
+        layer.placements.splice(
+            mapped_idx..mapped_idx,
+            pieces.iter().map(|piece| piece.placement.clone()),
+        );
+        self.session.selection = break_apart_result_selection(
+            &self.state.project,
+            q0rg_id,
+            layer_id,
+            mapped_idx,
+            &pieces,
+        );
+        self.session.status = format!("Traced the bitmap into {shape_count} shapes");
+        self.state.mark_dirty();
+        self.textures.invalidate();
+    }
+
     fn break_apart_vector_placement(
         &mut self,
         q0rg_id: u16,
@@ -9507,6 +9706,7 @@ impl EditorApp {
                     collapsed: false,
                     hidden: false,
                     locked: false,
+                    mask_preview: false,
                 },
             );
         }
@@ -9712,6 +9912,7 @@ impl EditorApp {
                     collapsed: false,
                     hidden: false,
                     locked: false,
+                    mask_preview: false,
                 },
             );
         }
@@ -10982,10 +11183,7 @@ impl EditorApp {
         }
 
         let selected_old = self
-            .state
-            .project
-            .runtime
-            .camera
+            .camera()
             .keys
             .iter()
             .filter(|key| (first..=last).contains(&key.frame))
@@ -11008,10 +11206,7 @@ impl EditorApp {
             .filter_map(|frame| remap(*frame))
             .collect::<std::collections::BTreeSet<_>>();
         if self
-            .state
-            .project
-            .runtime
-            .camera
+            .camera()
             .keys
             .iter()
             .any(|key| !selected_old.contains(&key.frame) && moved_frames.contains(&key.frame))
@@ -11021,7 +11216,7 @@ impl EditorApp {
         }
 
         let before = self.state.project.clone();
-        for key in &mut self.state.project.runtime.camera.keys {
+        for key in &mut self.camera_mut().keys {
             if selected_old.contains(&key.frame) {
                 key.frame = remap(key.frame).expect("validated camera frame remap");
             }
@@ -11034,12 +11229,7 @@ impl EditorApp {
                 };
             }
         }
-        self.state
-            .project
-            .runtime
-            .camera
-            .keys
-            .sort_by_key(|key| key.frame);
+        self.camera_mut().keys.sort_by_key(|key| key.frame);
         if q0s_format::v2::validate(&self.state.project).is_err() {
             self.state.project = before;
             self.session.status = "could not move camera frames".to_string();
@@ -11058,13 +11248,34 @@ impl EditorApp {
 
     pub(crate) fn camera_track_is_selected(&self) -> bool {
         self.session.camera_track_selected
-            && self.session.current_q0rg_id == self.state.project.meta.entry_q0rg_id
-            && self.state.project.runtime.camera.enabled
+            && self.state.project.camera_on(self.session.current_q0rg_id)
+    }
+
+    /// The camera of the scene whose timeline is in view (a switched-off one
+    /// inside a symbol).
+    pub(crate) fn camera(&self) -> &q0s_format::v2::CameraTrack {
+        self.state
+            .project
+            .scene_camera(self.session.current_q0rg_id)
+    }
+
+    /// The camera of the scene whose timeline is in view, to change. Only
+    /// called where the timeline in view is a scene's own.
+    pub(crate) fn camera_mut(&mut self) -> &mut q0s_format::v2::CameraTrack {
+        let scene = self.session.current_q0rg_id;
+        let project = &mut self.state.project;
+        if project.is_scene_root(scene) {
+            project
+                .scene_camera_mut(scene)
+                .expect("a scene's timeline has a camera")
+        } else {
+            &mut project.runtime.camera
+        }
     }
 
     fn insert_camera_frame_smart(&mut self) {
-        let entry_id = self.state.project.meta.entry_q0rg_id;
-        if self.session.current_q0rg_id != entry_id {
+        let entry_id = self.session.current_q0rg_id;
+        if !self.state.project.is_scene_root(entry_id) {
             self.session.camera_track_selected = false;
             return;
         }
@@ -11092,7 +11303,7 @@ impl EditorApp {
 
         let before = self.state.project.clone();
         if frame < old_count {
-            for key in &mut self.state.project.runtime.camera.keys {
+            for key in &mut self.camera_mut().keys {
                 if key.frame >= frame {
                     key.frame = key.frame.saturating_add(1);
                 }
@@ -11102,12 +11313,7 @@ impl EditorApp {
                     }
                 }
             }
-            self.state
-                .project
-                .runtime
-                .camera
-                .keys
-                .sort_by_key(|key| key.frame);
+            self.camera_mut().keys.sort_by_key(|key| key.frame);
         }
         if let Some(entry) = self
             .state
@@ -11133,8 +11339,8 @@ impl EditorApp {
     }
 
     fn insert_camera_keyframe_smart(&mut self) {
-        let entry_id = self.state.project.meta.entry_q0rg_id;
-        if self.session.current_q0rg_id != entry_id {
+        let entry_id = self.session.current_q0rg_id;
+        if !self.state.project.is_scene_root(entry_id) {
             self.session.camera_track_selected = false;
             return;
         }
@@ -11143,7 +11349,7 @@ impl EditorApp {
             .pending_timeline_frame
             .take()
             .unwrap_or(self.session.current_frame);
-        let has_exact = self.state.project.runtime.camera.has_keyframe(current);
+        let has_exact = self.camera().has_keyframe(current);
         let target = if has_exact {
             current.saturating_add(1)
         } else {
@@ -11153,13 +11359,13 @@ impl EditorApp {
             self.session.status = "timeline is already at its maximum length".to_string();
             return;
         };
-        if self.state.project.runtime.camera.has_keyframe(target) {
+        if self.camera().has_keyframe(target) {
             self.session.current_frame = target;
             self.session.status = format!("camera keyframe already exists at frame {}", target + 1);
             return;
         }
 
-        let state = self.state.project.camera_state_at(target);
+        let state = self.state.project.camera_state_in(entry_id, target);
         let before = self.state.project.clone();
         let old_count = self
             .state
@@ -11169,7 +11375,7 @@ impl EditorApp {
             .find(|q| q.q0rg_id == entry_id)
             .map(|q| q.frame_count)
             .unwrap_or(0);
-        self.state.project.runtime.camera.insert_key(target, state);
+        self.camera_mut().insert_key(target, state);
         if target >= old_count {
             if let Some(entry) = self
                 .state
@@ -11200,10 +11406,7 @@ impl EditorApp {
         let first = selection.first_frame();
         let last = selection.last_frame();
         let removed_frames = self
-            .state
-            .project
-            .runtime
-            .camera
+            .camera()
             .keys
             .iter()
             .filter(|key| (first..=last).contains(&key.frame))
@@ -11214,13 +11417,10 @@ impl EditorApp {
             return;
         }
         let before = self.state.project.clone();
-        self.state
-            .project
-            .runtime
-            .camera
+        self.camera_mut()
             .keys
             .retain(|key| !removed_frames.contains(&key.frame));
-        for key in &mut self.state.project.runtime.camera.keys {
+        for key in &mut self.camera_mut().keys {
             if key
                 .tween
                 .to_frame()
@@ -11245,10 +11445,7 @@ impl EditorApp {
         }
         let frame = self.session.current_frame;
         let mut ordered = self
-            .state
-            .project
-            .runtime
-            .camera
+            .camera()
             .keys
             .iter()
             .map(|key| key.frame)
@@ -11273,10 +11470,7 @@ impl EditorApp {
         };
         let before = self.state.project.clone();
         let Some(source) = self
-            .state
-            .project
-            .runtime
-            .camera
+            .camera_mut()
             .keys
             .iter_mut()
             .find(|key| key.frame == source_frame)
@@ -11632,6 +11826,18 @@ impl EditorApp {
             q0rg_id,
         );
         let before = self.state.project.clone();
+        // Keying past the end carries every layer that ended there on to the
+        // new frame, as F6 does, so the rest of the scene does not drop out
+        // behind the held objects.
+        for layer_id in &layers {
+            crate::timeline_edit::extend_layer_through_frame(
+                &mut self.state.project,
+                q0rg_id,
+                *layer_id,
+                target,
+                true,
+            );
+        }
         match crate::timeline_edit::materialize_keyframes_at_cells(
             &mut self.state.project,
             q0rg_id,
@@ -11670,7 +11876,10 @@ impl EditorApp {
                 self.textures.invalidate();
                 self.session.status = format!("keyed frame {}", u32::from(target) + 1);
             }
-            _ => self.session.status = "could not key the held objects here".to_string(),
+            _ => {
+                self.state.project = before;
+                self.session.status = "could not key the held objects here".to_string();
+            }
         }
     }
 
@@ -12295,7 +12504,7 @@ impl EditorApp {
             return;
         }
         let mut open = self.show_project_tree;
-        egui::Window::new("Project")
+        crate::dialog::Dialog::new("Project")
             .id(egui::Id::new("q0editor_project_tree_window"))
             .open(&mut open)
             .default_size([560.0, 600.0])
@@ -12316,7 +12525,7 @@ impl EditorApp {
             (screen.center().x - 380.0).max(16.0),
             (screen.center().y - 335.0).max(40.0),
         );
-        egui::Window::new("Credits")
+        crate::dialog::Dialog::new("Credits")
             .open(&mut open)
             .default_pos(initial_pos)
             .default_size([760.0, 590.0])
@@ -12356,528 +12565,9 @@ impl EditorApp {
         self.session.show_credits = open;
     }
 
-    /// Settings dialog — theme presets, custom colour pickers, brush
-    /// cap, .q7s save/load. Mirrors the player's dialog so the two
-    /// apps feel symmetric.
+    /// Settings: a page per subject, drawn by `settings_ui`.
     fn render_settings_dialog(&mut self, ctx: &Context) {
-        use crate::settings::Theme;
-
-        let mut open = true;
-        let mut close_requested = false;
-        egui::Window::new("Settings")
-            .open(&mut open)
-            .default_size([640.0, 580.0])
-            .max_height((ctx.screen_rect().height() - 110.0).max(320.0))
-            .default_pos(ctx.screen_rect().center() - egui::vec2(336.0, 330.0))
-            .collapsible(false)
-            .resizable(true)
-            .fit_to_screen(ctx)
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                ui.label(egui::RichText::new("Make it yours.").size(27.0).strong());
-                ui.label(egui::RichText::new("Appearance, canvas and editor preferences")
-                    .color(self.settings.theme.text_dim.to_color32()));
-                ui.add_space(18.0);
-                ui.horizontal(|ui| {
-                    ui.label("Keyboard shortcuts");
-                    if ui.button("Manage shortcuts...").clicked() {
-                        self.session.show_shortcuts = true;
-                    }
-                });
-                ui.horizontal(|ui| {
-                    let range = crate::settings::NudgeSteps::RANGE;
-                    let nudge = &mut self.settings.nudge;
-                    ui.label("Arrow keys move the selection by");
-                    let mut changed = ui
-                        .add(
-                            egui::DragValue::new(&mut nudge.step)
-                                .speed(0.1)
-                                .clamp_range(range.clone())
-                                .max_decimals(2)
-                                .suffix(" px"),
-                        )
-                        .changed();
-                    ui.label("with Shift");
-                    changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut nudge.shift_step)
-                                .speed(0.1)
-                                .clamp_range(range)
-                                .max_decimals(2)
-                                .suffix(" px"),
-                        )
-                        .changed();
-                    if changed {
-                        self.settings.save();
-                    }
-                });
-                ui.add_space(10.0);
-                crate::theme::section_heading(ui, "Display", "Frame presentation and responsiveness");
-                if ui.checkbox(&mut self.settings.vertical_sync, "Vertical sync (VSync)")
-                    .on_hover_text("Synchronize frame presentation with display refresh. Try disabling this if movement stutters despite low frame processing times. Applies after restarting q0editor.")
-                    .changed()
-                {
-                    self.session.status = match self.settings.try_save() {
-                        Ok(()) => "display synchronization changed; restart q0editor to apply".into(),
-                        Err(error) => format!("could not save display preference: {error}"),
-                    };
-                }
-                if let Some(active) = self.perf.presentation_sync() {
-                    if active != self.settings.vertical_sync {
-                        ui.label(egui::RichText::new("Restart q0editor to apply the display setting.")
-                            .color(self.settings.theme.text_dim.to_color32()));
-                    }
-                }
-                ui.add_space(10.0);
-                crate::theme::section_heading(ui, "Autosave", "Recovery snapshots of unsaved work, offered on Home after a crash");
-                let mut autosave_changed = ui
-                    .checkbox(&mut self.settings.autosave_enabled, "Keep recovery snapshots")
-                    .on_hover_text("Unsaved documents are copied to a private recovery folder in the background. Your project files are only written when you save.")
-                    .changed();
-                ui.add_enabled_ui(self.settings.autosave_enabled, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Every");
-                        let mut minutes = self.settings.autosave_interval_secs as f32 / 60.0;
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut minutes)
-                                    .speed(0.25)
-                                    .clamp_range(
-                                        crate::autosave::MIN_INTERVAL_SECS as f32 / 60.0
-                                            ..=crate::autosave::MAX_INTERVAL_SECS as f32 / 60.0,
-                                    )
-                                    .max_decimals(2)
-                                    .suffix(" min"),
-                            )
-                            .changed()
-                        {
-                            self.settings.autosave_interval_secs = ((minutes * 60.0).round() as u32)
-                                .clamp(
-                                    crate::autosave::MIN_INTERVAL_SECS,
-                                    crate::autosave::MAX_INTERVAL_SECS,
-                                );
-                            autosave_changed = true;
-                        }
-                    });
-                });
-                if autosave_changed {
-                    if let Err(error) = self.settings.try_save() {
-                        self.session.status = format!("could not save autosave preference: {error}");
-                    }
-                }
-                let autosave_note = if let Some(error) = self.autosave.last_error() {
-                    Some(format!("Last snapshot failed: {error}"))
-                } else {
-                    self.autosave.last_snapshot_age().map(|age| {
-                        format!("Last snapshot {} s ago", age.as_secs())
-                    })
-                };
-                if let Some(note) = autosave_note {
-                    ui.label(egui::RichText::new(note)
-                        .color(self.settings.theme.text_dim.to_color32()));
-                }
-                ui.add_space(10.0);
-                crate::theme::section_heading(ui, "Discord", "What your Discord profile says while q0editor is open");
-                let mut discord_changed = ui
-                    .checkbox(&mut self.settings.discord_presence, "Show what I'm working on")
-                    .on_hover_text("Discord shows \"Editing <project>\" and the frame you are on, while the Discord app is running on this computer.")
-                    .changed();
-                ui.add_enabled_ui(self.settings.discord_presence, |ui| {
-                    discord_changed |= ui
-                        .checkbox(&mut self.settings.discord_show_project, "Name the project")
-                        .on_hover_text("Off, Discord only says you are animating.")
-                        .changed();
-                    ui.horizontal(|ui| {
-                        ui.label("Application id");
-                        discord_changed |= ui
-                            .add(
-                                egui::TextEdit::singleline(&mut self.settings.discord_application_id)
-                                    .hint_text(if crate::discord::APPLICATION_ID.is_empty() {
-                                        "paste one"
-                                    } else {
-                                        "q0editor's own"
-                                    })
-                                    .desired_width(170.0),
-                            )
-                            .on_hover_text("The Discord application to show as. Leave it empty for q0editor's own.")
-                            .changed();
-                    });
-                });
-                if discord_changed {
-                    let _ = self.settings.try_save();
-                }
-                ui.add_space(10.0);
-                crate::theme::section_heading(ui, "Extra tools", "Bigger features that stay out of sight until you turn them on");
-                if ui
-                    .checkbox(&mut self.settings.physics_enabled, "Physics editor")
-                    .on_hover_text("Objects fall, bounce and collide, and the result is baked into keyframes. Adds Modify > Physics and a Physics button.")
-                    .changed()
-                {
-                    if !self.settings.physics_enabled {
-                        self.session.physics.open = false;
-                        self.session.physics.stop_preview();
-                    }
-                    if let Err(error) = self.settings.try_save() {
-                        self.session.status = format!("could not save the physics preference: {error}");
-                    }
-                }
-                if ui
-                    .checkbox(&mut self.settings.particles_enabled, "Particle system")
-                    .on_hover_text("Emitters spray fire, smoke, sparks, snow or library items, baked into keyframes. Adds Modify > Particles and a Particles button.")
-                    .changed()
-                {
-                    if !self.settings.particles_enabled {
-                        self.session.particles.open = false;
-                        self.session.particles.stop_preview();
-                    }
-                    if let Err(error) = self.settings.try_save() {
-                        self.session.status = format!("could not save the particles preference: {error}");
-                    }
-                }
-                if ui
-                    .checkbox(&mut self.settings.light_enabled, "Light editor")
-                    .on_hover_text("Real lights: darken the scene and drop lamps, torches and spotlights on it. Nothing is baked; exports and q0player light every frame. Adds Modify > Light and a Light button.")
-                    .changed()
-                {
-                    if !self.settings.light_enabled {
-                        self.session.lights.open = false;
-                    }
-                    if let Err(error) = self.settings.try_save() {
-                        self.session.status = format!("could not save the light preference: {error}");
-                    }
-                }
-                ui.add_space(10.0);
-                crate::theme::section_heading(ui, "Appearance", "Choose a palette. Every panel follows your theme.");
-                ui.horizontal_wrapped(|ui| {
-                    for preset in Theme::PRESETS {
-                        let selected = self.settings.theme.accent == preset.accent.into()
-                            && self.settings.theme.window == preset.window.into()
-                            && self.settings.theme.panel == preset.panel.into();
-                        if crate::theme::preset_button(ui, preset, selected).clicked() {
-                            self.settings.theme = Theme::from_builtin(preset);
-                            self.settings.theme.apply(ctx);
-                            self.settings.save();
-                            self.session.status = format!("theme: {}", preset.name);
-                        }
-                    }
-                });
-                ui.add_space(12.0);
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .button("Save as... (.q7s)")
-                        .on_hover_text("Persist current colours as a reusable .q7s theme")
-                        .clicked()
-                    {
-                        if let Some(path) = crate::platform::FileDialog::new()
-                            .add_filter("q7s theme", &["q7s"])
-                            .set_file_name("my-theme.q7s")
-                            .save_file()
-                        {
-                            let name = path
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("Custom")
-                                .to_string();
-                            match self.settings.theme.write_q7s(&path, &name) {
-                                Ok(()) => {
-                                    crate::platform::file_written(&path);
-                                    self.session.status =
-                                        format!("saved theme: {}", path.display())
-                                }
-                                Err(e) => {
-                                    self.session.status = format!("save theme failed: {e}")
-                                }
-                            }
-                        }
-                    }
-                    if ui
-                        .button("Load... (.q7s)")
-                        .on_hover_text("Apply a previously saved .q7s theme (works with q0player .q7s files too)")
-                        .clicked()
-                    {
-                        if let Some(action) = crate::platform::pick_file_then(
-                            crate::platform::FileDialog::new().add_filter("q7s theme", &["q7s"]),
-                            Action::LoadThemeFromPath,
-                        ) {
-                            self.queue(action);
-                        }
-                    }
-                });
-                ui.separator();
-
-                let mut t = self.settings.theme.clone();
-                egui::CollapsingHeader::new("Base palette")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        egui::Grid::new("editor_theme_base")
-                            .num_columns(2)
-                            .spacing([10.0, 6.0])
-                            .show(ui, |ui| {
-                                color_row(ui, "Accent", &mut t.accent);
-                                color_row(ui, "Panel", &mut t.panel);
-                                color_row(ui, "Window", &mut t.window);
-                                color_row(ui, "Inputs background", &mut t.deep_bg);
-                                color_row(ui, "Text", &mut t.text);
-                                color_row(ui, "Text dim", &mut t.text_dim);
-                                color_row(ui, "Window stroke", &mut t.stroke_dark);
-                            });
-                    });
-                egui::CollapsingHeader::new("Gradients")
-                    .default_open(true)
-                    .show(ui, |ui| crate::ui::gradient_editor(ui, &mut t));
-                egui::CollapsingHeader::new("Stage & canvas")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new(
-                                "The stage paper stays white. This is the drawing canvas.",
-                            )
-                            .small()
-                            .color(self.settings.theme.text_dim.to_color32()),
-                        );
-                        egui::Grid::new("editor_theme_stage")
-                            .num_columns(2)
-                            .spacing([10.0, 6.0])
-                            .show(ui, |ui| {
-                                color_row(ui, "Canvas (outside stage)", &mut t.canvas_bg);
-                                color_row(ui, "Stage border", &mut t.stage_border);
-                                color_row(ui, "Symbol edit mask", &mut t.symbol_edit_mask);
-                                color_row(
-                                    ui,
-                                    "Library preview (light)",
-                                    &mut t.library_preview_light,
-                                );
-                                color_row(
-                                    ui,
-                                    "Library preview (dark)",
-                                    &mut t.library_preview_dark,
-                                );
-                            });
-                        ui.horizontal_wrapped(|ui| {
-                            if ui.button("Choose canvas photo...").clicked() {
-                                if let Some(path) = crate::platform::FileDialog::new()
-                                    .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
-                                    .pick_file()
-                                {
-                                    match crate::bitmap_import::decode_bitmap_path(&path, u16::MAX) {
-                                        Ok(_) => {
-                                            t.canvas_background_image = Some(path.clone());
-                                            self.session.status = format!(
-                                                "canvas photo: {}",
-                                                path.file_name()
-                                                    .and_then(|name| name.to_str())
-                                                    .unwrap_or("image")
-                                            );
-                                        }
-                                        Err(error) => {
-                                            self.session.status =
-                                                format!("canvas photo failed: {error}");
-                                        }
-                                    }
-                                }
-                            }
-                            if let Some(path) = t.canvas_background_image.as_ref() {
-                                ui.label(
-                                    path.file_name()
-                                        .and_then(|name| name.to_str())
-                                        .unwrap_or("selected image"),
-                                );
-                                if ui.button("Clear photo").clicked() {
-                                    t.canvas_background_image = None;
-                                    t.canvas_background_darkening = 0;
-                                }
-                            }
-                        });
-                        ui.add(
-                            egui::Slider::new(&mut t.canvas_background_darkening, 0..=100)
-                                .text("Photo darkening")
-                                .suffix("%"),
-                        );
-                    });
-                egui::CollapsingHeader::new("Timeline")
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        egui::Grid::new("editor_theme_timeline")
-                            .num_columns(2)
-                            .spacing([10.0, 6.0])
-                            .show(ui, |ui| {
-                                color_row(ui, "Header strip", &mut t.timeline_header);
-                                color_row(ui, "Grid", &mut t.timeline_grid);
-                                color_row(ui, "Grid (every 5)", &mut t.timeline_grid_5);
-                                color_row(ui, "Playhead", &mut t.playhead);
-                                color_row(ui, "Keyframe dot", &mut t.keyframe);
-                                color_row(ui, "Span fill", &mut t.extension);
-                                color_row(ui, "Span fill (active layer)", &mut t.extension_active);
-                                // Once shown here the two kinds are edited
-                                // independently of each other.
-                                t.pin_shape_tween_colors();
-                                color_row(ui, "Motion tween fill", &mut t.tween_fill);
-                                color_row(ui, "Motion tween arrow", &mut t.tween_arrow);
-                                if let Some(fill) = t.shape_tween_fill.as_mut() {
-                                    color_row(ui, "Shape tween fill", fill);
-                                }
-                                if let Some(arrow) = t.shape_tween_arrow.as_mut() {
-                                    color_row(ui, "Shape tween arrow", arrow);
-                                }
-                                color_row(ui, "Empty cell (inside)", &mut t.empty_inside);
-                                color_row(
-                                    ui,
-                                    "Empty cell (active layer)",
-                                    &mut t.empty_inside_active,
-                                );
-                                color_row(ui, "Beyond cell", &mut t.empty_beyond);
-                                color_row(ui, "Beyond cell (every 5)", &mut t.empty_beyond_5);
-                            });
-                    });
-                egui::CollapsingHeader::new("Onion-skin tints")
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        egui::Grid::new("editor_theme_onion")
-                            .num_columns(2)
-                            .spacing([10.0, 6.0])
-                            .show(ui, |ui| {
-                                color_row(ui, "Past frames", &mut t.onion_past);
-                                color_row(ui, "Future frames", &mut t.onion_future);
-                            });
-                    });
-                egui::CollapsingHeader::new("q0lang syntax")
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new(
-                                "Used by the script editor (View > Script Editor, F9).",
-                            )
-                            .small()
-                            .color(self.settings.theme.text_dim.to_color32()),
-                        );
-                        egui::Grid::new("editor_theme_syntax")
-                            .num_columns(2)
-                            .spacing([10.0, 6.0])
-                            .show(ui, |ui| {
-                                color_row(ui, "Keyword", &mut t.syntax_keyword);
-                                color_row(ui, "Built-in / library", &mut t.syntax_builtin);
-                                color_row(ui, "String", &mut t.syntax_string);
-                                color_row(ui, "Number", &mut t.syntax_number);
-                                color_row(ui, "Comment", &mut t.syntax_comment);
-                                color_row(ui, "Operator", &mut t.syntax_operator);
-                                color_row(ui, "Identifier", &mut t.syntax_identifier);
-                                color_row(ui, "Signal (X!)", &mut t.syntax_signal);
-                                color_row(ui, "Gutter background", &mut t.syntax_gutter_bg);
-                                color_row(ui, "Gutter text", &mut t.syntax_gutter_fg);
-                            });
-                    });
-                if t != self.settings.theme {
-                    self.settings.theme = t;
-                    self.settings.theme.apply(ctx);
-                    self.settings.save();
-                }
-                ui.separator();
-
-                #[cfg(windows)]
-                {
-                    ui.heading("File association");
-                    let association_state = match crate::assoc::is_registered_for_current_user() {
-                        Ok(true) => "active for this q0editor",
-                        Ok(false) => "not active",
-                        Err(_) => "status unavailable",
-                    };
-                    ui.label(
-                        egui::RichText::new(format!(
-                            ".q1s project files: {association_state}. This affects the current Windows user only."
-                        ))
-                        .small()
-                        .color(self.settings.theme.text_dim.to_color32()),
-                    );
-                    let q0lang_association_state =
-                        match crate::assoc::is_q0lang_registered_for_current_user() {
-                            Ok(true) => "active for this q0editor",
-                            Ok(false) => "not active",
-                            Err(_) => "status unavailable",
-                        };
-                    ui.label(
-                        egui::RichText::new(format!(
-                            ".q0l / .q0lang source files: {q0lang_association_state}. Both extensions are the same q0lang source format."
-                        ))
-                        .small()
-                        .color(self.settings.theme.text_dim.to_color32()),
-                    );
-                    ui.horizontal(|ui| {
-                        if ui.button("Register .q1s").clicked() {
-                            match crate::assoc::register_for_current_user() {
-                                Ok(()) => {
-                                    self.session.status =
-                                        ".q1s files now open with q0editor".to_string()
-                                }
-                                Err(error) => {
-                                    self.session.status =
-                                        format!("association failed: {error}")
-                                }
-                            }
-                        }
-                        if ui.button("Remove .q1s association").clicked() {
-                            match crate::assoc::unregister_for_current_user() {
-                                Ok(()) => {
-                                    self.session.status =
-                                        ".q1s association removed".to_string()
-                                }
-                                Err(error) => {
-                                    self.session.status = format!("removal failed: {error}")
-                                }
-                            }
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        if ui.button("Register .q0l + .q0lang").clicked() {
-                            match crate::assoc::register_q0lang_for_current_user() {
-                                Ok(()) => {
-                                    self.session.status =
-                                        ".q0l and .q0lang files now open with q0editor".to_string()
-                                }
-                                Err(error) => {
-                                    self.session.status =
-                                        format!("q0lang association failed: {error}")
-                                }
-                            }
-                        }
-                        if ui.button("Remove q0lang associations").clicked() {
-                            match crate::assoc::unregister_q0lang_for_current_user() {
-                                Ok(()) => {
-                                    self.session.status =
-                                        ".q0l and .q0lang associations removed".to_string()
-                                }
-                                Err(error) => {
-                                    self.session.status = format!("removal failed: {error}")
-                                }
-                            }
-                        }
-                    });
-                    ui.separator();
-                }
-
-                // Brush options live in the Properties panel (Stage
-                // section when the Brush tool is active, plus per-asset
-                // when a stroked shape is selected).
-
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        if ui.button("Close").clicked() {
-                            close_requested = true;
-                        }
-                    },
-                );
-                    });
-            });
-        if !open || close_requested {
-            self.session.show_settings = false;
-        }
-        crate::ui::hidden_palette_note(
-            ctx,
-            self.session.show_settings,
-            self.settings.theme.accent.to_color32(),
-        );
+        crate::settings_ui::render(self, ctx);
     }
 
     fn render_shortcuts_dialog(&mut self, ctx: &Context) {
@@ -12894,6 +12584,7 @@ impl EditorApp {
         }
         let mut project_to_save = self.state.project.clone();
         self.rebase_project_dependencies_for_save(&mut project_to_save, path);
+        let left_out = crate::graphics::unused(&project_to_save).len();
         match file_io::save_project(path, &project_to_save) {
             Ok(_) => {
                 crate::platform::file_written(path);
@@ -12904,10 +12595,15 @@ impl EditorApp {
                 self.settings.push_recent(path);
                 self.plugins
                     .notify("saved", vec![q0ex::Value::str(path.display().to_string())]);
+                let left_out = match left_out {
+                    0 => String::new(),
+                    1 => " (1 unused drawing left out)".to_string(),
+                    n => format!(" ({n} unused drawings left out)"),
+                };
                 self.session.status = match self.settings.try_save() {
-                    Ok(()) => format!("saved {}", path.display()),
+                    Ok(()) => format!("saved {}{left_out}", path.display()),
                     Err(error) => format!(
-                        "saved {}; recent list was not saved: {error}",
+                        "saved {}{left_out}; recent list was not saved: {error}",
                         path.display()
                     ),
                 };
@@ -13033,19 +12729,9 @@ impl EditorApp {
                     if !self.activate_new_workspace(workspace) {
                         return;
                     }
-                    // A mask layer locked in the FLA opens with its mask
-                    // preview on, so it clips as it did there; the layer
-                    // itself stays locked.
-                    let tab = self.active_project_tab_id().unwrap_or(0);
-                    let locked_masks = self
-                        .state
-                        .project
-                        .layer_metadata
-                        .iter()
-                        .filter(|(_, metadata)| metadata.kind == LayerKind::Mask && metadata.locked)
-                        .map(|(key, _)| (tab, key.q0rg_id, key.layer_id))
-                        .collect::<Vec<_>>();
-                    self.session.hidden_mask_art_layers.extend(locked_masks);
+                    // A mask layer locked in the FLA comes in with its mask
+                    // preview on (the importer sets it), so it clips as it
+                    // did there.
                     self.new_project_dialog = None;
                     self.session.status = format!(
                         "q0fla imported {} as an unsaved q1s project; {summary}",
@@ -13299,7 +12985,7 @@ impl EditorApp {
         let mut open = true;
         let mut create = false;
         let mut cancel = false;
-        egui::Window::new("Create project")
+        crate::dialog::Dialog::new("Create project")
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .open(&mut open)
             .collapsible(false)
@@ -13391,16 +13077,22 @@ impl EditorApp {
                     .color(self.settings.theme.text_dim.to_color32())
                     .small(),
                 );
-                ui.add_space(12.0);
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if crate::theme::primary_button(ui, "Create project", self.settings.theme.accent.to_color32()).clicked() {
+                crate::dialog::footer(ui, |ui| {
+                    if crate::dialog::button(ui, "Create project", crate::dialog::Kind::Primary)
+                        .clicked()
+                    {
                         create = true;
                     }
-                    if ui.button("Cancel").clicked() {
+                    if crate::dialog::button(ui, "Cancel", crate::dialog::Kind::Secondary).clicked()
+                    {
                         cancel = true;
                     }
                 });
+                if ui.input(|input| input.key_pressed(egui::Key::Escape))
+                    && !ui.ctx().wants_keyboard_input()
+                {
+                    cancel = true;
+                }
             });
 
         if create {
@@ -13423,29 +13115,21 @@ impl EditorApp {
             _ => "continue",
         };
 
-        let mut save = false;
-        let mut discard = false;
-        let mut cancel = false;
-        egui::Window::new("Unsaved changes")
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .collapsible(false)
-            .resizable(false)
-            .fit_to_screen(ctx)
-            .show(ctx, |ui| {
-                ui.label(format!("Save your changes before you {destination}?"));
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Save").clicked() {
-                        save = true;
-                    }
-                    if ui.button("Discard").clicked() {
-                        discard = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
-            });
+        use crate::dialog::{Confirm, Kind, Tone};
+        let answer = Confirm::new(
+            "Unsaved changes",
+            Tone::Warning,
+            format!("Save your changes before you {destination}?"),
+        )
+        .detail("Discard loses everything since the last save.")
+        .action("Save", Kind::Primary)
+        .default_action()
+        .cancel("Cancel")
+        .action("Discard", Kind::Secondary)
+        .show(ctx);
+        let save = answer == Some(0);
+        let cancel = answer == Some(1);
+        let discard = answer == Some(2);
 
         if save {
             if self.save_current_document() {
@@ -13988,7 +13672,7 @@ impl EditorApp {
         let mut cancel_requested = false;
         let mut picked = None;
         let mut source_located = false;
-        egui::Window::new("Replace q0rg")
+        crate::dialog::Dialog::new("Replace q0rg")
             .open(&mut open)
             .default_size([560.0, 540.0])
             .min_size([240.0, 240.0])
@@ -14059,10 +13743,12 @@ impl EditorApp {
                             }
                         }
                     });
-                ui.separator();
-                if ui.button("Cancel").clicked() {
-                    cancel_requested = true;
-                }
+                crate::dialog::footer(ui, |ui| {
+                    if crate::dialog::button(ui, "Cancel", crate::dialog::Kind::Secondary).clicked()
+                    {
+                        cancel_requested = true;
+                    }
+                });
                 if ui.input(|input| input.key_pressed(egui::Key::Escape)) && !ui.ctx().wants_keyboard_input() {
                     cancel_requested = true;
                 }
@@ -14085,28 +13771,17 @@ impl EditorApp {
 
     fn render_destructive_change_dialogs(&mut self, ctx: &Context) {
         if let Some((asset_id, references)) = self.pending_asset_delete {
-            let mut confirm = false;
-            let mut cancel = false;
-            egui::Window::new("Delete used asset?")
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .collapsible(false)
-                .resizable(false)
-                .fit_to_screen(ctx)
-                .show(ctx, |ui| {
-                    ui.label(format!(
-                        "Asset {asset_id} is used by {references} placement(s)."
-                    ));
-                    ui.label("Deleting it also removes every one of those placements.");
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Delete asset and placements").clicked() {
-                            confirm = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
-                        }
-                    });
-                });
+            let answer = crate::dialog::Confirm::new(
+                "Delete used asset?",
+                crate::dialog::Tone::Danger,
+                format!("Asset {asset_id} is used by {references} placement(s)."),
+            )
+            .detail("Deleting it also removes every one of those placements.")
+            .action("Delete asset and placements", crate::dialog::Kind::Danger)
+            .cancel("Cancel")
+            .show(ctx);
+            let confirm = answer == Some(0);
+            let cancel = answer == Some(1);
             if confirm {
                 self.pending_asset_delete = None;
                 self.session.selection = Selection::Asset(asset_id);
@@ -14127,42 +13802,37 @@ impl EditorApp {
                 .scenes()
                 .into_iter()
                 .find(|scene| scene.q0rg_id == q0rg_id);
-            let mut confirm = false;
-            let mut cancel = false;
-            egui::Window::new(if scene.is_some() {
-                "Delete scene?"
-            } else {
-                "Delete used symbol?"
-            })
-            .id(egui::Id::new("delete_timeline_confirmation"))
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .collapsible(false)
-            .resizable(false)
-            .fit_to_screen(ctx)
-            .show(ctx, |ui| {
-                if let Some(scene) = &scene {
-                    ui.label(format!("Delete {} and its timeline?", scene.name));
-                }
-                if references > 0 {
-                    ui.label(format!(
-                        "This also removes {references} placement(s) that use it."
-                    ));
-                }
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    let label = if scene.is_some() {
+            let mut question = crate::dialog::Confirm::new(
+                if scene.is_some() {
+                    "Delete scene?"
+                } else {
+                    "Delete used symbol?"
+                },
+                crate::dialog::Tone::Danger,
+                match &scene {
+                    Some(scene) => format!("Delete {} and its timeline?", scene.name),
+                    None => "Delete this symbol?".to_string(),
+                },
+            )
+            .id(egui::Id::new("delete_timeline_confirmation"));
+            if references > 0 {
+                question = question.detail(format!(
+                    "This also removes {references} placement(s) that use it."
+                ));
+            }
+            let answer = question
+                .action(
+                    if scene.is_some() {
                         "Delete scene"
                     } else {
                         "Delete symbol and placements"
-                    };
-                    if ui.button(label).clicked() {
-                        confirm = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
-            });
+                    },
+                    crate::dialog::Kind::Danger,
+                )
+                .cancel("Cancel")
+                .show(ctx);
+            let confirm = answer == Some(0);
+            let cancel = answer == Some(1);
             if confirm {
                 self.pending_q0rg_delete = None;
                 self.apply_q0rg_delete(q0rg_id);
@@ -14178,27 +13848,17 @@ impl EditorApp {
         }
 
         if let Some((q0rg_id, layer_id, layer_count, item_count)) = self.pending_layer_delete {
-            let mut confirm = false;
-            let mut cancel = false;
-            egui::Window::new("Delete layer?")
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .collapsible(false)
-                .resizable(false)
-                .fit_to_screen(ctx)
-                .show(ctx, |ui| {
-                    ui.label(format!(
-                        "Delete {layer_count} layer row(s) and {item_count} timeline item(s)?"
-                    ));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Delete layer").clicked() {
-                            confirm = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
-                        }
-                    });
-                });
+            let answer = crate::dialog::Confirm::new(
+                "Delete layer?",
+                crate::dialog::Tone::Danger,
+                format!("Delete {layer_count} layer row(s) and {item_count} timeline item(s)?"),
+            )
+            .badge(crate::dialog::Badge::Icon(crate::ui::Icon::Layer))
+            .action("Delete layer", crate::dialog::Kind::Danger)
+            .cancel("Cancel")
+            .show(ctx);
+            let confirm = answer == Some(0);
+            let cancel = answer == Some(1);
             if confirm {
                 self.pending_layer_delete = None;
                 self.apply_layer_delete(q0rg_id, layer_id);
@@ -14219,11 +13879,10 @@ impl EditorApp {
                 .keys()
                 .filter(|key| key.q0rg_id == q0rg_id && key.frame >= frames)
                 .count();
-            let camera_keys = if q0rg_id == self.state.project.meta.entry_q0rg_id {
+            let camera_keys = if self.state.project.is_scene_root(q0rg_id) {
                 self.state
                     .project
-                    .runtime
-                    .camera
+                    .scene_camera(q0rg_id)
                     .keys
                     .iter()
                     .filter(|key| key.frame >= frames)
@@ -14231,11 +13890,10 @@ impl EditorApp {
             } else {
                 0
             };
-            let camera_tweens = if q0rg_id == self.state.project.meta.entry_q0rg_id {
+            let camera_tweens = if self.state.project.is_scene_root(q0rg_id) {
                 self.state
                     .project
-                    .runtime
-                    .camera
+                    .scene_camera(q0rg_id)
                     .keys
                     .iter()
                     .filter(|key| {
@@ -14247,28 +13905,20 @@ impl EditorApp {
             } else {
                 0
             };
-            let mut confirm = false;
-            let mut cancel = false;
-            egui::Window::new("Shorten symbol?")
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .collapsible(false)
-                .resizable(false)
-                .fit_to_screen(ctx)
-                .show(ctx, |ui| {
-                    ui.label(format!("Reduce the symbol to {frames} frame(s)?"));
-                    ui.label(format!(
-                        "This removes {keyframes} keyframe(s), {tweens} tween(s), {audio_clips} audio clip(s), {frame_scripts} frame script(s), {frame_labels} frame label(s), {camera_keys} camera key(s), and {camera_tweens} camera tween(s)."
-                    ));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Shorten symbol").clicked() {
-                            confirm = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
-                        }
-                    });
-                });
+            let answer = crate::dialog::Confirm::new(
+                "Shorten symbol?",
+                crate::dialog::Tone::Warning,
+                format!("Reduce the symbol to {frames} frame(s)?"),
+            )
+            .badge(crate::dialog::Badge::Icon(crate::ui::Icon::RemoveFrames))
+            .detail(format!(
+                "This removes {keyframes} keyframe(s), {tweens} tween(s), {audio_clips} audio clip(s), {frame_scripts} frame script(s), {frame_labels} frame label(s), {camera_keys} camera key(s), and {camera_tweens} camera tween(s)."
+            ))
+            .action("Shorten symbol", crate::dialog::Kind::Danger)
+            .cancel("Cancel")
+            .show(ctx);
+            let confirm = answer == Some(0);
+            let cancel = answer == Some(1);
             if confirm {
                 self.pending_frame_truncate = None;
                 self.apply_frame_count(q0rg_id, frames);
@@ -14513,20 +14163,6 @@ impl EditorApp {
     }
 }
 
-fn color_row(ui: &mut egui::Ui, label: &str, target: &mut crate::settings::ColorRgb) {
-    let response = ui.label(label);
-    if label == "Window stroke" {
-        crate::ui::hidden_palette_note_trigger(ui, &response);
-    }
-    let mut c = [target.r, target.g, target.b];
-    if crate::color_picker::color_edit_button_srgb(ui, &mut c).changed() {
-        target.r = c[0];
-        target.g = c[1];
-        target.b = c[2];
-    }
-    ui.end_row();
-}
-
 impl App for EditorApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.online.shutdown();
@@ -14593,6 +14229,9 @@ impl App for EditorApp {
     fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.update_frame(ctx, frame);
+            // Every window of this frame has been shown: fade out the ones
+            // that were closed.
+            crate::dialog::fade_closed(ctx);
         }));
         if let Err(panic) = result {
             // The editor is going down. Put unsaved work on disk first; a
@@ -14680,6 +14319,14 @@ impl EditorApp {
             ctx,
             (self.active_project_tab_id(), self.session.current_q0rg_id),
         );
+        if crate::color_picker::is_open(ctx) {
+            // The project's own colours, for the picker's Swatches tab.
+            crate::color_picker_ui::note_project(
+                ctx,
+                &self.state.project,
+                (self.active_project_tab_id(), self.state.revision()),
+            );
+        }
 
         let prelude_started = Instant::now();
         if ctx.input(|input| input.viewport().close_requested()) && !self.close_requested {
@@ -14709,9 +14356,14 @@ impl EditorApp {
             self.session.selection_history_gesture = Some((selection_before_frame.clone(), true));
         }
         self.handle_dropped_files(ctx);
-        if self.session.show_shortcuts && self.session.shortcut_capture.is_some() {
+        // A shortcut waits for its keys: from the shortcut editor (its own
+        // window or Settings) or from a keycap by a tool's name.
+        if self.session.shortcut_capture.is_some() {
             if panels::shortcuts::capture_key(self, ctx) {
                 self.settings.save();
+                if let Some(feedback) = &self.session.shortcut_feedback {
+                    self.session.status = feedback.clone();
+                }
             }
         } else if self.show_home {
             panels::menu::handle_home_shortcuts(self, ctx);
@@ -14818,6 +14470,7 @@ impl EditorApp {
         self.render_new_project_dialog(ctx);
         self.render_replace_q0rg_dialog(ctx);
         crate::symbol_prompt::render(self, ctx);
+        crate::bitmap_trace_ui::render(self, ctx);
         self.render_destructive_change_dialogs(ctx);
         self.render_unsaved_changes_dialog(ctx);
         if !self.render_fla_font_dialog(ctx) {
@@ -16939,17 +16592,21 @@ mod tests {
         app.handle(&ctx, Action::AddLayerMask);
         let mask = app.session.current_layer_id;
         assert_ne!(art, mask);
-        let tab = app.active_project_tab_id().unwrap_or(0);
         app.handle(&ctx, Action::ToggleLayerLock(q0rg_id, mask));
-        assert!(app
-            .session
-            .hidden_mask_art_layers
-            .contains(&(tab, q0rg_id, mask)));
+        let preview = |project: &ProjectV2| project.layer_metadata(q0rg_id, mask).mask_preview;
+        assert!(preview(&app.state.project));
+        let bytes = q0s_format::v2::write(&app.state.project).expect("write q1s");
+        let saved = q0s_format::v2::parse(&bytes).expect("read q1s");
+        assert!(preview(&saved), "the preview is saved with the project");
         app.handle(&ctx, Action::ToggleLayerLock(q0rg_id, mask));
-        assert!(!app
-            .session
-            .hidden_mask_art_layers
-            .contains(&(tab, q0rg_id, mask)));
+        assert!(!preview(&app.state.project));
+        app.handle(&ctx, Action::ToggleMaskArtworkVisibility(q0rg_id, mask));
+        assert!(
+            preview(&app.state.project),
+            "the preview can be on without the lock"
+        );
+        assert!(!app.state.project.layer_is_locked(q0rg_id, mask));
+        app.handle(&ctx, Action::ToggleMaskArtworkVisibility(q0rg_id, mask));
         app.handle(&ctx, Action::ToggleLayerVisibility(q0rg_id, mask));
         assert!(!app.state.project.layer_is_visible(q0rg_id, mask));
         assert!(
@@ -16992,7 +16649,6 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        let tab = app.active_project_tab_id().unwrap_or(0);
         let q0rg = &app.state.project.q0rgs[0];
         let layer = |name: &str| {
             q0rg.layers
@@ -17008,14 +16664,14 @@ mod tests {
                 .layer_metadata(q0rg.q0rg_id, locked)
                 .locked
         );
-        assert!(app
-            .session
-            .hidden_mask_art_layers
-            .contains(&(tab, q0rg.q0rg_id, locked)));
-        assert!(!app
-            .session
-            .hidden_mask_art_layers
-            .contains(&(tab, q0rg.q0rg_id, open)));
+        let preview = |layer_id| {
+            app.state
+                .project
+                .layer_metadata(q0rg.q0rg_id, layer_id)
+                .mask_preview
+        };
+        assert!(preview(locked));
+        assert!(!preview(open));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -17138,6 +16794,98 @@ mod tests {
             assert!((expected.x - actual.x).abs() < 0.001);
             assert!((expected.y - actual.y).abs() < 0.001);
         }
+    }
+
+    #[test]
+    fn trace_bitmap_swaps_the_bitmap_for_shapes_and_undo_brings_it_back() {
+        // 4x4: blue, with the right-hand column red.
+        let mut rgba = Vec::new();
+        for _row in 0..4 {
+            for column in 0..4 {
+                rgba.extend(if column < 3 {
+                    [30, 60, 200, 255]
+                } else {
+                    [220, 30, 40, 255]
+                });
+            }
+        }
+        let mut app = EditorApp::default();
+        app.state
+            .project
+            .assets
+            .push(Asset::Bitmap(q0s_format::v2::BitmapAsset {
+                asset_id: 90,
+                width: 4,
+                height: 4,
+                rgba: Arc::new(rgba),
+            }));
+        app.state.project.q0rgs[0].layers[0]
+            .placements
+            .push(Placement {
+                pivot: None,
+                instance_id: 0,
+                frame: 0,
+                target: Target::Asset(90),
+                transform: Transform2D {
+                    tx: 100.0,
+                    ty: 40.0,
+                    ..Transform2D::IDENTITY
+                },
+                tween: Tween::None,
+                fx: Default::default(),
+            });
+        app.session.selection = Selection::Placement {
+            q0rg_id: 1,
+            layer_id: 1,
+            placement_idx: 0,
+        };
+        assert!(app.can_trace_bitmap_selection());
+
+        let settings = crate::bitmap_trace::TraceSettings {
+            min_area: 1,
+            curve_fit: 0.0,
+            ..Default::default()
+        };
+        app.handle(&Context::default(), Action::TraceBitmap(settings));
+
+        let placements = &app.state.project.q0rgs[0].layers[0].placements;
+        assert_eq!(placements.len(), 2, "one shape per colour");
+        let Target::Asset(bottom_id) = placements[0].target else {
+            panic!("the bottom shape is an asset");
+        };
+        let Some(Asset::Vector(bottom)) = app
+            .state
+            .project
+            .assets
+            .iter()
+            .find(|asset| asset.id() == bottom_id)
+        else {
+            panic!("the bottom shape is a vector");
+        };
+        assert_eq!(
+            bottom.fill.map(|fill| fill.b),
+            Some(200),
+            "blue at the bottom"
+        );
+        let left = bottom.paths[0]
+            .anchors
+            .iter()
+            .map(|anchor| anchor.point.x)
+            .fold(f32::MAX, f32::min);
+        assert_eq!(left, 100.0, "baked where the bitmap stood");
+        assert!(
+            app.state
+                .project
+                .assets
+                .iter()
+                .any(|asset| asset.id() == 90),
+            "the bitmap stays in the library"
+        );
+
+        app.handle(&Context::default(), Action::Undo);
+        let restored = &app.state.project.q0rgs[0].layers[0].placements;
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].target, Target::Asset(90));
     }
 
     #[test]
@@ -17992,6 +17740,47 @@ mod tests {
     }
 
     #[test]
+    fn every_scene_has_its_own_camera() {
+        let ctx = Context::default();
+        let mut app = EditorApp::default();
+        app.handle(&ctx, Action::AddScene);
+        let scenes = app.state.project.scenes();
+        let (first, second) = (scenes[0].q0rg_id, scenes[1].q0rg_id);
+        assert_eq!(app.session.current_q0rg_id, second);
+        assert!(app.state.project.is_scene_root(second));
+
+        // Switch the second scene's camera on and key it.
+        app.camera_mut().enabled = true;
+        app.session.camera_track_selected = true;
+        assert!(app.camera_track_is_selected(), "the camera is there");
+        app.handle(&ctx, Action::InsertKeyframe);
+        let project = &app.state.project;
+        assert!(project.scene_camera(second).has_keyframe(0));
+        assert!(
+            !project.runtime.camera.enabled && project.runtime.camera.keys.is_empty(),
+            "the first scene's camera is untouched"
+        );
+        assert!(project.camera_on(second) && !project.camera_on(first));
+
+        let bytes = q0s_format::v2::write(project).expect("write q1s");
+        let saved = q0s_format::v2::parse(&bytes).expect("read q1s");
+        assert!(saved.scene_camera(second).has_keyframe(0), "saved");
+
+        // With the first scene gone, the second starts the movie and keeps
+        // its camera.
+        let first_scene = scenes[0].scene_id;
+        app.handle(&ctx, Action::DeleteScene(first_scene));
+        if app.pending_q0rg_delete.take().is_some() {
+            app.apply_q0rg_delete(first);
+        }
+        let project = &app.state.project;
+        assert_eq!(project.meta.entry_q0rg_id, second);
+        assert!(project.runtime.camera.has_keyframe(0));
+        assert!(project.runtime.scene_cameras.is_empty());
+        q0s_format::v2::validate(project).expect("valid after the first scene went");
+    }
+
+    #[test]
     fn layer_rename_and_depth_move_are_undoable() {
         let mut app = EditorApp::default();
         app.handle(&Context::default(), Action::AddLayer);
@@ -18162,6 +17951,7 @@ mod tests {
                     collapsed: false,
                     hidden: false,
                     locked: false,
+                    mask_preview: false,
                 },
             );
         }
@@ -18175,6 +17965,7 @@ mod tests {
                     collapsed: false,
                     hidden: false,
                     locked: false,
+                    mask_preview: false,
                 },
             );
         }

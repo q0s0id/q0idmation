@@ -120,7 +120,7 @@ pub(crate) const PRESETS: &[Preset] = &[
 impl PaintGradient {
     /// What switching a colour to a gradient gives: the colour into a light
     /// tint of itself, so nothing jumps.
-    pub(crate) fn starting_from(color: Rgba, kind: GradientKind) -> Self {
+    pub fn starting_from(color: Rgba, kind: GradientKind) -> Self {
         let lift = |c: u8| c + ((255 - c) as f32 * 0.6) as u8;
         let light = Rgba {
             r: lift(color.r),

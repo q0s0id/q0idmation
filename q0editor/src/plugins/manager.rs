@@ -225,7 +225,7 @@ pub(super) fn render(app: &mut EditorApp, ctx: &Context) {
     }
     let mut open = true;
     let screen = ctx.screen_rect();
-    egui::Window::new("Plugins")
+    crate::dialog::Dialog::new("Plugins")
         .id(egui::Id::new("q0editor_plugins_window"))
         .open(&mut open)
         .default_size([620.0, 560.0])
@@ -261,7 +261,7 @@ fn warning(app: &mut EditorApp, ui: &mut Ui) {
         .rounding(8.0)
         .inner_margin(egui::Margin::same(10.0))
         .show(ui, |ui| {
-            ui.label(RichText::new("Plugins can do anything").strong());
+            crate::ui::section_header(ui, "Plugins can do anything");
             ui.label(
                 "A plugin can change every part of q0editor, your projects and your files. \
                  Add only plugins you trust, like the checked ones from the #plugins channel. \
@@ -502,7 +502,7 @@ fn page(app: &mut EditorApp, ui: &mut Ui, index: usize) {
             .rounding(8.0)
             .inner_margin(egui::Margin::same(10.0))
             .show(ui, |ui| {
-                ui.label(RichText::new("It stopped with an error").strong());
+                crate::ui::section_header(ui, "It stopped with an error");
                 ui.label(RichText::new(error).monospace());
                 ui.horizontal(|ui| {
                     if ui.button("Try again").clicked() {
@@ -731,7 +731,7 @@ fn more(app: &mut EditorApp, ui: &mut Ui, index: usize) {
     let plugin = &app.plugins.list[index];
     let id = plugin.meta.id.clone();
     let path = plugin.path.clone();
-    ui.label(RichText::new("Where it lives").strong());
+    crate::ui::section_header(ui, "Where it lives");
     ui.label(
         RichText::new(path.display().to_string())
             .monospace()
@@ -793,7 +793,7 @@ fn more(app: &mut EditorApp, ui: &mut Ui, index: usize) {
             });
     }
     ui.add_space(10.0);
-    ui.label(RichText::new("Console").strong());
+    crate::ui::section_header(ui, "Console");
     let name = app
         .plugins
         .list
@@ -868,7 +868,7 @@ fn install_prompt(app: &mut EditorApp, ctx: &Context, pending: PendingInstall) {
         .and_then(q0ex::PluginDoc::thumbnail)
         .and_then(|bytes| super::cached_texture(ctx, &format!("install-{}", meta.id), &bytes));
     let screen = ctx.screen_rect();
-    egui::Window::new("Install this plugin?")
+    crate::dialog::Dialog::new("Install this plugin?")
         .id(egui::Id::new("q0editor_plugin_install"))
         .collapsible(false)
         .resizable(false)
@@ -922,15 +922,17 @@ fn install_prompt(app: &mut EditorApp, ctx: &Context, pending: PendingInstall) {
                 .small()
                 .color(ui.visuals().weak_text_color()),
             );
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if crate::theme::primary_button(ui, "Install", accent).clicked() {
+            crate::dialog::footer(ui, |ui| {
+                if crate::dialog::button(ui, "Install", crate::dialog::Kind::Primary).clicked() {
                     decision = Some(true);
                 }
-                if ui.button("Cancel").clicked() {
+                if crate::dialog::button(ui, "Cancel", crate::dialog::Kind::Secondary).clicked() {
                     decision = Some(false);
                 }
             });
+            if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                decision = Some(false);
+            }
         });
     match decision {
         Some(true) => {

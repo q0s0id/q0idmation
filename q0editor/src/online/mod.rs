@@ -335,6 +335,8 @@ pub struct Online {
     busy: BTreeSet<String>,
     /// Set while the room connection is failing; cleared when it recovers.
     connection: Option<String>,
+    /// Why the room's drawing is stuck at an edit this editor cannot read.
+    unreadable: Option<String>,
     avatars: HashMap<i64, Avatar>,
     follow: Option<Follow>,
     counter: u64,
@@ -383,6 +385,7 @@ impl Default for Online {
             rejected_drafts: Vec::new(),
             busy: BTreeSet::new(),
             connection: None,
+            unreadable: None,
             avatars: HashMap::new(),
             follow: None,
             counter: 0,
@@ -605,6 +608,7 @@ impl Online {
         self.pending_resync = None;
         self.follow = None;
         self.connection = None;
+        self.unreadable = None;
         self.view.left_room();
         self.chat.left_room();
         self.edits.clear();
@@ -847,6 +851,7 @@ impl Online {
                     self.room = None;
                     self.pending_resync = None;
                     self.connection = None;
+                    self.unreadable = None;
                     self.view.left_room();
                     self.chat.left_room();
                     self.send(Command::LeaveRoom);
@@ -859,7 +864,17 @@ impl Online {
                 }
             }
             Reply::Connection { ok, message } => {
+                if ok {
+                    self.unreadable = None;
+                }
                 self.connection = (!ok).then_some(message);
+            }
+            Reply::Unreadable(message) => {
+                // Said once, not on every retry.
+                if self.unreadable.as_deref() != Some(message.as_str()) {
+                    self.say(message.clone(), Tone::Warning);
+                }
+                self.unreadable = Some(message);
             }
             Reply::Notice(notice) => {
                 self.say(notice, Tone::Success);
@@ -962,6 +977,7 @@ impl Online {
                 app.history = History::new();
                 self.recovery = None;
                 self.connection = None;
+                self.unreadable = None;
                 self.view.joined_room();
                 self.send(Command::RoomInvites { room: room.id });
                 self.refresh();

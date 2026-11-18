@@ -24,16 +24,19 @@ pub(crate) enum Panel {
     Library,
     Properties,
     FramePicker,
+    /// Fill and stroke colours, and the swatches.
+    Color,
 }
 
 impl Panel {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Stage,
         Self::Tools,
         Self::Timeline,
         Self::Library,
         Self::Properties,
         Self::FramePicker,
+        Self::Color,
     ];
 
     fn icon(self) -> crate::ui::Icon {
@@ -45,6 +48,7 @@ impl Panel {
             Self::Library => Icon::Library,
             Self::Properties => Icon::Properties,
             Self::FramePicker => Icon::Frame,
+            Self::Color => Icon::Color,
         }
     }
 
@@ -56,6 +60,7 @@ impl Panel {
             Self::Library => "Library",
             Self::Properties => "Properties",
             Self::FramePicker => "Frame Picker",
+            Self::Color => "Color",
         }
     }
 }
@@ -189,6 +194,10 @@ struct SavedLayout {
     /// Panels collapsed to the icon strip, top first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     icons: Vec<Panel>,
+    /// Saved since the Color panel came. A layout from before gets it once,
+    /// as a tab beside Properties; after that, closing it keeps it closed.
+    #[serde(default)]
+    color_panel: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -224,6 +233,9 @@ impl SavedLayout {
         layout
             .icons
             .retain(|panel| *panel != Panel::Stage && seen.insert(*panel));
+        if !layout.color_panel {
+            layout.introduce_color_panel();
+        }
         let mut count = 0;
         if let Some(node) = &layout.main {
             if !node.valid(0, &mut count) {
@@ -243,6 +255,32 @@ impl SavedLayout {
             }
         }
         Some(layout)
+    }
+
+    /// Puts the Color panel beside Properties, as a tab behind it, in a
+    /// layout saved before there was one: docked, floating or as an icon.
+    fn introduce_color_panel(&mut self) {
+        self.color_panel = true;
+        let trees = self
+            .main
+            .iter_mut()
+            .chain(self.floating.iter_mut().map(|window| &mut window.tree));
+        let mut trees: Vec<&mut LayoutNode> = trees.collect();
+        if trees.iter().any(|tree| tree.holds(Panel::Color)) || self.icons.contains(&Panel::Color) {
+            return;
+        }
+        for tree in &mut trees {
+            if tree.add_beside(Panel::Properties, Panel::Color) {
+                return;
+            }
+        }
+        if let Some(index) = self
+            .icons
+            .iter()
+            .position(|panel| *panel == Panel::Properties)
+        {
+            self.icons.insert(index + 1, Panel::Color);
+        }
     }
 
     fn dock(&self) -> DockState<PanelTab> {
@@ -266,6 +304,33 @@ impl SavedLayout {
 }
 
 impl LayoutNode {
+    fn holds(&self, panel: Panel) -> bool {
+        match self {
+            Self::Tabs { panels, .. } => panels.contains(&panel),
+            Self::Split { first, second, .. } => first.holds(panel) || second.holds(panel),
+        }
+    }
+
+    /// Adds `panel` as a tab after `beside`, leaving the shown tab as it
+    /// was. False when `beside` is not here.
+    fn add_beside(&mut self, beside: Panel, panel: Panel) -> bool {
+        match self {
+            Self::Tabs { panels, active } => match panels.iter().position(|tab| *tab == beside) {
+                Some(index) => {
+                    panels.insert(index + 1, panel);
+                    if *active > index {
+                        *active += 1;
+                    }
+                    true
+                }
+                None => false,
+            },
+            Self::Split { first, second, .. } => {
+                first.add_beside(beside, panel) || second.add_beside(beside, panel)
+            }
+        }
+    }
+
     fn valid(&self, depth: usize, count: &mut usize) -> bool {
         if depth > 16 {
             return false;
@@ -370,7 +435,14 @@ fn default_dock() -> DockState<PanelTab> {
     );
     let [content, _] = tree.split_left(top, 0.045, vec![PanelTab::primary(Panel::Tools)]);
     let [_, right] = tree.split_right(content, 0.75, vec![PanelTab::primary(Panel::Library)]);
-    tree.split_below(right, 0.48, vec![PanelTab::primary(Panel::Properties)]);
+    tree.split_below(
+        right,
+        0.48,
+        vec![
+            PanelTab::primary(Panel::Properties),
+            PanelTab::primary(Panel::Color),
+        ],
+    );
     decorate(&mut dock);
     dock
 }
@@ -634,6 +706,7 @@ impl WorkspaceLayout {
             main: LayoutNode::capture(self.dock.main_surface(), NodeIndex::root()),
             floating,
             icons: self.icons.clone(),
+            color_panel: true,
         }
     }
 
@@ -933,6 +1006,7 @@ impl Viewer<'_> {
             Panel::Library => crate::panels::library::render(app, ui),
             Panel::Properties => crate::panels::properties::render(app, ui),
             Panel::FramePicker => crate::panels::properties::render_frame_picker(app, ui),
+            Panel::Color => crate::color_panel::render(app, ui),
         });
         if matches!(tab.panel, Panel::Library | Panel::Timeline) {
             self.panel_views
@@ -944,7 +1018,9 @@ impl Viewer<'_> {
             Panel::Tools => crate::perf::PerfSpan::Toolbar,
             Panel::Timeline => crate::perf::PerfSpan::Timeline,
             Panel::Library => crate::perf::PerfSpan::Library,
-            Panel::Properties | Panel::FramePicker => crate::perf::PerfSpan::Properties,
+            Panel::Properties | Panel::FramePicker | Panel::Color => {
+                crate::perf::PerfSpan::Properties
+            }
         };
         app.perf.record(span, started.elapsed());
     }
@@ -1431,7 +1507,7 @@ pub(crate) fn render_menu(app: &mut EditorApp, ui: &mut Ui) {
         ui.weak("Panels");
         for panel in Panel::ALL {
             let mut visible = workspace.shown(panel);
-            if ui.checkbox(&mut visible, panel.title()).changed() {
+            if crate::ui::switch(ui, &mut visible, panel.title()).changed() {
                 workspace.toggle(panel);
             }
         }
@@ -1457,7 +1533,7 @@ pub(crate) fn render_manager(app: &mut EditorApp, ctx: &Context) {
     let mut workspace = std::mem::take(&mut app.workspace_layout);
     if workspace.manager_open {
         let mut open = true;
-        egui::Window::new("Workspace layouts")
+        crate::dialog::Dialog::new("Workspace layouts")
             .id(Id::new("layout_manager"))
             .open(&mut open)
             .default_width(440.0)
@@ -2053,6 +2129,66 @@ mod tests {
 
         workspace.toggle(Panel::Stage);
         assert_eq!(topology(&workspace.dock), before);
+    }
+
+    #[test]
+    fn a_layout_from_before_the_color_panel_gets_it_once_beside_properties() {
+        // As saved by an editor without the Color panel: no `color_panel`.
+        let old = serde_json::json!({
+            "version": 1,
+            "main": {
+                "kind": "split", "vertical": false, "fraction": 0.75,
+                "first": { "kind": "tabs", "panels": ["stage"], "active": 0 },
+                "second": { "kind": "tabs", "panels": ["library", "properties"], "active": 1 }
+            },
+            "floating": []
+        });
+        let saved = SavedLayout::decode(&old).expect("old layouts still load");
+        assert!(saved.color_panel);
+        assert_eq!(
+            saved.main,
+            Some(LayoutNode::Split {
+                vertical: false,
+                fraction: 0.75,
+                first: Box::new(LayoutNode::Tabs {
+                    panels: vec![Panel::Stage],
+                    active: 0,
+                }),
+                second: Box::new(LayoutNode::Tabs {
+                    panels: vec![Panel::Library, Panel::Properties, Panel::Color],
+                    active: 1,
+                }),
+            }),
+            "a tab behind Properties, which stays the one shown"
+        );
+
+        // Closed afterwards, it stays closed.
+        let mut workspace = WorkspaceLayout::from_settings(&Settings {
+            workspace_layout: old,
+            ..Settings::default()
+        });
+        assert!(workspace.shown(Panel::Color));
+        workspace.toggle(Panel::Color);
+        assert!(!workspace.shown(Panel::Color));
+        let layout = serde_json::to_value(workspace.capture(&Context::default())).unwrap();
+        let reloaded = WorkspaceLayout::from_settings(&Settings {
+            workspace_layout: layout,
+            ..Settings::default()
+        });
+        assert!(!reloaded.shown(Panel::Color));
+
+        // Properties as an icon: Color joins it in the strip.
+        let icons = serde_json::json!({
+            "version": 1,
+            "main": { "kind": "tabs", "panels": ["stage"], "active": 0 },
+            "floating": [],
+            "icons": ["library", "properties"]
+        });
+        let saved = SavedLayout::decode(&icons).unwrap();
+        assert_eq!(
+            saved.icons,
+            vec![Panel::Library, Panel::Properties, Panel::Color]
+        );
     }
 
     #[test]

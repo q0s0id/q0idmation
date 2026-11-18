@@ -125,7 +125,7 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
     // undo stack) and (b) request a repaint after the buffer changes.
     let mut text_gained_focus = false;
 
-    egui::Window::new(title)
+    crate::dialog::Dialog::new(title)
         .id(egui::Id::new("q0lang_editor_window"))
         .open(&mut open)
         .default_size([920.0, 620.0])
@@ -194,7 +194,7 @@ pub fn render(app: &mut EditorApp, ctx: &Context) {
 
                 ui.separator();
                 let mut sl = show_lines;
-                if ui.checkbox(&mut sl, "line numbers").changed() {
+                if crate::ui::switch(ui, &mut sl, "line numbers").changed() {
                     new_show_lines = Some(sl);
                 }
 
@@ -570,8 +570,7 @@ pub fn render_standalone(app: &mut EditorApp, ui: &mut egui::Ui) {
 
     ui.horizontal(|ui| {
         super::blocks::mode_switch(ui, &mut simple);
-        ui.separator();
-        ui.label(egui::RichText::new("q0lang").strong());
+        crate::ui::section_header(ui, "q0lang");
         ui.separator();
         ui.label(
             egui::RichText::new(path_text)

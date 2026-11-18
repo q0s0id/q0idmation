@@ -91,8 +91,8 @@ pub(crate) fn sync_folder_timelines(project: &mut ProjectV2, q0rg_id: u16) -> bo
                 .unwrap_or_else(|| clip.start_frame.saturating_add(1)),
         );
     }
-    if q0rg_id == project.meta.entry_q0rg_id {
-        for key in &project.runtime.camera.keys {
+    if project.is_scene_root(q0rg_id) {
+        for key in &project.scene_camera(q0rg_id).keys {
             new_count = new_count.max(key.frame.saturating_add(1));
             if let Some(end) = key.tween.to_frame() {
                 new_count = new_count.max(end.saturating_add(1));
@@ -1779,12 +1779,16 @@ pub fn remove_selected_frame_columns(
         })
         .collect();
 
-    if q0rg_id == project.meta.entry_q0rg_id {
+    if let Some(camera) = project
+        .is_scene_root(q0rg_id)
+        .then_some(())
+        .and_then(|()| project.scene_camera_mut(q0rg_id))
+    {
         if first_frame == 0 && last_frame == old_count - 1 {
-            project.runtime.camera.keys.clear();
+            camera.keys.clear();
         } else {
-            let mut shifted_camera = Vec::with_capacity(project.runtime.camera.keys.len());
-            for mut key in project.runtime.camera.keys.drain(..) {
+            let mut shifted_camera = Vec::with_capacity(camera.keys.len());
+            for mut key in camera.keys.drain(..) {
                 if (first_frame..=last_frame).contains(&key.frame) {
                     continue;
                 }
@@ -1801,7 +1805,7 @@ pub fn remove_selected_frame_columns(
                 shifted_camera.push(key);
             }
             shifted_camera.sort_by_key(|key| key.frame);
-            project.runtime.camera.keys = shifted_camera;
+            camera.keys = shifted_camera;
         }
     }
 
@@ -3412,6 +3416,7 @@ mod tests {
                 collapsed: false,
                 hidden: false,
                 locked: false,
+                mask_preview: false,
             },
         );
         project.layer_metadata.insert(
@@ -3423,6 +3428,7 @@ mod tests {
                 collapsed: true,
                 hidden: false,
                 locked: false,
+                mask_preview: false,
             },
         );
 

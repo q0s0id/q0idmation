@@ -1982,6 +1982,35 @@ mod tests {
         loaded.validate_loaded().unwrap();
         assert_eq!(loaded.project, state.project);
     }
+
+    /// A room made by an older editor holds a project without the fields
+    /// added since. A newer editor joining it must still read it: it once
+    /// failed on `mask_preview` with "the server sent something this editor
+    /// doesn't understand".
+    #[test]
+    fn a_project_from_an_older_editor_still_decodes() {
+        fn forget(value: &mut serde_json::Value, keys: &[&str]) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for key in keys {
+                        map.remove(*key);
+                    }
+                    map.values_mut().for_each(|value| forget(value, keys));
+                }
+                serde_json::Value::Array(items) => {
+                    items.iter_mut().for_each(|value| forget(value, keys))
+                }
+                _ => {}
+            }
+        }
+        let project = project();
+        let mut older = serde_json::to_value(&project).unwrap();
+        assert!(older.to_string().contains("mask_preview"));
+        // Fields 0.1.0-beta.6.2 did not write.
+        forget(&mut older, &["mask_preview", "scene_cameras"]);
+        let loaded: ProjectV2 = serde_json::from_value(older).unwrap();
+        assert_eq!(loaded, project);
+    }
     use v2::LayerKind;
     use v2::{Anchor, Path, Placement, Q0rg, Rgba, Target, Transform2D, Tween, Vec2, VectorAsset};
     fn project() -> ProjectV2 {

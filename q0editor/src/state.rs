@@ -700,6 +700,9 @@ pub enum ToolState {
     },
     PenDrawing {
         anchors: Vec<Anchor>,
+        /// A press on the first point is closing the path; its drag shapes
+        /// the closing curve.
+        closing: bool,
     },
     FreehandDrawing {
         points: Vec<Vec2>,
@@ -896,7 +899,10 @@ impl Default for OnionSettings {
         Self {
             enabled: false,
             edit_frames: false,
-            all_unlocked_layers: false,
+            // As in Animate: every unlocked layer shows its ghosts, so a
+            // hand on its own layer over the body is seen moving while the
+            // body is being drawn. Lock a layer to leave it out.
+            all_unlocked_layers: true,
             before: 2,
             after: 2,
         }
@@ -1042,9 +1048,6 @@ pub struct Session {
     pub outline_mode: bool,
     /// Per-layer wireframe display, keyed by q0rg and layer id.
     pub outline_layers: HashSet<(u16, u16)>,
-    /// Editor-only mask-source visibility. Hiding a source keeps its clipping
-    /// effect active and leaves the source layer editable.
-    pub hidden_mask_art_layers: HashSet<(u64, u16, u16)>,
     /// Layers that "lock all", "hide all" and their Alt-click "all others"
     /// turned on, so turning them off again leaves the rest as they were.
     /// Layers given their own height in the timeline (Alt-drag a row's
@@ -1131,8 +1134,15 @@ pub struct Session {
     pub audio_scrubbing: bool,
     pub status: String,
     pub stroke_color: Rgba,
+    /// The stroke is none: closed shapes get their fill alone, and lines,
+    /// which are nothing but stroke, are not drawn. `stroke_color` is kept.
+    pub stroke_none: bool,
     pub stroke_width: f32,
+    /// `None` when the fill is none.
     pub fill_color: Option<Rgba>,
+    /// The fill colour put away while the fill is none, so turning it back
+    /// on finds it again.
+    pub fill_kept: Rgba,
     /// The fill's gradient when it is one: shapes, pen, pencil and bucket.
     pub fill_gradient: Option<crate::paint::PaintGradient>,
     /// The brushes' gradient when they paint one.
@@ -1149,8 +1159,9 @@ pub struct Session {
     pub advanced_brush_selected_preset: Option<String>,
     /// Transient source filter for the unified Advanced brush library.
     pub advanced_brush_library_filter: BrushLibraryFilter,
-    /// Independent classic eraser size while brush/eraser sync is disabled.
-    pub eraser_size: f32,
+    /// The eraser's own nib, size, smoothing and dynamics, used while
+    /// brush/eraser sync is off.
+    pub eraser: crate::brush::BrushSettings,
     /// Cap shape applied to brush strokes when committing them, and to
     /// stroke-to-fill conversions in the right-click menu. Per-session, so
     /// the user picks once and forgets.
@@ -1334,7 +1345,6 @@ impl Session {
             timeline_cell_selection: None,
             outline_mode: false,
             outline_layers: HashSet::new(),
-            hidden_mask_art_layers: HashSet::new(),
             timeline_row_heights: HashMap::new(),
             timeline_sizes_changed: None,
             layer_flag_memory: HashMap::new(),
@@ -1392,14 +1402,12 @@ impl Session {
             preview_audio_resync_needed: false,
             audio_scrubbing: true,
             status: "ready".to_string(),
-            stroke_color: Rgba {
-                r: 0,
-                g: 0,
-                b: 0,
-                a: 255,
-            },
+            stroke_color: DEFAULT_STROKE,
+            stroke_none: false,
             stroke_width: 1.0,
-            fill_color: None,
+            // Shapes come with a fill and a stroke, as in Animate.
+            fill_color: Some(DEFAULT_FILL),
+            fill_kept: DEFAULT_FILL,
             fill_gradient: None,
             brush_gradient: None,
             brush: BrushSettings::default(),
@@ -1409,7 +1417,7 @@ impl Session {
             advanced_brush_preset_name: "My Brush".to_string(),
             advanced_brush_selected_preset: None,
             advanced_brush_library_filter: BrushLibraryFilter::All,
-            eraser_size: 18.0,
+            eraser: crate::brush::BrushSettings::eraser_default(),
             brush_cap: CapShape::Round,
             brush_join: q0s_format::geom::JoinShape::Round,
             rig_mode: RigMode::Simple,
@@ -1567,7 +1575,7 @@ impl Session {
             self.pending_timeline_frame = None;
             self.camera_track_selected = false;
         }
-        if self.current_q0rg_id != project.meta.entry_q0rg_id || !project.runtime.camera.enabled {
+        if !project.camera_on(self.current_q0rg_id) {
             self.camera_track_selected = false;
             self.camera_timeline_selection = None;
             self.camera_frame_drag = None;
@@ -2771,6 +2779,21 @@ impl Default for History {
         Self::new()
     }
 }
+
+/// The fill new shapes start with, and the one "default colours" brings back.
+pub const DEFAULT_FILL: Rgba = Rgba {
+    r: 255,
+    g: 255,
+    b: 255,
+    a: 255,
+};
+/// The stroke new shapes and lines start with.
+pub const DEFAULT_STROKE: Rgba = Rgba {
+    r: 0,
+    g: 0,
+    b: 0,
+    a: 255,
+};
 
 pub const DEFAULT_STAGE_WIDTH: u16 = 640;
 pub const DEFAULT_STAGE_HEIGHT: u16 = 480;

@@ -30,10 +30,10 @@ pub const CAMERA_LAYER: u16 = u16::MAX;
 /// Chains longer than this are treated as broken.
 const MAX_DEPTH: usize = 256;
 
-/// Whether `layer_id` names the camera of `q0rg_id` (only the main
+/// Whether `layer_id` names the camera of `q0rg_id` (every scene's own
 /// timeline has one).
 pub fn is_camera(project: &ProjectV2, q0rg_id: u16, layer_id: u16) -> bool {
-    layer_id == CAMERA_LAYER && q0rg_id == project.meta.entry_q0rg_id
+    layer_id == CAMERA_LAYER && project.is_scene_root(q0rg_id)
 }
 
 /// A layer of the timeline, or its camera, that can take part in a link.
@@ -47,18 +47,22 @@ fn linkable(project: &ProjectV2, q0rg: &Q0rg, layer_id: u16) -> bool {
 
 /// Where the camera's view sits on the stage at `frame`: the stage's own
 /// rectangle mapped through it, so the identity camera is the identity.
-fn camera_frame(project: &ProjectV2, frame: u16) -> Option<Affine> {
-    project.camera_affine_at(frame).inverse()
+fn camera_frame(project: &ProjectV2, q0rg_id: u16, frame: u16) -> Option<Affine> {
+    project.camera_affine_in(q0rg_id, frame).inverse()
 }
 
 /// How far the camera's parent has carried it at `frame`: where the parent
 /// layer's object sits, added to the camera's own keyed centre. None when the
 /// camera follows nothing or its parent is empty there.
 pub fn camera_offset(project: &ProjectV2, frame: u16) -> Option<(f32, f32)> {
-    let entry = project.meta.entry_q0rg_id;
-    let parent = parent_of(project, entry, CAMERA_LAYER)?;
-    let q0rg = project.q0rgs.iter().find(|q0rg| q0rg.q0rg_id == entry)?;
-    let rig = crate::rig::rig_for_q0rg(project, entry)
+    camera_offset_in(project, project.meta.entry_q0rg_id, frame)
+}
+
+/// `camera_offset` for the camera of the scene rooted at `scene`.
+pub fn camera_offset_in(project: &ProjectV2, scene: u16, frame: u16) -> Option<(f32, f32)> {
+    let parent = parent_of(project, scene, CAMERA_LAYER)?;
+    let q0rg = project.q0rgs.iter().find(|q0rg| q0rg.q0rg_id == scene)?;
+    let rig = crate::rig::rig_for_q0rg(project, scene)
         .map(|rig| crate::rig::evaluate_rig(rig, f32::from(frame), &[]));
     let world = layer_world(project, q0rg, parent, frame, rig.as_ref())?;
     Some((world.tx, world.ty))
@@ -136,7 +140,7 @@ pub fn layer_world(
     for id in chain.into_iter().rev() {
         let own = if is_camera(project, q0rg.q0rg_id, id) {
             // The camera's place already has its own parent in it.
-            camera_frame(project, frame).map(|affine| (affine, true))
+            camera_frame(project, q0rg.q0rg_id, frame).map(|affine| (affine, true))
         } else {
             first_object(q0rg, id, frame, rig)
         };
@@ -444,19 +448,20 @@ pub fn set_parent(
 /// parent's place minus the new one's, so the view stays where it was on
 /// every key. A camera without keys gets one at frame 0 first.
 fn set_camera_parent(project: &mut ProjectV2, key: LayerKey, parent: Option<u16>) {
+    let scene = key.q0rg_id;
     if parent.is_some() {
         let rest = project.default_camera_state();
-        let track = &mut project.runtime.camera;
-        if !track.enabled || track.keys.is_empty() {
-            track.enabled = true;
-            if track.keys.is_empty() {
-                track.insert_key(0, rest);
+        if let Some(track) = project.scene_camera_mut(scene) {
+            if !track.enabled || track.keys.is_empty() {
+                track.enabled = true;
+                if track.keys.is_empty() {
+                    track.insert_key(0, rest);
+                }
             }
         }
     }
     let frames: Vec<u16> = project
-        .runtime
-        .camera
+        .scene_camera(scene)
         .keys
         .iter()
         .map(|key| key.frame)
@@ -464,7 +469,7 @@ fn set_camera_parent(project: &mut ProjectV2, key: LayerKey, parent: Option<u16>
     let offsets = |project: &ProjectV2| -> Vec<(f32, f32)> {
         frames
             .iter()
-            .map(|&frame| camera_offset(project, frame).unwrap_or((0.0, 0.0)))
+            .map(|&frame| camera_offset_in(project, scene, frame).unwrap_or((0.0, 0.0)))
             .collect()
     };
     let before = offsets(project);
@@ -473,14 +478,10 @@ fn set_camera_parent(project: &mut ProjectV2, key: LayerKey, parent: Option<u16>
         None => project.runtime.layer_parents.remove(&key),
     };
     let after = offsets(project);
-    for ((camera_key, old), new) in project
-        .runtime
-        .camera
-        .keys
-        .iter_mut()
-        .zip(before)
-        .zip(after)
-    {
+    let Some(track) = project.scene_camera_mut(scene) else {
+        return;
+    };
+    for ((camera_key, old), new) in track.keys.iter_mut().zip(before).zip(after) {
         camera_key.state.center_x += old.0 - new.0;
         camera_key.state.center_y += old.1 - new.1;
     }
@@ -549,9 +550,13 @@ pub fn tidy(project: &mut ProjectV2) -> bool {
     let before = project.runtime.layer_parents.len();
     let q0rgs = &project.q0rgs;
     let metadata = &project.layer_metadata;
-    let entry = project.meta.entry_q0rg_id;
+    let scenes = project
+        .scenes()
+        .into_iter()
+        .map(|scene| scene.q0rg_id)
+        .collect::<Vec<_>>();
     let usable = |q0rg_id: u16, layer_id: u16| {
-        if layer_id == CAMERA_LAYER && q0rg_id == entry {
+        if layer_id == CAMERA_LAYER && scenes.contains(&q0rg_id) {
             return q0rgs.iter().any(|q0rg| q0rg.q0rg_id == q0rg_id);
         }
         q0rgs

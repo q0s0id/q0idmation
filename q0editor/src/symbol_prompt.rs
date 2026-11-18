@@ -90,21 +90,28 @@ pub(crate) fn open(app: &mut EditorApp, ctx: &Context, request: SymbolRequest) {
         .max()
         .unwrap_or(0)
         .saturating_add(1);
-    let name = crate::app::unique_symbol_name(project, &format!("Symbol {next_id}"), None);
-    let folder = match request {
+    let source = match request {
         SymbolRequest::Duplicate(q0rg_id, layer_id, placement) => {
             duplicate_source(app, q0rg_id, layer_id, placement)
-                .and_then(|source| {
-                    project
-                        .runtime
-                        .library_item_folders
-                        .get(&LibraryItemReference::Q0rg(source))
-                        .cloned()
-                })
-                .unwrap_or_default()
         }
-        SymbolRequest::New | SymbolRequest::Convert => String::new(),
+        SymbolRequest::New | SymbolRequest::Convert => None,
     };
+    // A duplicate starts from its original's name, made unique the way it
+    // will be saved ("Walk" becomes "Walk #2").
+    let original = source.and_then(|id| project.q0rgs.iter().find(|q0rg| q0rg.q0rg_id == id));
+    let name = match original {
+        Some(original) => crate::app::unique_symbol_name(project, &original.name, None),
+        None => crate::app::unique_symbol_name(project, &format!("Symbol {next_id}"), None),
+    };
+    let folder = source
+        .and_then(|source| {
+            project
+                .runtime
+                .library_item_folders
+                .get(&LibraryItemReference::Q0rg(source))
+                .cloned()
+        })
+        .unwrap_or_default();
     ctx.data_mut(|data| {
         data.insert_temp(
             prompt_id(),
@@ -141,7 +148,7 @@ pub(crate) fn render(app: &mut EditorApp, ctx: &Context) {
     let mut open = true;
     let mut confirm = false;
     let mut cancel = false;
-    egui::Window::new(prompt.request.title())
+    crate::dialog::Dialog::new(prompt.request.title())
         .id(Id::new("q0editor_symbol_prompt_window"))
         .collapsible(false)
         .resizable(false)

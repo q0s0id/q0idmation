@@ -63,7 +63,7 @@ pub(crate) fn start(app: &mut EditorApp, ctx: &egui::Context, current_only: bool
             .unwrap_or(app.state.project.meta.entry_q0rg_id)
     };
     let mut project = app.state.project.clone();
-    project.meta.entry_q0rg_id = root;
+    project.set_entry_scene(root);
     app.session.playing = false;
     app.session.animation_preview_playing = false;
     app.stop_audio_playback();

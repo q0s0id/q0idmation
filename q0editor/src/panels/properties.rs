@@ -31,223 +31,445 @@ fn tool_paint_box(
 }
 use crate::state::{BrushLibraryFilter, BrushSizePreview, PlacementRef, Selection, Tool};
 
+/// The Properties panel's pages, as tabs along its top. The panel brings
+/// forward the page of what was just worked with: picking something shows
+/// its page, picking a tool the tool's, clicking away the stage's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Tab {
+    Selection,
+    Tool,
+    #[default]
+    Stage,
+}
+
+/// What the panel saw last frame, to tell what was just touched.
+#[derive(Clone, Debug, PartialEq)]
+struct Seen {
+    selection: Selection,
+    tool: Tool,
+    /// The selection page's name, `None` when nothing is selected.
+    context: Option<&'static str>,
+}
+
+/// The page to show this frame.
+fn follow_focus(stored: Option<Tab>, before: Option<&Seen>, now: &Seen) -> Tab {
+    // With a drawing tool in hand its page comes first; with a pointer, the
+    // selection's, or the stage's when nothing is picked.
+    let resting = if !pointer_tool(now.tool) {
+        Tab::Tool
+    } else if now.context.is_some() {
+        Tab::Selection
+    } else {
+        Tab::Stage
+    };
+    let mut tab = stored.unwrap_or(if now.context.is_some() && selection_takes_focus(now) {
+        Tab::Selection
+    } else {
+        resting
+    });
+    if let Some(before) = before {
+        if before.tool != now.tool {
+            tab = Tab::Tool;
+        }
+        if before.selection != now.selection || before.context != now.context {
+            if now.context.is_some() {
+                if selection_takes_focus(now) {
+                    tab = Tab::Selection;
+                }
+            } else if tab == Tab::Selection {
+                tab = resting;
+            }
+        }
+    }
+    if tab == Tab::Selection && now.context.is_none() {
+        tab = resting;
+    }
+    tab
+}
+
+/// Tools that pick and move things rather than draw them.
+fn pointer_tool(tool: Tool) -> bool {
+    matches!(
+        tool,
+        Tool::Select | Tool::Subselect | Tool::Lasso | Tool::Hand
+    )
+}
+
+/// Whether a new selection is something the user picked, rather than the
+/// stroke a drawing tool just left selected: that stays on the tool's page.
+fn selection_takes_focus(now: &Seen) -> bool {
+    matches!(
+        now.tool,
+        Tool::Select | Tool::Subselect | Tool::Lasso | Tool::Hand | Tool::Rig | Tool::Text
+    ) || matches!(now.selection, Selection::Q0rg(_) | Selection::Asset(_))
+        || matches!(now.context, Some("Camera" | "Sound" | "Tween"))
+}
+
+/// The name of the selection's page, or `None` with nothing selected.
+fn selection_label(app: &EditorApp) -> Option<&'static str> {
+    if crate::text_tool::has_text_selection(app) {
+        return Some("Text");
+    }
+    if app.camera_track_is_selected() {
+        return Some("Camera");
+    }
+    let audio = app.session.timeline_selection.is_some_and(|selection| {
+        crate::audio::audio_clip_at_frame(
+            &app.state.project,
+            app.session.current_q0rg_id,
+            selection.focus_layer_id,
+            selection.focus_frame,
+        )
+        .is_some()
+    });
+    if audio {
+        return Some("Sound");
+    }
+    if !crate::easing::selected_tween_targets(app).is_empty() {
+        return Some("Tween");
+    }
+    Some(match &app.session.selection {
+        Selection::None => return None,
+        Selection::Asset(_) => "Asset",
+        Selection::Q0rg(_) => "Symbol",
+        Selection::Placement {
+            q0rg_id,
+            layer_id,
+            placement_idx,
+        } => {
+            let symbol = app
+                .state
+                .project
+                .q0rgs
+                .iter()
+                .find(|q| q.q0rg_id == *q0rg_id)
+                .and_then(|q| q.layers.iter().find(|l| l.layer_id == *layer_id))
+                .and_then(|l| l.placements.get(*placement_idx))
+                .is_some_and(|p| matches!(p.target, Target::Q0rg(_)));
+            if symbol {
+                "Symbol"
+            } else {
+                "Object"
+            }
+        }
+        Selection::Multi(_) => "Objects",
+        _ => "Shape",
+    })
+}
+
 pub fn render(app: &mut EditorApp, ui: &mut Ui) {
+    crate::ui::inspector_style(ui);
+    let tab_id = egui::Id::new("properties_tab");
+    let seen_id = egui::Id::new("properties_seen");
+    let seen = Seen {
+        selection: app.session.selection.clone(),
+        tool: app.session.current_tool,
+        context: selection_label(app),
+    };
+    let (stored, before) = ui
+        .ctx()
+        .data(|d| (d.get_temp::<Tab>(tab_id), d.get_temp::<Seen>(seen_id)));
+    let mut tab = follow_focus(stored, before.as_ref(), &seen);
+    let mut tabs = Vec::with_capacity(3);
+    if let Some(label) = seen.context {
+        tabs.push((Tab::Selection, label));
+    }
+    tabs.push((Tab::Tool, app.session.current_tool.label()));
+    tabs.push((Tab::Stage, "Stage"));
+    tab_strip(ui, &tabs, &mut tab);
+    ui.ctx().data_mut(|d| {
+        d.insert_temp(tab_id, tab);
+        d.insert_temp(seen_id, seen);
+    });
     ScrollArea::both()
-        .id_source("properties_scroll")
+        .id_source(("properties_scroll", tab as u8))
         .auto_shrink([false, true])
-        .show(ui, |ui| {
-            if crate::text_tool::render_properties(app, ui) {
-                if app.session.text_editor.is_none() {
-                    if let Selection::Placement {
-                        q0rg_id,
-                        layer_id,
-                        placement_idx,
-                    } = app.session.selection
-                    {
-                        ui.separator();
-                        placement_properties(app, ui, q0rg_id, layer_id, placement_idx);
-                    }
-                }
-                return;
-            }
-            if app.camera_track_is_selected() {
-                let camera_tweens = crate::easing::selected_tween_targets(app);
-                if !camera_tweens.is_empty() {
-                    crate::easing::render_selected_tween_properties(app, ui, &camera_tweens);
-                } else {
-                    render_camera_properties(app, ui);
-                }
-                return;
-            }
-            if render_audio_clip_properties(app, ui) {
-                return;
-            }
-            if let Selection::Placement { q0rg_id, layer_id, placement_idx } = app.session.selection {
-                let symbol = app.state.project.q0rgs.iter().find(|q| q.q0rg_id == q0rg_id)
-                    .and_then(|q| q.layers.iter().find(|l| l.layer_id == layer_id))
-                    .and_then(|l| l.placements.get(placement_idx))
-                    .and_then(|p| match p.target { Target::Q0rg(id) => app.state.project.q0rgs.iter().find(|q| q.q0rg_id == id), _ => None });
-                if let Some(symbol) = symbol { ui.label(egui::RichText::new(&symbol.name).strong()); }
-            }
-            let timeline_tweens = crate::easing::selected_tween_targets(app);
-            if !timeline_tweens.is_empty() {
-                crate::easing::render_selected_tween_properties(app, ui, &timeline_tweens);
-                return;
-            }
-            match app.session.selection.clone() {
-                Selection::None => stage_properties(app, ui),
-                Selection::Asset(id) => asset_properties(app, ui, id),
-                Selection::Q0rg(id) => q0rg_properties(app, ui, id),
-                Selection::Placement {
-                    q0rg_id,
-                    layer_id,
-                    placement_idx,
-                } => placement_properties(app, ui, q0rg_id, layer_id, placement_idx),
-                Selection::Path {
-                    q0rg_id,
-                    layer_id,
-                    placement_idx,
-                    path_idx,
-                } => {
-                    raw_path_properties(app, ui, q0rg_id, layer_id, placement_idx, path_idx);
-                    selected_stroke_properties(app, ui);
-                }
-                Selection::Paths(refs) => {
-                    ui.label(egui::RichText::new(format!("{} contours", refs.len())).strong());
-                    ui.label(
-                        egui::RichText::new("Delete removes only these selected contours")
-                            .color(app.settings.theme.text_dim.to_color32())
-                            .small(),
-                    );
-                    selected_stroke_properties(app, ui);
-                }
-                Selection::StrokeSegment(segment) => {
-                    ui.label(egui::RichText::new("Stroke segment").strong());
-                    ui.label(
-                        egui::RichText::new(format!("Segment {}", segment.segment_idx + 1))
-                            .color(app.settings.theme.text_dim.to_color32())
-                            .small(),
-                    );
-                    ui.label(
-                        egui::RichText::new("Drag to detach this part of the outline")
-                            .color(app.settings.theme.text_dim.to_color32())
-                            .small(),
-                    );
-                    selected_stroke_properties(app, ui);
-                }
-                Selection::RawParts {
-                    fills,
-                    strokes,
-                    stroke_segments,
-                    objects,
-                } => {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} fill part(s) + {} outline(s) + {} outline segment(s) + {} object(s)",
-                            fills.len(),
-                            strokes.len(),
-                            stroke_segments.len(),
-                            objects.len()
-                        ))
-                        .strong(),
-                    );
-                    ui.label(
-                        egui::RichText::new("Drag to detach only the selected raw parts")
-                            .color(app.settings.theme.text_dim.to_color32())
-                            .small(),
-                    );
-                    if !fills.is_empty() || !strokes.is_empty() || !stroke_segments.is_empty() {
-                        selected_stroke_properties(app, ui);
-                    }
-                }
-                Selection::PathPoints { anchor_indices, .. } => {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Partial fill: {} boundary points",
-                            anchor_indices.len()
-                        ))
-                        .strong(),
-                    );
-                    ui.label(
-                        egui::RichText::new("V drag reshapes only this selected area")
-                            .color(app.settings.theme.text_dim.to_color32())
-                            .small(),
-                    );
-                }
-                Selection::SubselectPoints { path, anchor_indices, .. } => {
-                    let more: Vec<usize> = app
-                        .session
-                        .subselect_more
-                        .iter()
-                        .filter(|(other, _)| *other != path)
-                        .map(|(_, indices)| indices.len())
-                        .collect();
-                    let points = anchor_indices.len() + more.iter().sum::<usize>();
-                    ui.label(
-                        egui::RichText::new(if more.is_empty() {
-                            format!("Subselect: {points} vector point(s)")
-                        } else {
-                            format!(
-                                "Subselect: {points} vector point(s) on {} paths",
-                                more.len() + 1
-                            )
-                        })
-                        .strong(),
-                    );
-                    ui.label(
-                        egui::RichText::new("Switching to Select transforms the whole raw path")
-                            .color(app.settings.theme.text_dim.to_color32())
-                            .small(),
-                    );
-                }
-                Selection::RawArea {
-                    placements,
-                    objects,
-                    ..
-                } => {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Selected fill area across {} drawing(s) + {} object(s)",
-                            placements.len(),
-                            objects.len()
-                        ))
-                        .strong(),
-                    );
-                    ui.label(
-                        egui::RichText::new("The original geometry is unchanged until you drag")
-                            .color(app.settings.theme.text_dim.to_color32())
-                            .small(),
-                    );
-                }
-                Selection::Mixed { paths, objects } => {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} contours + {} objects",
-                            paths.len(),
-                            objects.len()
-                        ))
-                        .strong(),
-                    );
-                    ui.label(
-                        egui::RichText::new("Free transform edits them as one group")
-                            .color(app.settings.theme.text_dim.to_color32())
-                            .small(),
-                    );
-                    selected_stroke_properties(app, ui);
-                }
-                Selection::Multi(refs) => {
-                    ui.label(egui::RichText::new(format!("{} objects", refs.len())).strong());
-
-                }
-            }
-
-            let selected_objects = match &app.session.selection {
-                Selection::Multi(objects)
-                | Selection::Mixed { objects, .. }
-                | Selection::RawParts { objects, .. }
-                | Selection::RawArea { objects, .. } => objects.clone(),
-                _ => Vec::new(),
-            };
-            if !selected_objects.is_empty() {
-                multiple_placement_properties(app, ui, &selected_objects);
-            }
-
-            // Tool style must remain available while artwork is selected. Selecting
-            // the Rectangle tool used to leave the previous raw selection active,
-            // which hid the fill colour control behind selection-only properties.
-            render_tool_properties(app, ui);
+        .show(ui, |ui| match tab {
+            Tab::Selection => selection_tab(app, ui),
+            Tab::Tool => render_tool_properties(app, ui),
+            Tab::Stage => stage_properties(app, ui),
         });
+}
+
+/// The pages' tabs, sharing the panel's width, worn like the tool buttons.
+fn tab_strip(ui: &mut Ui, tabs: &[(Tab, &str)], current: &mut Tab) {
+    const GAP: f32 = 4.0;
+    let count = tabs.len().max(1) as f32;
+    let width = ((ui.available_width() - GAP * (count - 1.0)) / count).max(24.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = GAP;
+        for &(tab, label) in tabs {
+            let selected = *current == tab;
+            let (rect, response) =
+                ui.allocate_exact_size(egui::vec2(width, 26.0), egui::Sense::click());
+            response.widget_info(|| {
+                egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, selected, label)
+            });
+            if ui.is_rect_visible(rect) {
+                crate::ui::paint_control(ui, &response, rect, 6.0, selected);
+                let color = if selected {
+                    ui.visuals().strong_text_color()
+                } else {
+                    ui.visuals().text_color()
+                };
+                let font = egui::FontId::proportional(13.0);
+                let galley = ui
+                    .painter()
+                    .layout_no_wrap(label.to_owned(), font.clone(), color);
+                if galley.size().x <= rect.width() - 12.0 {
+                    ui.painter()
+                        .galley(rect.center() - galley.size() * 0.5, galley, color);
+                } else {
+                    crate::ui::clipped_label(
+                        ui.painter(),
+                        rect.shrink2(egui::vec2(6.0, 0.0)),
+                        label,
+                        font,
+                        color,
+                    );
+                }
+            }
+            if response
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+            {
+                *current = tab;
+            }
+        }
+    });
+    ui.add_space(4.0);
+}
+
+/// The page of what is selected: a symbol, shapes, text, a tween…
+fn selection_tab(app: &mut EditorApp, ui: &mut Ui) {
+    if crate::text_tool::has_text_selection(app) {
+        crate::text_tool::render_properties(app, ui);
+        if app.session.text_editor.is_none() {
+            if let Selection::Placement {
+                q0rg_id,
+                layer_id,
+                placement_idx,
+            } = app.session.selection
+            {
+                ui.separator();
+                placement_properties(app, ui, q0rg_id, layer_id, placement_idx);
+            }
+        }
+        return;
+    }
+    if app.camera_track_is_selected() {
+        let camera_tweens = crate::easing::selected_tween_targets(app);
+        if !camera_tweens.is_empty() {
+            crate::easing::render_selected_tween_properties(app, ui, &camera_tweens);
+        } else {
+            render_camera_properties(app, ui);
+        }
+        return;
+    }
+    if render_audio_clip_properties(app, ui) {
+        return;
+    }
+    if let Selection::Placement {
+        q0rg_id,
+        layer_id,
+        placement_idx,
+    } = app.session.selection
+    {
+        let symbol = app
+            .state
+            .project
+            .q0rgs
+            .iter()
+            .find(|q| q.q0rg_id == q0rg_id)
+            .and_then(|q| q.layers.iter().find(|l| l.layer_id == layer_id))
+            .and_then(|l| l.placements.get(placement_idx))
+            .and_then(|p| match p.target {
+                Target::Q0rg(id) => app.state.project.q0rgs.iter().find(|q| q.q0rg_id == id),
+                _ => None,
+            });
+        if let Some(symbol) = symbol {
+            crate::ui::section_header(ui, &symbol.name);
+        }
+    }
+    let timeline_tweens = crate::easing::selected_tween_targets(app);
+    if !timeline_tweens.is_empty() {
+        crate::easing::render_selected_tween_properties(app, ui, &timeline_tweens);
+        return;
+    }
+    match app.session.selection.clone() {
+        Selection::None => {}
+        Selection::Asset(id) => asset_properties(app, ui, id),
+        Selection::Q0rg(id) => q0rg_properties(app, ui, id),
+        Selection::Placement {
+            q0rg_id,
+            layer_id,
+            placement_idx,
+        } => placement_properties(app, ui, q0rg_id, layer_id, placement_idx),
+        Selection::Path {
+            q0rg_id,
+            layer_id,
+            placement_idx,
+            path_idx,
+        } => {
+            raw_path_properties(app, ui, q0rg_id, layer_id, placement_idx, path_idx);
+            selected_stroke_properties(app, ui);
+        }
+        Selection::Paths(refs) => {
+            crate::ui::section_header(ui, &format!("{} contours", refs.len()));
+            ui.label(
+                egui::RichText::new("Delete removes only these selected contours")
+                    .color(app.settings.theme.text_dim.to_color32())
+                    .small(),
+            );
+            selected_stroke_properties(app, ui);
+        }
+        Selection::StrokeSegment(segment) => {
+            crate::ui::section_header(ui, "Stroke segment");
+            ui.label(
+                egui::RichText::new(format!("Segment {}", segment.segment_idx + 1))
+                    .color(app.settings.theme.text_dim.to_color32())
+                    .small(),
+            );
+            ui.label(
+                egui::RichText::new("Drag to detach this part of the outline")
+                    .color(app.settings.theme.text_dim.to_color32())
+                    .small(),
+            );
+            selected_stroke_properties(app, ui);
+        }
+        Selection::RawParts {
+            fills,
+            strokes,
+            stroke_segments,
+            objects,
+        } => {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} fill part(s) + {} outline(s) + {} outline segment(s) + {} object(s)",
+                    fills.len(),
+                    strokes.len(),
+                    stroke_segments.len(),
+                    objects.len()
+                ))
+                .strong(),
+            );
+            ui.label(
+                egui::RichText::new("Drag to detach only the selected raw parts")
+                    .color(app.settings.theme.text_dim.to_color32())
+                    .small(),
+            );
+            if !fills.is_empty() || !strokes.is_empty() || !stroke_segments.is_empty() {
+                selected_stroke_properties(app, ui);
+            }
+        }
+        Selection::PathPoints { anchor_indices, .. } => {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Partial fill: {} boundary points",
+                    anchor_indices.len()
+                ))
+                .strong(),
+            );
+            ui.label(
+                egui::RichText::new("V drag reshapes only this selected area")
+                    .color(app.settings.theme.text_dim.to_color32())
+                    .small(),
+            );
+        }
+        Selection::SubselectPoints {
+            path,
+            anchor_indices,
+            ..
+        } => {
+            let more: Vec<usize> = app
+                .session
+                .subselect_more
+                .iter()
+                .filter(|(other, _)| *other != path)
+                .map(|(_, indices)| indices.len())
+                .collect();
+            let points = anchor_indices.len() + more.iter().sum::<usize>();
+            ui.label(
+                egui::RichText::new(if more.is_empty() {
+                    format!("Subselect: {points} vector point(s)")
+                } else {
+                    format!(
+                        "Subselect: {points} vector point(s) on {} paths",
+                        more.len() + 1
+                    )
+                })
+                .strong(),
+            );
+            ui.label(
+                egui::RichText::new("Switching to Select transforms the whole raw path")
+                    .color(app.settings.theme.text_dim.to_color32())
+                    .small(),
+            );
+        }
+        Selection::RawArea {
+            placements,
+            objects,
+            ..
+        } => {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Selected fill area across {} drawing(s) + {} object(s)",
+                    placements.len(),
+                    objects.len()
+                ))
+                .strong(),
+            );
+            ui.label(
+                egui::RichText::new("The original geometry is unchanged until you drag")
+                    .color(app.settings.theme.text_dim.to_color32())
+                    .small(),
+            );
+        }
+        Selection::Mixed { paths, objects } => {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} contours + {} objects",
+                    paths.len(),
+                    objects.len()
+                ))
+                .strong(),
+            );
+            ui.label(
+                egui::RichText::new("Free transform edits them as one group")
+                    .color(app.settings.theme.text_dim.to_color32())
+                    .small(),
+            );
+            selected_stroke_properties(app, ui);
+        }
+        Selection::Multi(refs) => {
+            crate::ui::section_header(ui, &format!("{} objects", refs.len()));
+        }
+    }
+
+    let selected_objects = match &app.session.selection {
+        Selection::Multi(objects)
+        | Selection::Mixed { objects, .. }
+        | Selection::RawParts { objects, .. }
+        | Selection::RawArea { objects, .. } => objects.clone(),
+        _ => Vec::new(),
+    };
+    if !selected_objects.is_empty() {
+        multiple_placement_properties(app, ui, &selected_objects);
+    }
 }
 
 fn render_camera_properties(app: &mut EditorApp, ui: &mut Ui) {
     let frame = app.session.current_frame;
     let before = app.state.project.clone();
-    let mut state = app.state.project.camera_state_at(frame);
-    let has_exact_key = app.state.project.runtime.camera.has_keyframe(frame);
+    let mut state = app
+        .state
+        .project
+        .camera_state_in(app.session.current_q0rg_id, frame);
+    let has_exact_key = app.camera().has_keyframe(frame);
     let mut changed = false;
     let mut wants_snapshot = false;
 
-    ui.label(egui::RichText::new("Camera").strong().size(15.0));
+    crate::ui::section_header(ui, "Camera");
     ui.label(
         egui::RichText::new(if has_exact_key {
             format!("keyframe {}", frame + 1)
@@ -316,7 +538,7 @@ fn render_camera_properties(app: &mut EditorApp, ui: &mut Ui) {
         if wants_snapshot {
             app.history.snapshot_with_session(&before, &app.session);
         }
-        app.state.project.runtime.camera.insert_key(frame, state);
+        app.camera_mut().insert_key(frame, state);
         if let Some(key) = app
             .state
             .project
@@ -369,7 +591,7 @@ fn render_audio_clip_properties(app: &mut EditorApp, ui: &mut Ui) -> bool {
         .unwrap_or_else(|| format!("Audio {}", clip.asset_id));
     let source_seconds =
         header.audio_samples_per_channel as f64 / f64::from(header.spec.audio_sample_rate.max(1));
-    ui.label(egui::RichText::new(name).strong());
+    crate::ui::section_header(ui, &name);
     ui.label(
         egui::RichText::new(format!(
             "{source_seconds:.2}s · {} Hz · {} channels",
@@ -419,7 +641,7 @@ fn render_audio_clip_properties(app: &mut EditorApp, ui: &mut Ui) -> bool {
                 ui.label("Length");
                 ui.horizontal(|ui| {
                     let mut full = clip.duration_frames.is_none();
-                    let response = ui.checkbox(&mut full, "Full source");
+                    let response = crate::ui::switch(ui, &mut full, "Full source");
                     snapshot |= response.changed();
                     if response.changed() {
                         clip.duration_frames = if full {
@@ -470,7 +692,7 @@ fn render_audio_clip_properties(app: &mut EditorApp, ui: &mut Ui) -> bool {
                     ui.end_row();
                 }
                 ui.label("Mute");
-                snapshot |= ui.checkbox(&mut clip.muted, "").changed();
+                snapshot |= crate::ui::switch(ui, &mut clip.muted, "").changed();
                 ui.end_row();
             });
     });
@@ -564,8 +786,7 @@ fn selected_stroke_properties(app: &mut EditorApp, ui: &mut Ui) {
     } = crate::tools::selected_paint(&app.state.project, &app.session.selection);
     let dim = app.settings.theme.text_dim.to_color32();
     if let Some((stroke, mixed)) = stroke {
-        ui.add_space(8.0);
-        ui.label(egui::RichText::new("Stroke").strong());
+        crate::ui::section_header(ui, "Stroke");
         if mixed {
             ui.label(
                 egui::RichText::new("Mixed styles - what you change is made the same")
@@ -575,6 +796,7 @@ fn selected_stroke_properties(app: &mut EditorApp, ui: &mut Ui) {
         }
         let mut snapshot = false;
         let mut restyle: Option<Restyle> = None;
+        let mut rejoin: Option<JoinShape> = None;
         egui::Grid::new("selected_stroke_style")
             .num_columns(2)
             .show(ui, |ui| {
@@ -649,7 +871,7 @@ fn selected_stroke_properties(app: &mut EditorApp, ui: &mut Ui) {
                             && stroke.join != join
                         {
                             snapshot = true;
-                            restyle = Some(Box::new(move |stroke| stroke.join = join));
+                            rejoin = Some(join);
                         }
                     }
                 });
@@ -658,6 +880,9 @@ fn selected_stroke_properties(app: &mut EditorApp, ui: &mut Ui) {
         if snapshot {
             app.history
                 .snapshot_with_session(&app.state.project, &app.session);
+        }
+        if let Some(join) = rejoin {
+            crate::tools::set_selected_stroke_join(app, join);
         }
         if let Some(restyle) = restyle {
             if crate::tools::restyle_selected_strokes(app, restyle) {
@@ -670,8 +895,7 @@ fn selected_stroke_properties(app: &mut EditorApp, ui: &mut Ui) {
         }
     }
     if let Some((color, mixed)) = fill {
-        ui.add_space(8.0);
-        ui.label(egui::RichText::new("Fill").strong());
+        crate::ui::section_header(ui, "Fill");
         if mixed {
             ui.label(
                 egui::RichText::new("Mixed colours - what you pick paints them all")
@@ -770,7 +994,7 @@ fn raw_path_properties(
         ui.label("Selection is no longer available");
         return;
     };
-    ui.label(egui::RichText::new("Contour").strong());
+    crate::ui::section_header(ui, "Contour");
     ui.label(format!("Contour {}", path_idx + 1));
     ui.label(format!("{} boundary points", path.anchors.len()));
     ui.label(if path.closed {
@@ -787,9 +1011,8 @@ fn raw_path_properties(
 }
 
 fn stage_properties(app: &mut EditorApp, ui: &mut Ui) {
-    ui.label(egui::RichText::new("Stage").strong());
     scene_properties(app, ui);
-    ui.separator();
+    crate::ui::section_header(ui, "Stage");
     let mut dirty = false;
     // Stage controls are drawn on every frame. Keep only the small metadata
     // value eagerly, then clone the full project if an edit actually starts.
@@ -877,8 +1100,9 @@ fn scene_properties(app: &mut EditorApp, ui: &mut Ui) {
         .first()
         .copied()
         .unwrap_or(app.session.current_q0rg_id);
+    ui.add_space(2.0);
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Scenes").strong());
+        crate::ui::section_title(ui, "Scenes");
         if icon_button(ui, Icon::Add, "Add scene").clicked() {
             app.queue(Action::AddScene);
         }
@@ -891,42 +1115,52 @@ fn scene_properties(app: &mut EditorApp, ui: &mut Ui) {
                 .max_height(104.0)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    // Each row is laid out from the right: the buttons first,
+                    // then the name takes what is left. Sizing the name by a
+                    // guess at the buttons' width overflowed, and every row
+                    // that overflowed widened the list for the rows below.
+                    let row_width = ui.available_width();
                     for scene in &scenes {
-                        ui.horizontal(|ui| {
-                            let active = scene.q0rg_id == active_scene_q0rg;
-                            if crate::ui::name_button(
-                                ui,
-                                &scene.name,
-                                active,
-                                (ui.available_width() - 58.0).max(30.0),
-                            )
-                            .on_hover_text("Switch to this scene")
-                            .clicked()
-                            {
-                                app.queue(Action::SwitchScene(scene.scene_id));
-                            }
-                            if icon_button(ui, Icon::Rename, "Rename scene").clicked() {
-                                app.session.scene_rename = Some(crate::state::SceneRename {
-                                    scene_id: scene.scene_id,
-                                    draft: scene.name.clone(),
-                                    focus_requested: true,
-                                });
-                            }
-                            if icon_button_enabled(
-                                ui,
-                                scenes.len() > 1,
-                                Icon::Delete,
-                                if scenes.len() > 1 {
-                                    "Delete scene"
-                                } else {
-                                    "The project needs at least one scene"
-                                },
-                            )
-                            .clicked()
-                            {
-                                app.queue(Action::DeleteScene(scene.scene_id));
-                            }
-                        });
+                        let row = egui::Layout::right_to_left(egui::Align::Center);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(row_width, crate::ui::ICON_CONTROL_SIZE),
+                            row,
+                            |ui| {
+                                if icon_button_enabled(
+                                    ui,
+                                    scenes.len() > 1,
+                                    Icon::Delete,
+                                    if scenes.len() > 1 {
+                                        "Delete scene"
+                                    } else {
+                                        "The project needs at least one scene"
+                                    },
+                                )
+                                .clicked()
+                                {
+                                    app.queue(Action::DeleteScene(scene.scene_id));
+                                }
+                                if icon_button(ui, Icon::Rename, "Rename scene").clicked() {
+                                    app.session.scene_rename = Some(crate::state::SceneRename {
+                                        scene_id: scene.scene_id,
+                                        draft: scene.name.clone(),
+                                        focus_requested: true,
+                                    });
+                                }
+                                let active = scene.q0rg_id == active_scene_q0rg;
+                                if crate::ui::name_button(
+                                    ui,
+                                    &scene.name,
+                                    active,
+                                    ui.available_width().max(0.0),
+                                )
+                                .on_hover_text("Switch to this scene")
+                                .clicked()
+                                {
+                                    app.queue(Action::SwitchScene(scene.scene_id));
+                                }
+                            },
+                        );
                     }
                 });
         });
@@ -1019,13 +1253,15 @@ fn tool_property_kind(tool: Tool) -> ToolPropertyKind {
 }
 
 fn render_tool_properties(app: &mut EditorApp, ui: &mut Ui) {
-    ui.add_space(10.0);
-    ui.separator();
-    ui.label(
-        egui::RichText::new(app.session.current_tool.label())
-            .strong()
-            .size(15.0),
-    );
+    // The tool's shortcut sits by its name, quietly, to change it right here.
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        crate::ui::section_title(ui, app.session.current_tool.label());
+        let command = crate::hotkeys::ShortcutCommand::for_tool(app.session.current_tool);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            crate::panels::shortcuts::chip(app, ui, command);
+        });
+    });
 
     match tool_property_kind(app.session.current_tool) {
         ToolPropertyKind::Select => {
@@ -1047,11 +1283,14 @@ fn render_tool_properties(app: &mut EditorApp, ui: &mut Ui) {
             ui,
             "Draw a loop to select contours and objects inside or touching it.",
         ),
-        ToolPropertyKind::Text => tool_hint(
-            app,
-            ui,
-            "Click the stage to add text. Click existing text to edit it.",
-        ),
+        ToolPropertyKind::Text => {
+            crate::text_tool::render_tool_defaults(app, ui);
+            tool_hint(
+                app,
+                ui,
+                "Click the stage to add text. Click existing text to edit it.",
+            );
+        }
         ToolPropertyKind::Hand => tool_hint(
             app,
             ui,
@@ -1065,6 +1304,11 @@ fn render_tool_properties(app: &mut EditorApp, ui: &mut Ui) {
         ToolPropertyKind::Pen => {
             stroke_tool_properties(app, ui, "Pen path", true, true);
             crossing_option(app, ui);
+            tool_hint(
+                app,
+                ui,
+                "Click for a corner, drag for a curve (Alt: one handle, Shift: 45°). Click the first point to close; Enter or double-click ends. Backspace takes a point back.",
+            );
         }
         ToolPropertyKind::Pencil => {
             stroke_tool_properties(app, ui, "Freehand line", false, true);
@@ -1088,7 +1332,7 @@ fn render_tool_properties(app: &mut EditorApp, ui: &mut Ui) {
         ToolPropertyKind::Eyedropper => tool_hint(
             app,
             ui,
-            "Click visible vector paint to copy its fill or stroke settings.",
+            "Click vector paint to copy its fill or stroke, or anything else to take the colour shown there. Drag from the stage to pick from anywhere on screen. Shift picks into the stroke.",
         ),
         ToolPropertyKind::Rig => crate::rigging::render_properties(app, ui),
     }
@@ -1199,9 +1443,9 @@ fn brush_library_entry_visible(filter: BrushLibraryFilter, source: BrushLibraryS
 }
 
 fn render_advanced_brush_library(app: &mut EditorApp, ui: &mut Ui) {
-    ui.separator();
+    ui.add_space(6.0);
     ui.horizontal_wrapped(|ui| {
-        ui.label(egui::RichText::new("Brush library").strong());
+        crate::ui::section_title(ui, "Brush library");
         for filter in BrushLibraryFilter::ALL {
             ui.selectable_value(
                 &mut app.session.advanced_brush_library_filter,
@@ -1458,11 +1702,11 @@ fn brush_properties(app: &mut EditorApp, ui: &mut Ui) {
                     ui.end_row();
 
                     ui.label("Pressure size");
-                    ui.checkbox(&mut app.session.brush.pressure_size, "");
+                    crate::ui::switch(ui, &mut app.session.brush.pressure_size, "");
                     ui.end_row();
 
                     ui.label("Speed size");
-                    ui.checkbox(&mut app.session.brush.velocity_size, "");
+                    crate::ui::switch(ui, &mut app.session.brush.velocity_size, "");
                     ui.end_row();
 
                     let dynamics_enabled =
@@ -1487,11 +1731,11 @@ fn brush_properties(app: &mut EditorApp, ui: &mut Ui) {
                     ui.end_row();
 
                     ui.label("Scale with stage");
-                    ui.checkbox(&mut app.session.brush.scale_with_stage, "");
+                    crate::ui::switch(ui, &mut app.session.brush.scale_with_stage, "");
                     ui.end_row();
 
                     ui.label("Sync with eraser");
-                    ui.checkbox(&mut app.session.brush.sync_with_eraser, "");
+                    crate::ui::switch(ui, &mut app.session.brush.sync_with_eraser, "");
                     ui.end_row();
                 });
         }
@@ -1582,7 +1826,7 @@ fn brush_properties(app: &mut EditorApp, ui: &mut Ui) {
                     ui.end_row();
 
                     ui.label("Auto angle");
-                    ui.checkbox(&mut app.session.advanced_brush.auto_angle, "");
+                    crate::ui::switch(ui, &mut app.session.advanced_brush.auto_angle, "");
                     ui.end_row();
 
                     ui.label("Taper start");
@@ -1600,7 +1844,7 @@ fn brush_properties(app: &mut EditorApp, ui: &mut Ui) {
                     ui.end_row();
 
                     ui.label("Pressure size");
-                    ui.checkbox(&mut app.session.advanced_brush.pressure_size, "");
+                    crate::ui::switch(ui, &mut app.session.advanced_brush.pressure_size, "");
                     ui.end_row();
 
                     ui.label("Pressure min size");
@@ -1628,7 +1872,7 @@ fn brush_properties(app: &mut EditorApp, ui: &mut Ui) {
                     #[cfg(feature = "appearance-mask-eraser")]
                     {
                         ui.label("Glow");
-                        ui.checkbox(&mut app.session.advanced_brush.glow, "");
+                        crate::ui::switch(ui, &mut app.session.advanced_brush.glow, "");
                         ui.end_row();
 
                         ui.label("Glow radius");
@@ -1652,7 +1896,7 @@ fn brush_properties(app: &mut EditorApp, ui: &mut Ui) {
                     }
 
                     ui.label("Scale with stage");
-                    ui.checkbox(&mut app.session.advanced_brush.scale_with_stage, "");
+                    crate::ui::switch(ui, &mut app.session.advanced_brush.scale_with_stage, "");
                     ui.end_row();
                 });
 
@@ -1739,41 +1983,76 @@ fn eraser_properties(app: &mut EditorApp, ui: &mut Ui) {
     tool_hint(
         app,
         ui,
-        "Subtracts one continuous circular coverage area from raw graphics.",
+        "A brush that takes away: erases raw graphics along its stroke. Synced, it is the brush exactly; otherwise it keeps its own nib, size, smoothing and dynamics.",
     );
     let brush_before = app.session.brush;
+    let eraser_before = app.session.eraser;
     egui::Grid::new("classic_eraser_settings")
         .num_columns(2)
         .show(ui, |ui| {
-            ui.label("Nib");
-            ui.label("Circle");
+            ui.label("Sync with brush");
+            crate::ui::switch(ui, &mut app.session.brush.sync_with_eraser, "");
             ui.end_row();
 
-            ui.label("Sync with brush");
-            ui.checkbox(&mut app.session.brush.sync_with_eraser, "");
+            let settings = if app.session.brush.sync_with_eraser {
+                &mut app.session.brush
+            } else {
+                &mut app.session.eraser
+            };
+            ui.label("Nib");
+            egui::ComboBox::from_id_source("classic_eraser_nib")
+                .selected_text(settings.nib.label())
+                .show_ui(ui, |ui| {
+                    for nib in crate::brush::BrushNib::ALL {
+                        ui.selectable_value(&mut settings.nib, nib, nib.label());
+                    }
+                });
             ui.end_row();
 
             ui.label("Size");
-            if app.session.brush.sync_with_eraser {
-                ui.add(
-                    egui::DragValue::new(&mut app.session.brush.size)
-                        .speed(0.25)
-                        .clamp_range(0.1..=512.0),
-                );
-            } else {
-                ui.add(
-                    egui::DragValue::new(&mut app.session.eraser_size)
-                        .speed(0.25)
-                        .clamp_range(0.1..=512.0),
-                );
-            }
+            ui.add(
+                egui::DragValue::new(&mut settings.size)
+                    .speed(0.25)
+                    .clamp_range(0.1..=512.0),
+            );
+            ui.end_row();
+
+            ui.label("Smoothing");
+            ui.add(egui::Slider::new(&mut settings.smoothing, 0..=100));
+            ui.end_row();
+
+            ui.label("Pressure size");
+            crate::ui::switch(ui, &mut settings.pressure_size, "");
+            ui.end_row();
+
+            ui.label("Speed size");
+            crate::ui::switch(ui, &mut settings.velocity_size, "");
+            ui.end_row();
+
+            let dynamics = settings.pressure_size || settings.velocity_size;
+            ui.label("Sensitivity");
+            ui.add_enabled(
+                dynamics,
+                egui::Slider::new(&mut settings.dynamics_sensitivity, 0..=100),
+            );
+            ui.end_row();
+
+            ui.label("Minimum size");
+            ui.add_enabled(
+                dynamics,
+                egui::Slider::new(&mut settings.dynamics_min_size, 0.01..=1.0),
+            );
             ui.end_row();
 
             ui.label("Scale with stage");
-            ui.checkbox(&mut app.session.brush.scale_with_stage, "");
+            crate::ui::switch(ui, &mut settings.scale_with_stage, "");
             ui.end_row();
         });
     persist_brush_preferences(app, brush_before);
+    if app.session.eraser != eraser_before {
+        app.settings.eraser.update_from_runtime(app.session.eraser);
+        app.settings.save();
+    }
 }
 
 fn persist_brush_preferences(app: &mut EditorApp, before: crate::brush::BrushSettings) {
@@ -1795,15 +2074,26 @@ fn stroke_tool_properties(
         .num_columns(2)
         .show(ui, |ui| {
             ui.label("Stroke color");
-            let mut stroke = rgba_to_color32(app.session.stroke_color);
-            if crate::color_picker::color_edit_button_srgba(ui, &mut stroke).changed() {
-                app.session.stroke_color = color32_to_rgba(stroke);
-            }
+            // Shapes may drop their stroke (not their fill too); a line is
+            // its stroke, so it only takes a colour.
+            tool_stroke_box(app, ui, supports_fill);
             ui.end_row();
 
-            ui.label("Stroke opacity");
-            opacity_control(ui, &mut app.session.stroke_color.a);
-            ui.end_row();
+            if app.session.stroke_none {
+                if !supports_fill {
+                    ui.label("");
+                    ui.label(
+                        egui::RichText::new("The stroke is none: pick a colour to draw lines")
+                            .small()
+                            .color(app.settings.theme.text_dim.to_color32()),
+                    );
+                    ui.end_row();
+                }
+            } else {
+                ui.label("Stroke opacity");
+                tool_opacity(app, ui, crate::color_panel::Slot::Stroke);
+                ui.end_row();
+            }
 
             ui.label("Width");
             ui.add(
@@ -1884,30 +2174,105 @@ fn cap_control(app: &mut EditorApp, ui: &mut Ui) {
     }
 }
 
+/// The fill of the shape tools and the pen: a colour, a gradient, or none
+/// (picked in its popup), as long as the stroke is not none as well.
 fn optional_fill_control(app: &mut EditorApp, ui: &mut Ui) {
-    ui.label("Fill");
-    let mut enabled = app.session.fill_color.is_some();
-    if ui.checkbox(&mut enabled, "Enabled").changed() {
-        set_optional_fill_enabled(&mut app.session.fill_color, enabled);
-    }
+    ui.label("Fill paint");
+    tool_fill_box(app, ui, true);
     ui.end_row();
 
-    if let Some(fill) = app.session.fill_color.as_mut() {
-        ui.label("Fill paint");
-        tool_paint_box(ui, fill, &mut app.session.fill_gradient);
-        ui.end_row();
-
+    if app.session.fill_color.is_some() {
         ui.label("Fill opacity");
-        opacity_control(ui, &mut fill.a);
+        tool_opacity(app, ui, crate::color_panel::Slot::Fill);
         ui.end_row();
     }
 }
 
-fn set_optional_fill_enabled(fill: &mut Option<Rgba>, enabled: bool) {
-    match (enabled, fill.is_some()) {
-        (true, false) => *fill = Some(default_fill_color()),
-        (false, true) => *fill = None,
-        _ => {}
+/// A colour as the paint stores it: unmultiplied.
+fn unmultiplied(color: Color32) -> Rgba {
+    let [r, g, b, a] = color.to_srgba_unmultiplied();
+    Rgba { r, g, b, a }
+}
+
+/// The tools' fill box: a colour or a gradient, and none where `allow_none`
+/// and the stroke is not none already.
+fn tool_fill_box(app: &mut EditorApp, ui: &mut Ui, allow_none: bool) {
+    use crate::color_panel::{self as colors, Slot};
+    let look = colors::tool_look(&app.session, Slot::Fill);
+    let mut shown = rgba_to_color32(look.color);
+    let mut gradient = look.gradient.clone();
+    let mut none = look.none && allow_none;
+    let (_, change) = if allow_none {
+        crate::color_picker::optional_paint_edit_button(
+            ui,
+            &mut shown,
+            &mut gradient,
+            &mut none,
+            colors::none_allowed(&app.session, Slot::Fill),
+        )
+    } else {
+        crate::color_picker::paint_edit_button(ui, &mut shown, &mut gradient)
+    };
+    if change != PaintChange::None {
+        let paint = colors::Look {
+            color: unmultiplied(shown),
+            gradient,
+            none,
+        }
+        .paint(change == PaintChange::Shape);
+        colors::set_tool_paint(&mut app.session, Slot::Fill, &paint);
+    }
+}
+
+/// The tools' stroke colour box, with none where `allow_none` and the fill
+/// is not none already.
+fn tool_stroke_box(app: &mut EditorApp, ui: &mut Ui, allow_none: bool) {
+    use crate::color_panel::{self as colors, Paint, Slot};
+    let look = colors::tool_look(&app.session, Slot::Stroke);
+    let mut shown = rgba_to_color32(look.color);
+    let mut none = look.none;
+    let changed = if allow_none {
+        crate::color_picker::optional_color_edit_button(
+            ui,
+            &mut shown,
+            &mut none,
+            colors::none_allowed(&app.session, Slot::Stroke),
+        )
+        .changed()
+    } else {
+        let changed = crate::color_picker::color_edit_button_srgba(ui, &mut shown).changed();
+        if changed {
+            none = false;
+        }
+        changed
+    };
+    if changed {
+        let paint = if none {
+            Paint::None
+        } else {
+            Paint::Color(unmultiplied(shown))
+        };
+        colors::set_tool_paint(&mut app.session, Slot::Stroke, &paint);
+    }
+}
+
+/// The opacity of the tools' fill or stroke.
+fn tool_opacity(app: &mut EditorApp, ui: &mut Ui, slot: crate::color_panel::Slot) {
+    use crate::color_panel::Slot;
+    let mut alpha = crate::color_panel::tool_look(&app.session, slot).color.a;
+    let before = alpha;
+    opacity_control(ui, &mut alpha);
+    if alpha == before {
+        return;
+    }
+    match slot {
+        Slot::Fill => {
+            if let Some(fill) = app.session.fill_color.as_mut() {
+                fill.a = alpha;
+            }
+            app.session.fill_kept.a = alpha;
+        }
+        Slot::Stroke => app.session.stroke_color.a = alpha,
     }
 }
 
@@ -1917,16 +2282,15 @@ fn fill_tool_properties(app: &mut EditorApp, ui: &mut Ui) {
         ui,
         "Fills enclosed raw regions on the active layer. Existing fills are recolored without changing their geometry.",
     );
-    let mut fill = app.session.fill_color.unwrap_or_else(default_fill_color);
     egui::Grid::new("bucket_fill_settings")
         .num_columns(2)
         .show(ui, |ui| {
             ui.label("Fill paint");
-            tool_paint_box(ui, &mut fill, &mut app.session.fill_gradient);
+            tool_fill_box(app, ui, false);
             ui.end_row();
 
             ui.label("Opacity");
-            opacity_control(ui, &mut fill.a);
+            tool_opacity(app, ui, crate::color_panel::Slot::Fill);
             ui.end_row();
 
             ui.label("Close gaps");
@@ -1945,7 +2309,6 @@ fn fill_tool_properties(app: &mut EditorApp, ui: &mut Ui) {
             }
             ui.end_row();
         });
-    app.session.fill_color = Some(fill);
 }
 
 /// A switch kept in the settings, saved as soon as it is flipped.
@@ -1957,7 +2320,10 @@ fn aid_checkbox(
     hint: &str,
 ) {
     let mut on = *value(&mut app.settings.aids);
-    if ui.checkbox(&mut on, label).on_hover_text(hint).changed() {
+    if crate::ui::switch(ui, &mut on, label)
+        .on_hover_text(hint)
+        .changed()
+    {
         *value(&mut app.settings.aids) = on;
         app.settings.save();
     }
@@ -1970,15 +2336,6 @@ fn opacity_control(ui: &mut Ui, alpha: &mut u8) {
         .changed()
     {
         *alpha = (opacity * 255.0 / 100.0).round().clamp(0.0, 255.0) as u8;
-    }
-}
-
-fn default_fill_color() -> Rgba {
-    Rgba {
-        r: 0xCC,
-        g: 0xCC,
-        b: 0xCC,
-        a: 255,
     }
 }
 
@@ -2038,7 +2395,7 @@ fn asset_properties(app: &mut EditorApp, ui: &mut Ui, id: u16) {
         ui.label("Selection is no longer available");
         return;
     };
-    ui.label(egui::RichText::new("Asset").strong());
+    crate::ui::section_header(ui, "Asset");
 
     let mut gradient = app
         .state
@@ -2105,32 +2462,39 @@ fn asset_properties(app: &mut EditorApp, ui: &mut Ui, id: u16) {
             egui::Grid::new(format!("asset_style_{id}"))
                 .num_columns(2)
                 .show(ui, |ui| {
+                    // None in the picker takes the stroke off, while
+                    // the drawing keeps a fill.
                     ui.label("Stroke");
-                    let mut has_stroke = v.stroke.is_some();
-                    if ui.checkbox(&mut has_stroke, "").changed() {
-                        v.stroke = if has_stroke {
-                            Some(VStroke {
-                                color: Rgba {
-                                    r: 0,
-                                    g: 0,
-                                    b: 0,
-                                    a: 255,
-                                },
-                                width: 1.0,
-                                cap: q0s_format::geom::CapShape::Round,
-                                join: q0s_format::geom::JoinShape::Bevel,
-                            })
+                    let mut no_stroke = v.stroke.is_none();
+                    let mut c = rgba_to_color32(
+                        v.stroke
+                            .map_or(crate::state::DEFAULT_STROKE, |stroke| stroke.color),
+                    );
+                    if crate::color_picker::optional_color_edit_button(
+                        ui,
+                        &mut c,
+                        &mut no_stroke,
+                        v.fill.is_some(),
+                    )
+                    .changed()
+                    {
+                        if no_stroke {
+                            v.stroke = None;
                         } else {
-                            None
-                        };
-                        dirty = true;
-                    }
-                    if let Some(s) = v.stroke.as_mut() {
-                        let mut c = rgba_to_color32(s.color);
-                        if crate::color_picker::color_edit_button_srgba(ui, &mut c).changed() {
-                            s.color = color32_to_rgba(c);
-                            dirty = true;
+                            let color = unmultiplied(c);
+                            match v.stroke.as_mut() {
+                                Some(stroke) => stroke.color = color,
+                                None => {
+                                    v.stroke = Some(VStroke {
+                                        color,
+                                        width: 1.0,
+                                        cap: q0s_format::geom::CapShape::Round,
+                                        join: q0s_format::geom::JoinShape::Bevel,
+                                    })
+                                }
+                            }
                         }
+                        dirty = true;
                     }
                     ui.end_row();
 
@@ -2155,36 +2519,37 @@ fn asset_properties(app: &mut EditorApp, ui: &mut Ui, id: u16) {
                         }
                     }
 
+                    // A colour, a gradient, or none (while a stroke stays).
                     ui.label("Fill");
-                    let mut has_fill = v.fill.is_some();
-                    if ui.checkbox(&mut has_fill, "").changed() {
-                        v.fill = if has_fill {
-                            Some(Rgba {
-                                r: 0xCC,
-                                g: 0xCC,
-                                b: 0xCC,
-                                a: 255,
-                            })
-                        } else {
-                            None
-                        };
-                        dirty = true;
-                    }
                     let bounds = crate::paint::vector_bounds(v).unwrap_or((
                         q0s_format::v2::Vec2::new(-50.0, -50.0),
                         q0s_format::v2::Vec2::new(50.0, 50.0),
                     ));
-                    if let Some(fill) = v.fill.as_mut() {
-                        let mut c = rgba_to_color32(*fill);
-                        let mut pick = gradient
-                            .as_ref()
-                            .map(|g| crate::paint::PaintGradient::from_fill(g, Some(bounds)));
-                        let (_, change) =
-                            crate::color_picker::paint_edit_button(ui, &mut c, &mut pick);
+                    let mut no_fill = v.fill.is_none();
+                    let mut c = rgba_to_color32(v.fill.unwrap_or(crate::state::DEFAULT_FILL));
+                    let mut pick = gradient
+                        .as_ref()
+                        .map(|g| crate::paint::PaintGradient::from_fill(g, Some(bounds)));
+                    let (_, change) = crate::color_picker::optional_paint_edit_button(
+                        ui,
+                        &mut c,
+                        &mut pick,
+                        &mut no_fill,
+                        v.stroke.is_some(),
+                    );
+                    if no_fill {
+                        if v.fill.take().is_some() {
+                            dirty = true;
+                        }
+                    } else {
+                        if v.fill.is_none() {
+                            v.fill = Some(unmultiplied(c));
+                            dirty = true;
+                        }
                         match change {
                             PaintChange::None => {}
                             PaintChange::Color => {
-                                *fill = color32_to_rgba(c);
+                                v.fill = Some(unmultiplied(c));
                                 dirty = true;
                             }
                             PaintChange::Stops => {
@@ -2199,7 +2564,8 @@ fn asset_properties(app: &mut EditorApp, ui: &mut Ui, id: u16) {
                                 gradient_dirty = true;
                             }
                         }
-                    } else if gradient.take().is_some() {
+                    }
+                    if v.fill.is_none() && gradient.take().is_some() {
                         gradient_dirty = true;
                     }
                     ui.end_row();
@@ -2249,7 +2615,7 @@ fn q0rg_properties(app: &mut EditorApp, ui: &mut Ui, id: u16) {
         return;
     };
     let symbol_name = app.state.project.q0rgs[q0rg_idx].name.clone();
-    ui.label(egui::RichText::new(format!("Symbol: {symbol_name}")).strong());
+    crate::ui::section_header(ui, &format!("Symbol: {symbol_name}"));
 
     let mut wants_snapshot = false;
     let mut dirty = false;
@@ -2470,7 +2836,7 @@ pub(crate) fn render_frame_picker(app: &mut EditorApp, ui: &mut Ui) {
         ("First frame", fx.q0rg_playback.first_frame)
     };
     let selected_frame = selected_frame.min(child_frames - 1);
-    ui.label(egui::RichText::new(&symbol.name).strong());
+    crate::ui::section_header(ui, &symbol.name);
     ui.weak(format!(
         "{} · {caption} {} / {child_frames}",
         q0rg_playback_mode_name(mode),
@@ -2579,7 +2945,7 @@ fn placement_properties(
     let mut fx_dirty = false;
     let mut manual_playback_edit = None;
     let mut rotation_pivot = None;
-    ui.label(egui::RichText::new("Placement").strong());
+    crate::ui::section_header(ui, "Placement");
     if rig_bound {
         ui.label(
             egui::RichText::new("transform edits the rig pose; linked bones stay connected")
@@ -2720,9 +3086,9 @@ fn placement_properties(
             .map(|q0rg| q0rg.frame_count.max(1))
             .unwrap_or(1);
         let max_frame = child_frames - 1;
-        ui.separator();
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Symbol").strong());
+            crate::ui::section_title(ui, "Symbol");
             let can_replace = !app.state.project.layer_is_locked(q0rg_id, layer_id);
             if ui
                 .add_enabled(can_replace, egui::Button::new("Replace q0rg"))
@@ -2783,9 +3149,9 @@ fn placement_properties(
                 }
             });
         }
-        ui.separator();
+        ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("Playback").strong());
+            crate::ui::section_title(ui, "Playback");
             if !crate::touch::ENABLED && ui.small_button("Frame Picker…").clicked() {
                 app.queue(Action::OpenFramePicker);
             }
@@ -3009,6 +3375,14 @@ fn placement_properties(
     };
     if break_apart.clicked() {
         app.queue(Action::BreakApartSelection);
+    }
+    if app.can_trace_bitmap_selection()
+        && ui
+            .button("Trace Bitmap…")
+            .on_hover_text("Turn this bitmap into vector shapes")
+            .clicked()
+    {
+        app.queue(Action::PromptTraceBitmap);
     }
     if let Some(reason) = break_apart_fx_block {
         ui.label(
@@ -3259,7 +3633,7 @@ fn fx_toggle(
     if mixed {
         *enabled = false;
     }
-    ui.add(egui::Checkbox::new(enabled, label).indeterminate(mixed))
+    crate::ui::switch_mixed(ui, enabled, mixed, label)
 }
 
 fn multiple_placement_properties(app: &mut EditorApp, ui: &mut Ui, refs: &[PlacementRef]) {
@@ -3314,7 +3688,7 @@ fn multiple_placement_properties(app: &mut EditorApp, ui: &mut Ui, refs: &[Place
     let Some(mut draft) = values.first().copied() else {
         return;
     };
-    ui.label(egui::RichText::new("Shared effects").strong());
+    crate::ui::section_header(ui, "Shared effects");
     ui.label(egui::RichText::new("Changes apply to every selected object").small());
     let locked = refs
         .iter()
@@ -3401,9 +3775,9 @@ fn multiple_placement_properties(app: &mut EditorApp, ui: &mut Ui, refs: &[Place
 
 fn render_fx_controls(ui: &mut Ui, fx: &mut PlacementFx, values: &[PlacementFx]) -> FxEdits {
     let mut edits = FxEdits::default();
-    ui.separator();
+    ui.add_space(6.0);
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("FX").strong());
+        crate::ui::section_title(ui, "FX");
         let reset = ui.add_enabled(
             values.iter().any(|value| !value.is_identity()),
             egui::Button::new("Reset"),
@@ -3937,7 +4311,7 @@ mod tests {
         let context = egui::Context::default();
         let mut app = EditorApp::default();
         app.session.current_tool = Tool::Rectangle;
-        app.session.fill_color = Some(default_fill_color());
+        app.session.fill_color = Some(crate::state::DEFAULT_FILL);
         app.session.selection = Selection::Path {
             q0rg_id: u16::MAX,
             layer_id: u16::MAX,
@@ -3968,26 +4342,74 @@ mod tests {
         assert!(painted_text.contains("Fill opacity"));
     }
 
-    #[test]
-    fn optional_fill_toggle_enables_a_visible_default_and_can_disable_it() {
-        let mut fill = None;
-        set_optional_fill_enabled(&mut fill, true);
-        assert_eq!(fill, Some(default_fill_color()));
-        set_optional_fill_enabled(&mut fill, false);
-        assert_eq!(fill, None);
+    /// The text a frame of the Properties panel paints for `app`.
+    fn painted_properties_text(app: &mut EditorApp) -> String {
+        let context = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(420.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let _first_frame = context.run(input.clone(), |context| {
+            egui::CentralPanel::default().show(context, |ui| render(app, ui));
+        });
+        let output = context.run(input, |context| {
+            egui::CentralPanel::default().show(context, |ui| render(app, ui));
+        });
+        let mut painted_text = String::new();
+        for clipped in &output.shapes {
+            collect_painted_text(&clipped.shape, &mut painted_text);
+        }
+        painted_text
     }
 
     #[test]
-    fn optional_fill_toggle_does_not_replace_an_existing_colour() {
-        let chosen = Rgba {
+    fn shape_tools_show_fill_and_stroke_with_no_on_off_switches() {
+        let mut app = EditorApp::default();
+        app.session.current_tool = Tool::Oval;
+        let text = painted_properties_text(&mut app);
+        assert!(text.contains("Stroke color") && text.contains("Fill paint"));
+        assert!(text.contains("Stroke opacity") && text.contains("Fill opacity"));
+        assert!(!text.contains("Enabled"), "none lives in the picker now");
+    }
+
+    #[test]
+    fn a_paint_of_none_keeps_its_box_and_drops_its_opacity() {
+        let mut app = EditorApp::default();
+        app.session.current_tool = Tool::Rectangle;
+        app.session.fill_color = None;
+        let text = painted_properties_text(&mut app);
+        assert!(
+            text.contains("Fill paint"),
+            "none is picked in the same box"
+        );
+        assert!(!text.contains("Fill opacity"));
+        assert!(text.contains("Stroke opacity"));
+
+        app.session.fill_color = Some(crate::state::DEFAULT_FILL);
+        app.session.stroke_none = true;
+        let text = painted_properties_text(&mut app);
+        assert!(text.contains("Fill opacity") && !text.contains("Stroke opacity"));
+    }
+
+    #[test]
+    fn the_bucket_pours_its_colour_even_when_the_fill_is_none() {
+        let mut app = EditorApp::default();
+        app.session.current_tool = Tool::Bucket;
+        app.session.fill_color = None;
+        app.session.fill_kept = Rgba {
             r: 12,
             g: 34,
             b: 56,
-            a: 78,
+            a: 255,
         };
-        let mut fill = Some(chosen);
-        set_optional_fill_enabled(&mut fill, true);
-        assert_eq!(fill, Some(chosen));
+        let _ = painted_properties_text(&mut app);
+        assert_eq!(
+            app.session.fill_color, None,
+            "showing the bucket changes nothing"
+        );
     }
 
     #[test]
@@ -4016,6 +4438,55 @@ mod tests {
             tool_property_kind(Tool::Rectangle),
             tool_property_kind(Tool::Oval),
             "rectangle and oval intentionally share the closed-shape panel"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tab_tests {
+    use super::*;
+
+    fn seen(selection: Selection, tool: Tool, context: Option<&'static str>) -> Seen {
+        Seen {
+            selection,
+            tool,
+            context,
+        }
+    }
+
+    #[test]
+    fn the_page_follows_what_was_touched() {
+        let idle = seen(Selection::None, Tool::Select, None);
+        assert_eq!(follow_focus(None, None, &idle), Tab::Stage);
+        // Picking a symbol in the library brings its page forward.
+        let symbol = seen(Selection::Q0rg(4), Tool::Select, Some("Symbol"));
+        assert_eq!(
+            follow_focus(Some(Tab::Stage), Some(&idle), &symbol),
+            Tab::Selection
+        );
+        // Picking a tool brings the tool's page forward.
+        let brush = seen(Selection::Q0rg(4), Tool::Brush, Some("Symbol"));
+        assert_eq!(
+            follow_focus(Some(Tab::Selection), Some(&symbol), &brush),
+            Tab::Tool
+        );
+        // Clicking away leaves the selection's page for the stage's.
+        let away = seen(Selection::None, Tool::Select, None);
+        assert_eq!(
+            follow_focus(Some(Tab::Selection), Some(&symbol), &away),
+            Tab::Stage
+        );
+        // A page picked by hand stays while nothing changes.
+        assert_eq!(follow_focus(Some(Tab::Tool), Some(&idle), &idle), Tab::Tool);
+    }
+
+    #[test]
+    fn drawing_does_not_pull_the_page_away_from_the_tool() {
+        let before = seen(Selection::None, Tool::Brush, None);
+        let drawn = seen(Selection::Paths(Vec::new()), Tool::Brush, Some("Shape"));
+        assert_eq!(
+            follow_focus(Some(Tab::Tool), Some(&before), &drawn),
+            Tab::Tool
         );
     }
 }

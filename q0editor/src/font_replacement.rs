@@ -51,7 +51,7 @@ impl FontReplacementDialog {
     pub fn show(&mut self, ctx: &egui::Context, importing: bool) -> Option<DialogAction> {
         let mut action = None;
         let mut open = true;
-        egui::Window::new("Replace missing fonts")
+        crate::dialog::Dialog::new("Replace missing fonts")
             .id(egui::Id::new(("missing_fonts", importing)))
             .open(&mut open)
             .collapsible(false)
@@ -62,7 +62,7 @@ impl FontReplacementDialog {
             .show(ctx, |ui| {
                 ui.label("These fonts are unavailable. Choose replacements - your text will be preserved.");
                 ui.add_space(10.0);
-                ui.checkbox(&mut self.use_one, "Use one font for all");
+                crate::ui::switch(ui, &mut self.use_one, "Use one font for all");
                 if self.use_one {
                     ui.horizontal(|ui| {
                         ui.label("Replace all with");

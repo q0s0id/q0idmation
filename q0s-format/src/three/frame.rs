@@ -50,17 +50,14 @@ impl SceneLook {
         q0rg_id: u16,
         frame: u16,
     ) -> Affine {
-        if self.orthographic
-            || q0rg_id != project.meta.entry_q0rg_id
-            || !project.runtime.camera.enabled
-        {
+        if self.orthographic || !project.camera_on(q0rg_id) {
             return Affine::IDENTITY;
         }
-        let state = project.camera_world_state_at(frame);
+        let state = project.camera_world_state_in(q0rg_id, frame);
         if state == project.default_camera_state() {
             return Affine::IDENTITY;
         }
-        let Some(remove_affine) = project.camera_affine_at(frame).inverse() else {
+        let Some(remove_affine) = project.camera_affine_in(q0rg_id, frame).inverse() else {
             return Affine::IDENTITY;
         };
         let offset = self.camera.target - self.camera.position;

@@ -1196,7 +1196,7 @@ fn render_hitbox(
     dim: Color32,
 ) {
     ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new("Hitbox").strong());
+        crate::ui::section_title(ui, "Hitbox");
         for shape in ColliderShape::ALL {
             edit.choice(ui, &mut body.shape, shape, shape_label(shape));
         }
@@ -1331,11 +1331,7 @@ impl Edit {
 
     pub(crate) fn color(&mut self, ui: &mut Ui, value: &mut Rgba) {
         let mut color = Color32::from_rgba_unmultiplied(value.r, value.g, value.b, value.a);
-        let response = egui::color_picker::color_edit_button_srgba(
-            ui,
-            &mut color,
-            egui::color_picker::Alpha::OnlyBlend,
-        );
+        let response = crate::color_picker::color_edit_button_srgba(ui, &mut color);
         if response.changed() {
             let [r, g, b, a] = color.to_srgba_unmultiplied();
             *value = Rgba { r, g, b, a };
@@ -1350,7 +1346,7 @@ pub fn render_window(app: &mut EditorApp, ctx: &Context) {
         return;
     }
     let mut open = true;
-    egui::Window::new("Physics")
+    crate::dialog::Dialog::new("Physics")
         .open(&mut open)
         .default_size([390.0, 620.0])
         .default_pos(ctx.screen_rect().right_top() + egui::vec2(-430.0, 80.0))
@@ -1673,7 +1669,7 @@ fn render_bake_controls(
     ui.horizontal_wrapped(|ui| {
         let has_selected = app.session.physics.selected_body.is_some();
         ui.add_enabled_ui(has_selected, |ui| {
-            ui.checkbox(&mut app.session.physics.only_selected, "Only the selected body")
+            crate::ui::switch(ui, &mut app.session.physics.only_selected, "Only the selected body")
                 .on_hover_text("Key just the body picked below; the others still bump into it, and liquids stay as they are");
         });
         if app.session.physics.mode == RigMode::Pro {

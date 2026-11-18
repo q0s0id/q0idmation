@@ -111,6 +111,7 @@ pub fn install(ctx: &Context) {
     style.spacing.indent = 16.0;
     style.spacing.scroll.bar_width = 6.0;
     style.spacing.scroll.bar_inner_margin = 3.0;
+    style.spacing.slider_rail_height = 5.0;
     style
         .text_styles
         .insert(egui::TextStyle::Heading, egui::FontId::proportional(18.0));

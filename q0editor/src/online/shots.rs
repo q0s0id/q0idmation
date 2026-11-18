@@ -624,7 +624,7 @@ fn timeline_controls_hold_their_position_when_room_avatars_appear() {
     let ctx = Context::default();
     crate::theme::install(&ctx);
     app.settings.theme.apply(&ctx);
-    for width in [1000.0, 1850.0] {
+    for width in [640.0, 1000.0, 1850.0] {
         let draw = |app: &mut EditorApp| {
             let mut output = egui::FullOutput::default();
             for _ in 0..5 {
@@ -653,8 +653,14 @@ fn timeline_controls_hold_their_position_when_room_avatars_appear() {
             .presence
             .clone_from(&presence);
         let with_people = draw(&mut app);
-        for label in ["loop range", "Edit frames"] {
-            let location = find_text(&alone, label).unwrap_or_else(|| panic!("missing {label}"));
+        // The bar's buttons stay put, and so do the layers: faces never take
+        // a row of their own out of the timeline.
+        for label in ["loop range", "Edit frames", "sky"] {
+            // A narrow bar leaves some buttons out; the layer is always there.
+            let Some(location) = find_text(&alone, label) else {
+                assert_ne!(label, "sky", "missing the layer at {width}");
+                continue;
+            };
             assert_eq!(
                 find_text(&with_people, label),
                 Some(location),

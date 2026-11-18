@@ -1137,7 +1137,7 @@ fn render_plugin_windows(app: &mut EditorApp, ctx: &Context) {
         }
         let name = app.plugins.list[index].meta.name.clone();
         let mut open = true;
-        egui::Window::new(&title)
+        crate::dialog::Dialog::new(&title)
             .id(egui::Id::new(("plugin-window", &id, &title)))
             .open(&mut open)
             .resizable(true)
@@ -1283,7 +1283,7 @@ pub(crate) fn menu(app: &mut EditorApp, ui: &mut Ui) {
                 let Some(title) = title else { continue };
                 let key = (id.clone(), title.clone());
                 let mut open = app.plugins.open_windows.contains(&key);
-                if ui.checkbox(&mut open, title).changed() {
+                if crate::ui::switch(ui, &mut open, title).changed() {
                     if open {
                         app.plugins.open_windows.insert(key);
                     } else {

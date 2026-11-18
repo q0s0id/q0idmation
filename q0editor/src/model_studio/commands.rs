@@ -609,7 +609,28 @@ pub fn paint(studio: &mut ModelStudio, part: usize, face: usize) {
         return;
     }
     ops::set_material(mesh, &faces, material);
+    lay_texture(studio, part, &faces);
     studio.touch();
+}
+
+/// Lays the current material's texture on `faces` of `part` the way the
+/// material panel says, when it says to.
+pub fn lay_texture(studio: &mut ModelStudio, part: usize, faces: &BTreeSet<usize>) {
+    let Some(fit) = studio.face_fit else {
+        return;
+    };
+    let aspect = studio
+        .model
+        .materials
+        .get(studio.material)
+        .and_then(|material| material.texture)
+        .and_then(|texture| studio.model.textures.get(usize::from(texture)))
+        .map_or(1.0, |texture| {
+            texture.width.max(1) as f32 / texture.height.max(1) as f32
+        });
+    if let Some(mesh) = studio.model.meshes.get_mut(part) {
+        ops::fit_face_uvs(mesh, faces, fit, aspect);
+    }
 }
 
 /// Adds a bone from `head` to `tail` (model space, rest pose) under
