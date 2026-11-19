@@ -2232,6 +2232,10 @@ struct RawFillCandidate {
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct RawFillStyle {
     color: Rgba,
+    /// A gradient is its own paint. Its solid colour is only the fallback
+    /// under it, so black paint must not join a gradient that falls back to
+    /// black (the join used to repaint the whole gradient flat black).
+    gradient: bool,
     stroke: Option<q0s_format::v2::Stroke>,
     material: Option<VectorMaterial>,
     fragmented: bool,
@@ -2241,6 +2245,7 @@ fn raw_fill_style(project: &ProjectV2, candidate: &RawFillCandidate) -> RawFillS
     let appearance = project.asset_appearances.get(&candidate.asset_id);
     RawFillStyle {
         color: candidate.color,
+        gradient: appearance.is_some_and(|appearance| appearance.fill_gradient.is_some()),
         stroke: candidate.stroke,
         material: appearance
             .map(|appearance| appearance.material)
@@ -2359,6 +2364,7 @@ pub(crate) fn paint_raw_fill(
         collect_raw_fill_candidates(&app.state.project, q0rg_id, layer_id, frame, false);
     let requested_style = RawFillStyle {
         color: settings.color,
+        gradient: false,
         stroke: None,
         material: requested_material,
         fragmented: false,
@@ -2965,46 +2971,7 @@ pub(crate) fn part_raw_fills_along_lines(
     frame: u16,
     lines: &[(Vec<Vec2>, f32)],
 ) -> BTreeSet<u16> {
-    let mut zone = MultiPolygon::<f64>(Vec::new());
-    for (points, width) in lines {
-        if points.len() < 2 {
-            continue;
-        }
-        // A line that stops on the edge of a fill parts it too: its ends
-        // reach on under its own cap.
-        let reach = (width * 0.5).max(0.5);
-        let extend = |end: Vec2, before: Vec2| {
-            let (dx, dy) = (end.x - before.x, end.y - before.y);
-            let length = dx.hypot(dy);
-            if length <= 1.0e-6 {
-                end
-            } else {
-                Vec2::new(end.x + dx / length * reach, end.y + dy / length * reach)
-            }
-        };
-        let mut coords: Vec<Vec2> = points.clone();
-        let closed = points.len() > 2 && points.first() == points.last();
-        if !closed {
-            let last = coords.len() - 1;
-            coords[0] = extend(points[0], points[1]);
-            coords[last] = extend(points[last], points[last - 1]);
-        }
-        let line = LineString::new(
-            coords
-                .iter()
-                .map(|point| Coord {
-                    x: f64::from(point.x),
-                    y: f64::from(point.y),
-                })
-                .collect(),
-        );
-        let band = line.buffer(PARTING_HALF);
-        zone = if zone.0.is_empty() {
-            band
-        } else {
-            zone.union(&band)
-        };
-    }
+    let zone = parting_zone(lines, PARTING_HALF, true);
     if zone.0.is_empty() {
         return BTreeSet::new();
     }
@@ -3041,6 +3008,119 @@ pub(crate) fn part_raw_fills_along_lines(
             updates.push((candidate.asset_id, MultiPolygon(kept)));
         }
     }
+    write_raw_fill_updates(project, q0rg_id, layer_id, frame, updates)
+}
+
+/// Closes the hairline that deleted `lines` took out of the fills they
+/// parted, so deleting a line leaves the fill whole again, as in Animate.
+/// Only the cut is closed: the pieces on either side are grown over it and
+/// shrunk back, and only what lies under the deleted lines is kept, less
+/// the cuts of the `remaining` lines, which keep their pieces apart.
+/// The caller has made the keyframe. Returns the fills that changed.
+pub(crate) fn heal_raw_fills_along_lines(
+    project: &mut ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    frame: u16,
+    lines: &[(Vec<Vec2>, f32)],
+    remaining: &[(Vec<Vec2>, f32)],
+) -> BTreeSet<u16> {
+    let mut zone = parting_zone(lines, PARTING_HALF * 3.0, true);
+    if zone.0.is_empty() {
+        return BTreeSet::new();
+    }
+    // Only along their length: a stub left outside the fill must not reach
+    // into it under its cap and keep a notch of the cut open.
+    let kept_cuts = parting_zone(remaining, PARTING_HALF, false);
+    if !kept_cuts.0.is_empty() {
+        zone = zone.difference(&kept_cuts);
+    }
+    let reach = PARTING_HALF * 2.0;
+    let mut updates = Vec::new();
+    for candidate in collect_raw_fill_candidates(project, q0rg_id, layer_id, frame, false) {
+        #[cfg(feature = "appearance-mask-eraser")]
+        if project.asset_appearances.contains_key(&candidate.asset_id) {
+            continue;
+        }
+        let (near, far): (Vec<Polygon<f64>>, Vec<Polygon<f64>>) = candidate
+            .geometry
+            .0
+            .iter()
+            .cloned()
+            .partition(|polygon| polygon.intersects(&zone));
+        if near.len() < 2 {
+            continue;
+        }
+        let near = MultiPolygon(near);
+        let bridge = near.buffer(reach).buffer(-reach).intersection(&zone);
+        let healed = near.union(&bridge);
+        // Nothing joined up: the pieces were moved apart since, or were
+        // never one fill.
+        if healed.0.len() >= near.0.len() {
+            continue;
+        }
+        let mut kept = far;
+        kept.extend(healed.0);
+        updates.push((candidate.asset_id, MultiPolygon(kept)));
+    }
+    write_raw_fill_updates(project, q0rg_id, layer_id, frame, updates)
+}
+
+/// The band each of `lines` covers, `half` either side of it, with its open
+/// ends reaching on under their caps when `under_caps`.
+fn parting_zone(lines: &[(Vec<Vec2>, f32)], half: f64, under_caps: bool) -> MultiPolygon<f64> {
+    let mut zone = MultiPolygon::<f64>(Vec::new());
+    for (points, width) in lines {
+        if points.len() < 2 {
+            continue;
+        }
+        // A line that stops on the edge of a fill parts it too: its ends
+        // reach on under its own cap.
+        let reach = (width * 0.5).max(0.5);
+        let extend = |end: Vec2, before: Vec2| {
+            let (dx, dy) = (end.x - before.x, end.y - before.y);
+            let length = dx.hypot(dy);
+            if length <= 1.0e-6 {
+                end
+            } else {
+                Vec2::new(end.x + dx / length * reach, end.y + dy / length * reach)
+            }
+        };
+        let mut coords: Vec<Vec2> = points.clone();
+        let closed = points.len() > 2 && points.first() == points.last();
+        if !closed && under_caps {
+            let last = coords.len() - 1;
+            coords[0] = extend(points[0], points[1]);
+            coords[last] = extend(points[last], points[last - 1]);
+        }
+        let line = LineString::new(
+            coords
+                .iter()
+                .map(|point| Coord {
+                    x: f64::from(point.x),
+                    y: f64::from(point.y),
+                })
+                .collect(),
+        );
+        let band = line.buffer(half);
+        zone = if zone.0.is_empty() {
+            band
+        } else {
+            zone.union(&band)
+        };
+    }
+    zone
+}
+
+/// Writes new surfaces for raw fills, copying fills shared with other
+/// keyframes first. Returns the fills that changed.
+fn write_raw_fill_updates(
+    project: &mut ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    frame: u16,
+    updates: Vec<(u16, MultiPolygon<f64>)>,
+) -> BTreeSet<u16> {
     if updates.is_empty() {
         return BTreeSet::new();
     }

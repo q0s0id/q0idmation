@@ -407,6 +407,8 @@ pub struct EditorApp {
     pending_clipboard_bitmap: Option<crate::system_clipboard::ClipboardBitmap>,
     editor_clipboard: Option<EditorClipboard>,
     native_paste_key_down: bool,
+    /// The editor's own mouse pointer and number-drag wrapping.
+    pub(crate) cursor: crate::cursors::CursorRuntime,
     audio_playback: Option<crate::audio::EditorAudioPlayback>,
     external_open_inbox: Option<crate::single_instance::ExternalOpenInbox>,
     /// Distinct video buffers in the project after the last sharing pass.
@@ -1508,6 +1510,7 @@ impl Default for EditorApp {
             pending_clipboard_bitmap: None,
             editor_clipboard: None,
             native_paste_key_down: false,
+            cursor: Default::default(),
             audio_playback: None,
             external_open_inbox: None,
             video_buffers: 0,
@@ -5911,13 +5914,16 @@ impl EditorApp {
                     return;
                 }
                 let before = self.state.project.clone();
+                // The copy starts exactly on the original; the drag that
+                // follows is what moves it. Duplicate's nudge would leave it
+                // riding off the pointer.
                 let result = crate::selection_edit::paste_payload(
                     &mut self.state.project,
                     self.session.current_q0rg_id,
                     self.session.current_layer_id,
                     self.session.current_frame,
                     &payload,
-                    q0s_format::v2::Vec2::new(10.0, 10.0),
+                    q0s_format::v2::Vec2::new(0.0, 0.0),
                 );
                 self.history.snapshot_with_session(&before, &self.session);
                 self.session.selection = crate::selection_edit::selection_from_paste(result);
@@ -13565,7 +13571,13 @@ impl EditorApp {
         // and registration origin. Pose-dependent bounds must never rescale or
         // recenter it: an open hand and a fist naturally have different bounds.
         let transform = active.transform;
-        let selection_before = self.session.selection.clone();
+        let old_center = crate::tools::placement_local_center(
+            &self.state.project,
+            dialog.parent_q0rg_id,
+            dialog.layer_id,
+            placement_idx,
+            dialog.frame,
+        );
         self.history
             .snapshot_with_session(&self.state.project, &self.session);
         let Some(new_idx) = crate::tools::materialize_placement_keyframe_for_edit(
@@ -13599,6 +13611,42 @@ impl EditorApp {
         placement.target = Target::Q0rg(replacement_id);
         placement.transform = transform;
         placement.fx = fx;
+        // Each symbol is drawn around its own origin, so keeping the old
+        // origin dropped the new one off to the side. Its middle goes where
+        // the old one's was instead, and a moved anchor keeps its place
+        // relative to that middle. (Variants, which share an origin, swap
+        // through `swap_variant` and keep it.)
+        let new_center = crate::tools::placement_local_center(
+            &self.state.project,
+            dialog.parent_q0rg_id,
+            dialog.layer_id,
+            new_idx,
+            dialog.frame,
+        );
+        if let (Some(old), Some(new)) = (old_center, new_center) {
+            let affine = q0s_format::transform::Affine::from_transform(transform);
+            let (was, now) = (affine.apply(old), affine.apply(new));
+            if let Some(placement) = self
+                .state
+                .project
+                .q0rgs
+                .iter_mut()
+                .find(|q0rg| q0rg.q0rg_id == dialog.parent_q0rg_id)
+                .and_then(|q0rg| {
+                    q0rg.layers
+                        .iter_mut()
+                        .find(|layer| layer.layer_id == dialog.layer_id)
+                })
+                .and_then(|layer| layer.placements.get_mut(new_idx))
+            {
+                placement.transform.tx += was.x - now.x;
+                placement.transform.ty += was.y - now.y;
+                if let Some(pivot) = placement.pivot.as_mut() {
+                    pivot.x += new.x - old.x;
+                    pivot.y += new.y - old.y;
+                }
+            }
+        }
 
         self.state.mark_dirty();
         // Only the placement target changed. Revision-scoped frame/bounds/FX
@@ -13609,11 +13657,9 @@ impl EditorApp {
             layer_id: dialog.layer_id,
             placement_idx: new_idx,
         };
-        rebind_transform_pivot(
-            &mut self.session.transform_pivot,
-            &selection_before,
-            &self.session.selection,
-        );
+        // An anchor parked on the stage would stay behind; the placement's
+        // own (moved above) or the new symbol's middle is the one to show.
+        self.session.transform_pivot = None;
         let replacement_name = self
             .state
             .project
@@ -14172,6 +14218,7 @@ impl App for EditorApp {
     }
 
     fn raw_input_hook(&mut self, ctx: &Context, raw_input: &mut egui::RawInput) {
+        self.cursor.rewrite_input(raw_input);
         // Sized from the whole screen, before a soft keyboard takes its share.
         #[cfg(target_os = "android")]
         crate::ui::apply_compact_zoom(ctx, raw_input.screen_rect);
@@ -14232,6 +14279,9 @@ impl App for EditorApp {
             // Every window of this frame has been shown: fade out the ones
             // that were closed.
             crate::dialog::fade_closed(ctx);
+            // Last, so the pointer is the one the frame ended on.
+            self.cursor
+                .finish_frame(ctx, &self.settings.cursors, &self.settings.theme);
         }));
         if let Err(panic) = result {
             // The editor is going down. Put unsaved work on disk first; a
@@ -14291,6 +14341,7 @@ impl EditorApp {
             .record(crate::perf::PerfSpan::AppStartup, startup_started.elapsed());
 
         let ingress_started = Instant::now();
+        self.session.sync_fill_with_brushes();
         crate::sweeper::take_keys(self, ctx);
         crate::plugins::update(self, ctx);
         self.poll_external_open_requests(ctx);

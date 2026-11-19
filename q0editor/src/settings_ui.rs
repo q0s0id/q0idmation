@@ -6,6 +6,7 @@
 use egui::{pos2, vec2, Context, Id, Margin, Rect, Response, RichText, Rounding, Sense, Ui};
 
 use crate::app::{Action, EditorApp};
+use crate::cursors::{CursorKind, CursorSettings};
 use crate::settings::{ColorRgb, PersistFontSize, Theme};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -68,7 +69,7 @@ impl Page {
                 "physics particles light lights extra tools vsync vertical sync display stutter refresh restart"
             }
             Self::Appearance => {
-                "theme colour color palette preset q7s gradient canvas photo stage border background onion tint syntax accent dark light window"
+                "theme colour color palette preset q7s gradient canvas photo stage border background onion tint syntax accent dark light window cursor cursors pointer mouse arrow animated animation wrap number drag blender"
             }
             Self::Drawing => "arrow keys nudge move selection shift pencil smoothing brush eraser",
             Self::Timeline => {
@@ -535,10 +536,137 @@ fn appearance(app: &mut EditorApp, ui: &mut Ui) {
             color_row(ui, "Gutter background", &mut t.syntax_gutter_bg);
             color_row(ui, "Gutter text", &mut t.syntax_gutter_fg);
         });
+    cursors(app, ui, &mut t);
     if t != app.settings.theme {
         app.settings.theme = t;
         app.settings.theme.apply(&ctx);
         app.settings.save();
+    }
+}
+
+/// The editor's own pointers: on or off, how they move, their colours (which
+/// live in the theme) and a switch with a live preview for each.
+fn cursors(app: &mut EditorApp, ui: &mut Ui, t: &mut Theme) {
+    group(
+        ui,
+        "Cursors",
+        "The editor draws its own pointers in your theme's colours. Hover a preview to try that pointer.",
+    );
+    let prefs = &mut app.settings.cursors;
+    let mut changed = toggle_row(
+        ui,
+        "Custom cursors",
+        "Off, every pointer is the system's own.",
+        &mut prefs.custom,
+    );
+    ui.add_enabled_ui(prefs.custom, |ui| {
+        changed |= toggle_row(
+            ui,
+            "Animation",
+            "Pointers play when they appear, when you press and as you move, then rest, so an idle editor draws nothing extra. Off, they hold still.",
+            &mut prefs.animated,
+        );
+        let (_, size) = row(ui, "Size", "1 is about the size of a system cursor.", |ui| {
+            ui.add(egui::Slider::new(&mut prefs.size, CursorSettings::SIZE_RANGE).fixed_decimals(2))
+        });
+        changed |= settled(&size);
+    });
+    changed |= toggle_row(
+        ui,
+        "Wrap number drags",
+        "Drag a number field into the window's edge and the pointer comes back from the opposite edge, so the drag never runs out of room. Windows only.",
+        &mut prefs.wrap_number_drags,
+    );
+
+    ui.add_space(6.0);
+    ui.label(RichText::new("Colours").strong());
+    cursor_colors(ui, t);
+
+    ui.add_space(6.0);
+    ui.label(RichText::new("Pointers").strong());
+    note(
+        ui,
+        "Each one on its own. Switched off, it falls back to the system cursor.",
+    );
+    let theme = t.clone();
+    ui.add_enabled_ui(prefs.custom, |ui| {
+        changed |= cursor_rows(ui, &CursorKind::STATES, prefs, &theme);
+    });
+
+    ui.add_space(6.0);
+    ui.label(RichText::new("Action cursors").strong());
+    note(
+        ui,
+        "The editor's own, for what a click or drag will do right there. Switched off, the plain pointer for that spot shows instead.",
+    );
+    ui.add_enabled_ui(prefs.custom, |ui| {
+        changed |= cursor_rows(ui, &CursorKind::ACTIONS, prefs, &theme);
+    });
+    if changed {
+        save_or_report(app, "the cursor settings");
+    }
+}
+
+/// A switch and a live preview for each of `kinds`. True when one flipped.
+fn cursor_rows(
+    ui: &mut Ui,
+    kinds: &[CursorKind],
+    prefs: &mut CursorSettings,
+    theme: &Theme,
+) -> bool {
+    let mut changed = false;
+    for &kind in kinds {
+        let mut on = prefs.state_on(kind);
+        let (_, flipped) = row(ui, kind.label(), kind.hint(), |ui| {
+            let switch = crate::ui::toggle_switch(ui, &mut on).on_hover_text(kind.hint());
+            crate::cursors::preview(ui, kind, prefs, theme).on_hover_text(kind.hint());
+            switch.changed()
+        });
+        if flipped {
+            prefs.set_state(kind, on);
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// The pointer colours. They follow the palette until one is changed.
+fn cursor_colors(ui: &mut Ui, t: &mut Theme) {
+    let pinned = t.cursors.is_some();
+    let mut colors = t.cursor_colors();
+    let before = colors;
+    note(
+        ui,
+        if pinned {
+            "Your own colours, saved with the theme and in .q7s files."
+        } else {
+            "Following the palette above. Change one to pick your own."
+        },
+    );
+    color_row(ui, "Body", &mut colors.fill);
+    color_row(ui, "Outline", &mut colors.outline);
+    color_row(ui, "Accent", &mut colors.accent);
+    row(
+        ui,
+        "Shadow",
+        "How dark the shadow under a pointer is.",
+        |ui| {
+            ui.add(egui::Slider::new(&mut colors.shadow, 0..=100).suffix("%"));
+        },
+    );
+    if colors != before {
+        t.cursors = Some(colors);
+    }
+    if pinned {
+        row(ui, "Palette", "", |ui| {
+            if ui
+                .button("Follow the palette")
+                .on_hover_text("Drop your own pointer colours and take them from the theme again")
+                .clicked()
+            {
+                t.cursors = None;
+            }
+        });
     }
 }
 

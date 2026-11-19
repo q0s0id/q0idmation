@@ -1762,6 +1762,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                     });
             if library_payload.is_some() {
                 if let Some((layer_id, frame)) = library_drop_cell {
+                    crate::cursors::request(ui.ctx(), crate::cursors::CursorKind::LibraryDrop);
                     if let Some(row) = layer_ids
                         .iter()
                         .position(|candidate| *candidate == layer_id)
@@ -2367,6 +2368,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                 (app.session.timeline_frame_drag, frame_drop_cell)
             {
                 if drag.q0rg_id == q0rg_id {
+                    crate::cursors::request(ui.ctx(), crate::cursors::CursorKind::FrameDrag);
                     if let Some(target_row) = layer_ids
                         .iter()
                         .position(|layer_id| *layer_id == target_layer_id)

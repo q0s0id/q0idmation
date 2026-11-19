@@ -869,7 +869,8 @@ pub fn cut_line_at_crossings(
 const MAX_SETTLED: usize = 256;
 
 /// A line's stage points and stroke width.
-type StageLine = (Vec<Vec2>, f32);
+/// A line on the stage, and its stroke width.
+pub(crate) type StageLine = (Vec<Vec2>, f32);
 
 /// A line that was just drawn, moved or reshaped, as it is now.
 struct Edited {
@@ -877,6 +878,38 @@ struct Edited {
     path: VPath,
     /// Its stage points and stroke width, to part fills along.
     stage: StageLine,
+}
+
+/// Where the line `reference` names lies on the stage, and its width: what
+/// fills are parted along. None when it is not a plain line.
+pub(crate) fn stage_line(project: &ProjectV2, reference: PathRef) -> Option<(Vec<Vec2>, f32)> {
+    edited_line(project, reference).map(|line| line.stage)
+}
+
+/// Every plain line on `layer_id` at `frame`, on the stage.
+pub(crate) fn stage_lines(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    frame: u16,
+) -> Vec<(Vec<Vec2>, f32)> {
+    drawings(project, q0rg_id, layer_id, frame)
+        .into_iter()
+        .flat_map(|(placement_idx, asset_id, _)| {
+            let count = vector(project, asset_id).map_or(0, |vector| vector.paths.len());
+            (0..count).filter_map(move |path_idx| {
+                stage_line(
+                    project,
+                    PathRef {
+                        q0rg_id,
+                        layer_id,
+                        placement_idx,
+                        path_idx,
+                    },
+                )
+            })
+        })
+        .collect()
 }
 
 fn edited_line(project: &ProjectV2, reference: PathRef) -> Option<Edited> {

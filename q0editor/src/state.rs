@@ -658,6 +658,21 @@ impl Handle {
     }
 }
 
+/// The turned or slanted box a transform left on a selection of several
+/// things or of raw paint, whose own bounds are always upright. It lasts
+/// while the selection stays the same and only moves as a whole.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupFrame {
+    pub selection: Selection,
+    /// Stage from the box's own space.
+    pub affine: Affine,
+    /// The box in its own space.
+    pub bounds: (f32, f32, f32, f32),
+    /// The selection's upright bounds when the box was first looked at
+    /// after the transform, to tell a move from any other change.
+    pub content_bounds: std::cell::Cell<Option<(f32, f32, f32, f32)>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransformEdge {
     Top,
@@ -1147,6 +1162,16 @@ pub struct Session {
     pub fill_gradient: Option<crate::paint::PaintGradient>,
     /// The brushes' gradient when they paint one.
     pub brush_gradient: Option<crate::paint::PaintGradient>,
+    /// The colour the fill and both brushes last agreed on. See
+    /// [`Session::sync_fill_with_brushes`].
+    pub fill_synced: Option<Rgba>,
+    /// See [`GroupFrame`].
+    pub group_frame: Option<GroupFrame>,
+    /// The box a group or raw transform in progress started from: stage
+    /// from box space, and the box in its own space.
+    pub group_frame_drag: Option<(Affine, (f32, f32, f32, f32))>,
+    /// Where that box is now, stage from box space.
+    pub group_frame_live: Option<Affine>,
     pub brush: BrushSettings,
     pub brush_mode: BrushMode,
     pub advanced_brush: AdvancedBrushSettings,
@@ -1239,6 +1264,42 @@ pub struct EditInPlaceContext {
 }
 
 impl Session {
+    /// One fill colour for every tool, as in Animate: the brushes paint with
+    /// the fill, and a colour given to the fill (swatches, the eyedropper,
+    /// Properties) or to a brush is the other's too. Whichever moved away
+    /// from the colour they last agreed on wins. A fill of none keeps its
+    /// colour put away, and the brushes still paint with that.
+    pub fn sync_fill_with_brushes(&mut self) {
+        let fill = self.fill_color.unwrap_or(self.fill_kept);
+        let Some(agreed) = self.fill_synced else {
+            self.brush.color = fill;
+            self.advanced_brush.color = fill;
+            self.fill_synced = Some(fill);
+            return;
+        };
+        let color = if fill != agreed {
+            fill
+        } else if self.brush.color != agreed {
+            self.brush.color
+        } else if self.advanced_brush.color != agreed {
+            self.advanced_brush.color
+        } else {
+            return;
+        };
+        self.brush.color = color;
+        self.advanced_brush.color = color;
+        if self.fill_color.is_some() {
+            self.fill_color = Some(color);
+        }
+        if fill != color {
+            // A brush colour that became the fill replaces a fill gradient,
+            // as picking a plain colour for the fill does.
+            self.fill_gradient = None;
+        }
+        self.fill_kept = color;
+        self.fill_synced = Some(color);
+    }
+
     pub fn history_pivot_state(&self) -> HistoryPivotState {
         HistoryPivotState {
             q0rg_id: self.current_q0rg_id,
@@ -1410,6 +1471,10 @@ impl Session {
             fill_kept: DEFAULT_FILL,
             fill_gradient: None,
             brush_gradient: None,
+            fill_synced: None,
+            group_frame: None,
+            group_frame_drag: None,
+            group_frame_live: None,
             brush: BrushSettings::default(),
             brush_mode: BrushMode::Classic,
             advanced_brush: AdvancedBrushSettings::default(),

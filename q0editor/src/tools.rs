@@ -248,6 +248,9 @@ fn handle_tool(
             Tool::Select | Tool::Lasso | Tool::Subselect | Tool::Hand
         )
     {
+        if response.hovered() {
+            crate::cursors::request(ctx, crate::cursors::CursorKind::Locked);
+        }
         if response.clicked() || response.drag_started() {
             app.session.status = "folders cannot contain artwork or keyframes".to_string();
         }
@@ -258,6 +261,9 @@ fn handle_tool(
         Tool::Select | Tool::Lasso | Tool::Subselect | Tool::Hand | Tool::Eyedropper | Tool::Rig
     );
     if edits_current_layer && (!current_layer_is_visible || current_layer_is_locked) {
+        if response.hovered() {
+            crate::cursors::request(ctx, crate::cursors::CursorKind::Locked);
+        }
         if response.clicked() || response.drag_started() {
             app.session.status = if !current_layer_is_visible {
                 "layer is hidden"
@@ -335,7 +341,18 @@ fn handle_tool(
     // (so menubar / panels keep their default cursor).
     if response.hovered() {
         if let Some(icon) = pick_cursor(app, response, view) {
-            ctx.set_cursor_icon(icon);
+            let kind = action_cursor(app, response, view)
+                .or_else(|| drawn_stage_cursor(app.session.current_tool, icon));
+            match kind {
+                Some(kind) => {
+                    let sample = app
+                        .session
+                        .fill_color
+                        .map(|c| egui::Color32::from_rgb(c.r, c.g, c.b));
+                    crate::cursors::request_with_sample(ctx, kind, sample);
+                }
+                None => ctx.set_cursor_icon(icon),
+            }
         }
     }
 
@@ -482,7 +499,6 @@ pub fn draw_overlay(app: &mut EditorApp, response: &Response, painter: &Painter,
     crate::snap::paint_hint(app, painter, view, response.ctx.frame_nr());
     draw_brush_cursor(app, painter, view);
     draw_eraser_cursor(app, painter, view);
-    draw_transform_cursor(app, response, painter, view);
     draw_line_ends(app, response, painter, view);
     if app.session.current_tool == Tool::Rig {
         crate::rigging::paint_stage_overlay(app, painter, view);
@@ -1700,19 +1716,26 @@ fn pick_cursor(
     {
         return Some(resize_cursor_for_handle(handle));
     }
-    if matches!(
-        app.session.tool_state,
+    match &app.session.tool_state {
+        ToolState::DraggingTransformPivot { .. } => {
+            return Some(drawn_cursor(
+                &response.ctx,
+                crate::cursors::CursorKind::Pivot,
+            ));
+        }
         ToolState::DraggingRawRotate { .. }
-            | ToolState::DraggingPlacementRotate { .. }
-            | ToolState::DraggingRawSkew { .. }
-            | ToolState::DraggingPlacementSkew { .. }
-            | ToolState::DraggingGroup {
-                operation: GroupTransformOperation::Rotate { .. }
-                    | GroupTransformOperation::Skew { .. },
-                ..
-            }
-    ) {
-        return Some(CursorIcon::None);
+        | ToolState::DraggingPlacementRotate { .. }
+        | ToolState::DraggingGroup {
+            operation: GroupTransformOperation::Rotate { .. },
+            ..
+        } => return Some(ROTATE_CURSOR),
+        ToolState::DraggingRawSkew { edge, .. }
+        | ToolState::DraggingPlacementSkew { edge, .. }
+        | ToolState::DraggingGroup {
+            operation: GroupTransformOperation::Skew { edge, .. },
+            ..
+        } => return Some(skew_cursor(*edge)),
+        _ => {}
     }
     if matches!(
         app.session.tool_state,
@@ -1758,6 +1781,114 @@ fn pick_cursor(
     })
 }
 
+/// Pointers for what a press or drag will do right here, beyond the tool's
+/// own: closing a pen path, cutting, snapping.
+fn action_cursor(
+    app: &EditorApp,
+    response: &Response,
+    view: &StageView,
+) -> Option<crate::cursors::CursorKind> {
+    use crate::cursors::CursorKind;
+    let tool = app.session.current_tool;
+    if let (Tool::Pen, ToolState::PenDrawing { anchors, .. }, Some(hover)) =
+        (tool, &app.session.tool_state, response.hover_pos())
+    {
+        if anchors.len() >= 2
+            && stage_to_screen(anchors[0].point, view).distance(hover) <= PEN_CLOSE_RADIUS
+        {
+            return Some(CursorKind::PenClose);
+        }
+    }
+    if tool == Tool::Knife && matches!(app.session.tool_state, ToolState::KnifeDrawing { .. }) {
+        return Some(CursorKind::KnifeCut);
+    }
+    let drawing = matches!(tool, Tool::Pen | Tool::Line | Tool::Rectangle | Tool::Oval);
+    let moving = matches!(
+        app.session.tool_state,
+        ToolState::DraggingPlacement { .. }
+            | ToolState::DraggingPath { .. }
+            | ToolState::DraggingPaths { .. }
+            | ToolState::DraggingGroup {
+                operation: GroupTransformOperation::Move { .. },
+                ..
+            }
+    );
+    if app.settings.aids.snap
+        && (drawing || moving)
+        && crate::snap::snapped_in(response.ctx.frame_nr())
+    {
+        return Some(CursorKind::Snap);
+    }
+    None
+}
+
+/// Ask for a drawn pointer and hand back the system cursor that stands for
+/// it, for the functions that pick the stage's cursor.
+fn drawn_cursor(ctx: &Context, kind: crate::cursors::CursorKind) -> egui::CursorIcon {
+    crate::cursors::request(ctx, kind);
+    kind.system()
+}
+
+/// Whether an Alt-drag from `point` copies the selection: it has to start on
+/// a selected object.
+fn alt_drag_copies(app: &mut EditorApp, point: Vec2, hit_slop: HitSlop) -> bool {
+    let selected_objects =
+        crate::selection_edit::selected_object_refs(&app.state.project, &app.session.selection);
+    hit_test_frontmost_placement_with_slop(
+        &app.state.project,
+        &mut app.textures,
+        app.session.current_q0rg_id,
+        app.session.current_frame,
+        point,
+        hit_slop,
+    )
+    .is_some_and(|(layer_id, placement_idx)| {
+        selected_objects.contains(&PlacementRef {
+            q0rg_id: app.session.current_q0rg_id,
+            layer_id,
+            placement_idx,
+        })
+    })
+}
+
+/// The editor's own pointer for a stage cursor, where it has one beyond the
+/// system cursor: rotate and skew zones, and the drawing tools.
+fn drawn_stage_cursor(tool: Tool, icon: egui::CursorIcon) -> Option<crate::cursors::CursorKind> {
+    use crate::cursors::CursorKind;
+    use egui::CursorIcon;
+    Some(match icon {
+        ROTATE_CURSOR => CursorKind::Rotate,
+        CursorIcon::ResizeColumn => CursorKind::SkewH,
+        CursorIcon::ResizeRow => CursorKind::SkewV,
+        CursorIcon::Crosshair => match tool {
+            Tool::Pen => CursorKind::Pen,
+            Tool::Pencil => CursorKind::Pencil,
+            Tool::Line => CursorKind::Line,
+            Tool::Rectangle => CursorKind::Rect,
+            Tool::Oval => CursorKind::Oval,
+            Tool::Lasso => CursorKind::Lasso,
+            Tool::Bucket => CursorKind::Bucket,
+            Tool::Eyedropper => CursorKind::Eyedropper,
+            Tool::Knife => CursorKind::Knife,
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
+/// Rotating the transform box. The same system cursor stands for rotating
+/// cameras, lights and physics bodies.
+const ROTATE_CURSOR: egui::CursorIcon = egui::CursorIcon::Alias;
+
+/// Skewing along an edge. Column and row resize keep it apart from the plain
+/// resize cursors of the side handles.
+fn skew_cursor(edge: TransformEdge) -> egui::CursorIcon {
+    match edge {
+        TransformEdge::Top | TransformEdge::Bottom => egui::CursorIcon::ResizeColumn,
+        TransformEdge::Left | TransformEdge::Right => egui::CursorIcon::ResizeRow,
+    }
+}
+
 fn resize_cursor_for_handle(handle: Handle) -> egui::CursorIcon {
     use egui::CursorIcon;
     match handle {
@@ -1789,14 +1920,14 @@ fn selected_transform_hit(
             | Selection::RawParts { .. }
     ) {
         if let Some(bounds) = selection_transform_bounds_scoped(app) {
-            if let Some(hit) = hit_test_raw_transform(bounds, view, cursor_screen) {
+            if let Some(hit) = hit_test_group_transform(app, bounds, view, cursor_screen) {
                 return Some(hit);
             }
         }
     }
     if let Some(refs) = selection_raw_path_refs(&app.session.selection) {
         if let Some(bounds) = raw_path_refs_ui_bounds(&app.state.project, &refs) {
-            if let Some(hit) = hit_test_raw_transform(bounds, view, cursor_screen) {
+            if let Some(hit) = hit_test_group_transform(app, bounds, view, cursor_screen) {
                 return Some(hit);
             }
         }
@@ -1853,16 +1984,20 @@ fn select_cursor(
     response: &Response,
     view: &StageView,
 ) -> Option<egui::CursorIcon> {
+    use crate::cursors::CursorKind;
     use egui::CursorIcon;
     let cursor_screen = response.hover_pos()?;
     let hit_slop = HitSlop::for_scale(view.effective_scale());
 
-    if response.ctx.input(|i| i.modifiers.alt) && selected_pivot_hit(app, view, cursor_screen) {
-        return Some(CursorIcon::Move);
+    let (shift, alt) = response.ctx.input(|i| (i.modifiers.shift, i.modifiers.alt));
+    if alt && selected_pivot_hit(app, view, cursor_screen) {
+        return Some(drawn_cursor(&response.ctx, CursorKind::Pivot));
     }
     // Transform handles take priority over body hit so the user can grab
     // a handle that overlaps a body pixel without surprise.
-    if let Some(hit) = selected_transform_hit(app, view, cursor_screen) {
+    let hit = selected_transform_hit(app, view, cursor_screen);
+    note_frame_hover(&response.ctx, hit);
+    if let Some(hit) = hit {
         return Some(cursor_for_transform_hit(hit));
     }
 
@@ -1912,6 +2047,16 @@ fn select_cursor(
         );
         hit
     };
+    if alt && alt_drag_copies(app, cursor_stage, hit_slop) {
+        return Some(drawn_cursor(&response.ctx, CursorKind::CopyDrag));
+    }
+    if shift && selected_body_hit {
+        // Shift-click toggles: on the selection it takes the thing out.
+        return Some(drawn_cursor(&response.ctx, CursorKind::SelectRemove));
+    }
+    if shift && (raw_hover_hit || selectable_placement_hit) {
+        return Some(drawn_cursor(&response.ctx, CursorKind::SelectAdd));
+    }
     if selected_body_hit || raw_hover_hit || selectable_placement_hit {
         Some(CursorIcon::Grab)
     } else {
@@ -2536,8 +2681,7 @@ fn selection_default_pivot(app: &EditorApp) -> Option<Vec2> {
             plane_pivot,
         ));
     }
-    selection_transform_bounds(app)
-        .map(|bounds| Vec2::new((bounds.0 + bounds.2) * 0.5, (bounds.1 + bounds.3) * 0.5))
+    selection_transform_bounds(app).map(|bounds| group_frame_for(app, bounds).center)
 }
 
 fn selection_transform_pivot(app: &EditorApp) -> Option<Vec2> {
@@ -5812,6 +5956,7 @@ fn begin_group_transform_inner(
     if !raw_selection_supports_axis_resize(bounds) {
         return false;
     }
+    start_group_frame_drag(app, bounds);
     let pivot = selection_transform_pivot(app)
         .unwrap_or_else(|| Vec2::new((bounds.0 + bounds.2) * 0.5, (bounds.1 + bounds.3) * 0.5));
     let (paths, raw_placements, objects, raw_clip, raw_style_parts) = match selection {
@@ -6155,7 +6300,7 @@ fn apply_group_transform(
     ctrl: bool,
 ) -> bool {
     let Some(transform) =
-        group_transform_affine(data.operation, data.start_pivot, cursor, shift, ctrl)
+        group_drag_affine(app, data.operation, data.start_pivot, cursor, shift, ctrl)
     else {
         return false;
     };
@@ -6438,6 +6583,7 @@ fn begin_transforming_raw_area(
     if placements.is_empty() || !raw_selection_supports_axis_resize(bounds) {
         return false;
     }
+    start_group_frame_drag(app, bounds);
     // Cutting is deferred until the user actually grabs a transform zone.
     // From this frame onward the clipped piece is ordinary path-granular raw
     // graphics, so scale/rotate/skew can start without a fake move first.
@@ -7240,136 +7386,6 @@ fn draw_nib_cursor_points(painter: &Painter, points: Vec<Pos2>) {
         }));
     }
 }
-fn active_custom_transform_cursor(
-    app: &mut EditorApp,
-    response: &Response,
-    view: &StageView,
-) -> Option<CustomTransformCursor> {
-    match app.session.tool_state {
-        ToolState::DraggingRawRotate { .. } | ToolState::DraggingPlacementRotate { .. } => {
-            return Some(CustomTransformCursor::Rotate);
-        }
-        ToolState::DraggingRawSkew { edge, .. } | ToolState::DraggingPlacementSkew { edge, .. } => {
-            return Some(CustomTransformCursor::Skew(edge));
-        }
-        _ => {}
-    }
-
-    if app.session.current_tool != Tool::Select {
-        return None;
-    }
-    let cursor_screen = response.hover_pos()?;
-    selected_transform_hit(app, view, cursor_screen).and_then(custom_transform_cursor_for_hit)
-}
-
-fn draw_transform_cursor(
-    app: &mut EditorApp,
-    response: &Response,
-    painter: &Painter,
-    view: &StageView,
-) {
-    let Some(cursor_kind) = active_custom_transform_cursor(app, response, view) else {
-        return;
-    };
-    let Some(center) = painter.ctx().pointer_hover_pos() else {
-        return;
-    };
-    if !painter.clip_rect().contains(center) {
-        return;
-    }
-
-    let accent = selection_color(app);
-    match cursor_kind {
-        CustomTransformCursor::Rotate => draw_rotate_cursor(painter, center, accent),
-        CustomTransformCursor::Skew(edge) => draw_skew_cursor(painter, center, edge, accent),
-    }
-}
-
-fn draw_rotate_cursor(painter: &Painter, center: Pos2, accent: Color32) {
-    let radius = 8.0;
-    let start_angle = -0.65 * std::f32::consts::PI;
-    let end_angle = 0.95 * std::f32::consts::PI;
-    let steps = 22;
-    let points: Vec<Pos2> = (0..=steps)
-        .map(|step| {
-            let t = step as f32 / steps as f32;
-            let angle = start_angle + (end_angle - start_angle) * t;
-            center + egui::vec2(angle.cos() * radius, angle.sin() * radius)
-        })
-        .collect();
-    draw_cursor_polyline(painter, &points, accent);
-    if points.len() >= 2 {
-        draw_cursor_arrowhead(painter, points[0], points[0] - points[1], accent);
-        let last = points.len() - 1;
-        draw_cursor_arrowhead(
-            painter,
-            points[last],
-            points[last] - points[last - 1],
-            accent,
-        );
-    }
-}
-
-fn draw_skew_cursor(painter: &Painter, center: Pos2, edge: TransformEdge, accent: Color32) {
-    let (start, end) = match edge {
-        TransformEdge::Top => (
-            center + egui::vec2(-8.0, 3.0),
-            center + egui::vec2(8.0, -3.0),
-        ),
-        TransformEdge::Bottom => (
-            center + egui::vec2(-8.0, -3.0),
-            center + egui::vec2(8.0, 3.0),
-        ),
-        TransformEdge::Left => (
-            center + egui::vec2(3.0, -8.0),
-            center + egui::vec2(-3.0, 8.0),
-        ),
-        TransformEdge::Right => (
-            center + egui::vec2(-3.0, -8.0),
-            center + egui::vec2(3.0, 8.0),
-        ),
-    };
-    draw_cursor_segment(painter, start, end, accent);
-    draw_cursor_arrowhead(painter, start, start - end, accent);
-    draw_cursor_arrowhead(painter, end, end - start, accent);
-}
-
-fn draw_cursor_polyline(painter: &Painter, points: &[Pos2], accent: Color32) {
-    if points.len() < 2 {
-        return;
-    }
-    for stroke in cursor_strokes(accent) {
-        painter.add(Shape::line(points.to_vec(), stroke));
-    }
-}
-
-fn draw_cursor_segment(painter: &Painter, start: Pos2, end: Pos2, accent: Color32) {
-    for stroke in cursor_strokes(accent) {
-        painter.line_segment([start, end], stroke);
-    }
-}
-
-fn draw_cursor_arrowhead(painter: &Painter, tip: Pos2, direction: egui::Vec2, accent: Color32) {
-    if direction.length_sq() <= 1.0e-6 {
-        return;
-    }
-    let direction = direction.normalized();
-    let perpendicular = egui::vec2(-direction.y, direction.x);
-    let base = tip - direction * 4.6;
-    let left = base + perpendicular * 2.8;
-    let right = base - perpendicular * 2.8;
-    draw_cursor_segment(painter, tip, left, accent);
-    draw_cursor_segment(painter, tip, right, accent);
-}
-
-fn cursor_strokes(accent: Color32) -> [Stroke; 3] {
-    [
-        Stroke::new(4.2_f32, Color32::from_black_alpha(235)),
-        Stroke::new(2.5_f32, Color32::WHITE),
-        Stroke::new(1.15_f32, accent),
-    ]
-}
-
 // ---------------- Selection tool (move placement) ----------------
 
 fn begin_dragging_placement(
@@ -7743,30 +7759,9 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                     break 'drag_start;
                 }
             }
-            if alt_down {
-                let selected_objects = crate::selection_edit::selected_object_refs(
-                    &app.state.project,
-                    &app.session.selection,
-                );
-                let hit_is_selected = hit_test_frontmost_placement_with_slop(
-                    &app.state.project,
-                    &mut app.textures,
-                    app.session.current_q0rg_id,
-                    app.session.current_frame,
-                    p,
-                    hit_slop,
-                )
-                .is_some_and(|(layer_id, placement_idx)| {
-                    selected_objects.contains(&PlacementRef {
-                        q0rg_id: app.session.current_q0rg_id,
-                        layer_id,
-                        placement_idx,
-                    })
-                });
-                if hit_is_selected {
-                    app.queue(crate::app::Action::AltDragDuplicateSelection(p));
-                    return;
-                }
+            if alt_down && alt_drag_copies(app, p, hit_slop) {
+                app.queue(crate::app::Action::AltDragDuplicateSelection(p));
+                return;
             }
             // Transform handles own their entire hit area, including the part
             // outside the artwork. Shift constrains that gesture instead of
@@ -7860,7 +7855,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
             };
             if let (Some(selection), Some(screen_pos)) = (group_selection, cursor_screen) {
                 if let Some(bounds) = selection_transform_bounds_scoped(app) {
-                    if let Some(hit) = hit_test_raw_transform(bounds, view, screen_pos) {
+                    if let Some(hit) = hit_test_group_transform(app, bounds, view, screen_pos) {
                         if begin_group_transform(app, selection, GroupTransformIntent::Hit(hit), p)
                         {
                             break 'drag_start;
@@ -7873,7 +7868,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 cursor_screen,
             ) {
                 if let Some(bounds) = raw_path_refs_ui_bounds(&app.state.project, &refs) {
-                    if let Some(hit) = hit_test_raw_transform(bounds, view, screen_pos) {
+                    if let Some(hit) = hit_test_group_transform(app, bounds, view, screen_pos) {
                         let started = match hit {
                             TransformHit::Scale(handle) => {
                                 begin_scaling_raw_paths(app, refs, handle, bounds)
@@ -7910,7 +7905,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
             {
                 if objects.is_empty() {
                     let bounds = (bounds_min.x, bounds_min.y, bounds_max.x, bounds_max.y);
-                    if let Some(hit) = hit_test_raw_transform(bounds, view, screen_pos) {
+                    if let Some(hit) = hit_test_group_transform(app, bounds, view, screen_pos) {
                         let pivot = selection_transform_pivot(app).unwrap_or_else(|| {
                             Vec2::new((bounds.0 + bounds.2) * 0.5, (bounds.1 + bounds.3) * 0.5)
                         });
@@ -8507,7 +8502,8 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 ..
             } => {
                 if let Some(p) = cursor {
-                    if let Some(transform) = group_transform_affine(
+                    if let Some(transform) = group_drag_affine(
+                        app,
                         GroupTransformOperation::Scale {
                             handle,
                             start_bounds,
@@ -8542,7 +8538,8 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 ..
             } => {
                 if let Some(p) = cursor {
-                    if let Some(transform) = group_transform_affine(
+                    if let Some(transform) = group_drag_affine(
+                        app,
                         GroupTransformOperation::Rotate {
                             center,
                             start_angle,
@@ -8578,7 +8575,8 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
                 ..
             } => {
                 if let Some(p) = cursor {
-                    if let Some(transform) = group_transform_affine(
+                    if let Some(transform) = group_drag_affine(
+                        app,
                         GroupTransformOperation::Skew {
                             edge,
                             start_bounds,
@@ -8901,12 +8899,13 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
             if let Some(end) = cursor {
                 let min = Vec2::new(start.x.min(end.x), start.y.min(end.y));
                 let max = Vec2::new(start.x.max(end.x), start.y.max(end.y));
-                // Whole shapes, as Shift-clicking each would; Alt cuts out
-                // only the part inside, as Animate does.
+                // The part inside, cut out of the paint it crosses, as
+                // Animate does; Alt takes whole shapes instead, as
+                // Shift-clicking each would.
                 let pick = if response.ctx.input(|input| input.modifiers.alt) {
-                    marquee_selection
-                } else {
                     marquee_whole_selection
+                } else {
+                    marquee_selection
                 };
                 let selection = pick(
                     &app.state.project,
@@ -9016,6 +9015,7 @@ fn select(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, view: 
             app.state.mark_dirty();
         }
         if finished_drag {
+            keep_group_frame(app, &finished_state, merge_reports.is_empty());
             app.session.tool_state = ToolState::Idle;
         }
     }
@@ -12673,6 +12673,7 @@ fn begin_scaling_raw_paths(
     if refs.is_empty() || !raw_selection_supports_axis_resize(start_bounds) {
         return false;
     }
+    start_group_frame_drag(app, start_bounds);
     let start_pivot = selection_transform_pivot(app).unwrap_or_else(|| {
         Vec2::new(
             (start_bounds.0 + start_bounds.2) * 0.5,
@@ -12730,6 +12731,7 @@ fn begin_rotating_raw_paths(
     if refs.is_empty() || !raw_selection_supports_axis_resize(bounds) {
         return false;
     }
+    start_group_frame_drag(app, bounds);
     app.history
         .snapshot_with_session(&app.state.project, &app.session);
     let Some(refs) =
@@ -12780,6 +12782,7 @@ fn begin_skewing_raw_paths(
     if refs.is_empty() || !raw_selection_supports_axis_resize(bounds) {
         return false;
     }
+    start_group_frame_drag(app, bounds);
     let start_pivot = selection_transform_pivot(app)
         .unwrap_or_else(|| Vec2::new((bounds.0 + bounds.2) * 0.5, (bounds.1 + bounds.3) * 0.5));
     app.history
@@ -13837,6 +13840,21 @@ fn replace_raw_path_points_translated(
 type Aabb = (f32, f32, f32, f32);
 type DragStartData = (Aabb, Aabb, Transform2D, bool);
 
+/// The middle of a placement's artwork in its own space at `frame`.
+pub(crate) fn placement_local_center(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    placement_idx: usize,
+    frame: u16,
+) -> Option<Vec2> {
+    let (_, local, _, _) = drag_start_data(project, q0rg_id, layer_id, placement_idx, frame)?;
+    Some(Vec2::new(
+        (local.0 + local.2) * 0.5,
+        (local.1 + local.3) * 0.5,
+    ))
+}
+
 /// Pull together the snapshot data needed at drag-start: world AABB, local
 /// AABB, and the transform itself.  Returns None if any of these can't be
 /// computed (e.g. empty asset / orphaned q0rg).
@@ -14123,7 +14141,10 @@ fn placement_mut(
 /// with a mouse at low zoom.
 const HANDLE_HIT_RADIUS_PX: f32 = 14.0;
 const RAW_HANDLE_HIT_RADIUS_PX: f32 = 10.0;
-const ROTATE_HIT_RADIUS_PX: f32 = 34.0;
+/// Rotating is a round spot out past each corner, along the diagonal, with
+/// a gap between it and the resize knob so the two are not mistaken.
+const ROTATE_HOTSPOT_OFFSET_PX: f32 = 18.0;
+const ROTATE_HOTSPOT_RADIUS_PX: f32 = 11.0;
 const PIVOT_HIT_RADIUS_PX: f32 = 10.0;
 const SKEW_EDGE_HIT_RADIUS_PX: f32 = 7.0;
 
@@ -14132,20 +14153,6 @@ enum TransformHit {
     Scale(Handle),
     Rotate(Handle),
     Skew(TransformEdge),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CustomTransformCursor {
-    Rotate,
-    Skew(TransformEdge),
-}
-
-fn custom_transform_cursor_for_hit(hit: TransformHit) -> Option<CustomTransformCursor> {
-    match hit {
-        TransformHit::Scale(_) => None,
-        TransformHit::Rotate(_) => Some(CustomTransformCursor::Rotate),
-        TransformHit::Skew(edge) => Some(CustomTransformCursor::Skew(edge)),
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -14158,7 +14165,8 @@ struct TransformFrame {
 fn cursor_for_transform_hit(hit: TransformHit) -> egui::CursorIcon {
     match hit {
         TransformHit::Scale(handle) => resize_cursor_for_handle(handle),
-        TransformHit::Rotate(_) | TransformHit::Skew(_) => egui::CursorIcon::None,
+        TransformHit::Rotate(_) => ROTATE_CURSOR,
+        TransformHit::Skew(edge) => skew_cursor(edge),
     }
 }
 
@@ -14233,6 +14241,13 @@ fn frame_handle_positions(frame: TransformFrame) -> [(Handle, Vec2); 8] {
     ]
 }
 
+/// Where a corner's rotate spot is on screen: out past the corner, away from
+/// the box's middle.
+fn rotate_hotspot(corner: Pos2, center: Pos2) -> Option<Pos2> {
+    let outward = corner - center;
+    (outward.length_sq() > 1.0e-6).then(|| corner + outward.normalized() * ROTATE_HOTSPOT_OFFSET_PX)
+}
+
 fn screen_distance_sq(a: Pos2, b: Pos2) -> f32 {
     let dx = a.x - b.x;
     let dy = a.y - b.y;
@@ -14287,15 +14302,11 @@ fn hit_test_transform_frame(
     .into_iter()
     .enumerate()
     {
-        let corner = corner_screen[index];
-        let outward = corner - center_screen;
-        let from_corner = screen_pos - corner;
-        let distance_sq = from_corner.length_sq();
-        let inner_radius = handle_radius + 1.0;
-        if outward.length_sq() > 1.0e-6
-            && from_corner.dot(outward) > 0.0
-            && distance_sq >= inner_radius * inner_radius
-            && distance_sq <= ROTATE_HIT_RADIUS_PX * ROTATE_HIT_RADIUS_PX
+        let Some(spot) = rotate_hotspot(corner_screen[index], center_screen) else {
+            continue;
+        };
+        if screen_distance_sq(spot, screen_pos)
+            <= ROTATE_HOTSPOT_RADIUS_PX * ROTATE_HOTSPOT_RADIUS_PX
         {
             return Some(TransformHit::Rotate(handle));
         }
@@ -14343,6 +14354,24 @@ fn hit_test_transform_frame(
     None
 }
 
+/// The transform zones of a group or raw selection, on the box its last
+/// transform left (see [`group_frame_for`]).
+fn hit_test_group_transform(
+    app: &EditorApp,
+    bounds: (f32, f32, f32, f32),
+    view: &StageView,
+    screen_pos: Pos2,
+) -> Option<TransformHit> {
+    hit_test_transform_frame(
+        group_frame_for(app, bounds),
+        view,
+        screen_pos,
+        RAW_HANDLE_HIT_RADIUS_PX,
+        true,
+    )
+}
+
+#[cfg(test)]
 fn hit_test_raw_transform(
     bbox: (f32, f32, f32, f32),
     view: &StageView,
@@ -17036,7 +17065,7 @@ fn draw_selection_content_overlay(
                 stage_to_screen(Vec2::new(bounds.0, bounds.1), view),
                 stage_to_screen(Vec2::new(bounds.2, bounds.3), view),
             );
-            draw_flash_selection_box(painter, rect, selection_color(app));
+            draw_flash_selection_box(app, painter, view, rect);
         }
         return;
     }
@@ -17170,27 +17199,14 @@ fn draw_selection_content_overlay(
         // Use the same oriented frame for rendering, hit-testing and drag
         // math. Rotated/skewed q0rg, bitmap and vector instances therefore no
         // longer show a misleading axis-aligned box.
-        painter.add(Shape::Path(PathShape {
-            points: outline.clone(),
-            closed: true,
-            fill: Color32::TRANSPARENT,
-            stroke: Stroke::new(3.0_f32, Color32::from_black_alpha(220)),
-        }));
-        painter.add(Shape::Path(PathShape {
-            points: outline,
-            closed: true,
-            fill: Color32::TRANSPARENT,
-            stroke: Stroke::new(1.5_f32, accent),
-        }));
-
-        if (rig_bound || supports_axis_resize(active_transform)) && transform_box_shown(app) {
-            for (_, world) in frame_handle_positions(frame) {
-                let point = stage_to_screen(world, view);
-                let handle = egui::Rect::from_center_size(point, egui::vec2(9.0, 9.0));
-                painter.rect_filled(handle, 0.0, Color32::WHITE);
-                painter.rect_stroke(handle, 0.0, Stroke::new(1.5_f32, Color32::BLACK));
-            }
-        }
+        let handles =
+            (rig_bound || supports_axis_resize(active_transform)) && transform_box_shown(app);
+        paint_transform_box(
+            app,
+            painter,
+            [outline[0], outline[1], outline[2], outline[3]],
+            handles,
+        );
     }
 }
 
@@ -17214,10 +17230,10 @@ fn draw_object_reference_outlines(
         .expand(2.0);
         painter.rect_stroke(
             rect,
-            0.0,
-            Stroke::new(2.0_f32, Color32::from_black_alpha(180)),
+            2.0,
+            Stroke::new(2.6_f32, Color32::from_black_alpha(60)),
         );
-        painter.rect_stroke(rect, 0.0, Stroke::new(1.0_f32, accent));
+        painter.rect_stroke(rect, 2.0, Stroke::new(1.0_f32, accent.gamma_multiply(0.7)));
     }
 }
 
@@ -17242,7 +17258,7 @@ fn draw_group_transform_frame(
         stage_to_screen(Vec2::new(bounds.0, bounds.1), view),
         stage_to_screen(Vec2::new(bounds.2, bounds.3), view),
     );
-    draw_flash_selection_box(painter, rect, selection_color(app));
+    draw_flash_selection_box(app, painter, view, rect);
 }
 
 fn draw_transform_pivot_overlay(
@@ -17275,23 +17291,27 @@ fn draw_transform_pivot_overlay(
     };
     let point = stage_to_screen(pivot, view);
     let accent = selection_color(app);
-    painter.circle_filled(point, 5.0, Color32::WHITE);
-    painter.circle_stroke(point, 6.0, Stroke::new(2.0_f32, Color32::BLACK));
-    painter.circle_stroke(point, 5.0, Stroke::new(1.5_f32, accent));
-    painter.line_segment(
-        [
-            Pos2::new(point.x - 8.0, point.y),
-            Pos2::new(point.x + 8.0, point.y),
-        ],
-        Stroke::new(1.0_f32, accent),
+    let knob = app.settings.theme.cursor_colors().fill.to_color32();
+    let halo = Color32::from_black_alpha(80);
+    // The anchor in the box's family: a ring knob with sights, as the
+    // Transform anchor pointer draws it.
+    for (from, to) in [
+        (egui::vec2(-10.0, 0.0), egui::vec2(-6.2, 0.0)),
+        (egui::vec2(6.2, 0.0), egui::vec2(10.0, 0.0)),
+        (egui::vec2(0.0, -10.0), egui::vec2(0.0, -6.2)),
+        (egui::vec2(0.0, 6.2), egui::vec2(0.0, 10.0)),
+    ] {
+        painter.line_segment([point + from, point + to], Stroke::new(3.4_f32, halo));
+        painter.line_segment([point + from, point + to], Stroke::new(1.4_f32, accent));
+    }
+    painter.circle_filled(
+        point + egui::vec2(0.0, 1.2),
+        6.6,
+        Color32::from_black_alpha(55),
     );
-    painter.line_segment(
-        [
-            Pos2::new(point.x, point.y - 8.0),
-            Pos2::new(point.x, point.y + 8.0),
-        ],
-        Stroke::new(1.0_f32, accent),
-    );
+    painter.circle_filled(point, 5.8, accent);
+    painter.circle_filled(point, 4.4, knob);
+    painter.circle_filled(point, 1.5, accent);
 }
 
 const SELECTION_STIPPLE_SPACING_PX: f32 = 4.0;
@@ -18127,7 +18147,7 @@ fn draw_raw_area_selection(
         {
             draw_clipped_raw_area_selection(app, &clipped, view, placements, points, accent);
             if draw_box {
-                draw_flash_selection_box(painter, selection_rect, accent);
+                draw_flash_selection_box(app, painter, view, selection_rect);
             }
             return;
         }
@@ -18191,7 +18211,7 @@ fn draw_raw_area_selection(
                 accent,
             );
             if draw_box {
-                draw_flash_selection_box(painter, selection_rect, accent);
+                draw_flash_selection_box(app, painter, view, selection_rect);
             }
             return;
         }
@@ -18283,7 +18303,7 @@ fn draw_raw_area_selection(
         paint_selection_surface(&clipped, &selection_contours, accent);
     }
     if draw_box {
-        draw_flash_selection_box(painter, selection_rect, accent);
+        draw_flash_selection_box(app, painter, view, selection_rect);
     }
 }
 
@@ -18614,7 +18634,7 @@ fn draw_raw_paths_overlay(
             stage_to_screen(Vec2::new(min_x, min_y), view),
             stage_to_screen(Vec2::new(max_x, max_y), view),
         );
-        draw_flash_selection_box(painter, rect, selection_color(app));
+        draw_flash_selection_box(app, painter, view, rect);
     }
 }
 
@@ -18779,35 +18799,476 @@ fn draw_partial_raw_selection(
     } else {
         crate::render::paint_concave_fill(&clipped, &screen, selection_fill_color(app, 40));
     }
-    draw_flash_selection_box(painter, selection_rect, selection_color(app));
+    draw_flash_selection_box(app, painter, view, selection_rect);
 }
 
 /// Set while the Select tool only moves: selection boxes lose their handles.
 const FREE_MOVE_ID: &str = "q0editor.free-move";
 
-fn draw_flash_selection_box(painter: &Painter, rect: egui::Rect, accent: Color32) {
-    if painter
-        .ctx()
+/// The box of a group or raw selection whose upright bounds show as `rect`:
+/// the turned or slanted box its last transform left, in the same look as a
+/// single object's.
+fn draw_flash_selection_box(
+    app: &EditorApp,
+    painter: &Painter,
+    view: &StageView,
+    rect: egui::Rect,
+) {
+    let (a, b) = (
+        screen_to_stage(rect.min, view),
+        screen_to_stage(rect.max, view),
+    );
+    let bounds = (a.x.min(b.x), a.y.min(b.y), a.x.max(b.x), a.y.max(b.y));
+    let frame = group_frame_for(app, bounds);
+    let corners = frame.corners.map(|corner| stage_to_screen(corner, view));
+    paint_transform_box(app, painter, corners, true);
+}
+
+// ---------------- The transform box ----------------
+
+/// The box of a group or raw selection: the turned or slanted one its last
+/// transform left, or its plain bounds. During a transform it follows the
+/// drag.
+fn group_frame_for(app: &EditorApp, bounds: (f32, f32, f32, f32)) -> TransformFrame {
+    if group_drag_in_progress(&app.session.tool_state) {
+        if let (Some(live), Some((_, local))) =
+            (app.session.group_frame_live, app.session.group_frame_drag)
+        {
+            return affine_transform_frame(local, live);
+        }
+    }
+    match kept_group_frame(app, bounds) {
+        Some((affine, local)) => affine_transform_frame(local, affine),
+        None => axis_aligned_transform_frame(bounds),
+    }
+}
+
+fn group_drag_in_progress(state: &ToolState) -> bool {
+    matches!(
+        state,
+        ToolState::DraggingGroup { .. }
+            | ToolState::DraggingRawHandle { .. }
+            | ToolState::DraggingRawRotate { .. }
+            | ToolState::DraggingRawSkew { .. }
+    )
+}
+
+/// The kept box, if it still describes the selection with upright bounds
+/// `bounds`. A move takes it along; any other change lets it go.
+fn kept_group_frame(
+    app: &EditorApp,
+    bounds: (f32, f32, f32, f32),
+) -> Option<(Affine, (f32, f32, f32, f32))> {
+    let kept = app
+        .session
+        .group_frame
+        .as_ref()
+        .filter(|kept| kept.selection == app.session.selection)?;
+    let seen = kept.content_bounds.get().unwrap_or_else(|| {
+        kept.content_bounds.set(Some(bounds));
+        bounds
+    });
+    let same = |a: f32, b: f32| (a - b).abs() <= 0.01 * (1.0 + a.abs().max(b.abs()) * 1.0e-3);
+    if !same(seen.2 - seen.0, bounds.2 - bounds.0) || !same(seen.3 - seen.1, bounds.3 - bounds.1) {
+        return None;
+    }
+    let moved = Affine {
+        tx: bounds.0 - seen.0,
+        ty: bounds.1 - seen.1,
+        ..Affine::IDENTITY
+    };
+    Some((Affine::compose(moved, kept.affine), kept.bounds))
+}
+
+/// A group or raw transform starts from the box shown: note it, so the drag
+/// can scale and skew along its sides and the box can follow.
+fn start_group_frame_drag(app: &mut EditorApp, bounds: (f32, f32, f32, f32)) {
+    app.session.group_frame_drag =
+        Some(kept_group_frame(app, bounds).unwrap_or((Affine::IDENTITY, bounds)));
+    app.session.group_frame_live = None;
+}
+
+/// [`group_transform_affine`] for a drag on the box it started from, which
+/// may be turned or slanted: scaling and skewing work along its sides, in
+/// its own space. Turning and moving do not care. Notes where the box is.
+fn group_drag_affine(
+    app: &mut EditorApp,
+    operation: GroupTransformOperation,
+    start_pivot: Vec2,
+    cursor: Vec2,
+    shift: bool,
+    ctrl: bool,
+) -> Option<Affine> {
+    let frame = app.session.group_frame_drag;
+    let transform = framed_group_affine(frame, operation, start_pivot, cursor, shift, ctrl)?;
+    let start = frame.map_or(Affine::IDENTITY, |(affine, _)| affine);
+    app.session.group_frame_live = Some(Affine::compose(transform, start));
+    Some(transform)
+}
+
+fn framed_group_affine(
+    frame: Option<(Affine, (f32, f32, f32, f32))>,
+    operation: GroupTransformOperation,
+    start_pivot: Vec2,
+    cursor: Vec2,
+    shift: bool,
+    ctrl: bool,
+) -> Option<Affine> {
+    let Some((frame, bounds)) = frame.filter(|(frame, _)| *frame != Affine::IDENTITY) else {
+        return group_transform_affine(operation, start_pivot, cursor, shift, ctrl);
+    };
+    let inverse = frame.inverse()?;
+    let local = match operation {
+        GroupTransformOperation::Move { .. } | GroupTransformOperation::Rotate { .. } => {
+            return group_transform_affine(operation, start_pivot, cursor, shift, ctrl);
+        }
+        GroupTransformOperation::Scale { handle, .. } => GroupTransformOperation::Scale {
+            handle,
+            start_bounds: bounds,
+        },
+        GroupTransformOperation::Skew {
+            edge, start_cursor, ..
+        } => GroupTransformOperation::Skew {
+            edge,
+            start_bounds: bounds,
+            start_cursor: inverse.apply(start_cursor),
+        },
+    };
+    let in_frame = group_transform_affine(
+        local,
+        inverse.apply(start_pivot),
+        inverse.apply(cursor),
+        shift,
+        ctrl,
+    )?;
+    Some(Affine::compose(frame, Affine::compose(in_frame, inverse)))
+}
+
+/// Keeps the box a finished group or raw transform left, unless fills
+/// merged and the selection is something else now.
+fn keep_group_frame(app: &mut EditorApp, finished: &ToolState, selection_kept: bool) {
+    let live = app.session.group_frame_live.take();
+    let start = app.session.group_frame_drag.take();
+    if !group_drag_in_progress(finished) || !selection_kept {
+        return;
+    }
+    if let (Some(affine), Some((_, bounds))) = (live, start) {
+        app.session.group_frame = Some(crate::state::GroupFrame {
+            selection: app.session.selection.clone(),
+            affine,
+            bounds,
+            content_bounds: std::cell::Cell::new(None),
+        });
+    }
+}
+
+const FRAME_HOVER_ID: &str = "q0editor.frame-hover";
+const FRAME_APPEAR_ID: &str = "q0editor.frame-appear";
+
+/// Which zone of the transform box the pointer is over, noted while the
+/// cursor is picked, so the box can light it up.
+fn note_frame_hover(ctx: &Context, hit: Option<TransformHit>) {
+    let frame = ctx.frame_nr();
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new(FRAME_HOVER_ID), (frame, hit)));
+}
+
+fn frame_hover(ctx: &Context) -> Option<TransformHit> {
+    ctx.data(|data| data.get_temp::<(u64, Option<TransformHit>)>(egui::Id::new(FRAME_HOVER_ID)))
+        .filter(|(frame, _)| frame + 1 >= ctx.frame_nr())
+        .and_then(|(_, hit)| hit)
+}
+
+/// The zone a transform in progress holds.
+fn frame_held(state: &ToolState) -> Option<TransformHit> {
+    match state {
+        ToolState::DraggingHandle { handle, .. }
+        | ToolState::DraggingRawHandle { handle, .. }
+        | ToolState::DraggingGroup {
+            operation: GroupTransformOperation::Scale { handle, .. },
+            ..
+        } => Some(TransformHit::Scale(*handle)),
+        ToolState::DraggingPlacementSkew { edge, .. }
+        | ToolState::DraggingRawSkew { edge, .. }
+        | ToolState::DraggingGroup {
+            operation: GroupTransformOperation::Skew { edge, .. },
+            ..
+        } => Some(TransformHit::Skew(*edge)),
+        _ => None,
+    }
+}
+
+/// How far the box is into its arrival, 0 to 1: it settles in from a touch
+/// outside when something new is selected. Not while a drag reshapes it.
+fn frame_appear(ctx: &Context, selection: &Selection, idle: bool) -> f32 {
+    let id = egui::Id::new(FRAME_APPEAR_ID);
+    let now = ctx.input(|input| input.time);
+    let frame = ctx.frame_nr();
+    let since = ctx.data_mut(|data| {
+        let last = data.get_temp::<(Selection, f64, u64, bool)>(id);
+        let start = match last {
+            // Shown last frame: new only if picked anew, not reshaped.
+            Some((shown, start, seen, was_idle)) if seen + 1 >= frame => {
+                if shown != *selection && idle && was_idle {
+                    now
+                } else {
+                    start
+                }
+            }
+            _ => now,
+        };
+        data.insert_temp(id, (selection.clone(), start, frame, idle));
+        start
+    });
+    let t = ((now - since) / 0.2) as f32;
+    if t < 1.0 {
+        ctx.request_repaint();
+    }
+    let u = 1.0 - t.clamp(0.0, 1.0);
+    1.0 - u * u * u
+}
+
+/// The hint that a corner turns the box: an arc around the corner through
+/// its rotate spot, with a head at each end. It fades in as the pointer
+/// comes near that corner and stays out of the way otherwise; over the spot
+/// it opens wider, thickens and takes a knob, and while it is held there it
+/// turns a little with the swell.
+fn paint_rotate_hint(
+    ctx: &Context,
+    painter: &Painter,
+    (corner, center): (Pos2, Pos2),
+    handle: Handle,
+    pointer: Option<Pos2>,
+    on: bool,
+    (accent, knob, halo): (Color32, Color32, Color32),
+) {
+    let Some(spot) = rotate_hotspot(corner, center) else {
+        return;
+    };
+    let near = pointer.map_or(0.0, |pointer| {
+        let distance = pointer.distance(spot);
+        (1.0 - (distance - ROTATE_HOTSPOT_RADIUS_PX) / 46.0).clamp(0.0, 1.0)
+    });
+    let swell = ctx.animate_bool_with_time(
+        egui::Id::new(("q0editor.rotate-hint", handle as u8)),
+        on,
+        0.16,
+    );
+    let shown = near.max(swell);
+    if shown <= 0.01 {
+        return;
+    }
+    let shown = shown * shown * (3.0 - 2.0 * shown);
+    let out = corner - center;
+    let facing = out.y.atan2(out.x);
+    let reach = 0.34 + 0.22 * swell;
+    let turn = 0.12 * swell;
+    let arc: Vec<Pos2> = (0..=18)
+        .map(|step| {
+            let a = facing + turn - reach + 2.0 * reach * step as f32 / 18.0;
+            corner + egui::vec2(a.cos(), a.sin()) * ROTATE_HOTSPOT_OFFSET_PX
+        })
+        .collect();
+    let width = 1.4 + 0.8 * swell;
+    painter.add(Shape::line(
+        arc.clone(),
+        Stroke::new(width + 2.4, halo.gamma_multiply(shown)),
+    ));
+    painter.add(Shape::line(
+        arc.clone(),
+        Stroke::new(width, accent.gamma_multiply(shown)),
+    ));
+    // A head at each end, pointing on round the corner.
+    let size = 3.6 + 1.6 * swell;
+    for (tip, before) in [(arc[0], arc[1]), (arc[arc.len() - 1], arc[arc.len() - 2])] {
+        let along = tip - before;
+        if along.length() <= 1.0e-3 {
+            continue;
+        }
+        let along = along.normalized();
+        let across = egui::vec2(-along.y, along.x);
+        let head = vec![
+            tip + along * size,
+            tip - across * size * 0.75,
+            tip + across * size * 0.75,
+        ];
+        painter.add(Shape::convex_polygon(
+            head,
+            accent.gamma_multiply(shown),
+            Stroke::new(1.2_f32, halo.gamma_multiply(shown)),
+        ));
+    }
+    if swell > 0.01 {
+        painter.circle_filled(spot, 2.8 * swell + 1.4, accent.gamma_multiply(swell));
+        painter.circle_filled(spot, 1.6 * swell, knob.gamma_multiply(swell));
+    }
+}
+
+/// A short bar with round ends: a side handle.
+fn paint_pill(painter: &Painter, a: Pos2, b: Pos2, width: f32, fill: Color32, rim: Color32) {
+    for (w, color) in [(width + 2.8, rim), (width, fill)] {
+        painter.line_segment([a, b], Stroke::new(w, color));
+        painter.circle_filled(a, w * 0.5, color);
+        painter.circle_filled(b, w * 0.5, color);
+    }
+}
+
+/// The transform box, one look for a single object and for several things
+/// or raw paint. `corners` are on screen, top left first, clockwise.
+///
+/// A soft halo keeps the accent line readable on any artwork. Corner knobs
+/// are round and side handles are pills along their side, in the theme's
+/// pointer colours. The zone under the pointer lights up (a knob swells and
+/// takes the accent, a skew edge glows, a rotate zone shows its arc), and
+/// the box settles in when something new is selected.
+fn paint_transform_box(app: &EditorApp, painter: &Painter, corners: [Pos2; 4], handles: bool) {
+    let ctx = painter.ctx();
+    if ctx
         .data(|data| data.get_temp::<bool>(egui::Id::new(FREE_MOVE_ID)))
         .unwrap_or(false)
     {
         return;
     }
-    painter.rect_stroke(rect, 0.0, Stroke::new(1.0_f32, accent));
-    for point in [
-        rect.left_top(),
-        rect.center_top(),
-        rect.right_top(),
-        rect.right_center(),
-        rect.right_bottom(),
-        rect.center_bottom(),
-        rect.left_bottom(),
-        rect.left_center(),
-    ] {
-        let handle = egui::Rect::from_center_size(point, egui::vec2(7.0, 7.0));
-        painter.rect_filled(handle, 0.0, Color32::BLACK);
-        painter.rect_stroke(handle, 0.0, Stroke::new(1.0_f32, accent));
+    let idle = matches!(app.session.tool_state, ToolState::Idle);
+    let arrive = frame_appear(ctx, &app.session.selection, idle);
+    let accent = selection_color(app).gamma_multiply(arrive);
+    let colors = app.settings.theme.cursor_colors();
+    let knob = colors.fill.to_color32().gamma_multiply(arrive);
+    let halo = Color32::from_black_alpha((72.0 * arrive) as u8);
+    let shadow = Color32::from_black_alpha((55.0 * arrive) as u8);
+    let center = Pos2::new(
+        corners.iter().map(|p| p.x).sum::<f32>() * 0.25,
+        corners.iter().map(|p| p.y).sum::<f32>() * 0.25,
+    );
+    let corners = corners.map(|corner| {
+        let out = corner - center;
+        let length = out.length();
+        if length > 1.0e-3 {
+            corner + out / length * 8.0 * (1.0 - arrive)
+        } else {
+            corner
+        }
+    });
+    painter.add(Shape::closed_line(
+        corners.to_vec(),
+        Stroke::new(3.4_f32, halo),
+    ));
+    painter.add(Shape::closed_line(
+        corners.to_vec(),
+        Stroke::new(1.25_f32, accent),
+    ));
+
+    let held = frame_held(&app.session.tool_state);
+    let hover = if idle { frame_hover(ctx) } else { None };
+    let lit = held.or(hover);
+    let side = |edge: TransformEdge| match edge {
+        TransformEdge::Top => (corners[0], corners[1]),
+        TransformEdge::Right => (corners[1], corners[2]),
+        TransformEdge::Bottom => (corners[2], corners[3]),
+        TransformEdge::Left => (corners[3], corners[0]),
+    };
+    if let Some(TransformHit::Skew(edge)) = lit {
+        let (a, b) = side(edge);
+        painter.line_segment([a, b], Stroke::new(7.0_f32, accent.gamma_multiply(0.22)));
+        painter.line_segment([a, b], Stroke::new(2.2_f32, accent));
     }
+    if !handles {
+        return;
+    }
+    let pointer = ctx.pointer_hover_pos().filter(|_| idle);
+    for (index, handle) in [
+        Handle::TopLeft,
+        Handle::TopRight,
+        Handle::BottomRight,
+        Handle::BottomLeft,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let on = matches!(hover, Some(TransformHit::Rotate(lit)) if lit == handle);
+        paint_rotate_hint(
+            ctx,
+            painter,
+            (corners[index], center),
+            handle,
+            pointer,
+            on,
+            (accent, knob, halo),
+        );
+    }
+    let mid = |a: Pos2, b: Pos2| a + (b - a) * 0.5;
+    let along = |a: Pos2, b: Pos2| {
+        let d = b - a;
+        if d.length() > 1.0e-3 {
+            d / d.length()
+        } else {
+            egui::vec2(1.0, 0.0)
+        }
+    };
+    let knobs = [
+        (Handle::TopLeft, corners[0], None),
+        (Handle::TopRight, corners[1], None),
+        (Handle::BottomRight, corners[2], None),
+        (Handle::BottomLeft, corners[3], None),
+        (
+            Handle::MidTop,
+            mid(corners[0], corners[1]),
+            Some(along(corners[0], corners[1])),
+        ),
+        (
+            Handle::MidRight,
+            mid(corners[1], corners[2]),
+            Some(along(corners[1], corners[2])),
+        ),
+        (
+            Handle::MidBottom,
+            mid(corners[2], corners[3]),
+            Some(along(corners[2], corners[3])),
+        ),
+        (
+            Handle::MidLeft,
+            mid(corners[3], corners[0]),
+            Some(along(corners[3], corners[0])),
+        ),
+    ];
+    for (handle, at, direction) in knobs {
+        let on = matches!(lit, Some(TransformHit::Scale(lit)) if lit == handle);
+        let swell = ctx.animate_bool_with_time(
+            egui::Id::new(("q0editor.box-knob", handle as u8)),
+            on,
+            0.12,
+        );
+        let fill = mix_color(knob, accent, swell);
+        let grow = (0.55 + 0.45 * arrive) * (1.0 + 0.35 * swell);
+        match direction {
+            None => {
+                let radius = 4.4 * grow;
+                painter.circle_filled(at + egui::vec2(0.0, 1.2), radius + 1.6, shadow);
+                painter.circle_filled(at, radius + 1.4, accent);
+                painter.circle_filled(at, radius, fill);
+            }
+            Some(direction) => {
+                let half = direction * 4.8 * grow;
+                let width = 4.2 * grow;
+                let drop = egui::vec2(0.0, 1.2);
+                painter.line_segment(
+                    [at - half + drop, at + half + drop],
+                    Stroke::new(width + 4.4, shadow),
+                );
+                paint_pill(painter, at - half, at + half, width, fill, accent);
+            }
+        }
+    }
+}
+
+fn mix_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgba_premultiplied(
+        l(a.r(), b.r()),
+        l(a.g(), b.g()),
+        l(a.b(), b.b()),
+        l(a.a(), b.a()),
+    )
 }
 
 // ---------------- Eyedropper ----------------
@@ -18836,9 +19297,18 @@ fn eyedropper(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, vi
     let pointer = ctx.input(|input| input.pointer.latest_pos());
     let shift = ctx.input(|input| input.modifiers.shift);
     if response.dragged_by(PointerButton::Primary) {
-        ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
         #[cfg(windows)]
-        if let (Some(point), Some(color)) = (pointer, crate::color_picker::pixel_under_pointer()) {
+        let sample = crate::color_picker::pixel_under_pointer();
+        #[cfg(not(windows))]
+        let sample: Option<Color32> = None;
+        let loupe = crate::cursors::CursorKind::ScreenPick;
+        crate::cursors::request_with_sample(&ctx, loupe, sample);
+        // The drawn loupe shows the colour itself; the system cursor needs
+        // a swatch beside it.
+        #[cfg(windows)]
+        if let (Some(point), Some(color), false) =
+            (pointer, sample, app.settings.cursors.shows(loupe))
+        {
             // A live swatch beside the pointer, never under it: the screen
             // is read where the pointer is.
             let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, owner));
@@ -18850,20 +19320,22 @@ fn eyedropper(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, vi
         ctx.request_repaint();
         return;
     }
-    if response.drag_stopped() {
+    // A drag let go over the stage reads the artwork like a click does: a
+    // line gives the stroke, paint the fill. Only off the artwork (or off
+    // the stage) is the colour read off the screen.
+    let released = response.drag_stopped();
+    if !released && !response.clicked_by(PointerButton::Primary) {
+        return;
+    }
+    let Some(cursor) = cursor.filter(|_| !released || response.hovered()) else {
         if let Some(point) = pointer {
             ctx.data_mut(|data| data.insert_temp(to_stroke_id, shift));
             crate::color_picker::request_pixel(&ctx, owner, point);
         }
         return;
-    }
-    if !response.clicked_by(PointerButton::Primary) {
-        return;
-    }
-    let Some(cursor) = cursor else {
-        return;
     };
-    let tolerance = 4.0 / view.effective_scale().max(0.001);
+    // Generous: a click a few pixels off a thin line still means that line.
+    let tolerance = EYEDROPPER_REACH_PX / view.effective_scale().max(0.001);
     let sampled = sample_paint_in_q0rg(
         &app.state.project,
         app.session.current_q0rg_id,
@@ -18895,6 +19367,10 @@ fn eyedropper(app: &mut EditorApp, response: &Response, cursor: Option<Vec2>, vi
         }
     }
 }
+
+/// How far off a line or a fill's edge, in screen pixels, the eyedropper
+/// still picks it.
+const EYEDROPPER_REACH_PX: f32 = 7.0;
 
 /// A colour picked off the screen: it has no opacity of its own, so the
 /// paint keeps the opacity it had.
@@ -26919,30 +27395,112 @@ mod tests {
     }
 
     #[test]
-    fn rotate_and_skew_transform_zones_hide_the_system_cursor_for_custom_icons() {
+    fn a_turned_group_box_scales_and_skews_along_its_own_sides() {
+        let quarter = Affine::from_transform(Transform2D {
+            rotation: std::f32::consts::FRAC_PI_2,
+            ..Transform2D::IDENTITY
+        });
+        let frame = Some((quarter, (0.0, 0.0, 10.0, 10.0)));
+        let center = quarter.apply(Vec2::new(5.0, 5.0));
+        // Pull the right side's middle out along the box's own x axis.
+        let pulled = quarter.apply(Vec2::new(20.0, 5.0));
+        let scale = framed_group_affine(
+            frame,
+            GroupTransformOperation::Scale {
+                handle: Handle::MidRight,
+                start_bounds: (0.0, 0.0, 0.0, 0.0),
+            },
+            center,
+            pulled,
+            false,
+            false,
+        )
+        .unwrap();
+        let moved = scale.apply(quarter.apply(Vec2::new(10.0, 5.0)));
+        assert!((moved.x - pulled.x).abs() < 1.0e-3 && (moved.y - pulled.y).abs() < 1.0e-3);
+        // The far side stays where it was when scaling from the opposite side.
+        let left = scale.apply(quarter.apply(Vec2::new(0.0, 5.0)));
+        let stays = quarter.apply(Vec2::new(-10.0, 5.0));
+        assert!((left.x - stays.x).abs() < 1.0e-3 && (left.y - stays.y).abs() < 1.0e-3);
+        // Skewing the top side slides it along the box's own top.
+        let grab = quarter.apply(Vec2::new(5.0, 0.0));
+        let slide = quarter.apply(Vec2::new(9.0, 0.0));
+        let skew = framed_group_affine(
+            frame,
+            GroupTransformOperation::Skew {
+                edge: TransformEdge::Top,
+                start_bounds: (0.0, 0.0, 0.0, 0.0),
+                start_cursor: grab,
+            },
+            center,
+            slide,
+            false,
+            false,
+        )
+        .unwrap();
+        // The same skew worked in the box's own space, then turned.
+        let local = group_transform_affine(
+            GroupTransformOperation::Skew {
+                edge: TransformEdge::Top,
+                start_bounds: (0.0, 0.0, 10.0, 10.0),
+                start_cursor: Vec2::new(5.0, 0.0),
+            },
+            Vec2::new(5.0, 5.0),
+            Vec2::new(9.0, 0.0),
+            false,
+            false,
+        )
+        .unwrap();
+        let corner = skew.apply(quarter.apply(Vec2::new(0.0, 0.0)));
+        let expected = quarter.apply(local.apply(Vec2::new(0.0, 0.0)));
+        assert!(
+            local.apply(Vec2::new(0.0, 0.0)).x > 0.5,
+            "the top slid along"
+        );
+        assert!((corner.x - expected.x).abs() < 1.0e-3 && (corner.y - expected.y).abs() < 1.0e-3);
+        // An upright box is the plain group transform.
+        let plain = framed_group_affine(
+            None,
+            GroupTransformOperation::Move {
+                start_cursor: Vec2::new(0.0, 0.0),
+            },
+            center,
+            Vec2::new(3.0, 4.0),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!((plain.tx, plain.ty), (3.0, 4.0));
+    }
+
+    #[test]
+    fn rotate_and_skew_transform_zones_ask_for_the_drawn_pointers() {
+        use crate::cursors::CursorKind;
+        let rotate = cursor_for_transform_hit(TransformHit::Rotate(Handle::TopLeft));
+        let skew_top = cursor_for_transform_hit(TransformHit::Skew(TransformEdge::Top));
+        let skew_left = cursor_for_transform_hit(TransformHit::Skew(TransformEdge::Left));
+        let scale = cursor_for_transform_hit(TransformHit::Scale(Handle::TopLeft));
+        assert_eq!(scale, egui::CursorIcon::ResizeNwSe);
         assert_eq!(
-            cursor_for_transform_hit(TransformHit::Rotate(Handle::TopLeft)),
-            egui::CursorIcon::None
+            drawn_stage_cursor(Tool::Select, rotate),
+            Some(CursorKind::Rotate)
         );
         assert_eq!(
-            cursor_for_transform_hit(TransformHit::Skew(TransformEdge::Top)),
-            egui::CursorIcon::None
+            drawn_stage_cursor(Tool::Select, skew_top),
+            Some(CursorKind::SkewH)
         );
         assert_eq!(
-            cursor_for_transform_hit(TransformHit::Scale(Handle::TopLeft)),
-            egui::CursorIcon::ResizeNwSe
+            drawn_stage_cursor(Tool::Select, skew_left),
+            Some(CursorKind::SkewV)
         );
+        assert_eq!(drawn_stage_cursor(Tool::Select, scale), None);
+        // Switched off, each falls back to the system cursor it stands on.
+        assert_eq!(CursorKind::Rotate.system(), rotate);
+        assert_eq!(CursorKind::SkewH.system(), skew_top);
+        assert_eq!(CursorKind::SkewV.system(), skew_left);
         assert_eq!(
-            custom_transform_cursor_for_hit(TransformHit::Rotate(Handle::TopLeft)),
-            Some(CustomTransformCursor::Rotate)
-        );
-        assert_eq!(
-            custom_transform_cursor_for_hit(TransformHit::Skew(TransformEdge::Top)),
-            Some(CustomTransformCursor::Skew(TransformEdge::Top))
-        );
-        assert_eq!(
-            custom_transform_cursor_for_hit(TransformHit::Scale(Handle::TopLeft)),
-            None
+            drawn_stage_cursor(Tool::Pen, egui::CursorIcon::Crosshair),
+            Some(CursorKind::Pen)
         );
     }
 
@@ -26969,7 +27527,7 @@ mod tests {
 
         let center = stage_to_screen(frame.center, &view);
         let outward = (corner - center).normalized();
-        let rotate = corner + outward * (ROTATE_HIT_RADIUS_PX * 0.7);
+        let rotate = corner + outward * ROTATE_HOTSPOT_OFFSET_PX;
         assert_eq!(
             hit_test_placement_transform((0.0, 0.0, 100.0, 60.0), transform, &view, rotate,),
             Some(TransformHit::Rotate(Handle::TopLeft))
@@ -28790,7 +29348,7 @@ mod tests {
     }
 
     #[test]
-    fn rotation_zone_is_broad_outside_corner_but_handle_keeps_priority() {
+    fn rotation_spot_sits_past_the_corner_apart_from_the_resize_handle() {
         let view = StageView {
             origin: pos2(0.0, 0.0),
             scale: 1.0,
@@ -28809,16 +29367,28 @@ mod tests {
             Some(TransformHit::Scale(Handle::TopLeft)),
             "the resize handle must still win directly on the corner"
         );
+        let spot = ROTATE_HOTSPOT_OFFSET_PX * std::f32::consts::FRAC_1_SQRT_2;
         assert_eq!(
             hit_test_transform_frame(
                 frame,
                 &view,
-                pos2(-24.0, -24.0),
+                pos2(-spot, -spot),
                 RAW_HANDLE_HIT_RADIUS_PX,
                 false,
             ),
             Some(TransformHit::Rotate(Handle::TopLeft)),
-            "rotation should be grabbable through a broad outward corner sector"
+            "the rotate spot is out past the corner, along the diagonal"
+        );
+        assert_eq!(
+            hit_test_transform_frame(
+                frame,
+                &view,
+                pos2(-12.0, 0.0),
+                RAW_HANDLE_HIT_RADIUS_PX,
+                false,
+            ),
+            None,
+            "right beside the resize knob nothing turns the box"
         );
     }
 
@@ -31366,7 +31936,7 @@ mod sprite_tests {
     }
 
     #[test]
-    fn the_marquee_picks_whole_shapes_like_shift_clicking() {
+    fn the_alt_marquee_picks_whole_shapes_like_shift_clicking() {
         let mut app = blank_app();
         app.session.fill_color = Some(Rgba {
             r: 200,
@@ -31390,7 +31960,7 @@ mod sprite_tests {
         };
         assert_eq!(fills.len(), 2, "both shapes, whole: {fills:?}");
         assert_eq!(strokes.len(), 2, "and their outlines");
-        // The Alt marquee still cuts out only the part inside.
+        // The plain marquee cuts out only the part inside.
         assert!(matches!(
             marquee_selection(&app.state.project, 1, 0, (30.0, 30.0, 110.0, 110.0)),
             Selection::RawArea { .. }
@@ -32353,6 +32923,220 @@ mod drawing_rework_tests {
         )
         .unwrap();
         commit_vector_path(app, path, DrawingMode::Merge);
+    }
+
+    fn sample_at(app: &EditorApp, x: f32, y: f32) -> Option<SampledPaint> {
+        sample_paint_in_q0rg(
+            &app.state.project,
+            app.session.current_q0rg_id,
+            0,
+            Affine::IDENTITY,
+            Vec2::new(x, y),
+            4.0,
+            0,
+        )
+    }
+
+    fn red_fill_surface(app: &EditorApp) -> MultiPolygon<f64> {
+        let surfaces: Vec<_> = fills(app)
+            .into_iter()
+            .filter(|v| v.fill == Some(red()))
+            .flat_map(|v| crate::brush::vector_fill_geometry(&v).0)
+            .collect();
+        MultiPolygon(surfaces)
+    }
+
+    #[test]
+    fn the_eyedropper_tells_an_outline_from_its_fill() {
+        let mut app = blank_app();
+        draw_rect(&mut app);
+        for (x, y, why) in [
+            (100.0, 150.0, "on the left edge"),
+            (103.0, 150.0, "just inside it"),
+            (97.0, 150.0, "just outside it"),
+            (150.0, 200.0, "on the bottom edge"),
+            (200.0, 200.0, "on a corner"),
+        ] {
+            assert!(
+                matches!(sample_at(&app, x, y), Some(SampledPaint::Stroke(_))),
+                "{why}: the outline"
+            );
+        }
+        assert!(matches!(
+            sample_at(&app, 150.0, 150.0),
+            Some(SampledPaint::Fill(_))
+        ));
+    }
+
+    #[test]
+    fn deleting_an_outline_leaves_its_fill_whole() {
+        let mut app = blank_app();
+        draw_rect(&mut app);
+        // A line across the fill, then the line and the outline deleted.
+        app.settings.aids.split_crossings = true;
+        draw_line(&mut app, (80.0, 150.0), (220.0, 150.0));
+        // The line's hairline cut is closed again once it is gone.
+        let before = 10_000.0;
+        let q0rg_id = app.session.current_q0rg_id;
+        for (x, y) in [(150.0, 150.0), (100.0, 120.0)] {
+            let Some(hit) = hit_test_raw_selection_cached_with_slop(
+                &app.state.project,
+                &mut app.textures,
+                q0rg_id,
+                0,
+                Vec2::new(x, y),
+                HitSlop::for_scale(1.0),
+            ) else {
+                continue;
+            };
+            app.session.selection = match hit {
+                RawSelectionHit::StrokePart(segment) => Selection::StrokeSegment(segment),
+                RawSelectionHit::Path(path) => Selection::RawParts {
+                    fills: Vec::new(),
+                    strokes: vec![path],
+                    stroke_segments: Vec::new(),
+                    objects: Vec::new(),
+                },
+                RawSelectionHit::Fill(refs) => Selection::Paths(refs),
+                RawSelectionHit::FillPart(refs) => Selection::RawParts {
+                    fills: refs,
+                    strokes: Vec::new(),
+                    stroke_segments: Vec::new(),
+                    objects: Vec::new(),
+                },
+            };
+            app.handle(
+                &egui::Context::default(),
+                crate::app::Action::DeleteSelection,
+            );
+        }
+        let surface = red_fill_surface(&app);
+        assert!(
+            (surface.unsigned_area() - before).abs() < 1.0,
+            "fill area {} became {}",
+            before,
+            surface.unsigned_area()
+        );
+        for (x, y) in [
+            (100.5, 150.0),
+            (150.0, 100.5),
+            (100.5, 100.5),
+            (199.5, 199.5),
+            (150.0, 150.0),
+            (150.0, 149.6),
+            (150.0, 150.4),
+        ] {
+            assert!(
+                surface.contains(&geo::Point::new(x, y)),
+                "a hole at ({x}, {y})"
+            );
+        }
+    }
+
+    #[test]
+    fn deleting_one_of_two_crossing_lines_keeps_the_other_cut() {
+        let mut app = blank_app();
+        draw_rect(&mut app);
+        app.settings.aids.split_crossings = true;
+        draw_line(&mut app, (80.0, 150.0), (220.0, 150.0));
+        draw_line(&mut app, (150.0, 80.0), (150.0, 220.0));
+        let pieces = red_fill_surface(&app).0.len();
+        assert_eq!(pieces, 4, "two lines part the fill in four");
+        let q0rg_id = app.session.current_q0rg_id;
+        // The crossing cut the horizontal line in two; each piece goes on
+        // its own and closes its own stretch of the cut.
+        for (x, pieces) in [(120.0, 3), (180.0, 2)] {
+            let hit = hit_test_raw_selection_cached_with_slop(
+                &app.state.project,
+                &mut app.textures,
+                q0rg_id,
+                0,
+                Vec2::new(x, 150.0),
+                HitSlop::for_scale(1.0),
+            );
+            let Some(RawSelectionHit::Path(path)) = hit else {
+                panic!("the horizontal line at {x}: {hit:?}");
+            };
+            app.session.selection = Selection::RawParts {
+                fills: Vec::new(),
+                strokes: vec![path],
+                stroke_segments: Vec::new(),
+                objects: Vec::new(),
+            };
+            app.handle(
+                &egui::Context::default(),
+                crate::app::Action::DeleteSelection,
+            );
+            assert_eq!(
+                red_fill_surface(&app).0.len(),
+                pieces,
+                "after the piece at {x}"
+            );
+        }
+        let surface = red_fill_surface(&app);
+        assert_eq!(surface.0.len(), 2, "left and right of the line that stays");
+        assert!(surface.contains(&geo::Point::new(120.0, 150.0)));
+        assert!(!surface.contains(&geo::Point::new(150.0, 120.0)));
+    }
+
+    #[test]
+    fn paint_does_not_join_a_gradient_that_falls_back_to_its_colour() {
+        let mut app = blank_app();
+        draw_rect(&mut app);
+        let gradient_id = fills(&app)
+            .iter()
+            .find(|v| v.fill == Some(red()))
+            .unwrap()
+            .asset_id;
+        let gradient = q0s_format::v2::GradientFill {
+            kind: q0s_format::v2::GradientKind::Linear,
+            stops: vec![
+                q0s_format::v2::GradientStop {
+                    position: 0.0,
+                    color: red(),
+                },
+                q0s_format::v2::GradientStop {
+                    position: 1.0,
+                    color: Rgba {
+                        r: 0,
+                        g: 0,
+                        b: 0,
+                        a: 255,
+                    },
+                },
+            ],
+            transform: Affine::IDENTITY,
+        };
+        app.state.project.asset_appearances.insert(
+            gradient_id,
+            q0s_format::v2::VectorAppearance {
+                fill_gradient: Some(gradient),
+                ..plain_appearance()
+            },
+        );
+        brush(&mut app, (180.0, 140.0, 260.0, 160.0), red());
+        let red_fills: Vec<_> = fills(&app)
+            .into_iter()
+            .filter(|v| v.fill == Some(red()))
+            .collect();
+        assert_eq!(
+            red_fills.len(),
+            2,
+            "the paint stays apart from the gradient"
+        );
+        assert_eq!(
+            red_fills
+                .iter()
+                .filter(|v| app
+                    .state
+                    .project
+                    .asset_appearances
+                    .get(&v.asset_id)
+                    .is_some_and(|a| a.fill_gradient.is_some()))
+                .count(),
+            1,
+            "the gradient keeps its gradient"
+        );
     }
 
     #[test]

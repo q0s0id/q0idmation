@@ -224,6 +224,9 @@ pub(crate) fn finish(app: &mut EditorApp, ui: &Ui, q0rg_id: u16) {
         .data_mut(|data| data.remove_temp(rows_id(q0rg_id)))
         .unwrap_or_default();
     let dragging: Option<u16> = ui.ctx().data(|data| data.get_temp(drag_id(q0rg_id)));
+    if dragging.is_some() {
+        crate::cursors::request(ui.ctx(), crate::cursors::CursorKind::ParentLink);
+    }
     let pending: Option<(u16, Option<u16>)> = ui
         .ctx()
         .data_mut(|data| data.remove_temp(pending_id(q0rg_id)));

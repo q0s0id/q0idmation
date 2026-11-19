@@ -15,6 +15,7 @@ pub(crate) mod color_panel;
 pub mod color_picker;
 pub(crate) mod color_picker_ui;
 mod crossings;
+pub mod cursors;
 pub(crate) mod dialog;
 mod discord;
 pub mod easing;

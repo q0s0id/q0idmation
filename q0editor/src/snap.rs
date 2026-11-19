@@ -535,6 +535,17 @@ fn leave_grips(project: &ProjectV2, leave: &Leave) -> Vec<Vec2> {
     grips
 }
 
+/// Whether something was snapped to in this paint pass: the next point or
+/// move lands on it.
+pub fn snapped_in(ctx_frame: u64) -> bool {
+    STATE.with(|state| {
+        state
+            .borrow()
+            .hint
+            .is_some_and(|(_, frame)| frame == ctx_frame)
+    })
+}
+
 /// A ring where the last snap landed, while it is fresh.
 pub fn paint_hint(app: &EditorApp, painter: &Painter, view: &StageView, ctx_frame: u64) {
     if !app.settings.aids.snap {

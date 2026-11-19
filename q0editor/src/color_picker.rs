@@ -278,7 +278,15 @@ pub(crate) fn finish_frame(ctx: &Context) {
                 .pointer_hover_pos()
                 .is_some_and(|point| !request.rect.contains(point))
         {
-            ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+            #[cfg(windows)]
+            let sample = pixel_under_pointer();
+            #[cfg(not(windows))]
+            let sample = None;
+            crate::cursors::request_with_sample(
+                ctx,
+                crate::cursors::CursorKind::ScreenPick,
+                sample,
+            );
         }
     }
 }

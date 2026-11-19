@@ -758,6 +758,17 @@ pub fn remove_materialized_paths_and_objects(
             .push(reference.path_idx);
     }
 
+    // Lines that go give back the hairline they parted fills along.
+    let mut deleted_lines: BTreeMap<(u16, u16), Vec<crate::crossings::StageLine>> = BTreeMap::new();
+    for reference in paths {
+        if let Some(line) = crate::crossings::stage_line(project, *reference) {
+            deleted_lines
+                .entry((reference.q0rg_id, reference.layer_id))
+                .or_default()
+                .push(line);
+        }
+    }
+
     let mut emptied_assets = BTreeSet::new();
     let mut changed = !objects.is_empty();
     for (asset_id, indices) in &mut by_asset {
@@ -827,6 +838,12 @@ pub fn remove_materialized_paths_and_objects(
     }
     if !emptied_assets.is_empty() {
         crate::tools::remove_assets_and_metadata(project, emptied_assets.iter().copied());
+    }
+    for ((q0rg_id, layer_id), lines) in deleted_lines {
+        let remaining = crate::crossings::stage_lines(project, q0rg_id, layer_id, frame);
+        crate::brush::heal_raw_fills_along_lines(
+            project, q0rg_id, layer_id, frame, &lines, &remaining,
+        );
     }
     for (q0rg_id, layer_id) in affected_layers {
         crate::tools::preserve_blank_keyframe_after_content_delete(

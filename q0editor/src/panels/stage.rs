@@ -336,6 +336,11 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
     let library_payload = response.dnd_hover_payload::<LibraryDragPayload>();
     let library_drag_active = library_payload.is_some();
     let ctx = ui.ctx().clone();
+    if library_payload.as_deref().is_some_and(|payload| {
+        !crate::panels::library::library_drag_item_is_audio_only(app, *payload)
+    }) {
+        crate::cursors::request(&ctx, crate::cursors::CursorKind::LibraryDrop);
+    }
     let camera_editing = app.camera_track_is_selected();
     if interactive && camera_editing && !library_drag_active && !editing_text {
         handle_camera_stage_input(app, &response, &view, &ctx);

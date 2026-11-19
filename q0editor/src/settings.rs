@@ -200,6 +200,13 @@ pub struct Theme {
     /// follows the base colours above; editing any stop pins them all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gradients: Option<ThemeGradients>,
+
+    // ----- Mouse pointers -----
+    /// The colours of the editor's own pointers. None follows the base
+    /// colours above; editing any of them pins them all. q0player has no
+    /// pointers of its own and skips them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursors: Option<CursorColors>,
 }
 
 /// Two colours a surface fades between, top to bottom.
@@ -254,6 +261,24 @@ impl From<q0theme::ChromeGradients> for ThemeGradients {
             selected: value.selected.into(),
         }
     }
+}
+
+/// The colours of the editor's own mouse pointers.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CursorColors {
+    /// The body of every pointer.
+    pub fill: ColorRgb,
+    /// The line around it, which keeps it readable on any background.
+    pub outline: ColorRgb,
+    /// Cuffs, pivots, ink, paint and ripples.
+    pub accent: ColorRgb,
+    /// How dark the drop shadow under a pointer is, 0 to 100.
+    #[serde(default = "default_cursor_shadow")]
+    pub shadow: u8,
+}
+
+fn default_cursor_shadow() -> u8 {
+    45
 }
 
 // Default-fns for the new fields. Backwards-compat hook: `#[serde(default)]`
@@ -318,6 +343,33 @@ impl Theme {
                 rgb(self.text),
             )
             .into()
+        })
+    }
+
+    /// The pointer colours: the pinned ones, or those that follow from the
+    /// base colours. Dark themes get light pointers with a dark rim, light
+    /// themes dark ones with a light rim, so a pointer reads on the chrome
+    /// and on the white stage alike.
+    pub fn cursor_colors(&self) -> CursorColors {
+        self.cursors.unwrap_or_else(|| {
+            let dark = (self.text.r as u16 + self.text.g as u16 + self.text.b as u16) > 384;
+            let white = ColorRgb::new(0xFF, 0xFF, 0xFF);
+            let black = ColorRgb::new(0x00, 0x00, 0x00);
+            if dark {
+                CursorColors {
+                    fill: blend(self.text, white, 0.6),
+                    outline: blend(self.deep_bg, black, 0.55),
+                    accent: self.accent,
+                    shadow: default_cursor_shadow(),
+                }
+            } else {
+                CursorColors {
+                    fill: blend(self.text, black, 0.45),
+                    outline: blend(self.panel, white, 0.75),
+                    accent: self.accent,
+                    shadow: 30,
+                }
+            }
         })
     }
 
@@ -441,6 +493,7 @@ impl Default for Theme {
             syntax_gutter_fg: default_syntax_gutter_fg(),
             syntax_current_line: default_syntax_current_line(),
             gradients: None,
+            cursors: None,
         }
     }
 }
@@ -1527,6 +1580,9 @@ pub struct Settings {
     /// Installed plugins that are on, and their settings.
     #[serde(default)]
     pub plugins: crate::plugins::PluginPrefs,
+    /// The editor's own mouse pointers and number-drag wrapping.
+    #[serde(default)]
+    pub cursors: crate::cursors::CursorSettings,
 }
 
 fn default_q0lang_font_name() -> String {
@@ -1616,6 +1672,7 @@ impl Default for Settings {
             light_enabled: false,
             sweeper: Default::default(),
             plugins: Default::default(),
+            cursors: Default::default(),
         }
     }
 }
