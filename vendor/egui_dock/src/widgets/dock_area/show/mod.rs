@@ -102,7 +102,7 @@ impl<'tree, Tab> DockArea<'tree, Tab> {
             }
         }
 
-        if ui.input(|i| i.pointer.primary_released()) {
+        if ui.input(|i| !i.pointer.primary_down()) {
             state.reset_drag();
         }
 

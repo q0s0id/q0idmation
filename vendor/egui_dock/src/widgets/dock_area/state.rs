@@ -6,6 +6,7 @@ use super::drag_and_drop::{DragData, DragDropState, HoverData};
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct State {
+    pub primary_tab_press: Option<(Id, Pos2)>,
     pub drag_start: Option<Pos2>,
     pub last_hover_pos: Option<Pos2>,
     pub dnd: Option<DragDropState>,
@@ -15,12 +16,7 @@ pub(super) struct State {
 impl State {
     #[inline(always)]
     pub(super) fn load(ctx: &Context, id: Id) -> Self {
-        ctx.data_mut(|d| d.get_temp(id)).unwrap_or(Self {
-            drag_start: None,
-            last_hover_pos: None,
-            dnd: None,
-            window_fade: None,
-        })
+        ctx.data_mut(|d| d.get_temp(id)).unwrap_or_default()
     }
 
     #[inline(always)]
@@ -32,6 +28,7 @@ impl State {
         self.dnd = None;
         self.window_fade = None;
         self.drag_start = None;
+        self.primary_tab_press = None;
     }
 
     pub(super) fn set_drag_and_drop(

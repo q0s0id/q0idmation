@@ -163,6 +163,7 @@ impl<'a, 'cache> Picker<'a, 'cache> {
             })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn visit_painted_layer(
         &mut self,
         symbol: &Q0rg,
@@ -237,6 +238,7 @@ impl<'a, 'cache> Picker<'a, 'cache> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn visit_layer(
         &mut self,
         q0rg_id: u16,

@@ -227,6 +227,7 @@ impl PixelCursor {
 
     /// An image file's pixels, shrunk to fit when bigger than the maker
     /// allows.
+    #[cfg(any(not(target_os = "android"), test))]
     pub(crate) fn from_image(image: &image::RgbaImage) -> Self {
         let (w, h) = image.dimensions();
         let image = if w as usize > MAX_SIDE || h as usize > MAX_SIDE {

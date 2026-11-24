@@ -192,11 +192,9 @@ impl VectorMeshBatch {
         stroke_scale_compensation: f32,
         color_transform: q0glblend::ColorTransform,
     ) -> bool {
-        let fill = vector.fill.filter(|_| tint.a() > 0).and_then(|color| {
-            textures
-                .vector_group_fill(vector)
-                .map(|cached| (color, cached))
-        });
+        let fill = vector.fill.filter(|_| tint.a() > 0);
+        let cached_fill = fill.and_then(|_| textures.vector_group_fill(vector));
+        let fill = fill.zip(cached_fill);
         let Some(stroke) = self.stroke_part(textures, vector, transform, stroke_scale_compensation)
         else {
             return false;

@@ -104,6 +104,85 @@ fn changed_asset_ids(before: &ProjectV2, restored: &ProjectV2) -> HashSet<u16> {
     changed
 }
 
+fn changed_timeline_ids(before: &ProjectV2, restored: &ProjectV2) -> HashSet<u16> {
+    let mut old: HashMap<_, _> = before
+        .q0rgs
+        .iter()
+        .map(|symbol| (symbol.q0rg_id, symbol))
+        .collect();
+    let mut changed: HashSet<_> = restored
+        .q0rgs
+        .iter()
+        .filter_map(|symbol| {
+            (old.remove(&symbol.q0rg_id) != Some(symbol)).then_some(symbol.q0rg_id)
+        })
+        .collect();
+    changed.extend(old.into_keys());
+    changed
+}
+
+fn affected_symbol_ids(
+    before: &ProjectV2,
+    restored: &ProjectV2,
+    changed_assets: &HashSet<u16>,
+    changed_timelines: &HashSet<u16>,
+) -> HashSet<u16> {
+    if before.meta != restored.meta
+        || before.runtime.scene3d != restored.runtime.scene3d
+        || before.runtime.layer_parents != restored.runtime.layer_parents
+    {
+        return before
+            .q0rgs
+            .iter()
+            .chain(&restored.q0rgs)
+            .map(|symbol| symbol.q0rg_id)
+            .collect();
+    }
+    let mut affected = changed_timelines.clone();
+    for key in before
+        .layer_metadata
+        .keys()
+        .chain(restored.layer_metadata.keys())
+    {
+        if before.layer_metadata.get(key) != restored.layer_metadata.get(key) {
+            affected.insert(key.q0rg_id);
+        }
+    }
+    for asset in before.assets.iter().chain(&restored.assets) {
+        if let Asset::Rig(rig) = asset {
+            if changed_assets.contains(&rig.asset_id) {
+                affected.insert(rig.owner_q0rg_id);
+            }
+        }
+    }
+
+    // A child's change can affect every symbol that contains it, but a move
+    // of one instance does not change the child's own outline or geometry.
+    let mut parents: HashMap<u16, HashSet<u16>> = HashMap::new();
+    for symbol in &restored.q0rgs {
+        for placement in symbol.layers.iter().flat_map(|layer| &layer.placements) {
+            match placement.target {
+                Target::Asset(id) if changed_assets.contains(&id) => {
+                    affected.insert(symbol.q0rg_id);
+                }
+                Target::Q0rg(id) => {
+                    parents.entry(id).or_default().insert(symbol.q0rg_id);
+                }
+                Target::Asset(_) => {}
+            }
+        }
+    }
+    let mut pending: Vec<_> = affected.iter().copied().collect();
+    while let Some(id) = pending.pop() {
+        for &parent in parents.get(&id).into_iter().flatten() {
+            if affected.insert(parent) {
+                pending.push(parent);
+            }
+        }
+    }
+    affected
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,83 +299,4 @@ mod tests {
             );
         });
     }
-}
-
-fn changed_timeline_ids(before: &ProjectV2, restored: &ProjectV2) -> HashSet<u16> {
-    let mut old: HashMap<_, _> = before
-        .q0rgs
-        .iter()
-        .map(|symbol| (symbol.q0rg_id, symbol))
-        .collect();
-    let mut changed: HashSet<_> = restored
-        .q0rgs
-        .iter()
-        .filter_map(|symbol| {
-            (old.remove(&symbol.q0rg_id) != Some(symbol)).then_some(symbol.q0rg_id)
-        })
-        .collect();
-    changed.extend(old.into_keys());
-    changed
-}
-
-fn affected_symbol_ids(
-    before: &ProjectV2,
-    restored: &ProjectV2,
-    changed_assets: &HashSet<u16>,
-    changed_timelines: &HashSet<u16>,
-) -> HashSet<u16> {
-    if before.meta != restored.meta
-        || before.runtime.scene3d != restored.runtime.scene3d
-        || before.runtime.layer_parents != restored.runtime.layer_parents
-    {
-        return before
-            .q0rgs
-            .iter()
-            .chain(&restored.q0rgs)
-            .map(|symbol| symbol.q0rg_id)
-            .collect();
-    }
-    let mut affected = changed_timelines.clone();
-    for key in before
-        .layer_metadata
-        .keys()
-        .chain(restored.layer_metadata.keys())
-    {
-        if before.layer_metadata.get(key) != restored.layer_metadata.get(key) {
-            affected.insert(key.q0rg_id);
-        }
-    }
-    for asset in before.assets.iter().chain(&restored.assets) {
-        if let Asset::Rig(rig) = asset {
-            if changed_assets.contains(&rig.asset_id) {
-                affected.insert(rig.owner_q0rg_id);
-            }
-        }
-    }
-
-    // A child's change can affect every symbol that contains it, but a move
-    // of one instance does not change the child's own outline or geometry.
-    let mut parents: HashMap<u16, HashSet<u16>> = HashMap::new();
-    for symbol in &restored.q0rgs {
-        for placement in symbol.layers.iter().flat_map(|layer| &layer.placements) {
-            match placement.target {
-                Target::Asset(id) if changed_assets.contains(&id) => {
-                    affected.insert(symbol.q0rg_id);
-                }
-                Target::Q0rg(id) => {
-                    parents.entry(id).or_default().insert(symbol.q0rg_id);
-                }
-                Target::Asset(_) => {}
-            }
-        }
-    }
-    let mut pending: Vec<_> = affected.iter().copied().collect();
-    while let Some(id) = pending.pop() {
-        for &parent in parents.get(&id).into_iter().flatten() {
-            if affected.insert(parent) {
-                pending.push(parent);
-            }
-        }
-    }
-    affected
 }

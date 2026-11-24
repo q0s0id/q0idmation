@@ -10380,7 +10380,7 @@ fn masked_fill_component(
         if polygon.contains(&point) {
             return Some(polygon.clone());
         }
-        if near.is_none() && slop > 0.0 && polygon_boundary_near_cursor(&polygon, cursor, slop) {
+        if near.is_none() && slop > 0.0 && polygon_boundary_near_cursor(polygon, cursor, slop) {
             near = Some(polygon);
         }
     }

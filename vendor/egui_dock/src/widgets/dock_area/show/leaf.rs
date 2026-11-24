@@ -218,11 +218,21 @@ impl<'tree, Tab> DockArea<'tree, Tab> {
                 .with((node_index, "node"))
                 .with((tab_index, "tab"));
             let tab_index = TabIndex(tab_index);
-            let is_being_dragged = tabs_ui.ctx().is_being_dragged(id)
-                && tabs_ui.input(|i| i.pointer.is_decidedly_dragging())
-                && self.draggable_tabs;
+            // egui 0.27 tracks one press origin across all mouse buttons.
+            // The tab belongs to the primary press even if a second button
+            // is pressed or released before or during the drag.
+            let is_being_dragged = self.draggable_tabs
+                && state.primary_tab_press.is_some_and(|(pressed, start)| {
+                    pressed == id
+                        && (state.drag_start.is_some()
+                            || tabs_ui
+                                .ctx()
+                                .pointer_interact_pos()
+                                .is_some_and(|pos| pos.distance(start) > 6.0))
+                });
 
             if is_being_dragged {
+                tabs_ui.ctx().set_dragged_id(id);
                 tabs_ui.output_mut(|o| o.cursor_icon = CursorIcon::Grabbing);
             }
 
@@ -313,6 +323,17 @@ impl<'tree, Tab> DockArea<'tree, Tab> {
                 );
                 let title_id = response.id;
                 let close_clicked = close_response.as_ref().is_some_and(|res| res.clicked());
+                if self.draggable_tabs
+                    && tabs_ui.input(|i| i.pointer.primary_pressed())
+                    && response.contains_pointer()
+                    && close_response
+                        .as_ref()
+                        .is_none_or(|button| !button.contains_pointer())
+                {
+                    if let Some(pos) = tabs_ui.ctx().pointer_interact_pos() {
+                        state.primary_tab_press = Some((id, pos));
+                    }
+                }
                 close = close_response;
                 let is_lonely_tab = self.dock_state[surface_index].num_tabs() == 1;
 
