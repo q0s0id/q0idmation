@@ -8,7 +8,27 @@ use egui::{pos2, Color32, Mesh, PaintCallback, Painter, Pos2, Rect, Shape, Textu
 use glow::HasContext as _;
 use q0s_format::v2::{BlendMode, GradientKind, GradientStop};
 
+#[cfg(not(target_arch = "wasm32"))]
+mod group_effects;
+#[cfg(not(target_arch = "wasm32"))]
+mod layer_opacity;
 mod lighting;
+#[cfg(not(target_arch = "wasm32"))]
+use layer_opacity::draw_framebuffer;
+#[cfg(not(target_arch = "wasm32"))]
+pub use layer_opacity::{begin_group_effects, begin_layer_masks, begin_layer_opacity};
+pub const GPU_LAYER_OPACITY: bool = !cfg!(target_arch = "wasm32");
+#[cfg(target_arch = "wasm32")]
+pub use web_mask::begin_layer_opacity;
+#[cfg(target_arch = "wasm32")]
+pub fn begin_group_effects(
+    _painter: &Painter,
+    _fx: q0s_format::v2::PlacementFx,
+    _scale: f32,
+) -> Option<()> {
+    None
+}
+pub mod raster_tiles;
 mod three;
 pub use three::paint_frame3d;
 mod stage3d;
@@ -45,6 +65,7 @@ fn mark_gl_unavailable(context_key: usize, error: &str) {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PaintDiagnostics {
     pub callbacks: u64,
+    pub layer_opacity_groups: u64,
     pub filtered_callbacks: u64,
     pub blur_passes: u64,
     pub glow_passes: u64,
@@ -55,7 +76,7 @@ pub struct PaintDiagnostics {
     pub max_filter_region_pixels: u64,
 }
 
-/// Asynchronous timing results for filtered vector-group paint callbacks.
+/// Asynchronous timing results for filtered GPU paint callbacks.
 /// GPU samples come from OpenGL timer queries and can arrive a frame later.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GpuCallbackTiming {
@@ -88,7 +109,7 @@ pub struct GpuCallbackTiming {
     pub filtered_cache_misses: u64,
 }
 
-/// Timer queries sample one of every sixteen filtered vector-group callbacks.
+/// Timer queries sample one of every sixteen filtered GPU callbacks.
 pub const GPU_FILTER_SAMPLE_STRIDE: u64 = 16;
 
 thread_local! {
@@ -230,6 +251,16 @@ fn record_paint_callback(painter: &Painter, rect: Rect, fx: Option<VectorGroupFx
         0
     };
     let filter_passes = blur_passes.saturating_add(glow_passes);
+    record_filter_work(painter, rect, blur_passes, glow_passes, filter_passes);
+}
+
+fn record_filter_work(
+    painter: &Painter,
+    rect: Rect,
+    blur_passes: u64,
+    glow_passes: u64,
+    filter_passes: u64,
+) {
     let clipped = rect.intersect(painter.clip_rect());
     let region_pixels = if clipped.is_positive() {
         (clipped.width().ceil().max(0.0) as u64)
@@ -472,6 +503,8 @@ struct GlResources {
     backdrop_uv_max_uniform: Option<glow::UniformLocation>,
     mode_uniform: Option<glow::UniformLocation>,
     passthrough_uniform: Option<glow::UniformLocation>,
+    source_mask_uniform: Option<glow::UniformLocation>,
+    source_mask_enabled_uniform: Option<glow::UniformLocation>,
     source_srgb_uniform: Option<glow::UniformLocation>,
     source_opacity_uniform: Option<glow::UniformLocation>,
     source_uv_min_uniform: Option<glow::UniformLocation>,
@@ -548,7 +581,6 @@ struct GlResources {
     mask_apply_program: glow::Program,
     mask_apply_source_uniform: Option<glow::UniformLocation>,
     mask_apply_mask_uniform: Option<glow::UniformLocation>,
-    mask_apply_size_uniform: Option<glow::UniformLocation>,
     filter_program: glow::Program,
     filter_source_uniform: Option<glow::UniformLocation>,
     filter_uv_max_uniform: Option<glow::UniformLocation>,
@@ -683,7 +715,7 @@ pub fn paint_solid_mesh_group_with_opacity_on_opaque_backdrop(
                 let Some(resources) = resources.get_mut(&context_key) else {
                     return;
                 };
-                resources.target_framebuffer = glow_painter.intermediate_fbo();
+                resources.target_framebuffer = draw_framebuffer(glow_painter);
                 unsafe {
                     resources.paint_solid_group(
                         gl,
@@ -904,7 +936,7 @@ pub fn paint_cached_mesh_affine_color(
                 let Some(resources) = resources.get_mut(&context_key) else {
                     return;
                 };
-                resources.target_framebuffer = glow_painter.intermediate_fbo();
+                resources.target_framebuffer = draw_framebuffer(glow_painter);
                 unsafe {
                     resources.paint_cached_mesh(
                         gl,
@@ -1506,7 +1538,7 @@ pub fn paint_vector_masked_placements_on_opaque_backdrop(
                 let Some(resources) = resources.get_mut(&context_key) else {
                     return;
                 };
-                resources.target_framebuffer = glow_painter.intermediate_fbo();
+                resources.target_framebuffer = draw_framebuffer(glow_painter);
                 unsafe {
                     resources.paint_vector_masked_placements(
                         glow_painter,
@@ -1610,7 +1642,7 @@ fn paint_vector_group_fx_impl(
                 let Some(resources) = resources.get_mut(&context_key) else {
                     return;
                 };
-                resources.target_framebuffer = glow_painter.intermediate_fbo();
+                resources.target_framebuffer = draw_framebuffer(glow_painter);
                 unsafe {
                     resources.paint_vector_group(
                         glow_painter,
@@ -1687,7 +1719,7 @@ pub fn paint_gradient_mesh(
                 let Some(resources) = resources.get_mut(&context_key) else {
                     return;
                 };
-                resources.target_framebuffer = glow_painter.intermediate_fbo();
+                resources.target_framebuffer = draw_framebuffer(glow_painter);
                 unsafe {
                     resources.paint_gradient(
                         gl,
@@ -1763,7 +1795,7 @@ pub fn paint_gradient_mesh_run(painter: &Painter, items: Vec<(Arc<Mesh>, Gradien
                 let Some(resources) = resources.get_mut(&context_key) else {
                     return;
                 };
-                resources.target_framebuffer = glow_painter.intermediate_fbo();
+                resources.target_framebuffer = draw_framebuffer(glow_painter);
                 unsafe {
                     resources.begin_screen_gradients(
                         gl,
@@ -1865,7 +1897,7 @@ fn paint_texture_impl(
                 let Some(resources) = resources.get_mut(&context_key) else {
                     return;
                 };
-                resources.target_framebuffer = glow_painter.intermediate_fbo();
+                resources.target_framebuffer = draw_framebuffer(glow_painter);
                 unsafe {
                     if fixed_opaque {
                         resources.paint_opaque_fixed(
@@ -1875,6 +1907,7 @@ fn paint_texture_impl(
                             region,
                             resources.source_srgb,
                             1.0,
+                            None,
                         );
                     } else {
                         resources.paint(
@@ -1884,6 +1917,7 @@ fn paint_texture_impl(
                             region,
                             resources.source_srgb,
                             1.0,
+                            None,
                         );
                     }
                 }
@@ -1986,6 +2020,8 @@ impl GlResources {
         let backdrop_uv_max_uniform = gl.get_uniform_location(program, "u_backdrop_uv_max");
         let mode_uniform = gl.get_uniform_location(program, "u_mode");
         let passthrough_uniform = gl.get_uniform_location(program, "u_passthrough");
+        let source_mask_uniform = gl.get_uniform_location(program, "u_source_mask");
+        let source_mask_enabled_uniform = gl.get_uniform_location(program, "u_source_mask_enabled");
         let source_srgb_uniform = gl.get_uniform_location(program, "u_source_srgb");
         let source_opacity_uniform = gl.get_uniform_location(program, "u_opacity");
         let source_uv_min_uniform = gl.get_uniform_location(program, "u_source_uv_min");
@@ -2116,7 +2152,6 @@ impl GlResources {
         let mask_apply_program = create_mask_apply_program(gl)?;
         let mask_apply_source_uniform = gl.get_uniform_location(mask_apply_program, "u_source");
         let mask_apply_mask_uniform = gl.get_uniform_location(mask_apply_program, "u_mask");
-        let mask_apply_size_uniform = gl.get_uniform_location(mask_apply_program, "u_texture_size");
         let filter_program = create_filter_program(gl)?;
         let filter_source_uniform = gl.get_uniform_location(filter_program, "u_source");
         let filter_uv_max_uniform = gl.get_uniform_location(filter_program, "u_uv_max");
@@ -2153,6 +2188,8 @@ impl GlResources {
             backdrop_uv_max_uniform,
             mode_uniform,
             passthrough_uniform,
+            source_mask_uniform,
+            source_mask_enabled_uniform,
             source_srgb_uniform,
             source_opacity_uniform,
             source_uv_min_uniform,
@@ -2222,7 +2259,6 @@ impl GlResources {
             mask_apply_program,
             mask_apply_source_uniform,
             mask_apply_mask_uniform,
-            mask_apply_size_uniform,
             filter_program,
             filter_source_uniform,
             filter_uv_max_uniform,
@@ -2900,9 +2936,28 @@ impl GlResources {
         let passes = usize::from(quality.clamp(1, 15));
         let (radii_x, _) = gaussian_box_radii(radius_points[0].max(0.0) * pixels_per_point, passes);
         let (radii_y, _) = gaussian_box_radii(radius_points[1].max(0.0) * pixels_per_point, passes);
+        self.box_blur_group_texture(
+            gl,
+            source,
+            source_size,
+            region,
+            &radii_x[..passes],
+            &radii_y[..passes],
+        )
+    }
+
+    unsafe fn box_blur_group_texture(
+        &mut self,
+        gl: &glow::Context,
+        source: glow::Texture,
+        source_size: (i32, i32),
+        region: CallbackRegion,
+        radii_x: &[i32],
+        radii_y: &[i32],
+    ) -> glow::Texture {
         let mut current = source;
         let mut current_size = source_size;
-        for index in 0..passes {
+        for (&x, &y) in radii_x.iter().zip(radii_y) {
             self.run_filter_pass(
                 gl,
                 current,
@@ -2910,7 +2965,7 @@ impl GlResources {
                 self.filter_fbos[0],
                 region,
                 [1.0, 0.0],
-                radii_x[index],
+                x,
             );
             current = self.filter_textures[0];
             current_size = self.filter_size;
@@ -2921,7 +2976,7 @@ impl GlResources {
                 self.filter_fbos[1],
                 region,
                 [0.0, 1.0],
-                radii_y[index],
+                y,
             );
             current = self.filter_textures[1];
         }
@@ -3198,9 +3253,9 @@ impl GlResources {
                     ..region
                 };
                 if fixed_opaque {
-                    self.paint_opaque_fixed(gl, texture, mode, cached_region, false, opacity);
+                    self.paint_opaque_fixed(gl, texture, mode, cached_region, false, opacity, None);
                 } else {
-                    self.paint(gl, texture, mode, cached_region, false, opacity);
+                    self.paint(gl, texture, mode, cached_region, false, opacity, None);
                 }
                 if let Some(started) = callback_cpu_started {
                     let nanoseconds = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
@@ -3636,9 +3691,9 @@ impl GlResources {
             ..region
         };
         if fixed_opaque {
-            self.paint_opaque_fixed(gl, source_texture, mode, group_region, false, opacity);
+            self.paint_opaque_fixed(gl, source_texture, mode, group_region, false, opacity, None);
         } else {
-            self.paint(gl, source_texture, mode, group_region, false, opacity);
+            self.paint(gl, source_texture, mode, group_region, false, opacity, None);
         }
         if let Some(index) = gpu_timer_query {
             self.gpu_filter_timer.end_sample(gl, index);
@@ -3730,11 +3785,6 @@ impl GlResources {
         gl.active_texture(glow::TEXTURE1);
         gl.bind_texture(glow::TEXTURE_2D, Some(mask));
         gl.uniform_1_i32(self.mask_apply_mask_uniform.as_ref(), 1);
-        gl.uniform_2_f32(
-            self.mask_apply_size_uniform.as_ref(),
-            self.filter_size.0 as f32,
-            self.filter_size.1 as f32,
-        );
         gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
         gl.disable(glow::SCISSOR_TEST);
     }
@@ -3835,6 +3885,7 @@ impl GlResources {
                     filtered_region,
                     false,
                     placement.opacity,
+                    None,
                 );
             } else {
                 self.paint(
@@ -3844,6 +3895,7 @@ impl GlResources {
                     filtered_region,
                     false,
                     placement.opacity,
+                    None,
                 );
             }
         }
@@ -3967,9 +4019,25 @@ impl GlResources {
             ..region
         };
         if fixed_opaque {
-            self.paint_opaque_fixed(gl, self.group_texture, mode, group_region, false, opacity);
+            self.paint_opaque_fixed(
+                gl,
+                self.group_texture,
+                mode,
+                group_region,
+                false,
+                opacity,
+                None,
+            );
         } else {
-            self.paint(gl, self.group_texture, mode, group_region, false, opacity);
+            self.paint(
+                gl,
+                self.group_texture,
+                mode,
+                group_region,
+                false,
+                opacity,
+                None,
+            );
         }
     }
 
@@ -3982,6 +4050,7 @@ impl GlResources {
         region: CallbackRegion,
         source_srgb: bool,
         opacity: f32,
+        mask: Option<glow::Texture>,
     ) {
         debug_assert!(
             mode == blend_mode_tag(BlendMode::Normal)
@@ -4019,6 +4088,13 @@ impl GlResources {
         gl.uniform_1_i32(self.source_uniform.as_ref(), 0);
         gl.uniform_1_i32(self.passthrough_uniform.as_ref(), 1);
         gl.uniform_1_i32(self.source_srgb_uniform.as_ref(), i32::from(source_srgb));
+        gl.active_texture(glow::TEXTURE2);
+        gl.bind_texture(glow::TEXTURE_2D, mask);
+        gl.uniform_1_i32(self.source_mask_uniform.as_ref(), 2);
+        gl.uniform_1_i32(
+            self.source_mask_enabled_uniform.as_ref(),
+            i32::from(mask.is_some()),
+        );
         gl.uniform_1_f32(
             self.source_opacity_uniform.as_ref(),
             opacity.clamp(0.0, 1.0),
@@ -4035,6 +4111,7 @@ impl GlResources {
         );
         gl.uniform_2_f32(self.backdrop_uv_max_uniform.as_ref(), 1.0, 1.0);
         gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+        gl.active_texture(glow::TEXTURE0);
     }
     #[allow(clippy::too_many_arguments)]
     unsafe fn paint(
@@ -4045,6 +4122,7 @@ impl GlResources {
         region: CallbackRegion,
         source_srgb: bool,
         opacity: f32,
+        mask: Option<glow::Texture>,
     ) {
         let read_framebuffer = self.target_framebuffer;
         let draw_framebuffer = self.target_framebuffer;
@@ -4134,6 +4212,13 @@ impl GlResources {
         );
         gl.uniform_1_i32(self.passthrough_uniform.as_ref(), 0);
         gl.uniform_1_i32(self.source_srgb_uniform.as_ref(), i32::from(source_srgb));
+        gl.active_texture(glow::TEXTURE2);
+        gl.bind_texture(glow::TEXTURE_2D, mask);
+        gl.uniform_1_i32(self.source_mask_uniform.as_ref(), 2);
+        gl.uniform_1_i32(
+            self.source_mask_enabled_uniform.as_ref(),
+            i32::from(mask.is_some()),
+        );
         gl.uniform_1_f32(
             self.source_opacity_uniform.as_ref(),
             opacity.clamp(0.0, 1.0),
@@ -4149,6 +4234,7 @@ impl GlResources {
             region.source_uv_max[1],
         );
         gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+        gl.active_texture(glow::TEXTURE0);
     }
 }
 
@@ -4177,6 +4263,8 @@ uniform sampler2D u_source;
 uniform sampler2D u_backdrop;
 uniform int u_mode;
 uniform int u_passthrough;
+uniform sampler2D u_source_mask;
+uniform int u_source_mask_enabled;
 uniform int u_source_srgb;
 uniform float u_opacity;
 in vec2 v_source_uv;
@@ -4225,7 +4313,9 @@ vec3 blend_rgb(vec3 back, vec3 src) {
 
 void main() {
     vec4 source = source_straight_gamma();
-    float sa = source.a * clamp(u_opacity, 0.0, 1.0);
+    float mask_alpha = u_source_mask_enabled == 0 ? 1.0
+        : texelFetch(u_source_mask, ivec2(gl_FragCoord.xy), 0).a;
+    float sa = source.a * clamp(u_opacity, 0.0, 1.0) * mask_alpha;
     if (sa <= 0.00001) discard;
     vec3 src = source.rgb;
     vec4 src_premul = vec4(src * sa, sa);
@@ -4672,12 +4762,11 @@ void main() {
     const FRAGMENT: &str = r#"#version 140
 uniform sampler2D u_source;
 uniform sampler2D u_mask;
-uniform vec2 u_texture_size;
 out vec4 out_color;
 void main() {
-    vec2 uv = gl_FragCoord.xy / u_texture_size;
-    vec4 content = texture(u_source, uv);
-    float mask_alpha = texture(u_mask, uv).a;
+    ivec2 pixel = ivec2(gl_FragCoord.xy);
+    vec4 content = texelFetch(u_source, pixel, 0);
+    float mask_alpha = texelFetch(u_mask, pixel, 0).a;
     out_color = content * mask_alpha;
 }
 "#;

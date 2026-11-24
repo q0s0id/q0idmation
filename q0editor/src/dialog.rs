@@ -710,54 +710,222 @@ pub(crate) enum Badge {
     Glyph(char),
 }
 
-/// A dialog's main message: a tinted badge, a headline, and quieter lines
-/// of detail under it.
-pub(crate) fn lead(ui: &mut Ui, tone: Tone, badge: Badge, headline: &str, detail: &[String]) {
+/// How long a dialog's badge takes to arrive.
+const BADGE_SECS: f32 = 0.45;
+
+/// How far a dialog's badge has arrived, 0 to 1, since the dialog `id`
+/// first showed. A dialog that went away starts over when it comes back.
+fn arrival(ui: &Ui, id: Id) -> f32 {
+    let ctx = ui.ctx();
+    let now = ctx.input(|input| input.time);
+    let frame = ctx.frame_nr();
+    let seen: Option<(f64, u64)> = ctx.data(|data| data.get_temp(id));
+    let since = match seen {
+        Some((since, last)) if last + 2 >= frame => since,
+        _ => now,
+    };
+    ctx.data_mut(|data| data.insert_temp(id, (since, frame)));
+    let t = ((now - since) as f32 / BADGE_SECS).clamp(0.0, 1.0);
+    if t < 1.0 {
+        ctx.request_repaint();
+    }
+    t
+}
+
+/// Past 1 and back: what pops in overshoots a little before it settles.
+fn ease_back(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    let back = 1.6;
+    1.0 + (back + 1.0) * (t - 1.0).powi(3) + back * (t - 1.0).powi(2)
+}
+
+/// A dialog's main message: a badge, a headline, and quieter lines of
+/// detail under it.
+///
+/// The badge is a tinted tile with the tone's picture drawn on it: a
+/// warning triangle, an "i", a bin, or any of the editor's icons. It pops
+/// in as the dialog opens and sends one ring out. `urge` (0 to 1) is how
+/// near the person is to the button that destroys something: the bin's lid
+/// lifts with it.
+pub(crate) fn lead(
+    ui: &mut Ui,
+    id: Id,
+    tone: Tone,
+    badge: Badge,
+    headline: &str,
+    detail: &[String],
+    urge: f32,
+) {
     let color = tone.color(ui);
+    let arrived = arrival(ui, id.with("dialog_badge_arrival"));
     ui.horizontal_top(|ui| {
-        let (rect, _) = ui.allocate_exact_size(Vec2::splat(38.0), Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(50.0), Sense::hover());
         if ui.is_rect_visible(rect) {
-            let center = rect.center();
-            ui.painter()
-                .circle_filled(center, 18.0, color.gamma_multiply(0.18));
-            ui.painter().circle_stroke(
-                center,
-                18.0,
-                Stroke::new(1.0_f32, color.gamma_multiply(0.55)),
-            );
-            match badge {
-                Badge::Icon(icon) => crate::ui::paint_icon(
-                    ui.painter(),
-                    Rect::from_center_size(center, Vec2::splat(18.0)),
-                    icon,
-                    color,
-                ),
-                Badge::Glyph(glyph) => {
-                    ui.painter().text(
-                        center,
-                        Align2::CENTER_CENTER,
-                        glyph,
-                        egui::FontId::proportional(20.0),
-                        color,
-                    );
-                }
-            }
+            paint_badge(ui.painter(), rect.center(), color, badge, arrived, urge);
         }
-        ui.add_space(6.0);
+        ui.add_space(10.0);
         ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 4.0;
-            ui.add_space(1.0);
+            ui.set_max_width(360.0);
+            ui.spacing_mut().item_spacing.y = 5.0;
+            ui.add_space(3.0);
             ui.label(
                 RichText::new(headline)
                     .strong()
-                    .size(15.0)
+                    .size(16.5)
                     .color(ui.visuals().strong_text_color()),
             );
             for line in detail {
-                ui.label(RichText::new(line).color(ui.visuals().weak_text_color()));
+                ui.label(
+                    RichText::new(line)
+                        .size(13.5)
+                        .color(ui.visuals().weak_text_color()),
+                );
             }
         });
     });
+}
+
+/// A dialog's badge at `center`: a rounded tile tinted with `color`, its
+/// picture on it. See [`lead`].
+fn paint_badge(
+    painter: &egui::Painter,
+    center: Pos2,
+    color: Color32,
+    badge: Badge,
+    arrived: f32,
+    urge: f32,
+) {
+    let pop = 0.6 + 0.4 * ease_back(arrived);
+    let half = 23.0 * pop;
+    let tile = Rect::from_center_size(center, Vec2::splat(half * 2.0));
+    // One ring goes out as it lands.
+    if arrived < 1.0 {
+        let ring = arrived;
+        painter.rect_stroke(
+            tile.expand(2.0 + 12.0 * ring),
+            15.0 + 6.0 * ring,
+            Stroke::new(2.0 * (1.0 - ring), color.gamma_multiply(0.7 * (1.0 - ring))),
+        );
+    }
+    painter.rect_filled(
+        tile.translate(vec2(0.0, 2.0)),
+        15.0,
+        Color32::from_black_alpha(40),
+    );
+    painter.rect_filled(tile, 15.0, color.gamma_multiply(0.16 + 0.08 * urge));
+    painter.rect_stroke(tile, 15.0, Stroke::new(1.0_f32, color.gamma_multiply(0.55)));
+    // A sheen across its top half.
+    painter.rect_filled(
+        Rect::from_min_max(
+            tile.min + vec2(3.0, 3.0),
+            pos2(tile.max.x - 3.0, tile.center().y),
+        ),
+        12.0,
+        Color32::from_white_alpha(10),
+    );
+    let unit = half / 23.0;
+    let stroke = Stroke::new(2.4 * unit, color);
+    match badge {
+        Badge::Glyph('!') => {
+            // A warning triangle, rounded at its corners, rocking once as it lands.
+            let rock = (1.0 - arrived) * (arrived * 14.0).sin() * 0.25;
+            let turn = |v: Vec2| {
+                let (sin, cos) = rock.sin_cos();
+                center + vec2(v.x * cos - v.y * sin, v.x * sin + v.y * cos) * unit
+            };
+            let corners = [vec2(0.0, -11.0), vec2(11.5, 8.5), vec2(-11.5, 8.5)];
+            let mut outline = Vec::new();
+            for index in 0..3 {
+                let at = corners[index];
+                let before = corners[(index + 2) % 3];
+                let after = corners[(index + 1) % 3];
+                outline.push(turn(at + (before - at).normalized() * 2.5));
+                outline.push(turn(at + (after - at).normalized() * 2.5));
+            }
+            painter.add(Shape::convex_polygon(
+                outline.clone(),
+                color.gamma_multiply(0.18),
+                Stroke::NONE,
+            ));
+            painter.add(Shape::closed_line(outline, stroke));
+            painter.line_segment([turn(vec2(0.0, -4.0)), turn(vec2(0.0, 2.0))], stroke);
+            painter.circle_filled(turn(vec2(0.0, 5.6)), 1.5 * unit, color);
+        }
+        Badge::Glyph('i') => {
+            painter.circle_stroke(center, 11.0 * unit, stroke);
+            painter.circle_filled(center + vec2(0.0, -5.0) * unit, 1.5 * unit, color);
+            painter.line_segment(
+                [
+                    center + vec2(0.0, -1.0) * unit,
+                    center + vec2(0.0, 6.0) * unit,
+                ],
+                stroke,
+            );
+        }
+        Badge::Icon(Icon::Delete) => paint_bin(painter, center, unit, color, arrived, urge),
+        Badge::Icon(icon) => crate::ui::paint_icon(
+            painter,
+            Rect::from_center_size(center, Vec2::splat(22.0 * unit)),
+            icon,
+            color,
+        ),
+        Badge::Glyph(glyph) => {
+            painter.text(
+                center,
+                Align2::CENTER_CENTER,
+                glyph,
+                egui::FontId::proportional(21.0 * unit),
+                color,
+            );
+        }
+    }
+}
+
+/// A bin: its body with three ribs, and a lid that hops as the dialog
+/// lands and lifts open (`urge`) while the pointer is on the button that
+/// throws things away.
+fn paint_bin(
+    painter: &egui::Painter,
+    center: Pos2,
+    unit: f32,
+    color: Color32,
+    arrived: f32,
+    urge: f32,
+) {
+    let stroke = Stroke::new(2.2 * unit, color);
+    let p = |x: f32, y: f32| center + vec2(x, y) * unit;
+    let body = vec![p(-7.5, -4.0), p(7.5, -4.0), p(6.0, 10.5), p(-6.0, 10.5)];
+    painter.add(Shape::convex_polygon(
+        body.clone(),
+        color.gamma_multiply(0.18),
+        Stroke::NONE,
+    ));
+    painter.add(Shape::closed_line(body, stroke));
+    for x in [-3.0, 0.0, 3.0] {
+        painter.line_segment(
+            [p(x, -0.5), p(x * 0.85, 7.5)],
+            Stroke::new(1.6 * unit, color),
+        );
+    }
+    // The lid turns open about its right end.
+    let hop = (1.0 - arrived) * (arrived * 12.0).sin().abs() * 0.35;
+    let open = 0.55 * urge + hop;
+    let hinge = p(9.0, -7.0);
+    let lid = |x: f32, y: f32| {
+        let v = vec2(x, y) * unit - vec2(9.0, -7.0) * unit;
+        let (sin, cos) = (-open).sin_cos();
+        hinge + vec2(v.x * cos - v.y * sin, v.x * sin + v.y * cos)
+    };
+    painter.line_segment([lid(-9.0, -7.0), lid(9.0, -7.0)], stroke);
+    painter.add(Shape::line(
+        vec![
+            lid(-3.0, -7.0),
+            lid(-3.0, -10.0),
+            lid(3.0, -10.0),
+            lid(3.0, -7.0),
+        ],
+        Stroke::new(2.0 * unit, color),
+    ));
 }
 
 /// How strongly a dialog button asks to be pressed.
@@ -970,16 +1138,33 @@ impl<'a> Confirm<'a> {
         if let Some(id) = self.id {
             dialog = dialog.id(id);
         }
+        // The bin's lid lifts while the pointer rests on a red button; last
+        // frame's word on that, as the badge is drawn before the buttons.
+        let urge_id = Id::new(("dialog_urge", self.title));
+        let urged: bool = ctx.data(|data| data.get_temp(urge_id)).unwrap_or(false);
+        let urge = ctx.animate_bool_with_time(urge_id.with("eased"), urged, 0.16);
+        let mut urging = false;
         dialog.show(ctx, |ui| {
-            lead(ui, self.tone, self.badge, &self.headline, &self.detail);
+            lead(
+                ui,
+                urge_id,
+                self.tone,
+                self.badge,
+                &self.headline,
+                &self.detail,
+                urge,
+            );
             footer(ui, |ui| {
                 for (index, (label, kind)) in self.actions.iter().enumerate() {
-                    if button(ui, label, *kind).clicked() {
+                    let response = button(ui, label, *kind);
+                    urging |= *kind == Kind::Danger && response.hovered();
+                    if response.clicked() {
                         chosen = Some(index);
                     }
                 }
             });
         });
+        ctx.data_mut(|data| data.insert_temp(urge_id, urging));
         if chosen.is_none() && !ctx.wants_keyboard_input() {
             let (escape, enter) = ctx.input(|input| {
                 (
@@ -1199,5 +1384,36 @@ mod tests {
         assert_eq!(inner, Some(None));
         assert!(painted_text(&output, "Rolled").is_some());
         assert!(painted_text(&output, "Hidden body").is_none());
+    }
+
+    #[test]
+    fn every_badge_draws_while_arriving_and_after() {
+        let ctx = Context::default();
+        let badges = [
+            Badge::Glyph('!'),
+            Badge::Glyph('i'),
+            Badge::Glyph('?'),
+            Badge::Icon(Icon::Delete),
+            Badge::Icon(Icon::Layer),
+        ];
+        for arrived in [0.0, 0.3, 1.0] {
+            for urge in [0.0, 1.0] {
+                let output = run(&ctx, vec![], |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        for badge in badges {
+                            paint_badge(
+                                ui.painter(),
+                                pos2(100.0, 100.0),
+                                DANGER,
+                                badge,
+                                arrived,
+                                urge,
+                            );
+                        }
+                    });
+                });
+                assert!(output.shapes.len() > badges.len());
+            }
+        }
     }
 }

@@ -20,11 +20,12 @@ pub(crate) fn plain_name(name: Option<&str>) -> bool {
 /// Whether asset `asset_id` is a plain drawing: a vector that is a graphic
 /// whenever it is not filed in a library folder.
 pub(crate) fn is_plain_drawing(project: &ProjectV2, asset_id: u16) -> bool {
-    project
-        .assets
-        .iter()
-        .any(|asset| matches!(asset, Asset::Vector(vector) if vector.asset_id == asset_id))
-        && plain_name(project.asset_names.get(&asset_id).map(String::as_str))
+    project.assets.iter().any(|asset| match asset {
+        Asset::Vector(vector) => vector.asset_id == asset_id,
+        // A raster layer's frames are its drawings, like raw vectors.
+        Asset::Raster(raster) => raster.asset_id == asset_id,
+        _ => false,
+    }) && plain_name(project.asset_names.get(&asset_id).map(String::as_str))
 }
 
 /// Graphics nothing in `project` uses: the ones a save leaves out.

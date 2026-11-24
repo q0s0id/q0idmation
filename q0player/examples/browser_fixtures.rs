@@ -169,6 +169,7 @@ fn main() {
         .unwrap();
         player.seek_to_frame(frame);
         let project = player.project_v2().unwrap();
+        let Rgba { r, g, b, a } = project.meta.background_color;
         let pixels = q0s_format::raster::rasterize_q0rg_frame_with_runtime_state(
             project,
             project.meta.entry_q0rg_id,
@@ -176,7 +177,7 @@ fn main() {
             320,
             200,
             1,
-            [255; 4],
+            [r, g, b, a],
             player.rig_runtime_overrides(),
             player.scene_runtime(),
         );

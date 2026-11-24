@@ -245,7 +245,8 @@ pub(crate) const ENTRIES: &[Entry] = &[
     // objects (fields and methods on handles, shown for the reference)
     value("obj.x", &[], "x of object", Cat::Objects, "An object's x; set it to move it. Also y, rotation, scale_x, scale_y, skew_x, skew_y, alpha."),
     value("obj.kind", &[], "kind of object", Cat::Objects, "drawing, bitmap, video, rig or symbol."),
-    value("obj.name", &[], "name of object", Cat::Objects, "The instance name q0lang uses; set it to rename."),
+    value("obj.name", &[], "name of object", Cat::Objects, "The instance name q0lang uses, or the library item's name while it has none; set it to rename."),
+    value("obj.instance_name", &[], "instance name of object", Cat::Objects, "Only the instance name q0lang uses: empty until one is given."),
     value("obj.raw", &[], "object as data", Cat::Objects, "Every detail of the object; set it to change any of them."),
     command("obj.move!", &["dx", "dy"], "move object by {dx} {dy}", Cat::Objects, "Moves an object."),
     command("obj.copy!", &["dx", "dy"], "copy object, shifted {dx} {dy}", Cat::Objects, "Copies an object and gives the copy back."),

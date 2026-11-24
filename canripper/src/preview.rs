@@ -336,6 +336,23 @@ fn preview_project_asset(
         .find(|asset| asset.id() == asset_id)
         .ok_or_else(|| format!("asset {asset_id} is missing"))?;
     match asset {
+        Asset::Raster(raster) => match raster.exact_bounds() {
+            Some(rect) => Ok(PreviewContent::Image {
+                width: rect.width() as usize,
+                height: rect.height() as usize,
+                rgba: raster.compose_straight(rect),
+                caption: format!(
+                    "raster drawing #{asset_id} • {}×{}",
+                    rect.width(),
+                    rect.height()
+                ),
+            }),
+            None => Ok(PreviewContent::Text {
+                text: format!("raster drawing #{asset_id}
+empty"),
+                caption: "raster drawing".to_string(),
+            }),
+        },
         Asset::Bitmap(bitmap) => Ok(PreviewContent::Image {
             width: usize::from(bitmap.width),
             height: usize::from(bitmap.height),

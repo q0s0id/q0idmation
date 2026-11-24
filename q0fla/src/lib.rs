@@ -858,8 +858,9 @@ fn import_dom_document(
                     Some(u16::try_from(parent_index + 1).map_err(|_| {
                         ImportError::Invalid("parent layer id overflow".to_string())
                     })?)
-                } else if parent.kind == LayerKind::Mask {
-                    // A masked layer sits in the folder its mask sits in.
+                } else {
+                    // A masked or guided layer sits in the folder its mask
+                    // or guide sits in.
                     parent
                         .parent_index
                         .filter(|index| {
@@ -868,12 +869,6 @@ fn import_dom_document(
                                 .is_some_and(|folder| folder.kind == LayerKind::Folder)
                         })
                         .and_then(|index| u16::try_from(index + 1).ok())
-                } else {
-                    warnings.push(format!(
-                        "layer '{}' points at non-folder parent index {}; parent relation was dropped",
-                        imported.name, parent_index
-                    ));
-                    None
                 }
             }
             Some(parent_index) => {
@@ -902,6 +897,8 @@ fn import_dom_document(
             locked: imported.locked,
             // Animate shows a locked mask's clipping; open it the same way.
             mask_preview: imported.kind == LayerKind::Mask && imported.locked,
+            raster: false,
+            fx: Default::default(),
         };
         if metadata != LayerMetadata::default() {
             layer_metadata.insert(LayerKey::new(1, layer_id), metadata);
@@ -1115,6 +1112,82 @@ mod tests {
     </DOMTimeline>
   </timelines>
 </DOMDocument>"##;
+
+    /// Layers in folders, on the stage and in a symbol, in an .fla the way
+    /// Animate writes it: plain layers, a mask with its masked layer, and a
+    /// guide with the layer it guides.
+    #[test]
+    fn fla_layers_stay_in_their_folders() {
+        const LAYERS: &str = r##"<layers>
+  <DOMLayer name="Folder" layerType="folder" open="true"/>
+  <DOMLayer name="Inner" layerType="folder" parentLayerIndex="0"/>
+  <DOMLayer name="Plain" parentLayerIndex="1"><frames><DOMFrame index="0"><elements><DOMShape><fills><FillStyle index="1"><SolidColor color="#ff0000"/></FillStyle></fills><edges><Edge fillStyle1="1" edges="!0 0|40 0|40 20|0 20|0 0"/></edges></DOMShape></elements></DOMFrame></frames></DOMLayer>
+  <DOMLayer name="Mask" layerType="mask" parentLayerIndex="0"><frames><DOMFrame index="0"><elements><DOMShape><fills><FillStyle index="1"><SolidColor color="#ff0000"/></FillStyle></fills><edges><Edge fillStyle1="1" edges="!0 0|40 0|40 20|0 20|0 0"/></edges></DOMShape></elements></DOMFrame></frames></DOMLayer>
+  <DOMLayer name="Masked" layerType="masked" parentLayerIndex="3"><frames><DOMFrame index="0"><elements><DOMShape><fills><FillStyle index="1"><SolidColor color="#00ff00"/></FillStyle></fills><edges><Edge fillStyle1="1" edges="!0 0|40 0|40 20|0 20|0 0"/></edges></DOMShape></elements></DOMFrame></frames></DOMLayer>
+  <DOMLayer name="Guide" layerType="guide" parentLayerIndex="0"><frames><DOMFrame index="0"/></frames></DOMLayer>
+  <DOMLayer name="Guided" layerType="guided" parentLayerIndex="5"><frames><DOMFrame index="0"><elements><DOMShape><fills><FillStyle index="1"><SolidColor color="#0000ff"/></FillStyle></fills><edges><Edge fillStyle1="1" edges="!0 0|40 0|40 20|0 20|0 0"/></edges></DOMShape></elements></DOMFrame></frames></DOMLayer>
+  <DOMLayer name="Outside"><frames><DOMFrame index="0"><elements><DOMSymbolInstance libraryItemName="Leaf" symbolType="graphic"/></elements></DOMFrame></frames></DOMLayer>
+</layers>"##;
+        let stage = format!(
+            r##"<?xml version="1.0" encoding="utf-8"?>
+<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="320" height="180" frameRate="24">
+  <timelines><DOMTimeline name="Scene 1">{LAYERS}</DOMTimeline></timelines>
+</DOMDocument>"##
+        );
+        let symbol = format!(
+            r##"<?xml version="1.0" encoding="utf-8"?>
+<DOMSymbolItem xmlns="http://ns.adobe.com/xfl/2008/" name="Leaf" symbolType="graphic">
+  <timeline><DOMTimeline name="Leaf">{}</DOMTimeline></timeline>
+</DOMSymbolItem>"##,
+            LAYERS.replace(
+                r#"<DOMSymbolInstance libraryItemName="Leaf" symbolType="graphic"/>"#,
+                ""
+            )
+        );
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file("DOMDocument.xml", FileOptions::default())
+            .unwrap();
+        writer.write_all(stage.as_bytes()).unwrap();
+        writer
+            .start_file("LIBRARY/Leaf.xml", FileOptions::default())
+            .unwrap();
+        writer.write_all(symbol.as_bytes()).unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let root = std::env::temp_dir().join(format!("q0fla-folder-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("folders.fla");
+        std::fs::write(&path, bytes).unwrap();
+        let imported = import_fla(&path).expect("import folder fla");
+        let _ = std::fs::remove_dir_all(&root);
+        let project = &imported.project;
+        assert_eq!(project.q0rgs.len(), 2, "the stage and the symbol");
+        for q0rg in &project.q0rgs {
+            let id_of = |name: &str| {
+                q0rg.layers
+                    .iter()
+                    .find(|layer| layer.name == name)
+                    .map(|layer| layer.layer_id)
+            };
+            let folder_of = |name: &str| {
+                id_of(name).and_then(|id| project.layer_metadata(q0rg.q0rg_id, id).parent_folder_id)
+            };
+            let names: Vec<_> = q0rg
+                .layers
+                .iter()
+                .map(|layer| layer.name.as_str())
+                .collect();
+            let outer = id_of("Folder").expect("the folder");
+            let inner = id_of("Inner").expect("the inner folder");
+            assert_eq!(folder_of("Inner"), Some(outer), "{}: {names:?}", q0rg.name);
+            assert_eq!(folder_of("Plain"), Some(inner), "{}: {names:?}", q0rg.name);
+            assert_eq!(folder_of("Mask"), Some(outer), "{}: {names:?}", q0rg.name);
+            assert_eq!(folder_of("Masked"), Some(outer), "{}: {names:?}", q0rg.name);
+            assert_eq!(folder_of("Guided"), Some(outer), "{}: {names:?}", q0rg.name);
+            assert_eq!(folder_of("Outside"), None, "{}: {names:?}", q0rg.name);
+        }
+    }
 
     #[test]
     fn basic_xfl_becomes_a_valid_q1s_project() {

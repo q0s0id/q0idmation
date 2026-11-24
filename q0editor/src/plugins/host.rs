@@ -1994,6 +1994,7 @@ impl q0ex::Host for EditorHost<'_> {
                             Ok(Asset::Q0v(_)) => "video",
                             Ok(Asset::Rig(_)) => "rig",
                             Ok(Asset::Model(_)) => "model",
+                            Ok(Asset::Raster(_)) => "raster",
                             Err(_) => "missing",
                         },
                     }),
@@ -2008,18 +2009,39 @@ impl q0ex::Host for EditorHost<'_> {
                     "layer" => layer_handle(q0rg_id, layer_id),
                     "timeline" => timeline_handle(q0rg_id),
                     "id" => Value::Num(f64::from(placement.instance_id)),
-                    "name" => {
+                    // Its instance name, or, while it has none, the name of
+                    // the library item it shows.
+                    "name" | "instance_name" => {
                         let key = q0s_format::v2::InstanceKey {
                             q0rg_id,
                             instance_id: placement.instance_id,
                         };
-                        self.app
-                            .state
-                            .project
-                            .runtime
-                            .instance_names
-                            .get(&key)
-                            .map_or(Value::str(""), Value::str)
+                        let own = (placement.instance_id != 0)
+                            .then(|| self.app.state.project.runtime.instance_names.get(&key))
+                            .flatten()
+                            .filter(|name| !name.is_empty());
+                        match (own, field) {
+                            (Some(name), _) => Value::str(name),
+                            (None, "instance_name") => Value::str(""),
+                            (None, _) => Value::str(match placement.target {
+                                Target::Q0rg(id) => self
+                                    .app
+                                    .state
+                                    .project
+                                    .q0rgs
+                                    .iter()
+                                    .find(|q0rg| q0rg.q0rg_id == id)
+                                    .map_or_else(String::new, |q0rg| q0rg.name.clone()),
+                                Target::Asset(id) => self
+                                    .app
+                                    .state
+                                    .project
+                                    .asset_names
+                                    .get(&id)
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            }),
+                        }
                     }
                     "selected" => Value::Bool(self.selection_refs().contains(&PlacementRef {
                         q0rg_id,
@@ -2030,7 +2052,7 @@ impl q0ex::Host for EditorHost<'_> {
                     "paths" => return self.drawing_paths(handle),
                     _ => {
                         return Err(format!(
-                            "an object has no `{field}`; it has x, y, rotation, scale_x, scale_y, skew_x, skew_y, alpha, frame, kind, asset, symbol, layer, timeline, id, name, selected, paths and raw"
+                            "an object has no `{field}`; it has x, y, rotation, scale_x, scale_y, skew_x, skew_y, alpha, frame, kind, asset, symbol, layer, timeline, id, name, instance_name, selected, paths and raw"
                         ))
                     }
                 })
@@ -2055,6 +2077,7 @@ impl q0ex::Host for EditorHost<'_> {
                         Asset::Q0v(_) => "video",
                         Asset::Rig(_) => "rig",
                         Asset::Model(_) => "model",
+                        Asset::Raster(_) => "raster",
                     }),
                     "width" => match asset {
                         Asset::Bitmap(bitmap) => Value::Num(f64::from(bitmap.width)),

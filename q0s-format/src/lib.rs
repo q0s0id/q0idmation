@@ -10,6 +10,7 @@ pub mod parenting;
 pub mod parser;
 pub mod particles;
 pub mod physics;
+pub mod pixels;
 pub mod q0lang;
 pub mod q0s_v2;
 pub mod q0s_writer;

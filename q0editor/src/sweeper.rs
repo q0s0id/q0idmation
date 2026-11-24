@@ -3,8 +3,10 @@
 //! q0editor demon where the smiley used to be.
 //!
 //! The way in: in the credits, knock on the "q0" mark six times, then six
-//! more, then six more, a short breath between each six. Every six grows
-//! the mark a horn; the third opens the game. Unlocked, it stays under Help.
+//! more, then six more, a short breath between each six. A pip lights for
+//! every knock; every six grows the mark a horn and warms it; the third
+//! burns it purple and the demon climbs out, opening the game. Unlocked, it
+//! stays under Help.
 
 use std::time::{Duration, Instant};
 
@@ -319,6 +321,11 @@ impl Board {
 const KNOCK_GROUP_GAP: f32 = 0.42;
 /// A longer breath than this between sixes starts over.
 const KNOCK_MAX_PAUSE: f32 = 2.4;
+/// From the last knock to the game: the mark burns, shakes and lets the
+/// demon out.
+const SUMMON_SECS: f32 = 1.6;
+/// How long a slip takes to fall away.
+const FIZZLE_SECS: f32 = 0.5;
 
 /// The secret knock on the credits' "q0" mark: three sixes.
 #[derive(Debug, Default)]
@@ -333,11 +340,18 @@ pub struct Knock {
     /// Recent knocks, for their ripples.
     ripples: Vec<Instant>,
     hover_since: Option<Instant>,
+    /// The third six landed: the summoning plays out from here.
+    summoned: Option<Instant>,
+    /// A six that went wrong, and how many knocks it had, falling away.
+    fizzled: Option<(Instant, u32)>,
 }
 
 impl Knock {
     /// A knock; true when it completes the third six.
     pub fn knock(&mut self, now: Instant) -> bool {
+        if self.summoned.is_some() {
+            return false;
+        }
         self.settle(now);
         self.group += 1;
         self.last = Some(now);
@@ -345,11 +359,13 @@ impl Knock {
             .retain(|at| now.duration_since(*at).as_secs_f32() < 0.4);
         self.ripples.push(now);
         if self.group > 6 {
+            self.fizzled = Some((now, 6));
             self.reset();
             return false;
         }
         if self.sixes == 2 && self.group == 6 {
             self.reset();
+            self.summoned = Some(now);
             return true;
         }
         false
@@ -367,12 +383,14 @@ impl Knock {
                 self.grown_at[self.sixes as usize] = Some(now);
                 self.sixes += 1;
             } else {
+                self.fizzled = Some((now, self.group.min(6)));
                 self.sixes = 0;
                 self.grown_at = [None; 2];
             }
             self.group = 0;
         }
         if self.group == 0 && self.sixes > 0 && quiet > KNOCK_MAX_PAUSE {
+            self.fizzled = Some((now, 0));
             self.sixes = 0;
             self.grown_at = [None; 2];
         }
@@ -384,20 +402,63 @@ impl Knock {
         self.grown_at = [None; 2];
     }
 
-    fn busy(&self) -> bool {
-        self.group > 0 || self.sixes > 0 || !self.ripples.is_empty()
+    fn busy(&self, now: Instant) -> bool {
+        self.group > 0
+            || self.sixes > 0
+            || !self.ripples.is_empty()
+            || self.summoned.is_some()
+            || self
+                .fizzled
+                .is_some_and(|(at, _)| now.duration_since(at).as_secs_f32() < FIZZLE_SECS)
+    }
+
+    /// How far the summoning has got, 0 to 1.
+    fn summoning(&self, now: Instant) -> Option<f32> {
+        self.summoned
+            .map(|at| (now.duration_since(at).as_secs_f32() / SUMMON_SECS).min(1.0))
+    }
+}
+
+/// How the credits draw their "q0" mark for the knock so far: squashed by
+/// the last knock and springing back, warmer with every horn, shaking and
+/// burning purple while the demon is summoned.
+pub(crate) fn mark_look(knock: &Knock, now: Instant) -> q0credits::MarkLook {
+    let since = |at: Option<Instant>| at.map(|at| now.duration_since(at).as_secs_f32());
+    let press = since(knock.last).map_or(0.0, |t| {
+        // Flat at once, then back through a little overshoot.
+        (-14.0 * t).exp() * (24.0 * t).cos()
+    });
+    let mut heat = knock.sixes as f32 * 0.28 + knock.group as f32 * 0.025;
+    let mut shake = [0.0, 0.0];
+    let mut dim = knock.sixes as f32 * 0.06;
+    if let Some(t) = knock.summoning(now) {
+        heat = 0.56 + 0.44 * t.min(0.6) / 0.6;
+        let strength = 3.0 * (t / 0.55).min(1.0) * (1.0 - ((t - 0.55) / 0.45).max(0.0));
+        let clock = since(knock.summoned).unwrap_or(0.0);
+        shake = [
+            (clock * 71.0).sin() * strength,
+            (clock * 53.0).cos() * strength * 0.6,
+        ];
+        dim = dim.max(0.12 + 0.3 * t);
+    }
+    q0credits::MarkLook {
+        press: press * if knock.summoned.is_some() { 0.4 } else { 1.0 },
+        heat,
+        shake,
+        dim,
     }
 }
 
 /// Listens for the knock on `mark`, the credits' "q0" square, and draws
-/// its horns and ripples. True when the knock opens the game.
+/// what it does: a pip lights for every knock of the six going on, a horn
+/// grows from every six, and the third six summons the demon out of the
+/// mark. True once the summoning is over and the game should open.
 pub(crate) fn knock_on_mark(knock: &mut Knock, ui: &mut Ui, mark: Rect) -> bool {
     let now = Instant::now();
     let response = ui.interact(mark, Id::new("q0sweeper_knock"), Sense::click());
     knock.settle(now);
-    let mut opened = false;
     if response.clicked() {
-        opened = knock.knock(now);
+        knock.knock(now);
     }
     if response.hovered() {
         let since = *knock.hover_since.get_or_insert(now);
@@ -410,33 +471,120 @@ pub(crate) fn knock_on_mark(knock: &mut Knock, ui: &mut Ui, mark: Rect) -> bool 
         knock.hover_since = None;
     }
     let painter = ui.painter().clone();
-    // Horns that grew from finished sixes.
-    for (index, grown) in knock.grown_at.iter().enumerate() {
-        let Some(grown) = grown else {
-            continue;
-        };
-        let t = (now.duration_since(*grown).as_secs_f32() / 0.22).clamp(0.0, 1.0);
-        let pop = 1.0 + (1.0 - t) * 0.6 * (t * std::f32::consts::PI).sin();
+    let summoning = knock.summoning(now);
+    let shake = {
+        let look = mark_look(knock, now);
+        vec2(look.shake[0], look.shake[1])
+    };
+    let mark = mark.translate(shake);
+
+    // Six pips in an arc over the mark: one lights with every knock.
+    if summoning.is_none() {
+        for pip in 0..6 {
+            let angle = std::f32::consts::PI * (1.15 + 0.7 * pip as f32 / 5.0);
+            let at = mark.center() + vec2(angle.cos(), angle.sin()) * (mark.width() * 0.5 + 12.0);
+            let lit = pip < knock.group;
+            let pop = knock
+                .ripples
+                .last()
+                .filter(|_| pip + 1 == knock.group)
+                .map_or(1.0, |at| {
+                    let t = (now.duration_since(*at).as_secs_f32() / 0.18).min(1.0);
+                    1.0 + 0.8 * (1.0 - t)
+                });
+            if lit {
+                painter.circle_filled(
+                    at,
+                    3.4 * pop,
+                    Color32::from_rgba_unmultiplied(157, 78, 255, 70),
+                );
+                painter.circle_filled(at, 2.2 * pop, DEMON_LIGHT);
+            } else if knock.group > 0 || knock.sixes > 0 {
+                painter.circle_stroke(
+                    at,
+                    2.0,
+                    Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(157, 78, 255, 120)),
+                );
+            }
+        }
+    }
+    // A slip: its pips go grey and fall away.
+    if let Some((at, count)) = knock.fizzled {
+        let t = now.duration_since(at).as_secs_f32() / FIZZLE_SECS;
+        if t < 1.0 {
+            for pip in 0..count {
+                let angle = std::f32::consts::PI * (1.15 + 0.7 * pip as f32 / 5.0);
+                let from =
+                    mark.center() + vec2(angle.cos(), angle.sin()) * (mark.width() * 0.5 + 12.0);
+                let drop = vec2((pip as f32 - 2.5) * 6.0 * t, 40.0 * t * t);
+                painter.circle_filled(
+                    from + drop,
+                    2.2,
+                    Color32::from_rgba_unmultiplied(150, 150, 150, (200.0 * (1.0 - t)) as u8),
+                );
+            }
+        } else {
+            knock.fizzled = None;
+        }
+    }
+
+    // Horns from finished sixes: curved, and they flare while summoning.
+    let flare = summoning.map_or(0.0, |t| (t / 0.5).min(1.0));
+    let grown: Vec<(usize, f32)> = if summoning.is_some() {
+        vec![(0, 1.0), (1, 1.0)]
+    } else {
+        knock
+            .grown_at
+            .iter()
+            .enumerate()
+            .filter_map(|(index, grown)| {
+                grown.map(|grown| {
+                    (
+                        index,
+                        (now.duration_since(grown).as_secs_f32() / 0.24).min(1.0),
+                    )
+                })
+            })
+            .collect()
+    };
+    for (index, t) in grown {
+        let pop = 1.0 + (1.0 - t) * 0.7 * (t * std::f32::consts::PI).sin();
         let side = if index == 0 { -1.0 } else { 1.0 };
         let base = if index == 0 {
-            mark.left_top() + vec2(7.0, 2.0)
+            mark.left_top() + vec2(9.0, 3.0)
         } else {
-            mark.right_top() + vec2(-7.0, 2.0)
+            mark.right_top() + vec2(-9.0, 3.0)
         };
-        let height = 13.0 * t * pop;
-        let tip = base + vec2(side * 5.0 * t, -height);
+        let height = (14.0 + 6.0 * flare) * t * pop;
+        // Leaning out, its outer edge bowed: the curve of a horn, kept
+        // convex so it fills cleanly.
+        let outer = base + vec2(side * 4.5, 0.0);
+        let inner = base - vec2(side * 4.5, 0.0);
+        let tip = base + vec2(side * 8.0, -height);
+        let bow = outer + (tip - outer) * 0.5 + vec2(side * 2.5, 0.0);
+        let horn = vec![inner, outer, bow, tip];
+        let color = if flare > 0.0 {
+            Color32::from_rgb(
+                (157.0 + 98.0 * flare) as u8,
+                (78.0 + 20.0 * flare) as u8,
+                (255.0 - 60.0 * flare) as u8,
+            )
+        } else {
+            DEMON
+        };
         painter.add(egui::Shape::convex_polygon(
-            vec![base + vec2(-4.0, 0.0), tip, base + vec2(4.0, 0.0)],
-            DEMON,
+            horn,
+            color,
             Stroke::new(1.0_f32, DEMON_DARK),
         ));
     }
+
     for at in &knock.ripples {
         let t = now.duration_since(*at).as_secs_f32() / 0.35;
         if t < 1.0 {
             painter.rect_stroke(
                 mark.expand(2.0 + 9.0 * t),
-                9.0,
+                11.0,
                 Stroke::new(
                     2.0 * (1.0 - t),
                     Color32::from_rgba_unmultiplied(170, 90, 255, (200.0 * (1.0 - t)) as u8),
@@ -447,10 +595,177 @@ pub(crate) fn knock_on_mark(knock: &mut Knock, ui: &mut Ui, mark: Rect) -> bool 
     knock
         .ripples
         .retain(|at| now.duration_since(*at).as_secs_f32() < 0.35);
-    if knock.busy() {
-        ui.ctx().request_repaint_after(Duration::from_millis(16));
+
+    // The summoning: rings pour out of the burning mark, sparks fly, and
+    // the demon rises out of it before the game opens.
+    let mut opened = false;
+    if let Some(t) = summoning {
+        for ring in 0..3 {
+            let r = ((t * 1.6 - ring as f32 * 0.2).rem_euclid(1.0)).clamp(0.0, 1.0);
+            painter.circle_stroke(
+                mark.center(),
+                mark.width() * 0.6 + 60.0 * r,
+                Stroke::new(
+                    2.0 * (1.0 - r),
+                    Color32::from_rgba_unmultiplied(
+                        170,
+                        90,
+                        255,
+                        (180.0 * (1.0 - r) * (1.0 - t * 0.5)) as u8,
+                    ),
+                ),
+            );
+        }
+        for spark in 0..14 {
+            let angle = spark as f32 * 2.399 + t * 2.0;
+            let reach =
+                (mark.width() * 0.5 + 70.0 * t) * (0.6 + 0.4 * ((spark * 7) % 5) as f32 / 4.0);
+            let at = mark.center() + vec2(angle.cos(), angle.sin()) * reach;
+            painter.circle_filled(
+                at,
+                1.6 * (1.0 - t) + 0.4,
+                Color32::from_rgba_unmultiplied(226, 196, 255, (230.0 * (1.0 - t)) as u8),
+            );
+        }
+        // The demon climbs out with an overshoot, its shades drop onto its
+        // face, and a glint runs across them.
+        let rise = ((t - 0.3) / 0.3).clamp(0.0, 1.0);
+        if rise > 0.0 {
+            let pop = ease_back(rise);
+            let size = mark.width() * (0.7 + 1.0 * pop);
+            let at = mark.center() - vec2(0.0, 22.0 * pop);
+            let shades = ease_back(((t - 0.58) / 0.18).clamp(0.0, 1.0));
+            let glint = ((t - 0.8) / 0.16).clamp(0.0, 1.0);
+            paint_cool_demon(&painter, at, size, shades, glint);
+        }
+        if t >= 1.0 {
+            knock.summoned = None;
+            opened = true;
+        }
+    }
+    if knock.busy(now) {
+        ui.ctx().request_repaint();
     }
     opened
+}
+
+/// Past 1 and back: what pops in overshoots a little before it settles.
+fn ease_back(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    let back = 1.7;
+    1.0 + (back + 1.0) * (t - 1.0).powi(3) + back * (t - 1.0).powi(2)
+}
+
+/// The demon the credits summon, drawn smooth at any size: a purple-rimmed
+/// head with curling horns and a heart on its brow, a lopsided grin, and
+/// shades that drop down onto its eyes (`shades`, 0 above its head, 1 on)
+/// and catch the light (`glint`, a sweep across from 0 to 1).
+fn paint_cool_demon(painter: &Painter, at: Pos2, size: f32, shades: f32, glint: f32) {
+    let r = size * 0.5;
+    let outline = Stroke::new((r * 0.06).max(1.0), DEMON_DARK);
+    for side in [-1.0_f32, 1.0] {
+        let base_in = at + vec2(side * r * 0.32, -r * 0.88);
+        let base_out = at + vec2(side * r * 0.78, -r * 0.45);
+        let tip = at + vec2(side * r * 1.05, -r * 1.45);
+        let bow = base_out + (tip - base_out) * 0.5 + vec2(side * r * 0.14, 0.0);
+        let mut horn = vec![base_in, base_out, bow, tip];
+        if side > 0.0 {
+            // Mirrored, it runs the other way round; keep both the same.
+            horn.reverse();
+        }
+        painter.add(egui::Shape::convex_polygon(horn, DEMON, outline));
+    }
+    painter.circle_filled(
+        at + vec2(0.0, r * 0.08),
+        r * 1.04,
+        Color32::from_black_alpha(70),
+    );
+    // The rim, darker along its underside, and the face inside it.
+    painter.circle_filled(at + vec2(0.0, r * 0.05), r, DEMON_DARK);
+    painter.circle_filled(at - vec2(0.0, r * 0.02), r * 0.97, DEMON);
+    painter.circle_filled(at + vec2(0.0, r * 0.04), r * 0.76, DEMON_FACE);
+    // The heart on its brow.
+    let heart = at + vec2(0.0, -r * 0.5);
+    let lobe = r * 0.075;
+    painter.circle_filled(heart + vec2(-lobe * 0.9, 0.0), lobe, DEMON);
+    painter.circle_filled(heart + vec2(lobe * 0.9, 0.0), lobe, DEMON);
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            heart + vec2(-lobe * 1.85, lobe * 0.3),
+            heart + vec2(lobe * 1.85, lobe * 0.3),
+            heart + vec2(0.0, lobe * 2.3),
+        ],
+        DEMON,
+        Stroke::NONE,
+    ));
+    // Eyes, until the shades come down over them.
+    for side in [-1.0_f32, 1.0] {
+        painter.add(egui::Shape::ellipse_filled(
+            at + vec2(side * r * 0.3, -r * 0.02),
+            vec2(r * 0.07, r * 0.12),
+            DEMON_LIGHT,
+        ));
+    }
+    // The grin, higher on one side.
+    painter.add(egui::epaint::QuadraticBezierShape::from_points_stroke(
+        [
+            at + vec2(-r * 0.3, r * 0.33),
+            at + vec2(r * 0.02, r * 0.6),
+            at + vec2(r * 0.36, r * 0.26),
+        ],
+        false,
+        Color32::TRANSPARENT,
+        Stroke::new((r * 0.07).max(1.0), DEMON_LIGHT),
+    ));
+    if shades <= 0.0 {
+        return;
+    }
+    // The shades: dropped from above the horns onto the eyes.
+    let drop = (1.0 - shades) * -r * 1.6;
+    let lens_size = vec2(r * 0.6, r * 0.36);
+    let rim = Stroke::new((r * 0.045).max(1.0), Color32::from_gray(45));
+    let fade = shades.min(1.0);
+    let glass = Color32::from_rgba_unmultiplied(12, 8, 18, (255.0 * fade) as u8);
+    let mut lenses = Vec::new();
+    for side in [-1.0_f32, 1.0] {
+        let lens = Rect::from_center_size(at + vec2(side * r * 0.35, -r * 0.03 + drop), lens_size);
+        painter.rect(lens, r * 0.13, glass, rim);
+        // Its arm, back toward the side of the head.
+        painter.line_segment(
+            [
+                pos2(
+                    if side < 0.0 {
+                        lens.left()
+                    } else {
+                        lens.right()
+                    },
+                    lens.top() + r * 0.05,
+                ),
+                at + vec2(side * r * 0.74, -r * 0.12 + drop),
+            ],
+            rim,
+        );
+        lenses.push(lens);
+    }
+    painter.line_segment(
+        [
+            pos2(lenses[0].right(), lenses[0].top() + r * 0.07),
+            pos2(lenses[1].left(), lenses[1].top() + r * 0.07),
+        ],
+        Stroke::new((r * 0.06).max(1.0), Color32::from_gray(45)),
+    );
+    if glint > 0.0 && glint < 1.0 {
+        for lens in &lenses {
+            let x = lens.left() - lens.width() * 0.3 + lens.width() * 1.6 * glint;
+            painter.with_clip_rect(lens.shrink(1.0)).line_segment(
+                [
+                    pos2(x - r * 0.12, lens.bottom()),
+                    pos2(x + r * 0.12, lens.top()),
+                ],
+                Stroke::new(r * 0.09, Color32::from_white_alpha(170)),
+            );
+        }
+    }
 }
 
 // --------------------------------------------------------------------- game
@@ -1788,5 +2103,40 @@ mod tests {
                 assert_ne!(faces[a], faces[b]);
             }
         }
+    }
+
+    #[test]
+    fn the_mark_warms_with_every_six_and_burns_while_the_demon_is_summoned() {
+        let start = Instant::now();
+        let mut knock = Knock::default();
+        let cold = mark_look(&knock, start);
+        assert_eq!(cold.heat, 0.0);
+        let mut at = start;
+        for _ in 0..6 {
+            at += Duration::from_millis(150);
+            knock.knock(at);
+        }
+        at += Duration::from_millis(800);
+        knock.settle(at);
+        let warm = mark_look(&knock, at);
+        assert!(warm.heat > cold.heat, "a horn warms it");
+        assert!(warm.dim > 0.0);
+
+        // A slip of five is remembered, so its pips can fall away.
+        for _ in 0..5 {
+            at += Duration::from_millis(150);
+            knock.knock(at);
+        }
+        at += Duration::from_millis(800);
+        knock.settle(at);
+        assert_eq!(knock.fizzled.map(|(_, count)| count), Some(5));
+
+        // The third six: the summoning burns it and dims the rest, then ends.
+        knock.summoned = Some(at);
+        let burning = mark_look(&knock, at + Duration::from_millis(1000));
+        assert!(burning.heat > 0.99, "{burning:?}");
+        assert!(burning.dim > 0.2);
+        assert_eq!(knock.summoning(at + Duration::from_secs(2)), Some(1.0));
+        assert!(!knock.knock(at), "no knocking through a summoning");
     }
 }

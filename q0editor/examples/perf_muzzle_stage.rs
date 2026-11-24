@@ -156,6 +156,7 @@ fn q0rg_plain_support(
                         q0s_format::v2::Asset::Q0v(v) => v.asset_id == id,
                         q0s_format::v2::Asset::Rig(v) => v.asset_id == id,
                         q0s_format::v2::Asset::Model(v) => v.asset_id == id,
+                        q0s_format::v2::Asset::Raster(v) => v.asset_id == id,
                     }) else {
                         return false;
                     };
@@ -283,6 +284,7 @@ fn q0rg_complex_flags(
                         q0s_format::v2::Asset::Q0v(v) => v.asset_id == id,
                         q0s_format::v2::Asset::Rig(v) => v.asset_id == id,
                         q0s_format::v2::Asset::Model(v) => v.asset_id == id,
+                        q0s_format::v2::Asset::Raster(v) => v.asset_id == id,
                     }) {
                         match a {
                             q0s_format::v2::Asset::Vector(v) => {

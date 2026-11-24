@@ -272,7 +272,16 @@ fn convert_to_q0rg_keeps_vector_appearance_attached_to_the_asset() {
 
     invoke_convert(&mut app);
 
-    assert_eq!(app.state.project.asset_appearances[&asset_id], appearance);
+    // The appearance stays with its drawing, moved with it into the symbol.
+    let kept = &app.state.project.asset_appearances[&asset_id];
+    assert_eq!(kept.material, appearance.material);
+    assert_eq!(
+        kept.erase_mask,
+        vec![moved_into_symbol(
+            &appearance.erase_mask[0],
+            registration(&app)
+        )]
+    );
     let outer = app
         .state
         .project
@@ -1008,7 +1017,8 @@ fn convert_full_marquee_real_bezier_raw_fill_to_q0rg_preserves_curve_handles_exa
         })
         .expect("converted marquee vector curve");
     assert_eq!(
-        converted, &original,
+        converted,
+        &moved_into_symbol(&original, registration(&app)),
         "full marquee Convert to q0rg changed cubic anchors/handles and polygonized the curve"
     );
 }
@@ -1078,7 +1088,8 @@ fn convert_real_bezier_raw_fill_to_q0rg_preserves_curve_handles_exactly() {
         })
         .expect("converted vector curve");
     assert_eq!(
-        converted, &original,
+        converted,
+        &moved_into_symbol(&original, registration(&app)),
         "Convert to q0rg changed cubic anchors/handles and polygonized the curve"
     );
 }
@@ -1697,6 +1708,37 @@ fn edit_cut_removes_mixed_selection_and_paste_restores_both_kinds() {
         other => panic!("paste in place should select restored mixed area, got {other:?}"),
     }
     q0s_format::v2::validate(&app.state.project).expect("cut/paste-in-place validates");
+}
+
+/// Where the instance Convert to Symbol made on the stage sits: the new
+/// symbol's registration point, at the art's top-left.
+fn registration(app: &EditorApp) -> (f32, f32) {
+    app.state.project.q0rgs[0]
+        .layers
+        .iter()
+        .flat_map(|layer| &layer.placements)
+        .find(|placement| matches!(placement.target, Target::Q0rg(_)))
+        .map(|placement| (placement.transform.tx, placement.transform.ty))
+        .expect("the converted instance")
+}
+
+/// `path` as it is kept inside a symbol whose registration is `at`.
+fn moved_into_symbol(path: &VPath, at: (f32, f32)) -> VPath {
+    let shift = |point: &mut Vec2| {
+        point.x += -at.0;
+        point.y += -at.1;
+    };
+    let mut path = path.clone();
+    for anchor in &mut path.anchors {
+        shift(&mut anchor.point);
+        if let Some(handle) = &mut anchor.in_handle {
+            shift(handle);
+        }
+        if let Some(handle) = &mut anchor.out_handle {
+            shift(handle);
+        }
+    }
+    path
 }
 
 // ---- internal: dispatch actions through the public action queue ----

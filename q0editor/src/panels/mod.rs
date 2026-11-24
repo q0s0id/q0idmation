@@ -8,6 +8,7 @@ pub mod shortcuts;
 pub mod stage;
 pub mod tabs;
 pub mod timeline;
+mod timeline_look;
 pub mod toolbar;
 
 pub mod project_tree;

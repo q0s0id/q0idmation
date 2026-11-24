@@ -33,9 +33,116 @@ pub(crate) struct Walls {
     pub friction: f32,
 }
 
+/// The outside of a body made of convex parts, in the body's own frame:
+/// every part edge no other part shares, with the way out of it. Edges
+/// between two parts lie inside the body, and liquid must never meet them:
+/// pushed out across one, a particle met a wall in the middle of nowhere.
+#[derive(Debug, Default)]
+pub(crate) struct Outline {
+    /// From, to, and the outward normal.
+    edges: Vec<[[f32; 2]; 3]>,
+    min: [f32; 2],
+    max: [f32; 2],
+}
+
+impl Outline {
+    pub(crate) fn of(parts: &[Vec<[f32; 2]>]) -> Self {
+        // Corners a hair apart are the same corner.
+        let key = |p: [f32; 2]| ((p[0] * 64.0).round() as i64, (p[1] * 64.0).round() as i64);
+        let edge_key = |a: [f32; 2], b: [f32; 2]| {
+            let (a, b) = (key(a), key(b));
+            if a <= b {
+                (a, b)
+            } else {
+                (b, a)
+            }
+        };
+        type Corner = (i64, i64);
+        let mut shared: HashMap<(Corner, Corner), u32> = HashMap::new();
+        for part in parts.iter().filter(|part| part.len() >= 3) {
+            for (a, b) in part.iter().zip(part.iter().cycle().skip(1)) {
+                *shared.entry(edge_key(*a, *b)).or_default() += 1;
+            }
+        }
+        let mut outline = Self {
+            edges: Vec::new(),
+            min: [f32::MAX; 2],
+            max: [f32::MIN; 2],
+        };
+        for part in parts.iter().filter(|part| part.len() >= 3) {
+            let area = part
+                .iter()
+                .zip(part.iter().cycle().skip(1))
+                .map(|(a, b)| a[0] * b[1] - b[0] * a[1])
+                .sum::<f32>();
+            let outward = if area >= 0.0 { 1.0 } else { -1.0 };
+            for (a, b) in part.iter().zip(part.iter().cycle().skip(1)) {
+                for p in [a, b] {
+                    outline.min = [outline.min[0].min(p[0]), outline.min[1].min(p[1])];
+                    outline.max = [outline.max[0].max(p[0]), outline.max[1].max(p[1])];
+                }
+                if shared
+                    .get(&edge_key(*a, *b))
+                    .is_some_and(|count| *count > 1)
+                {
+                    continue;
+                }
+                let edge = [b[0] - a[0], b[1] - a[1]];
+                let length = edge[0].hypot(edge[1]);
+                if length <= 1.0e-6 {
+                    continue;
+                }
+                let normal = [outward * edge[1] / length, -outward * edge[0] / length];
+                outline.edges.push([*a, *b, normal]);
+            }
+        }
+        outline
+    }
+
+    /// The nearest point of the outside to `point`, the outward normal of
+    /// the edge it lies on, and how far away it is.
+    fn nearest(&self, point: [f32; 2]) -> Option<([f32; 2], [f32; 2], f32)> {
+        let mut best: Option<([f32; 2], [f32; 2], f32)> = None;
+        for [a, b, normal] in &self.edges {
+            let edge = [b[0] - a[0], b[1] - a[1]];
+            let length_sq = edge[0] * edge[0] + edge[1] * edge[1];
+            let t = (((point[0] - a[0]) * edge[0] + (point[1] - a[1]) * edge[1]) / length_sq)
+                .clamp(0.0, 1.0);
+            let on = [a[0] + edge[0] * t, a[1] + edge[1] * t];
+            let distance = (point[0] - on[0]).hypot(point[1] - on[1]);
+            if best.is_none_or(|(_, _, nearest)| distance < nearest) {
+                best = Some((on, *normal, distance));
+            }
+        }
+        best
+    }
+}
+
+/// Whether `point` lies inside the convex loop `part`.
+fn convex_contains(part: &[[f32; 2]], point: [f32; 2]) -> bool {
+    if part.len() < 3 {
+        return false;
+    }
+    let mut sign = 0.0_f32;
+    for (a, b) in part.iter().zip(part.iter().cycle().skip(1)) {
+        let cross = (b[0] - a[0]) * (point[1] - a[1]) - (b[1] - a[1]) * (point[0] - a[0]);
+        if cross.abs() <= 1.0e-6 {
+            continue;
+        }
+        if sign == 0.0 {
+            sign = cross.signum();
+        } else if cross.signum() != sign {
+            return false;
+        }
+    }
+    true
+}
+
 /// A body the liquid runs into, as it is during one step.
 pub(crate) struct Obstacle {
     pub geometry: ColliderGeometry,
+    /// For a body made of parts: its outside, which the liquid runs along.
+    pub outline: Option<std::sync::Arc<Outline>>,
     pub center: [f32; 2],
     pub angle: f32,
     pub velocity: [f32; 2],
@@ -485,11 +592,41 @@ fn penetration(obstacle: &Obstacle, point: [f32; 2], radius: f32) -> Option<([f3
         }
         ColliderGeometry::Parts(parts) => {
             let local = into(delta, obstacle.angle);
-            parts
-                .iter()
-                .filter_map(|part| convex_penetration(part, local, radius))
-                .max_by(|a, b| a.1.total_cmp(&b.1))
-                .map(|(normal, depth)| (out(normal, obstacle.angle), depth))
+            let Some(outline) = obstacle.outline.as_deref().filter(|o| !o.edges.is_empty()) else {
+                return parts
+                    .iter()
+                    .filter_map(|part| convex_penetration(part, local, radius))
+                    .max_by(|a, b| a.1.total_cmp(&b.1))
+                    .map(|(normal, depth)| (out(normal, obstacle.angle), depth));
+            };
+            if local[0] < outline.min[0] - radius
+                || local[1] < outline.min[1] - radius
+                || local[0] > outline.max[0] + radius
+                || local[1] > outline.max[1] + radius
+            {
+                return None;
+            }
+            // Measured to the real outside, corners round: a sharp corner
+            // reaches no further than the particle does.
+            let (on, edge_normal, distance) = outline.nearest(local)?;
+            let inside = parts.iter().any(|part| convex_contains(part, local));
+            if inside {
+                let way = if distance > 1.0e-6 {
+                    [(on[0] - local[0]) / distance, (on[1] - local[1]) / distance]
+                } else {
+                    edge_normal
+                };
+                Some((out(way, obstacle.angle), distance + radius))
+            } else if distance < radius {
+                let way = if distance > 1.0e-6 {
+                    [(local[0] - on[0]) / distance, (local[1] - on[1]) / distance]
+                } else {
+                    edge_normal
+                };
+                Some((out(way, obstacle.angle), radius - distance))
+            } else {
+                None
+            }
         }
     }
 }
@@ -664,6 +801,7 @@ mod tests {
         let params = PhysicsLiquid::new(1, 1, [20.0, 20.0, 160.0, 60.0]);
         let mut liquid = Liquid::new(&params, walls());
         let block = Obstacle {
+            outline: None,
             geometry: ColliderGeometry::Box {
                 half_extents: [20.0, 20.0],
                 turn: 0.0,
@@ -707,5 +845,45 @@ mod tests {
         assert!(liquid.positions().is_empty());
         settle(&mut liquid, &[], 6);
         assert_eq!(liquid.positions().len(), 50);
+    }
+
+    #[test]
+    fn an_outlines_sharp_corner_reaches_no_further_than_a_particle() {
+        // A long sliver, as an outline's parts often are, and a block far
+        // off to its right. The sliver's tip used to push particles out
+        // from far past it: an invisible wall in the open.
+        let parts = vec![
+            vec![[50.0, 0.0], [150.0, 0.0], [50.0, 2.0]],
+            vec![[200.0, -50.0], [250.0, -50.0], [250.0, 50.0], [200.0, 50.0]],
+        ];
+        assert!(
+            convex_penetration(&parts[0], [180.0, 0.5], 4.0).is_some(),
+            "the old test saw a wall here"
+        );
+        let obstacle = Obstacle {
+            outline: Some(std::sync::Arc::new(Outline::of(&parts))),
+            geometry: ColliderGeometry::Parts(parts),
+            center: [0.0, 0.0],
+            angle: 0.0,
+            velocity: [0.0, 0.0],
+            spin: 0.0,
+            group: 1,
+            body: None,
+        };
+        assert!(penetration(&obstacle, [180.0, 0.5], 4.0).is_none());
+        assert!(
+            penetration(&obstacle, [152.0, 0.0], 4.0).is_some(),
+            "the tip is solid"
+        );
+        assert!(
+            penetration(&obstacle, [100.0, 0.5], 4.0).is_some(),
+            "inside is solid"
+        );
+        // Two parts side by side: the edge they share is inside the body.
+        let halves = vec![
+            vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]],
+            vec![[10.0, 0.0], [20.0, 0.0], [20.0, 10.0], [10.0, 10.0]],
+        ];
+        assert_eq!(Outline::of(&halves).edges.len(), 6);
     }
 }

@@ -1238,6 +1238,7 @@ pub struct BrushPreferences {
     pub nib: PersistBrushNib,
     pub pressure_size: bool,
     pub velocity_size: bool,
+    pub velocity_grows: bool,
     pub dynamics_sensitivity: u8,
     pub dynamics_min_size: PersistBrushSize,
     pub glow: bool,
@@ -1271,6 +1272,7 @@ impl BrushPreferences {
             },
             pressure_size: settings.pressure_size,
             velocity_size: settings.velocity_size,
+            velocity_grows: settings.velocity_grows,
             dynamics_sensitivity: settings.dynamics_sensitivity.min(100),
             dynamics_min_size: PersistBrushSize(settings.dynamics_min_size),
             glow: false,
@@ -1299,6 +1301,7 @@ impl BrushPreferences {
             },
             pressure_size: self.pressure_size,
             velocity_size: self.velocity_size,
+            velocity_grows: self.velocity_grows,
             dynamics_sensitivity: self.dynamics_sensitivity.min(100),
             dynamics_min_size: if self.dynamics_min_size.0.is_finite() {
                 self.dynamics_min_size.0.clamp(0.01, 1.0)
@@ -1461,6 +1464,9 @@ pub struct Settings {
     /// Synchronize native frame presentation with display refresh.
     /// Changes take effect when the native window is recreated on restart.
     pub vertical_sync: bool,
+    /// A frame rate counter in the stage's corner.
+    #[serde(default)]
+    pub show_fps: bool,
     /// Write recovery snapshots of unsaved documents in the background.
     #[serde(default = "default_autosave_enabled")]
     pub autosave_enabled: bool,
@@ -1478,6 +1484,12 @@ pub struct Settings {
     pub eraser: BrushPreferences,
     /// Freehand pencil smoothing, independent of brush settings.
     pub pencil_smoothing: u8,
+    /// How the pencil turns a drawn line into curves.
+    #[serde(default)]
+    pub pencil_mode: PencilMode,
+    /// Drawing behaviour with no place in the Properties panel.
+    #[serde(default)]
+    pub drawing: DrawingPrefs,
     /// Snapping and the drawing tools' own switches.
     #[serde(default)]
     pub aids: DrawingAids,
@@ -1523,6 +1535,28 @@ pub struct Settings {
     /// How tall a layer row is (drag a row's bottom edge).
     #[serde(default = "default_timeline_row_height")]
     pub timeline_row_height: f32,
+    /// How big the whole interface is drawn, 1.0 being the system's own
+    /// size: as if the screen had fewer (or more) pixels, without changing
+    /// them.
+    #[serde(default = "default_ui_scale")]
+    pub ui_scale: f32,
+    /// How tall the library's preview is; its lower edge drags.
+    #[serde(default = "default_library_preview_height")]
+    pub library_preview_height: f32,
+    /// Which backgrounds the library preview may put behind an item.
+    #[serde(default)]
+    pub library_backgrounds: PreviewBackgrounds,
+    /// The timeline's motion: the playhead gliding, rows and switches
+    /// easing, keyframes popping in. Off: everything snaps.
+    #[serde(default = "default_true")]
+    pub timeline_motion: bool,
+    /// How round the corners of the timeline's keyframe blocks are, in
+    /// points: 0 is square; past half a row's height they turn into pills.
+    #[serde(default = "default_timeline_key_round")]
+    pub timeline_key_round: f32,
+    /// The little white shine on filled keyframe dots.
+    #[serde(default = "default_true")]
+    pub timeline_dot_shine: bool,
     /// Font name used inside the q0lang script editor. Resolved via
     /// `q0lang::fonts::resolve` at install time; if the system can't find
     /// it, falls back to bundled monospace and warns once in status.
@@ -1565,6 +1599,9 @@ pub struct Settings {
     pub new_project_fps: u16,
     #[serde(default = "default_new_project_frame_count")]
     pub new_project_frame_count: u16,
+    /// The stage colour a new project starts with, last one chosen.
+    #[serde(default = "default_new_project_background")]
+    pub new_project_background: [u8; 3],
     /// Opt-in physics editor. While off, nothing of it is shown.
     #[serde(default)]
     pub physics_enabled: bool,
@@ -1583,6 +1620,9 @@ pub struct Settings {
     /// The editor's own mouse pointers and number-drag wrapping.
     #[serde(default)]
     pub cursors: crate::cursors::CursorSettings,
+    /// Raster brushes chosen and changed, fill and picker options.
+    #[serde(default)]
+    pub raster: crate::raster::RasterPrefs,
 }
 
 fn default_q0lang_font_name() -> String {
@@ -1606,6 +1646,10 @@ fn default_q0lang_tab_width() -> u8 {
 fn default_png_sequence_create_subfolder() -> bool {
     true
 }
+fn default_new_project_background() -> [u8; 3] {
+    [255, 255, 255]
+}
+
 fn default_new_project_width() -> u16 {
     crate::state::DEFAULT_STAGE_WIDTH
 }
@@ -1628,6 +1672,7 @@ impl Default for Settings {
             language: Language::English,
             theme: Theme::default(),
             vertical_sync: true,
+            show_fps: false,
             autosave_enabled: default_autosave_enabled(),
             autosave_interval_secs: default_autosave_interval_secs(),
             brush_cap: BrushCap::Round,
@@ -1635,6 +1680,8 @@ impl Default for Settings {
             brush: BrushPreferences::default(),
             eraser: default_eraser(),
             pencil_smoothing: 50,
+            pencil_mode: PencilMode::default(),
+            drawing: DrawingPrefs::default(),
             aids: DrawingAids::default(),
             brush_mode: PersistBrushMode::Classic,
             advanced_brush: AdvancedBrushPreferences::default(),
@@ -1652,6 +1699,12 @@ impl Default for Settings {
             discord_application_id: String::new(),
             timeline_frame_width: default_timeline_frame_width(),
             timeline_row_height: default_timeline_row_height(),
+            timeline_motion: true,
+            timeline_key_round: default_timeline_key_round(),
+            timeline_dot_shine: true,
+            ui_scale: default_ui_scale(),
+            library_preview_height: default_library_preview_height(),
+            library_backgrounds: PreviewBackgrounds::default(),
             q0lang_font_name: default_q0lang_font_name(),
             q0lang_font_size: default_q0lang_font_size(),
             q0lang_show_line_numbers: default_q0lang_show_line_numbers(),
@@ -1667,12 +1720,14 @@ impl Default for Settings {
             new_project_height: default_new_project_height(),
             new_project_fps: default_new_project_fps(),
             new_project_frame_count: default_new_project_frame_count(),
+            new_project_background: default_new_project_background(),
             physics_enabled: false,
             particles_enabled: false,
             light_enabled: false,
             sweeper: Default::default(),
             plugins: Default::default(),
             cursors: Default::default(),
+            raster: Default::default(),
         }
     }
 }
@@ -1937,6 +1992,7 @@ mod tests {
             nib: BrushNib::Backslash,
             pressure_size: true,
             velocity_size: true,
+            velocity_grows: true,
             dynamics_sensitivity: 77,
             dynamics_min_size: 0.15,
             scale_with_stage: false,
@@ -2251,6 +2307,108 @@ fn default_timeline_frame_width() -> f32 {
 fn default_timeline_row_height() -> f32 {
     26.0
 }
+
+fn default_timeline_key_round() -> f32 {
+    4.0
+}
+
+fn default_ui_scale() -> f32 {
+    1.0
+}
+
+/// How the pencil turns a drawn line into curves, after Animate's pencil
+/// modes.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum PencilMode {
+    /// Keeps the line as drawn, wobbles and all, with as few points as that
+    /// takes.
+    Ink,
+    /// Evens the line out into smooth curves, keeping sharp turns.
+    #[default]
+    Smooth,
+    /// Stretches that run nearly straight become straight lines.
+    Straighten,
+}
+
+/// Drawing behaviour that has no place in the Properties panel.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DrawingPrefs {
+    /// A pencil line that ends where it began closes on itself.
+    pub join_ends: bool,
+    /// The angle, in degrees, Shift turns things by and points lines along.
+    pub shift_angle: f32,
+    /// How near, in screen pixels, a point must come to snap.
+    pub snap_reach: f32,
+    /// How near, in screen pixels, a click must come to pick a thin line.
+    pub pick_reach: f32,
+    /// A shape or line becomes the selection once it is drawn.
+    pub select_drawn: bool,
+    /// The Select tool comes back after a rectangle, oval or line.
+    pub then_select: bool,
+    /// How big the rotate grips past the transform box's corners are, and
+    /// how far out they sit: 1 is the size they once had.
+    pub rotate_size: f32,
+}
+
+impl Default for DrawingPrefs {
+    fn default() -> Self {
+        Self {
+            join_ends: true,
+            shift_angle: 45.0,
+            snap_reach: 10.0,
+            pick_reach: 3.0,
+            select_drawn: false,
+            then_select: false,
+            rotate_size: 2.25,
+        }
+    }
+}
+
+/// The angles Shift may step by.
+pub(crate) const SHIFT_ANGLES: [f32; 5] = [15.0, 22.5, 30.0, 45.0, 90.0];
+
+pub(crate) fn default_library_preview_height() -> f32 {
+    142.0
+}
+
+/// The backgrounds the library preview picks from to make an item read:
+/// light behind dark art, dark behind light art, a checkerboard behind art
+/// with both or with see-through parts. Each can be ruled out; the preview
+/// then takes the next best one left.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PreviewBackgrounds {
+    pub light: bool,
+    pub dark: bool,
+    pub checker: bool,
+}
+
+impl Default for PreviewBackgrounds {
+    fn default() -> Self {
+        Self {
+            light: true,
+            dark: true,
+            checker: true,
+        }
+    }
+}
+
+impl PreviewBackgrounds {
+    /// One bit each: light 1, dark 2, checkerboard 4. None at all counts as
+    /// all of them.
+    pub(crate) fn mask(self) -> u8 {
+        let mask = u8::from(self.light) | u8::from(self.dark) << 1 | u8::from(self.checker) << 2;
+        if mask == 0 {
+            0b111
+        } else {
+            mask
+        }
+    }
+}
+
+/// The interface sizes Appearance offers.
+pub(crate) const UI_SCALES: [f32; 9] = [0.75, 0.85, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0];
 
 fn default_true() -> bool {
     true

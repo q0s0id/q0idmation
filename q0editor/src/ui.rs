@@ -197,6 +197,8 @@ pub(crate) enum Icon {
     Last,
     Onion,
     Layer,
+    /// A new raster layer: a sheet of pixels.
+    RasterLayer,
     Folder,
     Mask,
     Symbol,
@@ -769,24 +771,27 @@ pub(crate) fn preview_card_grid(
     if count == 0 {
         return None;
     }
-    let width = ui.available_width().max(48.0);
-    let gap = ui.spacing().item_spacing.x.max(4.0);
-    let columns = (((width + gap) / (64.0 + gap)).floor() as usize).max(1);
-    let size = ((width - gap * columns.saturating_sub(1) as f32) / columns as f32).max(48.0);
+    let width = ui.available_width().max(56.0);
+    let gap = ui.spacing().item_spacing.x.max(8.0);
+    let columns = (((width + gap) / (84.0 + gap)).floor() as usize).max(1);
+    let size = ((width - gap * columns.saturating_sub(1) as f32) / columns as f32).max(56.0);
     let rows = count.div_ceil(columns);
-    let stride = size + gap;
-    let height = rows as f32 * stride - gap;
+    // A square preview over a strip for the name.
+    let card_height = size + CARD_FOOTER;
+    let (stride_x, stride_y) = (size + gap, card_height + gap);
+    let height = rows as f32 * stride_y - gap + CARD_LIFT;
     let (grid, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
     let card_rect = |index: usize| {
         Rect::from_min_size(
             grid.min
                 + vec2(
-                    (index % columns) as f32 * stride,
-                    (index / columns) as f32 * stride,
+                    (index % columns) as f32 * stride_x,
+                    (index / columns) as f32 * stride_y + CARD_LIFT,
                 ),
-            vec2(size, size),
+            vec2(size, card_height),
         )
     };
+    let stride = stride_y;
     let source_rect = source_index.filter(|index| *index < count).map(card_rect);
     let visible = grid.intersect(ui.clip_rect());
     if visible.is_positive() {
@@ -807,6 +812,44 @@ pub(crate) fn preview_card_grid(
     source_rect
 }
 
+/// The strip under a card's preview that holds its name.
+const CARD_FOOTER: f32 = 20.0;
+/// How far a card rises under the pointer; the grid leaves room above.
+const CARD_LIFT: f32 = 2.0;
+
+/// How far along a card's hover, press and pick are, eased.
+fn card_motion(ui: &Ui, response: &Response, selected: bool) -> (f32, f32, f32) {
+    let ctx = ui.ctx();
+    let hover = ctx.animate_bool_with_time(response.id.with("hover"), response.hovered(), 0.14);
+    let press = ctx.animate_bool_with_time(
+        response.id.with("press"),
+        response.is_pointer_button_down_on(),
+        0.08,
+    );
+    let pick = ctx.animate_bool_with_time(response.id.with("pick"), selected, 0.2);
+    (hover, press, pick)
+}
+
+/// Where a card is drawn this frame: lifted by the pointer, pressed in a
+/// little while held.
+fn card_shape(rect: Rect, hover: f32, press: f32) -> Rect {
+    let lifted = rect.translate(vec2(0.0, -CARD_LIFT * hover * (1.0 - press)));
+    let shrink = press * 0.025;
+    Rect::from_center_size(lifted.center(), lifted.size() * (1.0 - shrink))
+}
+
+/// The preview's square in a card drawn at `card`.
+fn card_preview(card: Rect) -> Rect {
+    Rect::from_min_max(
+        card.min + vec2(4.0, 4.0),
+        pos2(card.right() - 4.0, card.bottom() - CARD_FOOTER),
+    )
+}
+
+/// A card in a preview grid: a picture over its name. It lifts and throws a
+/// shadow under the pointer, sinks a touch when pressed, and the chosen
+/// one wears an accent ring and a check. Draw the preview into the rect
+/// this returns, then finish the card with [`preview_card_overlay`].
 pub(crate) fn preview_card_at(
     ui: &mut Ui,
     label: &str,
@@ -817,43 +860,116 @@ pub(crate) fn preview_card_at(
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, selected, label)
     });
+    let (hover, press, pick) = card_motion(ui, &response, selected);
+    let card = card_shape(rect, hover, press);
     if ui.is_rect_visible(rect) {
-        let visuals = ui.style().interact_selectable(&response, selected);
-        let fill = if selected {
-            ui.visuals().selection.bg_fill
-        } else {
-            visuals.weak_bg_fill
-        };
-        let stroke = if selected {
-            ui.visuals().selection.stroke
-        } else {
-            visuals.bg_stroke
-        };
-        let color = if selected {
-            ui.visuals().selection.stroke.color
-        } else {
-            visuals.text_color()
-        };
-        let painter = ui.painter_at(rect);
-        painter.rect(rect.shrink(0.5), 4.0, fill, stroke);
+        let visuals = ui.visuals();
+        let accent = visuals.selection.stroke.color;
+        let painter = ui.painter_at(rect.expand(6.0));
+        let shadow = Color32::from_black_alpha((24.0 + 46.0 * hover) as u8);
+        painter.rect_filled(
+            card.translate(vec2(0.0, 1.5 + 2.0 * hover))
+                .expand(0.5 + hover),
+            8.0,
+            shadow,
+        );
+        let base = visuals.widgets.inactive.weak_bg_fill;
+        let fill = blend(
+            blend(base, visuals.widgets.hovered.weak_bg_fill, hover),
+            accent,
+            0.12 * pick,
+        );
+        let edge = blend(
+            visuals.widgets.noninteractive.bg_stroke.color,
+            accent,
+            (0.55 * hover).max(pick),
+        );
+        painter.rect(card, 7.0, fill, Stroke::new(1.0_f32, edge));
+        // A well for the picture, a shade darker than the card.
+        painter.rect_filled(
+            card_preview(card).expand(1.0),
+            5.0,
+            visuals.extreme_bg_color,
+        );
+        let text = blend(visuals.text_color(), accent, pick);
         clipped_label(
             &painter,
             Rect::from_min_max(
-                rect.min + vec2(5.0, 2.0),
-                pos2(rect.right() - 5.0, rect.top() + 18.0),
+                pos2(card.left() + 7.0, card.bottom() - CARD_FOOTER + 1.0),
+                pos2(card.right() - 7.0, card.bottom() - 1.0),
             ),
             label,
-            egui::FontId::proportional(11.0),
-            color,
+            egui::FontId::proportional(11.5),
+            text,
         );
     }
-    let preview = Rect::from_min_max(rect.min + vec2(3.0, 19.0), rect.max - vec2(3.0, 3.0));
     (
         response
             .on_hover_text(label)
             .on_hover_cursor(egui::CursorIcon::PointingHand),
-        preview,
+        card_preview(card),
     )
+}
+
+/// Finishes a card over the preview drawn into it: rounds the picture's
+/// corners into the card, and rings and checks the chosen one.
+pub(crate) fn preview_card_overlay(ui: &Ui, response: &Response, rect: Rect, selected: bool) {
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let (hover, press, pick) = card_motion(ui, response, selected);
+    let card = card_shape(rect, hover, press);
+    let visuals = ui.visuals();
+    let accent = visuals.selection.stroke.color;
+    let painter = ui.painter_at(rect.expand(6.0));
+    let preview = card_preview(card);
+    // The picture's square corners, tucked under the well's rounded edge.
+    painter.rect_stroke(
+        preview.expand(1.5),
+        5.5,
+        Stroke::new(2.0_f32, visuals.extreme_bg_color),
+    );
+    if hover > 0.01 && pick < 0.99 {
+        painter.rect_stroke(
+            preview.expand(0.5),
+            4.5,
+            Stroke::new(1.0_f32, accent.gamma_multiply(0.45 * hover)),
+        );
+    }
+    if pick > 0.01 {
+        painter.rect_stroke(
+            card.expand(1.5 * pick),
+            8.5,
+            Stroke::new(2.0_f32, accent.gamma_multiply(pick)),
+        );
+        // The check, popping in with a little overshoot.
+        let pop = {
+            let t = pick;
+            let back = 1.6;
+            1.0 + (back + 1.0) * (t - 1.0).powi(3) + back * (t - 1.0).powi(2)
+        };
+        let center = pos2(preview.right() - 7.0, preview.top() + 7.0);
+        let radius = 7.0 * pop;
+        painter.circle_filled(
+            center + vec2(0.0, 1.0),
+            radius + 1.0,
+            Color32::from_black_alpha(60),
+        );
+        painter.circle_filled(center, radius, accent);
+        let ink = if accent.r() as u32 + accent.g() as u32 + accent.b() as u32 > 520 {
+            Color32::from_gray(20)
+        } else {
+            Color32::WHITE
+        };
+        painter.add(Shape::line(
+            vec![
+                center + vec2(-3.2, 0.2) * pop,
+                center + vec2(-0.9, 2.5) * pop,
+                center + vec2(3.3, -2.3) * pop,
+            ],
+            Stroke::new(1.7_f32 * pop.min(1.0), ink),
+        ));
+    }
 }
 
 /// Pixel-based ellipsis: long names use all available room without covering controls.
@@ -1014,6 +1130,22 @@ pub(crate) fn paint_icon(painter: &Painter, rect: Rect, icon: Icon, color: Color
         Icon::Layer => {
             body(&[(0.10, 0.34), (0.46, 0.16), (0.82, 0.34), (0.46, 0.52)]);
             path(&[(0.10, 0.50), (0.46, 0.68), (0.58, 0.62)]);
+            plus();
+        }
+        Icon::RasterLayer => {
+            // A sheet of pixels: a square of cells, every other one lit.
+            for row in 0..3 {
+                for column in 0..3 {
+                    let x = 0.12 + column as f32 * 0.18;
+                    let y = 0.16 + row as f32 * 0.18;
+                    let cell = r(x, y, x + 0.16, y + 0.16);
+                    if (row + column) % 2 == 0 {
+                        painter.rect_filled(cell, 0.0, color);
+                    } else {
+                        painter.rect_filled(cell, 0.0, color.gamma_multiply(0.35));
+                    }
+                }
+            }
             plus();
         }
         Icon::Folder => {

@@ -380,6 +380,8 @@ struct Slot {
     collider: ColliderHandle,
     kind: BodyKind,
     geometry: ColliderGeometry,
+    /// The outside of a body made of parts, which liquid runs along.
+    outline: Option<std::sync::Arc<crate::liquid::Outline>>,
     group: u8,
     bounce: f32,
     friction: f32,
@@ -507,12 +509,19 @@ impl World {
             .mass(body.mass)
             .collision_groups(body_groups(body.group));
         let (handle, collider) = self.rapier.insert(builder, collider);
+        let outline = match &start.geometry {
+            ColliderGeometry::Parts(parts) => {
+                Some(std::sync::Arc::new(crate::liquid::Outline::of(parts)))
+            }
+            _ => None,
+        };
         self.slots.push(Slot {
             instance_id: body.instance_id,
             handle,
             collider,
             kind: body.kind,
             geometry: start.geometry,
+            outline,
             group: body.group,
             bounce: body.bounce,
             friction: body.friction,
@@ -1097,6 +1106,7 @@ impl World {
                 let linvel = body.linvel();
                 Some(Obstacle {
                     geometry: slot.geometry.clone(),
+                    outline: slot.outline.clone(),
                     center: [center.x, center.y],
                     angle: body.rotation().angle(),
                     velocity: [linvel.x, linvel.y],

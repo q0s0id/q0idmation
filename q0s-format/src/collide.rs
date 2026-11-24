@@ -437,6 +437,18 @@ fn asset_regions(asset: &Asset) -> Vec<Region> {
                 .into_iter()
                 .collect()
         }
+        Asset::Raster(raster) => raster
+            .exact_bounds()
+            .and_then(|r| {
+                Region::rect(
+                    r.x0 as f32,
+                    r.y0 as f32,
+                    r.width() as f32,
+                    r.height() as f32,
+                )
+            })
+            .into_iter()
+            .collect(),
         Asset::Q0v(video) => q0video::q0v::probe_header(&video.bytes)
             .ok()
             .filter(|media| media.spec.video)

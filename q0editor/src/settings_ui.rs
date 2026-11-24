@@ -54,7 +54,7 @@ impl Page {
                 "Make it yours. Pick a palette or tune each colour; every panel follows."
             }
             Self::Drawing => "How selections move and how pencil lines settle.",
-            Self::Timeline => "Sizes, onion skin and the parenting column.",
+            Self::Timeline => "Sizes, motion, onion skin and the parenting column.",
             Self::Online => "What other people see of you while q0editor is open.",
             Self::Files => "Recovery snapshots, recent projects and file types.",
             Self::Scripting => "The q0lang script editor (View > Script Editor, F9).",
@@ -66,14 +66,14 @@ impl Page {
     fn keywords(self) -> &'static str {
         match self {
             Self::General => {
-                "physics particles light lights extra tools vsync vertical sync display stutter refresh restart"
+                "physics particles light lights extra tools vsync vertical sync display stutter refresh restart fps frame rate counter frames per second performance lag"
             }
             Self::Appearance => {
-                "theme colour color palette preset q7s gradient canvas photo stage border background onion tint syntax accent dark light window cursor cursors pointer mouse arrow animated animation wrap number drag blender"
+                "theme colour color palette preset q7s gradient canvas photo stage border background onion tint syntax accent dark light window cursor cursors pointer mouse arrow animated animation wrap number drag blender squash stretch subselect library preview checkerboard checker interface ui size scale zoom resolution dpi bigger smaller"
             }
-            Self::Drawing => "arrow keys nudge move selection shift pencil smoothing brush eraser",
+            Self::Drawing => "arrow keys nudge move selection shift angle turn snap reach pick lines click pencil join ends close select drawn back to select rotate rotation handle grip corner turn size brush eraser",
             Self::Timeline => {
-                "frame width row height layer names column onion skin playback lights parenting parent"
+                "frame width row height layer names column motion animation animated glide playhead keyframe key corners round rounded rounding square pill dot dots shine highlight gloss flat onion skin playback lights parenting parent"
             }
             Self::Online => "discord presence profile application id",
             Self::Files => {
@@ -425,6 +425,14 @@ fn general(app: &mut EditorApp, ui: &mut Ui) {
     {
         note(ui, "Restart q0editor to apply the display setting.");
     }
+    if toggle_row(
+        ui,
+        "Frame rate counter",
+        "Shows in the stage's corner how many frames a second the editor really draws, how long each takes to work out, and the last second as bars. The editor draws only when something changes, so it reads idle when nothing does.",
+        &mut app.settings.show_fps,
+    ) {
+        save_or_report(app, "the frame rate counter");
+    }
 }
 
 fn appearance(app: &mut EditorApp, ui: &mut Ui) {
@@ -449,6 +457,32 @@ fn appearance(app: &mut EditorApp, ui: &mut Ui) {
     });
     ui.add_space(8.0);
     ui.separator();
+    row(
+        ui,
+        "Interface size",
+        "Draws all of q0editor bigger or smaller, as a lower or higher screen resolution would, without changing the screen",
+        |ui| {
+            let now = app.settings.ui_scale;
+            egui::ComboBox::from_id_source("settings_ui_scale")
+                .selected_text(format!("{:.0}%", now * 100.0))
+                .show_ui(ui, |ui| {
+                    for scale in crate::settings::UI_SCALES {
+                        let label = if scale == 1.0 {
+                            "100% (system)".to_string()
+                        } else {
+                            format!("{:.0}%", scale * 100.0)
+                        };
+                        if ui
+                            .selectable_label((now - scale).abs() < 0.001, label)
+                            .clicked()
+                        {
+                            app.settings.ui_scale = scale;
+                            app.settings.save();
+                        }
+                    }
+                });
+        },
+    );
     row(
         ui,
         "Theme file",
@@ -484,6 +518,24 @@ fn appearance(app: &mut EditorApp, ui: &mut Ui) {
             color_row(ui, "Symbol edit mask", &mut t.symbol_edit_mask);
             color_row(ui, "Library preview (light)", &mut t.library_preview_light);
             color_row(ui, "Library preview (dark)", &mut t.library_preview_dark);
+            row(
+                ui,
+                "Library backgrounds",
+                "The backgrounds the library preview may pick to make an item read. Rule one out and it takes the next best; at least one stays on.",
+                |ui| {
+                    let backgrounds = &mut app.settings.library_backgrounds;
+                    let before = *backgrounds;
+                    ui.checkbox(&mut backgrounds.light, "Light");
+                    ui.checkbox(&mut backgrounds.dark, "Dark");
+                    ui.checkbox(&mut backgrounds.checker, "Checkerboard");
+                    if !(backgrounds.light || backgrounds.dark || backgrounds.checker) {
+                        *backgrounds = before;
+                    }
+                    if *backgrounds != before {
+                        app.settings.save();
+                    }
+                },
+            );
             row(ui, "Canvas photo", "", |ui| canvas_photo(app, ui, &mut t));
             row(ui, "Photo darkening", "", |ui| {
                 ui.add(egui::Slider::new(&mut t.canvas_background_darkening, 0..=100).suffix("%"));
@@ -560,12 +612,32 @@ fn cursors(app: &mut EditorApp, ui: &mut Ui, t: &mut Theme) {
         &mut prefs.custom,
     );
     ui.add_enabled_ui(prefs.custom, |ui| {
+        let packs = crate::cursors::CursorPack::ALL.map(|pack| (pack, pack.label()));
+        let (_, picked) = row(ui, "Pack", prefs.pack.hint(), |ui| {
+            crate::color_picker_ui::segmented(ui, 340.0, &mut prefs.pack, &packs)
+        });
+        changed |= picked;
+        note(ui, prefs.pack.hint());
         changed |= toggle_row(
             ui,
             "Animation",
             "Pointers play when they appear, when you press and as you move, then rest, so an idle editor draws nothing extra. Off, they hold still.",
             &mut prefs.animated,
         );
+        ui.add_enabled_ui(prefs.animated, |ui| {
+            changed |= toggle_row(
+                ui,
+                "Squash at the edge",
+                "A pointer that runs into the screen's edge squashes flat against it and springs back.",
+                &mut prefs.squash,
+            );
+            changed |= toggle_row(
+                ui,
+                "Stretch at speed",
+                "A fast-moving pointer stretches out a little along its way.",
+                &mut prefs.stretch,
+            );
+        });
         let (_, size) = row(ui, "Size", "1 is about the size of a system cursor.", |ui| {
             ui.add(egui::Slider::new(&mut prefs.size, CursorSettings::SIZE_RANGE).fixed_decimals(2))
         });
@@ -601,6 +673,19 @@ fn cursors(app: &mut EditorApp, ui: &mut Ui, t: &mut Theme) {
     );
     ui.add_enabled_ui(prefs.custom, |ui| {
         changed |= cursor_rows(ui, &CursorKind::ACTIONS, prefs, &theme);
+    });
+
+    ui.add_space(6.0);
+    ui.label(RichText::new("Your own cursors").strong());
+    note(
+        ui,
+        "Draw any pointer pixel by pixel, or start from its Retro look or an image file. Drawing one switches the pack to Your own; states you have not drawn keep the standard pointer.",
+    );
+    ui.add_enabled_ui(prefs.custom, |ui| {
+        if crate::cursors::own::maker(ui, &mut prefs.own, &theme) {
+            prefs.pack = crate::cursors::CursorPack::Own;
+            changed = true;
+        }
     });
     if changed {
         save_or_report(app, "the cursor settings");
@@ -783,29 +868,107 @@ fn drawing(app: &mut EditorApp, ui: &mut Ui) {
             settled(&step) || settled(&shift)
         },
     );
-    if nudged {
-        app.settings.save();
-    }
+    let prefs = &mut app.settings.drawing;
+    let mut changed = nudged;
+    changed |= row(
+        ui,
+        "Pick lines within",
+        "How near a click must come to a thin line or an edge to pick it",
+        |ui| {
+            settled(
+                &ui.add(
+                    egui::DragValue::new(&mut prefs.pick_reach)
+                        .speed(0.1)
+                        .clamp_range(1.0..=12.0)
+                        .max_decimals(1)
+                        .suffix(" px"),
+                ),
+            )
+        },
+    )
+    .1;
+    changed |= row(
+        ui,
+        "Rotate handle size",
+        "How big the grips past the transform box's corners are, the ones you drag to turn things. They sit further out as they grow, so they never cover the box.",
+        |ui| {
+            settled(
+                &ui.add(
+                    egui::Slider::new(&mut prefs.rotate_size, 1.0..=4.0)
+                        .step_by(0.25)
+                        .suffix("×"),
+                ),
+            )
+        },
+    )
+    .1;
+    changed |= toggle_row(
+        ui,
+        "Select what you draw",
+        "A new shape or line becomes the selection, ready to move or restyle",
+        &mut prefs.select_drawn,
+    );
+    changed |= toggle_row(
+        ui,
+        "Back to Select after a shape",
+        "After a rectangle, oval or line is drawn, the Select tool comes back",
+        &mut prefs.then_select,
+    );
+
+    group(ui, "Shift", "");
+    changed |= row(
+        ui,
+        "Shift steps by",
+        "Holding Shift turns things by this step, and points lines and pen segments along it",
+        |ui| {
+            let mut picked = false;
+            egui::ComboBox::from_id_source("drawing_shift_angle")
+                .selected_text(format!("{}°", prefs.shift_angle))
+                .show_ui(ui, |ui| {
+                    for angle in crate::settings::SHIFT_ANGLES {
+                        picked |= ui
+                            .selectable_value(&mut prefs.shift_angle, angle, format!("{angle}°"))
+                            .clicked();
+                    }
+                });
+            picked
+        },
+    )
+    .1;
+
+    group(ui, "Snapping", "");
+    changed |= row(
+        ui,
+        "Snap within",
+        "How near a point must come to snap to an anchor, a line end, a crossing or the stage",
+        |ui| {
+            settled(
+                &ui.add(
+                    egui::DragValue::new(&mut prefs.snap_reach)
+                        .speed(0.2)
+                        .clamp_range(2.0..=40.0)
+                        .max_decimals(0)
+                        .suffix(" px"),
+                ),
+            )
+        },
+    )
+    .1;
 
     group(ui, "Pencil", "");
-    let (_, smoothed) = row(
+    changed |= toggle_row(
         ui,
-        "Smoothing",
-        "How much a pencil line is evened out after it is drawn",
-        |ui| {
-            settled(&ui.add(egui::Slider::new(
-                &mut app.settings.pencil_smoothing,
-                0..=100,
-            )))
-        },
+        "Join ends that meet",
+        "A pencil line that ends close to where it began closes on itself",
+        &mut prefs.join_ends,
     );
-    if smoothed {
+    if changed {
         app.settings.save();
     }
     ui.add_space(10.0);
     note(
         ui,
-        "Brush, eraser and shape options sit in the Properties panel while their tool is chosen.",
+        "Smoothing, the pencil's mode and the brush, eraser and shape options sit in the Properties panel while their tool is chosen.",
     );
 }
 
@@ -876,6 +1039,42 @@ fn timeline(app: &mut EditorApp, ui: &mut Ui, page: &mut Page) {
     })
     .1;
     if resized {
+        app.settings.save();
+    }
+
+    group(ui, "Look", "");
+    if toggle_row(
+        ui,
+        "Motion",
+        "The playhead glides, rows and switches ease, new keyframes pop in. Off: everything snaps into place.",
+        &mut app.settings.timeline_motion,
+    ) {
+        app.settings.save();
+    }
+    if row(
+        ui,
+        "Keyframe corners",
+        "How round the corners of keyframe blocks are. 0 is square; turned all the way up they become pills.",
+        |ui| {
+            settled(
+                &ui.add(
+                    egui::Slider::new(&mut app.settings.timeline_key_round, 0.0..=16.0)
+                        .step_by(0.5)
+                        .suffix(" px"),
+                ),
+            )
+        },
+    )
+    .1
+    {
+        app.settings.save();
+    }
+    if toggle_row(
+        ui,
+        "Shine on keyframe dots",
+        "The small white highlight on filled keyframe dots. Off: plain, flat dots.",
+        &mut app.settings.timeline_dot_shine,
+    ) {
         app.settings.save();
     }
 

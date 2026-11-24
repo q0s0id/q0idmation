@@ -1426,8 +1426,12 @@ impl Online {
                 self.view.room_name_edited = true;
             }
             let name = self.view.room_name.trim().to_owned();
-            let can_create =
-                project_name.is_some() && self.room.is_none() && !joining && !name.is_empty();
+            let has_raster = crate::raster::offered(&app.state.project);
+            let can_create = project_name.is_some()
+                && self.room.is_none()
+                && !joining
+                && !name.is_empty()
+                && !has_raster;
             let submit = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             ui.horizontal(|ui| {
                 let reason = if project_name.is_none() {
@@ -1436,6 +1440,8 @@ impl Online {
                     "Leave your current room first"
                 } else if name.is_empty() {
                     "Give the room a name"
+                } else if has_raster {
+                    "Raster layers don't travel to online rooms yet: share a copy of the file instead"
                 } else {
                     "Starting the room…"
                 };

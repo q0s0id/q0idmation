@@ -566,11 +566,68 @@ fn finish_pieces(pieces: Vec<Vec<Cubic>>, affine: Affine) -> Vec<VPath> {
 /// `path` cut at the parameters `cuts` (sorted, inside the path) into open
 /// pieces. A closed path cut once opens into one line from the cut round
 /// to it again.
-pub(crate) fn split_path(path: &VPath, cuts: &[f32]) -> Vec<VPath> {
+#[cfg(test)]
+fn split_path(path: &VPath, cuts: &[f32]) -> Vec<VPath> {
     if cuts.is_empty() || segment_count(path) == 0 {
         return vec![path.clone()];
     }
     finish_pieces(split_cubics(path, cuts), Affine::IDENTITY)
+}
+
+/// Subtract a brush footprint from a stroke's centerline without refitting its
+/// surviving curves. Explicit boundary crossings also catch gaps much smaller
+/// than the distance between samples on a long line.
+pub(crate) fn trim_path_in_region(
+    path: &VPath,
+    affine: Affine,
+    region: &geo::MultiPolygon<f64>,
+    boundaries: &[VPath],
+) -> Option<Vec<VPath>> {
+    use geo::{BoundingRect, Contains};
+
+    let count = segment_count(path);
+    if count == 0 {
+        return None;
+    }
+    let bounds = region.bounding_rect()?;
+    let path_box = control_box(path, affine);
+    let region_box = (
+        bounds.min().x as f32,
+        bounds.min().y as f32,
+        bounds.max().x as f32,
+        bounds.max().y as f32,
+    );
+    if !overlap(path_box, region_box, 0.0) {
+        return None;
+    }
+    let mut cuts: Vec<f32> = boundaries
+        .iter()
+        .filter(|boundary| overlap(path_box, control_box(boundary, Affine::IDENTITY), 0.0))
+        .flat_map(|boundary| crossings(path, affine, boundary, Affine::IDENTITY).0)
+        .map(|(t, _)| t)
+        .map(|t| {
+            if path.closed && t == count as f32 {
+                0.0
+            } else {
+                t
+            }
+        })
+        .filter(|t| (path.closed || 0.0 < *t) && *t < count as f32)
+        .collect();
+    cuts.sort_by(f32::total_cmp);
+    cuts.dedup_by(|a, b| (*a - *b).abs() <= f32::EPSILON);
+    let mut removed = false;
+    let mut pieces = split_cubics(path, &cuts);
+    pieces.retain(|piece| {
+        let Some(cubic) = piece.iter().find(|cubic| !degenerate(cubic)) else {
+            return false;
+        };
+        let point = placed_at(cubic, affine, 0.5);
+        let inside = region.contains(&geo::Point::new(f64::from(point.x), f64::from(point.y)));
+        removed |= inside;
+        !inside
+    });
+    removed.then(|| finish_pieces(pieces, affine))
 }
 
 /// Move the start of a run of cubics to `point`, a straight start staying
@@ -693,6 +750,155 @@ fn vector(project: &ProjectV2, asset_id: u16) -> Option<&q0s_format::v2::VectorA
         Asset::Vector(vector) => Some(vector),
         _ => None,
     }
+}
+
+/// A moved fill parts existing raw strokes wherever its visible edge meets
+/// them. The fill stays intact and each resulting stroke remains selectable.
+pub(crate) fn part_strokes_at_edited_fills(
+    project: &mut ProjectV2,
+    q0rg_id: u16,
+    layer_id: u16,
+    frame: u16,
+    edited: &std::collections::BTreeSet<u16>,
+) -> std::collections::BTreeSet<u16> {
+    let mut changed = std::collections::BTreeSet::new();
+    if !project.layer_is_visible(q0rg_id, layer_id) || project.layer_is_locked(q0rg_id, layer_id) {
+        return changed;
+    }
+    let Some(layer) = project
+        .q0rgs
+        .iter()
+        .find(|q| q.q0rg_id == q0rg_id)
+        .and_then(|q| q.layers.iter().find(|layer| layer.layer_id == layer_id))
+    else {
+        return changed;
+    };
+    let mut boundaries = Vec::new();
+    for (index, _) in crate::render::active_placements_at(layer, frame) {
+        let placement = &layer.placements[index];
+        let Target::Asset(id) = placement.target else {
+            continue;
+        };
+        if !edited.contains(&id)
+            || placement.frame != frame
+            || placement.transform != q0s_format::v2::Transform2D::IDENTITY
+            || placement.tween.is_motion()
+            || !placement.fx.is_identity()
+        {
+            continue;
+        }
+        let Some(fill) = vector(project, id).filter(|fill| fill.fill.is_some()) else {
+            continue;
+        };
+        #[cfg(feature = "appearance-mask-eraser")]
+        if project
+            .asset_appearances
+            .get(&id)
+            .is_some_and(|appearance| {
+                !appearance.clip_mask.is_empty() || !appearance.erase_mask.is_empty()
+            })
+        {
+            let visible = crate::tools::raw_selectable_fill_surface(project, id, fill);
+            boundaries.extend(crate::brush::coverage_to_linear_paths(&visible));
+            continue;
+        }
+        boundaries.extend(
+            fill.paths
+                .iter()
+                .filter(|path| path.closed && path.anchors.len() >= 3)
+                .cloned(),
+        );
+    }
+    if boundaries.is_empty() {
+        return changed;
+    }
+
+    let mut updates = std::collections::BTreeMap::new();
+    for (index, id, affine) in drawings(project, q0rg_id, layer_id, frame) {
+        let placement = &layer.placements[index];
+        if !crate::tools::is_raw_graphics_placement(project, placement)
+            || !placement.fx.is_identity()
+        {
+            continue;
+        }
+        let Some(strokes) = vector(project, id) else {
+            continue;
+        };
+        for (index, path) in strokes
+            .paths
+            .iter()
+            .enumerate()
+            .filter(|(_, path)| cuttable(strokes, path))
+        {
+            let path_box = control_box(path, affine);
+            let reach = strokes
+                .stroke
+                .map_or(MEET, |stroke| stroke.width * 0.5 + MEET);
+            let mut cuts = Vec::new();
+            let mut samples_on_stroke = None;
+            for boundary in &boundaries {
+                if !overlap(path_box, control_box(boundary, Affine::IDENTITY), reach) {
+                    continue;
+                }
+                let (crossed, _) = crossings(path, affine, boundary, Affine::IDENTITY);
+                if !crossed.is_empty() {
+                    cuts.extend(crossed);
+                    continue;
+                }
+                // A corner can touch the visible width of the stroke while
+                // staying just outside its centerline.
+                let samples = samples_on_stroke.get_or_insert_with(|| samples(path, affine));
+                let closest = boundary
+                    .anchors
+                    .iter()
+                    .filter_map(|anchor| {
+                        let point = anchor.point;
+                        let point_box = (point.x, point.y, point.x, point.y);
+                        if !overlap(path_box, point_box, reach) {
+                            return None;
+                        }
+                        nearest_on(samples, point).map(|(t, distance)| (t, distance, point))
+                    })
+                    .min_by(|a, b| a.1.total_cmp(&b.1));
+                if let Some((t, _, point)) = closest.filter(|entry| entry.1 <= reach) {
+                    let segment = (t.floor() as usize).min(segment_count(path) - 1);
+                    let cubic = cubic(path, segment);
+                    let local = refine_nearest(&cubic, affine, point, t - segment as f32);
+                    cuts.push((segment as f32 + local, placed_at(&cubic, affine, local)));
+                }
+            }
+            let cuts: Vec<_> = clean_cuts(path, affine, cuts)
+                .into_iter()
+                .map(|(t, _)| t)
+                .collect();
+            if !cuts.is_empty() {
+                let pieces = finish_pieces(split_cubics(path, &cuts), affine);
+                if !pieces.is_empty() {
+                    updates
+                        .entry(id)
+                        .or_insert_with(std::collections::BTreeMap::new)
+                        .insert(index, pieces);
+                }
+            }
+        }
+    }
+    let ids = updates.keys().copied().collect();
+    let writable =
+        crate::brush::prepare_writable_raw_assets(project, q0rg_id, layer_id, frame, &ids);
+    for (original, replacements) in updates {
+        let id = writable.get(&original).copied().unwrap_or(original);
+        let Some(Asset::Vector(vector)) = project.assets.iter_mut().find(|asset| asset.id() == id)
+        else {
+            continue;
+        };
+        for (index, pieces) in replacements {
+            let mut pieces = pieces.into_iter();
+            vector.paths[index] = pieces.next().expect("stroke has a surviving piece");
+            vector.paths.extend(pieces);
+        }
+        changed.insert(id);
+    }
+    changed
 }
 
 /// Cuts the line `new_path` of `asset_id` on `layer_id` and every line it

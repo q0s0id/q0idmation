@@ -13,7 +13,7 @@ use q0s_format::transform::Affine;
 use q0s_format::v2::{Asset, Placement, ProjectV2, Target, Transform2D, Vec2};
 
 use crate::app::EditorApp;
-use crate::render::{flatten_path, StageView};
+use crate::render::{flatten_path, placement_shown_frame, PlacementBoundsCache, StageView};
 use crate::state::{PathRef, PlacementRef, Selection};
 
 /// How close, in screen pixels, a point has to come to snap.
@@ -166,6 +166,18 @@ impl SnapScene {
         leave: &Leave,
         stage: Option<[f32; 2]>,
     ) -> Self {
+        let mut bounds = PlacementBoundsCache::new(project);
+        Self::build_with_bounds(project, q0rg_id, frame, leave, stage, &mut bounds)
+    }
+
+    fn build_with_bounds(
+        project: &ProjectV2,
+        q0rg_id: u16,
+        frame: u16,
+        leave: &Leave,
+        stage: Option<[f32; 2]>,
+        bounds: &mut PlacementBoundsCache,
+    ) -> Self {
         let mut scene = Self::default();
         // A symbol's own origin is where it is placed from.
         scene.points.push(Vec2::new(0.0, 0.0));
@@ -183,7 +195,12 @@ impl SnapScene {
             if !project.layer_is_visible(q0rg_id, layer.layer_id) {
                 continue;
             }
-            for (placement_idx, transform) in crate::render::active_placements_at(layer, frame) {
+            for active in q0s_format::raster::active_placement_states_at(layer, frame) {
+                let placement_idx = active.index;
+                let transform = active.transform;
+                if leave.leaves_placement(layer.layer_id, placement_idx) {
+                    continue;
+                }
                 let Some(placement) = layer.placements.get(placement_idx) else {
                     continue;
                 };
@@ -193,16 +210,11 @@ impl SnapScene {
                         let Some(Asset::Vector(vector)) =
                             project.assets.iter().find(|asset| asset.id() == asset_id)
                         else {
-                            if !leave.leaves_placement(layer.layer_id, placement_idx) {
-                                scene
-                                    .points
-                                    .extend(object_grips(project, placement, transform));
-                            }
+                            scene
+                                .points
+                                .extend(object_grips(project, bounds, placement, transform, None));
                             continue;
                         };
-                        if leave.leaves_placement(layer.layer_id, placement_idx) {
-                            continue;
-                        }
                         for (path_idx, path) in vector.paths.iter().enumerate() {
                             for (anchor_idx, anchor) in path.anchors.iter().enumerate() {
                                 if !leave.leaves_anchor(
@@ -225,12 +237,21 @@ impl SnapScene {
                             }
                         }
                     }
-                    Target::Q0rg(_) => {
-                        if !leave.leaves_placement(layer.layer_id, placement_idx) {
-                            scene
-                                .points
-                                .extend(object_grips(project, placement, transform));
-                        }
+                    Target::Q0rg(child) => {
+                        let shown = q0s_format::v2::resolve_q0rg_playback_frame(
+                            project,
+                            child,
+                            frame,
+                            active.playback_start_frame,
+                            active.fx.q0rg_playback,
+                        );
+                        scene.points.extend(object_grips(
+                            project,
+                            bounds,
+                            placement,
+                            transform,
+                            Some(shown),
+                        ));
                     }
                 }
             }
@@ -287,14 +308,25 @@ fn nearest_on_segment(a: Vec2, b: Vec2, point: Vec2) -> Vec2 {
     Vec2::new(a.x + dx * t, a.y + dy * t)
 }
 
-fn object_grips(project: &ProjectV2, placement: &Placement, transform: Transform2D) -> Vec<Vec2> {
+fn object_grips(
+    project: &ProjectV2,
+    bounds: &mut PlacementBoundsCache,
+    placement: &Placement,
+    transform: Transform2D,
+    shown: Option<u16>,
+) -> Vec<Vec2> {
     let affine = Affine::from_transform(transform);
     let mut grips = vec![affine.apply(placement.pivot.unwrap_or(Vec2::new(0.0, 0.0)))];
     let placed = Placement {
         transform,
         ..placement.clone()
     };
-    if let Some((x0, y0, x1, y1)) = crate::render::placement_bbox(project, &placed) {
+    let bbox = match (placement.target, shown) {
+        (Target::Q0rg(_), Some(shown)) => bounds.placement_frame_bbox(project, &placed, shown),
+        (Target::Q0rg(_), None) => None,
+        (Target::Asset(_), _) => bounds.placement_bbox(project, &placed),
+    };
+    if let Some((x0, y0, x1, y1)) = bbox {
         for x in [x0, (x0 + x1) * 0.5, x1] {
             for y in [y0, (y0 + y1) * 0.5, y1] {
                 grips.push(Vec2::new(x, y));
@@ -346,7 +378,8 @@ fn stage_size(app: &EditorApp) -> Option<[f32; 2]> {
 }
 
 fn reach(view: &StageView) -> f32 {
-    REACH_PX / view.effective_scale().abs().max(1.0e-3)
+    crate::tools::drawing_prefs().snap_reach.clamp(2.0, 40.0)
+        / view.effective_scale().abs().max(1.0e-3)
 }
 
 fn note(snapped: Snapped, ctx_frame: u64) {
@@ -402,7 +435,7 @@ pub fn point(
 /// to be, so the dragged selection's snapping point lands on something.
 /// The first call of a drag works out what is dragged from the selection.
 pub fn move_cursor(
-    app: &EditorApp,
+    app: &mut EditorApp,
     start_cursor: Vec2,
     cursor: Vec2,
     view: &StageView,
@@ -425,7 +458,15 @@ pub fn move_cursor(
                     .anchors
                     .extend(app.session.subselect_more.iter().cloned());
             }
-            let grips = leave_grips(&app.state.project, &leave);
+            let frame = app.session.current_frame;
+            let revision = (
+                app.active_project_tab_id().unwrap_or(0),
+                app.state.render_revision(),
+            );
+            let mut bounds = app
+                .textures
+                .take_placement_bounds_cache(&app.state.project, revision);
+            let grips = leave_grips(&app.state.project, frame, &leave, &mut bounds);
             let grip = grips
                 .iter()
                 .copied()
@@ -433,13 +474,15 @@ pub fn move_cursor(
                     distance_sq(*a, start_cursor).total_cmp(&distance_sq(*b, start_cursor))
                 })
                 .unwrap_or(start_cursor);
-            let scene = SnapScene::build(
+            let scene = SnapScene::build_with_bounds(
                 &app.state.project,
                 app.session.current_q0rg_id,
-                app.session.current_frame,
+                frame,
                 &leave,
                 stage_size(app),
+                &mut bounds,
             );
+            app.textures.store_placement_bounds_cache(bounds, revision);
             state.moving = Some(Moving {
                 start_cursor,
                 offset: Vec2::new(grip.x - start_cursor.x, grip.y - start_cursor.y),
@@ -467,7 +510,12 @@ pub fn end_move() {
 
 /// The points of what `leave` names that snap when it is dragged: its
 /// anchors and the corners and middle of objects.
-fn leave_grips(project: &ProjectV2, leave: &Leave) -> Vec<Vec2> {
+fn leave_grips(
+    project: &ProjectV2,
+    frame: u16,
+    leave: &Leave,
+    bounds: &mut PlacementBoundsCache,
+) -> Vec<Vec2> {
     let mut grips = Vec::new();
     let placement = |q0rg_id: u16, layer_id: u16, placement_idx: usize| {
         project
@@ -516,8 +564,10 @@ fn leave_grips(project: &ProjectV2, leave: &Leave) -> Vec<Vec2> {
         }
     }
     for object in &leave.placements {
-        let Some(placement) = placement(object.q0rg_id, object.layer_id, object.placement_idx)
-        else {
+        let Some(layer) = bounds.layer(project, object.q0rg_id, object.layer_id) else {
+            continue;
+        };
+        let Some(placement) = layer.placements.get(object.placement_idx) else {
             continue;
         };
         let affine = Affine::from_transform(placement.transform);
@@ -529,7 +579,22 @@ fn leave_grips(project: &ProjectV2, leave: &Leave) -> Vec<Vec2> {
                     .flat_map(|path| path.anchors.iter())
                     .map(|anchor| affine.apply(anchor.point)),
             ),
-            None => grips.extend(object_grips(project, placement, placement.transform)),
+            None => {
+                let shown = placement_shown_frame(
+                    project,
+                    object.q0rg_id,
+                    layer,
+                    object.placement_idx,
+                    frame,
+                );
+                grips.extend(object_grips(
+                    project,
+                    bounds,
+                    placement,
+                    placement.transform,
+                    shown,
+                ));
+            }
         }
     }
     grips
@@ -606,8 +671,20 @@ mod tests {
         };
         let mut child = app.state.project.q0rgs[0].clone();
         child.q0rg_id = 2;
-        child.layers[0].placements = vec![bitmap.clone()];
+        child.frame_count = 2;
+        child.layers[0].placements = vec![
+            bitmap.clone(),
+            Placement {
+                frame: 1,
+                transform: Transform2D {
+                    tx: -180.0,
+                    ..bitmap.transform
+                },
+                ..bitmap.clone()
+            },
+        ];
         app.state.project.q0rgs.push(child);
+        app.state.project.q0rgs[0].frame_count = 2;
         app.state.project.q0rgs[0].layers[0].placements = vec![
             Placement {
                 target: Target::Q0rg(2),
@@ -632,6 +709,13 @@ mod tests {
             visible.nearest(Vec2::new(149.5, 130.0), 1.0).unwrap().point,
             Vec2::new(150.0, 130.0)
         );
+        let far_corner = Vec2::new(-79.5, 130.0);
+        assert!(visible.nearest(far_corner, 1.0).is_none());
+        let later = SnapScene::build(&app.state.project, 1, 1, &Leave::default(), None);
+        assert_eq!(
+            later.nearest(far_corner, 1.0).unwrap().point,
+            Vec2::new(-80.0, 130.0)
+        );
         app.session.selection = Selection::Placement {
             q0rg_id: 1,
             layer_id: 1,
@@ -648,11 +732,11 @@ mod tests {
         end_move();
         app.settings.aids.snap = true;
         assert_eq!(
-            move_cursor(&app, start, cursor, &view, 0),
+            move_cursor(&mut app, start, cursor, &view, 0),
             Vec2::new(200.0, 130.0)
         );
         app.settings.aids.snap = false;
-        assert_eq!(move_cursor(&app, start, cursor, &view, 0), cursor);
+        assert_eq!(move_cursor(&mut app, start, cursor, &view, 0), cursor);
         end_move();
     }
 

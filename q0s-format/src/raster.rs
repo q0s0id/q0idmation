@@ -18,7 +18,8 @@
 //! controls quality/cost trade-off — players default to `1` (live), the
 //! exporter could use `2`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use crate::geom::flatten_path;
 use crate::runtime_scene::RuntimeSceneState;
@@ -257,6 +258,15 @@ fn asset_stage_bounds(
                 max_y: max.y,
             }
         }
+        Asset::Raster(raster) => {
+            let rect = raster.exact_bounds()?;
+            StageBounds {
+                min_x: rect.x0 as f32,
+                min_y: rect.y0 as f32,
+                max_x: rect.x1 as f32,
+                max_y: rect.y1 as f32,
+            }
+        }
         Asset::Rig(_) => return None,
     };
     Some(local.transform(transform))
@@ -322,6 +332,7 @@ pub(crate) fn rasterize_asset_alone(
         height: h,
         elapsed_host_frames: elapsed_frames,
         host_fps: project.meta.fps,
+        cache: None,
     };
     rasterize_asset(
         asset,
@@ -374,6 +385,10 @@ fn bounds_with_placement_fx(
                 .translate(shadow.offset_x * scale, shadow.offset_y * scale);
             result = result.union(shadow_bounds);
         }
+    }
+    if let Some(outline) = fx.outline {
+        result = result
+            .union(bounds.expand(outline.width * OUTLINE_SAMPLE_SCALE.with(|scale| scale.get())));
     }
     result
 }
@@ -995,6 +1010,7 @@ fn rasterize_placement_fx_tile_with_runtime_state(
         rig,
         rig_pose.as_ref(),
         None,
+        None,
     );
     let mut filtered = vec![0u8; len];
     let local_fx = PlacementFx {
@@ -1070,6 +1086,7 @@ fn rasterize_placement_outer_fx_tile(
         blur: None,
         glow: fx.glow,
         shadow: fx.shadow,
+        outline: None,
         audio_gain: fx.audio_gain,
         audio_muted: fx.audio_muted,
         q0rg_playback: fx.q0rg_playback,
@@ -1144,6 +1161,7 @@ fn rasterize_placement_outer_fx_tile(
         &RuntimeSceneState::new(),
         rig,
         rig_pose.as_ref(),
+        None,
         None,
     );
     let source_alpha = alpha_channel(&source);
@@ -1220,6 +1238,114 @@ fn crop_rgba_alpha(source: &[u8], width: u32, height: u32) -> Option<CroppedRgba
     })
 }
 
+/// Renders a sequence from one immutable project. Workers share only data
+/// derived from authored artwork; per-frame poses and compositing stay local.
+pub struct FrameRasterizer<'a> {
+    project: &'a ProjectV2,
+    cache: FrameRasterCache,
+}
+
+impl<'a> FrameRasterizer<'a> {
+    pub fn new(project: &'a ProjectV2) -> Self {
+        Self {
+            project,
+            cache: FrameRasterCache {
+                bounds: RuntimeBoundsCache::new(project),
+                appearances: Mutex::new(AppearanceTiles::default()),
+            },
+        }
+    }
+
+    pub fn render_scaled(
+        &self,
+        q0rg_id: u16,
+        frame: u16,
+        w: u32,
+        h: u32,
+        ss: u32,
+        bg_rgba: [u8; 4],
+    ) -> Vec<u8> {
+        let root = raster_stage_scale(self.project, w, h);
+        rasterize_root_transform(
+            self.project,
+            q0rg_id,
+            frame,
+            w,
+            h,
+            ss,
+            bg_rgba,
+            root,
+            &crate::rig::RigRuntimeOverrides::new(),
+            &RuntimeSceneState::new(),
+            Some(&self.cache),
+        )
+    }
+}
+
+struct FrameRasterCache {
+    bounds: RuntimeBoundsCache,
+    appearances: Mutex<AppearanceTiles>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AppearanceTileKey {
+    asset_id: u16,
+    scale_bits: u32,
+    halo: bool,
+}
+
+#[derive(Default)]
+struct AppearanceTiles {
+    entries: VecDeque<(AppearanceTileKey, Arc<RasterizedVectorAppearance>)>,
+    bytes: usize,
+}
+
+impl FrameRasterCache {
+    fn appearance(
+        &self,
+        key: AppearanceTileKey,
+        build: impl FnOnce() -> Option<RasterizedVectorAppearance>,
+    ) -> Option<Arc<RasterizedVectorAppearance>> {
+        if let Some(tile) = self.appearances.lock().unwrap().get(key) {
+            return Some(tile);
+        }
+        let tile = Arc::new(build()?);
+        let mut cache = self.appearances.lock().unwrap();
+        // Another render worker may have built the same tile in the meantime.
+        Some(cache.get(key).unwrap_or_else(|| {
+            cache.insert(key, Arc::clone(&tile));
+            tile
+        }))
+    }
+}
+
+impl AppearanceTiles {
+    fn get(&mut self, key: AppearanceTileKey) -> Option<Arc<RasterizedVectorAppearance>> {
+        let index = self.entries.iter().position(|(cached, _)| *cached == key)?;
+        let entry = self.entries.remove(index)?;
+        let tile = Arc::clone(&entry.1);
+        self.entries.push_back(entry);
+        Some(tile)
+    }
+
+    fn insert(&mut self, key: AppearanceTileKey, tile: Arc<RasterizedVectorAppearance>) {
+        const MAX_BYTES: usize = 64 * 1024 * 1024;
+        const MAX_TILES: usize = 64;
+        let bytes = tile.rgba.capacity();
+        if bytes > MAX_BYTES {
+            return;
+        }
+        while self.bytes + bytes > MAX_BYTES || self.entries.len() >= MAX_TILES {
+            let Some((_, old)) = self.entries.pop_front() else {
+                break;
+            };
+            self.bytes -= old.rgba.capacity();
+        }
+        self.entries.push_back((key, tile));
+        self.bytes += bytes;
+    }
+}
+
 pub fn rasterize_q0rg_frame_scaled(
     project: &ProjectV2,
     q0rg_id: u16,
@@ -1277,9 +1403,7 @@ pub fn rasterize_q0rg_frame_with_runtime_state(
     rig_overrides: &crate::rig::RigRuntimeOverrides,
     scene_state: &RuntimeSceneState,
 ) -> Vec<u8> {
-    let stage_w = f32::from(project.meta.stage_width.max(1));
-    let stage_h = f32::from(project.meta.stage_height.max(1));
-    let root = Affine::from_scale(w as f32 / stage_w, h as f32 / stage_h);
+    let root = raster_stage_scale(project, w, h);
     rasterize_q0rg_frame_with_root_transform(
         project,
         q0rg_id,
@@ -1292,6 +1416,12 @@ pub fn rasterize_q0rg_frame_with_runtime_state(
         rig_overrides,
         scene_state,
     )
+}
+
+fn raster_stage_scale(project: &ProjectV2, w: u32, h: u32) -> Affine {
+    let stage_w = f32::from(project.meta.stage_width.max(1));
+    let stage_h = f32::from(project.meta.stage_height.max(1));
+    Affine::from_scale(w as f32 / stage_w, h as f32 / stage_h)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1312,12 +1442,41 @@ pub fn rasterize_q0rg_frame_with_root_transform(
     rig_overrides: &crate::rig::RigRuntimeOverrides,
     scene_state: &RuntimeSceneState,
 ) -> Vec<u8> {
+    rasterize_root_transform(
+        project,
+        q0rg_id,
+        frame,
+        w,
+        h,
+        ss,
+        bg_rgba,
+        root,
+        rig_overrides,
+        scene_state,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rasterize_root_transform(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    frame: u16,
+    w: u32,
+    h: u32,
+    ss: u32,
+    bg_rgba: [u8; 4],
+    root: Affine,
+    rig_overrides: &crate::rig::RigRuntimeOverrides,
+    scene_state: &RuntimeSceneState,
+    cache: Option<&FrameRasterCache>,
+) -> Vec<u8> {
     let root = if project.camera_on(q0rg_id) {
         Affine::compose(root, project.camera_affine_in(q0rg_id, frame))
     } else {
         root
     };
-    rasterize_q0rg_frame_with_mask_preview(
+    rasterize_frame_impl(
         project,
         q0rg_id,
         frame,
@@ -1330,6 +1489,7 @@ pub fn rasterize_q0rg_frame_with_root_transform(
         scene_state,
         None,
         true,
+        cache,
     )
 }
 
@@ -1339,6 +1499,8 @@ pub fn rasterize_q0rg_frame_with_root_transform(
 #[derive(Clone, Copy)]
 pub struct MaskEditingPreview<'a> {
     pub q0rg_id: u16,
+    /// Raster pixels per editor point, including a reduced-resolution preview.
+    pub outline_scale: f32,
     /// None uses playback mask visibility; Some enables mask artwork editing.
     pub hidden_artwork: Option<&'a HashSet<(u16, u16)>>,
     /// Filter root artwork only. Mask sources still contribute clipping alpha.
@@ -1375,6 +1537,39 @@ pub fn rasterize_q0rg_frame_with_mask_preview(
     mask_preview: Option<MaskEditingPreview<'_>>,
     timeline_camera_applied: bool,
 ) -> Vec<u8> {
+    rasterize_frame_impl(
+        project,
+        q0rg_id,
+        frame,
+        w,
+        h,
+        ss,
+        bg_rgba,
+        root,
+        rig_overrides,
+        scene_state,
+        mask_preview,
+        timeline_camera_applied,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rasterize_frame_impl(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    frame: u16,
+    w: u32,
+    h: u32,
+    ss: u32,
+    bg_rgba: [u8; 4],
+    root: Affine,
+    rig_overrides: &crate::rig::RigRuntimeOverrides,
+    scene_state: &RuntimeSceneState,
+    mask_preview: Option<MaskEditingPreview<'_>>,
+    timeline_camera_applied: bool,
+    cache: Option<&FrameRasterCache>,
+) -> Vec<u8> {
     let ss = ss.max(1);
     let sw = w.saturating_mul(ss);
     let sh = h.saturating_mul(ss);
@@ -1409,6 +1604,9 @@ pub fn rasterize_q0rg_frame_with_mask_preview(
             px.copy_from_slice(&bg_rgba);
         }
     }
+    let outline_scale = mask_preview.map_or(1.0, |preview| preview.outline_scale);
+    let previous_sample_scale =
+        OUTLINE_SAMPLE_SCALE.with(|scale| scale.replace(ss as f32 * outline_scale));
     render_to_buffer(
         project,
         q0rg_id,
@@ -1422,7 +1620,9 @@ pub fn rasterize_q0rg_frame_with_mask_preview(
         scene_state,
         mask_preview,
         timeline_camera_applied,
+        cache,
     );
+    OUTLINE_SAMPLE_SCALE.with(|scale| scale.set(previous_sample_scale));
     if ss == 1 {
         return hi;
     }
@@ -1588,6 +1788,7 @@ fn render_to_buffer(
     scene_state: &RuntimeSceneState,
     mask_preview: Option<MaskEditingPreview<'_>>,
     timeline_camera_applied: bool,
+    cache: Option<&FrameRasterCache>,
 ) {
     if depth > MAX_Q0RG_NESTING_DEPTH {
         return;
@@ -1663,9 +1864,16 @@ fn render_to_buffer(
                 rig_overrides,
                 scene_state,
                 rig_pose.as_ref(),
+                cache,
             );
             if scoped {
                 three_pass::end(project, &mut mask);
+            }
+            let fx = project.layer_metadata(q0rg_id, layer.layer_id).fx.visual();
+            if !fx.is_identity() {
+                let mut filtered = vec![0u8; mask.len()];
+                apply_placement_fx(&mut filtered, &mask, w, h, fx, parent.uniform_scale());
+                mask = filtered;
             }
             (layer.layer_id, mask)
         })
@@ -1705,31 +1913,29 @@ fn render_to_buffer(
         {
             continue;
         }
-        // A script moved or faded the layer: it draws shifted, and a faded
-        // layer is drawn on its own and laid over at its opacity.
+        // Filters and opacity apply to the composed layer, including overlap.
         let parent = look.shift(parent);
-        let mut faded = (look.alpha < 1.0).then(|| vec![0u8; buffer.len()]);
-        let faded_scope = faded
-            .as_ref()
-            .is_some_and(|layer_buffer| three_pass::begin_scope(layer_buffer, w, h, 0.0, 0.0));
-        let target: &mut [u8] = match faded.as_mut() {
-            Some(layer_buffer) => layer_buffer,
-            None => &mut *buffer,
-        };
         let mask_sources = project
             .layer_clipping_masks(q0rg_id, layer.layer_id)
             .into_iter()
             .filter(|mask_id| mask_preview.is_none_or(|preview| preview.clips(*mask_id)))
             .filter(|mask_id| !blank_mask_ids.contains(mask_id))
             .collect::<Vec<_>>();
-        if !mask_sources.is_empty() {
-            let Some(masks) = mask_sources
-                .iter()
-                .map(|mask_layer_id| mask_buffers.get(mask_layer_id).map(Vec::as_slice))
-                .collect::<Option<Vec<_>>>()
-            else {
-                continue;
-            };
+        let Some(masks) = mask_sources
+            .iter()
+            .map(|mask_layer_id| mask_buffers.get(mask_layer_id).map(Vec::as_slice))
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        let fx = metadata.fx;
+        let mut layer_buffer =
+            (look.alpha < 1.0 || !fx.is_identity()).then(|| vec![0u8; buffer.len()]);
+        let layer_scope = layer_buffer
+            .as_ref()
+            .is_some_and(|pixels| three_pass::begin_scope(pixels, w, h, 0.0, 0.0));
+        let target = layer_buffer.as_deref_mut().unwrap_or(&mut *buffer);
+        if !masks.is_empty() {
             render_masked_layer_contents(
                 project,
                 q0rg_id,
@@ -1744,6 +1950,7 @@ fn render_to_buffer(
                 scene_state,
                 rig_pose.as_ref(),
                 &masks,
+                cache,
             );
         } else {
             render_layer_contents(
@@ -1759,14 +1966,21 @@ fn render_to_buffer(
                 rig_overrides,
                 scene_state,
                 rig_pose.as_ref(),
+                cache,
             );
         }
-        if let Some(mut layer_buffer) = faded {
-            if faded_scope {
-                three_pass::end(project, &mut layer_buffer);
+        if let Some(mut source) = layer_buffer {
+            if layer_scope {
+                three_pass::end(project, &mut source);
             }
             three_pass::flush(project, buffer);
-            composite_rgba_with_blend(buffer, &layer_buffer, BlendMode::Normal, look.alpha);
+            if fx.is_identity() {
+                composite_rgba_with_blend(buffer, &source, BlendMode::Normal, look.alpha);
+            } else {
+                let mut filters = fx.visual();
+                filters.opacity *= look.alpha;
+                apply_placement_fx(buffer, &source, w, h, filters, parent.uniform_scale());
+            }
         }
     }
     if let Some(lighting) = lighting.as_ref().filter(|_| !lit) {
@@ -1975,6 +2189,7 @@ fn render_layer_contents(
     rig_overrides: &crate::rig::RigRuntimeOverrides,
     scene_state: &RuntimeSceneState,
     rig_pose: Option<&crate::rig::RigPose>,
+    cache: Option<&FrameRasterCache>,
 ) {
     let shape_morph = crate::shape_tween::project_layer_morph(project, layer, local_frame);
     for active in active_placement_states_at(layer, local_frame) {
@@ -2021,6 +2236,7 @@ fn render_layer_contents(
                 crate::rig::rig_for_q0rg(project, q0rg_id),
                 rig_pose,
                 morphed,
+                cache,
             );
         } else {
             let tile = fx_tile(
@@ -2036,6 +2252,7 @@ fn render_layer_contents(
                 morphed,
                 w,
                 h,
+                cache.map(|cache| &cache.bounds),
             );
             let (min_x, min_y, max_x, max_y) = match tile {
                 FxTile::Offscreen => continue,
@@ -2063,6 +2280,7 @@ fn render_layer_contents(
                 crate::rig::rig_for_q0rg(project, q0rg_id),
                 rig_pose,
                 morphed,
+                cache,
             );
             if scoped {
                 three_pass::end(project, &mut source);
@@ -2108,6 +2326,7 @@ fn fx_tile(
     morphed: Option<&[crate::v2::VectorAsset]>,
     w: u32,
     h: u32,
+    cache: Option<&RuntimeBoundsCache>,
 ) -> FxTile {
     // Bounds pose rigs from the scene state; when the caller overrides rigs
     // separately they could disagree with what gets drawn.
@@ -2130,7 +2349,7 @@ fn fx_tile(
             composed,
             depth,
             scene_state,
-            None,
+            cache,
         ),
     };
     let Some(bounds) = bounds else {
@@ -2194,6 +2413,7 @@ fn render_masked_layer_contents(
     scene_state: &RuntimeSceneState,
     rig_pose: Option<&crate::rig::RigPose>,
     masks: &[&[u8]],
+    cache: Option<&FrameRasterCache>,
 ) {
     let shape_morph = crate::shape_tween::project_layer_morph(project, layer, local_frame);
     let mut projected_mask_bounds = None;
@@ -2244,6 +2464,7 @@ fn render_masked_layer_contents(
                     morphed,
                     w,
                     h,
+                    cache.map(|cache| &cache.bounds),
                 ) {
                     FxTile::Offscreen => continue,
                     FxTile::Region(region) => region,
@@ -2251,6 +2472,9 @@ fn render_masked_layer_contents(
                 }
             };
         let (tile_w, tile_h) = (max_x - min_x, max_y - min_y);
+        if tile_w == 0 || tile_h == 0 {
+            continue;
+        }
         let mut source = vec![0u8; tile_w as usize * tile_h as usize * 4];
         // A masked tile has a 3D pass of its own.
         let scoped = three_pass::begin_scope(&source, tile_w, tile_h, min_x as f32, min_y as f32);
@@ -2288,6 +2512,7 @@ fn render_masked_layer_contents(
                 crate::rig::rig_for_q0rg(project, q0rg_id),
                 rig_pose,
                 morphed,
+                cache,
             );
         }
         if scoped {
@@ -2310,19 +2535,26 @@ fn render_masked_layer_contents(
             );
             effected
         };
-        for (index, pixel) in tile.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-            let row = index / tile_w as usize;
-            let column = index % tile_w as usize;
-            let pixel_index = (min_y as usize + row) * w as usize + min_x as usize + column;
-            let mask_alpha = masks.iter().fold(255u16, |alpha, mask| {
-                let mask_alpha = u16::from(mask[pixel_index * 4 + 3]);
-                (alpha * mask_alpha + 127) / 255
-            });
-            pixel[3] = ((u16::from(pixel[3]) * mask_alpha + 127) / 255) as u8;
+        let tile_stride = tile_w as usize * 4;
+        for (row, source) in tile.chunks_exact_mut(tile_stride).enumerate() {
+            let offset = ((min_y as usize + row) * w as usize + min_x as usize) * 4;
+            for (column, pixel) in source.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                if pixel[3] == 0 {
+                    continue;
+                }
+                let alpha_index = offset + column * 4 + 3;
+                let mask_alpha = masks.iter().fold(255u16, |alpha, mask| {
+                    (alpha * u16::from(mask[alpha_index]) + 127) / 255
+                });
+                pixel[3] = ((u16::from(pixel[3]) * mask_alpha + 127) / 255) as u8;
+            }
+            composite_rgba_with_blend(
+                &mut buffer[offset..offset + tile_stride],
+                source,
+                active.fx.blend_mode,
+                1.0,
+            );
         }
-        let mut destination = copy_rgba_rect(buffer, w, min_x, min_y, max_x, max_y);
-        composite_rgba_with_blend(&mut destination, &tile, active.fx.blend_mode, 1.0);
-        write_rgba_rect(buffer, w, min_x, min_y, max_x, max_y, &destination);
     }
 }
 
@@ -2344,20 +2576,13 @@ fn render_placement_target(
     rig: Option<&crate::v2::RigAsset>,
     rig_pose: Option<&crate::rig::RigPose>,
     morphed: Option<&[crate::v2::VectorAsset]>,
+    cache: Option<&FrameRasterCache>,
 ) {
     if let Some(shapes) = morphed {
         three_pass::flush(project, buffer);
         // Inside a shape tween the stored asset is replaced by its in-between.
         for shape in shapes {
-            let mut context = AssetRasterContext {
-                transform: composed,
-                buffer: &mut *buffer,
-                width: w,
-                height: h,
-                elapsed_host_frames: 0,
-                host_fps: project.meta.fps,
-            };
-            rasterize_asset(&Asset::Vector(shape.clone()), None, &mut context);
+            rasterize_vector(shape, None, composed, buffer, w, h, None);
         }
         return;
     }
@@ -2391,6 +2616,7 @@ fn render_placement_target(
                     height: h,
                     elapsed_host_frames: local_frame.saturating_sub(playback_start_frame),
                     host_fps: project.meta.fps,
+                    cache: cache.filter(|_| deformed.is_none()),
                 };
                 rasterize_asset(asset, project.asset_appearances.get(&id), &mut context);
             }
@@ -2416,6 +2642,7 @@ fn render_placement_target(
                 scene_state,
                 None,
                 false,
+                cache,
             );
         }
         _ => {}
@@ -2565,6 +2792,10 @@ fn composite_rgba_with_blend(destination: &mut [u8], source: &[u8], mode: BlendM
         .iter_mut()
         .zip(source.as_chunks::<4>().0.iter())
     {
+        if mode == BlendMode::Normal && opacity == 1.0 && src[3] == 255 {
+            dst.copy_from_slice(src);
+            continue;
+        }
         let sa = (f32::from(src[3]) * opacity / 255.0).clamp(0.0, 1.0);
         if sa <= 0.0 {
             continue;
@@ -2678,6 +2909,7 @@ fn placement_fx_in_pixels(fx: PlacementFx, scale: f32) -> PlacementFx {
             offset_y: shadow.offset_y * scale,
             ..shadow
         }),
+        outline: fx.outline,
         audio_gain: fx.audio_gain,
         audio_muted: fx.audio_muted,
         q0rg_playback: fx.q0rg_playback,
@@ -2687,7 +2919,9 @@ fn placement_fx_in_pixels(fx: PlacementFx, scale: f32) -> PlacementFx {
 }
 
 fn placement_fx_padding(fx: PlacementFx) -> u32 {
-    let mut extent = 0.0f32;
+    let mut extent = fx.outline.map_or(0.0, |outline| {
+        outline.width * OUTLINE_SAMPLE_SCALE.with(|scale| scale.get())
+    });
     if let Some(blur) = fx.blur {
         extent = extent.max(blur.radius_x.max(blur.radius_y));
     }
@@ -2703,12 +2937,17 @@ fn placement_fx_padding(fx: PlacementFx) -> u32 {
     extent.ceil().clamp(0.0, (u32::MAX - 2) as f32) as u32 + 2
 }
 
-fn apply_placement_fx_full(
+thread_local! {
+    static OUTLINE_SAMPLE_SCALE: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0) };
+}
+
+fn apply_visual_fx(
     destination: &mut [u8],
     source: &[u8],
     width: u32,
     height: u32,
     fx: PlacementFx,
+    outline: Option<crate::v2::Outline2d>,
 ) {
     // Tint changes RGB only. Keep source coverage and holes exactly intact.
     let tinted_source;
@@ -2777,6 +3016,13 @@ fn apply_placement_fx_full(
         );
     }
 
+    if let Some(outline) = outline.filter(|outline| outline.width > 0.0 && outline.color.a > 0) {
+        let radius =
+            outline.width.clamp(0.0, 64.0) * OUTLINE_SAMPLE_SCALE.with(|scale| scale.get());
+        let mask = outline_alpha(&source_alpha, width as usize, height as usize, radius);
+        composite_mask_color(&mut group, &mask, width, height, outline.color, 1.0, (0, 0));
+    }
+
     let body = if let Some(blur) = fx.blur {
         gaussian_blur_rgba_xy(
             source,
@@ -2793,6 +3039,89 @@ fn apply_placement_fx_full(
     composite_rgba_with_blend(destination, &group, fx.blend_mode, fx.opacity);
 }
 
+/// Two directional passes measure the distance to the layer's alpha silhouette.
+/// Three units are one axis-aligned pixel, and four approximate the diagonal.
+fn outline_alpha(alpha: &[u8], width: usize, height: usize, radius: f32) -> Vec<u8> {
+    let limit = ((radius + 1.0) * 3.0).ceil() as u16;
+    let mut distance: Vec<_> = alpha
+        .iter()
+        .map(|&a| if a != 0 { 0 } else { limit })
+        .collect();
+    for y in 0..height {
+        for x in 0..width {
+            let index = y * width + x;
+            if x > 0 {
+                distance[index] = distance[index].min(distance[index - 1] + 3);
+            }
+            if y > 0 {
+                let row = index - width;
+                distance[index] = distance[index].min(distance[row] + 3);
+                if x > 0 {
+                    distance[index] = distance[index].min(distance[row - 1] + 4);
+                }
+                if x + 1 < width {
+                    distance[index] = distance[index].min(distance[row + 1] + 4);
+                }
+            }
+        }
+    }
+    for y in (0..height).rev() {
+        for x in (0..width).rev() {
+            let index = y * width + x;
+            if x + 1 < width {
+                distance[index] = distance[index].min(distance[index + 1] + 3);
+            }
+            if y + 1 < height {
+                let row = index + width;
+                distance[index] = distance[index].min(distance[row] + 3);
+                if x > 0 {
+                    distance[index] = distance[index].min(distance[row - 1] + 4);
+                }
+                if x + 1 < width {
+                    distance[index] = distance[index].min(distance[row + 1] + 4);
+                }
+            }
+        }
+    }
+    distance
+        .into_iter()
+        .enumerate()
+        .map(|(index, distance)| {
+            let coverage = if distance == 0 {
+                outline_under_edge(alpha, width, height, index, radius)
+            } else {
+                (radius + 1.0 - f32::from(distance) / 3.0).clamp(0.0, 1.0)
+            };
+            (coverage * 255.0).round() as u8
+        })
+        .collect()
+}
+
+fn outline_under_edge(alpha: &[u8], width: usize, height: usize, index: usize, radius: f32) -> f32 {
+    let body = alpha[index];
+    if body == 255 {
+        return 0.0;
+    }
+
+    // Fill behind partial coverage only at the silhouette, as in the GPU pass.
+    let (x, y) = (index % width, index / width);
+    let mut adjacent_to_transparency = x == 0 || y == 0 || x + 1 == width || y + 1 == height;
+    let mut max_alpha = body;
+    let left = x.saturating_sub(1);
+    let right = (x + 1).min(width - 1);
+    for row in y.saturating_sub(1)..=(y + 1).min(height - 1) {
+        let row_start = row * width;
+        for &neighbor in &alpha[row_start + left..=row_start + right] {
+            adjacent_to_transparency |= neighbor == 0;
+            max_alpha = max_alpha.max(neighbor);
+        }
+    }
+    if !adjacent_to_transparency {
+        return 0.0;
+    }
+    f32::from(max_alpha - body).min(radius * 255.0) / f32::from(255 - body)
+}
+
 fn apply_placement_fx(
     destination: &mut [u8],
     source: &[u8],
@@ -2801,13 +3130,36 @@ fn apply_placement_fx(
     fx: PlacementFx,
     transform_scale: f32,
 ) {
+    let fx = placement_fx_in_pixels(fx, transform_scale);
+    composite_fx_tile(destination, source, width, height, fx, fx.outline);
+}
+
+fn composite_fx_tile(
+    destination: &mut [u8],
+    source: &[u8],
+    width: u32,
+    height: u32,
+    fx: PlacementFx,
+    outline: Option<crate::v2::Outline2d>,
+) {
+    if outline.is_none()
+        && fx.blur.is_none()
+        && fx.glow.is_none()
+        && fx.shadow.is_none()
+        && fx.tint.is_none()
+    {
+        composite_rgba_with_blend(destination, source, fx.blend_mode, fx.opacity);
+        return;
+    }
     let Some((body_min_x, body_min_y, body_max_x, body_max_y)) =
         rgba_alpha_bounds(source, width, height)
     else {
         return;
     };
-    let fx = placement_fx_in_pixels(fx, transform_scale);
-    let padding = placement_fx_padding(fx);
+    let outline_padding = outline.map_or(0, |outline| {
+        (outline.width * OUTLINE_SAMPLE_SCALE.with(|scale| scale.get())).ceil() as u32 + 2
+    });
+    let padding = placement_fx_padding(fx).max(outline_padding);
     let min_x = body_min_x.saturating_sub(padding);
     let min_y = body_min_y.saturating_sub(padding);
     let max_x = body_max_x.saturating_add(padding).min(width);
@@ -2819,12 +3171,13 @@ fn apply_placement_fx(
     }
     let source_tile = copy_rgba_rect(source, width, min_x, min_y, max_x, max_y);
     let mut destination_tile = copy_rgba_rect(destination, width, min_x, min_y, max_x, max_y);
-    apply_placement_fx_full(
+    apply_visual_fx(
         &mut destination_tile,
         &source_tile,
         tile_width,
         tile_height,
         fx,
+        outline,
     );
     write_rgba_rect(
         destination,
@@ -2891,7 +3244,18 @@ pub fn active_placement_states_at(
     layer: &crate::v2::Layer,
     frame: u16,
 ) -> Vec<ActivePlacementState> {
-    active_placement_states_in(layer, frame, None)
+    active_placement_states_in(layer, frame, None, true)
+}
+
+/// `active_placement_states_at` for callers that want only where things
+/// are and how they look: each state's `playback_start_frame` is left as
+/// its own key's frame. Working out where symbol playback starts walks
+/// every key of the layer, which on a long timeline is most of the cost.
+pub fn active_placement_motion_at(
+    layer: &crate::v2::Layer,
+    frame: u16,
+) -> Vec<ActivePlacementState> {
+    active_placement_states_in(layer, frame, None, false)
 }
 
 /// `active_placement_states_at`, reusing what `timeline` already knows about
@@ -2901,13 +3265,14 @@ pub fn active_placement_states_with(
     frame: u16,
     timeline: &LayerTimeline,
 ) -> Vec<ActivePlacementState> {
-    active_placement_states_in(layer, frame, Some(timeline))
+    active_placement_states_in(layer, frame, Some(timeline), true)
 }
 
 fn active_placement_states_in(
     layer: &crate::v2::Layer,
     frame: u16,
     timeline: Option<&LayerTimeline>,
+    with_playback_starts: bool,
 ) -> Vec<ActivePlacementState> {
     if layer
         .timeline_frame_count
@@ -2942,7 +3307,7 @@ fn active_placement_states_in(
     // A first-key hold has no earlier segment to look up, even if the layer
     // contains thousands of future keys. The editor indexes other keys once.
     let built_starts;
-    let playback_starts: Option<&[u16]> = if keyframe == 0 {
+    let playback_starts: Option<&[u16]> = if keyframe == 0 || !with_playback_starts {
         None
     } else if let Some(timeline) = timeline {
         Some(&timeline.starts)
@@ -3029,10 +3394,55 @@ fn active_placement_states_in(
 }
 
 pub fn active_placements_at(layer: &crate::v2::Layer, frame: u16) -> Vec<(usize, Transform2D)> {
-    active_placement_states_at(layer, frame)
+    active_placement_motion_at(layer, frame)
         .into_iter()
         .map(|active| (active.index, active.transform))
         .collect()
+}
+
+pub fn q0rg_has_layer_fx(project: &ProjectV2, q0rg_id: u16) -> bool {
+    q0rg_has_matching_layer_fx(project, q0rg_id, |metadata| !metadata.fx.is_identity())
+}
+
+/// Effects that the interactive renderers still need the software path for.
+pub fn q0rg_needs_software_layer_fx(project: &ProjectV2, q0rg_id: u16) -> bool {
+    q0rg_has_matching_layer_fx(project, q0rg_id, |metadata| {
+        metadata.kind == crate::v2::LayerKind::Mask && metadata.fx.has_effects_beyond_opacity()
+    })
+}
+
+fn q0rg_has_matching_layer_fx(
+    project: &ProjectV2,
+    q0rg_id: u16,
+    matches: impl Fn(crate::v2::LayerMetadata) -> bool,
+) -> bool {
+    if !project.layer_metadata.values().copied().any(&matches) {
+        return false;
+    }
+    let mut visited = HashSet::new();
+    let mut pending = vec![q0rg_id];
+    while let Some(id) = pending.pop() {
+        if !visited.insert(id) {
+            continue;
+        }
+        if let Some(q0rg) = project.q0rgs.iter().find(|q0rg| q0rg.q0rg_id == id) {
+            for layer in &q0rg.layers {
+                if !project.layer_is_visible(id, layer.layer_id) {
+                    continue;
+                }
+                if matches(project.layer_metadata(id, layer.layer_id)) {
+                    return true;
+                }
+                pending.extend(layer.placements.iter().filter_map(
+                    |placement| match placement.target {
+                        Target::Q0rg(child) => Some(child),
+                        Target::Asset(_) => None,
+                    },
+                ));
+            }
+        }
+    }
+    false
 }
 
 pub fn q0rg_frame_has_placement_fx(project: &ProjectV2, q0rg_id: u16, frame: u16) -> bool {
@@ -3080,6 +3490,7 @@ struct AssetRasterContext<'a> {
     height: u32,
     elapsed_host_frames: u16,
     host_fps: u16,
+    cache: Option<&'a FrameRasterCache>,
 }
 
 fn rasterize_asset(
@@ -3102,6 +3513,7 @@ fn rasterize_asset(
             context.buffer,
             context.width,
             context.height,
+            context.cache,
         ),
         Asset::Q0v(v) => {
             let Some(bitmap) = video::frame(v, context.elapsed_host_frames, context.host_fps)
@@ -3116,6 +3528,12 @@ fn rasterize_asset(
                 context.height,
             );
         }
+        Asset::Raster(raster) => raster.draw_straight(
+            context.transform,
+            context.buffer,
+            context.width,
+            context.height,
+        ),
         // Models are drawn by the 3D renderer.
         Asset::Rig(_) | Asset::Model(_) => {}
     }
@@ -3605,17 +4023,38 @@ fn rasterize_vector(
     buffer: &mut [u8],
     w: u32,
     h: u32,
+    cache: Option<&FrameRasterCache>,
 ) {
     if let Some(appearance) = appearance {
+        let appearance_tile = |ppu: f32, halo: bool| {
+            let build = || {
+                if halo {
+                    rasterize_vector_halo_local(v, appearance, ppu)
+                } else {
+                    rasterize_vector_body_local(v, appearance, ppu)
+                }
+            };
+            match cache {
+                Some(cache) => cache.appearance(
+                    AppearanceTileKey {
+                        asset_id: v.asset_id,
+                        scale_bits: ppu.to_bits(),
+                        halo,
+                    },
+                    build,
+                ),
+                None => build().map(Arc::new),
+            }
+        };
         if matches!(appearance.material, VectorMaterial::SoftHalo { .. }) {
             let field_transform = Affine::compose(t, appearance.field_transform);
             let pixels_per_unit = field_transform.uniform_scale().clamp(1.0, 4.0);
-            if let Some(tile) = rasterize_vector_halo_local(v, appearance, pixels_per_unit) {
+            if let Some(tile) = appearance_tile(pixels_per_unit, true) {
                 composite_appearance_tile(&tile, field_transform, buffer, w, h);
             }
         }
         let body_ppu = t.uniform_scale().clamp(1.0, 4.0);
-        if let Some(body) = rasterize_vector_body_local(v, appearance, body_ppu) {
+        if let Some(body) = appearance_tile(body_ppu, false) {
             composite_appearance_tile(&body, t, buffer, w, h);
         }
         if let Some(stroke) = &v.stroke {
@@ -3726,36 +4165,42 @@ fn sample_tile_bilinear(tile: &RasterizedVectorAppearance, x: f32, y: f32) -> Op
     if x < -0.5 || y < -0.5 || x > tile.width as f32 - 0.5 || y > tile.height as f32 - 0.5 {
         return None;
     }
-    let x0 = x.floor().clamp(0.0, tile.width.saturating_sub(1) as f32) as u32;
-    let y0 = y.floor().clamp(0.0, tile.height.saturating_sub(1) as f32) as u32;
-    let x1 = (x0 + 1).min(tile.width - 1);
-    let y1 = (y0 + 1).min(tile.height - 1);
-    let fx = (x - x.floor()).clamp(0.0, 1.0);
-    let fy = (y - y.floor()).clamp(0.0, 1.0);
-    let sample = |sx: u32, sy: u32| -> [u8; 4] {
-        let index = ((sy * tile.width + sx) * 4) as usize;
-        [
-            tile.rgba[index],
-            tile.rgba[index + 1],
-            tile.rgba[index + 2],
-            tile.rgba[index + 3],
-        ]
-    };
-    let a = sample(x0, y0);
-    let b = sample(x1, y0);
-    let c = sample(x0, y1);
-    let d = sample(x1, y1);
-    let lerp = |p: u8, q: u8, t: f32| f32::from(p) + (f32::from(q) - f32::from(p)) * t;
+    let floor_x = x.floor();
+    let floor_y = y.floor();
+    let x0 = floor_x.clamp(0.0, tile.width.saturating_sub(1) as f32) as usize;
+    let y0 = floor_y.clamp(0.0, tile.height.saturating_sub(1) as f32) as usize;
+    let x1 = (x0 + 1).min(tile.width as usize - 1);
+    let y1 = (y0 + 1).min(tile.height as usize - 1);
+    let fx = (x - floor_x).clamp(0.0, 1.0);
+    let fy = (y - floor_y).clamp(0.0, 1.0);
+    let pixels = tile.rgba.as_chunks::<4>().0;
+    let row0 = y0 * tile.width as usize;
+    let row1 = y1 * tile.width as usize;
+    let [a, b, c, d] = [
+        pixels[row0 + x0],
+        pixels[row0 + x1],
+        pixels[row1 + x0],
+        pixels[row1 + x1],
+    ];
+    let lerp = |p: u8, q: u8| -> f32 { f32::from(p) + (f32::from(q) - f32::from(p)) * fx };
     let channel = |index: usize| {
-        let top = lerp(a[index], b[index], fx);
-        let bottom = lerp(c[index], d[index], fx);
-        (top + (bottom - top) * fy).clamp(0.0, 255.0).round() as u8
+        let top = lerp(a[index], b[index]);
+        let bottom = lerp(c[index], d[index]);
+        let value = top + (bottom - top) * fy;
+        // Interpolated channels are nonnegative. Subtracting the truncated
+        // byte preserves exact half-up rounding without a floating round call.
+        let lower = value as u8;
+        lower.saturating_add(u8::from(value - f32::from(lower) >= 0.5))
     };
+    let alpha = channel(3);
+    if alpha == 0 {
+        return None;
+    }
     Some(Rgba {
         r: channel(0),
         g: channel(1),
         b: channel(2),
-        a: channel(3),
+        a: alpha,
     })
 }
 
@@ -3960,6 +4405,15 @@ fn paint_span(buffer: &mut [u8], w: u32, yi: i32, x0: f32, x1: f32, color: Rgba)
     let xi0 = x0.max(0.0).round() as i32;
     let xi1 = x1.min((w as i32 - 1) as f32).round() as i32;
     if xi0 > xi1 {
+        return;
+    }
+    if color.a == 255 {
+        let row = yi as usize * w as usize;
+        let start = (row + xi0 as usize) * 4;
+        let end = (row + xi1 as usize + 1) * 4;
+        for pixel in buffer[start..end].as_chunks_mut::<4>().0 {
+            *pixel = [color.r, color.g, color.b, 255];
+        }
         return;
     }
     for xi in xi0..=xi1 {
@@ -5393,6 +5847,17 @@ mod resolver_tests {
             alpha(18, 25) > 0,
             "transformed halo must survive q0rg nesting"
         );
+
+        // The export cache must retain alpha and masks at different scales,
+        // and a held drawing can safely reuse both of its material tiles.
+        let sequence = FrameRasterizer::new(&project);
+        for (width, height) in [(64, 64), (80, 92), (64, 64)] {
+            assert_eq!(
+                sequence.render_scaled(1, 0, width, height, 1, [0; 4]),
+                rasterize_q0rg_frame_scaled(&project, 1, 0, width, height, 1, [0; 4]),
+            );
+        }
+        assert_eq!(sequence.cache.appearances.lock().unwrap().entries.len(), 4);
     }
 
     #[test]
@@ -5490,6 +5955,41 @@ mod resolver_tests {
         let visible = rasterize_q0rg_frame(&project, 1, 0, 2, 2, 1, [0, 0, 0, 0]);
         assert_eq!(&visible[..4], &[255, 0, 0, 255]);
 
+        let mut with_fx = project.clone();
+        with_fx.meta.stage_width = 16;
+        with_fx.meta.stage_height = 16;
+        with_fx.q0rgs[0].layers[0].placements[0].transform.tx = 4.0;
+        with_fx.q0rgs[0].layers[0].placements[0].transform.ty = 4.0;
+        let overlapping = with_fx.q0rgs[0].layers[0].placements[0].clone();
+        with_fx.q0rgs[0].layers[0].placements.push(overlapping);
+        let fx = &mut with_fx
+            .layer_metadata
+            .entry(LayerKey::new(1, 1))
+            .or_default()
+            .fx;
+        fx.filters.opacity = 0.5;
+        fx.outline = Some(crate::v2::Outline2d {
+            width: 2.0,
+            color: Rgba {
+                r: 0,
+                g: 0,
+                b: 255,
+                a: 255,
+            },
+        });
+        let saved = crate::v2::write(&with_fx).unwrap();
+        let restored = crate::v2::parse(&saved).unwrap();
+        assert_eq!(restored.layer_metadata, with_fx.layer_metadata);
+        for zoom in [1u32, 2] {
+            let size = 16 * zoom;
+            let pixels = rasterize_q0rg_frame_scaled(&restored, 1, 0, size, size, 1, [0; 4]);
+            let pixel = |x, y| &pixels[((y * size + x) * 4) as usize..][..4];
+            let edge = 4 * zoom;
+            assert_eq!(pixel(edge, edge), &[255, 0, 0, 128]);
+            assert_eq!(pixel(edge - 2, edge), &[0, 0, 255, 128]);
+            assert_eq!(pixel(edge - 3, edge), &[0, 0, 0, 0]);
+        }
+
         project.layer_metadata.insert(
             LayerKey::new(1, 1),
             LayerMetadata {
@@ -5499,6 +5999,40 @@ mod resolver_tests {
         );
         let hidden = rasterize_q0rg_frame(&project, 1, 0, 2, 2, 1, [0, 0, 0, 0]);
         assert!(hidden.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 0));
+    }
+
+    #[test]
+    fn outline_covers_antialiased_silhouette_without_tinting_translucent_body() {
+        let alpha = [0, 0, 128, 255, 255, 0, 0, 96, 96, 96, 0, 0];
+        let width = alpha.len();
+        let source: Vec<_> = alpha
+            .repeat(3)
+            .into_iter()
+            .flat_map(|a| [0, 0, 0, a])
+            .collect();
+        let mut output = vec![255; source.len()];
+        let outline = crate::v2::Outline2d {
+            width: 2.0,
+            color: Rgba {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255,
+            },
+        };
+        apply_visual_fx(
+            &mut output,
+            &source,
+            width as u32,
+            3,
+            PlacementFx::default(),
+            Some(outline),
+        );
+        let pixel = |x: usize| &output[(width + x) * 4..(width + x + 1) * 4];
+        assert_eq!(pixel(1), &[255, 0, 0, 255]);
+        assert_eq!(pixel(2), &[127, 0, 0, 255]);
+        assert_eq!(pixel(3), &[0, 0, 0, 255]);
+        assert_eq!(pixel(8), &[159, 159, 159, 255]);
     }
 
     #[test]

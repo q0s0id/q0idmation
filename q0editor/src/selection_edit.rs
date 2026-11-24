@@ -170,10 +170,32 @@ pub fn selected_object_refs(project: &ProjectV2, selection: &Selection) -> Vec<P
     refs
 }
 
+/// The selected objects as they show on the stage: an object on a parented
+/// layer is kept relative to its parent, and is copied with its parent's
+/// place taken in, so it pastes where it was seen.
 fn selected_object_placements(project: &ProjectV2, selection: &Selection) -> Vec<Placement> {
     selected_object_refs(project, selection)
         .into_iter()
-        .filter_map(|reference| placement_clone(project, reference))
+        .filter_map(|reference| {
+            let mut placement = placement_clone(project, reference)?;
+            if let Some(world) = q0s_format::parenting::parent_world(
+                project,
+                reference.q0rg_id,
+                reference.layer_id,
+                placement.frame,
+            )
+            .map(|parent| {
+                q0s_format::transform::Affine::compose(
+                    parent,
+                    q0s_format::transform::Affine::from_transform(placement.transform),
+                )
+            })
+            .and_then(q0s_format::parenting::affine_to_transform)
+            {
+                placement.transform = world;
+            }
+            Some(placement)
+        })
         .collect()
 }
 
@@ -541,6 +563,11 @@ pub fn paste_payload_with_depth(
     let preserve_depth =
         source_depths.len() == payload.placements.len() && !source_depths.is_empty();
     let mut active_indices: Vec<usize> = materialized.values().copied().collect();
+    // Pasted objects come in stage space; on a parented layer they are kept
+    // in the parent's. (Ones without an id are moved there as they take
+    // one.)
+    let into_parent = q0s_format::parenting::parent_world(project, q0rg_id, layer_id, frame)
+        .and_then(|parent| parent.inverse());
 
     for source in &payload.raw_vectors {
         let asset_id = next_asset_id(project);
@@ -645,6 +672,16 @@ pub fn paste_payload_with_depth(
         placement.frame = frame;
         placement.transform.tx += offset.x;
         placement.transform.ty += offset.y;
+        if let Some(inverse) = into_parent.filter(|_| placement.instance_id != 0) {
+            if let Some(local) =
+                q0s_format::parenting::affine_to_transform(q0s_format::transform::Affine::compose(
+                    inverse,
+                    q0s_format::transform::Affine::from_transform(placement.transform),
+                ))
+            {
+                placement.transform = local;
+            }
+        }
         pasted_objects.push(placement);
         if preserve_depth {
             pasted_depths.push(source_depths[index]);
@@ -1214,6 +1251,129 @@ fn next_asset_id(project: &ProjectV2) -> u16 {
         .unwrap_or(0)
         .saturating_add(1)
         .max(1)
+}
+
+/// Moves everything in `q0rg_id` by `offset`, in the symbol's own space:
+/// objects by their transforms and drawings by their points. A drawing also
+/// shown outside the symbol is copied first, so only the symbol's moves.
+pub(crate) fn move_symbol_content(project: &mut ProjectV2, q0rg_id: u16, offset: Vec2) {
+    let Some(index) = project
+        .q0rgs
+        .iter()
+        .position(|q0rg| q0rg.q0rg_id == q0rg_id)
+    else {
+        return;
+    };
+    let is_drawing = |project: &ProjectV2, id: u16| {
+        project
+            .assets
+            .iter()
+            .any(|asset| matches!(asset, Asset::Vector(vector) if vector.asset_id == id))
+    };
+    // How many placements show each drawing: everywhere, and in the symbol.
+    let mut everywhere: HashMap<u16, usize> = HashMap::new();
+    for q0rg in &project.q0rgs {
+        for layer in &q0rg.layers {
+            for placement in &layer.placements {
+                if let Target::Asset(id) = placement.target {
+                    *everywhere.entry(id).or_default() += 1;
+                }
+            }
+        }
+    }
+    let mut here: HashMap<u16, usize> = HashMap::new();
+    for layer in &project.q0rgs[index].layers {
+        for placement in &layer.placements {
+            if let Target::Asset(id) = placement.target {
+                *here.entry(id).or_default() += 1;
+            }
+        }
+    }
+    let drawings: BTreeSet<u16> = here
+        .keys()
+        .copied()
+        .filter(|id| is_drawing(project, *id))
+        .collect();
+    let mut moved: HashMap<u16, u16> = HashMap::new();
+    for id in drawings {
+        let Some(mut vector) = project.assets.iter().find_map(|asset| match asset {
+            Asset::Vector(vector) if vector.asset_id == id => Some(vector.clone()),
+            _ => None,
+        }) else {
+            continue;
+        };
+        translate_vector(&mut vector, offset);
+        let shared = everywhere.get(&id) != here.get(&id);
+        let new_id = if shared { next_asset_id(project) } else { id };
+        vector.asset_id = new_id;
+        #[cfg(feature = "appearance-mask-eraser")]
+        if let Some(appearance) = project.asset_appearances.get(&id) {
+            let moved = moved_appearance(appearance, offset);
+            project.asset_appearances.insert(new_id, moved);
+        }
+        if shared {
+            if let Some(name) = project.asset_names.get(&id).cloned() {
+                project.asset_names.insert(new_id, name);
+            }
+            project.assets.push(Asset::Vector(vector));
+        } else if let Some(slot) = project.assets.iter_mut().find_map(|asset| match asset {
+            Asset::Vector(slot) if slot.asset_id == id => Some(slot),
+            _ => None,
+        }) {
+            *slot = vector;
+        }
+        moved.insert(id, new_id);
+    }
+    for layer in &mut project.q0rgs[index].layers {
+        for placement in &mut layer.placements {
+            match placement.target {
+                Target::Asset(id) if moved.contains_key(&id) => {
+                    placement.target = Target::Asset(moved[&id]);
+                }
+                _ => {
+                    placement.transform.tx += offset.x;
+                    placement.transform.ty += offset.y;
+                }
+            }
+        }
+    }
+}
+
+/// `appearance` for its drawing's points moved by `offset`, drawing the same
+/// as before. A glow made from the drawing's own outline moves with the
+/// points already, so its field is carried round them (and its masks moved
+/// with them); one made from a kept source outline is moved as a whole.
+#[cfg(feature = "appearance-mask-eraser")]
+fn moved_appearance(
+    appearance: &q0s_format::v2::VectorAppearance,
+    offset: Vec2,
+) -> q0s_format::v2::VectorAppearance {
+    use q0s_format::transform::Affine;
+    let by = |x: f32, y: f32| Affine {
+        tx: x,
+        ty: y,
+        ..Affine::IDENTITY
+    };
+    if !appearance.material_source.is_empty() {
+        return crate::appearance::transform_appearance(appearance, by(offset.x, offset.y));
+    }
+    let mut moved = appearance.clone();
+    moved.field_transform = Affine::compose(
+        by(offset.x, offset.y),
+        Affine::compose(appearance.field_transform, by(-offset.x, -offset.y)),
+    );
+    let mut masks = VectorAsset {
+        asset_id: 0,
+        paths: std::mem::take(&mut moved.erase_mask),
+        fill: None,
+        stroke: None,
+    };
+    translate_vector(&mut masks, offset);
+    moved.erase_mask = masks.paths;
+    masks.paths = std::mem::take(&mut moved.clip_mask);
+    translate_vector(&mut masks, offset);
+    moved.clip_mask = masks.paths;
+    moved
 }
 
 fn translate_vector(vector: &mut VectorAsset, offset: Vec2) {

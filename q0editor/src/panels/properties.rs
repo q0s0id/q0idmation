@@ -40,6 +40,7 @@ enum Tab {
     Tool,
     #[default]
     Stage,
+    Layer,
 }
 
 /// What the panel saw last frame, to tell what was just touched.
@@ -170,12 +171,19 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         .ctx()
         .data(|d| (d.get_temp::<Tab>(tab_id), d.get_temp::<Seen>(seen_id)));
     let mut tab = follow_focus(stored, before.as_ref(), &seen);
-    let mut tabs = Vec::with_capacity(3);
+    let mut tabs = Vec::with_capacity(4);
     if let Some(label) = seen.context {
         tabs.push((Tab::Selection, label));
     }
-    tabs.push((Tab::Tool, app.session.current_tool.label()));
+    tabs.push((
+        Tab::Tool,
+        app.session
+            .raster
+            .tool
+            .map_or(app.session.current_tool.label(), |tool| tool.label()),
+    ));
     tabs.push((Tab::Stage, "Stage"));
+    tabs.push((Tab::Layer, "Layer"));
     tab_strip(ui, &tabs, &mut tab);
     ui.ctx().data_mut(|d| {
         d.insert_temp(tab_id, tab);
@@ -186,9 +194,64 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
         .auto_shrink([false, true])
         .show(ui, |ui| match tab {
             Tab::Selection => selection_tab(app, ui),
+            Tab::Tool if app.session.raster.active() => crate::raster::ui::tool_options(app, ui),
             Tab::Tool => render_tool_properties(app, ui),
             Tab::Stage => stage_properties(app, ui),
+            Tab::Layer => layer_effects(app, ui),
         });
+}
+
+fn layer_effects(app: &mut EditorApp, ui: &mut Ui) {
+    use q0s_format::v2::LayerKey;
+    let q0rg_id = app.session.current_q0rg_id;
+    let layer_id = app.session.current_layer_id;
+    let Some(layer) = app
+        .state
+        .project
+        .q0rgs
+        .iter()
+        .find(|q| q.q0rg_id == q0rg_id)
+        .and_then(|q| q.layers.iter().find(|layer| layer.layer_id == layer_id))
+    else {
+        return;
+    };
+    crate::ui::section_header(ui, &layer.name);
+    if app.state.project.layer_is_folder(q0rg_id, layer_id) {
+        return;
+    }
+    let key = LayerKey::new(q0rg_id, layer_id);
+    let mut metadata = app.state.project.layer_metadata(q0rg_id, layer_id);
+    let before = metadata.fx;
+    let locked = app.layer_refuses_timeline_edits(q0rg_id, layer_id)
+        || app.state.project.layer_is_locked(q0rg_id, layer_id);
+    ui.add_enabled_ui(!locked, |ui| {
+        let mut filters = metadata.fx.visual();
+        render_fx_controls(ui, &mut filters, &[before.visual()]);
+        metadata.fx.outline = filters.outline.take();
+        metadata.fx.filters = filters;
+    });
+    let gesture = ui.id().with(("layer_fx_drag", q0rg_id, layer_id));
+    let held = ui.input(|input| input.pointer.primary_down());
+    let recorded = ui.data_mut(|data| {
+        if held {
+            data.get_temp::<bool>(gesture).unwrap_or(false)
+        } else {
+            data.remove::<bool>(gesture);
+            false
+        }
+    });
+    if metadata.fx != before {
+        if !recorded {
+            app.history
+                .snapshot_with_session(&app.state.project, &app.session);
+            if held {
+                ui.data_mut(|data| data.insert_temp(gesture, true));
+            }
+        }
+        app.state.project.layer_metadata.insert(key, metadata);
+        app.state.mark_dirty();
+        app.textures.invalidate();
+    }
 }
 
 /// The pages' tabs, sharing the panel's width, worn like the tool buttons.
@@ -424,6 +487,10 @@ fn selection_tab(app: &mut EditorApp, ui: &mut Ui) {
                     .color(app.settings.theme.text_dim.to_color32())
                     .small(),
             );
+            // Its paint, straight away: changing it cuts the area out first.
+            if objects.is_empty() {
+                selected_stroke_properties(app, ui);
+            }
         }
         Selection::Mixed { paths, objects } => {
             ui.label(
@@ -460,7 +527,10 @@ fn selection_tab(app: &mut EditorApp, ui: &mut Ui) {
 
 fn render_camera_properties(app: &mut EditorApp, ui: &mut Ui) {
     let frame = app.session.current_frame;
-    let before = app.state.project.clone();
+    // The fields edit a copy of the camera, so the project is still as it
+    // was when an edit lands and is snapshotted then. Copying the whole
+    // project here "just in case" cost a big project its frame rate for as
+    // long as the camera stayed selected.
     let mut state = app
         .state
         .project
@@ -536,7 +606,8 @@ fn render_camera_properties(app: &mut EditorApp, ui: &mut Ui) {
 
     if changed {
         if wants_snapshot {
-            app.history.snapshot_with_session(&before, &app.session);
+            app.history
+                .snapshot_with_session(&app.state.project, &app.session);
         }
         app.camera_mut().insert_key(frame, state);
         if let Some(key) = app
@@ -893,6 +964,15 @@ fn selected_stroke_properties(app: &mut EditorApp, ui: &mut Ui) {
                 }
             }
         }
+        if ui
+            .button("Convert to fill")
+            .on_hover_text(
+                "Turns the selected lines into fills of their colour, with their own ends and corners, so a gradient can paint them (Modify > Convert Lines to Fills)",
+            )
+            .clicked()
+        {
+            app.queue(crate::app::Action::ConvertStrokeToFill);
+        }
     }
     if let Some((color, mixed)) = fill {
         crate::ui::section_header(ui, "Fill");
@@ -988,7 +1068,11 @@ fn raw_path_properties(
         })
         .and_then(|asset| match asset {
             Asset::Vector(vector) => vector.paths.get(path_idx),
-            Asset::Bitmap(_) | Asset::Q0v(_) | Asset::Rig(_) | Asset::Model(_) => None,
+            Asset::Bitmap(_)
+            | Asset::Q0v(_)
+            | Asset::Rig(_)
+            | Asset::Model(_)
+            | Asset::Raster(_) => None,
         });
     let Some(path) = path else {
         ui.label("Selection is no longer available");
@@ -1311,8 +1395,36 @@ fn render_tool_properties(app: &mut EditorApp, ui: &mut Ui) {
             );
         }
         ToolPropertyKind::Pencil => {
+            use crate::settings::PencilMode;
             stroke_tool_properties(app, ui, "Freehand line", false, true);
-            if ui.add(egui::Slider::new(&mut app.settings.pencil_smoothing, 0..=100).text("Smoothing")).changed() {
+            let before = app.settings.pencil_mode;
+            ui.horizontal(|ui| {
+                ui.label("Mode");
+                for (mode, name, hint) in [
+                    (
+                        PencilMode::Ink,
+                        "Ink",
+                        "Keeps the line as drawn, wobbles and all",
+                    ),
+                    (
+                        PencilMode::Smooth,
+                        "Smooth",
+                        "Evens the line into smooth curves; sharp turns stay corners",
+                    ),
+                    (
+                        PencilMode::Straighten,
+                        "Straighten",
+                        "Stretches that run nearly straight become straight lines",
+                    ),
+                ] {
+                    ui.selectable_value(&mut app.settings.pencil_mode, mode, name)
+                        .on_hover_text(hint);
+                }
+            });
+            let smoothed = ui
+                .add(egui::Slider::new(&mut app.settings.pencil_smoothing, 0..=100).text("Smoothing"))
+                .on_hover_text("How far the line is evened out; what you see while drawing is what you get");
+            if app.settings.pencil_mode != before || smoothed.drag_stopped() || (smoothed.changed() && !smoothed.dragged()) {
                 app.settings.save();
             }
         }
@@ -1707,6 +1819,28 @@ fn brush_properties(app: &mut EditorApp, ui: &mut Ui) {
 
                     ui.label("Speed size");
                     crate::ui::switch(ui, &mut app.session.brush.velocity_size, "");
+                    ui.end_row();
+
+                    ui.label("Faster is");
+                    let speed_on = app.session.brush.velocity_size;
+                    ui.add_enabled_ui(speed_on, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(
+                                &mut app.session.brush.velocity_grows,
+                                false,
+                                "Thinner",
+                            )
+                            .on_hover_text("Quick strokes come out thin, slow ones full size");
+                            ui.selectable_value(
+                                &mut app.session.brush.velocity_grows,
+                                true,
+                                "Thicker",
+                            )
+                            .on_hover_text(
+                                "Quick strokes come out full size, slow ones at the minimum size",
+                            );
+                        });
+                    });
                     ui.end_row();
 
                     let dynamics_enabled =
@@ -2410,6 +2544,9 @@ fn asset_properties(app: &mut EditorApp, ui: &mut Ui, id: u16) {
         Asset::Bitmap(b) => {
             ui.label(format!("Bitmap {} x {}", b.width, b.height));
         }
+        Asset::Raster(raster) => {
+            ui.label(format!("Raster drawing: {} tiles", raster.tiles.len()));
+        }
         Asset::Q0v(v) => match q0video::q0v::probe_header(&v.bytes) {
             Ok(header) => {
                 ui.label(format!(
@@ -2781,6 +2918,7 @@ fn q0rg_frame_grid(
             light,
             dark,
         );
+        crate::ui::preview_card_overlay(ui, &response, rect, frame == selected_frame);
         if response.clicked() {
             picked = Some(frame);
         }
@@ -3511,6 +3649,9 @@ enum FxField {
     ShadowOffsetY,
     ShadowStrength,
     ShadowQuality,
+    OutlineEnabled,
+    OutlineWidth,
+    OutlineColor,
     Reset,
 }
 
@@ -3552,6 +3693,9 @@ impl FxField {
             Self::ShadowQuality => {
                 value.shadow.map(|v| v.quality) != first.shadow.map(|v| v.quality)
             }
+            Self::OutlineEnabled => value.outline.is_some() != first.outline.is_some(),
+            Self::OutlineWidth => value.outline.map(|v| v.width) != first.outline.map(|v| v.width),
+            Self::OutlineColor => value.outline.map(|v| v.color) != first.outline.map(|v| v.color),
             Self::Reset => false,
         })
     }
@@ -3611,6 +3755,7 @@ impl FxEdits {
         optional!(shadow, ShadowEnabled, ShadowColor => color, ShadowBlur => blur_radius,
             ShadowOffsetX => offset_x, ShadowOffsetY => offset_y, ShadowStrength => strength,
             ShadowQuality => quality);
+        optional!(outline, OutlineEnabled, OutlineWidth => width, OutlineColor => color);
     }
 }
 
@@ -4067,6 +4212,45 @@ fn render_fx_controls(ui: &mut Ui, fx: &mut PlacementFx, values: &[PlacementFx])
         });
     }
 
+    let mut outline_enabled = fx.outline.is_some();
+    if fx_toggle(
+        ui,
+        &mut outline_enabled,
+        FxField::OutlineEnabled,
+        "Outline",
+        values,
+    )
+    .changed()
+    {
+        fx.outline = outline_enabled.then_some(q0s_format::v2::Outline2d {
+            width: 2.0,
+            color: Rgba {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255,
+            },
+        });
+        edits.mark(FxField::OutlineEnabled);
+    }
+    if let Some(outline) = &mut fx.outline {
+        ui.horizontal(|ui| {
+            fx_label(ui, "Width", FxField::OutlineWidth, values);
+            let width = ui.add(
+                egui::DragValue::new(&mut outline.width)
+                    .clamp_range(0.5..=64.0)
+                    .speed(0.1)
+                    .suffix(" px"),
+            );
+            edits.response(FxField::OutlineWidth, &width);
+            let mut color = rgba_to_color32(outline.color);
+            let response = ui.color_edit_button_srgba(&mut color);
+            edits.response(FxField::OutlineColor, &response);
+            if response.changed() {
+                outline.color = color32_to_rgba(color);
+            }
+        });
+    }
     edits
 }
 
@@ -4488,5 +4672,111 @@ mod tab_tests {
             follow_focus(Some(Tab::Tool), Some(&before), &drawn),
             Tab::Tool
         );
+    }
+}
+
+#[cfg(test)]
+mod user_project_probe {
+    use super::*;
+
+    fn load() -> Option<EditorApp> {
+        let path = std::env::var("Q0_PROBE_PROJECT").ok()?;
+        let bytes = std::fs::read(path).expect("the project");
+        let mut app = EditorApp::default();
+        app.state.project = q0s_format::v2::parse(&bytes).expect("a project");
+        app.session.current_q0rg_id = app.state.project.q0rgs[0].q0rg_id;
+        app.session.current_layer_id = app.state.project.q0rgs[0].layers[0].layer_id;
+        app.session.current_tool = Tool::Select;
+        Some(app)
+    }
+
+    /// Times each side panel, nothing selected, on a real project.
+    #[test]
+    #[ignore]
+    fn probe_side_panels_on_a_real_project() {
+        let Some(mut app) = load() else {
+            return;
+        };
+        app.session.current_frame = 4;
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
+        let frame = |app: &mut EditorApp, label: &str, tab: Option<Tab>, which: u8| {
+            for _ in 0..4 {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(rect),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        if let Some(tab) = tab {
+                            ctx.data_mut(|d| d.insert_temp(egui::Id::new("properties_tab"), tab));
+                        }
+                        egui::SidePanel::right("probe")
+                            .exact_width(320.0)
+                            .show(ctx, |ui| {
+                                let t = std::time::Instant::now();
+                                match which {
+                                    0 => render(app, ui),
+                                    1 => crate::color_panel::render(app, ui),
+                                    _ => render_frame_picker(app, ui),
+                                }
+                                eprintln!("{label}: {:?}", t.elapsed());
+                            });
+                    },
+                );
+            }
+        };
+        frame(&mut app, "properties (resting)", None, 0);
+        frame(&mut app, "properties tool", Some(Tab::Tool), 0);
+        frame(&mut app, "properties stage", Some(Tab::Stage), 0);
+        frame(&mut app, "colour", None, 1);
+        frame(&mut app, "frame picker", None, 2);
+        app.session.current_tool = Tool::Brush;
+        frame(&mut app, "properties brush", Some(Tab::Tool), 0);
+        app.session.current_tool = Tool::Select;
+
+        // A frame picked in the timeline: one cell on a tweened layer, then
+        // a span over every layer.
+        let q0rg = &app.state.project.q0rgs[0];
+        let tweened = q0rg.layers.iter().find_map(|layer| {
+            layer
+                .placements
+                .iter()
+                .find(|p| p.tween.to_frame().is_some())
+                .map(|p| (layer.layer_id, p.frame))
+        });
+        let first = q0rg.layers.first().map(|l| l.layer_id).unwrap_or(0);
+        let last = q0rg.layers.last().map(|l| l.layer_id).unwrap_or(0);
+        let frames = q0rg.frame_count.max(1) - 1;
+        eprintln!(
+            "layers {} frames {} tweened {tweened:?}",
+            q0rg.layers.len(),
+            q0rg.frame_count
+        );
+        if let Some((layer_id, at)) = tweened {
+            app.session.timeline_selection =
+                Some(crate::state::TimelineSelection::single(layer_id, at));
+            app.session.current_frame = at;
+            frame(&mut app, "one tween cell", None, 0);
+        }
+        app.session.timeline_selection = Some(crate::state::TimelineSelection {
+            anchor_layer_id: first,
+            anchor_frame: 0,
+            focus_layer_id: last,
+            focus_frame: frames,
+        });
+        frame(&mut app, "every layer, every frame", None, 0);
+        frame(&mut app, "colour, span", None, 1);
+
+        // The camera picked in the timeline.
+        app.session.timeline_selection = None;
+        app.session.current_q0rg_id = app.state.project.meta.entry_q0rg_id;
+        app.session.current_frame = 124;
+        app.session.camera_track_selected = true;
+        eprintln!("camera on: {}", app.camera_track_is_selected());
+        let t = std::time::Instant::now();
+        let _ = app.state.project.clone();
+        eprintln!("one project copy: {:?}", t.elapsed());
+        frame(&mut app, "camera", None, 0);
     }
 }

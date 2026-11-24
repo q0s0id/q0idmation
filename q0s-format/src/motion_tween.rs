@@ -87,6 +87,11 @@ fn target_bounds(
                 include(Vec2::new(0.0, 0.0));
                 include(Vec2::new(bitmap.width as f32, bitmap.height as f32));
             }
+            Asset::Raster(raster) => {
+                let rect = raster.exact_bounds()?;
+                include(Vec2::new(rect.x0 as f32, rect.y0 as f32));
+                include(Vec2::new(rect.x1 as f32, rect.y1 as f32));
+            }
             Asset::Q0v(video) => {
                 let h = q0video::q0v::probe_header(&video.bytes).ok()?;
                 include(Vec2::new(0.0, 0.0));

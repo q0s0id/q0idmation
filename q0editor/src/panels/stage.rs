@@ -315,6 +315,21 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
             .unwrap_or(q0s_format::transform::Affine::IDENTITY),
     };
     app.textures.editing_mask_q0rg_id = Some(app.session.current_q0rg_id);
+    let hidden_mask_art_layers = app
+        .state
+        .project
+        .layer_metadata
+        .iter()
+        .filter(|(_, metadata)| {
+            metadata.kind == q0s_format::v2::LayerKind::Mask && metadata.mask_preview
+        })
+        .map(|(key, _)| (key.q0rg_id, key.layer_id))
+        .collect::<std::collections::HashSet<_>>();
+    if app.textures.hidden_mask_art_layers != hidden_mask_art_layers {
+        app.textures.mask_visibility_revision =
+            app.textures.mask_visibility_revision.wrapping_add(1);
+        app.textures.hidden_mask_art_layers = hidden_mask_art_layers;
+    }
     if let Some(pointer) = interactive
         .then(|| {
             ui.ctx()
@@ -358,6 +373,8 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
         let tools_started = std::time::Instant::now();
         if app.session.tools3d.active() {
             crate::tools3d::handle(app, &response, &view);
+        } else if app.session.raster.active() {
+            crate::raster::handle(app, &response, &view, &ctx);
         } else if !crate::frame_edit::handle(app, &response, &view, &ctx)
             && !crate::plugins::stage_input(app, &response, &view)
         {
@@ -442,21 +459,6 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
             .or(physics_preview.as_ref().map(|(_, revision)| *revision))
             .unwrap_or(app.state.render_revision()),
     );
-    let hidden_mask_art_layers = app
-        .state
-        .project
-        .layer_metadata
-        .iter()
-        .filter(|(_, metadata)| {
-            metadata.kind == q0s_format::v2::LayerKind::Mask && metadata.mask_preview
-        })
-        .map(|(key, _)| (key.q0rg_id, key.layer_id))
-        .collect::<std::collections::HashSet<_>>();
-    if app.textures.hidden_mask_art_layers != hidden_mask_art_layers {
-        app.textures.mask_visibility_revision =
-            app.textures.mask_visibility_revision.wrapping_add(1);
-        app.textures.hidden_mask_art_layers = hidden_mask_art_layers;
-    }
     app.textures.editing_mask_q0rg_id = Some(q0rg_id);
     app.textures.video_playback_active = app.session.playing;
     app.textures.reset_stage_traversal_stats();
@@ -509,6 +511,7 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
             frame,
             &view,
             &app.textures.hidden_mask_art_layers,
+            (text_preview.is_none() && physics_preview.is_none()).then(|| app.state.revision()),
         );
     } else {
         // Ghosts (onion skin's `before` past and `after` upcoming frames, and
@@ -583,10 +586,20 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
                 &view,
                 &outlined_layers,
                 &app.textures.hidden_mask_art_layers,
+                (text_preview.is_none() && physics_preview.is_none()).then(|| app.state.revision()),
             );
         }
     }
 
+    // Inside a symbol, its registration point: where its instances' X and
+    // Y are measured from.
+    if !breadcrumb_is_at_root(app) && free_view.is_none() {
+        draw_registration_mark(
+            &painter,
+            view.stage_to_screen(q0s_format::v2::Vec2::new(0.0, 0.0)),
+        );
+    }
+    crate::select_all::note_stage(ui.ctx(), response.rect);
     let scene_elapsed = scene_started.elapsed();
     let traversal = app.textures.stage_traversal_stats();
     app.textures.record_stage_work_timings(&mut app.perf);
@@ -750,12 +763,17 @@ pub(crate) fn render_view(app: &mut EditorApp, ui: &mut Ui, interactive: bool) {
         }
     }
 
+    if interactive && app.settings.show_fps {
+        crate::fps::paint(ui.ctx(), canvas_rect);
+    }
     // Canvas text UI and transient overlays stay above the freshly rendered scene.
     let editing_text = interactive && crate::text_tool::render_canvas(app, ui, &view, canvas_rect);
     if !editing_text && app.session.onion.edit_frames {
         crate::frame_edit::draw_overlay(app, &painter, &view);
     } else if app.session.tools3d.active() {
         crate::tools3d::draw_overlay(app, &response, &painter, &view);
+    } else if app.session.raster.active() {
+        crate::raster::stage::draw_overlay(app, &response, &painter, &view);
     } else if !editing_text {
         if interactive {
             crate::tools::draw_overlay(app, &response, &painter, &view);
@@ -1132,6 +1150,23 @@ fn draw_symbol_edit_backdrop(app: &EditorApp, painter: &egui::Painter, view: &St
     painter.rect_filled(rect, 0.0, color);
 }
 
+/// A small ringed cross at a symbol's registration point.
+fn draw_registration_mark(painter: &egui::Painter, at: egui::Pos2) {
+    let dark = Stroke::new(3.0_f32, Color32::from_black_alpha(140));
+    let light = Stroke::new(1.25_f32, Color32::WHITE);
+    for stroke in [dark, light] {
+        painter.circle_stroke(at, 4.5, stroke);
+        painter.line_segment(
+            [at - egui::vec2(9.0, 0.0), at + egui::vec2(9.0, 0.0)],
+            stroke,
+        );
+        painter.line_segment(
+            [at - egui::vec2(0.0, 9.0), at + egui::vec2(0.0, 9.0)],
+            stroke,
+        );
+    }
+}
+
 fn symbol_edit_backdrop_spec(stage: Rect, mask: crate::settings::ColorRgb) -> (Rect, Color32) {
     (
         stage,
@@ -1175,10 +1210,16 @@ fn handle_viewport_input(
     // replace the selected tool: while held over the stage, primary drag pans
     // exactly like MMB and releasing it restores the underlying tool.
     let typing = ctx.wants_keyboard_input();
+    // A raster tool stands in for the 2D tool underneath, Hand included.
+    let tool = if app.session.raster.active() {
+        crate::state::Tool::Select
+    } else {
+        app.session.current_tool
+    };
     let hand_held = hand_mode_requested(
-        app.session.current_tool,
+        tool,
         typing,
-        app.session.tool_state.is_drawing(),
+        app.session.tool_state.is_drawing() || app.session.raster.painting(),
         ctx.input(|i| i.key_down(Key::Space)),
     );
     let middle_pressed = ctx.input(|i| i.pointer.button_pressed(PointerButton::Middle));
@@ -1768,11 +1809,14 @@ fn stage_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
                     ui.close_menu();
                 }
             }
-            // Stroke → Fill: only enabled when the selected placement points
-            // at a vector asset that actually has a stroke.
+            // Lines → fills: enabled when lines are selected, or an object
+            // that has lines.
             let can_convert = selected_has_stroke(app);
             if ui
-                .add_enabled(can_convert, egui::Button::new("Convert Stroke to Fill"))
+                .add_enabled(can_convert, egui::Button::new("Convert Lines to Fills"))
+                .on_hover_text(
+                    "The selected lines become fills of their colour, so a gradient can paint them",
+                )
                 .clicked()
             {
                 app.queue(Action::ConvertStrokeToFill);
@@ -1834,6 +1878,12 @@ fn stage_context_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
 }
 
 fn selected_has_stroke(app: &EditorApp) -> bool {
+    if crate::tools::selected_paint(&app.state.project, &app.session.selection)
+        .stroke
+        .is_some()
+    {
+        return true;
+    }
     let crate::state::Selection::Placement {
         q0rg_id,
         layer_id,

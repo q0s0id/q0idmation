@@ -7,6 +7,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Process
 import android.provider.OpenableColumns
+import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.ViewGroup
@@ -124,6 +125,22 @@ abstract class Q0Activity : GameActivity() {
         if (hasFocus && hidesSystemBars) {
             immersive(true)
         }
+    }
+
+    /**
+     * GameActivity's native side keeps only events whose source is exactly
+     * the touchscreen. A pen on the screen reports itself as a stylus and the
+     * touchscreen both, so everything it did went to the system and the app
+     * never saw it. It is passed on as the touchscreen it draws on; its
+     * pressure comes along in the event as it is.
+     */
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        if (event.isFromSource(InputDevice.SOURCE_STYLUS) &&
+            event.source != InputDevice.SOURCE_TOUCHSCREEN
+        ) {
+            event.source = InputDevice.SOURCE_TOUCHSCREEN
+        }
+        return super.dispatchTouchEvent(event)
     }
 
     /** How many pixels at the bottom of the surface the soft keyboard covers. */

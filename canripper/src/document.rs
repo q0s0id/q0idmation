@@ -593,6 +593,16 @@ fn q_project_tree(
                 .cloned()
                 .unwrap_or_else(|| format!("asset {id}"));
             let (kind, visual_kind, detail) = match asset {
+                Asset::Raster(raster) => (
+                    "raster",
+                    AssetVisualKind::Bitmap,
+                    format!(
+                        "raster drawing {id}
+name: {name}
+tiles: {}",
+                        raster.tiles.len()
+                    ),
+                ),
                 Asset::Bitmap(bitmap) => (
                     "bitmap",
                     AssetVisualKind::Bitmap,

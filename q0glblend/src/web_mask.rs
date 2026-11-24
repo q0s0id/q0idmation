@@ -15,6 +15,52 @@ pub(super) fn take_error() -> Option<String> {
 pub(super) fn record_error(error: String) {
     ERROR.with(|slot| *slot.borrow_mut() = Some(error));
 }
+
+/// The canvas-sized target keeps egui and nested mask callbacks in the same
+/// pixel coordinates while an ordered group of shapes is painted.
+pub struct LayerOpacity<'a> {
+    painter: &'a Painter,
+    opacity: f32,
+}
+
+pub fn begin_layer_opacity(painter: &Painter, opacity: f32) -> Option<LayerOpacity<'_>> {
+    let rect = painter.clip_rect();
+    if !rect.is_finite() || !rect.is_positive() {
+        return None;
+    }
+    let callback = egui_glow::CallbackFn::new(move |info, painter| {
+        let region = callback_region(
+            info.viewport,
+            info.clip_rect,
+            info.pixels_per_point,
+            info.screen_size_px,
+        );
+        with_resources(painter.gl(), |resources| unsafe {
+            resources.begin_opacity(painter.gl(), info.screen_size_px, region);
+        });
+    });
+    painter.add(Shape::Callback(PaintCallback {
+        rect,
+        callback: Arc::new(callback),
+    }));
+    Some(LayerOpacity { painter, opacity })
+}
+
+impl Drop for LayerOpacity<'_> {
+    fn drop(&mut self) {
+        let opacity = self.opacity;
+        let rect = self.painter.clip_rect();
+        let callback = egui_glow::CallbackFn::new(move |_info, painter| {
+            with_resources(painter.gl(), |resources| unsafe {
+                resources.finish_opacity(painter.gl(), opacity);
+            });
+        });
+        self.painter.add(Shape::Callback(PaintCallback {
+            rect,
+            callback: Arc::new(callback),
+        }));
+    }
+}
 pub(super) fn paint(
     painter: &Painter,
     rect: Rect,
@@ -61,7 +107,7 @@ pub(super) fn gradient(painter: &Painter, rect: Rect, mesh: Arc<Mesh>, paint: Gr
         };
         let gl = painter.gl();
         with_resources(gl, |resources| unsafe {
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, resources.output_framebuffer());
             gl.viewport(
                 0,
                 0,
@@ -110,20 +156,120 @@ struct Target {
     texture: glow::Texture,
     framebuffer: glow::Framebuffer,
 }
+struct OpacityTarget {
+    resolved: Target,
+    msaa: glow::Framebuffer,
+    color: glow::Renderbuffer,
+    size: [u32; 2],
+}
+
+impl OpacityTarget {
+    unsafe fn new(gl: &glow::Context) -> Result<Self, String> {
+        Ok(Self {
+            resolved: Target {
+                texture: gl.create_texture()?,
+                framebuffer: gl.create_framebuffer()?,
+            },
+            msaa: gl.create_framebuffer()?,
+            color: gl.create_renderbuffer()?,
+            size: [0; 2],
+        })
+    }
+
+    unsafe fn resize(
+        &mut self,
+        gl: &glow::Context,
+        size: [u32; 2],
+        samples: i32,
+    ) -> Result<(), String> {
+        if self.size == size {
+            return Ok(());
+        }
+        let [w, h] = size.map(|n| n as i32);
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(self.resolved.texture));
+        for parameter in [glow::TEXTURE_MIN_FILTER, glow::TEXTURE_MAG_FILTER] {
+            gl.tex_parameter_i32(glow::TEXTURE_2D, parameter, glow::NEAREST as i32);
+        }
+        gl.tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            glow::RGBA8 as i32,
+            w,
+            h,
+            0,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            None,
+        );
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.resolved.framebuffer));
+        gl.framebuffer_texture_2d(
+            glow::FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT0,
+            glow::TEXTURE_2D,
+            Some(self.resolved.texture),
+            0,
+        );
+        if gl.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE {
+            return Err("could not allocate a WebGL opacity texture".into());
+        }
+        gl.bind_renderbuffer(glow::RENDERBUFFER, Some(self.color));
+        gl.renderbuffer_storage_multisample(glow::RENDERBUFFER, samples, glow::RGBA8, w, h);
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.msaa));
+        gl.framebuffer_renderbuffer(
+            glow::FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT0,
+            glow::RENDERBUFFER,
+            Some(self.color),
+        );
+        if gl.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE {
+            return Err("could not allocate a multisample WebGL opacity target".into());
+        }
+        self.size = size;
+        Ok(())
+    }
+}
+
+const OPACITY_VERTEX: &str = r#"#version 140
+void main() {
+    vec2 corner = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));
+    gl_Position = vec4(2.0 * corner - 1.0, 0.0, 1.0);
+}
+"#;
+
+const OPACITY_FRAGMENT: &str = r#"#version 140
+uniform sampler2D u_source;
+uniform float u_opacity;
+out vec4 out_color;
+void main() {
+    out_color = texelFetch(u_source, ivec2(gl_FragCoord.xy), 0) * u_opacity;
+}
+"#;
+
 struct GradientBuffers {
     source: std::sync::Weak<Mesh>,
     vbo: glow::Buffer,
     ebo: glow::Buffer,
+    bytes: usize,
+    last_used: u64,
 }
+const VECTOR_BUFFER_BUDGET: usize = 32 * 1024 * 1024;
+
 struct Resources {
     solid: glow::Program,
     textured: glow::Program,
     multiply: glow::Program,
     composite: glow::Program,
     gradient: glow::Program,
+    opacity_program: glow::Program,
+    opacity_targets: Vec<OpacityTarget>,
+    opacity_regions: Vec<Option<CallbackRegion>>,
     stops: glow::Texture,
     stop_data: Vec<f32>,
+    uploaded_stops: Vec<GradientStop>,
     gradients: HashMap<usize, GradientBuffers>,
+    gradient_bytes: usize,
+    gradient_clock: u64,
     vao: glow::VertexArray,
     vbo: glow::Buffer,
     ebo: glow::Buffer,
@@ -185,9 +331,15 @@ impl Resources {
             multiply: create_mask_apply_program(gl)?,
             composite: create_program(gl)?,
             gradient: create_gradient_program(gl)?,
+            opacity_program: create_fullscreen_program(gl, OPACITY_VERTEX, OPACITY_FRAGMENT)?,
+            opacity_targets: Vec::new(),
+            opacity_regions: Vec::new(),
             stops,
             stop_data: vec![0.0; 256 * 8],
+            uploaded_stops: Vec::new(),
             gradients: HashMap::new(),
+            gradient_bytes: 0,
+            gradient_clock: 0,
             vao: gl.create_vertex_array()?,
             vbo: gl.create_buffer()?,
             ebo: gl.create_buffer()?,
@@ -198,6 +350,86 @@ impl Resources {
             backdrop_size: (0, 0),
             samples: gl.get_parameter_i32(glow::MAX_SAMPLES).clamp(1, 4),
         })
+    }
+
+    fn output_framebuffer(&self) -> Option<glow::Framebuffer> {
+        self.opacity_regions
+            .iter()
+            .rposition(Option::is_some)
+            .map(|slot| self.opacity_targets[slot].msaa)
+    }
+
+    unsafe fn begin_opacity(
+        &mut self,
+        gl: &glow::Context,
+        size: [u32; 2],
+        region: Option<CallbackRegion>,
+    ) {
+        let slot = self.opacity_regions.len();
+        let parent = self.output_framebuffer();
+        let region = region.filter(|region| {
+            let allocate = (|| {
+                while self.opacity_targets.len() <= slot {
+                    self.opacity_targets.push(OpacityTarget::new(gl)?);
+                }
+                self.opacity_targets[slot].resize(gl, size, self.samples)
+            })();
+            if let Err(error) = allocate {
+                record_error(error);
+                gl.bind_framebuffer(glow::FRAMEBUFFER, parent);
+                return false;
+            }
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.opacity_targets[slot].msaa));
+            gl.enable(glow::SCISSOR_TEST);
+            gl.scissor(region.left, region.bottom, region.width, region.height);
+            gl.color_mask(true, true, true, true);
+            gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+            true
+        });
+        self.opacity_regions.push(region);
+    }
+
+    unsafe fn finish_opacity(&mut self, gl: &glow::Context, opacity: f32) {
+        let Some(Some(region)) = self.opacity_regions.pop() else {
+            return;
+        };
+        let target = &self.opacity_targets[self.opacity_regions.len()];
+        let right = region.left + region.width;
+        let top = region.bottom + region.height;
+        gl.disable(glow::SCISSOR_TEST);
+        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(target.msaa));
+        gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(target.resolved.framebuffer));
+        gl.blit_framebuffer(
+            region.left,
+            region.bottom,
+            right,
+            top,
+            region.left,
+            region.bottom,
+            right,
+            top,
+            glow::COLOR_BUFFER_BIT,
+            glow::NEAREST,
+        );
+        gl.bind_framebuffer(glow::FRAMEBUFFER, self.output_framebuffer());
+        gl.viewport(region.left, region.bottom, region.width, region.height);
+        self.blending(gl);
+        gl.use_program(Some(self.opacity_program));
+        gl.bind_vertex_array(Some(self.vao));
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(target.resolved.texture));
+        gl.uniform_1_i32(
+            gl.get_uniform_location(self.opacity_program, "u_source")
+                .as_ref(),
+            0,
+        );
+        gl.uniform_1_f32(
+            gl.get_uniform_location(self.opacity_program, "u_opacity")
+                .as_ref(),
+            opacity.clamp(0.0, 1.0),
+        );
+        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
     }
 
     unsafe fn ensure_size(&mut self, gl: &glow::Context, width: i32, height: i32) {
@@ -464,18 +696,21 @@ impl Resources {
         placement: &VectorMaskedPlacement,
         region: CallbackRegion,
     ) {
-        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        let output = self.output_framebuffer();
+        gl.bind_framebuffer(glow::FRAMEBUFFER, output);
         gl.active_texture(glow::TEXTURE1);
         gl.bind_texture(glow::TEXTURE_2D, Some(self.targets[3].texture));
-        let fixed = matches!(
-            placement.blend_mode,
-            BlendMode::Normal | BlendMode::Multiply | BlendMode::Screen
-        );
+        let fixed = placement.blend_mode == BlendMode::Normal
+            || (output.is_none()
+                && matches!(
+                    placement.blend_mode,
+                    BlendMode::Multiply | BlendMode::Screen
+                ));
         if !fixed {
             // ES3 requires identical source/destination coordinates when resolving
             // MSAA. Keep the backdrop in screen coordinates; copy only this region.
             gl.disable(glow::SCISSOR_TEST);
-            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, output);
             gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.targets[3].framebuffer));
             gl.blit_framebuffer(
                 region.left,
@@ -489,7 +724,7 @@ impl Resources {
                 glow::COLOR_BUFFER_BIT,
                 glow::NEAREST,
             );
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, output);
         }
         gl.viewport(region.left, region.bottom, region.width, region.height);
         gl.disable(glow::BLEND);
@@ -582,7 +817,7 @@ impl Resources {
             };
             self.composite(gl, output, placement, region);
         }
-        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        gl.bind_framebuffer(glow::FRAMEBUFFER, self.output_framebuffer());
         gl.active_texture(glow::TEXTURE0);
         gl.bind_vertex_array(None);
     }
@@ -603,20 +838,21 @@ impl Resources {
             .and_then(|b| b.source.upgrade())
             .is_some_and(|source| Arc::ptr_eq(&source, mesh));
         if !reusable {
-            if self.gradients.len() >= 64 {
-                for (_, b) in self.gradients.drain() {
-                    gl.delete_buffer(b.vbo);
-                    gl.delete_buffer(b.ebo);
-                }
-            }
-            if let Some(b) = self.gradients.remove(&key) {
-                gl.delete_buffer(b.vbo);
-                gl.delete_buffer(b.ebo);
+            self.remove_gradient_buffers(gl, key);
+            let buffer_bytes = (mesh.vertices.len() * 2 + mesh.indices.len()) * 4;
+            while self.gradient_bytes + buffer_bytes > VECTOR_BUFFER_BUDGET {
+                let Some((&oldest, _)) = self.gradients.iter().min_by_key(|(_, b)| b.last_used)
+                else {
+                    break;
+                };
+                self.remove_gradient_buffers(gl, oldest);
             }
             let b = GradientBuffers {
                 source: Arc::downgrade(mesh),
                 vbo: gl.create_buffer().expect("gradient vertices"),
                 ebo: gl.create_buffer().expect("gradient indices"),
+                bytes: buffer_bytes,
+                last_used: self.gradient_clock,
             };
             gl.bind_vertex_array(Some(self.vao));
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(b.vbo));
@@ -633,31 +869,15 @@ impl Resources {
                 glow::STATIC_DRAW,
             );
             self.gradients.insert(key, b);
+            self.gradient_bytes += buffer_bytes;
         }
-        for (i, stop) in paint.stops.iter().take(256).enumerate() {
-            self.stop_data[i * 4] = stop.position.clamp(0.0, 1.0);
-            self.stop_data[1024 + i * 4..1028 + i * 4].copy_from_slice(
-                &[stop.color.r, stop.color.g, stop.color.b, stop.color.a]
-                    .map(|v| f32::from(v) / 255.0),
-            );
-        }
-        gl.active_texture(glow::TEXTURE0);
-        gl.bind_texture(glow::TEXTURE_2D, Some(self.stops));
-        gl.tex_sub_image_2d(
-            glow::TEXTURE_2D,
-            0,
-            0,
-            0,
-            256,
-            2,
-            glow::RGBA,
-            glow::FLOAT,
-            glow::PixelUnpackData::Slice(bytes(&self.stop_data)),
-        );
+        self.gradient_clock += 1;
         let p = self.gradient;
         gl.use_program(Some(p));
+        self.set_gradient_stops(gl, &paint.stops);
         gl.bind_vertex_array(Some(self.vao));
-        let b = &self.gradients[&key];
+        let b = self.gradients.get_mut(&key).expect("cached vector mesh");
+        b.last_used = self.gradient_clock;
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(b.vbo));
         gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(b.ebo));
         gl.enable_vertex_attrib_array(0);
@@ -731,5 +951,56 @@ impl Resources {
             glow::UNSIGNED_INT,
             0,
         );
+    }
+
+    unsafe fn remove_gradient_buffers(&mut self, gl: &glow::Context, key: usize) {
+        if let Some(buffers) = self.gradients.remove(&key) {
+            self.gradient_bytes -= buffers.bytes;
+            gl.delete_buffer(buffers.vbo);
+            gl.delete_buffer(buffers.ebo);
+        }
+    }
+
+    unsafe fn set_gradient_stops(&mut self, gl: &glow::Context, stops: &[GradientStop]) {
+        let p = self.gradient;
+        let stops = &stops[..stops.len().min(256)];
+        let uniform = stops
+            .first()
+            .filter(|first| stops.iter().all(|s| s.color == first.color));
+        gl.uniform_1_i32(
+            gl.get_uniform_location(p, "u_uniform").as_ref(),
+            i32::from(uniform.is_some()),
+        );
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(self.stops));
+        if let Some(stop) = uniform {
+            gl.uniform_4_f32_slice(
+                gl.get_uniform_location(p, "u_uniform_color").as_ref(),
+                &[stop.color.r, stop.color.g, stop.color.b, stop.color.a]
+                    .map(|v| f32::from(v) / 255.0),
+            );
+        } else if self.uploaded_stops != stops {
+            let row = stops.len() * 4;
+            for (i, stop) in stops.iter().enumerate() {
+                self.stop_data[i * 4] = stop.position.clamp(0.0, 1.0);
+                self.stop_data[row + i * 4..row + i * 4 + 4].copy_from_slice(
+                    &[stop.color.r, stop.color.g, stop.color.b, stop.color.a]
+                        .map(|v| f32::from(v) / 255.0),
+                );
+            }
+            gl.tex_sub_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                0,
+                0,
+                stops.len() as i32,
+                2,
+                glow::RGBA,
+                glow::FLOAT,
+                glow::PixelUnpackData::Slice(bytes(&self.stop_data[..row * 2])),
+            );
+            self.uploaded_stops.clear();
+            self.uploaded_stops.extend_from_slice(stops);
+        }
     }
 }

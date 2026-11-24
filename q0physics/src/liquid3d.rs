@@ -17,6 +17,9 @@ const SUBSTEPS: u32 = 4;
 const GRIP: f32 = 0.08;
 /// The most drops one liquid may hold.
 pub const MAX_DROPS: usize = 6000;
+/// How much of its neighbours' motion each drop takes on in a step: enough
+/// to calm the shiver a crowd of drops keeps up, not enough to slow a pour.
+const XSPH: f32 = 0.15;
 /// Drops further than this from the stage are let go.
 const FAR: f32 = 20_000.0;
 
@@ -423,6 +426,31 @@ pub fn simulate(
                 }
                 *v = scale(moved, 1.0 / dt);
             }
+            // Neighbours drag each other along a little (XSPH).
+            grid.rebuild(&positions, reach);
+            let mut calmed = velocities.clone();
+            for i in 0..positions.len() {
+                grid.near(positions[i], &mut near);
+                let mut pull = [0.0f32; 3];
+                let mut weight = 0.0;
+                for &j in &near {
+                    let j = j as usize;
+                    if j == i {
+                        continue;
+                    }
+                    let distance = length(sub(positions[j], positions[i]));
+                    if distance >= reach {
+                        continue;
+                    }
+                    let w = 1.0 - distance / reach;
+                    pull = add(pull, scale(sub(velocities[j], velocities[i]), w));
+                    weight += w;
+                }
+                if weight > 0.0 {
+                    calmed[i] = add(velocities[i], scale(pull, XSPH / weight.max(1.0)));
+                }
+            }
+            velocities = calmed;
             // Drops that fell off the world are gone.
             let mut i = 0;
             while i < positions.len() {

@@ -431,6 +431,25 @@ pub fn asset_image(
                 ))
             })
         }
+        Asset::Raster(raster) => {
+            let rect = raster.exact_bounds()?;
+            // Second key half: no vector resolution is this.
+            cached((raster.fingerprint(), u32::MAX - 7), || {
+                Some((
+                    Image {
+                        width: rect.width() as u32,
+                        height: rect.height() as u32,
+                        rgba: Arc::new(raster.compose(rect)),
+                    },
+                    [
+                        rect.x0 as f32,
+                        rect.y0 as f32,
+                        rect.x1 as f32,
+                        rect.y1 as f32,
+                    ],
+                ))
+            })
+        }
         Asset::Q0v(video) => {
             let bitmap = crate::raster::video_frame(video, elapsed_frames, project.meta.fps)?;
             Some((

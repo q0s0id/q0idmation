@@ -21,9 +21,21 @@ pub struct PaintGradient {
 pub(crate) type Bounds = (Vec2, Vec2);
 
 pub(crate) fn vector_bounds(vector: &VectorAsset) -> Option<Bounds> {
+    bounds_of_anchors(vector.paths.iter().flat_map(|path| &path.anchors))
+}
+
+/// The bounds a gradient is fitted to for one path, the same way as for a
+/// whole drawing.
+pub(crate) fn path_bounds(path: &q0s_format::v2::Path) -> Option<Bounds> {
+    bounds_of_anchors(path.anchors.iter())
+}
+
+fn bounds_of_anchors<'a>(
+    anchors: impl Iterator<Item = &'a q0s_format::v2::Anchor>,
+) -> Option<Bounds> {
     let mut min = Vec2::new(f32::INFINITY, f32::INFINITY);
     let mut max = Vec2::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
-    for anchor in vector.paths.iter().flat_map(|path| &path.anchors) {
+    for anchor in anchors {
         for point in std::iter::once(anchor.point)
             .chain(anchor.in_handle)
             .chain(anchor.out_handle)

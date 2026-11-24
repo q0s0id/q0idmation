@@ -73,6 +73,7 @@ impl Category {
             | C::PasteInPlace
             | C::Duplicate
             | C::Delete
+            | C::SelectAll
             | C::ConvertToSymbol
             | C::BreakApart
             | C::FlipHorizontal

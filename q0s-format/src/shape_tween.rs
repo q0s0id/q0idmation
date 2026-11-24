@@ -103,6 +103,34 @@ pub fn layer_morph<'a>(
     vector: impl Fn(u16) -> Option<&'a VectorAsset>,
 ) -> Option<LayerMorph> {
     let span = span_at(layer, frame)?;
+    Some(prepare_layer_morph(layer, span, vector)?.sample(span.t))
+}
+
+/// The geometry correspondence of a span, independent of its easing and progress.
+pub struct LayerMorphPlan {
+    shapes: HashMap<usize, Vec<ShapeMorphPlan>>,
+}
+
+impl LayerMorphPlan {
+    pub fn sample(&self, t: f32) -> LayerMorph {
+        LayerMorph {
+            shapes: self
+                .shapes
+                .iter()
+                .map(|(&index, shapes)| {
+                    (index, shapes.iter().map(|shape| shape.sample(t)).collect())
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Prepare the fixed inputs of a tween once for consecutive frames or repaints.
+pub fn prepare_layer_morph<'a>(
+    layer: &Layer,
+    span: ShapeSpan,
+    vector: impl Fn(u16) -> Option<&'a VectorAsset>,
+) -> Option<LayerMorphPlan> {
     let mut sources = Vec::new();
     let mut destinations = Vec::new();
     for (index, placement) in layer.placements.iter().enumerate() {
@@ -137,22 +165,23 @@ pub fn layer_morph<'a>(
         let local_scale = affine.uniform_scale().max(1e-6);
         let morphed = if targets.is_empty() {
             // Nothing to become: collapse into the shape's own centre and fade.
-            vec![morph(
+            vec![prepare_shape_morph(
                 source,
                 &Shape::vanished(source.centroid),
-                span.t,
                 to_local,
                 local_scale,
             )]
         } else {
             targets
                 .into_iter()
-                .map(|target| morph(source, &destinations[target], span.t, to_local, local_scale))
+                .map(|target| {
+                    prepare_shape_morph(source, &destinations[target], to_local, local_scale)
+                })
                 .collect()
         };
         shapes.insert(*index, morphed);
     }
-    Some(LayerMorph { shapes })
+    Some(LayerMorphPlan { shapes })
 }
 
 /// [`layer_morph`] for callers without their own asset index.
@@ -463,13 +492,56 @@ fn pair_shapes(sources: &[&Shape], destinations: &[Shape]) -> Vec<Vec<usize>> {
     targets
 }
 
-fn morph(
-    source: &Shape,
-    destination: &Shape,
-    t: f32,
+struct ShapeMorphPlan {
+    asset_id: u16,
+    paths: Vec<ContourMorphPlan>,
     to_local: Affine,
     local_scale: f32,
-) -> VectorAsset {
+    fill: [Option<Rgba>; 2],
+    stroke: [Option<Stroke>; 2],
+}
+
+impl ShapeMorphPlan {
+    fn sample(&self, t: f32) -> VectorAsset {
+        VectorAsset {
+            asset_id: self.asset_id,
+            paths: self
+                .paths
+                .iter()
+                .map(|path| Path {
+                    anchors: path
+                        .points
+                        .iter()
+                        .map(|&(from, to)| Anchor {
+                            point: self.to_local.apply(lerp_point(from, to, t)),
+                            in_handle: None,
+                            out_handle: None,
+                        })
+                        .collect(),
+                    closed: if t < 0.5 {
+                        path.closed[0]
+                    } else {
+                        path.closed[1]
+                    },
+                })
+                .collect(),
+            fill: lerp_paint(self.fill[0], self.fill[1], t),
+            stroke: lerp_stroke(self.stroke[0], self.stroke[1], t, self.local_scale),
+        }
+    }
+}
+
+struct ContourMorphPlan {
+    points: Vec<(Vec2, Vec2)>,
+    closed: [bool; 2],
+}
+
+fn prepare_shape_morph(
+    source: &Shape,
+    destination: &Shape,
+    to_local: Affine,
+    local_scale: f32,
+) -> ShapeMorphPlan {
     // Outlines are matched by where they are and how big they are, never by
     // their order: a drawing of many strokes keeps every stroke in place. A
     // hole only pairs with a hole, and an open line only with an open line,
@@ -502,33 +574,18 @@ fn morph(
     };
 
     let mut paths = Vec::with_capacity(source.contours.len() + destination.contours.len());
-    let mut push = |points: Vec<Vec2>, closed: bool| {
-        paths.push(Path {
-            anchors: points
-                .into_iter()
-                .map(|point| Anchor {
-                    point: to_local.apply(point),
-                    in_handle: None,
-                    out_handle: None,
-                })
-                .collect(),
-            closed,
-        });
-    };
     for (from, partner) in source.contours.iter().zip(&partner) {
         match partner {
-            Some(to) => {
-                let (points, closed) = morph_contour(from, &destination.contours[*to], t);
-                push(points, closed);
-            }
+            Some(to) => paths.push(prepare_contour_morph(from, &destination.contours[*to])),
             // An outline with nothing to become shrinks away where it is.
-            None => push(
-                from.points
+            None => paths.push(ContourMorphPlan {
+                points: from
+                    .points
                     .iter()
-                    .map(|point| lerp_point(*point, from.centre, t))
+                    .map(|&point| (point, from.centre))
                     .collect(),
-                from.closed,
-            ),
+                closed: [from.closed; 2],
+            }),
         }
     }
     for (to, used) in destination.contours.iter().zip(&destination_used) {
@@ -539,18 +596,23 @@ fn morph(
         let mut points = to
             .points
             .iter()
-            .map(|point| lerp_point(to.centre, *point, t))
+            .map(|&point| (to.centre, point))
             .collect::<Vec<_>>();
         if turned && to.closed {
             points.reverse();
         }
-        push(points, to.closed);
+        paths.push(ContourMorphPlan {
+            points,
+            closed: [to.closed; 2],
+        });
     }
-    VectorAsset {
+    ShapeMorphPlan {
         asset_id: source.asset_id,
         paths,
-        fill: lerp_paint(source.fill, destination.fill, t),
-        stroke: lerp_stroke(source.stroke, destination.stroke, t, local_scale),
+        to_local,
+        local_scale,
+        fill: [source.fill, destination.fill],
+        stroke: [source.stroke, destination.stroke],
     }
 }
 
@@ -560,7 +622,7 @@ fn morph(
 /// *either* outline has one, so at `t = 0` it is exactly the first drawing and
 /// at `t = 1` exactly the second, however detailed they are. Only the choice
 /// of matching start point and direction is made on a coarse resampling.
-fn morph_contour(from: &Contour, to: &Contour, t: f32) -> (Vec<Vec2>, bool) {
+fn prepare_contour_morph(from: &Contour, to: &Contour) -> ContourMorphPlan {
     if from.closed != to.closed {
         // Closed on one side only: keep that side's topology for its half of
         // the tween and fall back to an even resampling.
@@ -568,15 +630,10 @@ fn morph_contour(from: &Contour, to: &Contour, t: f32) -> (Vec<Vec2>, bool) {
         let from_points = resample(&from.points, from.closed, samples);
         let mut to_points = resample(&to.points, to.closed, samples);
         align(&from_points, &mut to_points, false);
-        let closed = if t < 0.5 { from.closed } else { to.closed };
-        return (
-            from_points
-                .iter()
-                .zip(&to_points)
-                .map(|(from, to)| lerp_point(*from, *to, t))
-                .collect(),
-            closed,
-        );
+        return ContourMorphPlan {
+            points: from_points.into_iter().zip(to_points).collect(),
+            closed: [from.closed, to.closed],
+        };
     }
 
     let closed = from.closed;
@@ -626,13 +683,13 @@ fn morph_contour(from: &Contour, to: &Contour, t: f32) -> (Vec<Vec2>, bool) {
         // Position 1 is position 0 again.
         stops.pop();
     }
-    (
-        stops
+    ContourMorphPlan {
+        points: stops
             .into_iter()
-            .map(|stop| lerp_point(from.eval(stop), to.eval(stop + shift), t))
+            .map(|stop| (from.eval(stop), to.eval(stop + shift)))
             .collect(),
-        closed,
-    )
+        closed: [closed; 2],
+    }
 }
 
 fn polyline_length(points: &[Vec2], closed: bool) -> f32 {
@@ -722,8 +779,8 @@ fn travel(from: &[Vec2], to: &[Vec2], offset: usize) -> f32 {
     let from_centre = centre(from);
     let to_centre = centre(to);
     let mut sum = 0.0;
-    for (index, point) in from.iter().enumerate() {
-        let other = to[(index + offset) % to.len()];
+    let (before, after) = to.split_at(offset);
+    for (point, other) in from.iter().zip(after.iter().chain(before)) {
         let dx = (point.x - from_centre.x) - (other.x - to_centre.x);
         let dy = (point.y - from_centre.y) - (other.y - to_centre.y);
         sum += dx * dx + dy * dy;

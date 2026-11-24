@@ -542,7 +542,7 @@ impl PerfLog {
             "gpu_work_note=callback counts and filter pixel-work are estimates of workload; sampled GPU times below use non-blocking timer queries when supported\n",
         );
         out.push_str(&format!(
-            "gpu_timer_note=GL_TIME_ELAPSED samples 1/{} filtered vector callbacks; results are asynchronous and can trail the rendered scene by one or more frames\n",
+            "gpu_timer_note=GL_TIME_ELAPSED samples 1/{} filtered GPU callbacks; results are asynchronous and can trail the rendered scene by one or more frames\n",
             q0glblend::GPU_FILTER_SAMPLE_STRIDE,
         ));
         out.push_str("frame_timing_note=frame.total measures App::update only; frame.backend-cpu also includes tessellation, texture uploads and GL submission, excluding vsync waiting (attached to the previous frame)\n");

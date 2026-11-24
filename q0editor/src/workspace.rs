@@ -834,6 +834,8 @@ struct Viewer<'a> {
     edge_preview: Option<Split>,
     duplicate: Option<PanelTab>,
     collapse: Option<Panel>,
+    /// The tab buttons as the dock laid them out, drawn once it is done.
+    tabs: Vec<crate::dock_look::Tab>,
     stage_views: &'a mut HashMap<(u64, u64), StagePaneState>,
     panel_views: &'a mut HashMap<(u64, u64), PanelViewState>,
     active_stage: &'a mut Option<u64>,
@@ -850,6 +852,22 @@ impl TabViewer for Viewer<'_> {
     }
     fn scroll_bars(&self, _: &PanelTab) -> [bool; 2] {
         [false, false]
+    }
+    fn tab_leading_width(&mut self, _: &mut PanelTab) -> f32 {
+        crate::dock_look::ICON_ROOM
+    }
+    /// The tabs are drawn by `dock_look`, animated.
+    fn paints_tabs(&self) -> bool {
+        true
+    }
+    fn paint_tab(&mut self, ui: &mut Ui, tab: &mut PanelTab, look: &egui_dock::q0s::TabLook<'_>) {
+        self.tabs.push(crate::dock_look::Tab::note(
+            ui,
+            look,
+            Id::new(("workspace_panel", tab.id)),
+            tab.panel.icon(),
+            tab.panel.title(),
+        ));
     }
     /// The canvas gets every pixel of its panel, and the tool column nearly so.
     fn tab_style_override(
@@ -1115,6 +1133,25 @@ pub(crate) fn render(app: &mut EditorApp, ctx: &Context) {
             style.overlay.selection_color =
                 app.settings.theme.accent.to_color32().linear_multiply(0.35);
             style.overlay.overlay_type = egui_dock::OverlayType::Widgets;
+            // The overlay is drawn by `dock_look`, animated; egui_dock only
+            // works out where a tab would land.
+            style.overlay.q0s_custom = true;
+            style.overlay.max_button_size = 44.0;
+            style.overlay.button_spacing = 8.0;
+            let accent = app.settings.theme.accent.to_color32();
+            style.separator.color_hovered =
+                crate::ui::blend(style.separator.color_idle, accent, 0.7);
+            style.separator.color_dragged = accent;
+            let chrome = crate::ui::chrome(ui.ctx());
+            let palette = crate::dock_look::Palette {
+                accent,
+                text: app.settings.theme.text.to_color32(),
+                text_dim: app.settings.theme.text_dim.to_color32(),
+                card: chrome.pick(chrome.panel, style.tab.tab_body.bg_fill)[0],
+                line: ui.visuals().widgets.noninteractive.bg_stroke.color,
+                hover: chrome.pick(chrome.hover, ui.visuals().widgets.hovered.weak_bg_fill)[0],
+                tile: app.settings.theme.window.to_color32(),
+            };
             let before = workspace.dock.clone();
             let mut viewer = Viewer {
                 app,
@@ -1123,6 +1160,7 @@ pub(crate) fn render(app: &mut EditorApp, ctx: &Context) {
                 edge_preview: None,
                 duplicate: None,
                 collapse: None,
+                tabs: Vec::new(),
                 stage_views: &mut workspace.stage_views,
                 panel_views: &mut workspace.panel_views,
                 active_stage: &mut workspace.active_stage,
@@ -1144,7 +1182,7 @@ pub(crate) fn render(app: &mut EditorApp, ctx: &Context) {
                 .show_inside(&mut dock_ui, &mut viewer);
             crate::ui::paint_tab_bars(&dock_ui, tab_bars);
             let collapse = viewer.collapse.take();
-            if let Some(split) = viewer.edge_preview {
+            let edge = viewer.edge_preview.map(|split| {
                 let mut preview = bounds;
                 match split {
                     Split::Left => preview.max.x = bounds.left() + bounds.width() * 0.25,
@@ -1152,27 +1190,18 @@ pub(crate) fn render(app: &mut EditorApp, ctx: &Context) {
                     Split::Above => preview.max.y = bounds.top() + bounds.height() * 0.25,
                     Split::Below => preview.min.y = bounds.bottom() - bounds.height() * 0.25,
                 }
-                let painter = ctx.layer_painter(egui::LayerId::new(
-                    egui::Order::Tooltip,
-                    Id::new("workspace_edge_preview"),
-                ));
-                painter.rect_filled(
-                    preview,
-                    3.0,
-                    viewer
-                        .app
-                        .settings
-                        .theme
-                        .accent
-                        .to_color32()
-                        .linear_multiply(0.2),
-                );
-                painter.rect_stroke(
-                    preview,
-                    3.0,
-                    egui::Stroke::new(2.0_f32, viewer.app.settings.theme.accent.to_color32()),
-                );
-            }
+                preview
+            });
+            crate::dock_look::paint(
+                ctx,
+                crate::dock_look::Shown {
+                    palette,
+                    tabs: std::mem::take(&mut viewer.tabs),
+                    overlay: egui_dock::q0s::take_overlay(ctx),
+                    edge,
+                    bounds,
+                },
+            );
             let duplicate = viewer.duplicate;
             if let Some((panel, split)) = viewer.edge_command {
                 dock_at_edge(&mut workspace.dock, panel, split);
@@ -1241,6 +1270,7 @@ fn render_stage_only(app: &mut EditorApp, ctx: &Context) {
                 edge_preview: None,
                 duplicate: None,
                 collapse: None,
+                tabs: Vec::new(),
                 stage_views: &mut workspace.stage_views,
                 panel_views: &mut workspace.panel_views,
                 active_stage: &mut workspace.active_stage,
@@ -1410,6 +1440,7 @@ fn flyout(
                         edge_preview: None,
                         duplicate: None,
                         collapse: None,
+                        tabs: Vec::new(),
                         stage_views: &mut workspace.stage_views,
                         panel_views: &mut workspace.panel_views,
                         active_stage: &mut workspace.active_stage,
@@ -2235,5 +2266,90 @@ mod tests {
         restored.toggle(Panel::Stage);
         assert_eq!(restored.dock.iter_all_tabs().count(), 1);
         assert!(restored.find_panel(Panel::Stage).is_some());
+    }
+
+    #[test]
+    fn regression_other_buttons_during_a_tab_drag_do_not_panic() {
+        use egui::{Event, PointerButton};
+        fn button(pos: egui::Pos2, button: PointerButton, pressed: bool) -> Event {
+            Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }
+        }
+        // The primary button picks a tab up, carries it to the middle of the
+        // stage over 14 frames and lets go on frame 14 (unless a script lets
+        // go itself); then 6 more frames while it lands. Each script presses
+        // another button somewhere along the way.
+        let mut scripts: Vec<Vec<(usize, PointerButton, bool)>> = Vec::new();
+        for at in 1..=18 {
+            for other in [PointerButton::Secondary, PointerButton::Middle] {
+                scripts.push(vec![(at, other, true), (at + 1, other, false)]);
+            }
+            scripts.push(vec![(at, PointerButton::Secondary, true)]);
+            if at < 14 {
+                scripts.push(vec![
+                    (at, PointerButton::Secondary, true),
+                    (at + 1, PointerButton::Primary, false),
+                    (at + 2, PointerButton::Secondary, false),
+                ]);
+            }
+        }
+        for script in scripts {
+            let ctx = Context::default();
+            crate::theme::install(&ctx);
+            let mut app = EditorApp::default();
+            let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+            let frame = |app: &mut EditorApp, events| {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| render(app, ctx),
+                );
+            };
+            for _ in 0..3 {
+                frame(&mut app, vec![]);
+            }
+            let before = app.workspace_layout.find_panel(Panel::Library).unwrap();
+            let (surface, node, _) = before;
+            let Node::Leaf { rect, viewport, .. } = app.workspace_layout.dock[surface][node] else {
+                unreachable!()
+            };
+            let tab = egui::pos2(rect.left() + 24.0, (rect.top() + viewport.top()) * 0.5);
+            let goal = panel_rect(&app.workspace_layout, Panel::Stage).center();
+            frame(&mut app, vec![Event::PointerMoved(tab)]);
+            frame(&mut app, vec![button(tab, PointerButton::Primary, true)]);
+            let mut primary_down = true;
+            let mut carried = false;
+            for step in 1..=20 {
+                let at = tab + (goal - tab) * (step.min(14) as f32 / 14.0);
+                let mut events = vec![Event::PointerMoved(at)];
+                for &(when, which, pressed) in &script {
+                    if when == step {
+                        events.push(button(at, which, pressed));
+                        if which == PointerButton::Primary {
+                            primary_down = pressed;
+                        }
+                    }
+                }
+                if step == 14 && primary_down {
+                    events.push(button(at, PointerButton::Primary, false));
+                    primary_down = false;
+                }
+                frame(&mut app, events);
+                carried |= ctx.dragged_id().is_some();
+            }
+            assert!(carried, "{script:?}: the tab was never picked up");
+            assert!(app.workspace_layout.find_panel(Panel::Library).is_some());
+            eprintln!(
+                "{script:?}: {before:?} -> {:?}",
+                app.workspace_layout.find_panel(Panel::Library)
+            );
+        }
     }
 }

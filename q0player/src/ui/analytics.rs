@@ -177,6 +177,11 @@ impl FileStats {
                 Asset::Q0v(video) => {
                     total_bitmap_bytes += video.bytes.len() as u64;
                 }
+                Asset::Raster(raster) => {
+                    bitmap_asset_count += 1;
+                    total_bitmap_bytes +=
+                        (raster.tiles.len() * q0s_format::pixels::TILE_BYTES) as u64;
+                }
                 Asset::Rig(_) | Asset::Model(_) => {}
             }
         }

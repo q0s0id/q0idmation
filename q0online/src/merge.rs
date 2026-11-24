@@ -400,6 +400,7 @@ fn set_asset_id(asset: &mut Asset, id: u16) {
         Asset::Q0v(a) => a.asset_id = id,
         Asset::Rig(a) => a.asset_id = id,
         Asset::Model(a) => a.asset_id = id,
+        Asset::Raster(a) => a.asset_id = id,
     }
 }
 fn fresh(used: &mut HashSet<u16>) -> Option<u16> {

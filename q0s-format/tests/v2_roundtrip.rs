@@ -263,6 +263,7 @@ fn placement_fx_survive_q1s_roundtrip_without_touching_symbol_contents() {
             offset_y: -4.0,
             strength: 0.8,
         }),
+        outline: None,
         audio_gain: 1.0,
         audio_muted: false,
         q0rg_playback: Default::default(),
@@ -353,6 +354,8 @@ fn layer_folders_and_depth_order_survive_q1s_roundtrip() {
             hidden: false,
             locked: false,
             mask_preview: false,
+            raster: false,
+            fx: Default::default(),
         },
     );
     project.layer_metadata.insert(
@@ -365,6 +368,8 @@ fn layer_folders_and_depth_order_survive_q1s_roundtrip() {
             hidden: false,
             locked: false,
             mask_preview: false,
+            raster: false,
+            fx: Default::default(),
         },
     );
     project.layer_metadata.insert(
@@ -377,6 +382,8 @@ fn layer_folders_and_depth_order_survive_q1s_roundtrip() {
             hidden: false,
             locked: false,
             mask_preview: false,
+            raster: false,
+            fx: Default::default(),
         },
     );
 
@@ -407,6 +414,8 @@ fn layer_folder_cannot_hold_keyframes_or_have_noncontiguous_children() {
             hidden: false,
             locked: false,
             mask_preview: false,
+            raster: false,
+            fx: Default::default(),
         },
     );
     assert_eq!(
@@ -432,6 +441,8 @@ fn layer_folder_cannot_hold_keyframes_or_have_noncontiguous_children() {
             hidden: false,
             locked: false,
             mask_preview: false,
+            raster: false,
+            fx: Default::default(),
         },
     );
     project.layer_metadata.insert(
@@ -444,6 +455,8 @@ fn layer_folder_cannot_hold_keyframes_or_have_noncontiguous_children() {
             hidden: false,
             locked: false,
             mask_preview: false,
+            raster: false,
+            fx: Default::default(),
         },
     );
     project.q0rgs[0].layers.insert(

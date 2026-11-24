@@ -55,6 +55,7 @@ impl LibraryIcon {
             }
             Asset::Rig(_) => Self::Symbol,
             Asset::Model(_) => Self::Model,
+            Asset::Raster(_) => Self::Bitmap,
         }
     }
 }
@@ -491,6 +492,8 @@ struct LibraryPreviewBackgroundKey {
     item: LibraryKey,
     frame: u16,
     library_revision: u64,
+    /// The backgrounds allowed when it was picked.
+    shown: u8,
 }
 
 impl Default for LibraryCache {
@@ -538,6 +541,10 @@ fn hash_library_project(project: &ProjectV2, hasher: &mut impl Hasher) {
         id.hash(hasher);
         project.asset_names.get(&id).hash(hasher);
         match asset {
+            Asset::Raster(raster) => {
+                7_u8.hash(hasher);
+                raster.tiles.len().hash(hasher);
+            }
             Asset::Bitmap(bitmap) => {
                 0_u8.hash(hasher);
                 bitmap.width.hash(hasher);
@@ -888,6 +895,7 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     }
 
     draw_preview(app, ui, app.library_selection);
+    preview_grip(app, ui);
 
     let needle = app.library_search.trim().to_lowercase();
 
@@ -1066,8 +1074,12 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
                         ui.visuals().text_color(),
                         0.035,
                     );
+                    // Stripes follow each row's place in the whole list, not
+                    // its place among the rows in view, so they hold still
+                    // as the list scrolls.
                     egui::Grid::new("library_items")
                         .striped(true)
+                        .start_row(visible_rows.start)
                         .num_columns(columns)
                         .min_col_width(28.0)
                         .spacing([8.0, 2.0])
@@ -2169,6 +2181,15 @@ fn collect_rows_for_project(
         };
         let uses = asset_uses.get(&id).copied().unwrap_or(0);
         let (name, kind, detail) = match asset {
+            Asset::Raster(raster) => (
+                project
+                    .asset_names
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Raster {id}")),
+                "raster",
+                format!("{} tiles", raster.tiles.len()),
+            ),
             Asset::Bitmap(bitmap) => (
                 format!("Bitmap {id}"),
                 "bitmap",
@@ -2282,8 +2303,65 @@ fn collect_rows_for_project(
     rows
 }
 
+/// The bar under the preview: drag it to make the preview taller or
+/// shorter, double-click for the usual height.
+fn preview_grip(app: &mut EditorApp, ui: &mut Ui) {
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(ui.available_width(), 8.0), Sense::click_and_drag());
+    let response = response
+        .on_hover_cursor(egui::CursorIcon::ResizeVertical)
+        .on_hover_text("Drag to resize the preview; double-click for the usual size");
+    if response.dragged() {
+        app.settings.library_preview_height = (app.settings.library_preview_height
+            + response.drag_delta().y)
+            .clamp(PREVIEW_HEIGHTS.0, PREVIEW_HEIGHTS.1);
+    }
+    if response.double_clicked() {
+        app.settings.library_preview_height = crate::settings::default_library_preview_height();
+    }
+    if response.drag_stopped() || response.double_clicked() {
+        app.settings.save();
+    }
+    let lit = ui.ctx().animate_bool_with_time(
+        response.id,
+        response.hovered() || response.dragged(),
+        0.12,
+    );
+    let theme = &app.settings.theme;
+    let color = crate::ui::blend(theme.text_dim.to_color32(), theme.accent.to_color32(), lit);
+    ui.painter().rect_filled(
+        Rect::from_center_size(rect.center(), vec2(28.0 + 10.0 * lit, 3.0)),
+        1.5,
+        color.gamma_multiply(0.55 + 0.45 * lit),
+    );
+}
+
+/// How short and how tall the preview may be dragged.
+const PREVIEW_HEIGHTS: (f32, f32) = (48.0, 640.0);
+
+thread_local! {
+    /// The preview backgrounds allowed, as `PreviewBackgrounds::mask`, set
+    /// as each frame begins.
+    static SHOWN_BACKGROUNDS: std::cell::Cell<u8> = const { std::cell::Cell::new(0b111) };
+}
+
+/// Takes this frame's allowed preview backgrounds from the settings.
+pub(crate) fn set_shown_backgrounds(backgrounds: crate::settings::PreviewBackgrounds) {
+    SHOWN_BACKGROUNDS.with(|shown| shown.set(backgrounds.mask()));
+}
+
+fn shown_backgrounds() -> u8 {
+    SHOWN_BACKGROUNDS.with(std::cell::Cell::get)
+}
+
 fn draw_preview(app: &mut EditorApp, ui: &mut Ui, selection: Option<LibrarySelection>) {
-    let height = (ui.clip_rect().bottom() - ui.cursor().top() - 145.0).clamp(64.0, 142.0);
+    // As tall as asked, but always leaving the list some room under it.
+    let room = (ui.clip_rect().bottom() - ui.cursor().top() - 145.0).max(PREVIEW_HEIGHTS.0);
+    let height = app
+        .settings
+        .library_preview_height
+        .clamp(PREVIEW_HEIGHTS.0, PREVIEW_HEIGHTS.1)
+        .min(room);
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::drag());
     let border = app.settings.theme.stroke_dark.to_color32();
@@ -2350,6 +2428,7 @@ fn draw_preview(app: &mut EditorApp, ui: &mut Ui, selection: Option<LibrarySelec
         library_revision: app
             .project_library_revision_for_tab(selection.tab_id)
             .unwrap_or(0),
+        shown: shown_backgrounds(),
     };
     let cached_background = app
         .library_cache
@@ -2522,6 +2601,17 @@ enum PreviewBackground {
     Checker,
 }
 
+impl PreviewBackground {
+    /// Its bit in `PreviewBackgrounds::mask`.
+    fn bit(self) -> u8 {
+        match self {
+            Self::Light => 1,
+            Self::Dark => 2,
+            Self::Checker => 4,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct PreviewColorStats {
     visible_weight: f32,
@@ -2555,6 +2645,34 @@ impl PreviewColorStats {
         }
     }
 
+    /// The best background among those `shown` allows. A light background
+    /// ruled out gives way to the checkerboard and then dark (it was picked
+    /// for dark art), and the other way round; a checkerboard ruled out
+    /// gives way to whichever plain one suits the art's average.
+    fn background_within(self, shown: u8) -> PreviewBackground {
+        let wanted = self.background();
+        if shown & wanted.bit() != 0 {
+            return wanted;
+        }
+        let average = if self.visible_weight > f32::EPSILON {
+            self.luminance_sum / self.visible_weight
+        } else {
+            0.5
+        };
+        let order = match wanted {
+            PreviewBackground::Light => [PreviewBackground::Checker, PreviewBackground::Dark],
+            PreviewBackground::Dark => [PreviewBackground::Checker, PreviewBackground::Light],
+            PreviewBackground::Checker if average >= 0.5 => {
+                [PreviewBackground::Dark, PreviewBackground::Light]
+            }
+            PreviewBackground::Checker => [PreviewBackground::Light, PreviewBackground::Dark],
+        };
+        order
+            .into_iter()
+            .find(|background| shown & background.bit() != 0)
+            .unwrap_or(wanted)
+    }
+
     fn background(self) -> PreviewBackground {
         if self.visible_weight <= f32::EPSILON {
             return PreviewBackground::Checker;
@@ -2585,7 +2703,7 @@ fn preview_background_for_key(
         LibraryKey::Asset(id) => collect_asset_color_stats(project, id, &mut stats),
         LibraryKey::Q0rg(id) => collect_q0rg_color_stats(project, id, frame, 0, &mut stats),
     }
-    stats.background()
+    stats.background_within(shown_backgrounds())
 }
 
 fn preview_label_for_key(project: &ProjectV2, key: LibraryKey) -> String {
@@ -2607,6 +2725,11 @@ fn preview_label_for_key(project: &ProjectV2, key: LibraryKey) -> String {
                     .cloned()
                     .unwrap_or_else(|| "Vector asset".to_string()),
                 Asset::Bitmap(_) => "Bitmap asset".to_string(),
+                Asset::Raster(_) => project
+                    .asset_names
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| "Raster drawing".to_string()),
                 Asset::Q0v(_) => project
                     .asset_names
                     .get(&id)
@@ -2717,6 +2840,24 @@ fn collect_asset_color_stats(project: &ProjectV2, asset_id: u16, stats: &mut Pre
                 stats.add(material.color, 1.0);
             }
         }
+        Asset::Raster(raster) => {
+            let stride = (raster.tiles.len() / 64).max(1);
+            for tile in raster.tiles.values().step_by(stride) {
+                for pixel in tile.pixels().as_chunks::<4>().0.iter().step_by(97) {
+                    let mut straight = [pixel[0], pixel[1], pixel[2], pixel[3]];
+                    q0s_format::pixels::unpremultiply(&mut straight);
+                    stats.add(
+                        Rgba {
+                            r: straight[0],
+                            g: straight[1],
+                            b: straight[2],
+                            a: straight[3],
+                        },
+                        1.0,
+                    );
+                }
+            }
+        }
         Asset::Rig(_) => {}
     }
 }
@@ -2764,6 +2905,8 @@ fn draw_preview_background(
 pub(crate) struct LibraryFramePreview {
     bounds: Option<(f32, f32, f32, f32)>,
     background: PreviewBackground,
+    /// The backgrounds allowed when it was picked.
+    shown: u8,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2802,7 +2945,15 @@ pub(crate) fn draw_cached_q0rg_frame_preview(
             .as_ref()
             .is_some_and(|(_, start)| start.elapsed() >= std::time::Duration::from_millis(4))
     {
-        draw_preview_background(painter, rect, PreviewBackground::Checker, light, dark);
+        let waiting = [
+            PreviewBackground::Checker,
+            PreviewBackground::Light,
+            PreviewBackground::Dark,
+        ]
+        .into_iter()
+        .find(|background| shown_backgrounds() & background.bit() != 0)
+        .unwrap_or(PreviewBackground::Checker);
+        draw_preview_background(painter, rect, waiting, light, dark);
         ctx.request_repaint();
         return;
     }
@@ -2812,13 +2963,20 @@ pub(crate) fn draw_cached_q0rg_frame_preview(
     {
         textures.library_frame_previews.clear();
     }
-    let preview = *textures
+    let shown = shown_backgrounds();
+    let entry = textures
         .library_frame_previews
         .entry(key)
         .or_insert_with(|| LibraryFramePreview {
             bounds: q0rg_frame_bbox(project, q0rg_id, frame),
             background: preview_background_for_key(project, LibraryKey::Q0rg(q0rg_id), frame),
+            shown,
         });
+    if entry.shown != shown {
+        entry.background = preview_background_for_key(project, LibraryKey::Q0rg(q0rg_id), frame);
+        entry.shown = shown;
+    }
+    let preview = *entry;
     draw_preview_background(painter, rect, preview.background, light, dark);
     if let Some(bounds) = preview.bounds {
         crate::render::render_stage_with_revision(
@@ -3122,6 +3280,16 @@ mod tests {
             1.0,
         );
         assert_eq!(transparent.background(), PreviewBackground::Checker);
+        // Without the checkerboard it takes a plain one; with only one
+        // allowed it takes that one.
+        assert_ne!(
+            transparent.background_within(0b011),
+            PreviewBackground::Checker
+        );
+        assert_eq!(
+            transparent.background_within(0b010),
+            PreviewBackground::Dark
+        );
     }
 
     #[test]

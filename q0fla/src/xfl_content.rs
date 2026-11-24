@@ -1002,6 +1002,7 @@ fn camera_track_from_timeline(timeline: &RawTimeline, warnings: &mut Vec<String>
     let mut track = CameraTrack {
         enabled: !keyed_frames.is_empty(),
         keys: Vec::with_capacity(keyed_frames.len()),
+        frame_count: None,
     };
     for (position, (frame, state)) in keyed_frames.iter().enumerate() {
         let next_frame = keyed_frames.get(position + 1).map(|(next, _)| next.index);
@@ -1329,8 +1330,8 @@ fn build_q0rg(
             }
         }
 
-        // A masked layer points at its mask; it sits in the folder its mask
-        // sits in.
+        // A masked or guided layer points at its mask or guide; it sits in
+        // the folder that sits in.
         let folder_of = |index: usize| {
             timeline
                 .layers
@@ -1340,7 +1341,7 @@ fn build_q0rg(
         };
         let parent_folder_id = raw_layer.parent_index.and_then(|parent_index| {
             match timeline.layers.get(parent_index) {
-                Some(parent) if parent.kind == LayerKind::Mask => {
+                Some(parent) if parent.kind != LayerKind::Folder => {
                     parent.parent_index.and_then(folder_of)
                 }
                 _ => folder_of(parent_index),
@@ -1364,6 +1365,8 @@ fn build_q0rg(
             locked: raw_layer.locked,
             // Animate shows a locked mask's clipping; open it the same way.
             mask_preview: raw_layer.kind == LayerKind::Mask && raw_layer.locked,
+            raster: false,
+            fx: Default::default(),
         };
         if layer_metadata != LayerMetadata::default() {
             metadata.insert(LayerKey::new(q0rg_id, layer_id), layer_metadata);
@@ -2420,6 +2423,12 @@ fn parse_timeline_index(
                     &mut current_frame,
                     &mut instance,
                 )?;
+                // A layer with nothing in it is all one tag, the way Animate
+                // writes a folder. Skipped, it took the folder away and moved
+                // every later layer's parent index onto the wrong layer.
+                if timeline_depth.is_some() && name == b"DOMLayer" && current_layer.is_none() {
+                    layers.push(raw_layer(&reader, &element, layers.len())?);
+                }
                 if current_layer.is_some() && name == b"DOMFrame" && current_frame.is_none() {
                     let frame = raw_frame(&reader, &element)?;
                     if current_layer

@@ -4,7 +4,7 @@ exclude = ["vendor"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0-beta.6.3"
+version = "0.1.0-beta.7"
 edition = "2021"
 authors = ["q0s"]
 license = "GPL-3.0-or-later"
@@ -14,3 +14,5 @@ homepage = "https://q0id.com"
 [patch.crates-io]
 # Non-Latin keyboard layouts: see vendor/egui-winit/VENDORED.md
 egui-winit = { path = "vendor/egui-winit" }
+# Tabs and drop targets q0editor draws itself: see vendor/egui_dock/VENDORED.md
+egui_dock = { path = "vendor/egui_dock" }

@@ -2,15 +2,15 @@
 //! editing a range never materializes all its objects onto the playhead.
 use std::collections::{BTreeMap, BTreeSet};
 
-use egui::{pos2, vec2, Context, Painter, Rect, Response, Stroke};
+use egui::{pos2, Context, Painter, Rect, Response, Stroke};
 use q0s_format::transform::Affine;
 use q0s_format::v2::{Asset, Placement, ProjectV2, Target, Transform2D, Vec2, VectorAsset};
 
 use crate::app::EditorApp;
-use crate::render::StageView;
+use crate::render::{PlacementBoundsCache, StageView};
 use crate::state::{
-    GroupTransformOperation, Handle, PlacementRef, Selection, Session, TimelineSelection, Tool,
-    ToolState, TransformPivot,
+    GroupTransformOperation, PlacementRef, Selection, Session, TimelineSelection, Tool, ToolState,
+    TransformPivot,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,10 +211,14 @@ pub(crate) fn preview_layers(app: &EditorApp) -> BTreeMap<u16, BTreeSet<u16>> {
         let Some(layer) = q.layers.iter().find(|l| l.layer_id == layer_id) else {
             continue;
         };
-        let current =
-            q0s_format::raster::active_placement_states_at(layer, app.session.current_frame);
+        let timeline = q0s_format::raster::LayerTimeline::new(layer);
+        let current = q0s_format::raster::active_placement_states_with(
+            layer,
+            app.session.current_frame,
+            &timeline,
+        );
         for sample in frames {
-            let active = q0s_format::raster::active_placement_states_at(layer, sample);
+            let active = q0s_format::raster::active_placement_states_with(layer, sample, &timeline);
             if !active.is_empty()
                 && !active.iter().all(|a| {
                     current
@@ -242,14 +246,17 @@ fn candidates_for(project: &ProjectV2, session: &Session) -> Vec<FrameRef> {
         let Some(layer) = q.layers.iter().find(|l| l.layer_id == layer_id) else {
             continue;
         };
+        let timeline = q0s_format::raster::LayerTimeline::new(layer);
+        let mut seen = BTreeSet::new();
         for frame in frames {
-            for active in q0s_format::raster::active_placement_states_at(layer, frame) {
+            for active in q0s_format::raster::active_placement_states_with(layer, frame, &timeline)
+            {
                 let reference = PlacementRef {
                     q0rg_id: q.q0rg_id,
                     layer_id,
                     placement_idx: active.index,
                 };
-                if !result.iter().any(|r: &FrameRef| r.reference == reference) {
+                if seen.insert(active.index) {
                     result.push(FrameRef { reference, frame });
                 }
             }
@@ -267,6 +274,10 @@ pub(crate) fn refresh_session(session: &mut Session, project: &ProjectV2) {
         return;
     }
     let refs = crate::selection_edit::selected_object_refs(project, &session.selection);
+    if refs.is_empty() {
+        session.frame_edit_selection.clear();
+        return;
+    }
     session.frame_edit_selection = candidates_for(project, session)
         .into_iter()
         .filter(|r| refs.contains(&r.reference))
@@ -319,16 +330,50 @@ fn placement(app: &EditorApp, reference: FrameRef) -> Option<Placement> {
     Some(p)
 }
 
-fn bounds(app: &EditorApp, r: FrameRef) -> Option<(f32, f32, f32, f32)> {
-    crate::render::placement_bbox(&app.state.project, &placement(app, r)?)
+type Bounds = (f32, f32, f32, f32);
+
+fn bounds_for(app: &EditorApp, r: FrameRef, cache: &mut PlacementBoundsCache) -> Option<Bounds> {
+    let project = &app.state.project;
+    let placed = placement(app, r)?;
+    let layer = cache.layer(project, r.reference.q0rg_id, r.reference.layer_id)?;
+    match crate::render::placement_shown_frame(
+        project,
+        r.reference.q0rg_id,
+        layer,
+        r.reference.placement_idx,
+        r.frame,
+    ) {
+        Some(shown) => cache.placement_frame_bbox(project, &placed, shown),
+        None => cache.placement_bbox(project, &placed),
+    }
 }
 
-fn selected_bounds(app: &EditorApp) -> Option<(f32, f32, f32, f32)> {
-    app.session
+fn selection_boxes(app: &mut EditorApp) -> Vec<Bounds> {
+    let revision = (
+        app.active_project_tab_id().unwrap_or(0),
+        app.state.render_revision(),
+    );
+    let mut cache = app
+        .textures
+        .take_placement_bounds_cache(&app.state.project, revision);
+    let boxes = app
+        .session
         .frame_edit_selection
         .iter()
-        .filter_map(|r| bounds(app, *r))
+        .filter_map(|r| bounds_for(app, *r, &mut cache))
+        .collect();
+    app.textures.store_placement_bounds_cache(cache, revision);
+    boxes
+}
+
+fn combined_bounds(boxes: impl IntoIterator<Item = Bounds>) -> Option<Bounds> {
+    boxes
+        .into_iter()
         .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)))
+}
+
+fn selected_bounds(app: &mut EditorApp) -> Option<Bounds> {
+    combined_bounds(selection_boxes(app))
 }
 
 fn sync_selection(app: &mut EditorApp) {
@@ -433,7 +478,7 @@ pub(crate) fn materialize_refs(
         .collect()
 }
 
-fn pick(app: &EditorApp, p: Vec2, scale: f32) -> Option<FrameRef> {
+fn pick(app: &mut EditorApp, p: Vec2, scale: f32) -> Option<FrameRef> {
     let mut refs = candidates(app);
     refs.sort_by_key(|r| {
         (
@@ -453,50 +498,38 @@ fn pick(app: &EditorApp, p: Vec2, scale: f32) -> Option<FrameRef> {
             r.reference.placement_idx,
         )
     });
-    refs.into_iter().rev().find(|r| {
-        placement(app, *r).is_some_and(|placement| {
-            let playback_start_frame = app
-                .state
-                .project
-                .q0rgs
-                .iter()
-                .find(|q| q.q0rg_id == r.reference.q0rg_id)
-                .and_then(|q| q.layers.iter().find(|l| l.layer_id == r.reference.layer_id))
-                .and_then(|layer| {
-                    q0s_format::v2::placement_playback_start_frames(layer)
-                        .get(r.reference.placement_idx)
-                        .copied()
-                })
-                .unwrap_or(placement.frame);
-            crate::tools::frame_range_placement_hit(
-                &app.state.project,
-                &placement,
-                playback_start_frame,
-                r.frame,
-                p,
-                scale,
-            )
-        })
-    })
+    let slop = crate::tools::frame_range_hit_slop(scale);
+    hits_in_region(app, refs, (p.x - slop, p.y - slop, p.x + slop, p.y + slop)).next_back()
 }
 
-fn handles(b: (f32, f32, f32, f32)) -> [(Handle, Vec2); 8] {
-    let (x, y) = ((b.0 + b.2) * 0.5, (b.1 + b.3) * 0.5);
-    [
-        (Handle::TopLeft, Vec2::new(b.0, b.1)),
-        (Handle::TopRight, Vec2::new(b.2, b.1)),
-        (Handle::BottomRight, Vec2::new(b.2, b.3)),
-        (Handle::BottomLeft, Vec2::new(b.0, b.3)),
-        (Handle::MidTop, Vec2::new(x, b.1)),
-        (Handle::MidRight, Vec2::new(b.2, y)),
-        (Handle::MidBottom, Vec2::new(x, b.3)),
-        (Handle::MidLeft, Vec2::new(b.0, y)),
-    ]
+fn hits_in_region(
+    app: &mut EditorApp,
+    refs: Vec<FrameRef>,
+    rect: Bounds,
+) -> impl DoubleEndedIterator<Item = FrameRef> + use<> {
+    let poses: Vec<_> = refs.iter().map(|r| (r.reference, r.frame)).collect();
+    let revision = (
+        app.active_project_tab_id().unwrap_or(0),
+        app.state.render_revision(),
+    );
+    let hits = crate::render::frame_region_hits(
+        &app.state.project,
+        app.session.current_q0rg_id,
+        &poses,
+        rect,
+        &mut app.textures,
+        revision,
+    );
+    refs.into_iter()
+        .zip(hits)
+        .filter_map(|(r, hit)| hit.then_some(r))
 }
 
 fn prepare(app: &mut EditorApp, operation: GroupTransformOperation, pivot: Vec2) -> Gesture {
     app.history
         .snapshot_with_session(&app.state.project, &app.session);
+    let asset_count = app.state.project.assets.len();
+    let mut rekeyed = false;
     let mut mappings = BTreeMap::new();
     for r in &app.session.frame_edit_selection {
         let key = (r.reference.q0rg_id, r.reference.layer_id, r.frame);
@@ -513,6 +546,7 @@ fn prepare(app: &mut EditorApp, operation: GroupTransformOperation, pivot: Vec2)
         if let Some(Some(map)) = mappings.get(&(r.reference.q0rg_id, r.reference.layer_id, r.frame))
         {
             if let Some(index) = map.get(&r.reference.placement_idx) {
+                rekeyed |= r.reference.placement_idx != *index;
                 r.reference.placement_idx = *index;
             }
         }
@@ -575,6 +609,16 @@ fn prepare(app: &mut EditorApp, operation: GroupTransformOperation, pivot: Vec2)
             })
         })
         .collect();
+    if rekeyed || app.state.project.assets.len() != asset_count {
+        let document = app.active_project_tab_id().unwrap_or(0);
+        let old_revision = (document, app.state.render_revision());
+        app.state.mark_dirty();
+        app.textures.rekey_placement_bounds_cache(
+            &app.state.project,
+            old_revision,
+            (document, app.state.render_revision()),
+        );
+    }
     Gesture::Transform {
         operation,
         pivot,
@@ -585,6 +629,7 @@ fn prepare(app: &mut EditorApp, operation: GroupTransformOperation, pivot: Vec2)
 
 fn apply(app: &mut EditorApp, poses: &[Pose], raw: &[RawSnapshot], affine: Affine, pivot: Vec2) {
     let saved_frame = app.session.current_frame;
+    let mut changed = Vec::new();
     for pose in poses.iter().filter(|p| p.raw_asset.is_none()) {
         let r = pose.reference.reference;
         if let Some(transform) = crate::app::affine_to_transform(Affine::compose(
@@ -592,13 +637,15 @@ fn apply(app: &mut EditorApp, poses: &[Pose], raw: &[RawSnapshot], affine: Affin
             Affine::from_transform(pose.transform),
         )) {
             app.session.current_frame = pose.reference.frame;
-            crate::tools::set_placement_transform_for_edit(
+            if crate::tools::set_placement_transform_for_edit(
                 app,
                 r.q0rg_id,
                 r.layer_id,
                 r.placement_idx,
                 transform,
-            );
+            ) {
+                changed.push((r.q0rg_id, r.layer_id, r.placement_idx));
+            }
         }
     }
     app.session.current_frame = saved_frame;
@@ -627,13 +674,17 @@ fn apply(app: &mut EditorApp, poses: &[Pose], raw: &[RawSnapshot], affine: Affin
                 crate::appearance::transform_appearance(appearance, affine),
             );
         }
+        app.textures.invalidate_asset(source.asset.asset_id);
     }
     app.session.transform_pivot = Some(TransformPivot {
         selection: app.session.selection.clone(),
         point: affine.apply(pivot),
     });
-    app.state.mark_dirty();
-    app.textures.invalidate();
+    if !changed.is_empty() {
+        app.mark_placement_transforms_changed(&changed);
+    } else if !raw.is_empty() {
+        app.state.mark_artwork_dirty();
+    }
 }
 
 pub(crate) fn handle(
@@ -656,6 +707,17 @@ pub(crate) fn handle(
         app.stop_audio_playback();
     }
     let shift = ctx.input(|i| i.modifiers.shift);
+    let selection_bounds = app
+        .session
+        .frame_edit_gesture
+        .is_none()
+        .then(|| selected_bounds(app))
+        .flatten();
+    if app.session.frame_edit_gesture.is_none() {
+        if let Some(b) = selection_bounds {
+            crate::tools::frames_box_hover(ctx, view, b, response.hover_pos());
+        }
+    }
     if response.secondary_clicked() {
         if let Some(hit) = response
             .interact_pointer_pos()
@@ -688,35 +750,12 @@ pub(crate) fn handle(
             let start = view.screen_to_stage(pointer);
             let mut operation = None;
             let mut pivot_drag = false;
-            if let Some(b) = selected_bounds(app) {
-                let center = app
-                    .session
-                    .transform_pivot
-                    .as_ref()
-                    .filter(|p| p.selection == app.session.selection)
-                    .map(|p| p.point)
-                    .unwrap_or(Vec2::new((b.0 + b.2) * 0.5, (b.1 + b.3) * 0.5));
+            if let Some(b) = selection_bounds {
+                let center = pivot_of(app, b);
                 pivot_drag = ctx.input(|i| i.modifiers.alt)
-                    && view.stage_to_screen(center).distance(pointer) <= 7.0;
-                let rotate =
-                    view.stage_to_screen(Vec2::new((b.0 + b.2) * 0.5, b.1)) - vec2(0.0, 24.0);
-                if rotate.distance(pointer) <= 12.0 {
-                    operation = Some(GroupTransformOperation::Rotate {
-                        center,
-                        start_angle: (start.y - center.y).atan2(start.x - center.x),
-                    });
-                } else if let Some((handle, _)) = handles(b).into_iter().find(|(_, p)| {
-                    let distance = view.stage_to_screen(*p).distance(pointer);
-                    distance <= 12.0
-                        && (distance <= 5.0
-                            || !view
-                                .stage_bounds_to_screen(Vec2::new(b.0, b.1), Vec2::new(b.2, b.3))
-                                .contains(pointer))
-                }) {
-                    operation = Some(GroupTransformOperation::Scale {
-                        handle,
-                        start_bounds: b,
-                    });
+                    && view.stage_to_screen(center).distance(pointer) <= 10.0;
+                if !pivot_drag {
+                    operation = crate::tools::frames_box_operation(view, b, pointer, center);
                 }
             }
             if operation.is_none() && !pivot_drag {
@@ -736,7 +775,9 @@ pub(crate) fn handle(
             app.session.frame_edit_gesture = Some(if pivot_drag {
                 Gesture::Pivot
             } else if let Some(operation) = operation {
-                let b = selected_bounds(app).unwrap_or((start.x, start.y, start.x, start.y));
+                let b = selection_bounds
+                    .or_else(|| selected_bounds(app))
+                    .unwrap_or((start.x, start.y, start.x, start.y));
                 let pivot = app
                     .session
                     .transform_pivot
@@ -779,19 +820,23 @@ pub(crate) fn handle(
                     base,
                 } => {
                     *last = cursor;
-                    let rect = Rect::from_two_pos(pos2(start.x, start.y), pos2(cursor.x, cursor.y));
-                    let mut selected = base.clone();
-                    for r in candidates(app) {
-                        if let Some(b) = bounds(app, r) {
-                            if rect.intersects(Rect::from_min_max(pos2(b.0, b.1), pos2(b.2, b.3)))
-                                && !selected.contains(&r)
-                            {
+                    if response.drag_stopped() {
+                        let rect =
+                            Rect::from_two_pos(pos2(start.x, start.y), pos2(cursor.x, cursor.y));
+                        let mut selected = std::mem::take(base);
+                        let refs = candidates(app);
+                        for r in hits_in_region(
+                            app,
+                            refs,
+                            (rect.min.x, rect.min.y, rect.max.x, rect.max.y),
+                        ) {
+                            if !selected.contains(&r) {
                                 selected.push(r);
                             }
                         }
+                        app.session.frame_edit_selection = selected;
+                        sync_selection(app);
                     }
-                    app.session.frame_edit_selection = selected;
-                    sync_selection(app);
                 }
                 Gesture::Transform {
                     operation,
@@ -818,56 +863,39 @@ pub(crate) fn handle(
     true
 }
 
-pub(crate) fn draw_overlay(app: &EditorApp, painter: &Painter, view: &StageView) {
+/// The objects picked across frames each get a faint outline; together
+/// they get the transform box the rest of the editor uses.
+pub(crate) fn draw_overlay(app: &mut EditorApp, painter: &Painter, view: &StageView) {
     let color = app.settings.theme.accent.to_color32();
-    for r in &app.session.frame_edit_selection {
-        if let Some(b) = bounds(app, *r) {
+    let boxes = selection_boxes(app);
+    if app.session.frame_edit_selection.len() > 1 {
+        for b in &boxes {
             painter.rect_stroke(
                 view.stage_bounds_to_screen(Vec2::new(b.0, b.1), Vec2::new(b.2, b.3)),
-                0.0,
-                Stroke::new(1.0_f32, color.gamma_multiply(0.5)),
+                2.0,
+                Stroke::new(1.0_f32, color.gamma_multiply(0.4)),
             );
         }
     }
-    if let Some(b) = selected_bounds(app) {
-        painter.rect_stroke(
-            view.stage_bounds_to_screen(Vec2::new(b.0, b.1), Vec2::new(b.2, b.3)),
-            0.0,
-            Stroke::new(1.3_f32, color),
-        );
-        for (_, p) in handles(b) {
-            painter.rect_filled(
-                Rect::from_center_size(view.stage_to_screen(p), vec2(6.0, 6.0)),
-                1.0,
-                color,
-            );
-        }
-        let top = view.stage_to_screen(Vec2::new((b.0 + b.2) * 0.5, b.1));
-        painter.line_segment([top, top - vec2(0.0, 24.0)], Stroke::new(1.0_f32, color));
-        painter.circle_stroke(top - vec2(0.0, 24.0), 4.0, Stroke::new(1.5_f32, color));
-        let pivot = app
-            .session
-            .transform_pivot
-            .as_ref()
-            .filter(|p| p.selection == app.session.selection)
-            .map(|p| p.point)
-            .unwrap_or(Vec2::new((b.0 + b.2) * 0.5, (b.1 + b.3) * 0.5));
-        let p = view.stage_to_screen(pivot);
-        painter.circle_stroke(p, 3.5, Stroke::new(1.3_f32, color));
-        painter.line_segment(
-            [p - vec2(6.0, 0.0), p + vec2(6.0, 0.0)],
-            Stroke::new(1.0_f32, color),
-        );
-        painter.line_segment(
-            [p - vec2(0.0, 6.0), p + vec2(0.0, 6.0)],
-            Stroke::new(1.0_f32, color),
-        );
+    if let Some(b) = combined_bounds(boxes) {
+        crate::tools::paint_frames_box(app, painter, view, b, pivot_of(app, b));
     }
     if let Some(Gesture::Marquee { start, cursor, .. }) = &app.session.frame_edit_gesture {
         let rect = Rect::from_two_pos(view.stage_to_screen(*start), view.stage_to_screen(*cursor));
-        painter.rect_filled(rect, 0.0, color.gamma_multiply(0.08));
-        painter.rect_stroke(rect, 0.0, Stroke::new(1.0_f32, color));
+        painter.rect_filled(rect, 2.0, color.gamma_multiply(0.08));
+        painter.rect_stroke(rect, 2.0, Stroke::new(1.0_f32, color));
     }
+}
+
+/// Where the picked objects turn about: the anchor set for them, or the
+/// middle of their bounds `b`.
+fn pivot_of(app: &EditorApp, b: (f32, f32, f32, f32)) -> Vec2 {
+    app.session
+        .transform_pivot
+        .as_ref()
+        .filter(|p| p.selection == app.session.selection)
+        .map(|p| p.point)
+        .unwrap_or(Vec2::new((b.0 + b.2) * 0.5, (b.1 + b.3) * 0.5))
 }
 
 pub(crate) fn nudge(app: &mut EditorApp, delta: Vec2) -> bool {

@@ -418,6 +418,25 @@ pub fn menus(app: &mut EditorApp, ui: &mut Ui) {
                 app.queue(Action::BreakApartSelection);
                 ui.close_menu();
             }
+            let has_lines =
+                crate::tools::selected_paint(&app.state.project, &app.session.selection)
+                    .stroke
+                    .is_some()
+                    || matches!(
+                        app.session.selection,
+                        crate::state::Selection::Placement { .. }
+                    );
+            if ui
+                .add_enabled(has_lines, egui::Button::new("Convert Lines to Fills"))
+                .on_hover_text(
+                    "The selected lines become fills of their colour, so a gradient can paint them",
+                )
+                .on_disabled_hover_text("Select lines on the stage first")
+                .clicked()
+            {
+                app.queue(Action::ConvertStrokeToFill);
+                ui.close_menu();
+            }
             if ui
                 .add_enabled(
                     app.can_trace_bitmap_selection(),
@@ -880,7 +899,7 @@ fn action_for_shortcut(command: ShortcutCommand) -> Option<Action> {
         C::ToggleSnap => Action::ToggleSnap,
         C::StageOnly => Action::ToggleStageOnly,
         C::Fullscreen => Action::ToggleFullscreen,
-        C::PerformanceSnapshot | C::ClearSelection | C::OpenChat => return None,
+        C::PerformanceSnapshot | C::ClearSelection | C::OpenChat | C::SelectAll => return None,
     })
 }
 
@@ -894,6 +913,12 @@ fn dispatch_shortcut(
     match command {
         ShortcutCommand::PerformanceSnapshot => app.copy_performance_snapshot(ctx),
         ShortcutCommand::OpenChat => app.online.open_chat(),
+        ShortcutCommand::SelectAll => {
+            if matches!(app.session.tool_state, crate::state::ToolState::Idle) {
+                let scope = crate::select_all::scope(app, ctx);
+                app.queue(Action::SelectAll(scope));
+            }
+        }
         ShortcutCommand::ClearSelection => {
             if matches!(app.session.tool_state, crate::state::ToolState::Idle) {
                 app.session.selection = crate::state::Selection::None;
@@ -1029,6 +1054,7 @@ pub fn handle_global_shortcuts(app: &mut EditorApp, ctx: &egui::Context) {
             test(ShortcutCommand::PasteInPlace);
             test(ShortcutCommand::Duplicate);
             test(ShortcutCommand::Delete);
+            test(ShortcutCommand::SelectAll);
         }
         test(ShortcutCommand::Export);
         test(ShortcutCommand::FastPreviewScene);

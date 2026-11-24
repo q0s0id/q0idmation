@@ -144,7 +144,14 @@ pub const Q1S_VERSION_LAYER_PARENTS: u16 = 45;
 pub const Q1S_VERSION_MASK_PREVIEW: u16 = 46;
 /// Every scene has its own camera, not only the starting one.
 pub const Q1S_VERSION_SCENE_CAMERAS: u16 = 47;
-pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_SCENE_CAMERAS;
+/// A camera can end before its scene does; the scene goes on without it.
+pub const Q1S_VERSION_CAMERA_LENGTHS: u16 = 48;
+/// Raster layers: drawings made of pixels (`Asset::Raster`), and a graphics
+/// byte on every layer metadata entry.
+pub const Q1S_VERSION_RASTER: u16 = 49;
+pub const Q1S_VERSION_LAYER_FX: u16 = 50;
+pub const Q1S_VERSION_OUTLINE_FX: u16 = 51;
+pub const Q1S_VERSION_CURRENT: u16 = Q1S_VERSION_OUTLINE_FX;
 /// A packed `.q1s`: not a body version but a container around one, as
 /// `.q0s` v42 is. After it come the body's own version and length, then the
 /// body, with packed paths, deflated. A tenth of the size or less for most
@@ -170,6 +177,7 @@ const ASSET_KIND_Q0V: u8 = 3;
 const ASSET_KIND_RIG: u8 = 4;
 const ASSET_KIND_MODEL: u8 = 6;
 const ASSET_KIND_Q0V_REFERENCE: u8 = 5;
+const ASSET_KIND_RASTER: u8 = 7;
 const TARGET_KIND_ASSET: u8 = 1;
 const TARGET_KIND_Q0RG: u8 = 2;
 const TWEEN_KIND_NONE: u8 = 0;
@@ -784,6 +792,8 @@ pub enum Asset {
     Rig(RigAsset),
     /// A 3D model.
     Model(crate::three::ModelAsset),
+    /// A drawing made of pixels: what a raster layer's keyframes hold.
+    Raster(crate::pixels::RasterAsset),
 }
 
 impl Asset {
@@ -794,6 +804,7 @@ impl Asset {
             Asset::Q0v(v) => v.asset_id,
             Asset::Rig(v) => v.asset_id,
             Asset::Model(m) => m.asset_id,
+            Asset::Raster(r) => r.asset_id,
         }
     }
 }
@@ -1383,6 +1394,8 @@ pub struct PlacementFx {
     pub blur: Option<BlurFx>,
     pub glow: Option<GlowFx>,
     pub shadow: Option<DropShadowFx>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub outline: Option<Outline2d>,
     pub audio_gain: f32,
     pub audio_muted: bool,
     pub q0rg_playback: Q0rgPlayback,
@@ -1400,6 +1413,7 @@ impl Default for PlacementFx {
             blur: None,
             glow: None,
             shadow: None,
+            outline: None,
             audio_gain: 1.0,
             audio_muted: false,
             q0rg_playback: Q0rgPlayback::default(),
@@ -1425,6 +1439,9 @@ impl PlacementFx {
             && blur_identity
             && glow_identity
             && shadow_identity
+            && self
+                .outline
+                .is_none_or(|outline| outline.width <= 0.0 || outline.color.a == 0)
     }
 
     pub fn lerp_to(self, target: Self, t: f32) -> Self {
@@ -1461,6 +1478,25 @@ impl PlacementFx {
             blur: lerp_blur(self.blur, target.blur, t),
             glow: lerp_glow(self.glow, target.glow, t),
             shadow: lerp_shadow(self.shadow, target.shadow, t),
+            outline: match (self.outline, target.outline) {
+                (None, None) => None,
+                (a, b) => {
+                    let a = a.unwrap_or_else(|| Outline2d {
+                        width: 0.0,
+                        ..b.unwrap()
+                    });
+                    let b = b.unwrap_or(Outline2d { width: 0.0, ..a });
+                    Some(Outline2d {
+                        width: lerp_f32(a.width, b.width, t),
+                        color: Rgba {
+                            r: lerp_u8(a.color.r, b.color.r, t),
+                            g: lerp_u8(a.color.g, b.color.g, t),
+                            b: lerp_u8(a.color.b, b.color.b, t),
+                            a: lerp_u8(a.color.a, b.color.a, t),
+                        },
+                    })
+                }
+            },
             audio_gain: lerp_f32(self.audio_gain, target.audio_gain, t),
             audio_muted: if t >= 1.0 {
                 target.audio_muted
@@ -1697,7 +1733,7 @@ pub enum LayerKind {
     Mask,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 // Rooms and the server keep projects as JSON written by every editor version:
 // a field an older editor never wrote must read as its default, not fail.
@@ -1720,6 +1756,52 @@ pub struct LayerMetadata {
     /// its own artwork. Locking a mask turns it on, as in Animate. Exported
     /// playback always masks; this is only what the editor shows.
     pub mask_preview: bool,
+    /// A raster layer: its keyframes hold pixel drawings, and the raster
+    /// tools paint on it. Everything else about it is an ordinary layer.
+    pub raster: bool,
+    pub fx: LayerFx,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Outline2d {
+    /// Thickness in output pixels, independent of the artwork transform.
+    pub width: f32,
+    pub color: Rgba,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+pub struct LayerFx {
+    pub filters: PlacementFx,
+    pub outline: Option<Outline2d>,
+}
+
+impl LayerFx {
+    pub fn visual(self) -> PlacementFx {
+        PlacementFx {
+            outline: self.outline.or(self.filters.outline),
+            ..self.filters
+        }
+    }
+    pub fn is_identity(self) -> bool {
+        self.filters.is_identity()
+            && self
+                .outline
+                .is_none_or(|outline| outline.width <= 0.0 || outline.color.a == 0)
+    }
+
+    pub fn has_effects_beyond_opacity(self) -> bool {
+        !Self {
+            filters: PlacementFx {
+                opacity: 1.0,
+                ..self.filters
+            },
+            ..self
+        }
+        .is_identity()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -1879,6 +1961,14 @@ pub struct CameraKey {
 pub struct CameraTrack {
     pub enabled: bool,
     pub keys: Vec<CameraKey>,
+    /// How many frames the camera runs for, when it ends before its scene
+    /// does. From there on the scene shows as if it had no camera. None:
+    /// it runs to the scene's end, however long that grows.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub frame_count: Option<u16>,
 }
 
 /// A top-level Animate-style scene. Each scene owns one root q0rg timeline;
@@ -2084,6 +2174,7 @@ impl ProjectV2 {
         static NO_CAMERA: CameraTrack = CameraTrack {
             enabled: false,
             keys: Vec::new(),
+            frame_count: None,
         };
         if q0rg_id == self.meta.entry_q0rg_id {
             &self.runtime.camera
@@ -2112,6 +2203,19 @@ impl ProjectV2 {
     /// Whether `q0rg_id` is a scene whose camera is switched on.
     pub fn camera_on(&self, q0rg_id: u16) -> bool {
         self.scene_camera(q0rg_id).enabled
+    }
+
+    /// How many frames the camera of the scene rooted at `q0rg_id` runs
+    /// for: its own length when it ends early, else the whole timeline.
+    pub fn camera_frame_count(&self, q0rg_id: u16) -> u16 {
+        let timeline = self
+            .q0rgs
+            .iter()
+            .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+            .map_or(0, |q0rg| q0rg.frame_count);
+        self.scene_camera(q0rg_id)
+            .frame_count
+            .map_or(timeline, |count| count.min(timeline))
     }
 
     /// Makes the scene rooted at `q0rg_id` the one the movie starts with.
@@ -2144,7 +2248,10 @@ impl ProjectV2 {
     pub fn camera_state_in(&self, q0rg_id: u16, frame: u16) -> CameraState {
         let track = self.scene_camera(q0rg_id);
         let fallback = self.default_camera_state();
-        if !track.enabled || track.keys.is_empty() {
+        if !track.enabled
+            || track.keys.is_empty()
+            || track.frame_count.is_some_and(|count| frame >= count)
+        {
             return fallback;
         }
         let Some(source) = track
@@ -3911,6 +4018,11 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
             }
             Asset::Rig(rig) => validate_rig_asset(rig)?,
             Asset::Model(_) => {}
+            Asset::Raster(raster) => {
+                if raster.tiles.len() > crate::pixels::MAX_TILES_PER_DRAWING {
+                    return Err(Error::Validation("raster drawing holds too many tiles"));
+                }
+            }
         }
     }
 
@@ -4184,6 +4296,12 @@ pub fn validate(project: &ProjectV2) -> Result<(), Error> {
                     return Err(Error::Validation(
                         "placement opacity must be finite and between 0 and 1",
                     ));
+                }
+                if p.fx
+                    .outline
+                    .is_some_and(|outline| !(0.0..=64.0).contains(&outline.width))
+                {
+                    return Err(Error::Validation("invalid placement outline width"));
                 }
                 if !p.fx.audio_gain.is_finite() || !(0.0..=4.0).contains(&p.fx.audio_gain) {
                     return Err(Error::Validation(
@@ -4858,6 +4976,9 @@ struct MediaPayloads {
     contents: HashMap<u64, Vec<Arc<Vec<u8>>>>,
     by_id: HashMap<u16, Arc<Vec<u8>>>,
     unique_bytes: usize,
+    /// Raster tiles read so far, in file order, for tiles that repeat.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    tiles: Vec<Arc<crate::pixels::RasterTile>>,
 }
 
 impl MediaPayloads {
@@ -4944,7 +5065,19 @@ pub(crate) const BODY_FLAG_PACKED_PATHS: u16 = 1;
 
 /// `write`, optionally packing vector paths. Packed bodies are for .q0s.
 pub(crate) fn write_with(project: &ProjectV2, packed: bool) -> Result<Vec<u8>, Error> {
-    let version = if has_scene_cameras(project) {
+    let version = if has_instance_outline(project) {
+        Q1S_VERSION_OUTLINE_FX
+    } else if project
+        .layer_metadata
+        .values()
+        .any(|layer| layer.fx != LayerFx::default())
+    {
+        Q1S_VERSION_LAYER_FX
+    } else if uses_raster(project) {
+        Q1S_VERSION_RASTER
+    } else if has_camera_lengths(project) {
+        Q1S_VERSION_CAMERA_LENGTHS
+    } else if has_scene_cameras(project) {
         Q1S_VERSION_SCENE_CAMERAS
     } else if project
         .layer_metadata
@@ -5197,8 +5330,32 @@ fn write_version_with(project: &ProjectV2, version: u16, packed: bool) -> Result
         && version != Q1S_VERSION_LAYER_PARENTS
         && version != Q1S_VERSION_MASK_PREVIEW
         && version != Q1S_VERSION_SCENE_CAMERAS
+        && version != Q1S_VERSION_CAMERA_LENGTHS
+        && version != Q1S_VERSION_RASTER
+        && version != Q1S_VERSION_LAYER_FX
+        && version != Q1S_VERSION_OUTLINE_FX
     {
         return Err(Error::UnsupportedVersion(version));
+    }
+    if version < Q1S_VERSION_LAYER_FX
+        && project
+            .layer_metadata
+            .values()
+            .any(|layer| layer.fx != LayerFx::default())
+    {
+        return Err(Error::Validation(
+            "legacy versions cannot store layer effects",
+        ));
+    }
+    if version < Q1S_VERSION_OUTLINE_FX && has_instance_outline(project) {
+        return Err(Error::Validation(
+            "legacy versions cannot store instance outlines",
+        ));
+    }
+    if version < Q1S_VERSION_RASTER && uses_raster(project) {
+        return Err(Error::Validation(
+            "legacy q1s versions cannot store raster layers",
+        ));
     }
     if version < Q1S_VERSION_PARTICLES
         && (project.runtime.physics.uses_v41()
@@ -5375,6 +5532,11 @@ fn write_version_with(project: &ProjectV2, version: u16, packed: bool) -> Result
     if version < Q1S_VERSION_SCENE_CAMERAS && has_scene_cameras(project) {
         return Err(Error::Validation(
             "legacy q1s versions cannot store scene cameras",
+        ));
+    }
+    if version < Q1S_VERSION_CAMERA_LENGTHS && has_camera_lengths(project) {
+        return Err(Error::Validation(
+            "legacy q1s versions cannot store camera lengths",
         ));
     }
     if version < Q1S_VERSION_LAYER_PARENTS && !project.runtime.layer_parents.is_empty() {
@@ -5577,7 +5739,22 @@ fn write_version_with(project: &ProjectV2, version: u16, packed: bool) -> Result
         HashMap::new()
     };
     let mut path_memory = packed.then(PathMemory::default);
+    let mut tile_memory = crate::pixels::TileWriteMemory::default();
     for asset in assets {
+        if let Asset::Raster(raster) = asset {
+            out.extend_from_slice(&raster.asset_id.to_le_bytes());
+            out.push(ASSET_KIND_RASTER);
+            write_string_u16(
+                &mut out,
+                project
+                    .asset_names
+                    .get(&raster.asset_id)
+                    .map(String::as_str)
+                    .unwrap_or(""),
+            )?;
+            crate::pixels::write_raster(&mut out, raster, &mut tile_memory)?;
+            continue;
+        }
         if let Some(original) = media_references.get(&asset.id()) {
             out.extend_from_slice(&asset.id().to_le_bytes());
             out.push(ASSET_KIND_Q0V_REFERENCE);
@@ -5644,6 +5821,27 @@ fn write_version_with(project: &ProjectV2, version: u16, packed: bool) -> Result
             }
             if version >= Q1S_VERSION_MASK_PREVIEW {
                 out.push(u8::from(value.mask_preview));
+            }
+            if version >= Q1S_VERSION_RASTER {
+                out.push(u8::from(value.raster));
+            }
+            if version >= Q1S_VERSION_LAYER_FX {
+                write_placement_fx(&mut out, value.fx.filters, version);
+                if let Some(outline) = value.fx.outline {
+                    if !outline.width.is_finite() || !(0.0..=64.0).contains(&outline.width) {
+                        return Err(Error::Validation("invalid layer outline width"));
+                    }
+                    out.push(1);
+                    out.extend_from_slice(&outline.width.to_le_bytes());
+                    out.extend_from_slice(&[
+                        outline.color.r,
+                        outline.color.g,
+                        outline.color.b,
+                        outline.color.a,
+                    ]);
+                } else {
+                    out.push(0);
+                }
             }
         }
     }
@@ -5911,7 +6109,78 @@ fn write_version_with(project: &ProjectV2, version: u16, packed: bool) -> Result
             write_camera_track(&mut out, track)?;
         }
     }
+    if version >= Q1S_VERSION_CAMERA_LENGTHS {
+        write_camera_lengths(&mut out, project)?;
+    }
     Ok(out)
+}
+
+/// Whether any camera ends before its scene does.
+/// Whether the project has raster layers or drawings, which need q1s v49.
+pub fn uses_raster(project: &ProjectV2) -> bool {
+    project
+        .layer_metadata
+        .values()
+        .any(|metadata| metadata.raster)
+        || project
+            .assets
+            .iter()
+            .any(|asset| matches!(asset, Asset::Raster(_)))
+}
+
+fn has_camera_lengths(project: &ProjectV2) -> bool {
+    project.runtime.camera.frame_count.is_some()
+        || project
+            .runtime
+            .scene_cameras
+            .values()
+            .any(|track| track.frame_count.is_some())
+}
+
+/// The starting scene's camera length (a flag, then the length when it has
+/// one), then how many other scenes' cameras end early and, for each, its
+/// scene and length.
+fn write_camera_lengths(out: &mut Vec<u8>, project: &ProjectV2) -> Result<(), Error> {
+    match project.runtime.camera.frame_count {
+        Some(count) => {
+            out.push(1);
+            out.extend_from_slice(&count.to_le_bytes());
+        }
+        None => out.push(0),
+    }
+    let ended = project
+        .runtime
+        .scene_cameras
+        .iter()
+        .filter_map(|(q0rg_id, track)| track.frame_count.map(|count| (*q0rg_id, count)))
+        .collect::<Vec<_>>();
+    let count = u16::try_from(ended.len())
+        .map_err(|_| Error::Overflow("camera length count exceeds u16"))?;
+    out.extend_from_slice(&count.to_le_bytes());
+    for (q0rg_id, frames) in ended {
+        out.extend_from_slice(&q0rg_id.to_le_bytes());
+        out.extend_from_slice(&frames.to_le_bytes());
+    }
+    Ok(())
+}
+
+fn read_camera_lengths(c: &mut Cursor, runtime: &mut ProjectRuntimeData) -> Result<(), Error> {
+    runtime.camera.frame_count = match c.read_u8()? {
+        0 => None,
+        1 => Some(c.read_u16()?),
+        _ => return Err(Error::Validation("invalid camera length flag")),
+    };
+    let count = c.read_u16()?;
+    for _ in 0..count {
+        let q0rg_id = c.read_u16()?;
+        let frames = c.read_u16()?;
+        runtime
+            .scene_cameras
+            .entry(q0rg_id)
+            .or_default()
+            .frame_count = Some(frames);
+    }
+    Ok(())
 }
 
 /// Whether any scene besides the starting one has a camera worth saving.
@@ -5960,6 +6229,7 @@ fn read_camera_track(c: &mut Cursor) -> Result<CameraTrack, Error> {
             _ => return Err(Error::Validation("invalid camera enabled flag")),
         },
         keys: Vec::new(),
+        frame_count: None,
     };
     let count = c.read_u16()?;
     track.keys.reserve(usize::from(count));
@@ -6111,6 +6381,12 @@ fn write_asset<'a>(
             out.push(ASSET_KIND_MODEL);
             write_string_u16(out, asset_name.unwrap_or(""))?;
             crate::three::wire::write_model(out, &model.data)?;
+        }
+        // Written by the asset loop, which keeps the file's tile memory.
+        Asset::Raster(_) => {
+            return Err(Error::Validation(
+                "raster drawings are written with their file's tiles",
+            ))
         }
     }
     Ok(())
@@ -6939,6 +7215,19 @@ fn write_easing(out: &mut Vec<u8>, easing: Easing) {
     }
 }
 
+fn has_instance_outline(project: &ProjectV2) -> bool {
+    project
+        .q0rgs
+        .iter()
+        .flat_map(|symbol| &symbol.layers)
+        .flat_map(|layer| &layer.placements)
+        .any(|placement| placement.fx.outline.is_some())
+        || project
+            .layer_metadata
+            .values()
+            .any(|layer| layer.fx.filters.outline.is_some())
+}
+
 fn write_placement_fx(out: &mut Vec<u8>, fx: PlacementFx, version: u16) {
     let mut flags = 0u8;
     if (fx.opacity - 1.0).abs() > 1.0e-6 {
@@ -7053,6 +7342,18 @@ fn write_placement_fx(out: &mut Vec<u8>, fx: PlacementFx, version: u16) {
     }
     if version >= Q1S_VERSION_THREE_D {
         crate::three::wire::write_space(out, fx.three);
+    }
+    if version >= Q1S_VERSION_OUTLINE_FX {
+        out.push(u8::from(fx.outline.is_some()));
+        if let Some(outline) = fx.outline {
+            out.extend_from_slice(&outline.width.to_le_bytes());
+            out.extend_from_slice(&[
+                outline.color.r,
+                outline.color.g,
+                outline.color.b,
+                outline.color.a,
+            ]);
+        }
     }
 }
 
@@ -7230,6 +7531,29 @@ fn read_placement_fx(c: &mut Cursor<'_>, version: u16) -> Result<PlacementFx, Er
     } else {
         None
     };
+    let outline = if version >= Q1S_VERSION_OUTLINE_FX {
+        match c.read_u8()? {
+            0 => None,
+            1 => {
+                let width = c.read_f32()?;
+                if !width.is_finite() || !(0.0..=64.0).contains(&width) {
+                    return Err(Error::Validation("invalid instance outline width"));
+                }
+                Some(Outline2d {
+                    width,
+                    color: Rgba {
+                        r: c.read_u8()?,
+                        g: c.read_u8()?,
+                        b: c.read_u8()?,
+                        a: c.read_u8()?,
+                    },
+                })
+            }
+            _ => return Err(Error::Validation("invalid instance outline flag")),
+        }
+    } else {
+        None
+    };
     Ok(PlacementFx {
         opacity,
         tint,
@@ -7237,6 +7561,7 @@ fn read_placement_fx(c: &mut Cursor<'_>, version: u16) -> Result<PlacementFx, Er
         blur,
         glow,
         shadow,
+        outline,
         audio_gain,
         audio_muted,
         q0rg_playback,
@@ -7418,7 +7743,11 @@ pub(crate) fn is_known_version(version: u16) -> bool {
         && version != Q1S_VERSION_THREE_D
         && version != Q1S_VERSION_LAYER_PARENTS
         && version != Q1S_VERSION_MASK_PREVIEW
-        && version != Q1S_VERSION_SCENE_CAMERAS)
+        && version != Q1S_VERSION_SCENE_CAMERAS
+        && version != Q1S_VERSION_CAMERA_LENGTHS
+        && version != Q1S_VERSION_RASTER
+        && version != Q1S_VERSION_LAYER_FX
+        && version != Q1S_VERSION_OUTLINE_FX)
 }
 
 /// Parse a project body after a six-byte wrapper header without copying the
@@ -7535,6 +7864,35 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
                     1 => true,
                     _ => return Err(Error::Validation("invalid layer mask preview flag")),
                 };
+            let raster = version >= Q1S_VERSION_RASTER
+                && match c.read_u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(Error::Validation("invalid layer graphics type")),
+                };
+            let fx = if version >= Q1S_VERSION_LAYER_FX {
+                let filters = read_placement_fx(&mut c, version)?;
+                let outline = match c.read_u8()? {
+                    0 => None,
+                    1 => {
+                        let width = c.read_f32()?;
+                        if !width.is_finite() || !(0.0..=64.0).contains(&width) {
+                            return Err(Error::Validation("invalid layer outline width"));
+                        }
+                        let color = Rgba {
+                            r: c.read_u8()?,
+                            g: c.read_u8()?,
+                            b: c.read_u8()?,
+                            a: c.read_u8()?,
+                        };
+                        Some(Outline2d { width, color })
+                    }
+                    _ => return Err(Error::Validation("invalid layer outline flag")),
+                };
+                LayerFx { filters, outline }
+            } else {
+                LayerFx::default()
+            };
             if layer_metadata
                 .insert(
                     key,
@@ -7546,6 +7904,8 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
                         hidden,
                         locked,
                         mask_preview,
+                        raster,
+                        fx,
                     },
                 )
                 .is_some()
@@ -7851,6 +8211,9 @@ fn parse_body(mut c: Cursor<'_>, version: u16) -> Result<ProjectV2, Error> {
             }
         }
     }
+    if version >= Q1S_VERSION_CAMERA_LENGTHS {
+        read_camera_lengths(&mut c, &mut runtime)?;
+    }
     c.finish()?;
 
     let mut project = ProjectV2 {
@@ -8099,6 +8462,9 @@ fn parse_asset(
                 asset_id,
                 data: Arc::new(crate::three::wire::read_model(c)?),
             })
+        }
+        ASSET_KIND_RASTER if version >= Q1S_VERSION_RASTER => {
+            Asset::Raster(crate::pixels::read_raster(c, asset_id, &mut media.tiles)?)
         }
         other => return Err(Error::InvalidAssetKind(other)),
     };
@@ -9290,12 +9656,51 @@ mod compatibility_tests {
                 hidden: false,
                 locked: false,
                 mask_preview: false,
+                raster: false,
+                fx: Default::default(),
             },
         );
         assert_eq!(
             write_version(&project, Q1S_VERSION_ASSET_NAMES)
                 .expect_err("v5 cannot store layer folders"),
             Error::Validation("legacy q1s versions cannot store layer folders")
+        );
+    }
+
+    #[test]
+    fn a_camera_that_ends_early_saves_its_length_and_lets_go_after_it() {
+        let version = |bytes: &[u8]| u16::from_le_bytes([bytes[4], bytes[5]]);
+        let mut project = legacy_project();
+        project.q0rgs[0].frame_count = 10;
+        let rest = project.default_camera_state();
+        let mut moved = rest;
+        moved.center_x += 50.0;
+        project.runtime.camera.enabled = true;
+        project.runtime.camera.insert_key(0, moved);
+        project.runtime.camera.frame_count = Some(4);
+        assert_eq!(project.camera_frame_count(1), 4);
+        assert_eq!(project.camera_state_at(3), moved);
+        assert_eq!(
+            project.camera_state_at(4),
+            rest,
+            "past its end the scene has no camera"
+        );
+
+        let bytes = write(&project).unwrap();
+        assert_eq!(version(&bytes), Q1S_VERSION_CAMERA_LENGTHS);
+        assert_eq!(
+            parse(&bytes).unwrap().runtime.camera,
+            project.runtime.camera
+        );
+        assert_eq!(
+            write_version(&project, Q1S_VERSION_SCENE_CAMERAS).expect_err("v47 has no lengths"),
+            Error::Validation("legacy q1s versions cannot store camera lengths")
+        );
+        project.runtime.camera.frame_count = None;
+        assert_eq!(project.camera_frame_count(1), 10);
+        assert_ne!(
+            version(&write(&project).unwrap()),
+            Q1S_VERSION_CAMERA_LENGTHS
         );
     }
 

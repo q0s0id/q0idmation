@@ -1088,6 +1088,7 @@ pub struct Session {
     pub current_tool: Tool,
     pub tool_state: ToolState,
     pub selection: Selection,
+    pub(crate) pending_raw_edit: Option<crate::tools::PendingRawEdit>,
     pub transform_pivot: Option<TransformPivot>,
     pub marquee_base_selection: Option<Selection>,
     /// Points picked on further paths alongside a `SubselectPoints`
@@ -1205,6 +1206,8 @@ pub struct Session {
     pub scene3d: crate::scene3d::Scene3dSession,
     /// The 3D tools on the stage and the free 3D view.
     pub tools3d: crate::tools3d::Tools3dSession,
+    /// The raster tools: which is picked, the stroke and the selection.
+    pub raster: crate::raster::RasterSession,
     /// The background preview both windows share.
     pub sim_preview: crate::sim_preview::SimPreview,
     pub rig_auto_key: bool,
@@ -1306,6 +1309,7 @@ impl Session {
             frame: self.current_frame,
             layer_id: self.current_layer_id,
             selection: self.selection.clone(),
+            pending_raw_edit: self.pending_raw_edit.clone(),
             timeline_selection: self.timeline_selection,
             timeline_cell_selection: self.timeline_cell_selection.clone(),
             timeline_layer_selection: self.timeline_layer_selection,
@@ -1320,6 +1324,7 @@ impl Session {
     }
 
     pub fn restore_history_pivot(&mut self, state: Option<HistoryPivotState>, project: &ProjectV2) {
+        self.pending_raw_edit = None;
         let Some(state) = state else {
             self.transform_pivot = None;
             return;
@@ -1329,6 +1334,7 @@ impl Session {
         self.current_frame = state.frame;
         self.pending_timeline_frame = None;
         self.selection = state.selection;
+        self.pending_raw_edit = state.pending_raw_edit;
         self.timeline_selection = state.timeline_selection;
         self.timeline_cell_selection = state.timeline_cell_selection;
         self.timeline_layer_selection = state.timeline_layer_selection;
@@ -1425,6 +1431,7 @@ impl Session {
             frame_edit_gesture: None,
             frame_edit_selection: Vec::new(),
             symbol_edit_click: None,
+            pending_raw_edit: None,
             timeline_horizontal_scroll: 0.0,
             preview_loop_ranges: HashMap::new(),
             show_animation_preview: false,
@@ -1492,6 +1499,7 @@ impl Session {
             lights: Default::default(),
             scene3d: Default::default(),
             tools3d: Default::default(),
+            raster: Default::default(),
             sim_preview: Default::default(),
             rig_auto_key: true,
             rig_selected_node: None,
@@ -1555,15 +1563,39 @@ impl Session {
 
     pub fn reconcile_with(&mut self, project: &ProjectV2) {
         let previous_q0rg_id = self.current_q0rg_id;
-        self.breadcrumb
-            .retain(|id| project.q0rgs.iter().any(|q0rg| q0rg.q0rg_id == *id));
-        if !project
-            .q0rgs
-            .iter()
-            .any(|q| q.q0rg_id == self.current_q0rg_id)
+        let exists = |id: u16| project.q0rgs.iter().any(|q0rg| q0rg.q0rg_id == id);
+        // The symbol being edited is gone (an undo took back the variant
+        // just made, say): step out of it the way Exit does, to the symbol
+        // it was opened from and the frame it was opened at.
+        while !exists(self.current_q0rg_id) {
+            let Some(parent) = self.breadcrumb.pop() else {
+                self.current_q0rg_id = project.meta.entry_q0rg_id;
+                break;
+            };
+            if let Some(context) = self
+                .edit_in_place
+                .last()
+                .copied()
+                .filter(|context| context.parent_q0rg_id == parent)
+            {
+                self.edit_in_place.pop();
+                self.current_frame = context.parent_frame;
+            }
+            self.current_q0rg_id = parent;
+        }
+        self.breadcrumb.retain(|id| exists(*id));
+        // Editing in place draws the symbol where its instance sits, with
+        // the parent dimmed behind it. Kept for a symbol no longer open, it
+        // drew the whole timeline moved and turned under a ghost of the
+        // parent; it is kept only while it still leads to the open symbol.
+        self.edit_in_place
+            .retain(|context| self.breadcrumb.contains(&context.parent_q0rg_id));
+        if self
+            .edit_in_place
+            .last()
+            .is_some_and(|context| self.breadcrumb.last() != Some(&context.parent_q0rg_id))
         {
-            self.current_q0rg_id = project.meta.entry_q0rg_id;
-            self.breadcrumb.clear();
+            self.edit_in_place.clear();
         }
         if let Some(q) = project
             .q0rgs
@@ -1748,7 +1780,8 @@ impl Session {
                         q0s_format::v2::Asset::Bitmap(_)
                         | q0s_format::v2::Asset::Q0v(_)
                         | q0s_format::v2::Asset::Rig(_)
-                        | q0s_format::v2::Asset::Model(_) => None,
+                        | q0s_format::v2::Asset::Model(_)
+                        | q0s_format::v2::Asset::Raster(_) => None,
                     })
                     .is_some();
                 if !exists {
@@ -2431,7 +2464,8 @@ fn path_ref_exists(project: &ProjectV2, r: PathRef) -> bool {
             q0s_format::v2::Asset::Bitmap(_)
             | q0s_format::v2::Asset::Q0v(_)
             | q0s_format::v2::Asset::Rig(_)
-            | q0s_format::v2::Asset::Model(_) => None,
+            | q0s_format::v2::Asset::Model(_)
+            | q0s_format::v2::Asset::Raster(_) => None,
         })
         .is_some()
 }
@@ -2454,7 +2488,8 @@ fn path_anchor_count(project: &ProjectV2, r: PathRef) -> Option<usize> {
             q0s_format::v2::Asset::Bitmap(_)
             | q0s_format::v2::Asset::Q0v(_)
             | q0s_format::v2::Asset::Rig(_)
-            | q0s_format::v2::Asset::Model(_) => None,
+            | q0s_format::v2::Asset::Model(_)
+            | q0s_format::v2::Asset::Raster(_) => None,
         })
         .map(|path| path.anchors.len())
 }
@@ -2477,7 +2512,8 @@ fn path_segment_count(project: &ProjectV2, r: PathRef) -> Option<usize> {
             q0s_format::v2::Asset::Bitmap(_)
             | q0s_format::v2::Asset::Q0v(_)
             | q0s_format::v2::Asset::Rig(_)
-            | q0s_format::v2::Asset::Model(_) => None,
+            | q0s_format::v2::Asset::Model(_)
+            | q0s_format::v2::Asset::Raster(_) => None,
         })
         .map(|path| {
             if path.anchors.len() < 2 {
@@ -2569,6 +2605,7 @@ pub(crate) fn project_copy_bytes(project: &ProjectV2) -> usize {
                     video.bytes.len() / std::sync::Arc::strong_count(&video.bytes).max(1)
                 }
                 q0s_format::v2::Asset::Rig(_) => 4096,
+                q0s_format::v2::Asset::Raster(raster) => raster.held_bytes(),
                 q0s_format::v2::Asset::Model(model) => {
                     let data = &model.data;
                     (data.vertex_count() * 48
@@ -2609,6 +2646,7 @@ pub struct HistoryPivotState {
     frame: u16,
     layer_id: u16,
     selection: Selection,
+    pending_raw_edit: Option<crate::tools::PendingRawEdit>,
     timeline_selection: Option<TimelineSelection>,
     timeline_cell_selection: Option<(u16, Vec<(u16, u16)>)>,
     timeline_layer_selection: Option<TimelineLayerSelection>,
@@ -2763,7 +2801,11 @@ impl History {
         self.snapshot_inner(current, Some(session.history_pivot_state()));
     }
 
-    fn snapshot_inner(&mut self, current: &ProjectV2, pivot_state: Option<HistoryPivotState>) {
+    pub(crate) fn snapshot_inner(
+        &mut self,
+        current: &ProjectV2,
+        pivot_state: Option<HistoryPivotState>,
+    ) {
         if self.undo.last().is_some_and(|entry| {
             entry.project.as_ref() == Some(current) && entry.pivot_state == pivot_state
         }) {
@@ -2845,11 +2887,12 @@ impl Default for History {
     }
 }
 
-/// The fill new shapes start with, and the one "default colours" brings back.
+/// The fill new shapes start with, and the one "default colours" brings back:
+/// black like the stroke, so a quick sketch on a new white stage shows.
 pub const DEFAULT_FILL: Rgba = Rgba {
-    r: 255,
-    g: 255,
-    b: 255,
+    r: 0,
+    g: 0,
+    b: 0,
     a: 255,
 };
 /// The stroke new shapes and lines start with.

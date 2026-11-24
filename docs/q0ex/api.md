@@ -120,7 +120,8 @@ Every word a plugin can use besides the language itself. Words ending in `!` do 
 | --- | --- | --- |
 | `object.x` |  | An object's x; set it to move it. Also y, rotation, scale_x, scale_y, skew_x, skew_y, alpha. → value |
 | `object.kind` |  | drawing, bitmap, video, rig or symbol. → value |
-| `object.name` |  | The instance name q0lang uses; set it to rename. → value |
+| `object.name` |  | The instance name q0lang uses, or the library item's name while it has none; set it to rename. → value |
+| `object.instance_name` |  | Only the instance name q0lang uses: empty until one is given. → value |
 | `object.raw` |  | Every detail of the object; set it to change any of them. → value |
 | `object.move!` | dx, dy | Moves an object. |
 | `object.copy!` | dx, dy | Copies an object and gives the copy back. |

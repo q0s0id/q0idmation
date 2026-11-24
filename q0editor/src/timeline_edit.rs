@@ -3417,6 +3417,8 @@ mod tests {
                 hidden: false,
                 locked: false,
                 mask_preview: false,
+                raster: false,
+                fx: Default::default(),
             },
         );
         project.layer_metadata.insert(
@@ -3429,6 +3431,8 @@ mod tests {
                 hidden: false,
                 locked: false,
                 mask_preview: false,
+                raster: false,
+                fx: Default::default(),
             },
         );
 

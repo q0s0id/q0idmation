@@ -57,6 +57,9 @@ pub struct BrushSettings {
     pub pressure_size: bool,
     /// Use pointer velocity to make fast motion thinner.
     pub velocity_size: bool,
+    /// With `velocity_size`: fast motion makes the line thicker instead,
+    /// from the minimum size at rest up to the full size.
+    pub velocity_grows: bool,
     /// Shared response strength for pressure and velocity, 0..=100.
     pub dynamics_sensitivity: u8,
     /// Smallest dynamic diameter as a fraction of the nominal size, 0.01..=1.
@@ -79,6 +82,7 @@ impl Default for BrushSettings {
             nib: BrushNib::Circle,
             pressure_size: false,
             velocity_size: false,
+            velocity_grows: false,
             dynamics_sensitivity: 50,
             dynamics_min_size: 0.2,
             scale_with_stage: true,
@@ -139,6 +143,7 @@ pub struct BrushStroke {
     smoothing: u8,
     pressure_size: bool,
     velocity_size: bool,
+    velocity_grows: bool,
     dynamics_sensitivity: u8,
     dynamics_min_size: f32,
     last_pressure: Option<f32>,
@@ -163,6 +168,7 @@ pub fn brush_begin(settings: BrushSettings, sample: BrushSample) -> BrushStroke 
         smoothing: settings.smoothing,
         pressure_size: settings.pressure_size,
         velocity_size: settings.velocity_size,
+        velocity_grows: settings.velocity_grows,
         dynamics_sensitivity: settings.dynamics_sensitivity.min(100),
         dynamics_min_size: sanitized_dynamic_min_size(settings.dynamics_min_size),
         last_pressure: sample.pressure,
@@ -178,6 +184,7 @@ pub fn brush_add_sample(
     let mut changed_from = (stroke.nib != settings.nib
         || stroke.pressure_size != settings.pressure_size
         || stroke.velocity_size != settings.velocity_size
+        || stroke.velocity_grows != settings.velocity_grows
         || stroke.dynamics_sensitivity != settings.dynamics_sensitivity.min(100)
         || stroke.dynamics_min_size != sanitized_dynamic_min_size(settings.dynamics_min_size))
     .then_some(0);
@@ -230,6 +237,7 @@ pub fn brush_add_sample(
     stroke.smoothing = settings.smoothing;
     stroke.pressure_size = settings.pressure_size;
     stroke.velocity_size = settings.velocity_size;
+    stroke.velocity_grows = settings.velocity_grows;
     stroke.dynamics_sensitivity = settings.dynamics_sensitivity.min(100);
     stroke.dynamics_min_size = sanitized_dynamic_min_size(settings.dynamics_min_size);
     if let Some(first) = changed_from {
@@ -373,6 +381,7 @@ pub fn brush_prerender_dab_at(stroke: &BrushStroke, index: usize) -> Option<(Vec
         size: *stroke.nominal_sizes.get(index)?,
         pressure_size: stroke.pressure_size,
         velocity_size: stroke.velocity_size,
+        velocity_grows: stroke.velocity_grows,
         dynamics_sensitivity: stroke.dynamics_sensitivity,
         dynamics_min_size: stroke.dynamics_min_size,
         ..BrushSettings::default()
@@ -430,6 +439,7 @@ pub fn brush_finish(mut stroke: BrushStroke, settings: BrushSettings) -> MultiPo
     stroke.smoothing = settings.smoothing;
     stroke.pressure_size = settings.pressure_size;
     stroke.velocity_size = settings.velocity_size;
+    stroke.velocity_grows = settings.velocity_grows;
     stroke.dynamics_sensitivity = settings.dynamics_sensitivity.min(100);
     stroke.dynamics_min_size = sanitized_dynamic_min_size(settings.dynamics_min_size);
     stroke.dirty_preview = true;
@@ -568,7 +578,14 @@ fn dynamic_sample_size(samples: &[BrushSample], index: usize, settings: BrushSet
     if settings.velocity_size && sample.is_some() {
         let speed = brush_sample_speed(samples, index);
         let normalized = (speed / velocity_reference.max(1.0)).max(0.0);
-        let speed_factor = min_ratio + (1.0 - min_ratio) / (1.0 + normalized);
+        // Thinner the faster, or thicker: from the minimum at rest towards
+        // the full size, the same curve the other way round.
+        let quick = normalized / (1.0 + normalized);
+        let speed_factor = if settings.velocity_grows {
+            min_ratio + (1.0 - min_ratio) * quick
+        } else {
+            min_ratio + (1.0 - min_ratio) * (1.0 - quick)
+        };
         factor *= speed_factor;
     }
     settings.size.max(0.1) * factor.clamp(min_ratio, 1.0)
@@ -1791,6 +1808,158 @@ fn fitted_segments_to_closed_path(segments: &[FittedCubic]) -> Option<VPath> {
     })
 }
 
+/// A freehand line through `points` as a few smooth curves, for the
+/// pencil. Turns sharper than `corner` (radians, measured across `reach`
+/// along the line on each side) stay corners; the stretches between are
+/// fitted with cubics that stray at most `tolerance` from the samples. With
+/// `straighten`, a stretch that runs nearly straight becomes a straight
+/// line, its anchors without handles.
+pub(crate) fn fit_freehand(
+    points: &[Vec2],
+    tolerance: f32,
+    corner: f32,
+    reach: f32,
+    straighten: bool,
+) -> Vec<Anchor> {
+    let count = points.len();
+    if count < 2 {
+        return points
+            .iter()
+            .map(|point| Anchor {
+                point: *point,
+                in_handle: None,
+                out_handle: None,
+            })
+            .collect();
+    }
+    // Distance along the line to every sample.
+    let mut along = Vec::with_capacity(count);
+    let mut total = 0.0;
+    along.push(0.0);
+    for pair in points.windows(2) {
+        total += vec2_length(vec2_sub(pair[1], pair[0]));
+        along.push(total);
+    }
+    // How sharply the line turns at each sample, seen from `reach` away on
+    // both sides, and the corners: the sharpest turn of each bend.
+    let turn = |index: usize| -> f32 {
+        let back = (0..index)
+            .rev()
+            .find(|&k| along[index] - along[k] >= reach)
+            .unwrap_or(0);
+        let ahead = (index + 1..count)
+            .find(|&k| along[k] - along[index] >= reach)
+            .unwrap_or(count - 1);
+        let incoming = vec2_sub(points[index], points[back]);
+        let outgoing = vec2_sub(points[ahead], points[index]);
+        let (a, b) = (vec2_length(incoming), vec2_length(outgoing));
+        if a <= 1.0e-6 || b <= 1.0e-6 {
+            return 0.0;
+        }
+        (vec2_dot(incoming, outgoing) / (a * b))
+            .clamp(-1.0, 1.0)
+            .acos()
+    };
+    let turns: Vec<f32> = (0..count).map(turn).collect();
+    let mut breaks = vec![0_usize];
+    for index in 1..count - 1 {
+        if turns[index] < corner || along[index] < reach * 0.5 || total - along[index] < reach * 0.5
+        {
+            continue;
+        }
+        // The sharpest point of this bend only.
+        let sharpest = (0..count)
+            .filter(|&k| (along[k] - along[index]).abs() <= reach)
+            .all(|k| turns[k] < turns[index] || (turns[k] == turns[index] && k >= index));
+        if sharpest && along[index] - along[*breaks.last().unwrap_or(&0)] >= reach * 0.5 {
+            breaks.push(index);
+        }
+    }
+    breaks.push(count - 1);
+
+    let mut segments: Vec<(FittedCubic, bool)> = Vec::new();
+    for pair in breaks.windows(2) {
+        let run = &points[pair[0]..=pair[1]];
+        if run.len() < 2 {
+            continue;
+        }
+        let (start, end) = (run[0], run[run.len() - 1]);
+        if straighten && run_is_straight(run, tolerance * 3.0) {
+            let chord = vec2_sub(end, start);
+            segments.push((
+                FittedCubic {
+                    p0: start,
+                    p1: vec2_add(start, vec2_scale(chord, 1.0 / 3.0)),
+                    p2: vec2_add(start, vec2_scale(chord, 2.0 / 3.0)),
+                    p3: end,
+                },
+                true,
+            ));
+            continue;
+        }
+        // Tangents from a little way in, so a hook at either end does not
+        // set the curve's direction.
+        let lead = run
+            .iter()
+            .position(|point| vec2_length(vec2_sub(*point, start)) >= reach * 0.6)
+            .unwrap_or(run.len() - 1)
+            .max(1);
+        let tail = run
+            .iter()
+            .rposition(|point| vec2_length(vec2_sub(*point, end)) >= reach * 0.6)
+            .unwrap_or(0)
+            .min(run.len() - 2);
+        let start_tangent = normalized_or(vec2_sub(run[lead], start), Vec2::new(1.0, 0.0));
+        let end_tangent = normalized_or(vec2_sub(run[tail], end), vec2_scale(start_tangent, -1.0));
+        let mut fitted = Vec::new();
+        fit_cubic_run(run, start_tangent, end_tangent, tolerance, 0, &mut fitted);
+        segments.extend(fitted.into_iter().map(|segment| (segment, false)));
+    }
+    let Some((first, first_straight)) = segments.first().copied() else {
+        return vec![
+            Anchor {
+                point: points[0],
+                in_handle: None,
+                out_handle: None,
+            },
+            Anchor {
+                point: points[count - 1],
+                in_handle: None,
+                out_handle: None,
+            },
+        ];
+    };
+    let mut anchors = vec![Anchor {
+        point: first.p0,
+        in_handle: None,
+        out_handle: (!first_straight).then_some(first.p1),
+    }];
+    for (index, (segment, straight)) in segments.iter().enumerate() {
+        let next = segments.get(index + 1);
+        anchors.push(Anchor {
+            point: segment.p3,
+            in_handle: (!straight).then_some(segment.p2),
+            out_handle: next.and_then(|(next, straight)| (!straight).then_some(next.p1)),
+        });
+    }
+    anchors
+}
+
+/// Whether every sample of `run` lies within `tolerance` of the straight
+/// line between its ends.
+fn run_is_straight(run: &[Vec2], tolerance: f32) -> bool {
+    let (start, end) = (run[0], run[run.len() - 1]);
+    let chord = vec2_sub(end, start);
+    let length = vec2_length(chord);
+    if length <= 1.0e-6 {
+        return false;
+    }
+    run.iter().all(|point| {
+        let offset = vec2_sub(*point, start);
+        (offset.x * chord.y - offset.y * chord.x).abs() / length <= tolerance
+    })
+}
+
 pub(crate) fn fit_closed_ring_path(points: &[Vec2], tolerance: f32) -> Option<VPath> {
     if points.len() < 4 {
         return None;
@@ -2689,7 +2858,8 @@ fn merge_touching_raw_fills_after_edit_impl(
     for (style, items) in groups {
         // Clipped halo fragments retain their resolved material field. Solid
         // fragments are ordinary visible paint and can participate in a union.
-        if style.fragmented {
+        // Gradients keep their own paint fields until there is a gradient union.
+        if style.fragmented || style.gradient {
             continue;
         }
         let mut visited = vec![false; items.len()];
@@ -2748,7 +2918,19 @@ fn merge_touching_raw_fills_after_edit_impl(
             }
             // Persist only the union boundary. Concatenating source paths left
             // interior edges selectable/stroked and could cancel opposite windings.
-            let paths = coverage_to_separate_paths(&merged);
+            let paths = crate::brush_geometry::BoundarySources::new(
+                project
+                    .assets
+                    .iter()
+                    .filter_map(|asset| match asset {
+                        Asset::Vector(vector) if asset_ids.contains(&vector.asset_id) => {
+                            Some(&vector.paths)
+                        }
+                        _ => None,
+                    })
+                    .flatten(),
+            )
+            .paths(&merged);
             if !paths.is_empty() {
                 updates.push((style, asset_ids, paths));
             }
@@ -2913,7 +3095,16 @@ fn erase_brush_region_impl(
         let asset_id = *writable_assets
             .get(original_asset_id)
             .unwrap_or(original_asset_id);
-        let paths = coverage_to_separate_paths(geometry);
+        let Some(Asset::Vector(source)) = app
+            .state
+            .project
+            .assets
+            .iter()
+            .find(|asset| asset.id() == asset_id)
+        else {
+            continue;
+        };
+        let paths = crate::brush_geometry::BoundarySources::new(&source.paths).paths(geometry);
         if paths.is_empty() {
             remove_asset_ids.insert(asset_id);
         } else if let Some(Asset::Vector(vector)) = app
@@ -2944,10 +3135,12 @@ fn erase_brush_region_impl(
     true
 }
 
-/// Half the width of the hairline a line takes out of the fill it parts:
-/// thin enough to stay hidden under the line, wide enough that the pieces
-/// on either side stay apart.
-const PARTING_HALF: f64 = 0.05;
+/// Half the width of the seam a line leaves in the fill it parts. The
+/// pieces live in one drawing, and pieces that touched would read as one
+/// fill again, so a seam stays between them: four thousandths of a stage
+/// pixel, so moving the line away shows no stripe even zoomed far in. It
+/// used to be a tenth of a pixel, which showed once the line was moved.
+const PARTING_HALF: f64 = 0.002;
 
 /// Whether a piece left after parting a fill is a real region rather than
 /// a sliver shaved off along the line: big enough, and not a thin strip.
@@ -2975,6 +3168,34 @@ pub(crate) fn part_raw_fills_along_lines(
     if zone.0.is_empty() {
         return BTreeSet::new();
     }
+    // What the lines cover. A piece the cut leaves wholly under a line is a
+    // sliver between the line and the fill's own edge (an outline drawn
+    // round its fill traces that edge in slightly different steps), not a
+    // part of the fill: counting those shattered big shapes into shards.
+    let covered = lines
+        .iter()
+        .filter(|(points, _)| points.len() >= 2)
+        .map(|(points, width)| {
+            LineString(
+                points
+                    .iter()
+                    .map(|p| Coord {
+                        x: f64::from(p.x),
+                        y: f64::from(p.y),
+                    })
+                    .collect(),
+            )
+            .buffer(f64::from(*width) * 0.5 + 0.5)
+        })
+        .fold(MultiPolygon::<f64>(Vec::new()), |all, band| {
+            all.union(&band)
+        });
+    let beyond_line = |piece: &Polygon<f64>| {
+        MultiPolygon(vec![piece.clone()])
+            .difference(&covered)
+            .unsigned_area()
+            >= 2.0
+    };
     let mut updates = Vec::new();
     for candidate in collect_raw_fill_candidates(project, q0rg_id, layer_id, frame, false) {
         #[cfg(feature = "appearance-mask-eraser")]
@@ -2995,7 +3216,7 @@ pub(crate) fn part_raw_fills_along_lines(
                 .difference(&zone)
                 .0
                 .into_iter()
-                .filter(real_piece)
+                .filter(|piece| real_piece(piece) && beyond_line(piece))
                 .collect();
             if pieces.len() >= 2 {
                 parted = true;
@@ -3152,6 +3373,9 @@ fn collect_raw_fill_candidates(
     frame: u16,
     include_stroked_fills: bool,
 ) -> Vec<RawFillCandidate> {
+    if !project.layer_is_visible(q0rg_id, layer_id) || project.layer_is_locked(q0rg_id, layer_id) {
+        return Vec::new();
+    }
     let Some(layer) = project
         .q0rgs
         .iter()
@@ -3735,10 +3959,77 @@ fn vector_fill_geometry_boolean(vector: &VectorAsset) -> MultiPolygon<f64> {
         .collect();
     rings.sort_by(|left, right| right.1.abs().total_cmp(&left.1.abs()));
 
+    // Rings whose boxes never touch cannot change each other, so each
+    // touching group is unioned on its own. A drawing of many separate
+    // sprites used to grow one shape through every sprite, which took
+    // seconds; the parts are the same either way.
+    let mut parts = Vec::new();
+    for group in touching_ring_groups(&rings) {
+        let group: Vec<&(Polygon<f64>, f64)> =
+            group.into_iter().map(|index| &rings[index]).collect();
+        parts.extend(winding_surface(&group).0);
+    }
+    MultiPolygon(parts)
+}
+
+/// The rings' indices, in their order, split into groups whose boxes
+/// touch through each other.
+fn touching_ring_groups(rings: &[(Polygon<f64>, f64)]) -> Vec<Vec<usize>> {
+    let boxes: Vec<Option<geo::Rect<f64>>> = rings
+        .iter()
+        .map(|(polygon, _)| polygon.bounding_rect())
+        .collect();
+    let mut leader: Vec<usize> = (0..rings.len()).collect();
+    fn find(leader: &mut [usize], mut index: usize) -> usize {
+        while leader[index] != index {
+            leader[index] = leader[leader[index]];
+            index = leader[index];
+        }
+        index
+    }
+    // Rings that merely touch still join, so a shared edge unions.
+    let touch = |a: &geo::Rect<f64>, b: &geo::Rect<f64>| {
+        const SLACK: f64 = 1.0e-6;
+        a.min().x <= b.max().x + SLACK
+            && b.min().x <= a.max().x + SLACK
+            && a.min().y <= b.max().y + SLACK
+            && b.min().y <= a.max().y + SLACK
+    };
+    for a in 0..rings.len() {
+        for b in a + 1..rings.len() {
+            let joined = match (&boxes[a], &boxes[b]) {
+                (Some(box_a), Some(box_b)) => touch(box_a, box_b),
+                _ => true,
+            };
+            if joined {
+                let (lead_a, lead_b) = (find(&mut leader, a), find(&mut leader, b));
+                if lead_a != lead_b {
+                    leader[lead_b.max(lead_a)] = lead_a.min(lead_b);
+                }
+            }
+        }
+    }
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut group_of_leader = std::collections::HashMap::new();
+    for index in 0..rings.len() {
+        let lead = find(&mut leader, index);
+        let group = *group_of_leader.entry(lead).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[group].push(index);
+    }
+    groups
+}
+
+/// Rings sorted largest first, filled by their winding: a ring stepping
+/// from outside to inside adds to the surface, one stepping back cuts a
+/// hole.
+fn winding_surface(rings: &[&(Polygon<f64>, f64)]) -> MultiPolygon<f64> {
     let mut surface = MultiPolygon(Vec::new());
     let mut inside_windings: Vec<i32> = Vec::with_capacity(rings.len());
     for index in 0..rings.len() {
-        let (polygon, area) = &rings[index];
+        let (polygon, area) = rings[index];
         let sample = polygon
             .exterior()
             .0
@@ -4234,6 +4525,32 @@ mod tests {
             max < dynamic.size * 0.6,
             "pressure gap became a full nib: {max}"
         );
+    }
+
+    #[test]
+    fn speed_size_can_grow_with_speed() {
+        let sizes = |grows: bool| {
+            let mut dynamic = settings(40.0, 0);
+            dynamic.velocity_size = true;
+            dynamic.velocity_grows = grows;
+            dynamic.dynamics_min_size = 0.1;
+            let samples = [
+                BrushSample::pointer(Vec2::new(0.0, 0.0), None, 0.0),
+                BrushSample::pointer(Vec2::new(2.0, 0.0), None, 0.1),
+                BrushSample::pointer(Vec2::new(4.0, 0.0), None, 0.2),
+                BrushSample::pointer(Vec2::new(300.0, 0.0), None, 0.25),
+                BrushSample::pointer(Vec2::new(600.0, 0.0), None, 0.3),
+            ];
+            (
+                dynamic_sample_size(&samples, 2, dynamic),
+                dynamic_sample_size(&samples, 4, dynamic),
+            )
+        };
+        let (slow, fast) = sizes(false);
+        assert!(fast < slow, "thinner the faster: {slow} then {fast}");
+        let (slow, fast) = sizes(true);
+        assert!(fast > slow, "thicker the faster: {slow} then {fast}");
+        assert!(fast <= 40.0, "never past the brush's size: {fast}");
     }
 
     #[test]
@@ -7035,6 +7352,106 @@ mod tests {
         assert_eq!(
             crate::tools::geo_multi_polygon_to_linear_paths(&holed).len(),
             2
+        );
+    }
+
+    #[test]
+    fn a_freehand_line_becomes_a_few_curves_and_keeps_its_corners() {
+        let wobbly: Vec<Vec2> = (0..=100)
+            .map(|i| Vec2::new(i as f32, 0.02 * ((i * 7) % 3) as f32))
+            .collect();
+        let anchors = fit_freehand(&wobbly, 0.5, 70_f32.to_radians(), 7.0, false);
+        assert_eq!(anchors.len(), 2, "{anchors:?}");
+
+        let mut bent: Vec<Vec2> = (0..=50).map(|i| Vec2::new(i as f32, 0.0)).collect();
+        bent.extend((1..=50).map(|i| Vec2::new(50.0, i as f32)));
+        let anchors = fit_freehand(&bent, 0.5, 70_f32.to_radians(), 7.0, false);
+        assert!(
+            anchors
+                .iter()
+                .any(|a| (a.point.x - 50.0).abs() < 0.01 && a.point.y.abs() < 0.01),
+            "the corner stays: {anchors:?}"
+        );
+        let straight = fit_freehand(&bent, 0.5, 40_f32.to_radians(), 7.0, true);
+        assert_eq!(straight.len(), 3, "{straight:?}");
+        assert!(straight
+            .iter()
+            .all(|a| a.in_handle.is_none() && a.out_handle.is_none()));
+    }
+}
+
+#[cfg(test)]
+mod grouped_union_tests {
+    use super::*;
+    use q0s_format::v2::Anchor;
+
+    fn ring(points: &[(f32, f32)]) -> VPath {
+        VPath {
+            anchors: points
+                .iter()
+                .map(|&(x, y)| Anchor {
+                    point: Vec2::new(x, y),
+                    in_handle: None,
+                    out_handle: None,
+                })
+                .collect(),
+            closed: true,
+        }
+    }
+
+    fn square(x: f32, y: f32, size: f32, clockwise: bool) -> VPath {
+        let mut points = vec![(x, y), (x + size, y), (x + size, y + size), (x, y + size)];
+        if !clockwise {
+            points.reverse();
+        }
+        ring(&points)
+    }
+
+    /// Unioning each touching group alone gives the shapes one union of
+    /// everything gives: crossing rings, a hole with an island in it, and
+    /// two squares sharing an edge.
+    #[test]
+    fn separate_groups_union_to_the_same_shapes() {
+        let vector = VectorAsset {
+            asset_id: 1,
+            paths: vec![
+                // Two crossing squares, the second starting outside the first.
+                square(0.0, 0.0, 10.0, true),
+                ring(&[(15.0, 15.0), (5.0, 15.0), (5.0, 5.0), (15.0, 5.0)]),
+                // A square with a hole and an island in the hole.
+                square(100.0, 0.0, 60.0, true),
+                square(110.0, 10.0, 40.0, false),
+                square(120.0, 20.0, 20.0, true),
+                // Two squares sharing an edge.
+                square(200.0, 0.0, 10.0, true),
+                square(210.0, 0.0, 10.0, true),
+            ],
+            fill: Some(q0s_format::v2::Rgba {
+                r: 1,
+                g: 2,
+                b: 3,
+                a: 255,
+            }),
+            stroke: None,
+        };
+        let mut rings: Vec<(Polygon<f64>, f64)> = vector
+            .paths
+            .iter()
+            .filter_map(|path| {
+                let polygon = path_to_polygon(path)?;
+                let area = signed_ring_area(polygon.exterior());
+                Some((polygon, area))
+            })
+            .collect();
+        rings.sort_by(|left, right| right.1.abs().total_cmp(&left.1.abs()));
+        let everything: Vec<&(Polygon<f64>, f64)> = rings.iter().collect();
+        let at_once = winding_surface(&everything);
+        let grouped = vector_fill_geometry_boolean(&vector);
+        assert_eq!(touching_ring_groups(&rings).len(), 3);
+        assert_eq!(grouped.0.len(), at_once.0.len());
+        assert!((grouped.unsigned_area() - at_once.unsigned_area()).abs() < 1.0e-6);
+        assert!(
+            (grouped.unsigned_area() - (175.0 + 3600.0 - 1600.0 + 400.0 + 200.0)).abs() < 1.0e-6
         );
     }
 }

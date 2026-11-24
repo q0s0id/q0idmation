@@ -22,6 +22,10 @@ use crate::ui::FitToScreen;
 
 /// The light layer's name when one is made for a timeline.
 const LIGHT_LAYER: &str = "Light";
+/// Where the lights' own objects are filed in the library.
+const LIGHTS_FOLDER: &str = "q0 lights";
+/// The library name of the drawing a light's object shows.
+const BULB_NAME: &str = "light";
 
 #[derive(Default)]
 pub struct LightSession {
@@ -134,6 +138,397 @@ fn store_setup(app: &mut EditorApp, edit: &Edit, setup: LightSetup) {
         *project.runtime.lighting.setup_mut(q0rg_id) = setup;
         project.runtime.lighting.sanitize();
     });
+}
+
+// ------------------------------------------------------- lights as objects
+//
+// Every light rides on an object of its own: a small disc kept at no
+// opacity, so nothing of it is ever drawn, on a layer of its own. The
+// object is keyed and tweened on the timeline like any other, motion
+// tweens and their eases included, and the light goes where it goes and
+// turns as it turns. The light's own keys only hold its colour,
+// brightness, size and aim.
+
+/// The drawing every light's object shows, made once.
+fn bulb_asset(project: &mut ProjectV2) -> Result<u16, String> {
+    let existing = project.asset_names.iter().find_map(|(id, name)| {
+        (name == BULB_NAME
+            && project
+                .runtime
+                .library_item_folders
+                .get(&q0s_format::v2::LibraryItemReference::Asset(*id))
+                .is_some_and(|folder| folder == LIGHTS_FOLDER))
+        .then_some(*id)
+    });
+    if let Some(id) = existing.filter(|id| project.assets.iter().any(|asset| asset.id() == *id)) {
+        return Ok(id);
+    }
+    let disc = (0..12)
+        .map(|index| {
+            let angle = index as f32 * std::f32::consts::TAU / 12.0;
+            [angle.cos() * 8.0, angle.sin() * 8.0]
+        })
+        .collect::<Vec<_>>();
+    let mut ids = crate::sim_bake::AssetIds::new(project);
+    crate::sim_bake::add_drawing(
+        project,
+        &mut ids,
+        vec![crate::sim_bake::polygon_path(&disc)],
+        rgba(255, 214, 150),
+        BULB_NAME.to_string(),
+        LIGHTS_FOLDER,
+    )
+}
+
+/// Whether `placement` is a light's own object.
+fn is_bulb(project: &ProjectV2, placement: &q0s_format::v2::Placement) -> bool {
+    matches!(placement.target, q0s_format::v2::Target::Asset(id)
+        if project.asset_names.get(&id).is_some_and(|name| name == BULB_NAME)
+            && project
+                .runtime
+                .library_item_folders
+                .get(&q0s_format::v2::LibraryItemReference::Asset(id))
+                .is_some_and(|folder| folder == LIGHTS_FOLDER))
+}
+
+/// The layer holding `light`'s own object, when it rides on one.
+fn own_layer(project: &ProjectV2, q0rg_id: u16, light: &Light) -> Option<u16> {
+    let instance_id = light.follow?;
+    project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)?
+        .layers
+        .iter()
+        .find(|layer| {
+            layer.placements.iter().any(|placement| {
+                placement.instance_id == instance_id && is_bulb(project, placement)
+            })
+        })
+        .map(|layer| layer.layer_id)
+}
+
+/// A new layer just under `above`, called `name`.
+fn layer_below(
+    project: &mut ProjectV2,
+    q0rg_id: u16,
+    above: u16,
+    name: &str,
+) -> Result<u16, String> {
+    let q0rg = project
+        .q0rgs
+        .iter_mut()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+        .ok_or("the timeline is gone")?;
+    let layer_id = q0rg
+        .layers
+        .iter()
+        .map(|layer| layer.layer_id)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or("this timeline has no layer ids left")?;
+    let at = q0rg
+        .layers
+        .iter()
+        .position(|layer| layer.layer_id == above)
+        .unwrap_or(q0rg.layers.len());
+    q0rg.layers.insert(
+        at,
+        q0s_format::v2::Layer {
+            layer_id,
+            timeline_frame_count: None,
+            name: name.to_string(),
+            explicit_keyframes: vec![0],
+            placements: Vec::new(),
+        },
+    );
+    Ok(layer_id)
+}
+
+/// Puts a light that rides on nothing onto the timeline as an object of
+/// its own: on the light layer while that is empty, else on a layer of its
+/// own just under it, keyed wherever the light was keyed and eased between
+/// as it was. The light then rides on it; its keys keep the rest.
+fn give_object(project: &mut ProjectV2, q0rg_id: u16, light_id: u16) -> Result<(), String> {
+    let Some(light) = project
+        .runtime
+        .lighting
+        .setup(q0rg_id)
+        .and_then(|setup| setup.light(light_id))
+        .cloned()
+    else {
+        return Ok(());
+    };
+    if light.follow.is_some() {
+        return Ok(());
+    }
+    ensure_light_layer(project, q0rg_id);
+    let top = project
+        .runtime
+        .lighting
+        .setup(q0rg_id)
+        .and_then(|setup| setup.layer_id)
+        .ok_or("this timeline has no light layer")?;
+    let asset = bulb_asset(project)?;
+    let instance_id = project
+        .q0rgs
+        .iter()
+        .flat_map(|q0rg| &q0rg.layers)
+        .flat_map(|layer| &layer.placements)
+        .map(|placement| placement.instance_id)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or("the project has no object ids left")?;
+    let top_empty = project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+        .and_then(|q0rg| q0rg.layers.iter().find(|layer| layer.layer_id == top))
+        .is_some_and(|layer| layer.placements.is_empty());
+    let layer_id = if top_empty {
+        top
+    } else {
+        layer_below(project, q0rg_id, top, &light.name)?
+    };
+    // Where it was keyed, or where it stands.
+    let mut keys: Vec<(u16, [f32; 2])> = if light.keys.is_empty() {
+        vec![(0, light.position)]
+    } else {
+        light
+            .keys
+            .iter()
+            .map(|key| (key.frame, key.position))
+            .collect()
+    };
+    let eased_from = keys[0].0;
+    if keys[0].0 > 0 {
+        keys.insert(0, (0, keys[0].1));
+    }
+    for (index, (frame, at)) in keys.iter().enumerate() {
+        let tween = match keys.get(index + 1) {
+            // Lights always eased softly in and out between their keys.
+            Some((next, _)) if *frame >= eased_from => q0s_format::v2::Tween::Eased {
+                to_frame: *next,
+                easing: q0s_format::v2::Easing::Preset {
+                    family: q0s_format::v2::EasingFamily::Sine,
+                    mode: q0s_format::v2::EasingMode::InOut,
+                },
+            },
+            _ => q0s_format::v2::Tween::None,
+        };
+        crate::sim_bake::key_frame(
+            project,
+            q0rg_id,
+            layer_id,
+            *frame,
+            vec![q0s_format::v2::Placement {
+                pivot: None,
+                instance_id,
+                frame: *frame,
+                target: q0s_format::v2::Target::Asset(asset),
+                transform: q0s_format::v2::Transform2D {
+                    tx: at[0],
+                    ty: at[1],
+                    ..q0s_format::v2::Transform2D::IDENTITY
+                },
+                tween,
+                fx: q0s_format::v2::PlacementFx {
+                    opacity: 0.0,
+                    ..Default::default()
+                },
+            }],
+        );
+    }
+    let last = project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+        .map_or(0, |q0rg| q0rg.frame_count.saturating_sub(1));
+    crate::sim_bake::reach_frame(project, q0rg_id, layer_id, last);
+    if let Some(light) = project
+        .runtime
+        .lighting
+        .setup_mut(q0rg_id)
+        .light_mut(light_id)
+    {
+        light.follow = Some(instance_id);
+        light.position = [0.0, 0.0];
+        for key in &mut light.keys {
+            key.position = [0.0, 0.0];
+        }
+    }
+    Ok(())
+}
+
+/// Takes `light`'s own object off the timeline, and its layer with it once
+/// that holds nothing else (the light layer itself stays).
+fn drop_object(project: &mut ProjectV2, q0rg_id: u16, light: &Light) {
+    let (Some(instance_id), Some(layer_id)) = (light.follow, own_layer(project, q0rg_id, light))
+    else {
+        return;
+    };
+    let top = project
+        .runtime
+        .lighting
+        .setup(q0rg_id)
+        .and_then(|setup| setup.layer_id);
+    let bulbs: Vec<bool> = project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+        .and_then(|q0rg| q0rg.layers.iter().find(|layer| layer.layer_id == layer_id))
+        .map(|layer| {
+            layer
+                .placements
+                .iter()
+                .map(|placement| {
+                    placement.instance_id == instance_id && is_bulb(project, placement)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let Some(q0rg) = project
+        .q0rgs
+        .iter_mut()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+    else {
+        return;
+    };
+    if let Some(layer) = q0rg
+        .layers
+        .iter_mut()
+        .find(|layer| layer.layer_id == layer_id)
+    {
+        let mut doomed = bulbs.into_iter();
+        layer.placements.retain(|_| !doomed.next().unwrap_or(false));
+    }
+    if Some(layer_id) != top {
+        q0rg.layers
+            .retain(|layer| layer.layer_id != layer_id || !layer.placements.is_empty());
+    }
+}
+
+/// Gives every light of `q0rg_id` that rides on nothing an object of its
+/// own. Returns whether any got one.
+fn give_objects(app: &mut EditorApp, q0rg_id: u16) -> bool {
+    let loose: Vec<u16> = app
+        .state
+        .project
+        .runtime
+        .lighting
+        .setup(q0rg_id)
+        .map(|setup| {
+            setup
+                .lights
+                .iter()
+                .filter(|light| light.follow.is_none())
+                .map(|light| light.light_id)
+                .collect()
+        })
+        .unwrap_or_default();
+    if loose.is_empty() {
+        return false;
+    }
+    // A locked light layer takes nothing; try again once it is unlocked
+    // rather than on every frame.
+    let locked = app
+        .state
+        .project
+        .runtime
+        .lighting
+        .setup(q0rg_id)
+        .and_then(|setup| setup.layer_id)
+        .is_some_and(|layer_id| app.state.project.layer_is_locked(q0rg_id, layer_id));
+    if locked {
+        return false;
+    }
+    app.history
+        .snapshot_with_session(&app.state.project, &app.session);
+    for light_id in loose {
+        if let Err(error) = give_object(&mut app.state.project, q0rg_id, light_id) {
+            app.session.status = format!("lights: {error}");
+            break;
+        }
+    }
+    app.state.project.runtime.lighting.sanitize();
+    app.state.mark_dirty();
+    app.textures.invalidate();
+    true
+}
+
+/// Moves `light`'s own object so the light's middle lands on `to` on
+/// `frame`. An object keyed more than once is keyed here first, so moving
+/// it animates it; one keyed once just moves.
+fn move_object(app: &mut EditorApp, q0rg_id: u16, light: &Light, frame: u16, to: [f32; 2]) {
+    let (Some(instance_id), Some(layer_id)) =
+        (light.follow, own_layer(&app.state.project, q0rg_id, light))
+    else {
+        return;
+    };
+    let Some(now) = light_centre(&app.state.project, q0rg_id, light, frame) else {
+        return;
+    };
+    let keyed: std::collections::BTreeSet<u16> = app
+        .state
+        .project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+        .and_then(|q0rg| q0rg.layers.iter().find(|layer| layer.layer_id == layer_id))
+        .map(|layer| {
+            layer
+                .placements
+                .iter()
+                .filter(|placement| placement.instance_id == instance_id)
+                .map(|placement| placement.frame)
+                .collect()
+        })
+        .unwrap_or_default();
+    if keyed.len() > 1 && !keyed.contains(&frame) {
+        let _ = crate::tools::materialize_layer_keyframe_for_edit(
+            &mut app.state.project,
+            q0rg_id,
+            layer_id,
+            frame,
+        );
+    }
+    let Some(index) = app
+        .state
+        .project
+        .q0rgs
+        .iter()
+        .find(|q0rg| q0rg.q0rg_id == q0rg_id)
+        .and_then(|q0rg| q0rg.layers.iter().find(|layer| layer.layer_id == layer_id))
+        .and_then(|layer| {
+            crate::render::active_placements_at(layer, frame)
+                .into_iter()
+                .map(|(index, _)| index)
+                .find(|index| {
+                    layer
+                        .placements
+                        .get(*index)
+                        .is_some_and(|placement| placement.instance_id == instance_id)
+                })
+        })
+    else {
+        return;
+    };
+    let Some((mut transform, _)) = crate::tools::placement_transform_for_edit(
+        &app.state.project,
+        q0rg_id,
+        layer_id,
+        index,
+        frame,
+    ) else {
+        return;
+    };
+    transform.tx += to[0] - now[0];
+    transform.ty += to[1] - now[1];
+    crate::tools::set_placement_transform_for_edit(app, q0rg_id, layer_id, index, transform);
+    app.textures.invalidate();
+    app.state.mark_dirty();
 }
 
 /// Gives `q0rg_id` a light layer on top if it has none, so lights shine on
@@ -412,6 +807,12 @@ pub fn render_window(app: &mut EditorApp, ctx: &Context) {
 fn render_contents(app: &mut EditorApp, ui: &mut Ui) {
     let dim = app.settings.theme.text_dim.to_color32();
     let q0rg_id = app.session.current_q0rg_id;
+    // Lights from before they were objects, or let go of what they rode
+    // on, go onto the timeline.
+    if give_objects(app, q0rg_id) {
+        app.session.status =
+            "lights are objects on the timeline now: key and tween them there".into();
+    }
     ui.horizontal(|ui| {
         ui.label("Mode");
         for mode in RigMode::ALL {
@@ -451,6 +852,17 @@ fn render_contents(app: &mut EditorApp, ui: &mut Ui) {
             render_light(app, ui, &mut edit, &mut shown, mode, dim);
             if edit.follow_selection {
                 if let Some(instance_id) = follow_target(app, q0rg_id) {
+                    // Riding on something else now: its own object goes.
+                    let mut before = light.clone();
+                    before.follow = shown.follow;
+                    if own_layer(&app.state.project, q0rg_id, &before).is_some() {
+                        if let Some(centre) =
+                            light_centre(&app.state.project, q0rg_id, &before, frame)
+                        {
+                            shown.position = centre;
+                        }
+                        drop_object(&mut app.state.project, q0rg_id, &before);
+                    }
                     // The light keeps its place and aim, now as an offset
                     // and heading in the object's own space.
                     if let Some(anchor) = anchor(&app.state.project, q0rg_id, frame, instance_id) {
@@ -678,6 +1090,17 @@ fn render_light_list(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16, dim: Color3
     if let Some(light_id) = remove {
         app.history
             .snapshot_with_session(&app.state.project, &app.session);
+        if let Some(light) = app
+            .state
+            .project
+            .runtime
+            .lighting
+            .setup(q0rg_id)
+            .and_then(|setup| setup.light(light_id))
+            .cloned()
+        {
+            drop_object(&mut app.state.project, q0rg_id, &light);
+        }
         app.state
             .project
             .runtime
@@ -685,6 +1108,7 @@ fn render_light_list(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16, dim: Color3
             .setup_mut(q0rg_id)
             .lights
             .retain(|light| light.light_id != light_id);
+        app.textures.invalidate();
         app.state.mark_dirty();
     }
 }
@@ -710,7 +1134,11 @@ fn add_light(app: &mut EditorApp, q0rg_id: u16) {
     let light_id = setup.next_light_id();
     setup.lights.push(Light::new(light_id, position));
     project.runtime.lighting.sanitize();
+    if let Err(error) = give_object(project, q0rg_id, light_id) {
+        app.session.status = format!("lights: {error}");
+    }
     app.session.lights.selected = Some(light_id);
+    app.textures.invalidate();
     app.state.mark_dirty();
 }
 
@@ -806,7 +1234,39 @@ fn render_light(
                 ui.end_row();
             }
             ui.label("Follows");
+            let own = own_layer(&app.state.project, q0rg_id, light).and_then(|layer_id| {
+                app.state
+                    .project
+                    .q0rgs
+                    .iter()
+                    .find(|q0rg| q0rg.q0rg_id == q0rg_id)?
+                    .layers
+                    .iter()
+                    .find(|layer| layer.layer_id == layer_id)
+                    .map(|layer| layer.name.clone())
+            });
             ui.horizontal(|ui| match light.follow {
+                Some(_) if own.is_some() => {
+                    ui.label(
+                        RichText::new(format!(
+                            "its own object, on layer \"{}\"",
+                            own.as_deref().unwrap_or_default()
+                        ))
+                        .small()
+                        .color(dim),
+                    )
+                    .on_hover_text(
+                        "Key and tween it on the timeline like any object: the light goes where it goes and turns as it turns",
+                    );
+                    if ui
+                        .add_enabled(selected, egui::Button::new("Ride on selected").small())
+                        .on_hover_text("Ride along with the selected object instead, like a torch in a hand")
+                        .on_disabled_hover_text("Select an object on this timeline first")
+                        .clicked()
+                    {
+                        edit.follow_selection = true;
+                    }
+                }
                 Some(instance_id) => {
                     let name = app
                         .state
@@ -850,9 +1310,11 @@ fn render_light(
             ui.end_row();
         });
     ui.label(
-        RichText::new("drag the light on the stage to move it, its ring to resize it")
-            .small()
-            .color(dim),
+        RichText::new(
+            "drag the light on the stage to move it, its ring to resize it; its layer on the timeline keys and tweens where it goes",
+        )
+        .small()
+        .color(dim),
     );
 }
 
@@ -1133,6 +1595,17 @@ pub fn handle_stage(
         return true;
     };
     let snap = response.ctx.input(|input| input.modifiers.shift);
+    if drag.grip == Grip::Move && own_layer(&app.state.project, q0rg_id, &light).is_some() {
+        let mut to = [
+            drag.centre[0] + cursor.x - drag.press.x,
+            drag.centre[1] + cursor.y - drag.press.y,
+        ];
+        if snap {
+            to = to.map(f32::round);
+        }
+        move_object(app, q0rg_id, &light, frame, to);
+        return true;
+    }
     let mut changed = shown.clone();
     match drag.grip {
         Grip::Move => {
@@ -1368,5 +1841,54 @@ mod tests {
         light.set_key(8);
         let shown = on_frame(&light, 4);
         assert!((shown.position[0] - 40.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_light_rides_on_an_object_keyed_and_tweened_on_the_timeline() {
+        let mut app = EditorApp::default();
+        app.state.project = project();
+        app.session.current_q0rg_id = 1;
+        add_light(&mut app, 1);
+        let light = app.state.project.runtime.lighting.setup(1).unwrap().lights[0].clone();
+        let layer_id = own_layer(&app.state.project, 1, &light).expect("it has an object");
+        let layer = app.state.project.q0rgs[0]
+            .layers
+            .iter()
+            .find(|layer| layer.layer_id == layer_id)
+            .unwrap();
+        assert_eq!(layer.placements.len(), 1);
+        assert_eq!(layer.placements[0].fx.opacity, 0.0, "never drawn");
+        let centre = light_centre(&app.state.project, 1, &light, 0).unwrap();
+        assert!((centre[0] - 200.0).abs() < 0.5 && (centre[1] - 150.0).abs() < 0.5);
+
+        // A light keyed the old way moves onto keyframes of its own object,
+        // eased between them as it was.
+        let mut old = Light::new(9, [0.0, 0.0]);
+        old.set_key(0);
+        old.position = [100.0, 0.0];
+        old.set_key(10);
+        app.state
+            .project
+            .runtime
+            .lighting
+            .setup_mut(1)
+            .lights
+            .push(old);
+        assert!(give_objects(&mut app, 1));
+        let moved = app
+            .state
+            .project
+            .runtime
+            .lighting
+            .setup(1)
+            .unwrap()
+            .light(9)
+            .unwrap()
+            .clone();
+        assert!(own_layer(&app.state.project, 1, &moved).is_some());
+        let at = |frame| light_centre(&app.state.project, 1, &moved, frame).unwrap();
+        assert!((at(0)[0]).abs() < 0.5, "{:?}", at(0));
+        assert!((at(5)[0] - 50.0).abs() < 1.0, "{:?}", at(5));
+        assert!((at(10)[0] - 100.0).abs() < 0.5, "{:?}", at(10));
     }
 }

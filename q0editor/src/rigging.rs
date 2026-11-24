@@ -2096,8 +2096,20 @@ fn render_bone_selection(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
         render_selected_node_numeric(app, ui, q0rg_id, node_id);
     }
 }
+/// The project as it was before an edit that changed only `q0rg_id`'s rig,
+/// put together once the edit lands: the panels below edit the rig in place
+/// and keep just the rig from before, rather than copying the whole project
+/// every frame they are shown.
+fn project_with_rig(project: &ProjectV2, q0rg_id: u16, rig: Option<RigAsset>) -> ProjectV2 {
+    let mut before = project.clone();
+    if let (Some(slot), Some(rig)) = (rig_for_q0rg_mut(&mut before, q0rg_id), rig) {
+        *slot = rig;
+    }
+    before
+}
+
 fn render_selected_node_numeric(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16, node_id: u16) {
-    let before = app.state.project.clone();
+    let rig_before = rig_for_q0rg(&app.state.project, q0rg_id).cloned();
     let Some(rig) = rig_for_q0rg_mut(&mut app.state.project, q0rg_id) else {
         return;
     };
@@ -2190,6 +2202,7 @@ fn render_selected_node_numeric(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16, 
         node.rest.sx = node.rest.sx.max(0.01);
         node.rest.sy = node.rest.sy.max(0.01);
         node.length = node.length.max(0.0);
+        let before = project_with_rig(&app.state.project, q0rg_id, rig_before);
         app.history.snapshot_with_session(&before, &app.session);
         app.state.mark_dirty();
     }
@@ -2261,7 +2274,7 @@ fn render_pro_controls(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                 .find(|control| control.control_id == control_id)
         })
         .map(|control| control.kind);
-    let before = app.state.project.clone();
+    let rig_before = rig_for_q0rg(&app.state.project, q0rg_id).cloned();
     let Some(rig) = rig_for_q0rg_mut(&mut app.state.project, q0rg_id) else {
         return;
     };
@@ -2383,6 +2396,7 @@ fn render_pro_controls(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16) {
                 .rest_value
                 .clamp(control.min_value, control.max_value);
         }
+        let before = project_with_rig(&app.state.project, q0rg_id, rig_before);
         app.history.snapshot_with_session(&before, &app.session);
         app.state.mark_dirty();
     }
@@ -2524,7 +2538,6 @@ fn render_master_driver_editor(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16, c
         .map(|value| value.value)
         .unwrap_or(control.rest_value);
     let mut value = current_value;
-    let before_value = app.state.project.clone();
     let response = if control.kind == RigControlKind::Toggle {
         let mut enabled = value >= 0.5;
         let response = crate::ui::switch(ui, &mut enabled, "Enabled");
@@ -2537,21 +2550,24 @@ fn render_master_driver_editor(app: &mut EditorApp, ui: &mut Ui, q0rg_id: u16, c
                 .clamp_to_range(true),
         )
     };
-    if response.changed()
-        && set_control_value(
+    if response.changed() {
+        // Copied only as an edit begins, not every frame the slider shows.
+        let before_value =
+            (response.drag_started() || response.gained_focus()).then(|| app.state.project.clone());
+        if set_control_value(
             &mut app.state.project,
             q0rg_id,
             control_id,
             app.session.current_frame,
             value,
             app.session.rig_auto_key,
-        )
-    {
-        if response.drag_started() || response.gained_focus() {
-            app.history
-                .snapshot_with_session(&before_value, &app.session);
+        ) {
+            if let Some(before_value) = before_value {
+                app.history
+                    .snapshot_with_session(&before_value, &app.session);
+            }
+            app.state.mark_dirty();
         }
-        app.state.mark_dirty();
     }
 
     let drivers = rig_snapshot

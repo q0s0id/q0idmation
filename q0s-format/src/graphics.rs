@@ -120,6 +120,7 @@ pub fn unused_graphics(project: &ProjectV2, plain_name: impl Fn(Option<&str>) ->
         .iter()
         .filter_map(|asset| match asset {
             Asset::Vector(vector) => Some(vector.asset_id),
+            Asset::Raster(raster) => Some(raster.asset_id),
             _ => None,
         })
         .filter(|id| !used.contains(id) && is_graphic(project, *id, &plain_name))

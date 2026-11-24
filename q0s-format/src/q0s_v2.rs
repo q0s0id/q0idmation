@@ -763,6 +763,15 @@ mod tests {
                 offset_y: 3.0,
                 strength: 0.75,
             }),
+            outline: Some(v2::Outline2d {
+                width: 2.5,
+                color: v2::Rgba {
+                    r: 11,
+                    g: 22,
+                    b: 33,
+                    a: 240,
+                },
+            }),
             audio_gain: 1.0,
             audio_muted: false,
             q0rg_playback: Default::default(),
@@ -1173,6 +1182,8 @@ mod tests {
                 hidden: false,
                 locked: false,
                 mask_preview: false,
+                raster: false,
+                fx: Default::default(),
             },
         );
         project.layer_metadata.insert(
@@ -1185,6 +1196,8 @@ mod tests {
                 hidden: false,
                 locked: false,
                 mask_preview: false,
+                raster: false,
+                fx: Default::default(),
             },
         );
 

@@ -12,9 +12,13 @@ use super::model::{Material, Mesh, ModelData, RenderMesh, Shading};
 use super::scene::Liquid3d;
 
 /// Where the skin lies: a lone drop's field peaks at 1.
-const LEVEL: f32 = 0.35;
-/// How far a drop reaches, in its spacing.
-const REACH: f32 = 1.6;
+const LEVEL: f32 = 0.3;
+/// How far a drop reaches, in its spacing: far enough that drops a spacing
+/// apart share one skin, so a thin pool stays a sheet and does not fall
+/// into beads.
+const REACH: f32 = 2.0;
+/// Rounds of evening the skin's corners out.
+const SMOOTHING: usize = 2;
 /// The grid never gets finer than this many cells across.
 const MAX_CELLS: f32 = 96.0;
 /// Surfaces kept for drawing again.
@@ -39,10 +43,18 @@ pub fn surface(drops: &[[i16; 3]], spacing: f32) -> Mesh {
     }
     lo -= V3::new(reach, reach, reach);
     hi += V3::new(reach, reach, reach);
+    // The grid is fixed to the stage, not to where the drops are: a grid
+    // that moved with them laid the skin out afresh every frame and made it
+    // shimmer. Cells only ever double, so a spreading liquid keeps one cell
+    // size for long stretches.
+    let widest = (hi - lo).x.max((hi - lo).y).max((hi - lo).z);
+    let mut cell = (spacing * 0.5).max(0.5);
+    while widest / cell > MAX_CELLS {
+        cell *= 2.0;
+    }
+    let snap = |v: f32| (v / cell).floor() * cell;
+    lo = V3::new(snap(lo.x), snap(lo.y), snap(lo.z));
     let size = hi - lo;
-    let cell = (spacing * 0.5)
-        .max(size.x.max(size.y).max(size.z) / MAX_CELLS)
-        .max(0.5);
     let n = [
         (size.x / cell).ceil() as usize + 1,
         (size.y / cell).ceil() as usize + 1,
@@ -186,12 +198,48 @@ pub fn surface(drops: &[[i16; 3]], spacing: f32) -> Mesh {
             }
         }
     }
+    smooth_skin(&mut mesh, SMOOTHING);
     mesh.corner_normals = mesh
         .corner_verts
         .iter()
         .map(|v| normals[*v as usize])
         .collect();
     mesh
+}
+
+/// Evens out the steps surface nets leave: each vertex moves halfway to the
+/// middle of its neighbours, `rounds` times.
+fn smooth_skin(mesh: &mut Mesh, rounds: usize) {
+    if rounds == 0 || mesh.positions.is_empty() {
+        return;
+    }
+    let mut neighbours: Vec<Vec<u32>> = vec![Vec::new(); mesh.positions.len()];
+    for face in &mesh.faces {
+        let verts = mesh.face_verts(face);
+        for (index, &v) in verts.iter().enumerate() {
+            let next = verts[(index + 1) % verts.len()];
+            for (a, b) in [(v, next), (next, v)] {
+                let list = &mut neighbours[a as usize];
+                if !list.contains(&b) {
+                    list.push(b);
+                }
+            }
+        }
+    }
+    for _ in 0..rounds {
+        let before = mesh.positions.clone();
+        for (vertex, around) in neighbours.iter().enumerate() {
+            if around.is_empty() {
+                continue;
+            }
+            let mut middle = V3::ZERO;
+            for &n in around {
+                middle += before[n as usize];
+            }
+            middle = middle / around.len() as f32;
+            mesh.positions[vertex] = before[vertex] + (middle - before[vertex]) * 0.5;
+        }
+    }
 }
 
 type Built = (Arc<ModelData>, Arc<RenderMesh>);

@@ -554,6 +554,24 @@ pub(crate) fn fast_visible_material_bounds_for_paths(
     appearance: Option<&VectorAppearance>,
     path_indices: &[usize],
 ) -> Option<(f32, f32, f32, f32)> {
+    if let Some(appearance) = appearance.filter(|appearance| is_masked_solid(appearance)) {
+        let visible = visible_material_surface_for_paths(vector, Some(appearance), path_indices);
+        let bounds = geo::BoundingRect::bounding_rect(&visible)?;
+        return Some((
+            bounds.min().x as f32,
+            bounds.min().y as f32,
+            bounds.max().x as f32,
+            bounds.max().y as f32,
+        ));
+    }
+    conservative_visible_material_bounds_for_paths(vector, appearance, path_indices)
+}
+
+fn conservative_visible_material_bounds_for_paths(
+    vector: &VectorAsset,
+    appearance: Option<&VectorAppearance>,
+    path_indices: &[usize],
+) -> Option<(f32, f32, f32, f32)> {
     let mut selected_bounds: Option<(f32, f32, f32, f32)> = None;
     for path in path_indices
         .iter()
@@ -803,6 +821,22 @@ pub(crate) fn visible_material_surface_for_vector(
     transform_surface(&canonical_visible, appearance.field_transform)
 }
 
+fn is_masked_solid(appearance: &VectorAppearance) -> bool {
+    appearance.material == VectorMaterial::Solid
+        && (!appearance.clip_mask.is_empty() || !appearance.erase_mask.is_empty())
+}
+
+pub(crate) fn solid_masked_surface(
+    vector: &VectorAsset,
+    appearance: Option<&VectorAppearance>,
+) -> Option<MultiPolygon<f64>> {
+    let appearance = appearance.filter(|appearance| is_masked_solid(appearance))?;
+    Some(visible_material_surface_for_vector(
+        vector,
+        Some(appearance),
+    ))
+}
+
 pub(crate) fn visible_material_surface_for_paths(
     vector: &VectorAsset,
     appearance: Option<&VectorAppearance>,
@@ -888,12 +922,32 @@ pub(crate) fn asset_visible_material_bounds(
 /// footprint is intersected with the finite material support and then unioned
 /// into the asset-local mask. No radius is added to the eraser region.
 pub fn erase_visible_region(app: &mut EditorApp, region: MultiPolygon<f64>) -> bool {
+    erase_visible_region_impl(app, region, true)
+}
+
+pub(crate) fn erase_visible_region_without_snapshot(
+    app: &mut EditorApp,
+    region: MultiPolygon<f64>,
+) -> bool {
+    erase_visible_region_impl(app, region, false)
+}
+
+fn erase_visible_region_impl(
+    app: &mut EditorApp,
+    region: MultiPolygon<f64>,
+    snapshot: bool,
+) -> bool {
     if region.0.is_empty() {
         return false;
     }
     let q0rg_id = app.session.current_q0rg_id;
     let layer_id = app.session.current_layer_id;
     let frame = app.session.current_frame;
+    if !app.state.project.layer_is_visible(q0rg_id, layer_id)
+        || app.state.project.layer_is_locked(q0rg_id, layer_id)
+    {
+        return false;
+    }
     let Some(layer) = app
         .state
         .project
@@ -937,8 +991,9 @@ pub fn erase_visible_region(app: &mut EditorApp, region: MultiPolygon<f64>) -> b
         if cuts_by_asset.contains_key(&asset_id) {
             continue;
         }
+        let indices: Vec<_> = (0..vector.paths.len()).collect();
         let Some((min_x, min_y, max_x, max_y)) =
-            asset_visible_material_bounds_fast(&app.state.project, asset_id)
+            conservative_visible_material_bounds_for_paths(vector, Some(appearance), &indices)
         else {
             continue;
         };
@@ -965,8 +1020,10 @@ pub fn erase_visible_region(app: &mut EditorApp, region: MultiPolygon<f64>) -> b
         return false;
     }
 
-    app.history
-        .snapshot_with_session(&app.state.project, &app.session);
+    if snapshot {
+        app.history
+            .snapshot_with_session(&app.state.project, &app.session);
+    }
     if crate::tools::materialize_layer_keyframe_for_edit(
         &mut app.state.project,
         q0rg_id,
@@ -1002,7 +1059,7 @@ pub fn erase_visible_region(app: &mut EditorApp, region: MultiPolygon<f64>) -> b
         } else {
             old_mask.union(&canonical_cut)
         };
-        let new_paths = crate::brush::coverage_to_paths(&new_mask);
+        let new_paths = crate::brush::coverage_to_linear_paths(&new_mask);
         if new_paths != appearance.erase_mask {
             if let Some(entry) = app.state.project.asset_appearances.get_mut(&asset_id) {
                 entry.erase_mask = new_paths;

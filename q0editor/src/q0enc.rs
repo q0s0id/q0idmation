@@ -1072,24 +1072,24 @@ fn export_q0v(
 fn mp4_render_workers(options: &ExportOptions, total: u32) -> usize {
     let pixels = u64::from(h264_encoded_dimension(options.width))
         * u64::from(h264_encoded_dimension(options.height));
-    // Account for a supersampled stage plus an isolation surface, RGBA and
-    // NV12. Large/4x exports use fewer workers. Rendezvous channels below keep
-    // at most one prepared frame per worker, regardless of movie duration.
-    let working_bytes = pixels * (8 * u64::from(options.supersampling).pow(2) + 6);
+    // Account for a supersampled stage plus an isolation surface, RGBA,
+    // NV12 and one look-ahead NV12 buffer per worker. Larger exports still
+    // use fewer workers, whichever limit (memory or CPU) they reach first.
+    let working_bytes = pixels * (8 * u64::from(options.supersampling).pow(2) + 8);
     let memory_workers = (768 * 1024 * 1024 / working_bytes.max(1)).max(1) as usize;
     std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1)
         .saturating_sub(1)
-        .clamp(1, 4)
+        .clamp(1, 8)
         .min(memory_workers)
         .min(total.max(1) as usize)
 }
 
-/// Prepare independent frames concurrently, consume in timeline order. Each
-/// worker has a rendezvous channel: a slow early frame cannot cause an
-/// unbounded collection of later frames. Dropping all receivers unblocks
-/// producers on cancellation, renderer failure, or an encoder error.
+/// Prepare independent frames concurrently, consume in timeline order.
+/// Each worker can prepare the frame after its queued result while the
+/// encoder waits for an earlier frame. A slow frame cannot cause an unbounded
+/// backlog, and dropping all receivers releases workers on cancellation or error.
 #[cfg(any(windows, target_os = "android", test))]
 fn ordered_render_frames<T: Send>(
     range: RangeInclusive<u16>,
@@ -1105,7 +1105,7 @@ fn ordered_render_frames<T: Send>(
     std::thread::scope(|scope| {
         let mut receivers = Vec::with_capacity(workers);
         for worker in 0..workers {
-            let (sender, receiver) = mpsc::sync_channel(0);
+            let (sender, receiver) = mpsc::sync_channel(1);
             receivers.push(receiver);
             let (render, stopped) = (&render, &stopped);
             scope.spawn(move || {
@@ -1188,12 +1188,22 @@ fn export_mp4(
         #[cfg(windows)]
         let mut audio_written = 0_u64;
         progress(0, total, "rendering and encoding h.264 frames");
+        let project = job.snapshot();
+        let rasterizer = q0s_format::raster::FrameRasterizer::new(project);
+        let bg = project.meta.background_color;
         let outcome = ordered_render_frames(
             range,
             mp4_render_workers(&job.options, total),
             cancel,
             |frame_number| {
-                let rgba = render_frame(job.snapshot(), &job.options, frame_number);
+                let rgba = rasterizer.render_scaled(
+                    job.options.source_q0rg_id,
+                    frame_number,
+                    job.options.width,
+                    job.options.height,
+                    u32::from(job.options.supersampling),
+                    [bg.r, bg.g, bg.b, 255],
+                );
                 let encoded = pad_rgba_to_even(
                     &rgba,
                     job.options.width,
@@ -1782,9 +1792,10 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let started = AtomicUsize::new(0);
         let mut seen = Vec::new();
+        let workers = 4;
         let outcome = ordered_render_frames(
             25..=48,
-            4,
+            workers,
             &cancel,
             |frame| {
                 started.fetch_add(1, Ordering::SeqCst);
@@ -1795,8 +1806,9 @@ mod tests {
             },
             |offset, frame| {
                 assert_eq!(frame, 25 + offset as u16);
-                // One current frame per producer; no movie-sized reorder buffer.
-                assert!(started.load(Ordering::SeqCst) <= offset as usize + 5);
+                // Each worker has one queued frame and one in preparation.
+                let consumed = offset as usize + 1;
+                assert!(started.load(Ordering::SeqCst) <= consumed + workers * 2);
                 seen.push(frame);
                 Ok(())
             },

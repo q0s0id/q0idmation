@@ -85,6 +85,18 @@ fn extract_q_project(project: &ProjectV2, output: &Path) -> Result<usize, String
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| format!("asset_{id:05}"));
         match asset {
+            Asset::Raster(raster) => {
+                if let Some(rect) = raster.exact_bounds() {
+                    let path = assets_dir.join(format!("{id:05}_{friendly}.png"));
+                    save_rgba_png(
+                        &path,
+                        rect.width() as u32,
+                        rect.height() as u32,
+                        &raster.compose_straight(rect),
+                    )?;
+                    files += 1;
+                }
+            }
             Asset::Bitmap(bitmap) => {
                 let path = assets_dir.join(format!("{id:05}_{friendly}.png"));
                 save_rgba_png(

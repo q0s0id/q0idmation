@@ -43,6 +43,10 @@ fn asset_weight(asset: &Asset) -> (&'static str, u64) {
         Asset::Q0v(video) => ("video", video.bytes.len() as u64),
         Asset::Rig(_) => ("rig", 256),
         Asset::Model(_) => ("3D model", 4096),
+        Asset::Raster(raster) => (
+            "raster",
+            (raster.tiles.len() * q0s_format::pixels::TILE_BYTES) as u64,
+        ),
     }
 }
 

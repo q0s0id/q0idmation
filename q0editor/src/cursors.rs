@@ -25,6 +25,11 @@ use egui::{
 };
 use serde::{Deserialize, Serialize};
 
+pub mod own;
+pub mod packs;
+mod studio;
+pub use packs::CursorPack;
+
 // ---------------------------------------------------------------------------
 // States
 
@@ -32,6 +37,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CursorKind {
     Arrow,
+    Subselect,
     Link,
     Text,
     Grab,
@@ -60,6 +66,7 @@ pub(crate) enum CursorKind {
     ScreenPick,
     FrameDrag,
     ParentLink,
+    ParentUnlink,
     KnifeCut,
     SelectAdd,
     SelectRemove,
@@ -67,12 +74,19 @@ pub(crate) enum CursorKind {
     Pivot,
     Snap,
     Locked,
+    /// The raster brush: a round paintbrush.
+    RasterBrush,
+    /// The raster eraser: a block of rubber.
+    RasterEraser,
+    /// Smudge: a fingertip.
+    Smudge,
 }
 
 impl CursorKind {
     /// One of each switch in Settings, in the order shown there.
-    pub(crate) const STATES: [Self; 20] = [
+    pub(crate) const STATES: [Self; 24] = [
         Self::Arrow,
+        Self::Subselect,
         Self::Link,
         Self::Text,
         Self::Grab,
@@ -92,16 +106,20 @@ impl CursorKind {
         Self::Knife,
         Self::Lasso,
         Self::Rect,
+        Self::RasterBrush,
+        Self::RasterEraser,
+        Self::Smudge,
     ];
 
     /// Pointers for what a press or drag will do right there, which no
     /// system cursor stands for. Settings lists them on their own.
-    pub(crate) const ACTIONS: [Self; 12] = [
+    pub(crate) const ACTIONS: [Self; 13] = [
         Self::LibraryDrop,
         Self::PenClose,
         Self::ScreenPick,
         Self::FrameDrag,
         Self::ParentLink,
+        Self::ParentUnlink,
         Self::KnifeCut,
         Self::SelectAdd,
         Self::SelectRemove,
@@ -116,6 +134,7 @@ impl CursorKind {
     pub(crate) fn key(self) -> &'static str {
         match self {
             Self::Arrow => "arrow",
+            Self::Subselect => "subselect",
             Self::Link => "link",
             Self::Text => "text",
             Self::Grab => "grab",
@@ -140,6 +159,7 @@ impl CursorKind {
             Self::ScreenPick => "screen_pick",
             Self::FrameDrag => "frame_drag",
             Self::ParentLink => "parent_link",
+            Self::ParentUnlink => "parent_unlink",
             Self::KnifeCut => "knife_cut",
             Self::SelectAdd => "select_add",
             Self::SelectRemove => "select_remove",
@@ -147,12 +167,16 @@ impl CursorKind {
             Self::Pivot => "pivot",
             Self::Snap => "snap",
             Self::Locked => "locked",
+            Self::RasterBrush => "raster_brush",
+            Self::RasterEraser => "raster_eraser",
+            Self::Smudge => "smudge",
         }
     }
 
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Arrow => "Pointer",
+            Self::Subselect => "Subselect",
             Self::Link => "Buttons and links",
             Self::Text => "Text",
             Self::Grab => "Grab",
@@ -177,6 +201,7 @@ impl CursorKind {
             Self::ScreenPick => "Pick from the screen",
             Self::FrameDrag => "Move frames",
             Self::ParentLink => "Link to a parent",
+            Self::ParentUnlink => "Let go of a parent",
             Self::KnifeCut => "Cutting",
             Self::SelectAdd => "Add to the selection",
             Self::SelectRemove => "Take from the selection",
@@ -184,6 +209,9 @@ impl CursorKind {
             Self::Pivot => "Transform anchor",
             Self::Snap => "Snapping",
             Self::Locked => "Locked layer",
+            Self::RasterBrush => "Raster brush",
+            Self::RasterEraser => "Raster eraser",
+            Self::Smudge => "Smudge",
         }
     }
 
@@ -191,6 +219,7 @@ impl CursorKind {
     pub(crate) fn hint(self) -> &'static str {
         match self {
             Self::Arrow => "The idle pointer. Trails a little behind fast moves and springs back; dips when you click.",
+            Self::Subselect => "The Subselect arrow: the pointer turned inside out, with a path point at its heel that pops in, fills when you press and grows a handle that swings as you drag.",
             Self::Link => "Over buttons and links. Wags once on arrival; the finger presses in while the button is down.",
             Self::Text => "In text fields and the Text tool. Unfolds from the middle, then holds still.",
             Self::Grab => "Over things you can pick up, and the Hand tool. The fingers fan open one by one.",
@@ -202,19 +231,20 @@ impl CursorKind {
             Self::ResizeNwSe | Self::ResizeNeSw => "Corner handles and zooming the camera. The corner bracket slides into place.",
             Self::Rotate => "Rotate zones of the transform box, cameras and lights. Draws its arc on arrival and turns as you drag.",
             Self::SkewH | Self::SkewV => "Skew zones on the edges of the transform box. Leans into the shear as you drag.",
-            Self::Scrub => "Dragging a number field. The chevrons run like a belt in the direction you drag.",
+            Self::Scrub => "Dragging a number field. Both sets of chevrons turn the way you drag and run like a belt, the leading side lit.",
             Self::Pen => "The Pen tool. Dips in like a nib into ink and leaves an ink dot when you press.",
             Self::Pencil => "The Pencil tool. Swings into hand and tilts with the stroke.",
             Self::Bucket => "The Paint Bucket. Still until you click; then it pours a drop and splashes.",
             Self::Eyedropper => "The Eyedropper and screen colour picks. Holds the fill colour; a press draws more up the tube.",
             Self::Knife => "The Knife. Still, with a glint along the edge as you cut.",
-            Self::Lasso => "The Lasso. The loop spins once on arrival and its rope runs as you draw.",
+            Self::Lasso => "The Lasso. The loop spins on arrival and turns as it is carried, its rope trails behind, and it cinches while you draw.",
             Self::Line | Self::Rect | Self::Oval => "The Line, Rectangle and Oval tools: a crosshair with a badge of the shape that pops in.",
             Self::LibraryDrop => "Dragging a Library item over the stage or the timeline: letting go places it there. Its card drops in, hangs from the pointer and swings as you move.",
             Self::PenClose => "The Pen over the first point of the path you are drawing: a click closes the shape. A ring draws itself shut around the nib, then pulses once.",
             Self::ScreenPick => "Dragging the Eyedropper, or a colour button off its panel: a loupe holding the colour under it, live. It zooms in and its notches turn as you sweep.",
             Self::FrameDrag => "Dragging selected frames along the timeline: a keyframe diamond with ghosts trailing the way it came.",
             Self::ParentLink => "Dragging a layer's parent square onto another layer: two chain links snap together and swing with the drag.",
+            Self::ParentUnlink => "Dragging a parent square clear of every layer: letting go frees the layer. The links pull apart and a spark jumps the gap.",
             Self::KnifeCut => "The Knife while it cuts: the blade leans back against the cut and leaves a slash behind; sparks fly as it bites.",
             Self::SelectAdd => "Shift over something not yet selected: a click adds it. The plus spins into its badge.",
             Self::SelectRemove => "Shift over something already selected: a click takes it out. The badge drops in and the minus wipes open.",
@@ -222,13 +252,16 @@ impl CursorKind {
             Self::Pivot => "Alt over the transform anchor, and while moving it: a target whose satellite orbits once, and again as you drag.",
             Self::Snap => "Drawing or moving onto something the magnet catches: the point lands on it. The magnet clicks in with a spark.",
             Self::Locked => "A drawing tool over a layer that is locked, hidden or a folder: nothing will be drawn. The shackle drops shut; a click rattles it.",
+            Self::RasterBrush => "The Raster brush. Swings into hand; its hairs bend against the stroke, splay when you press, and flick off a drop when you let go.",
+            Self::RasterEraser => "The Raster eraser. Drops in on its corner, scrubs back and forth as you rub and sheds crumbs.",
+            Self::Smudge => "Smudge. A fingertip that presses flat and drags a smear behind it.",
         }
     }
 
     /// The system cursor that stands in for it when it is switched off.
     pub(crate) fn system(self) -> CursorIcon {
         match self {
-            Self::Arrow => CursorIcon::Default,
+            Self::Arrow | Self::Subselect => CursorIcon::Default,
             Self::Link => CursorIcon::PointingHand,
             Self::Text => CursorIcon::Text,
             Self::Grab => CursorIcon::Grab,
@@ -254,8 +287,13 @@ impl CursorKind {
             | Self::PenClose
             | Self::ScreenPick
             | Self::KnifeCut
-            | Self::Snap => CursorIcon::Crosshair,
-            Self::LibraryDrop | Self::FrameDrag | Self::ParentLink => CursorIcon::Grabbing,
+            | Self::Snap
+            | Self::RasterBrush
+            | Self::RasterEraser
+            | Self::Smudge => CursorIcon::Crosshair,
+            Self::LibraryDrop | Self::FrameDrag | Self::ParentLink | Self::ParentUnlink => {
+                CursorIcon::Grabbing
+            }
             Self::SelectAdd | Self::SelectRemove => CursorIcon::Default,
             Self::CopyDrag => CursorIcon::Copy,
             Self::Pivot => CursorIcon::Move,
@@ -288,16 +326,25 @@ impl CursorKind {
     fn entry_secs(self) -> f32 {
         match self {
             Self::Arrow | Self::Scrub | Self::Bucket | Self::Knife | Self::KnifeCut => 0.0,
-            Self::Text | Self::Crosshair | Self::Line | Self::Rect | Self::Oval => 0.32,
+            Self::Text
+            | Self::Crosshair
+            | Self::Line
+            | Self::Rect
+            | Self::Oval
+            | Self::Subselect => 0.32,
             Self::ResizeNwSe | Self::ResizeNeSw | Self::Grabbing => 0.4,
             Self::Grab | Self::Rotate | Self::SkewH | Self::SkewV | Self::Pen => 0.45,
             Self::Link | Self::Move | Self::Pencil => 0.55,
             Self::ResizeH | Self::ResizeV | Self::Lasso => 0.65,
             Self::Eyedropper => 0.7,
             Self::FrameDrag | Self::ScreenPick | Self::SelectAdd | Self::SelectRemove => 0.36,
-            Self::CopyDrag | Self::Snap | Self::ParentLink | Self::Locked => 0.48,
+            Self::CopyDrag | Self::Snap | Self::ParentLink | Self::ParentUnlink | Self::Locked => {
+                0.48
+            }
             Self::LibraryDrop | Self::Pivot => 0.65,
             Self::PenClose => 0.8,
+            Self::RasterBrush | Self::Smudge => 0.55,
+            Self::RasterEraser => 0.5,
         }
     }
 
@@ -305,6 +352,7 @@ impl CursorKind {
     fn preview_center(self) -> Vec2 {
         match self {
             Self::Arrow => vec2(6.0, 9.5),
+            Self::Subselect => vec2(7.0, 10.0),
             Self::Link => vec2(2.4, 10.4),
             Self::Grab | Self::Grabbing => vec2(0.0, 2.0),
             Self::Pen => vec2(5.4, -6.4),
@@ -317,11 +365,14 @@ impl CursorKind {
             Self::LibraryDrop => vec2(5.4, 10.8),
             Self::PenClose => vec2(4.0, -5.0),
             Self::ScreenPick => vec2(3.2, 3.2),
-            Self::ParentLink => vec2(5.4, -5.4),
+            Self::ParentLink | Self::ParentUnlink => vec2(5.4, -5.4),
             Self::KnifeCut => vec2(5.0, -8.6),
             Self::SelectAdd | Self::SelectRemove | Self::Locked => vec2(6.6, 10.4),
             Self::CopyDrag => vec2(7.6, 10.4),
             Self::Snap => vec2(4.0, -4.0),
+            Self::RasterBrush => vec2(6.0, -8.0),
+            Self::RasterEraser => vec2(6.4, -6.4),
+            Self::Smudge => vec2(5.4, -7.0),
             _ => Vec2::ZERO,
         }
     }
@@ -343,9 +394,18 @@ pub struct CursorSettings {
     /// A number field dragged into the window's edge carries on from the
     /// opposite edge.
     pub wrap_number_drags: bool,
+    /// A pointer that runs into the screen's edge squashes against it and
+    /// springs back.
+    pub squash: bool,
+    /// A fast pointer stretches out along its way.
+    pub stretch: bool,
     /// The states left to the system cursor, by `CursorKind::key`. New
     /// states start drawn.
     pub system: BTreeSet<String>,
+    /// Which look the pointers have.
+    pub pack: CursorPack,
+    /// Pointers drawn in the cursor maker, by `own::key`.
+    pub own: std::collections::BTreeMap<String, own::PixelCursor>,
 }
 
 impl Default for CursorSettings {
@@ -355,7 +415,11 @@ impl Default for CursorSettings {
             animated: true,
             size: 1.0,
             wrap_number_drags: true,
+            squash: true,
+            stretch: true,
             system: BTreeSet::new(),
+            pack: CursorPack::Standard,
+            own: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -484,8 +548,14 @@ struct Motion {
     travel: f32,
     /// Sideways distance moved with the button down, signed.
     sweep: f32,
+    /// Distance moved at all, button down or not.
+    drift: f32,
     /// The colour an eyedropper holds.
     sample: Option<Color32>,
+    /// Seconds on a clock that keeps going: blinks and idle loops.
+    now: f32,
+    /// Since the pointer last moved.
+    still: f32,
 }
 
 impl Motion {
@@ -497,7 +567,10 @@ impl Motion {
         lean: Vec2::ZERO,
         travel: 0.0,
         sweep: 0.0,
+        drift: 0.0,
         sample: None,
+        now: 0.0,
+        still: 100.0,
     };
 
     /// 0 at rest, 1 while the button is down; after release it springs back
@@ -530,7 +603,11 @@ impl Motion {
             lean: vec2(sway, sway * 0.25),
             travel: seconds * 80.0,
             sweep: (seconds * 1.4).sin() * 120.0,
+            drift: seconds * 60.0,
             sample: None,
+            now: seconds,
+            // Previews nod off now and then, so naps can be seen too.
+            still: (seconds % 16.0 - 4.0).max(0.0),
         }
     }
 }
@@ -680,8 +757,28 @@ impl Canvas {
         self.origin + self.xf.apply(p) * self.scale
     }
 
+    /// `points` on the screen, less any that sit on the one before: two
+    /// points (nearly) in one place give a stroked outline a corner with no
+    /// direction, and egui draws that as a long spike.
     fn map(&self, points: &[Vec2]) -> Vec<Pos2> {
-        points.iter().map(|&p| self.at(p)).collect()
+        let mut mapped: Vec<Pos2> = Vec::with_capacity(points.len());
+        for &point in points {
+            let at = self.at(point);
+            if mapped.last().is_none_or(|last| last.distance(at) > 0.05) {
+                mapped.push(at);
+            }
+        }
+        mapped
+    }
+
+    /// `points` on the screen as a closed outline: also without a last point
+    /// that only comes back to the first.
+    fn map_closed(&self, points: &[Vec2]) -> Vec<Pos2> {
+        let mut mapped = self.map(points);
+        if mapped.len() > 2 && mapped[0].distance(mapped[mapped.len() - 1]) <= 0.05 {
+            mapped.pop();
+        }
+        mapped
     }
 
     fn ink(&self, color: Color32) -> Color32 {
@@ -702,7 +799,7 @@ impl Canvas {
 
     /// A filled shape with an outline. It may be concave.
     fn body(&mut self, points: &[Vec2], fill: Color32) {
-        let points = self.map(points);
+        let points = self.map_closed(points);
         let fill = self.ink(fill);
         let outline = Stroke::new(self.line, self.ink(self.pal.outline));
         fill_polygon(&mut self.shapes, &points, fill);
@@ -712,7 +809,7 @@ impl Canvas {
     /// A filled shape without an outline, for things inside a body.
     fn flat(&mut self, points: &[Vec2], fill: Color32) {
         if !self.shadow {
-            let points = self.map(points);
+            let points = self.map_closed(points);
             fill_polygon(&mut self.shapes, &points, fill);
         }
     }
@@ -747,6 +844,46 @@ impl Canvas {
                 self.shapes
                     .push(Shape::circle_filled(end, width * 0.5, color));
             }
+        }
+    }
+
+    /// Lines that fade as a whole, by their colour's alpha, keeping a black
+    /// outline. The outline is a ring round each line's edge, nothing of it
+    /// under the line: an outline drawn under a see-through line showed
+    /// through and turned it dark. The line itself is one piece, round ends
+    /// included: separate round ends sat over it, two layers of a
+    /// see-through colour, and showed as bright dots.
+    fn fading_lines(&mut self, lines: &[(&[Vec2], f32, Color32)]) {
+        let mapped: Vec<(Vec<Pos2>, f32, Color32)> = lines
+            .iter()
+            .filter(|(points, _, color)| points.len() >= 2 && color.a() > 0)
+            .map(|(points, width, color)| (self.map(points), width * self.scale, *color))
+            .filter(|(points, _, _)| points.len() >= 2)
+            .collect();
+        let outline = self.ink(self.pal.outline);
+        for (points, width, color) in &mapped {
+            // The outline stays darker for longer than the line fades.
+            let strength = (f32::from(color.a()) / 255.0).sqrt();
+            let half = width * 0.5;
+            if self.shadow {
+                self.shapes.push(Shape::mesh(ribbon_mesh(
+                    points,
+                    half + self.line,
+                    outline.gamma_multiply(strength),
+                )));
+            } else {
+                self.shapes.push(Shape::closed_line(
+                    ribbon_outline(points, half + self.line * 0.5),
+                    Stroke::new(self.line, outline.gamma_multiply(strength)),
+                ));
+            }
+        }
+        if self.shadow {
+            return;
+        }
+        for (points, width, color) in mapped {
+            self.shapes
+                .push(Shape::mesh(ribbon_mesh(&points, width * 0.5, color)));
         }
     }
 
@@ -798,6 +935,107 @@ impl Canvas {
     }
 }
 
+/// The two edges of a stroke `half` wide each side along `points`: left
+/// and right of the way it runs, sharp joints mitred.
+fn ribbon_sides(points: &[Pos2], half: f32) -> (Vec<Pos2>, Vec<Pos2>) {
+    let count = points.len();
+    let normal = |a: Pos2, b: Pos2| {
+        let d = (b - a).normalized();
+        vec2(-d.y, d.x)
+    };
+    let mut left = Vec::with_capacity(count);
+    let mut right = Vec::with_capacity(count);
+    for index in 0..count {
+        let offset = if index == 0 {
+            normal(points[0], points[1]) * half
+        } else if index == count - 1 {
+            normal(points[count - 2], points[count - 1]) * half
+        } else {
+            let a = normal(points[index - 1], points[index]);
+            let b = normal(points[index], points[index + 1]);
+            let mitre = (a + b).normalized();
+            mitre * (half / mitre.dot(a).max(0.3))
+        };
+        left.push(points[index] + offset);
+        right.push(points[index] - offset);
+    }
+    (left, right)
+}
+
+/// Half a circle round the end `at` of a stroke `half` wide running along
+/// `way`, from its left edge round to its right.
+fn ribbon_cap(at: Pos2, way: Vec2, half: f32) -> Vec<Pos2> {
+    let side = vec2(-way.y, way.x);
+    (1..8)
+        .map(|step| {
+            let angle = std::f32::consts::PI * step as f32 / 8.0;
+            at + side * half * angle.cos() + way * half * angle.sin()
+        })
+        .collect()
+}
+
+/// The outline of a stroke along `points`, round at both ends.
+fn ribbon_outline(points: &[Pos2], half: f32) -> Vec<Pos2> {
+    let (left, right) = ribbon_sides(points, half);
+    let count = points.len();
+    let end_way = (points[count - 1] - points[count - 2]).normalized();
+    let start_way = (points[0] - points[1]).normalized();
+    let mut outline = left;
+    outline.extend(ribbon_cap(points[count - 1], end_way, half));
+    outline.extend(right.into_iter().rev());
+    outline.extend(ribbon_cap(points[0], start_way, half));
+    outline
+}
+
+/// A stroke along `points` as one mesh, round ends included, so a
+/// see-through colour covers every spot of it once.
+fn ribbon_mesh(points: &[Pos2], half: f32, color: Color32) -> Mesh {
+    let (left, right) = ribbon_sides(points, half);
+    let count = points.len();
+    let mut mesh = Mesh::default();
+    for (l, r) in left.iter().zip(&right) {
+        mesh.colored_vertex(*l, color);
+        mesh.colored_vertex(*r, color);
+    }
+    for index in 0..count as u32 - 1 {
+        let a = index * 2;
+        mesh.add_triangle(a, a + 1, a + 2);
+        mesh.add_triangle(a + 1, a + 3, a + 2);
+    }
+    // Each end: a fan from its middle over the half circle, between the
+    // edge points the strip already has.
+    let ends = [
+        (
+            count - 1,
+            (points[count - 1] - points[count - 2]).normalized(),
+        ),
+        (0, (points[0] - points[1]).normalized()),
+    ];
+    for (end, way) in ends {
+        let (from, to) = if end == 0 {
+            // At the start the half circle runs from the right edge round
+            // to the left one.
+            (right[0], left[0])
+        } else {
+            (left[end], right[end])
+        };
+        let middle = mesh.vertices.len() as u32;
+        mesh.colored_vertex(points[end], color);
+        let mut previous = mesh.vertices.len() as u32;
+        mesh.colored_vertex(from, color);
+        for at in ribbon_cap(points[end], way, half) {
+            let next = mesh.vertices.len() as u32;
+            mesh.colored_vertex(at, color);
+            mesh.add_triangle(middle, previous, next);
+            previous = next;
+        }
+        let last = mesh.vertices.len() as u32;
+        mesh.colored_vertex(to, color);
+        mesh.add_triangle(middle, previous, last);
+    }
+    mesh
+}
+
 fn fill_polygon(shapes: &mut Vec<Shape>, points: &[Pos2], color: Color32) {
     if points.len() < 3 || color.a() == 0 {
         return;
@@ -819,6 +1057,13 @@ fn triangulate(points: &[Pos2]) -> Vec<[u32; 3]> {
     if n < 3 {
         return Vec::new();
     }
+    // Worked out about the shape's own first corner: in screen coordinates
+    // the turns of a cursor's tiny corners came out near zero with rounding
+    // that changed with where the pointer was, an ear was missed, and the
+    // fan the rest fell back to poked out of the shape as a spike.
+    let origin = points[0].to_vec2();
+    let local: Vec<Pos2> = points.iter().map(|point| *point - origin).collect();
+    let points = &local[..];
     let twice_area: f32 = (0..n)
         .map(|i| {
             let (p, q) = (points[i], points[(i + 1) % n]);
@@ -837,9 +1082,13 @@ fn triangulate(points: &[Pos2]) -> Vec<[u32; 3]> {
             let (a, b, c) = (points[ia], points[ib], points[ic]);
             turn(a, b, c) > 1.0e-6
                 && !left.iter().any(|&j| {
+                    let p = points[j];
+                    // A corner in the same place as one of the ear's own
+                    // does not block it.
                     j != ia
                         && j != ib
                         && j != ic
+                        && [a, b, c].iter().all(|q| q.distance(p) > 1.0e-4)
                         && turn(a, b, points[j]) >= 0.0
                         && turn(b, c, points[j]) >= 0.0
                         && turn(c, a, points[j]) >= 0.0
@@ -879,28 +1128,79 @@ fn head(tip: Vec2, direction: Vec2, length: f32, half_width: f32) -> [Vec2; 3] {
     [tip, base + n * half_width, base - n * half_width]
 }
 
-/// Paint `kind` with its hotspot at `at`.
+/// Paint `kind` with its hotspot at `at`, at `scale` and bent by `deform`.
+/// Draws `kind` in the chosen pack's look.
 fn paint(
+    shapes: &mut Vec<Shape>,
+    prefs: &CursorSettings,
+    kind: CursorKind,
+    at: Pos2,
+    (scale, deform): (f32, Xf),
+    pal: Palette,
+    m: &Motion,
+) {
+    match prefs.pack {
+        CursorPack::Standard => {}
+        CursorPack::Studio => return studio::paint(shapes, kind, at, scale, pal, m),
+        CursorPack::Retro => return packs::retro(shapes, kind, at, scale, pal, m),
+        CursorPack::Critters => {
+            return packs::critters(shapes, kind, at, (scale, deform), pal, m);
+        }
+        CursorPack::Own => {
+            if let Some(cursor) = prefs.own.get(&own::key(kind)).filter(|c| c.is_valid()) {
+                return own::paint(shapes, cursor, at, scale);
+            }
+        }
+    }
+    paint_standard(shapes, kind, at, (scale, deform), pal, m);
+}
+
+fn paint_standard(
     shapes: &mut Vec<Shape>,
     kind: CursorKind,
     at: Pos2,
-    scale: f32,
+    (scale, deform): (f32, Xf),
     pal: Palette,
     m: &Motion,
 ) {
     if pal.shadow.a() > 0 {
         let mut shadow = Canvas::new(at + vec2(0.5, 1.4) * scale, scale, pal, true);
+        shadow.xf = deform;
         draw(&mut shadow, kind, m);
         shapes.extend(shadow.shapes);
     }
     let mut canvas = Canvas::new(at, scale, pal, false);
+    canvas.xf = deform;
     draw(&mut canvas, kind, m);
     shapes.extend(canvas.shapes);
+}
+
+/// The outward direction of the screen edge `at` is pressed against, if
+/// it is against one.
+fn edge_normal(at: Pos2, screen: egui::Rect) -> Option<Vec2> {
+    const NEAR: f32 = 1.5;
+    let x = if at.x <= screen.left() + NEAR {
+        -1.0
+    } else if at.x >= screen.right() - NEAR {
+        1.0
+    } else {
+        0.0
+    };
+    let y = if at.y <= screen.top() + NEAR {
+        -1.0
+    } else if at.y >= screen.bottom() - NEAR {
+        1.0
+    } else {
+        0.0
+    };
+    let normal = vec2(x, y);
+    (normal != Vec2::ZERO).then(|| normal.normalized())
 }
 
 fn draw(c: &mut Canvas, kind: CursorKind, m: &Motion) {
     match kind {
         CursorKind::Arrow => arrow(c, m),
+        CursorKind::Subselect => subselect(c, m),
         CursorKind::Link => link(c, m),
         CursorKind::Text => text(c, m),
         CursorKind::Grab => grab(c, m),
@@ -927,6 +1227,7 @@ fn draw(c: &mut Canvas, kind: CursorKind, m: &Motion) {
         CursorKind::ScreenPick => screen_pick(c, m),
         CursorKind::FrameDrag => frame_drag(c, m),
         CursorKind::ParentLink => parent_link(c, m),
+        CursorKind::ParentUnlink => parent_unlink(c, m),
         CursorKind::KnifeCut => knife_cut(c, m),
         CursorKind::SelectAdd => select_add(c, m),
         CursorKind::SelectRemove => select_remove(c, m),
@@ -934,6 +1235,9 @@ fn draw(c: &mut Canvas, kind: CursorKind, m: &Motion) {
         CursorKind::Pivot => pivot(c, m),
         CursorKind::Snap => snap(c, m),
         CursorKind::Locked => locked(c, m),
+        CursorKind::RasterBrush => raster_brush(c, m),
+        CursorKind::RasterEraser => raster_eraser(c, m),
+        CursorKind::Smudge => smudge(c, m),
     }
 }
 
@@ -963,15 +1267,101 @@ fn arrow(c: &mut Canvas, m: &Motion) {
             c.pal.accent.gamma_multiply(0.85),
         );
     });
-    let t = m.pressed / 0.45;
-    if t < 1.0 {
-        let color = c.pal.accent.gamma_multiply(1.0 - t);
-        c.ripple(
-            Vec2::ZERO,
-            2.0 + 11.0 * ease_out(t),
-            1.6 * (1.0 - t) + 0.4,
-            color,
-        );
+}
+
+/// A click's ring, left where it happened: it spreads and fades on its own
+/// whatever the pointer does next, and another click adds another ring.
+#[derive(Clone, Copy, Debug)]
+struct Ripple {
+    at: Pos2,
+    since: f64,
+    /// A right click: a broken ring that turns as it spreads, round a dot.
+    context: bool,
+}
+
+/// How long a click's ring lasts.
+const RIPPLE_SECS: f32 = 0.45;
+
+/// The pointers whose clicks leave a ring.
+fn ripples_on(kind: CursorKind) -> bool {
+    matches!(kind, CursorKind::Arrow | CursorKind::Subselect)
+}
+
+fn paint_ripple(shapes: &mut Vec<Shape>, ripple: Ripple, age: f32, scale: f32, pal: Palette) {
+    let t = (age / RIPPLE_SECS).clamp(0.0, 1.0);
+    let fade = 1.0 - t;
+    let grow = ease_out(t);
+    let accent = pal.accent;
+    if ripple.context {
+        let radius = (3.0 + 10.0 * grow) * scale;
+        let width = (1.8 * fade + 0.5) * scale;
+        let color = accent.gamma_multiply(fade);
+        let turn = 0.9 * grow;
+        for quarter in 0..4 {
+            let from = turn + quarter as f32 * FRAC_PI_2 + 0.3;
+            let to = from + FRAC_PI_2 - 0.6;
+            let points = (0..=8)
+                .map(|i| {
+                    let a = from + (to - from) * i as f32 / 8.0;
+                    ripple.at + vec2(a.cos(), a.sin()) * radius
+                })
+                .collect::<Vec<_>>();
+            shapes.push(Shape::line(points, Stroke::new(width, color)));
+        }
+        let dot = (1.0 - t * 2.0).max(0.0) * 2.2 * scale;
+        if dot > 0.05 {
+            shapes.push(Shape::circle_filled(ripple.at, dot, color));
+        }
+    } else {
+        let radius = (2.0 + 11.0 * grow) * scale;
+        let width = (1.6 * fade + 0.4) * scale;
+        shapes.push(Shape::circle_filled(
+            ripple.at,
+            radius,
+            accent.gamma_multiply(0.14 * fade * fade),
+        ));
+        shapes.push(Shape::circle_stroke(
+            ripple.at,
+            radius,
+            Stroke::new(width, accent.gamma_multiply(fade)),
+        ));
+    }
+}
+
+/// The Subselect arrow: the pointer turned inside out, dark with a light
+/// rim, and a path point at its heel. The point pops in on arrival, fills
+/// when you press, and grows a handle that swings as you drag.
+fn subselect(c: &mut Canvas, m: &Motion) {
+    let trail = (m.lean.x * 0.00042).clamp(-0.2, 0.2);
+    let press = m.press();
+    let squash = 1.0 - 0.08 * press;
+    let (fill, dark, accent) = (c.pal.fill, c.pal.outline, c.pal.accent);
+    c.with(Xf::scale(squash, squash).then(Xf::rotate(trail)), |c| {
+        c.body(&ARROW, dark);
+        let mut rim = ARROW.to_vec();
+        rim.push(ARROW[0]);
+        c.line(&rim, 0.9, fill);
+    });
+    let pop = ease_back(m.enter / 0.32);
+    let node = v(13.2, 17.6);
+    if press > 0.05 {
+        let swing = (m.lean.x * 0.0016).clamp(-0.9, 0.9);
+        let along = Xf::rotate(swing - 0.5).apply(v(1.0, 0.0));
+        let reach = 5.2 * press.min(1.0);
+        let (a, b) = (node - along * reach, node + along * reach);
+        c.line(&[a, b], 0.8, accent);
+        c.dot(a, 1.2 * press.min(1.0), accent);
+        c.dot(b, 1.2 * press.min(1.0), accent);
+    }
+    let half = 1.9 * pop.max(0.0) * (1.0 + 0.25 * press);
+    if half > 0.1 {
+        let square = [
+            node + v(-half, -half),
+            node + v(half, -half),
+            node + v(half, half),
+            node + v(-half, half),
+        ];
+        c.body(&square, mix(fill, accent, press.clamp(0.0, 1.0)));
     }
 }
 
@@ -1284,34 +1674,55 @@ fn skew(c: &mut Canvas, m: &Motion, angle: f32) {
 /// A value pill between chevrons. While dragging the chevrons run outward
 /// like a belt, and the pill leans the way you drag.
 fn scrub(c: &mut Canvas, m: &Motion) {
-    let flow = if m.held {
-        (m.sweep.abs() * 0.07).rem_euclid(1.0)
+    // Which way the number is dragged, from the spring that follows the
+    // pointer: -1 left, 1 right, 0 at rest. It eases, so the chevrons turn
+    // rather than flip.
+    let way = if m.held {
+        (m.lean.x * 0.006).clamp(-1.0, 1.0)
     } else {
         0.0
     };
-    let lean = if m.held {
-        (m.lean.x * 0.0025).clamp(-1.3, 1.3)
-    } else {
-        0.0
-    };
-    let fill = c.pal.fill;
-    let chevrons: Vec<[Vec2; 3]> = [-1.0_f32, 1.0]
+    let toward = way.signum() * ease_out(way.abs());
+    // The belt runs with the drag, on both sides at once.
+    let phase = (m.sweep * 0.055).rem_euclid(1.0);
+    let lean = (m.lean.x * 0.0025).clamp(-1.3, 1.3) * f32::from(u8::from(m.held));
+    let (fill, accent) = (c.pal.fill, c.pal.accent);
+    const LANE: f32 = 6.4;
+    const COUNT: usize = 3;
+    let mut chevrons: Vec<([Vec2; 3], f32, Color32)> = Vec::new();
+    for side in [-1.0_f32, 1.0] {
+        // At rest each side points out; dragging, both point the way the
+        // number goes.
+        let point = side + (toward.signum() - side) * toward.abs();
+        // The side the number runs toward stands out: bolder and clearer.
+        let lead = (side * toward).max(0.0);
+        for i in 0..COUNT {
+            let p = (i as f32 + phase) / COUNT as f32 % 1.0;
+            // Moving right, the right lane flows out and the left lane in.
+            let along = if side > 0.0 { p } else { 1.0 - p };
+            let x = side * (3.6 + LANE * along);
+            // Each fades in where it enters its lane and out where it
+            // leaves, so the loop never shows a jump.
+            let seen = (PI * p).sin().powf(0.8);
+            let color = fill.gamma_multiply(seen * (0.55 + 0.45 * lead));
+            let tip = 1.8 * point;
+            chevrons.push((
+                [v(x - tip, -2.8), v(x, 0.0), v(x - tip, 2.8)],
+                1.35 + 0.25 * lead,
+                color,
+            ));
+        }
+    }
+    let lines: Vec<(&[Vec2], f32, Color32)> = chevrons
         .iter()
-        .flat_map(|&side| {
-            (0..2).map(move |i| {
-                let x = side * (4.6 + 2.9 * ((i as f32 + flow) % 2.0));
-                [v(x - side * 1.8, -2.8), v(x, 0.0), v(x - side * 1.8, 2.8)]
-            })
-        })
+        .map(|(ch, width, color)| (&ch[..], *width, *color))
         .collect();
-    let lines: Vec<(&[Vec2], f32, Color32)> =
-        chevrons.iter().map(|ch| (&ch[..], 1.35, fill)).collect();
-    c.lines(&lines);
+    c.fading_lines(&lines);
     let pill = arc(v(lean, -2.9), 1.7, 1.7, PI, TAU, 6)
         .into_iter()
         .chain(arc(v(lean, 2.9), 1.7, 1.7, 0.0, PI, 6))
         .collect::<Vec<_>>();
-    c.body(&pill, c.pal.accent);
+    c.body(&pill, accent);
 }
 
 /// The Pen: dips in like a nib into ink, overshooting a touch, and leaves an
@@ -1554,14 +1965,26 @@ fn knife_body(c: &mut Canvas, angle: f32, glint: f32) {
     });
 }
 
-/// The Lasso: the loop spins once on arrival, and its dashes run along
-/// while you draw.
+/// The Lasso: the loop spins once on arrival and turns as it is carried
+/// about, its rope trails behind the motion, and while you draw it cinches
+/// and its dashes run along.
 fn lasso(c: &mut Canvas, m: &Motion) {
     const DASHES: usize = 9;
-    let spin = ease_out(m.enter / 0.6) * DASHES as f32 + if m.held { m.travel * 0.05 } else { 0.0 };
+    // The loop turns once on arrival, then as it is carried about, and its
+    // dashes run faster while a selection is being drawn.
+    let spin = ease_out(m.enter / 0.6) * DASHES as f32
+        + m.drift * 0.03
+        + if m.held { m.travel * 0.05 } else { 0.0 };
+    // It cinches a little while the button is down and springs open after.
+    let cinch = 1.0 - 0.14 * m.press();
+    // The rope trails behind the way the pointer moves.
+    let trail = vec2(
+        (-m.lean.x * 0.004).clamp(-2.6, 2.6),
+        (-m.lean.y * 0.004).clamp(-2.6, 2.6),
+    );
     let center = v(6.4, -7.0);
-    let tilt = Xf::rotate(-0.35);
-    let on_loop = |a: f32| center + tilt.apply(vec2(a.cos() * 5.8, a.sin() * 3.7));
+    let tilt = Xf::rotate(-0.35 + (m.lean.x * 0.0006).clamp(-0.3, 0.3));
+    let on_loop = |a: f32| center + tilt.apply(vec2(a.cos() * 5.8, a.sin() * 3.7) * cinch);
     let step = TAU / DASHES as f32;
     let dashes: Vec<Vec<Vec2>> = (0..DASHES)
         .map(|i| {
@@ -1575,7 +1998,7 @@ fn lasso(c: &mut Canvas, m: &Motion) {
     let rope: Vec<Vec2> = (0..=8)
         .map(|k| {
             let t = k as f32 / 8.0;
-            let bend = v(1.2, -2.2);
+            let bend = v(1.2, -2.2) + trail;
             start * (1.0 - t) * (1.0 - t) + bend * 2.0 * t * (1.0 - t)
         })
         .collect();
@@ -1783,6 +2206,38 @@ fn parent_link(c: &mut Canvas, m: &Motion) {
     c.dot(Vec2::ZERO, 1.2, accent);
 }
 
+/// A parent square dragged clear of every layer: the two links pull apart
+/// along their chain, and a spark jumps the gap now and then.
+fn parent_unlink(c: &mut Canvas, m: &Motion) {
+    let apart = ease_back(m.enter / 0.34);
+    let swing = (m.lean.x * 0.0009).clamp(-0.45, 0.45);
+    let fill = c.pal.fill;
+    let accent = c.pal.accent;
+    let along = v(1.0, -1.0) * std::f32::consts::FRAC_1_SQRT_2;
+    let gap = 2.6 * apart;
+    c.with(Xf::rotate(swing), |c| {
+        let near = ellipse(v(3.4, -3.4) - along * gap * 0.4, 3.6, 2.1, -FRAC_PI_4);
+        let far = ellipse(v(7.9, -7.9) + along * gap, 3.6, 2.1, -FRAC_PI_4);
+        c.lines(&[(&near[..], 1.5, fill), (&far[..], 1.5, accent)]);
+        // A spark in the gap, twice a second.
+        let beat = (m.enter * 2.0).fract();
+        if apart > 0.6 && beat < 0.35 {
+            let t = beat / 0.35;
+            let mid = v(5.7, -5.7) + along * gap * 0.3;
+            let side = v(1.0, 1.0) * std::f32::consts::FRAC_1_SQRT_2;
+            for (k, sign) in [(0.0_f32, 1.0_f32), (0.5, -1.0)] {
+                let reach = 1.0 + 2.4 * ease_out(t);
+                c.spot(
+                    mid + side * sign * reach + along * (k - 0.25),
+                    0.7 * (1.0 - t) + 0.2,
+                    accent,
+                );
+            }
+        }
+    });
+    c.dot(Vec2::ZERO, 1.2, accent);
+}
+
 /// The Knife mid-cut: the blade leans back against the way it cuts and
 /// leaves a slash behind; sparks fly as it bites.
 fn knife_cut(c: &mut Canvas, m: &Motion) {
@@ -1930,6 +2385,163 @@ fn locked(c: &mut Canvas, m: &Motion) {
     });
 }
 
+/// A round paintbrush, tip on the hotspot. It swings into hand; while you
+/// paint, the hairs bend back against the way you go and the handle leans
+/// with it; a press splays the tuft, and letting go flicks a drop off.
+fn raster_brush(c: &mut Canvas, m: &Motion) {
+    let swing = 0.6 * (1.0 - ease_back(m.enter / 0.5));
+    let press = m.press().max(0.0);
+    let (bend, lean) = if m.held {
+        (
+            (m.lean.x * 0.0011).clamp(-0.55, 0.55),
+            (m.lean.x * 0.0003).clamp(-0.18, 0.18),
+        )
+    } else {
+        (wobble(m.release, 30.0, 8.0) * 0.25, 0.0)
+    };
+    let fill = c.pal.fill;
+    let accent = c.pal.accent;
+    let outline = c.pal.outline;
+    let splay = 1.0 + 0.45 * press;
+    c.with(Xf::rotate(0.66 + swing + lean), |c| {
+        // Handle: long, tapering to its end.
+        c.body(
+            &[
+                v(-1.5, -9.6),
+                v(1.5, -9.6),
+                v(1.0, -21.4),
+                v(0.0, -22.4),
+                v(-1.0, -21.4),
+            ],
+            accent,
+        );
+        c.hairline(&[v(0.5, -10.2), v(0.3, -20.6)], 0.8, mix(accent, fill, 0.5));
+        // Ferrule.
+        c.body(
+            &[v(-1.9, -6.6), v(1.9, -6.6), v(1.7, -9.8), v(-1.7, -9.8)],
+            fill,
+        );
+        c.hairline(
+            &[v(-1.8, -7.8), v(1.8, -7.8)],
+            0.7,
+            mix(fill, outline, 0.35),
+        );
+        // The tuft bends from the ferrule down to the tip.
+        let tip = v(-bend * 5.0, 0.0);
+        let side = |s: f32| {
+            let mid = v(s * 2.3 * splay - bend * 2.0, -3.4 + press * 0.8);
+            [v(s * 1.8, -6.7), mid, lerp(mid, tip, 0.65)]
+        };
+        let left = side(-1.0);
+        let right = side(1.0);
+        let mut tuft = vec![left[0], left[1], left[2], tip];
+        tuft.extend([right[2], right[1], right[0]]);
+        c.body(&tuft, mix(outline, accent, 0.25));
+        c.hairline(
+            &[v(0.0, -6.4), lerp(v(-bend * 1.5, -3.0), tip, 0.4)],
+            0.6,
+            mix(outline, fill, 0.35),
+        );
+    });
+    // Letting go flicks a drop off the tip.
+    let flick = m.release / 0.45;
+    if m.pressed < 100.0 && !m.held && (0.0..1.0).contains(&flick) {
+        let at = v(-3.0 * flick, 2.0 + 7.0 * flick * flick);
+        c.spot(at, 1.2 * (1.0 - flick * 0.7), accent);
+    }
+}
+
+/// A block of rubber in a paper sleeve, rubbing corner down. It drops in,
+/// scrubs side to side as you rub and sheds crumbs behind.
+fn raster_eraser(c: &mut Canvas, m: &Motion) {
+    let drop = (1.0 - ease_back(m.enter / 0.42)) * -6.0;
+    let press = m.press().max(0.0);
+    let scrub = if m.held {
+        (m.travel * 0.12).sin() * 0.16
+    } else {
+        wobble(m.release, 26.0, 9.0) * 0.12
+    };
+    let fill = c.pal.fill;
+    let accent = c.pal.accent;
+    let outline = c.pal.outline;
+    let squash = 1.0 - 0.12 * press;
+    c.with(
+        Xf::scale(1.0, squash)
+            .then(Xf::rotate(0.75 + scrub))
+            .then(Xf::translate(v(0.0, drop))),
+        |c| {
+            // Rubber end, on the hotspot.
+            c.body(
+                &[v(-3.4, -0.4), v(3.4, -0.4), v(3.4, -7.2), v(-3.4, -7.2)],
+                mix(accent, fill, 0.35),
+            );
+            c.hairline(&[v(-2.6, -1.4), v(2.6, -1.4)], 0.7, mix(accent, fill, 0.7));
+            // Sleeve.
+            c.body(
+                &[v(-3.6, -7.0), v(3.6, -7.0), v(3.6, -17.4), v(-3.6, -17.4)],
+                fill,
+            );
+            c.hairline(
+                &[v(-3.4, -12.2), v(3.4, -12.2)],
+                0.8,
+                mix(fill, outline, 0.3),
+            );
+            c.hairline(&[v(1.6, -7.6), v(1.6, -16.8)], 0.7, mix(fill, accent, 0.25));
+        },
+    );
+    // Crumbs fly off while rubbing.
+    if m.held && m.travel > 2.0 {
+        for i in 0..3 {
+            let phase = (m.travel * 0.045 + i as f32 * 0.33).rem_euclid(1.0);
+            let side = if i % 2 == 0 { -1.0 } else { 1.0 };
+            let at = v(
+                side * (2.0 + 5.0 * phase),
+                1.0 + 4.0 * phase - 6.0 * phase * phase,
+            );
+            c.spot(at, 0.75 * (1.0 - phase), mix(accent, outline, 0.3));
+        }
+    }
+}
+
+/// A fingertip pointing at the hotspot, nail up. A press flattens it; while
+/// it drags, a smear streams out behind.
+fn smudge(c: &mut Canvas, m: &Motion) {
+    let swing = 0.5 * (1.0 - ease_back(m.enter / 0.5));
+    let press = m.press().max(0.0);
+    let fill = c.pal.fill;
+    let accent = c.pal.accent;
+    let outline = c.pal.outline;
+    // The smear runs opposite to the way the finger moves.
+    if m.held && m.lean.length() > 20.0 {
+        let back = -m.lean.normalized();
+        let reach = (m.lean.length() * 0.012).clamp(2.0, 9.0);
+        let smear = [Vec2::ZERO, back * reach * 0.5, back * reach];
+        c.fading_lines(&[(&smear, 3.2, accent.gamma_multiply(0.55))]);
+    }
+    let flat = 1.0 + 0.3 * press;
+    c.with(
+        Xf::scale(flat, 1.0 / flat).then(Xf::rotate(0.7 + swing)),
+        |c| {
+            // The finger: straight sides, a round end on the hotspot.
+            let mut body = vec![v(2.8, -15.6), v(2.8, -2.6)];
+            body.extend(arc(v(0.0, -2.6), 2.8, 2.6, 0.0, PI, 12));
+            body.push(v(-2.8, -15.6));
+            c.body(&body, fill);
+            // Nail.
+            c.body(
+                &[v(-1.6, -3.4), v(1.6, -3.4), v(1.4, -7.0), v(-1.4, -7.0)],
+                mix(fill, accent, 0.25),
+            );
+            // Knuckle crease.
+            c.hairline(
+                &[v(-2.2, -11.0), v(2.2, -11.4)],
+                0.7,
+                mix(fill, outline, 0.4),
+            );
+        },
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Each frame
 
@@ -1947,9 +2559,22 @@ pub(crate) struct CursorRuntime {
     lean_speed: Vec2,
     travel: f32,
     sweep: f32,
+    drift: f32,
+    /// The pointer shown before this one and when it changed, so the two
+    /// cross-fade instead of swapping.
+    previous: Option<(CursorKind, f64)>,
+    /// The last time the pointer ran into the screen's edge: the edge's
+    /// outward direction, how hard, and when.
+    impact: Option<(Vec2, f32, f64)>,
+    /// The pointer is against an edge now; it hits again only after leaving.
+    at_edge: bool,
+    /// Clicks still spreading where they happened.
+    ripples: Vec<Ripple>,
     wrap: Wrap,
     /// The end-of-frame hook that keeps the system cursor hidden is in.
     hooked: bool,
+    /// When the pointer last moved.
+    moved_at: f64,
 }
 
 impl Default for CursorRuntime {
@@ -1966,8 +2591,14 @@ impl Default for CursorRuntime {
             lean_speed: Vec2::ZERO,
             travel: 0.0,
             sweep: 0.0,
+            drift: 0.0,
+            previous: None,
+            impact: None,
+            at_edge: false,
+            ripples: Vec::new(),
             wrap: Wrap::default(),
             hooked: false,
+            moved_at: 0.0,
         }
     }
 }
@@ -2056,10 +2687,12 @@ impl CursorRuntime {
         let kind = kind.filter(|&kind| prefs.shows(kind) && !crate::touch::ENABLED);
         let (Some(kind), Some(at)) = (kind, real) else {
             self.shown = None;
+            self.previous = None;
             self.last = None;
             return;
         };
         if self.shown != Some(kind) {
+            self.previous = self.shown.map(|old| (old, now));
             self.shown = Some(kind);
             self.shown_since = now;
         }
@@ -2067,6 +2700,27 @@ impl CursorRuntime {
         // through a wrap.
         let seen = hover.unwrap_or(at);
         self.follow(seen, now);
+        // Running into the screen's edge: the system cursor stops dead there.
+        // A wrapping number drag jumps away from it instead.
+        match edge_normal(at, ctx.screen_rect()).filter(|_| !scrubbing) {
+            Some(normal) if !self.at_edge => {
+                self.at_edge = true;
+                let toward = self.velocity.dot(normal);
+                if toward > 450.0 {
+                    let strength = ((toward - 450.0) / 2600.0).clamp(0.1, 0.3);
+                    self.impact = Some((normal, strength, now));
+                }
+            }
+            Some(_) => {}
+            None => self.at_edge = false,
+        }
+        packs::set_pixels_per_point(ctx.pixels_per_point());
+        let deform = if prefs.pack.bends() {
+            self.deform(prefs, kind, now)
+        } else {
+            self.impact = None;
+            Xf::ID
+        };
 
         let motion = if prefs.animated {
             Motion {
@@ -2081,7 +2735,10 @@ impl CursorRuntime {
                 lean: self.lean,
                 travel: self.travel,
                 sweep: self.sweep,
+                drift: self.drift,
                 sample: request.and_then(|r| r.sample),
+                now: (now % 100_000.0) as f32,
+                still: ((now - self.moved_at) as f32).min(100.0),
             }
         } else {
             Motion {
@@ -2093,18 +2750,82 @@ impl CursorRuntime {
         ctx.set_cursor_icon(CursorIcon::None);
         ctx.data_mut(|data| data.insert_temp(Id::new(HIDE_ID), true));
         let mut shapes = Vec::new();
+        let palette = Palette::from_theme(theme);
+        if prefs.animated && prefs.pack.ripples() && ripples_on(kind) {
+            let (left, right) = ctx.input(|i| {
+                (
+                    i.pointer.button_pressed(egui::PointerButton::Primary),
+                    i.pointer.button_pressed(egui::PointerButton::Secondary),
+                )
+            });
+            for (pressed, context) in [(left, false), (right, true)] {
+                if pressed {
+                    self.ripples.push(Ripple {
+                        at,
+                        since: now,
+                        context,
+                    });
+                }
+            }
+        }
+        self.ripples
+            .retain(|ripple| ((now - ripple.since) as f32) < RIPPLE_SECS);
+        if self.ripples.len() > 12 {
+            self.ripples.drain(..self.ripples.len() - 12);
+        }
+        for ripple in &self.ripples {
+            paint_ripple(
+                &mut shapes,
+                *ripple,
+                (now - ripple.since) as f32,
+                prefs.scale(),
+                palette,
+            );
+        }
+        // A new pointer grows in from its hotspot while the old one shrinks
+        // and fades: a short cross-fade, never a shape morph. The screen
+        // picker reads the pixels under the hotspot, so it never fades.
+        let morph = self
+            .previous
+            .filter(|(old, _)| {
+                prefs.animated
+                    && prefs.pack.fades()
+                    && ![*old, kind].contains(&CursorKind::ScreenPick)
+            })
+            .map(|(old, since)| (old, ((now - since) as f32 / MORPH_SECS).min(1.0)))
+            .filter(|(_, t)| *t < 1.0);
+        if let Some((old, t)) = morph {
+            let gone = 1.0 - t;
+            paint(
+                &mut shapes,
+                prefs,
+                old,
+                at,
+                (prefs.scale() * (1.0 - 0.2 * t), deform),
+                palette.faded(gone * gone),
+                &Motion {
+                    enter: 100.0,
+                    ..motion
+                },
+            );
+        }
+        let grown = morph.map_or(1.0, |(_, t)| ease_out(t));
         paint(
             &mut shapes,
+            prefs,
             kind,
             at,
-            prefs.scale(),
-            Palette::from_theme(theme),
+            (prefs.scale() * (0.8 + 0.2 * grown), deform),
+            palette.faded((grown * 1.5).min(1.0)),
             &motion,
         );
         ctx.layer_painter(LayerId::new(Order::Debug, Id::new(LAYER_ID)))
             .extend(shapes);
 
-        let settling = motion.enter < kind.entry_secs()
+        let settling = morph.is_some()
+            || !self.ripples.is_empty()
+            || self.impact.is_some()
+            || motion.enter < kind.entry_secs()
             || motion.pressed < 1.3
             || motion.release < 1.3
             || self.velocity.length() > 2.0
@@ -2112,7 +2833,43 @@ impl CursorRuntime {
             || self.lean_speed.length() > 6.0;
         if prefs.animated && settling {
             ctx.request_repaint();
+        } else if let Some(after) = prefs.pack.idle_frame().filter(|_| prefs.animated) {
+            // Packs that move while resting draw a few frames a second.
+            ctx.request_repaint_after(after);
         }
+    }
+
+    /// How the whole pointer is bent this frame: stretched along its way
+    /// when it moves fast, squashed against the edge it just ran into. Both
+    /// pivot on the hotspot, so where it points never moves.
+    fn deform(&mut self, prefs: &CursorSettings, kind: CursorKind, now: f64) -> Xf {
+        // The screen picker reads the pixels under its hotspot; it stays as
+        // drawn.
+        if !prefs.animated || kind == CursorKind::ScreenPick {
+            self.impact = None;
+            return Xf::ID;
+        }
+        let mut deform = Xf::ID;
+        let mut calm = 1.0;
+        if let Some((normal, strength, since)) = self.impact {
+            let t = (now - since) as f32;
+            if t > 0.6 || !prefs.squash {
+                self.impact = None;
+            } else {
+                // Flat against the edge at once, then a quick bounce back.
+                let squash = strength * (-9.0 * t).exp() * (22.0 * t).cos();
+                deform = Xf::stretch(normal, (1.0 - squash).clamp(0.55, 1.4));
+                calm = (t / 0.3).min(1.0);
+            }
+        }
+        let speed = self.lean.length();
+        if prefs.stretch && speed > 1.0 {
+            let k = ((speed - 700.0) / 5000.0).clamp(0.0, 0.2) * calm;
+            if k > 0.001 {
+                deform = Xf::stretch(self.lean / speed, 1.0 + k).then(deform);
+            }
+        }
+        deform
     }
 
     /// Track the pointer's velocity and the spring that follows it.
@@ -2125,10 +2882,14 @@ impl CursorRuntime {
             return;
         }
         let moved = pos - last;
+        if moved.length() > 0.5 {
+            self.moved_at = now;
+        }
         if self.held {
             self.travel = (self.travel + moved.length()) % 10_000.0;
             self.sweep = (self.sweep + moved.x) % 10_000.0;
         }
+        self.drift = (self.drift + moved.length()) % 10_000.0;
         let instant = moved / dt.max(1.0 / 240.0);
         self.velocity = lerp(self.velocity, instant, (dt * 20.0).min(1.0));
         if self.velocity.length() < 0.5 {
@@ -2155,6 +2916,9 @@ impl CursorRuntime {
 
 // ---------------------------------------------------------------------------
 // Wrapping number drags
+
+/// How long two pointers cross-fade when one replaces the other.
+const MORPH_SECS: f32 = 0.13;
 
 /// A jump of the system cursor that the input has not shown yet.
 #[derive(Clone, Copy, Debug)]
@@ -2323,7 +3087,16 @@ pub(crate) fn preview(
     let scale = 1.05;
     let at = rect.center() - kind.preview_center() * scale;
     let mut shapes = Vec::new();
-    paint(&mut shapes, kind, at, scale, pal, &motion);
+    if ripples_on(kind) && motion.pressed < RIPPLE_SECS {
+        let ripple = Ripple {
+            at,
+            since: 0.0,
+            context: false,
+        };
+        paint_ripple(&mut shapes, ripple, motion.pressed, scale, pal);
+    }
+    packs::set_pixels_per_point(ui.ctx().pixels_per_point());
+    paint(&mut shapes, prefs, kind, at, (scale, Xf::ID), pal, &motion);
     ui.painter().with_clip_rect(rect.shrink(1.0)).extend(shapes);
     if prefs.animated && on {
         ui.ctx().request_repaint();
@@ -2342,19 +3115,20 @@ mod tests {
     fn shapes_for(kind: CursorKind, rect: Rect) -> Vec<Shape> {
         let mut shapes = Vec::new();
         let pal = Palette::from_theme(&crate::settings::Theme::default());
-        paint(
+        paint_standard(
             &mut shapes,
             kind,
             rect.center(),
-            1.0,
+            (1.0, Xf::ID),
             pal,
             &Motion::demo(1.3),
         );
         shapes
     }
 
-    const ALL: [CursorKind; 36] = [
+    const ALL: [CursorKind; 38] = [
         CursorKind::Arrow,
+        CursorKind::Subselect,
         CursorKind::Link,
         CursorKind::Text,
         CursorKind::Grab,
@@ -2383,6 +3157,7 @@ mod tests {
         CursorKind::ScreenPick,
         CursorKind::FrameDrag,
         CursorKind::ParentLink,
+        CursorKind::ParentUnlink,
         CursorKind::KnifeCut,
         CursorKind::SelectAdd,
         CursorKind::SelectRemove,
@@ -2446,11 +3221,11 @@ mod tests {
         let pal = Palette::from_theme(&crate::settings::Theme::default());
         for time in [0.05, 0.3, 1.3, 2.0] {
             let mut shapes = Vec::new();
-            paint(
+            paint_standard(
                 &mut shapes,
                 CursorKind::ScreenPick,
                 at,
-                1.75,
+                (1.75, Xf::ID),
                 pal,
                 &Motion::demo(time),
             );
@@ -2468,6 +3243,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_pointer_against_the_screen_edge_knows_which_edge() {
+        let screen = egui::Rect::from_min_size(Pos2::ZERO, vec2(100.0, 50.0));
+        assert_eq!(
+            edge_normal(Pos2::new(0.5, 20.0), screen),
+            Some(vec2(-1.0, 0.0))
+        );
+        assert_eq!(
+            edge_normal(Pos2::new(50.0, 49.5), screen),
+            Some(vec2(0.0, 1.0))
+        );
+        assert_eq!(edge_normal(Pos2::new(50.0, 20.0), screen), None);
+        let corner = edge_normal(Pos2::new(99.5, 0.0), screen).unwrap();
+        assert!((corner.length() - 1.0).abs() < 1e-5 && corner.x > 0.0 && corner.y < 0.0);
     }
 
     #[test]
@@ -2570,5 +3361,74 @@ mod tests {
             egui::Event::PointerButton { pos, .. } if pos == pos2(804.0, 50.0)
         ));
         assert_eq!(wrap.shift, Vec2::ZERO);
+    }
+
+    #[test]
+    fn no_cursor_spikes_anywhere_on_the_screen() {
+        // Every corner of every shape a cursor draws, tessellated the way
+        // egui draws it, stays near the pointer: wherever the pointer is,
+        // down to fractions of a pixel, and at every moment of its motion.
+        let pal = Palette::from_theme(&crate::settings::Theme::default());
+        let mut tessellator =
+            egui::epaint::Tessellator::new(1.0, Default::default(), [1, 1], Vec::new());
+        for kind in [
+            CursorKind::Bucket,
+            CursorKind::Eyedropper,
+            CursorKind::Arrow,
+        ] {
+            for (x, y) in [
+                (100.0, 100.0),
+                (1337.37, 811.61),
+                (1919.93, 1079.07),
+                (2560.5, 13.25),
+            ] {
+                let at = pos2(x, y);
+                for step in 0..140 {
+                    let time = 1.15 + step as f64 * 0.005;
+                    let mut shapes = Vec::new();
+                    paint_standard(
+                        &mut shapes,
+                        kind,
+                        at,
+                        (1.75, Xf::ID),
+                        pal,
+                        &Motion::demo(time),
+                    );
+                    for shape in shapes {
+                        let mut mesh = Mesh::default();
+                        tessellator.tessellate_shape(shape, &mut mesh);
+                        for vertex in &mesh.vertices {
+                            assert!(
+                                vertex.pos.distance(at) < 70.0,
+                                "{kind:?} at {at:?}, {time:.3}s: a spike out to {:?}",
+                                vertex.pos
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_fading_line_is_one_piece_inside_its_outline() {
+        let points = [pos2(0.0, -3.0), pos2(4.0, 0.0), pos2(0.0, 3.0)];
+        let mesh = ribbon_mesh(&points, 1.0, Color32::WHITE);
+        // A strip of two quads, and a fan of eight triangles at each end.
+        assert_eq!(mesh.indices.len() / 3, 4 + 2 * 8);
+        let outline = ribbon_outline(&points, 1.5);
+        assert_eq!(outline.len(), 3 + 7 + 3 + 7);
+        // Every corner of the line lies inside its outline's reach.
+        for vertex in &mesh.vertices {
+            let nearest = points
+                .windows(2)
+                .map(|pair| {
+                    let (a, b) = (pair[0], pair[1]);
+                    let t = ((vertex.pos - a).dot(b - a) / (b - a).length_sq()).clamp(0.0, 1.0);
+                    vertex.pos.distance(a + (b - a) * t)
+                })
+                .fold(f32::MAX, f32::min);
+            assert!(nearest <= 1.0 / 0.3 + 1e-3, "{:?}", vertex.pos);
+        }
     }
 }

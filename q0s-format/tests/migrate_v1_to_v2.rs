@@ -37,7 +37,11 @@ fn migrate_one_scene_v1_to_v2_preserves_data() {
                 assert_eq!(b.height, expected.height);
                 assert_eq!(*b.rgba, expected.rgba);
             }
-            Asset::Vector(_) | Asset::Q0v(_) | Asset::Rig(_) | Asset::Model(_) => {
+            Asset::Vector(_)
+            | Asset::Q0v(_)
+            | Asset::Rig(_)
+            | Asset::Model(_)
+            | Asset::Raster(_) => {
                 panic!("v1 assets must migrate as bitmap")
             }
         }

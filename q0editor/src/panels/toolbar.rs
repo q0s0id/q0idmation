@@ -55,6 +55,7 @@ impl ToolIcon {
 
 pub fn render(app: &mut EditorApp, ui: &mut Ui) {
     let three = crate::tools3d::offered(&app.state.project);
+    let raster = crate::raster::offered(&app.state.project);
     if ui.available_width() >= 90.0 {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
@@ -68,6 +69,16 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             render_paint_well(app, ui);
             ui.vertical(|ui| render_paint_buttons(app, ui));
         });
+        if raster {
+            ui.add_space(4.0);
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                for tool in crate::raster::RasterTool::ALL {
+                    render_raster_button(app, ui, tool);
+                }
+            });
+        }
         if three {
             ui.add_space(4.0);
             ui.separator();
@@ -95,6 +106,18 @@ pub fn render(app: &mut EditorApp, ui: &mut Ui) {
             render_paint_well(app, ui);
             ui.add_space(2.0);
             render_paint_buttons(app, ui);
+            if raster {
+                ui.add_space(3.0);
+                ui.separator();
+                ui.label(
+                    egui::RichText::new("Raster")
+                        .small()
+                        .color(app.settings.theme.text_dim.to_color32()),
+                );
+                for tool in crate::raster::RasterTool::ALL {
+                    render_raster_button(app, ui, tool);
+                }
+            }
             if three {
                 ui.add_space(3.0);
                 ui.separator();
@@ -319,8 +342,39 @@ fn render_tool3d_button(app: &mut EditorApp, ui: &mut Ui, tool: crate::tools3d::
     }
     if response.on_hover_text(tool.hint()).clicked() && crate::text_tool::finish_edit(app) {
         app.plugins.active_tool = None;
+        crate::raster::select::let_go(app);
+        app.session.raster.leave();
         app.session.tools3d.tool = Some(tool);
         app.session.tool_state = crate::state::ToolState::Idle;
+    }
+}
+
+/// A raster tool's button, styled like the 2D ones.
+fn render_raster_button(app: &mut EditorApp, ui: &mut Ui, tool: crate::raster::RasterTool) {
+    let selected = app.session.raster.tool == Some(tool);
+    let size = tool_button_size();
+    let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::click());
+    response
+        .widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, selected, tool.label()));
+    let text = app.settings.theme.text.to_color32();
+    let accent = app.settings.theme.accent.to_color32();
+    if ui.is_rect_visible(rect) {
+        crate::ui::paint_control(
+            ui,
+            &response,
+            rect.shrink(1.0),
+            (size * 0.25).round(),
+            selected,
+        );
+        let icon = Rect::from_center_size(
+            rect.center(),
+            vec2(TOOL_ICON_SIZE, TOOL_ICON_SIZE) * (size / TOOL_BUTTON_SIZE),
+        );
+        let (primary, secondary) = tool_icon_colors(text, accent, selected);
+        crate::raster::ui::paint_icon(ui.painter(), icon, tool, primary, secondary);
+    }
+    if response.on_hover_text(tool.hint()).clicked() {
+        crate::raster::pick_tool(app, tool);
     }
 }
 
@@ -328,7 +382,9 @@ fn render_tool_button(app: &mut EditorApp, ui: &mut Ui, tool: Tool) {
     let response = tool_button(
         ui,
         tool,
-        app.session.current_tool == tool && !app.session.tools3d.active(),
+        app.session.current_tool == tool
+            && !app.session.tools3d.active()
+            && !app.session.raster.active(),
         app.settings.theme.text.to_color32(),
         app.settings.theme.panel.to_color32(),
         app.settings.theme.accent.to_color32(),
