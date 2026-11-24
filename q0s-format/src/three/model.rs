@@ -668,8 +668,7 @@ impl ModelData {
     /// out-of-range references, parents after children, broken numbers.
     pub fn sanitize(&mut self) {
         let count = self.nodes.len();
-        for index in 0..count {
-            let node = &mut self.nodes[index];
+        for (index, node) in self.nodes.iter_mut().enumerate() {
             if node
                 .parent
                 .is_some_and(|parent| usize::from(parent) >= index)

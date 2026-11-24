@@ -13,3 +13,4 @@
 /android/local.properties
 __pycache__/
 *.pyc
+/android/.kotlin/
