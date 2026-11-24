@@ -4725,12 +4725,8 @@ fn collect_vector_asset_group_primitives(
             }
         }
     }
-    if vector.stroke.is_some()
-        && !collect_vector_group_stroke(vector, transform, view, textures, tint, primitives)
-    {
-        return false;
-    }
-    true
+    vector.stroke.is_none()
+        || collect_vector_group_stroke(vector, transform, view, textures, tint, primitives)
 }
 
 #[cfg(feature = "appearance-mask-eraser")]
@@ -5520,10 +5516,13 @@ impl RootLayerFilter<'_> {
 
     fn is_mask_source(self) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
-        if matches!(self, Self::MaskSource(_)) {
-            return true;
+        {
+            matches!(self, Self::MaskSource(_))
         }
-        false
+        #[cfg(target_arch = "wasm32")]
+        {
+            false
+        }
     }
 
     fn includes_placement(self, layer_id: u16, placement_idx: usize) -> bool {

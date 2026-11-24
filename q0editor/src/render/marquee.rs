@@ -748,7 +748,7 @@ impl<'a> Area<'a> {
     }
 
     fn triangles_hit(self, indices: &[u32], mut vertex: impl FnMut(usize) -> Pos2) -> bool {
-        indices.chunks_exact(3).any(|triangle| {
+        indices.as_chunks::<3>().0.iter().any(|triangle| {
             let points = [
                 vertex(triangle[0] as usize),
                 vertex(triangle[1] as usize),

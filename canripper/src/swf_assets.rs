@@ -182,13 +182,13 @@ impl<'a> Reader<'a> {
         let channels = if alpha { 4 } else { 3 };
         let mut transform = ColorTransform::IDENTITY;
         if has_mult {
-            for channel in 0..channels {
-                transform.mult[channel] = self.sb(bits)? as f32 / 256.0;
+            for channel in &mut transform.mult[..channels] {
+                *channel = self.sb(bits)? as f32 / 256.0;
             }
         }
         if has_add {
-            for channel in 0..channels {
-                transform.add[channel] = self.sb(bits)? as f32;
+            for channel in &mut transform.add[..channels] {
+                *channel = self.sb(bits)? as f32;
             }
         }
         self.align();

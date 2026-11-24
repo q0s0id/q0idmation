@@ -693,8 +693,13 @@ fn paint_canvas_selection(
     color: Color32,
 ) {
     let [start, end] = range.sorted_cursors().map(|cursor| cursor.rcursor);
-    for row_index in start.row..=end.row {
-        let row = &galley.rows[row_index];
+    for (row_index, row) in galley
+        .rows
+        .iter()
+        .enumerate()
+        .take(end.row + 1)
+        .skip(start.row)
+    {
         let left = if row_index == start.row {
             row.x_offset(start.column)
         } else {

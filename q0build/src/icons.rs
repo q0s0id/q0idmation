@@ -118,8 +118,8 @@ pub fn placeholder(name: &str, background: [u8; 3]) -> AppIcon {
             let outside = dx.max(0.0).hypot(dy.max(0.0)) + dx.max(dy).min(0.0) - 30.0;
             if outside < 0.0 {
                 let pixel = image.get_pixel_mut(x, y);
-                for channel in 0..3 {
-                    pixel.0[channel] = pixel.0[channel].saturating_add(46);
+                for channel in &mut pixel.0[..3] {
+                    *channel = channel.saturating_add(46);
                 }
             }
         }
